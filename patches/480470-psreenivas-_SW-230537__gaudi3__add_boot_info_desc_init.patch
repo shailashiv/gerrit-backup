@@ -1,0 +1,107 @@
+From f175a80ae718a0156224640d6b3b0dbc5ecae405 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Thu, 29 May 2025 06:47:37 +0300
+Subject: [PATCH] [SW-230537] gaudi3: add boot_info_desc_init
+
+The boot_info_desc_init was removed from
+common utils since it is no longer needed
+by d2d driver hence adding it in preboot for
+sram bist.
+https://gerrit.habana-labs.com/#/c/478823/
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I015d60b61e6d98a7325ad76986bf12ea6a5d682f
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 8c36aed..01721e4 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -266,6 +266,73 @@
+ 	return is_skip;
+ }
+ 
++static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	if ((img_desc->magic.val & IMG_DESC_MAGIC_MASK) != HL_FW_IMG_DESC_MAGIC)
++		return false;
++
++	if (img_desc->desc_ver == 0 || img_desc->desc_ver == ~0)
++		return false;
++
++	if (img_desc->idx >= IMG_DESC_IDX_SHIFT)
++		return false;
++
++	return true;
++}
++
++static int boot_info_desc_init(enum hl_fw_img_type type, struct hl_fw_img_desc *desc)
++{
++	struct hl_fw_desc_info desc_info;
++	uint32_t copy_sz;
++	uint32_t iter;
++	uint8_t *desc_buff;
++	struct hl_fw_img_desc *img_desc;
++	int ret = 0;
++
++	/* Read the main boot pointers structure */
++	if (boot_info_get_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &desc_info,
++				  sizeof(struct hl_fw_desc_info), &copy_sz)) {
++		LOG_ERR("Error reading desc info from bootinfo\n");
++		return -1;
++	}
++
++	desc_buff = k_malloc(desc_info.desc_size * desc_info.count);
++	if (!desc_buff) {
++		LOG_ERR("Failed to alloc memory for image descriptors");
++		return -1;
++	}
++
++	if (boot_info_get_no_merge(HL_BOOT_INFO_IMG_DESC_DATA, (void *)(desc_buff),
++			(desc_info.desc_size * desc_info.count), &copy_sz)) {
++		LOG_ERR("Failed to copy image desc from bootinfo\n");
++		k_free(desc_buff);
++		return -1;
++	}
++
++	/*
++	 * struct hl_fw_img_desc is used for parsing the descriptor fields, but developer must
++	 * take the descriptor version into account in order to know which fields are available
++	 */
++	for (iter = 0; iter < desc_info.count; iter++) {
++		img_desc = (struct hl_fw_img_desc *)(desc_buff + iter * desc_info.desc_size);
++		if (!boot_desc_img_desc_is_valid(img_desc)) {
++			LOG_ERR("Bad boot descriptor: %u", iter);
++			ret = -1;
++			break;
++		}
++
++		if (img_desc->magic.type == type) {
++			memcpy(desc, img_desc, sizeof(struct hl_fw_img_desc));
++			ret = iter;
++			break;
++		}
++
++	}
++
++	k_free(desc_buff);
++	return ret;
++}
++
+ static void gaudi3_sram_self_repair(void)
+ {
+ 	u32 dft_apb_base, die_id, engine_idx, engine_cnt;
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index a52a2e7..9c42203 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -133,6 +133,9 @@
+ #define GAUDI3_CTEMP_WARN_TEMP		95
+ #define GAUDI3_CTEMP_CRIT_TEMP		105
+ 
++#define IMG_DESC_IDX_SHIFT	2
++#define IMG_DESC_MAGIC_MASK	0xFFFFFF00
++
+ struct cpld_hl338_config2_reg {
+ 	union {
+ 		struct {

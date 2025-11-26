@@ -1,0 +1,150 @@
+From 0cc61a6cfa5b73a393a2ac318e9d37f132603cde Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 16 Apr 2025 13:51:26 +0300
+Subject: [PATCH] [SW-218933] g3: use access mode enum from specs
+
+The `mem_access_mode` enum was defined within individual Zephyr apps. This
+enum has been moved to specs dir to avoid definitions across multiple apps
+in an earlier patch. This patch replaces the older enum with enum from
+specs dir in preboot_rtos
+
+Change-Id: Ifb40ca3eacd472b1a0d2045e2ecbd0c1e19d4d0f
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/app/io/preboot.c b/app/io/preboot.c
+index 9c14326..4f0fb94 100644
+--- a/app/io/preboot.c
++++ b/app/io/preboot.c
+@@ -337,7 +337,8 @@
+ EMPTY_WEAK_FUNC(int preboot_binning_init(void), 0)
+ EMPTY_WEAK_FUNC(int preboot_isolation_init(void), 0)
+ EMPTY_WEAK_FUNC(void preboot_nic_mask_serr_derr_interrupts(void),)
+-EMPTY_WEAK_FUNC(void preboot_security_dynamic_img_sram_open(uintptr_t img_offset, int img_sz, enum preboot_mem_access_mode mode),)
++EMPTY_WEAK_FUNC(void preboot_security_dynamic_img_sram_open(uintptr_t img_offset,
++		int img_sz, enum mem_access_mode mode),)
+ 
+ bool preboot_is_overlap_address_range(u64 addr, int len)
+ {
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index c2f9dec..fd1628d 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -578,7 +578,7 @@
+ }
+ 
+ void preboot_security_dynamic_img_sram_open(uintptr_t img_offset, int img_sz,
+-					    enum preboot_mem_access_mode mode)
++					    enum mem_access_mode mode)
+ {
+ 	struct hl_sec_dyn_pcie_rr_cfg *cfg;
+ 	u64 img_max, image_base_full;
+@@ -603,15 +603,15 @@
+ 	/* Finally open the image memory space */
+ 	cfg = &preboot_sec_dyn_cfg[IMAGE];
+ 	switch (mode) {
+-	case MEM_ACCESS_RO:
++	case ACCESS_RO:
+ 		/* Open IMAGE region in read only mode */
+ 		hl_secure_dyn_rr_cfg(HL_SEC_HBW_SRAM_RO, cfg->min, cfg->max);
+ 		break;
+-	case MEM_ACCESS_RW:
++	case ACCESS_RW:
+ 		/* Open IMAGE region read-only RR if closed already */
+ 		hl_secure_dyn_rr_cfg(HL_SEC_HBW_SRAM_RO, 0, 0);
+ 		break;
+-	case MEM_ACCESS_WR: /* write-only not possible in gaudi2 */
++	case ACCESS_WR: /* write-only not possible in gaudi2 */
+ 	default:
+ 		LOG_ERR("dynamic_image_sram_open with invalid mode: %d", mode);
+ 		return;
+diff --git a/arch/gaudi3/common/security.c b/arch/gaudi3/common/security.c
+index da9c5b8..9020437 100644
+--- a/arch/gaudi3/common/security.c
++++ b/arch/gaudi3/common/security.c
+@@ -357,7 +357,7 @@
+ #define SDRAM_BASE		(FW_MEM_REGION_BASE - SDRAM_SIZE)
+ #define IMAGE_OFFSET_MASK	0xFFFFFF
+ void preboot_security_dynamic_img_sram_open(uintptr_t img_offset, int img_sz,
+-						enum preboot_mem_access_mode mode)
++						enum mem_access_mode mode)
+ {
+ 	u64 img_max, image_base_full, min, max, telem_base_full = 0;
+ 	u32 telem_addr, telem_size;
+@@ -390,7 +390,7 @@
+ 	 * RR5 is used to enforce the write protection on the SRAM region dynamically
+ 	 * opened to the host, as it is exposed with read-only (RO) permissions.
+ 	 */
+-	if (mode == MEM_ACCESS_RO) {
++	if (mode == ACCESS_RO) {
+ 		min = image_base_full;
+ 		max = img_max;
+ 		hl_secure_dyn_rr_cfg(HL_SEC_HBW_RR_5, image_base_full, img_max, HL_SEC_WR_PROT);
+diff --git a/include/security.h b/include/security.h
+index 0db74c1..9e0bb91 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -9,18 +9,13 @@
+ 
+ #include <types.h>
+ #include <memory.h>
++#include <hl_sec_if.h>
+ 
+ struct config_lbw_rr {
+ 	int rr_idx;
+ 	uint64_t min;
+ 	uint64_t max;
+ 	bool rr_en;
+-};
+-
+-enum preboot_mem_access_mode {
+-	MEM_ACCESS_RO,
+-	MEM_ACCESS_WR,
+-	MEM_ACCESS_RW,
+ };
+ 
+ bool preboot_security_is_enabled(void);
+@@ -32,7 +27,7 @@
+ void preboot_security_dynamic_init(void);
+ void preboot_security_dynamic_img_sram_close(void);
+ void preboot_security_dynamic_img_sram_open(uintptr_t img_offset, int img_sz,
+-					    enum preboot_mem_access_mode mode);
++					    enum mem_access_mode mode);
+ void preboot_security_dynamic_img_elbi_reg_close(void);
+ void preboot_security_dynamic_img_elbi_reg_open(void);
+ void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len);
+diff --git a/lib/module/module_fwupd.c b/lib/module/module_fwupd.c
+index f182043..ebff4b1 100644
+--- a/lib/module/module_fwupd.c
++++ b/lib/module/module_fwupd.c
+@@ -282,7 +282,7 @@
+ 		 */
+ 		if (state->use_security && status.offset && state->wfc_cmd.cmd != HL_UPD_MAP_SRAM)
+ 			preboot_security_dynamic_img_sram_open((uintptr_t)state->map_offset,
+-							       state->map_size, MEM_ACCESS_RO);
++							       state->map_size, ACCESS_RO);
+ 	}
+ 
+ 	state->sts_writel(status.val);
+@@ -563,7 +563,7 @@
+ 
+ 	if (state->use_security) {
+ 		if (cmd == HL_UPD_MAP_SRAM)
+-			preboot_security_dynamic_img_sram_open(base_offset, size, MEM_ACCESS_RW);
++			preboot_security_dynamic_img_sram_open(base_offset, size, ACCESS_RW);
+ 		else
+ 			preboot_security_dynamic_img_elbi_reg_open();
+ 	}
+diff --git a/lib/module/module_lkd.c b/lib/module/module_lkd.c
+index 20d6def..5479d50 100644
+--- a/lib/module/module_lkd.c
++++ b/lib/module/module_lkd.c
+@@ -467,7 +467,7 @@
+ 
+ 	*offset = lkd_dev_spec_get_desc_offset(sts.mem_base);
+ 
+-	preboot_security_dynamic_img_sram_open(sts.mem_base, sts.mem_size, MEM_ACCESS_RW);
++	preboot_security_dynamic_img_sram_open(sts.mem_base, sts.mem_size, ACCESS_RW);
+ 
+ 	if (sts.is_elbi_desc) {
+ 		preboot_security_dynamic_img_elbi_reg_open();

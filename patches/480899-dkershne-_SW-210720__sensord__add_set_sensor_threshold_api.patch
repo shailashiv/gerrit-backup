@@ -1,0 +1,79 @@
+From b748ba8d3f6d0f00a7a93dac079a2783641cc508 Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Thu, 15 May 2025 21:34:47 +0300
+Subject: [PATCH] [SW-210720] sensord: add set_sensor_threshold api
+
+Setting a threshold can change the behavior of certain sensors. Add
+ability to notify sensor specific code of change in threshold values.
+
+Change-Id: Iff0d273d75ba16afe1106f4c140429c99c314032
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/include/sensord.h b/include/sensord.h
+index 417bf99..19ce6af 100644
+--- a/include/sensord.h
++++ b/include/sensord.h
+@@ -69,6 +69,9 @@
+ typedef void (*sensord_before_read_callback_fn_t)(void);
+ void set_sensord_before_read_callback(sensord_before_read_callback_fn_t cb);
+ 
++typedef int (*sensord_sensor_threshold_set_fn_t)(const struct sensord_sensor_entry *entry,
++						  struct pldm_pmc_threshold_data *val);
++
+ struct sensord_sensor_entry {
+ 	const struct pldm_pdr_record *pdr;
+ 	struct sensord_sensor_state *state;
+@@ -87,6 +90,8 @@
+ 		 */
+ 		sensord_sensor_poll_fn_t poll;
+ 
++		sensord_sensor_threshold_set_fn_t set_sensor_thresholds;
++
+ 		/* Custom polling interval for this sensor, in milliseconds.
+ 		 * Use 0 to use global sampling rate.
+ 		 */
+diff --git a/src/sensord.c b/src/sensord.c
+index b16ba1e..a87fa5b 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -525,6 +525,7 @@
+ 	struct sensord_sensor_state *state;
+ 	struct pldm_pmc_threshold_data *val;
+ 	k_spinlock_key_t key;
++	int res = 0;
+ 
+ 	sensor = find_sensor(sensor_id, NUMERIC_SENSOR_TYPE_MASK);
+ 	if (!sensor) {
+@@ -602,7 +603,10 @@
+ 
+ 	k_spin_unlock(&sensord_state.lock, key);
+ 
+-	return 0;
++	if (sensor->api.set_sensor_thresholds)
++		res = sensor->api.set_sensor_thresholds(sensor, val);
++
++	return res;
+ }
+ 
+ static int sensord_init_numeric_sensor(
+@@ -1078,12 +1082,16 @@
+ 		break;
+ 	}
+ 
+-	if (!res)
++	if (!res) {
+ 		state->polled = false;
++		sensord_persist_sensor_thresholds(&sensord_state.oobi, sensor_id,
++						  thresholds);
++	}
+ 
+-	sensord_persist_sensor_thresholds(&sensord_state.oobi, sensor_id,
+-					  thresholds);
+ 	k_spin_unlock(&sensord_state.lock, key);
+ 
++	if (!res && sensor->api.set_sensor_thresholds)
++		res = sensor->api.set_sensor_thresholds(sensor, thresholds);
++
+ 	return res;
+ }

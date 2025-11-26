@@ -1,0 +1,499 @@
+From 6747f61e23f85267d420b5e82e00bacdbb5ef483 Mon Sep 17 00:00:00 2001
+From: Shivani Raval <sraval@habana.ai>
+Date: Fri, 04 Apr 2025 10:25:47 +0300
+Subject: [PATCH] [JSW-31] module: jgs files for common module
+
+Added required JGS files same as FS1 for JGS
+asic build.
+
+Change-Id: I915e9dafb335eb9ff93194f86725aa9d0838f7b6
+---
+
+diff --git a/arch/jgs/asic.c b/arch/jgs/asic.c
+new file mode 100644
+index 0000000..a65fd6a
+--- /dev/null
++++ b/arch/jgs/asic.c
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
+diff --git a/arch/jgs/common.c b/arch/jgs/common.c
+new file mode 100644
+index 0000000..3c4afa7
+--- /dev/null
++++ b/arch/jgs/common.c
+@@ -0,0 +1,412 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#include <parc_global_conf_regs.h>
++#include <parc_global_conf_masks.h>
++#include <arc_local_conf_regs.h>
++#include <arc_local_conf_masks.h>
++#include <tran_chk_lbw_regs.h>
++#include <tran_chk_lbw_masks.h>
++#include <mem_copy_regs.h>
++#include <mem_copy_masks.h>
++#include <muc_arc_aux_regs.h>
++#include <muc_arc_aux_masks.h>
++#include <efuse.h>
++#include <jgs_efuse.h>
++#include <arc_regs.h>
++#include <arc_masks.h>
++
++#ifdef __ZEPHYR__
++#include <preboot.h>
++#include <hl_device.h>
++#include <zephyr/drivers/misc/common/common_utils.h>
++#include <hl_platform_defs.h>
++#else
++#include <baremetal.h>
++#include <device.h>
++#include <bitops.h>
++#include <pll.h>
++#include <iopoll.h>
++#include <hl.h>
++#endif
++#include <stdbool.h>
++#include <stdint.h>
++#include <hl_fit_if.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <address_space.h>
++#include <emb_cmn_log.h>
++#include <common.h>
++#include <lib_common.h>
++#include <fit.h>
++#include <hl_boot_desc.h>
++
++
++#ifdef __ZEPHYR__
++#include <preboot.h>
++LOG_MODULE_REGISTER(fs1_emb_common);
++#else
++#include <baremetal.h>
++#endif
++
++int get_mgmt_core_id(void)
++{
++	return FIT_CORE_ID_IO0_MGMT;
++}
++
++int fit_process_core_id(enum fit_core_id core_id, uint64_t loadaddr, uint8_t *config)
++{
++	switch (core_id) {
++	case FIT_CORE_ID_IO0_MGMT:
++		/* Nothing needs to be done for psoc mgmt arc as its already running */
++		*config = true;
++		return 0;
++
++	case FIT_CORE_ID_IO0_PID:
++	case FIT_CORE_ID_IO0_RST:
++	case FIT_CORE_ID_IO0_MISC:
++	case FIT_CORE_ID_IO0_NMS:
++	case FIT_CORE_ID_IO0_MUC:
++		/*
++		 * It is expected to receive two images for single core (iccm/dccm),
++		 * so assumption is made here that 1st image will be iccm followed
++		 * by dccm.
++		 */
++		if (!(*config)) {
++			/* halt and reset arc along with desassert */
++			preboot_configure_arc(core_id, loadaddr);
++			*config = true;
++		}
++		return 0;
++
++	default:
++		EMB_LOG_HEX_ERR("Unsupported core id: ", core_id);
++		return 1;
++	}
++}
++
++#define LBW_START_OFFSET	0x8000000
++#define IO0_CFG_SPACE		(CFG_PHYS_BASE + LBW_START_OFFSET)
++
++/* based on lkd_dev_spec_get_img_addr from preboot */
++u64 get_64bit_addr_from_32bit_addr(uintptr_t base)
++{
++	/* ARC.MNG DCCM and ICCM regions */
++	if (base >= LOCAL_ICCM_BASE && base < IO_MNG_ICCM_SIZE)
++		return (base & ~IO0_MNG_ICCM_BASE) + IO0_MNG_ICCM_FULL_BASE;
++
++	if (base >= LOCAL_DCCM_BASE && base < IO_MNG_DCCM_SIZE)
++		return (base & ~IO0_MNG_DCCM_BASE) + IO0_MNG_DCCM_FULL_BASE;
++
++	/* TODO Other regions better be added as well (GT, HBW, DBG) */
++
++	/* CFG region (15) */
++	if (base >= mmIO_0_CFG_BASE) /* all the top 256MB region is CFG */ {
++		return (base & ~mmIO_0_CFG_BASE) + IO0_CFG_SPACE;
++	}
++
++	EMB_LOG_HEX_ERR("no address translation for base ", (u32)base);
++
++	return 0;
++}
++
++u32 fs1_get_arc_addr_from_64bit(u64 addr)
++{
++	/* ARC.MNG DCCM and ICCM regions */
++	if (addr >= IO0_MNG_ICCM_FULL_BASE && addr < IO0_MNG_ICCM_FULL_BASE + (u64)IO_MNG_ICCM_SIZE)
++		return (u32)((addr & ADDR_MASK(IO_MNG_ICCM)) + LOCAL_ICCM_BASE);
++
++	if (addr >= IO0_MNG_DCCM_FULL_BASE && addr < IO0_MNG_DCCM_FULL_BASE + (u64)IO_MNG_DCCM_SIZE)
++		return (u32)((addr & ADDR_MASK(IO_MNG_DCCM)) + LOCAL_DCCM_BASE);
++
++	/* TODO Other regions better be added as well (GT, HBW, DBG) */
++
++	/* CFG region (15) */
++	return (addr & 0xffffffff);
++}
++
++#define MEM_CPY_LBW_SIZE_LIMIT		(SZ_1M - SZ_16)
++#define MEM_CPY_LBW_SIZE_SHIFT		2
++#define MEM_CPY_LBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_LBW_SIZE_SHIFT) - 1)
++#define MEM_CPY_HBW_SIZE_LIMIT		(SZ_4M - SZ_16)
++#define MEM_CPY_HBW_SIZE_SHIFT		4
++#define MEM_CPY_HBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_HBW_SIZE_SHIFT) - 1)
++#define HL_MEM_CPY_TIMEOUT_US		100000
++
++/* currently eligible to run from IO arc mgmt only, because of HL_MNG_W_BARRIER() macro */
++int hw_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw, bool const_data)
++{
++	u64 start = timer_get_us();
++	u32 cpy_sts, copy_sz;
++	u32 cp_err, wr_err, rd_err;
++	u32 sz_limit, sz_shift, sz_mask;
++
++	if (is_hbw) {
++		sz_limit = MEM_CPY_HBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_HBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_HBW_SIZE_SHIFT_MASK;
++	} else {
++		sz_limit = MEM_CPY_LBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_LBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_LBW_SIZE_SHIFT_MASK;
++	}
++
++	if (size > sz_limit) {
++		EMB_LOG_RAW_ERR("size exceeds MEM_CPY engine limit\n");
++		return -1;
++	}
++
++	regmap_writel((uint32_t)src & MEM_COPY_SRC_ADDR_LSB_BITS_31_4_M,
++		      mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE + mmMEM_COPY_SRC_ADDR_LSB);
++	regmap_writel((uint32_t)(src >> 32), mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					     mmMEM_COPY_SRC_ADDR_MSB);
++
++	regmap_writel((uint32_t)dst & MEM_COPY_DEST_ADDR_LSB_BITS_31_4_M,
++		      mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE + mmMEM_COPY_DEST_ADDR_LSB);
++	regmap_writel((uint32_t)(dst >> 32), mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					     mmMEM_COPY_DEST_ADDR_MSB);
++
++	/* set size of in granuality of 4 bytes */
++	copy_sz = size >> sz_shift;
++	if (size & sz_mask) {
++		EMB_LOG_RAW_WRN("MEM_CPY size not aligned, rounding up\n");
++		copy_sz++;
++	}
++
++	regmap_writel(copy_sz, mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			       mmMEM_COPY_COPY_SIZE);
++
++	/* use constant value write mode for memory init */
++	if (const_data)
++		regmap_writel(MEM_COPY_CONST_VAL_WR_MODE_VAL_M,
++			      mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_CONST_VAL_WR_MODE);
++	else
++		regmap_writel(0, mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++				 mmMEM_COPY_CONST_VAL_WR_MODE);
++
++	/* disable LBW size check per H15-255 */
++	regmap_rmwritel(mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_MSTR_IF_LBW_TSRL_T_BASE +
++			mmTRAN_CHK_LBW_CHECK_EN, 0, TRAN_CHK_LBW_CHECK_EN_SIZE_CHK_M);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(MEM_COPY_COPY_EN_VAL_M, mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					      mmMEM_COPY_COPY_EN);
++
++	/* let 'enable' command propagate before polling on status */
++	HL_MNG_W_BARRIER();
++
++	while (1) {
++		cpy_sts = regmap_readl(mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++				       mmMEM_COPY_COPY_EN);
++		/* COPY_EN is set by FW, and cleared by HW when copy ends */
++		if (!(cpy_sts & MEM_COPY_COPY_EN_VAL_M))
++			break;
++
++		if (timer_expired(start, HL_MEM_CPY_TIMEOUT_US)) {
++			EMB_LOG_RAW_ERR("error: MEM_CPY engine timeout\n");
++			return -1;
++		}
++	}
++
++	cp_err = regmap_readl(mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_COPY_ERR_STS);
++	wr_err = regmap_readl(mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_WR_ERR_STS);
++	rd_err = regmap_readl(mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_RD_ERR_STS);
++
++	if (cp_err | wr_err | rd_err) {
++		EMB_LOG_RAW_ERR("MEM_CPY finished with errors\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++u32 fs1_get_arc_reg_offset(u64 addr)
++{
++	u32 reg_offset = (u32)addr | CFG_ARC_REGION_BASE;
++
++	return (reg_offset - HL_CFG_BASE);
++}
++
++int hw_mem_init(uint64_t dst, uint32_t size, bool is_hbw)
++{
++	return hw_mem_copy(0, dst, size, is_hbw, true);
++}
++
++#define PSOC_CPU_RUN_MASK	0x1
++#define PSOC_CPU_HALT_MASK	0x2
++#define ARC_RST_ADDR_SHIFT	10
++#define ARC_RUN_HALT_TIMEOUT_US	100
++
++static void fs1_arc_halt_cpu(u32 cpu_base, int type)
++{
++	u64 start;
++	bool ack;
++
++	if (type == CPU_TYPE_PSOC)
++		regmap_writel(PSOC_CPU_HALT_MASK, cpu_base + mmARC_RUN_HALT_REQ);
++	else if (type == CPU_TYPE_MUC)
++		regmap_writel(1, cpu_base + mmMUC_ARC_AUX_HALT_REQ);
++
++	start = timer_get_us();
++	while (1) {
++		if (type == CPU_TYPE_PSOC)
++			ack = !!(regmap_readl(cpu_base + mmARC_RUN_HALT_ACK) &
++				 ARC_RUN_HALT_ACK_HALT_ACK_M);
++		else if (type == CPU_TYPE_MUC)
++			ack = !!(regmap_readl(cpu_base + mmMUC_ARC_AUX_RUN_HALT_ACK) &
++				MUC_ARC_AUX_RUN_HALT_ACK_HALT_ACK_M);
++
++		if (ack)
++			break;
++
++		if (timer_expired(start, ARC_RUN_HALT_TIMEOUT_US)) {
++			EMB_LOG_HEX_ERR("timeout waiting for arc halt: ", cpu_base);
++			return;
++		}
++	}
++
++	if (type == CPU_TYPE_PSOC)
++		regmap_writel(0, cpu_base + mmARC_RUN_HALT_REQ);
++	else if (type == CPU_TYPE_MUC)
++		regmap_writel(0, cpu_base + mmMUC_ARC_AUX_HALT_REQ);
++}
++
++int arch_stop_and_reset_cpu(uint64_t base, int type, uint64_t start)
++{
++	u32 cpu_base = fs1_get_arc_reg_offset(base);
++	bool halted = false;
++	u32 rst_addr = (u32)start >> ARC_RST_ADDR_SHIFT;
++
++	if (type == CPU_TYPE_PSOC) {
++		halted = !!(regmap_readl(cpu_base + mmARC_RUN_HALT_ACK) &
++				 ARC_RUN_HALT_ACK_SYS_HALT_R_M);
++	} else if (type == CPU_TYPE_MUC) {
++		halted = !!(regmap_readl(cpu_base + mmMUC_ARC_AUX_RUN_HALT_ACK) &
++				MUC_ARC_AUX_RUN_HALT_ACK_SYS_HALT_R_M);
++	}
++	/* if arc is not halted halt the arc */
++	if (!halted)
++		fs1_arc_halt_cpu(cpu_base, type);
++
++	/* reset, set reset vector, and release reset */
++	if (type == CPU_TYPE_PSOC) {
++		regmap_writel(1, cpu_base + mmARC_ARC_RST);
++		regmap_writel(rst_addr, cpu_base + mmARC_RST_VEC_ADDR);
++		regmap_writel(0, cpu_base + mmARC_ARC_RST);
++	} else if (type == CPU_TYPE_MUC) {
++		regmap_writel(1, cpu_base + mmMUC_ARC_AUX_ARC_RST);
++		regmap_writel(rst_addr, cpu_base + mmMUC_ARC_AUX_RST_VEC_ADDR);
++		regmap_writel(0, cpu_base + mmMUC_ARC_AUX_ARC_RST);
++	}
++
++	return 0;
++}
++
++#define PSOC_CPU_RUN_MASK	0x1
++#define PSOC_CPU_HALT_MASK	0x2
++#define ARC_RST_ADDR_SHIFT	10
++#define ARC_RUN_HALT_TIMEOUT_US	100
++
++void fs1_run_arc_cpu(uint64_t base, int type)
++{
++	u32 cpu_base = fs1_get_arc_reg_offset(base);
++	u64 start;
++	bool ack;
++
++	if (type == CPU_TYPE_PSOC)
++		regmap_writel(PSOC_CPU_RUN_MASK, cpu_base + mmARC_RUN_HALT_REQ);
++	else if (type == CPU_TYPE_MUC)
++		regmap_writel(1, cpu_base + mmMUC_ARC_AUX_RUN_REQ);
++
++	start = timer_get_us();
++	while (1) {
++		if (type == CPU_TYPE_PSOC)
++			ack = !!(regmap_readl(cpu_base + mmARC_RUN_HALT_ACK) &
++				 ARC_RUN_HALT_ACK_RUN_ACK_M);
++		else if (type == CPU_TYPE_MUC)
++			ack = !!(regmap_readl(cpu_base + mmMUC_ARC_AUX_RUN_HALT_ACK) &
++				 MUC_ARC_AUX_RUN_HALT_ACK_RUN_ACK_M);
++
++		if (ack)
++			break;
++
++		if (timer_expired(start, ARC_RUN_HALT_TIMEOUT_US)) {
++			EMB_LOG_HEX_ERR("timeout waiting for arc run: ", cpu_base);
++			return;
++		}
++	}
++
++	if (type == CPU_TYPE_PSOC)
++		regmap_writel(0, cpu_base + mmARC_RUN_HALT_REQ);
++	else if (type == CPU_TYPE_MUC)
++		regmap_writel(0, cpu_base + mmMUC_ARC_AUX_RUN_REQ);
++}
++
++static bool hl_is_sim_mode_supported(void)
++{
++	u32 val;
++	int err;
++
++	err = preboot_fuse_read(IO_EFUSE_PALAD_CFG_0_OFFSET, &val);
++	if (err)
++		return false;
++
++	return (val & SIM_MODE);
++}
++
++bool is_fit_verify_supported(void)
++{
++	if (hl_is_sim_mode_supported())
++		return false;
++
++	return true;
++}
++
++enum fit_load_result fit_setup_copy_imgs_params_dev_spec(bool *fit_no_ret,
++							 struct fit_image *images, const void *fit,
++							 int node, u64 load,
++							 struct arc_status *arc_info,
++							 bool executable, int i)
++{
++	*fit_no_ret = false;
++
++	return FIT_LOAD_SUCCESS;
++}
++
++u64 get_mgmt_cpu_base(void)
++{
++	return get_64bit_addr_from_32bit_addr(IO0_H0_MNG_ARC(0));
++}
++
++void fit_arch_run_cpus(struct fit_image *image_arr, struct arc_status *cpu_arr)
++{
++	int i;
++	bool local_cpu_jump = false;
++	u64 local_jmp_addr;
++
++	for (i = 0; i < FIT_MAX_CPUS; i++) {
++		if (!cpu_arr[i].run)
++			continue;
++
++		/* In case of Arcmgmt, preboot will jump to arcmgmt after running all other CPUs */
++		if (get_mgmt_cpu_base() == cpu_arr[i].cpubase) {
++			local_cpu_jump = true;
++			local_jmp_addr = cpu_arr[i].startaddr;
++			continue;
++		}
++
++		EMB_LOG_HEX_INF("Run Non-ARC.MNG image for cpu: ", i);
++		fs1_run_arc_cpu(cpu_arr[i].cpubase, cpu_arr[i].cputype);
++	}
++
++	if (local_cpu_jump) {
++		EMB_LOG_INF("Run ARC.MNG image");
++		image_start(local_jmp_addr);
++	}
++}
+diff --git a/arch/jgs/onix.c b/arch/jgs/onix.c
+new file mode 100644
+index 0000000..a65fd6a
+--- /dev/null
++++ b/arch/jgs/onix.c
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
+diff --git a/arch/jgs/palad.c b/arch/jgs/palad.c
+new file mode 100644
+index 0000000..8b09d5f
+--- /dev/null
++++ b/arch/jgs/palad.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#include <parc_global_conf_regs.h>
++#include <parc_global_conf_masks.h>
++#include <arc_local_conf_regs.h>
++#include <arc_local_conf_masks.h>
++#include <farm_arc_aux_regs.h>
++#include <farm_arc_aux_masks.h>
++#include <muc_arc_aux_regs.h>
++#include <muc_arc_aux_masks.h>
++#include <arc_regs.h>
++#include <arc_masks.h>
++
++#ifdef __ZEPHYR__
++#include <preboot.h>
++#include <hl_device.h>
++#include <zephyr/drivers/misc/common/common_utils.h>
++#include <hl_platform_defs.h>
++#else
++#include <baremetal.h>
++#include <device.h>
++#include <bitops.h>
++#include <pll.h>
++#include <iopoll.h>
++#include <hl.h>
++#endif
++#include <stdbool.h>
++#include <stdint.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++#include <address_space.h>
++#include <emb_cmn_log.h>
++#include <common.h>
++#include <lib_common.h>
++
++#ifdef __ZEPHYR__
++#include <preboot.h>
++LOG_MODULE_REGISTER(fs1_emb_common_palad);
++#else
++#include <baremetal.h>
++#endif

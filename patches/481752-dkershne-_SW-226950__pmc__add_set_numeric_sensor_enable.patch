@@ -1,0 +1,278 @@
+From b9bd39355107c1bde57f58f389fe665db90bf4e5 Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Thu, 15 May 2025 21:34:36 +0300
+Subject: [PATCH] [SW-226950] pmc: add set numeric sensor enable
+
+Add the PLDM command SetNumericSensorEnable. Sensors can be
+manually set to ENABLED, DISABLED, or UNAVAILABLE. Sensor
+operational state is persisted across soft resets (oobi) as
+long as table is not full.
+
+Change-Id: I2a00fdaa7777ab76a59edf574a276aa0d5ed507f
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/include/sensord.h b/include/sensord.h
+index ff2db38..dda6568 100644
+--- a/include/sensord.h
++++ b/include/sensord.h
+@@ -131,10 +131,9 @@
+ 	uint32_t pdr_type_mask,
+ 	struct sensord_sensor_value *out);
+ 
+-int sensord_enable_set(
++int sensord_numeric_sensor_enable_set(
+ 	uint16_t sensor_id,
+-	uint32_t pdr_type_mask,
+-	bool enable);
++	pldm_sensor_op_state_t op_state);
+ 
+ int sensord_update_thresholds(
+ 	uint16_t sensor_id,
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index f2fb9c5..664e5ca 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -1293,6 +1293,42 @@
+ 	return 0;
+ }
+ 
++static int pldm_do_pmc_set_numeric_sensor_enable(
++	pldm_t pldm, void *arg, struct pldm_transport_msg *msg, k_timeout_t timeout)
++{
++	struct pldm_pmc_set_numeric_sensor_enable_req *req =
++		&msg->pldm.req.pmc_set_numeric_sensor_enable;
++	struct pldm_pmc_state *state = arg;
++	uint8_t err;
++
++	if (state->log_requests)
++		LOG_INF("PLDM:PMC:SetNumericEffecterEnable ID=%u op_state=0x%08x",
++			req->sensor_id,
++			req->sensor_operational_state);
++
++	if (req->sensor_event_message_enable)
++		return pldm_respond_error(pldm, msg, timeout,
++			PLDM_PMC_SET_NUMERIC_SENSOR_ENABLE_STATUS_EVENT_GEN_NOT_SUPPORTED);
++
++	err = sensord_numeric_sensor_enable_set(req->sensor_id, req->sensor_operational_state);
++	if (err)
++		return pldm_respond_error(pldm, msg, timeout, err);
++
++	err = pldm_resp_prepare(pldm, msg, 0);
++	if (err) {
++		LOG_ERR("%s: failed to prepare response: %d", __func__, err);
++		return err;
++	}
++
++	err = pldm_resp_send(pldm, msg, timeout);
++	if (err) {
++		LOG_ERR("%s: failed to send response: %d", __func__, err);
++		return err;
++	}
++
++	return 0;
++}
++
+ static const struct pldm_handler pldm_pmc_handlers[] = {
+ 	{ PLDM_CMD_PMC_GET_PDR_REPO_INFO,		pldm_do_pmc_get_pdr_repo_info},
+ 	{ PLDM_CMD_PMC_GET_PDR,				pldm_do_pmc_get_pdr},
+@@ -1307,6 +1343,7 @@
+ 	{ PLDM_CMD_PMC_SET_STATE_EFFECTER_ENABLES,	pldm_do_pmc_set_state_effecter_enables},
+ 	{ PLDM_CMD_PMC_SET_STATE_EFFECTER_STATES,	pldm_do_pmc_set_state_effecter_states},
+ 	{ PLDM_CMD_PMC_GET_STATE_EFFECTER_STATES,	pldm_do_pmc_get_state_effecter_states},
++	{ PLDM_CMD_PMC_SET_NUMERIC_SENSOR_ENABLE,	pldm_do_pmc_set_numeric_sensor_enable},
+ };
+ 
+ static struct pldm_handler_table pldm_pmc_handler_table = {
+diff --git a/src/sensord.c b/src/sensord.c
+index cd3998d..b65f806 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -10,6 +10,7 @@
+ #include <pldm.h>
+ #include <sensord.h>
+ #include <pldm_arch_common.h>
++#include <oobi.h>
+ 
+ #define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
+ #include <zephyr/logging/log.h>
+@@ -43,6 +44,8 @@
+ 	uint64_t timestamp_save;
+ 
+ 	size_t pause_counter;
++
++	struct hl_oobi_pldm_sensors oobi;
+ } sensord_state;
+ 
+ static sensord_before_read_callback_fn_t sensord_before_read_callback;
+@@ -665,6 +668,40 @@
+ 	}
+ }
+ 
++static uint8_t decode_oobi_op_state(uint8_t oobi_op_state)
++{
++	switch (oobi_op_state) {
++	case OOBI_SENSOR_OP_STATE_DISABLED:
++		return PLDM_SENSOR_OP_STATE_DISABLED;
++	case OOBI_SENSOR_OP_STATE_UNAVAILABLE:
++		return PLDM_SENSOR_OP_STATE_UNAVAILABLE;
++	default:
++		return PLDM_SENSOR_OP_STATE_ENABLED;
++	}
++}
++
++static void sensord_oobi_load_numeric_sensor_enable(void)
++{
++	struct hl_oobi_pldm_numeric_sensor_op_state *sensors;
++
++	sensors = sensord_state.oobi.numeric_op_state;
++
++	for (size_t i = 0; i < ARRAY_SIZE(sensord_state.oobi.numeric_op_state); i++) {
++		if (sensors[i].sensor_id == 0)
++			continue;
++
++		sensord_numeric_sensor_enable_set(sensors[i].sensor_id,
++			decode_oobi_op_state(sensors[i].sensor_op_state));
++	}
++}
++
++static void sensord_oobi_load(void)
++{
++	hl_oobi_pldm_sensor_restore_data(&sensord_state.oobi);
++
++	sensord_oobi_load_numeric_sensor_enable();
++}
++
+ static int sensord_init_all_sensors(void)
+ {
+ 	uint8_t current_platform = pldm_get_current_platform();
+@@ -704,6 +741,8 @@
+ 			return -EINVAL;
+ 		}
+ 	}
++
++	sensord_oobi_load();
+ 
+ 	return 0;
+ }
+@@ -812,58 +851,90 @@
+ 	return err;
+ }
+ 
+-/* FIXME: this function is not used ... delete? */
+-int sensord_enable_set(
++static void sensord_persist_numeric_sensor_enable(
++	struct hl_oobi_pldm_sensors *oobi, uint16_t sensor_id,
++	pldm_sensor_op_state_t operational_state)
++{
++	struct hl_oobi_pldm_numeric_sensor_op_state *item = NULL;
++	struct hl_oobi_pldm_numeric_sensor_op_state *empty = NULL;
++
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->numeric_op_state); i++) {
++		if (oobi->numeric_op_state[i].sensor_id == sensor_id) {
++			item = &oobi->numeric_op_state[i];
++			break;
++		}
++		if (!empty && oobi->numeric_op_state[i].sensor_id == 0)
++			empty = &oobi->numeric_op_state[i];
++	}
++	if (!item)
++		item = empty;
++
++	if (!item) {
++		if (operational_state != PLDM_SENSOR_OP_STATE_ENABLED)
++			LOG_WRN("%s: Unable to persist sensor enable  %d: table_full",
++				__func__, sensor_id);
++		return;
++	}
++
++	switch (operational_state) {
++	case PLDM_SENSOR_OP_STATE_DISABLED:
++		item->sensor_id = sensor_id;
++		item->sensor_op_state = OOBI_SENSOR_OP_STATE_DISABLED;
++		break;
++	case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
++		item->sensor_id = sensor_id;
++		item->sensor_op_state = OOBI_SENSOR_OP_STATE_UNAVAILABLE;
++		break;
++	default:
++		/* Other op states are ignored, just delete entry */
++		item->sensor_id = 0;
++		break;
++	}
++
++	hl_oobi_pldm_sensor_persist_data(oobi);
++}
++
++int sensord_numeric_sensor_enable_set(
+ 	uint16_t sensor_id,
+-	uint32_t pdr_type_mask,
+-	bool enable)
++	pldm_sensor_op_state_t desired_op_state)
+ {
+ 	struct sensord_sensor_entry *sensor;
+ 	struct sensord_sensor_state *state;
+ 	k_spinlock_key_t key;
++	pldm_sensor_op_state_t current_op_state;
+ 
+-	sensor = find_sensor(sensor_id, pdr_type_mask);
++	if (desired_op_state > PLDM_SENSOR_OP_STATE_UNAVAILABLE)
++		return PLDM_PMC_SET_NUMERIC_SENSOR_ENABLE_STATUS_INVALID_OP_STATE;
++
++	sensor = find_sensor(sensor_id, NUMERIC_SENSOR_TYPE_MASK);
+ 	if (!sensor)
+-		return -ENODEV;
++		return PLDM_PMC_SET_NUMERIC_SENSOR_ENABLE_STATUS_INVALID_SENSOR_ID;
+ 
+ 	state = sensor->state;
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+-	/* FIXME: assumes numeric sensor; add support for state sensors? */
+-	switch ((pldm_sensor_op_state_t) state->value.single.operational_state) {
+-	case PLDM_SENSOR_OP_STATE_DISABLED:
+-		if (enable) {
+-			state->value.single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+-			state->value.single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+-			state->value.single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+-			state->value.single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++	current_op_state = (pldm_sensor_op_state_t)state->value.single.operational_state;
+ 
++	if (current_op_state != desired_op_state) {
++		state->value.single.operational_state = desired_op_state;
++		state->value.single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++		state->value.single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++		state->value.single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++
++		if (desired_op_state == PLDM_SENSOR_OP_STATE_ENABLED) {
+ 			state->polled = false; /* reset poll-once tracking */
+ 
+ 			/* trigger daemon poll immediately after enabling a sensor */
+ 			state->timestamp_next_poll = 0;
+ 			sensord_state.timestamp_next_poll = 0;
+ 		}
+-		break;
+-	case PLDM_SENSOR_OP_STATE_ENABLED:
+-	case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
+-	case PLDM_SENSOR_OP_STATE_UNKNOWN:
+-	case PLDM_SENSOR_OP_STATE_FAILED:
+-	case PLDM_SENSOR_OP_STATE_INITIALIZING:
+-	case PLDM_SENSOR_OP_STATE_SHUTTING_DOWN:
+-	case PLDM_SENSOR_OP_STATE_IN_TEST:
+-		if (!enable) {
+-			state->value.single.operational_state = PLDM_SENSOR_OP_STATE_DISABLED;
+-			state->value.single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+-			state->value.single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+-			state->value.single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+-		}
+-		break;
+ 	}
+ 
+ 	k_spin_unlock(&sensord_state.lock, key);
+ 
+-	return 0;
++	sensord_persist_numeric_sensor_enable(&sensord_state.oobi, sensor_id, desired_op_state);
++
++	return MCTP_STATUS_SUCCESS;
+ }
+ 
+ static int update_if_enabled_u8(

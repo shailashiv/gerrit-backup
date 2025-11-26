@@ -1,0 +1,408 @@
+From 461d103cacea583ff731a082488e0f26d16801f2 Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Thu, 29 May 2025 09:13:44 -0400
+Subject: [PATCH] [SW-230673] pdr: deprecate utf16 aux names
+
+All firmwares have been migrated to use ASCII aux names.
+Support for UTF16 can be deprecated and removed.
+
+Change-Id: I0f5483cb918690e8be733913377626e96947f168
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/include/pldm_base.h b/include/pldm_base.h
+index 9c14ffd..e8e4641 100644
+--- a/include/pldm_base.h
++++ b/include/pldm_base.h
+@@ -1511,14 +1511,7 @@
+ struct pldm_pdr_oem_state_set_simple_element {
+ 	uint8_t min_value;
+ 	uint8_t max_value;
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ 	const char *name;
+-#else
+-	uint8_t name_string_count; /* limited to at most 1 */
+-	/* simplification => only permit at most 1 string */
+-	const char *name_language_tag; /* ISO646 (ASCII) */
+-	const uint16_t *name; /* UTF-16BE */
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+ } __packed;
+ 
+ struct pldm_pdr_oem_state_set {
+@@ -1532,15 +1525,6 @@
+ 	struct pldm_pdr_oem_state_set_simple_element values[PLDM_PDR_MAX_STATE_SET_VALUES];
+ } __packed;
+ 
+-#if !CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+-struct pldm_pdr_utf_strings {
+-	uint8_t name_string_count; /* limited to at most 1 */
+-	/* simplification => only permit at most 1 tag+name pair */
+-	const char *name_language_tag; /* ISO646 (ASCII) */
+-	const uint16_t *name; /* UTF-16BE */
+-} __packed;
+-#endif
+-
+ /* Used for both sensor and effecter aux names PDRs.
+  * Simplified to only support 1x pair of tag+name strings per sensor/effecter.
+  */
+@@ -1549,11 +1533,7 @@
+ 	uint16_t terminus_handle;
+ 	uint16_t id;
+ 	uint8_t count;
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ 	const char *names[PLDM_PDR_MAX_COMPOSITE_SENSORS];
+-#else
+-	struct pldm_pdr_utf_strings names[PLDM_PDR_MAX_COMPOSITE_SENSORS];
+-#endif
+ } __packed;
+ 
+ /* Used for entity aux names PDRs.
+@@ -1565,11 +1545,7 @@
+ 	uint16_t entity_instance;
+ 	uint16_t entity_container_id;
+ 	uint8_t shared_name_count;
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ 	const char *name;
+-#else
+-	struct pldm_pdr_utf_strings name;
+-#endif
+ } __packed;
+ 
+ struct pldm_pdr_oem_unit {
+@@ -1578,11 +1554,7 @@
+ 	uint8_t oem_unit_handle;
+ 	uint32_t iana;
+ 	uint8_t oem_unit_id;
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ 	const char *name;
+-#else
+-	struct pldm_pdr_utf_strings name;
+-#endif
+ } __packed;
+ 
+ struct pldm_pdr_numeric_effecter {
+diff --git a/scripts/g3-gen-pdrs.py b/scripts/g3-gen-pdrs.py
+index 4793a97..a442267 100755
+--- a/scripts/g3-gen-pdrs.py
++++ b/scripts/g3-gen-pdrs.py
+@@ -227,25 +227,12 @@
+ 			.id = PLDM_SID_{sid},
+ 			.count = {pdr.count},
+ 			.names = {{
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ ''')
+-			# New format - array of char*
++			# array of char*
+ 			for name in pdr.names:
+ 				variable = variable_from_name(name)
+ 				output.write(f'				{variable},\n')
+-			output.write("#else /* old aux name format */\n")
+-			# old format, array of name structs
+-			for name in pdr.names:
+-				variable = variable_from_name(name)
+-				output.write(f'''\
+-				{{
+-					.name_string_count = 1,
+-					.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
+-					.name = {variable},
+-				}},
+-''')
+ 			output.write(f'''\
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+ 			}},
+ 		}},
+ 	}},
+@@ -336,6 +323,7 @@
+ 			.entity_instance_number_base	= 1,
+ 		}},
+ ''')
++			variable = variable_from_name(pdr.aux_name)
+ 			output.write(f'''\
+ 		.entity_aux_names = {{
+ 			.header = {{
+@@ -349,21 +337,7 @@
+ 			.entity_instance = {pdr.entityInstance},
+ 			.entity_container_id = {pdr.entityContainer},
+ 			.shared_name_count = {pdr.sharedCount},
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+-''')
+-			# New format - array of char*
+-			variable = variable_from_name(pdr.aux_name)
+-			output.write(f'			.name = {variable},\n')
+-			output.write("#else /* old aux name format */\n")
+-			# old format, array of name structs
+-			variable = variable_from_name(pdr.aux_name)
+-			output.write(f'''\
+-			.name = {{
+-				.name_string_count = 1,
+-				.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
+-				.name = {variable},
+-			}},
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
++			.name = {variable},
+ 		}},
+ 	}},
+ ''')
+@@ -495,10 +469,6 @@
+ 				{{
+ 					.min_value = {value.min},
+ 					.max_value = {value.max},
+-#if !CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+-					.name_string_count = 1,
+-					.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+ 					.name = {variable},
+ 				}},
+ ''')
+@@ -598,15 +568,7 @@
+ 			.oem_unit_handle = {pdr.id},
+ 			.iana = INTEL_IANA,
+ 			.oem_unit_id = {pdr.id},
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ 			.name = {variable},
+-#else
+-			.name = {{
+-				.name_string_count = 1,
+-				.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
+-				.name = {variable},
+-			}},
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+ 		}},
+ 	}},
+ ''')
+@@ -810,7 +772,6 @@
+ 
+ def generate_name_string_variables(title, name_string_map, output):
+ 	output.write(f"/**** {title} ****/\n\n")
+-	output.write("#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES\n\n")
+ 	for pdr_name, name_strings in name_string_map.items():
+ 		output.write(f"/* {pdr_name} */\n")
+ 		for name in name_strings:
+@@ -820,28 +781,6 @@
+ 			else:
+ 				output.write(f"#define {variable} \"{name}\"\n")
+ 				NEW_USED_NAMES.add(variable)
+-	output.write("\n#else /* old aux name format */\n\n")
+-	for pdr_name, name_strings in name_string_map.items():
+-		output.write(f"/* {pdr_name} */\n")
+-		for name in name_strings:
+-			utf_name = name.encode("utf-16")
+-			utf_name = utf_name.hex(' ', 2)              # convert to 2-byte hex, with space between each entry
+-			utf_name = utf_name.split()[1:] + ['0000']   # split by spaces, drop the 'byte order mark', add NULL
+-			utf_name = map(lambda x: "0x" + x, utf_name) # Prefix with '0x'
+-			u16_chars = list(utf_name)
+-
+-			variable = variable_from_name(name)
+-			if variable in OLD_USED_NAMES:
+-				output.write(f"/* already defined: {variable} */\n")
+-			else:
+-				OLD_USED_NAMES.add(variable)
+-				formatted = ',\n'.join(['\t' + ', '.join(chunk) for chunk in gen_chunks(u16_chars)])
+-				output.write(f'''\
+-const uint16_t {variable}[] OFFLOAD_AUX_NAMES_ATTR = {{
+-{formatted}
+-}};
+-''')
+-	output.write("\n#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */\n\n")
+ 
+ #-------------------------------------------------------------------------------
+ def command_pdrs(args):
+diff --git a/src/encode.c b/src/encode.c
+index 87ad315..86d1783 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -126,8 +126,6 @@
+ 	return encode_buffer_append_ascii_str(buffer, str, max_count);
+ }
+ 
+-#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+-
+ static bool generate_utf_string(
+ 	struct encode_buffer *buffer,
+ 	const char *value,
+@@ -227,185 +225,6 @@
+ 
+ 	return true;
+ }
+-
+-#else /* ! CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+-
+-/* Append UTF16 string to the buffer, including the null character (0x0000).
+- * 'max_count' is the array size (not byte size) indicating max possible length
+- * of the string.  It is used to verify 'str' is null terminated.
+- */
+-static bool encode_buffer_append_utf16_str(
+-	struct encode_buffer *buffer,
+-	const uint16_t *str,
+-	size_t max_count)
+-{
+-	size_t count = 0;
+-
+-	/* count number of non-null characters */
+-	while (count < max_count && str[count])
+-		++count;
+-
+-	if (count >= max_count) {
+-		LOG_ERR("%s: string too long: len=%u max=%u",
+-			__func__, count, max_count);
+-		return false;
+-	}
+-
+-	count += 1; /* include the null byte */
+-	return encode_buffer_append(buffer, str, count * sizeof(str[0]));
+-}
+-
+-/* Append a language tag and unicode string. */
+-static bool encode_unicode_str(
+-	struct encode_buffer *buffer,
+-	const char *lang_tag,
+-	const uint16_t *str,
+-	const char *suffix)
+-{
+-	if (!encode_buffer_append_ascii_str(buffer, lang_tag, PLDM_PDR_LANGUAGE_TAG_LEN + 1))
+-		return false;
+-
+-	if (!encode_buffer_append_utf16_str(buffer, str, PLDM_PDR_SENSOR_NAME_LEN + 1))
+-		return false;
+-
+-	if (suffix) {
+-		/* Concatenate the suffix by first erasing existing NULL */
+-		if (buffer->consumed >= sizeof(uint16_t))
+-			buffer->consumed -= sizeof(uint16_t);
+-
+-		/* Convert the suffix string to UTF16 and append to current buffer */
+-		for (size_t i = 0; suffix[i]; ++i) {
+-			if (!encode_buffer_append_uint16(buffer, ((uint16_t)suffix[i]) << 8))
+-				return false;
+-		}
+-
+-		/* Must be null terminated */
+-		if (!encode_buffer_append_uint16(buffer, 0x0000))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+-/* Append a list of language tags and unicode strings.  */
+-static bool encode_unicode_strings(
+-	struct encode_buffer *buffer,
+-	const char * const *lang_tags,
+-	const uint16_t * const *strings,
+-	uint8_t count,
+-	const char *suffix)
+-{
+-	/* Current implementation only supports one string per element.
+-	 * To support multiple strings, element definition would need
+-	 * to include an array of pointers to strings for language
+-	 * and name.
+-	 */
+-	if (count != 1) {
+-		LOG_ERR("%s: invalid string count: %u", __func__, count);
+-		return false;
+-	}
+-
+-	/* always need to write count (even if 0) */
+-	if (!encode_buffer_append_uint8(buffer, count))
+-		return false;
+-
+-	for (size_t i = 0; i < count; i++) {
+-		if (!encode_unicode_str(buffer, lang_tags[i], strings[i], suffix))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+-static bool encode_utf_strings(
+-	struct encode_buffer *buffer,
+-	const struct pldm_pdr_utf_strings *string,
+-	const char *suffix)
+-{
+-	if (!encode_unicode_strings(buffer, &string->name_language_tag, &string->name,
+-	    string->name_string_count, suffix))
+-		return false;
+-
+-	return true;
+-}
+-
+-static bool encode_utf_strings_array(
+-	struct encode_buffer *buffer,
+-	const struct pldm_pdr_utf_strings *strings,
+-	uint8_t num_strings,
+-	const char *suffix)
+-{
+-	for (uint8_t i = 0; i < num_strings; ++i) {
+-		if (!encode_utf_strings(buffer, &strings[i], suffix))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+-static bool encode_entity_aux_names(
+-	struct encode_buffer *buffer,
+-	const struct pldm_pdr_entity_aux_names_simple *pdr)
+-{
+-	size_t offset = offsetof(struct pldm_pdr_entity_aux_names_simple, name);
+-
+-	/* encode const-sized data, followed by variable-sized data */
+-	return encode_buffer_append(buffer, pdr, offset) &&
+-		encode_utf_strings(buffer, &pdr->name, NULL);
+-}
+-
+-static bool encode_oem_unit(
+-	struct encode_buffer *buffer,
+-	const struct pldm_pdr_oem_unit *pdr)
+-{
+-	size_t offset = offsetof(struct pldm_pdr_oem_unit, name);
+-
+-	/* encode const-sized data, followed by variable-sized data */
+-	return encode_buffer_append(buffer, pdr, offset) &&
+-		encode_utf_strings(buffer, &pdr->name, NULL);
+-}
+-
+-static bool encode_oem_state_set_records(
+-	struct encode_buffer *buffer,
+-	const struct pldm_pdr_oem_state_set_simple_element *elements,
+-	uint8_t num_states)
+-{
+-	for (uint8_t i = 0; i < num_states; ++i) {
+-		const struct pldm_pdr_oem_state_set_simple_element *element = elements + i;
+-
+-		/* This implementation uses "simple" oem state set elements, where:
+-		 *  - For each value, the number of tag+name pairs is limited to at most 1.
+-		 *  - All values with names are grouped contiguously, starting at index 0.
+-		 *
+-		 * Hence, any count other than 1 indicates a bug in the static PDR definition.
+-		 */
+-		if (element->name_string_count != 1) {
+-			LOG_ERR("%s: invalid oem state set value count: %u",
+-				__func__, element->name_string_count);
+-			return false;
+-		}
+-
+-		if (element->min_value > element->max_value) {
+-			LOG_ERR("%s: invalid oem state set min/max value: %u, %u",
+-				__func__, element->min_value, element->max_value);
+-			return false;
+-		}
+-
+-		if (!encode_buffer_append_uint8(buffer, element->min_value))
+-			return false;
+-
+-		if (!encode_buffer_append_uint8(buffer, element->max_value))
+-			return false;
+-
+-		if (!encode_unicode_strings(buffer, &element->name_language_tag, &element->name,
+-			element->name_string_count, NULL))
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+ 
+ static bool encode_aux_names(
+ 	struct encode_buffer *buffer,

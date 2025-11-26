@@ -1,0 +1,94 @@
+From 4d832f19b9565eb43e723aa970ee93bb495b6de6 Mon Sep 17 00:00:00 2001
+From: Yaniv Levinsky <ylevinsky@habana.ai>
+Date: Thu, 22 May 2025 15:38:59 +0300
+Subject: [PATCH] [SW-224425] common: suppress events close to init
+
+We should allow time for the regulation threads to stabilize before
+sending power and thermal events.
+
+For some reason, early events are causing SRAM Repair RMA errors in
+Gaudi2 when cycling LKD load and unload for hundreds of times.
+
+While this patch isn't addressing the inherent issue of early events
+triggering the SRAM Repair RMA errors, it does help to avoid the issue
+without any unintended side effects. The suppression of events in the
+first 1 second after init is actually a good idea regardless. Moreover,
+before [PNP-194] these early events were suppressed unintentionally.
+
+Add a condition to suppress events in the first 1 second after init.
+
+Change-Id: Ib9467c13b554786b3255302c9bb745003c610d4e
+Signed-off-by: Yaniv Levinsky <ylevinsky@habana.ai>
+---
+
+diff --git a/app/io/pid.c b/app/io/pid.c
+index 28a24c7..c5191cb 100644
+--- a/app/io/pid.c
++++ b/app/io/pid.c
+@@ -261,6 +261,7 @@
+ 
+ 	hl_set_first_init(true);
+ 	platdata.state = PID_RUN;
++	platdata.run_state_ts = k_uptime_get();
+ 
+ 	/* Update throttle timestamp before starting PID loop */
+ 	platdata.event.power_timestamp = platdata.event.thermal_timestamp = k_cycle_get_32();
+@@ -302,8 +303,11 @@
+ 		}
+ 
+ 		if (platdata.using_threads) {
+-			send_power_events(&platdata);
+-			send_thermal_events(&platdata);
++			/* Send power and thermal events only after regulation got stable */
++			if (k_uptime_get() - platdata.run_state_ts > PID_EVENTS_SUPPRESSION_MS) {
++				send_power_events(&platdata);
++				send_thermal_events(&platdata);
++			}
+ 			read_pid_cfg_reg(&platdata);
+ 			update_threads_status(&platdata);
+ 			update_thread_freq(platdata.threads[MAIN_THREAD_INDEX]);
+diff --git a/arch/gaudi2/mailbox.c b/arch/gaudi2/mailbox.c
+index 8d9ed35..a6b06f1 100644
+--- a/arch/gaudi2/mailbox.c
++++ b/arch/gaudi2/mailbox.c
+@@ -329,6 +329,8 @@
+ 	if (new_request == true) {
+ 		mbx_read_new_state_val(mbx, platdata->state);
+ 		process_state_change_req(platdata);
++		if (platdata->state == PID_RUN)
++			platdata->run_state_ts = k_uptime_get();
+ 		/* Clear new_request and respond */
+ 		mbx_write_new_state_req(mbx, false);
+ 		process_response(platdata, MBX_STATUS_SUCCESS);
+diff --git a/arch/gaudi3/common.c b/arch/gaudi3/common.c
+index 377e6eb..fd8dfc4 100644
+--- a/arch/gaudi3/common.c
++++ b/arch/gaudi3/common.c
+@@ -861,6 +861,7 @@
+ 	case HL_MBX_MSG_START_OPS:
+ 		platdata->state = PID_RUN;
+ 		process_state_change_req(platdata);
++		platdata->run_state_ts = k_uptime_get();
+ 		break;
+ 	case HL_MBX_MSG_STOP_OPS:
+ 		platdata->state = PID_STOP;
+diff --git a/include/app/io/pid.h b/include/app/io/pid.h
+index fd27e01..4057995 100644
+--- a/include/app/io/pid.h
++++ b/include/app/io/pid.h
+@@ -34,6 +34,7 @@
+ #define PID_MAX_TIMEOUT_MULTIPLIER	10
+ #define PID_GAIN_DENOMINATOR		1000
+ #define PID_COUNTER_MAX			(0xFFFFFFFF - 1)
++#define PID_EVENTS_SUPPRESSION_MS	1000
+ 
+ enum pid_threads_index {
+ 	MAIN_THREAD_INDEX,
+@@ -538,6 +539,7 @@
+ 	uint16_t num_pll;
+ 	uint16_t num_rl;
+ 	enum pid_state state;
++	int64_t run_state_ts;
+ 	uint16_t num_threads;
+ 	bool using_threads;
+ 	struct pid_thread *threads[PID_NUM_THREADS];

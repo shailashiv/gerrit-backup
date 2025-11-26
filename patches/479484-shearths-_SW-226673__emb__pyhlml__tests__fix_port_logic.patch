@@ -1,0 +1,108 @@
+From e853ab168814738922c219b9388ff084d1b2cbf4 Mon Sep 17 00:00:00 2001
+From: Sarai <shearthstone@habana.ai>
+Date: Sun, 11 May 2025 18:33:02 +0300
+Subject: [PATCH] [SW-226673] emb: pyhlml: tests: fix port logic
+
+The "port" arg in hlml expects infiniband numbering (sequential index),
+while hl-smi, which was previously used in test to get the list,
+provides non-sequential. Implement logic to map the ports to their
+index and use it instead of hl-smi.
+
+Change-Id: Icd3aebfe113285ceda92abf33e5ed6d8de58f5c9
+Signed-off-by: Sarai <shearthstone@habana.ai>
+---
+
+diff --git a/pyhlml/tests/unittest_pyhlml_attributes.py b/pyhlml/tests/unittest_pyhlml_attributes.py
+index 88cba90..3daa5c3 100644
+--- a/pyhlml/tests/unittest_pyhlml_attributes.py
++++ b/pyhlml/tests/unittest_pyhlml_attributes.py
+@@ -22,24 +22,59 @@
+ 
+     return wrapper
+ 
++def get_port_index_map(mask):
++    """
++    Given a 64-bit integer mask, returns a dictionary mapping each set bit (port number)
++    to its corresponding sequential index.
++
++    Each bit in the mask represents a port: if the bit is set (1), the port is considered active.
++    The ports are numbered from 0 (least significant bit) to 63 (most significant bit).
++    The index reflects the order in which set bits are encountered from LSB to MSB.
++
++    Parameters:
++        mask (int): A 64-bit integer bitmask representing active ports.
++
++    Returns:
++        dict: A dictionary where keys are port numbers (bit positions with value 1),
++              and values are their corresponding sequential indices.
++
++    Example:
++        >>> get_port_index_map(0b10000010010)
++        {1: 0, 4: 1, 10: 2}
++    """
++    port_index_map = {}
++    index = 0
++    bit_pos = 0
++
++    while mask:
++        if mask & 1:
++            port_index_map[bit_pos] = index
++            index += 1
++        mask >>= 1
++        bit_pos += 1
++
++    return port_index_map
++
+ @decorate_test_methods(ignore_not_supported)
+ class TestPyHLML_Attributes(unittest.TestCase):
+     def setUp(self):
+         pyhlml.hlmlInit()
+         self.not_supported_exception = pyhlml.hlml_error.HLMLError_NotSupported
+         self.device = pyhlml.hlmlDeviceGetHandleByIndex(0)
+-
+-        get_nic_ports_command = \
+-            """hl-smi --nic link -i $(lspci -d 1da3: | cut -f 1 -d ' ') | awk '{print $2}' | cut -f 1 -d ':' """
+-
+-        with os.popen(get_nic_ports_command) as proc:
+-            ports_output = proc.readlines()
+-
+         self.skip_nic = False
+-        try:
+-            self.nic_ports = [int(port.strip()) for port in ports_output]
+-        except:
++
++        mac_addr_info = pyhlml.hlmlDeviceGetMacAddrInfo(self.device)
++
++        # The mac addr info is two tuples (mask and ext_mask) of two ints each,
++        # but only the first is actually used (second is not implemented)
++        ports_mask = mac_addr_info[0][0]
++
++        if not ports_mask:
++            print("WARNING: No ports are set! Will not run any tests on them")
+             self.skip_nic = True
++
++        # Port number (key) is used by hl-smi, while index number (value) is used by infiniband
++        self.nic_ports = get_port_index_map(ports_mask)
+ 
+ 
+     def tearDown(self):
+@@ -53,16 +88,16 @@
+         if self.skip_nic:
+             print("skipping nic tests after failure in getting nic ports")
+             return
+-        nic_links = {i: pyhlml.hlmlDeviceNicGetLink(self.device, i) for i in self.nic_ports}
++        nic_links = {i: pyhlml.hlmlDeviceNicGetLink(self.device, i) for i in self.nic_ports.values()}
+         pprint.pprint(f"nic_links={nic_links}")
+ 
+     def test_nic_get_statistics(self):
+         if self.skip_nic:
+             print("skipping nic tests after failure in getting nic ports")
+             return
+-        nic_stats = {i: pyhlml.hlmlDeviceNicGetStatistics(self.device, i) for i in self.nic_ports}
++        nic_stats = {i: pyhlml.hlmlDeviceNicGetStatistics(self.device, i) for i in self.nic_ports.values()}
+         print(f"nic_stats=")
+-        for port in self.nic_ports:
++        for port in self.nic_ports.values():
+             print(f"\tport {port}:")
+             num_of_counters_out = nic_stats[port].num_of_counters_out[0]
+             str_buf = list(filter(None, nic_stats[port].str_buf[:num_of_counters_out].split(b'\x00')))

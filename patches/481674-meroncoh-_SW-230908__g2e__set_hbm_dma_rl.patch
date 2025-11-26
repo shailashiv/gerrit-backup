@@ -1,0 +1,114 @@
+From ec0f4ec094757cb5d3e9ed6fd7ec9a513991ee5d Mon Sep 17 00:00:00 2001
+From: Meron Cohen <mecohen@habana.ai>
+Date: Wed, 11 Jun 2025 15:27:02 +0300
+Subject: [PATCH] [SW-230908] g2e: set hbm dma rl
+
+For G2E we have to limit the HBM DMA BW to 1400 GB/s.
+For that we need to fine-tune the max_rate parameter
+(provided by PID application), of the RL driver.
+
+Change-Id: I24134abeca558e62e85ba0a9e65e631089124e20
+Signed-off-by: Meron Cohen <mecohen@habana.ai>
+---
+
+diff --git a/drivers/clock_control/clock_control_hl_rl_v2.c b/drivers/clock_control/clock_control_hl_rl_v2.c
+index 6c48874..9dc962b 100644
+--- a/drivers/clock_control/clock_control_hl_rl_v2.c
++++ b/drivers/clock_control/clock_control_hl_rl_v2.c
+@@ -674,6 +674,8 @@
+ 		data->max_timeout = config->max_timeout_bis;
+ 		data->max_rate = config->max_rate_bis;
+ 		data->max_reset_val = config->max_reset_val_bis;
++		if (is_bis_e_compliant_device())
++			data->max_rate = config->max_rate_bis_e;
+ 	} else {
+ 		data->max_sat = config->max_sat;
+ 		data->max_timeout = config->max_timeout;
+@@ -716,9 +718,14 @@
+ #define DEV_INIT_LEVEL PRE_KERNEL_1
+ #endif
+ 
+-/* If a property for bis compliance exists use it. otherwise use the normal property */
++/*
++ * If a property for bis compliance e exists, use it.
++ * Otherwise, of a property for bis compliance exists, use it.
++ * Otherwise use the normal property.
++ */
+ #define DT_INST_PROP_BIS(inst, prop) \
+-	DT_INST_PROP_OR(inst, prop##_bis, DT_INST_PROP(inst, prop))
++	DT_INST_PROP_OR(inst, prop##_bis_e, DT_INST_PROP_OR(inst, prop##_bis,	\
++		DT_INST_PROP(inst, prop)))
+ 
+ #define CREATE_HL_RL_DEVICE(inst)						\
+ 	const uint32_t regs_##inst##_base[] = { DT_FOREACH_PROP_ELEM(		\
+@@ -734,6 +741,7 @@
+ 		.max_timeout_bis = DT_INST_PROP_BIS(inst, max_timeout),		\
+ 		.max_rate = DT_INST_PROP(inst, max_rate),			\
+ 		.max_rate_bis = DT_INST_PROP_BIS(inst, max_rate),		\
++		.max_rate_bis_e = DT_INST_PROP_BIS(inst, max_rate),		\
+ 		.max_reset_val = DT_INST_PROP_OR(inst, max_reset_val,		\
+ 			DT_INST_PROP(inst, max_timeout) + 1),			\
+ 		.max_reset_val_bis = DT_INST_PROP_OR(inst, max_reset_val_bis,	\
+diff --git a/dts/arc/hl_gaudi2_pid.dtsi b/dts/arc/hl_gaudi2_pid.dtsi
+index e71dfc3..f19d2ea 100644
+--- a/dts/arc/hl_gaudi2_pid.dtsi
++++ b/dts/arc/hl_gaudi2_pid.dtsi
+@@ -761,6 +761,7 @@
+ 		max_sat = <4>;
+ 		max_timeout = <15>;
+ 		max_rate = <94>;
++		max_rate_bis_e = <79>;
+ 		block_type = "mstr_if";
+ 		node_label = "EDMA_RL_DCORE0";
+ 	};
+@@ -772,6 +773,7 @@
+ 		max_sat = <4>;
+ 		max_timeout = <15>;
+ 		max_rate = <94>;
++		max_rate_bis_e = <79>;
+ 		block_type = "mstr_if";
+ 		node_label = "EDMA_RL_DCORE1";
+ 	};
+@@ -783,6 +785,7 @@
+ 		max_sat = <4>;
+ 		max_timeout = <15>;
+ 		max_rate = <94>;
++		max_rate_bis_e = <79>;
+ 		block_type = "mstr_if";
+ 		node_label = "EDMA_RL_DCORE2";
+ 	};
+@@ -794,6 +797,7 @@
+ 		max_sat = <4>;
+ 		max_timeout = <15>;
+ 		max_rate = <94>;
++		max_rate_bis_e = <79>;
+ 		block_type = "mstr_if";
+ 		node_label = "EDMA_RL_DCORE3";
+ 	};
+diff --git a/dts/bindings/clock/hl,rl.yaml b/dts/bindings/clock/hl,rl.yaml
+index 6e4a4fc..f05e470 100644
+--- a/dts/bindings/clock/hl,rl.yaml
++++ b/dts/bindings/clock/hl,rl.yaml
+@@ -44,6 +44,10 @@
+       type: int
+       required: false
+       description: max allowed bandwidth for the rl block under bis compliance
++    max_rate_bis_e:
++      type: int
++      required: false
++      description: max allowed bandwidth for the rl block under bis compliance e
+     max_reset_val:
+       type: int
+       required: false
+diff --git a/include/zephyr/drivers/clock_control/hl_rl.h b/include/zephyr/drivers/clock_control/hl_rl.h
+index a340c0c..7ef5f1b 100644
+--- a/include/zephyr/drivers/clock_control/hl_rl.h
++++ b/include/zephyr/drivers/clock_control/hl_rl.h
+@@ -63,6 +63,7 @@
+ 	uint8_t *block_type;
+ 	uint8_t max_rate;
+ 	uint8_t max_rate_bis;
++	uint8_t max_rate_bis_e;
+ 	uint8_t max_reset_val;
+ 	uint8_t max_reset_val_bis;
+ 	uint8_t dup_grp_id;

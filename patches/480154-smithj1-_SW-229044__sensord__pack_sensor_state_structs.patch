@@ -1,0 +1,273 @@
+From 341be8d5a93f47014816c1d061fd47836493c510 Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Sun, 18 May 2025 09:21:29 -0400
+Subject: [PATCH] [SW-229044] sensord: pack sensor state structs
+
+Reduce memory footprint by using uint8_t instead of raw enum values
+and marking structs as packed.  Switch statements updated to cast
+from integer to enum as appropriate.
+
+This change saves 34 bytes of state per sensor. This directly
+impacts preboot and the agents, as those apps use a static buffer
+for sensor state.  Mgmt allocates sensor state out of the HBM
+memory pool.
+
+Change-Id: Ie7f807652a1ab1f5f0bbf6a264a9fc79940b84d7
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/include/sensord.h b/include/sensord.h
+index 37166b5..53211b4 100644
+--- a/include/sensord.h
++++ b/include/sensord.h
+@@ -11,33 +11,33 @@
+ #include <pldm_base.h>
+ 
+ struct sensord_sensor_value_single {
+-	pldm_sensor_op_state_t operational_state;
+-	pldm_data_size_t data_size;
+-	pldm_sensor_threshold_t present_state;
+-	pldm_sensor_threshold_t previous_state;
+-	pldm_sensor_threshold_t event_state;
+ 	uint32_t present_reading;
+ 	struct pldm_pmc_threshold_data threshold_values;
+-};
++	uint8_t operational_state;	/* pldm_sensor_op_state_t */
++	uint8_t data_size;		/* pldm_data_size_t */
++	uint8_t present_state;		/* pldm_sensor_threshold_t */
++	uint8_t previous_state;		/* pldm_sensor_threshold_t */
++	uint8_t event_state;		/* pldm_sensor_threshold_t */
++} __packed;
+ 
+ struct sensord_sensor_value_composite_element {
+-	pldm_sensor_op_state_t operational_state;
++	uint8_t operational_state;	/* pldm_sensor_op_state_t */
+ 	uint8_t present_state;
+ 	uint8_t previous_state;
+ 	uint8_t event_state;
+-};
++} __packed;
+ 
+ struct sensord_sensor_value_composite {
+ 	struct sensord_sensor_value_composite_element element[PLDM_PDR_MAX_COMPOSITE_SENSORS];
+ 	uint8_t count;
+-};
++} __packed;
+ 
+ struct sensord_sensor_value {
+ 	union {
+ 		struct sensord_sensor_value_single single;
+ 		struct sensord_sensor_value_composite composite;
+ 	};
+-};
++} __packed;
+ 
+ struct sensord_sample {
+ 	union {
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index 7439a1f..6955625 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -481,7 +481,7 @@
+ 			PLDM_PMC_GET_SENSOR_READING_STATUS_INVALID_SENSOR_ID);
+ 	}
+ 
+-	switch (value.single.data_size) {
++	switch ((pldm_data_size_t) value.single.data_size) {
+ 	case PLDM_DATA_SIZE_UINT8:
+ 	case PLDM_DATA_SIZE_SINT8:
+ 		rsp_size = offsetof(struct pldm_pmc_get_sensor_reading_rsp, present_reading) +
+@@ -552,7 +552,7 @@
+ 	struct pldm_pmc_threshold_data *thresholds)
+ {
+ 	thresholds->data_size = req->data_size;
+-	switch (req->data_size) {
++	switch ((pldm_data_size_t) req->data_size) {
+ 	case PLDM_DATA_SIZE_UINT8:
+ 	case PLDM_DATA_SIZE_SINT8:
+ 		READ_THRESHOLDS(thresholds, (struct pldm_pmc_threshold_data_u8 *)req->data, u8);
+@@ -575,7 +575,7 @@
+ 	struct pldm_pmc_get_sensor_thresholds_rsp *rsp,
+ 	struct pldm_pmc_threshold_data *thresholds)
+ {
+-	switch (rsp->data_size) {
++	switch ((pldm_data_size_t) rsp->data_size) {
+ 	case PLDM_DATA_SIZE_UINT8:
+ 	case PLDM_DATA_SIZE_SINT8:
+ 		STORE_THRESHOLDS((struct pldm_pmc_threshold_data_u8 *)rsp->data, thresholds, u8);
+@@ -654,7 +654,7 @@
+ 			PLDM_PMC_GET_SENSOR_THRESHOLDS_STATUS_INVALID_SENSOR_ID);
+ 	}
+ 
+-	switch (value.single.data_size) {
++	switch ((pldm_data_size_t) value.single.data_size) {
+ 	case PLDM_DATA_SIZE_UINT8:
+ 	case PLDM_DATA_SIZE_SINT8:
+ 		data_packet_size = sizeof(struct pldm_pmc_threshold_data_u8);
+@@ -1334,7 +1334,7 @@
+ 		return false;
+ 	}
+ 
+-	switch (record->common.type) {
++	switch ((pldm_pdr_type_t) record->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 		data_size = record->numeric_sensor_common.data_size;
+ 
+diff --git a/src/sensord.c b/src/sensord.c
+index 67b8d37..7f75616 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -57,7 +57,7 @@
+ {
+ 	uint16_t id = 0;
+ 
+-	switch (sensor->pdr->common.type) {
++	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 		id = sensor->pdr->numeric_sensor_common.sensor_id;
+ 		break;
+@@ -123,7 +123,7 @@
+ 				struct sensord_sensor_state *state,
+ 				struct sensord_sample *sample)
+ {
+-	switch (sensor->pdr->common.type) {
++	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
+ 		state->value.single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+@@ -145,6 +145,9 @@
+ 			if (initial_state != element->present_state)
+ 				element->previous_state = initial_state;
+ 		}
++		break;
++	default:
++		CODE_UNREACHABLE;
+ 		break;
+ 	}
+ }
+@@ -171,7 +174,7 @@
+ 	const struct sensord_sensor_entry *sensor,
+ 	const struct sensord_sensor_state *state)
+ {
+-	switch (sensor->pdr->common.type) {
++	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
+ 		return is_op_state_updatable(state->value.single.operational_state);
+@@ -184,6 +187,9 @@
+ 			if (is_op_state_updatable(element->operational_state))
+ 				return true;
+ 		}
++		break;
++	default:
++		CODE_UNREACHABLE;
+ 		break;
+ 	}
+ 
+@@ -204,7 +210,7 @@
+ /* return true if we transitioned to error */
+ static bool set_numeric_sensor_failed(struct sensord_sensor_value *value)
+ {
+-	switch (value->single.operational_state) {
++	switch ((pldm_sensor_op_state_t) value->single.operational_state) {
+ 	case PLDM_SENSOR_OP_STATE_ENABLED:
+ 		/* only transition to FAILED if currently ENABLED */
+ 		value->single.operational_state = PLDM_SENSOR_OP_STATE_FAILED;
+@@ -236,7 +242,7 @@
+ 		struct sensord_sensor_value_composite_element *element =
+ 			&value->composite.element[i];
+ 
+-		switch (element->operational_state) {
++		switch ((pldm_sensor_op_state_t) element->operational_state) {
+ 		case PLDM_SENSOR_OP_STATE_ENABLED:
+ 			/* only transition to FAILED if currently ENABLED */
+ 			break;
+@@ -457,7 +463,7 @@
+ 		if (sensord_before_read_callback)
+ 			sensord_before_read_callback();
+ 
+-		switch (pdr->common.type) {
++		switch ((pldm_pdr_type_t) pdr->common.type) {
+ 		case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 		case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
+ 			updated = sensord_process_numeric_sensor(
+@@ -515,9 +521,9 @@
+ 
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+-	switch (sensor->pdr->common.type) {
++	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+-		switch (state->value.single.data_size) {
++		switch ((pldm_data_size_t) state->value.single.data_size) {
+ 		case PLDM_DATA_SIZE_UINT8:
+ 		case PLDM_DATA_SIZE_SINT8:
+ 			const struct pldm_pdr_numeric_sensor_u8 *entry_u8 =
+@@ -567,6 +573,9 @@
+ 		val->upper_threshold_warning.u32 = entry_32->warning_high;
+ 		val->lower_threshold_warning.u32 = entry_32->warning_low;
+ 		break;
++	default:
++		CODE_UNREACHABLE;
++		break;
+ 	}
+ 
+ 	state->polled = false;
+@@ -590,7 +599,7 @@
+ 	if (sensor->pdr->common.type == PLDM_PDR_TYPE_NUMERIC_SENSOR) {
+ 		value->single.data_size = sensor->pdr->numeric_sensor_common.data_size;
+ 		sensord_restore_thresholds(get_sensor_id(sensor));
+-		switch (sensor->pdr->numeric_sensor_common.data_size) {
++		switch ((pldm_data_size_t) sensor->pdr->numeric_sensor_common.data_size) {
+ 		case PLDM_DATA_SIZE_UINT32:
+ 			if (sensor->pdr->numeric_sensor_u32.range_format != PLDM_DATA_SIZE_UINT32) {
+ 				LOG_ERR("sensor %u has invalid range format %u",
+@@ -666,7 +675,7 @@
+ 
+ 		state->timestamp_next_poll = 0;
+ 
+-		switch (pdr->common.type) {
++		switch ((pldm_pdr_type_t) pdr->common.type) {
+ 		case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 		case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
+ 			err = sensord_init_numeric_sensor(sensor, state);
+@@ -752,7 +761,7 @@
+ 	struct sensord_sensor_entry *sensor,
+ 	struct sensord_sensor_state *state)
+ {
+-	switch (sensor->pdr->common.type) {
++	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
+ 		sensord_process_numeric_sensor(sensor, state, sensor->api.get, "get");
+@@ -815,7 +824,7 @@
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+ 	/* FIXME: assumes numeric sensor; add support for state sensors? */
+-	switch (state->value.single.operational_state) {
++	switch ((pldm_sensor_op_state_t) state->value.single.operational_state) {
+ 	case PLDM_SENSOR_OP_STATE_DISABLED:
+ 		if (enable) {
+ 			state->value.single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+@@ -963,9 +972,9 @@
+ 
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+-	switch (sensor->pdr->common.type) {
++	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+-		switch (thresholds->data_size) {
++		switch ((pldm_data_size_t) thresholds->data_size) {
+ 		case PLDM_DATA_SIZE_UINT8:
+ 		case PLDM_DATA_SIZE_SINT8:
+ 			res = update_if_enabled_u8(&sensor->pdr->numeric_sensor_u8,
+@@ -996,6 +1005,9 @@
+ 					  &state->value.single.threshold_values,
+ 					  thresholds);
+ 		break;
++	default:
++		CODE_UNREACHABLE;
++		break;
+ 	}
+ 
+ 	if (!res)

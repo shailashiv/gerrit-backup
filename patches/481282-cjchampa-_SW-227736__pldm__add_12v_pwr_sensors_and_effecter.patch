@@ -1,0 +1,452 @@
+From 5a747976d972eccd18f88027d1a5ad781a62a3d5 Mon Sep 17 00:00:00 2001
+From: Christopher Champagne <cjchampagne@habana.ai>
+Date: Tue, 13 May 2025 18:11:14 +0300
+Subject: [PATCH] [SW-227736] pldm: add 12v pwr sensors and effecter
+
+Add HL-338 specific sensors for the 12V domain.
+    Effecter ID 387: Gaudi3 power effecter: Limit maximal
+        supported power envelope for 12V domain (TDP)
+    Sensor ID 388: Gaudi3 energy consumed by the 12V PSU
+    Sensor ID 389: Gaudi3 Peak power consumption observed
+        in 1 minute time window for 12V PSU
+
+Change-Id: Ib6b4236a72d999b88783f88d17de4c516dd50293
+Signed-off-by: Christopher Champagne <cjchampagne@habana.ai>
+---
+
+diff --git a/arch/gaudi3/ras/pldm/pldm_effecter_db.c b/arch/gaudi3/ras/pldm/pldm_effecter_db.c
+index 13ef56c..08a9124 100644
+--- a/arch/gaudi3/ras/pldm/pldm_effecter_db.c
++++ b/arch/gaudi3/ras/pldm/pldm_effecter_db.c
+@@ -40,8 +40,15 @@
+ 	{
+ 		.pdr = &pldm_pdr_records[PLDM_RIDX_EFFECTER_LIMIT_TDP_54V],
+ 		.api = {
+-			.set = pldm_effecter_set_limit_tdp_54v,
+-			.get = pldm_effecter_get_limit_tdp_54v,
++			.set = pldm_effecter_set_limit_tdp,
++			.get = pldm_effecter_get_limit_tdp,
++		},
++	},
++	{
++		.pdr = &pldm_pdr_records[PLDM_RIDX_EFFECTER_LIMIT_TDP_12V],
++		.api = {
++			.set = pldm_effecter_set_limit_tdp,
++			.get = pldm_effecter_get_limit_tdp,
+ 		},
+ 	},
+ };
+diff --git a/arch/gaudi3/ras/pldm/pldm_effecter_handlers.c b/arch/gaudi3/ras/pldm/pldm_effecter_handlers.c
+index a1a1b5d..67f1a7c 100644
+--- a/arch/gaudi3/ras/pldm/pldm_effecter_handlers.c
++++ b/arch/gaudi3/ras/pldm/pldm_effecter_handlers.c
+@@ -258,12 +258,15 @@
+ 		(now >= reset_device_wait);
+ }
+ 
+-int pldm_effecter_set_limit_tdp_54v(const struct pldm_pdr_numeric_effecter *pdr,
+-				    struct pldm_numeric_effecter_state *state,
+-				    pldm_sensor_value_t new_state)
++int pldm_effecter_set_limit_tdp(const struct pldm_pdr_numeric_effecter *pdr,
++				struct pldm_numeric_effecter_state *state,
++				pldm_sensor_value_t new_state)
+ {
+ 	enum cpucp_packet_rc ret;
+ 
++	/* PID handles differences between OAM and PCI systems and checks new state
++	 * values against the appropriate domain information
++	 */
+ 	ret = pid_power_write(W_TO_MILLW(new_state.u32));
+ 	if (ret)
+ 		return ret;
+@@ -275,12 +278,15 @@
+ 	return 0;
+ }
+ 
+-int pldm_effecter_get_limit_tdp_54v(const struct pldm_pdr_numeric_effecter *pdr,
+-				    struct pldm_numeric_effecter_state *state)
++int pldm_effecter_get_limit_tdp(const struct pldm_pdr_numeric_effecter *pdr,
++				struct pldm_numeric_effecter_state *state)
+ {
+ 	enum cpucp_packet_rc ret;
+ 	uint64_t value;
+ 
++	/* PID handles differences between OAM and PCI systems and puts relevant
++	 * domain information into shared memory
++	 */
+ 	ret = hl_sensors_power_get_shmem(CPUCP_POWER_INPUT_MAX, &value);
+ 	if (ret)
+ 		return ret;
+diff --git a/arch/gaudi3/ras/pldm/pldm_pdr.c b/arch/gaudi3/ras/pldm/pldm_pdr.c
+index 9d907c8..1cc8a8e 100644
+--- a/arch/gaudi3/ras/pldm/pldm_pdr.c
++++ b/arch/gaudi3/ras/pldm/pldm_pdr.c
+@@ -12,6 +12,8 @@
+ #include <pldm_pdr_generated.h>
+ #include <pldm_pcie.h>
+ #include <pldm_state_set.h>
++#include <hl_devs.h>
++#include <eeprom_util.h>
+ 
+ #define BYTE0(mask) ((mask)&0xFF)
+ #define BYTE1(mask) (((mask)>>8)&0xFF)
+@@ -500,6 +502,18 @@
+ static void pdr_pcie_link_speed_init(struct pldm_pdr_record *record)
+ {
+ 	record->numeric_sensor_u16.normal_max = pldm_pcie_link_speed_max();
++}
++
++static void pdr_effecter_limit_tdp_init(struct pldm_pdr_record *record)
++{
++	const struct device *eeprom_dev = EEPROM_DEV_INST;
++	int power = hl_eeprom_get_max_power(eeprom_dev);
++
++	if (power < 0)
++		return;
++
++	record->numeric_effecter.normal_max = power;
++	record->numeric_effecter.max_settable = power;
+ }
+ 
+ struct pldm_pdr_record pldm_pdr_records[] OFFLOAD_PDR_ATTR = {
+@@ -3005,6 +3019,7 @@
+ 			},
+ 			.normal_max = 850,
+ 		},
++		.init = pdr_effecter_limit_tdp_init,
+ 	},
+ 	[PLDM_RIDX_SENSOR_ENERGY_CONSUMED_54V_JOULES] = {
+ 		.meta = {
+@@ -3050,6 +3065,79 @@
+ 			.sensor_name = "peakPowerConsumption54VJoules",
+ 		},
+ 	},
++	[PLDM_RIDX_EFFECTER_LIMIT_TDP_12V] = {
++		.meta = {
++			.unsupported_platform_mask = PLDM_PLATFORM_MASK_HL325,
++		},
++		.numeric_effecter = {
++			.header = {
++				.record_handle = PLDM_RH_EFFECTER_LIMIT_TDP_12V,
++				.header_version = PLDM_PDR_HEADER_VERSION,
++				.type = PLDM_PDR_TYPE_NUMERIC_EFFECTER,
++				.record_change_number = 0,
++			},
++			.effecter_id = PLDM_SID_LIMIT_TDP_12V,
++			.entity_type = PLDM_ENTITY_TYPE_ACCELERATOR,
++			.entity_instance_number = 1,
++			.container_id = PLDM_CONTAINER_ADDIN_CARD,
++			.aux_names = true,
++			.base_unit = PLDM_PDR_SENSOR_UNIT_WATTS,
++			.rate_unit = PLDM_PDR_SENSOR_RATE_NONE,
++			.data_size = PLDM_DATA_SIZE_UINT32,
++			.max_settable = 600,
++			.min_settable = 300,
++			.range_format = PLDM_DATA_SIZE_UINT32,
++			.range_field_support = {
++				.normal_max = 1,
++			},
++			.normal_max = 600,
++		},
++		.init = pdr_effecter_limit_tdp_init,
++	},
++	[PLDM_RIDX_SENSOR_ENERGY_CONSUMED_12V_JOULES] = {
++		.meta = {
++			.unsupported_platform_mask = PLDM_PLATFORM_MASK_HL325,
++		},
++		.compact_numeric_sensor = {
++			.header = {
++				.record_handle = PLDM_RH_SENSOR_ENERGY_CONSUMED_12V_JOULES,
++				.header_version = PLDM_PDR_HEADER_VERSION,
++				.type = PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR,
++				.record_change_number = 0,
++			},
++			.terminus_handle = 0,
++			.sensor_id = PLDM_SID_ENERGY_CONSUMED_12V_JOULES,
++			.entity_type = PLDM_ENTITY_TYPE_ACCELERATOR,
++			.entity_instance_number = 1,
++			.container_id = PLDM_CONTAINER_ADDIN_CARD,
++			.base_unit = PLDM_PDR_SENSOR_UNIT_JOULES,
++			.unit_modifier = -3,
++			.occurrence_rate = PLDM_PDR_SENSOR_RATE_NONE,
++			.sensor_name = "EnergyConsumed12VJoules",
++		},
++	},
++	[PLDM_RIDX_SENSOR_PEAK_ENERGY_CONSUMED_12V_JOULES] = {
++		.meta = {
++			.unsupported_platform_mask = PLDM_PLATFORM_MASK_HL325,
++		},
++		.compact_numeric_sensor = {
++			.header = {
++				.record_handle = PLDM_RH_SENSOR_PEAK_ENERGY_CONSUMED_12V_JOULES,
++				.header_version = PLDM_PDR_HEADER_VERSION,
++				.type = PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR,
++				.record_change_number = 0,
++			},
++			.terminus_handle = 0,
++			.sensor_id = PLDM_SID_PEAK_ENERGY_CONSUMED_12V_JOULES,
++			.entity_type = PLDM_ENTITY_TYPE_ACCELERATOR,
++			.entity_instance_number = 1,
++			.container_id = PLDM_CONTAINER_ADDIN_CARD,
++			.base_unit = PLDM_PDR_SENSOR_UNIT_JOULES,
++			.unit_modifier = -3,
++			.occurrence_rate = PLDM_PDR_SENSOR_RATE_NONE,
++			.sensor_name = "PeakEnergyConsumed12VJoules",
++		},
++	},
+ 	[PLDM_RIDX_SENSOR_COMPOSITE_TEMPERATURE] = { .compact_numeric_sensor = {
+ 		.header = {
+ 			.record_handle = PLDM_RH_SENSOR_COMPOSITE_TEMPERATURE,
+diff --git a/arch/gaudi3/ras/pldm/pldm_pdr_generated.c b/arch/gaudi3/ras/pldm/pldm_pdr_generated.c
+index 8645c12..6a0b844 100644
+--- a/arch/gaudi3/ras/pldm/pldm_pdr_generated.c
++++ b/arch/gaudi3/ras/pldm/pldm_pdr_generated.c
+@@ -5,12 +5,12 @@
+ 
+ /* !!! AUTO-GENERATED FILE - DO NOT EDIT !!! */
+ /*
+- * Spreadsheet : '20250312_GAUDI3_RAS_PLDM_7th_stage.xlsx'
+- * MD5         : 16e5181b9434558e4bd9c4ada1bbfa62
++ * Spreadsheet : '20250507_GAUDI3_RAS_PLDM_7th_stage.xlsx'
++ * MD5         : 6bbcc11a6d64ea92876ded4f307e00b4
+  *
+  * Command line:
+  *   ./g3-gen-pdrs.py \
+- *     -w ".../20250312_GAUDI3_RAS_PLDM_7th_stage.xlsx" \
++ *     -w ".../20250507_GAUDI3_RAS_PLDM_7th_stage.xlsx" \
+  *     -r ".../pldm_pdr.h" "pdrs" \
+  *     --header ".../pldm_pdr_generated.h" \
+  *     --source ".../pldm_pdr_generated.c"
+@@ -310,6 +310,8 @@
+ #define _pcieRevision_str "pcieRevision"
+ /* Gaudi3 Enable UART dump effecter */
+ #define _EnableUartDump_str "EnableUartDump"
++/* Gaudi3 power effecter: Limit maximal supported power envelope for 12V domain (TDP) */
++#define _limitTDP12V_str "limitTDP12V"
+ 
+ #else /* old aux name format */
+ 
+@@ -1382,6 +1384,11 @@
+ 	0x4500, 0x6e00, 0x6100, 0x6200, 0x6c00, 0x6500,
+ 	0x5500, 0x6100, 0x7200, 0x7400, 0x4400, 0x7500,
+ 	0x6d00, 0x7000, 0x0000
++};
++/* Gaudi3 power effecter: Limit maximal supported power envelope for 12V domain (TDP) */
++const uint16_t _limitTDP12V_str[] OFFLOAD_AUX_NAMES_ATTR = {
++	0x6c00, 0x6900, 0x6d00, 0x6900, 0x7400, 0x5400,
++	0x4400, 0x5000, 0x3100, 0x3200, 0x5600, 0x0000
+ };
+ 
+ #endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+@@ -4061,6 +4068,30 @@
+ 			},
+ 		},
+ 	},
++	[PLDM_RIDX_EFFECTER_AUX_NAMES_LIMIT_TDP_12V] = {
++		.aux_names = {
++			.header = {
++				.record_handle = PLDM_RH_EFFECTER_AUX_NAMES_LIMIT_TDP_12V,
++				.header_version = PLDM_PDR_HEADER_VERSION,
++				.type = PLDM_PDR_TYPE_EFFECTER_AUX_NAMES,
++				.record_change_number = 0,
++			},
++			.terminus_handle = 0,
++			.id = PLDM_SID_LIMIT_TDP_12V,
++			.count = 1,
++			.names = {
++#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
++				_limitTDP12V_str,
++#else /* old aux name format */
++				{
++					.name_string_count = 1,
++					.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
++					.name = _limitTDP12V_str,
++				},
++#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
++			},
++		},
++	},
+ };
+ const size_t pldm_pdr_name_records_length = ARRAY_SIZE(pldm_pdr_name_records);
+ 
+diff --git a/arch/gaudi3/ras/pldm/sensord_db.c b/arch/gaudi3/ras/pldm/sensord_db.c
+index 14bde8d..2484a50 100644
+--- a/arch/gaudi3/ras/pldm/sensord_db.c
++++ b/arch/gaudi3/ras/pldm/sensord_db.c
+@@ -235,11 +235,19 @@
+ 	},
+ 	{
+ 		.pdr = &pldm_pdr_records[PLDM_RIDX_SENSOR_ENERGY_CONSUMED_54V_JOULES],
+-		.api.poll = sensord_poll_energy_consumed_54v_joules,
++		.api.poll = sensord_poll_energy_consumed,
+ 	},
+ 	{
+ 		.pdr = &pldm_pdr_records[PLDM_RIDX_SENSOR_PEAK_POWER_CONSUMPTION_54V_JOULES],
+-		.api.poll = sensord_poll_peak_power_consumption_54v_joules,
++		.api.poll = sensord_poll_peak_power_consumption,
++	},
++	{
++		.pdr = &pldm_pdr_records[PLDM_RIDX_SENSOR_ENERGY_CONSUMED_12V_JOULES],
++		.api.poll = sensord_poll_energy_consumed,
++	},
++	{
++		.pdr = &pldm_pdr_records[PLDM_RIDX_SENSOR_PEAK_ENERGY_CONSUMED_12V_JOULES],
++		.api.poll = sensord_poll_peak_power_consumption,
+ 	},
+ 	{
+ 		.pdr = &pldm_pdr_records[PLDM_RIDX_SENSOR_COMPOSITE_TEMPERATURE],
+diff --git a/arch/gaudi3/ras/pldm/sensord_handlers.c b/arch/gaudi3/ras/pldm/sensord_handlers.c
+index 0832c51..35b5654 100644
+--- a/arch/gaudi3/ras/pldm/sensord_handlers.c
++++ b/arch/gaudi3/ras/pldm/sensord_handlers.c
+@@ -894,13 +894,17 @@
+ }
+ 
+ #define MICRO_J_PER_MILL_J	1000;
+-int sensord_poll_energy_consumed_54v_joules(const struct sensord_sensor_entry *entry,
+-					    struct sensord_sample *sample)
++int sensord_poll_energy_consumed(const struct sensord_sensor_entry *entry,
++				 struct sensord_sample *sample)
+ {
+ 	uint64_t v;
+ 	uint64_t energy;
+ 	enum cpucp_packet_rc ret;
+ 
++	/* PID handles differences between OAM and PCI systems and puts relevant
++	 * domain information into shared memory. This means both 12V and 54V domain
++	 * sensors can use the same interface since only one will be the main power.
++	 */
+ 	ret = hl_sensors_energy_get_shmem(&v);
+ 	if (ret)
+ 		return ret;
+@@ -913,13 +917,17 @@
+ 	return 0;
+ }
+ 
+-int sensord_poll_peak_power_consumption_54v_joules(const struct sensord_sensor_entry *entry,
+-						   struct sensord_sample *sample)
++int sensord_poll_peak_power_consumption(const struct sensord_sensor_entry *entry,
++					struct sensord_sample *sample)
+ {
+ 	uint64_t v;
+ 	uint64_t peak;
+ 	enum cpucp_packet_rc ret;
+ 
++	/* PID handles differences between OAM and PCI systems and puts relevant
++	 * domain information into shared memory. This means both 12V and 54V domain
++	 * sensors can use the same interface since only one will be the main power.
++	 */
+ 	ret = hl_sensors_peak_energy_get_shmem(&v);
+ 	if (ret)
+ 		return ret;
+diff --git a/include/arch/gaudi3/pldm_effecter_handlers.h b/include/arch/gaudi3/pldm_effecter_handlers.h
+index 5427046..a5d6d7e 100644
+--- a/include/arch/gaudi3/pldm_effecter_handlers.h
++++ b/include/arch/gaudi3/pldm_effecter_handlers.h
+@@ -57,12 +57,12 @@
+ 				       struct pldm_state_effecter_state *composite_state,
+ 				       uint8_t composite_index);
+ 
+-int pldm_effecter_set_limit_tdp_54v(const struct pldm_pdr_numeric_effecter *pdr,
+-				    struct pldm_numeric_effecter_state *state,
+-				    pldm_sensor_value_t new_state);
++int pldm_effecter_set_limit_tdp(const struct pldm_pdr_numeric_effecter *pdr,
++				struct pldm_numeric_effecter_state *state,
++				pldm_sensor_value_t new_state);
+ 
+-int pldm_effecter_get_limit_tdp_54v(const struct pldm_pdr_numeric_effecter *pdr,
+-				    struct pldm_numeric_effecter_state *state);
++int pldm_effecter_get_limit_tdp(const struct pldm_pdr_numeric_effecter *pdr,
++				struct pldm_numeric_effecter_state *state);
+ 
+ int pldm_effecter_error_injection_set_sram(const struct pldm_pdr_state_effecter *pdr,
+ 					   struct pldm_state_effecter_state *composite_state,
+diff --git a/include/arch/gaudi3/pldm_pdr.h b/include/arch/gaudi3/pldm_pdr.h
+index 896d7d1..cadd0ec 100644
+--- a/include/arch/gaudi3/pldm_pdr.h
++++ b/include/arch/gaudi3/pldm_pdr.h
+@@ -95,6 +95,9 @@
+ 	PLDM_RH_EFFECTER_LIMIT_TDP_54V					= 2164,
+ 	PLDM_RH_SENSOR_ENERGY_CONSUMED_54V_JOULES			= 2165,
+ 	PLDM_RH_SENSOR_PEAK_POWER_CONSUMPTION_54V_JOULES		= 2166,
++	PLDM_RH_EFFECTER_LIMIT_TDP_12V					= 2167,
++	PLDM_RH_SENSOR_ENERGY_CONSUMED_12V_JOULES			= 2168,
++	PLDM_RH_SENSOR_PEAK_ENERGY_CONSUMED_12V_JOULES			= 2169,
+ 	PLDM_RH_SENSOR_COMPOSITE_TEMPERATURE				= 2185,
+ 	PLDM_RH_SENSOR_CURRENT_SOC_TEMPERATURE				= 2186,
+ 	PLDM_RH_SENSOR_HISTORICAL_SOC_TEMPERATURE			= 2187,
+@@ -502,6 +505,7 @@
+ 	PLDM_RH_SENSOR_AUX_NAMES_PCIE_HDR_LOG_3				= 5508,
+ 	PLDM_RH_SENSOR_AUX_NAMES_PCIE_REVISION_ID			= 5509,
+ 	PLDM_RH_EFFECTER_AUX_NAMES_ENABLE_UART_DUMP			= 5511,
++	PLDM_RH_EFFECTER_AUX_NAMES_LIMIT_TDP_12V			= 5512,
+ };
+ 
+ enum pldm_sensor_id {
+@@ -588,6 +592,9 @@
+ 	PLDM_SID_LIMIT_TDP_54V						= 384,
+ 	PLDM_SID_ENERGY_CONSUMED_54V_JOULES				= 385,
+ 	PLDM_SID_PEAK_POWER_CONSUMPTION_54V_JOULES			= 386,
++	PLDM_SID_LIMIT_TDP_12V						= 387,
++	PLDM_SID_ENERGY_CONSUMED_12V_JOULES				= 388,
++	PLDM_SID_PEAK_ENERGY_CONSUMED_12V_JOULES			= 389,
+ 	PLDM_SID_COMPOSITE_TEMPERATURE					= 405,
+ 	PLDM_SID_CURRENT_SOC_TEMPERATURE				= 406,
+ 	PLDM_SID_HISTORICAL_SOC_TEMPERATURE				= 407,
+@@ -957,6 +964,9 @@
+ 	PLDM_RIDX_EFFECTER_LIMIT_TDP_54V,
+ 	PLDM_RIDX_SENSOR_ENERGY_CONSUMED_54V_JOULES,
+ 	PLDM_RIDX_SENSOR_PEAK_POWER_CONSUMPTION_54V_JOULES,
++	PLDM_RIDX_EFFECTER_LIMIT_TDP_12V,
++	PLDM_RIDX_SENSOR_ENERGY_CONSUMED_12V_JOULES,
++	PLDM_RIDX_SENSOR_PEAK_ENERGY_CONSUMED_12V_JOULES,
+ 	PLDM_RIDX_SENSOR_COMPOSITE_TEMPERATURE,
+ 	PLDM_RIDX_SENSOR_CURRENT_SOC_TEMPERATURE,
+ 	PLDM_RIDX_SENSOR_HISTORICAL_SOC_TEMPERATURE,
+diff --git a/include/arch/gaudi3/pldm_pdr_generated.h b/include/arch/gaudi3/pldm_pdr_generated.h
+index 9e99093..60fe52c 100644
+--- a/include/arch/gaudi3/pldm_pdr_generated.h
++++ b/include/arch/gaudi3/pldm_pdr_generated.h
+@@ -5,12 +5,12 @@
+ 
+ /* !!! AUTO-GENERATED FILE - DO NOT EDIT !!! */
+ /*
+- * Spreadsheet : '20250312_GAUDI3_RAS_PLDM_7th_stage.xlsx'
+- * MD5         : 16e5181b9434558e4bd9c4ada1bbfa62
++ * Spreadsheet : '20250507_GAUDI3_RAS_PLDM_7th_stage.xlsx'
++ * MD5         : 6bbcc11a6d64ea92876ded4f307e00b4
+  *
+  * Command line:
+  *   ./g3-gen-pdrs.py \
+- *     -w ".../20250312_GAUDI3_RAS_PLDM_7th_stage.xlsx" \
++ *     -w ".../20250507_GAUDI3_RAS_PLDM_7th_stage.xlsx" \
+  *     -r ".../pldm_pdr.h" "pdrs" \
+  *     --header ".../pldm_pdr_generated.h" \
+  *     --source ".../pldm_pdr_generated.c"
+@@ -104,6 +104,7 @@
+ 	PLDM_RIDX_SENSOR_AUX_NAMES_PCIE_HDR_LOG_3,
+ 	PLDM_RIDX_SENSOR_AUX_NAMES_PCIE_REVISION_ID,
+ 	PLDM_RIDX_EFFECTER_AUX_NAMES_ENABLE_UART_DUMP,
++	PLDM_RIDX_EFFECTER_AUX_NAMES_LIMIT_TDP_12V,
+ };
+ 
+ enum pldm_oem_state_set_ridx {
+diff --git a/include/arch/gaudi3/sensord_handlers.h b/include/arch/gaudi3/sensord_handlers.h
+index 14c9549..ff67c68 100644
+--- a/include/arch/gaudi3/sensord_handlers.h
++++ b/include/arch/gaudi3/sensord_handlers.h
+@@ -104,10 +104,10 @@
+ 					   struct sensord_sample *sample);
+ int sensord_poll_total_hbm_throttling_duration(const struct sensord_sensor_entry *entry,
+ 					       struct sensord_sample *sample);
+-int sensord_poll_energy_consumed_54v_joules(const struct sensord_sensor_entry *entry,
+-					    struct sensord_sample *sample);
+-int sensord_poll_peak_power_consumption_54v_joules(const struct sensord_sensor_entry *entry,
+-						   struct sensord_sample *sample);
++int sensord_poll_energy_consumed(const struct sensord_sensor_entry *entry,
++				 struct sensord_sample *sample);
++int sensord_poll_peak_power_consumption(const struct sensord_sensor_entry *entry,
++					struct sensord_sample *sample);
+ int sensord_poll_last_clock_throttling_duration(const struct sensord_sensor_entry *entry,
+ 						struct sensord_sample *sample);
+ int sensord_poll_total_clock_throttling_duration(const struct sensord_sensor_entry *entry,

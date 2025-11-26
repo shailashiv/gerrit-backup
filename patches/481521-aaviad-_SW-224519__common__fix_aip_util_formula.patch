@@ -1,0 +1,519 @@
+From 922b2d1a2b47db719a2c86dcd9016f80c9d62bfc Mon Sep 17 00:00:00 2001
+From: Meron Cohen <mecohen@habana.ai>
+Date: Tue, 08 Apr 2025 18:28:57 +0300
+Subject: [PATCH] [SW-224519] common: fix aip util formula
+
+The problem was that when querying the utilization.aip (via hl-smi -Q),
+the utilization of several cards returned garbage values (representing
+negative numbers). However, when running hl-smi (w/o parameters), all
+the utilization values were valid. It turned out that in the former
+case,the power drawn from the secondary PSU wasn't updated
+periodically, while in the latter case it was.
+A fix for this was merged into v1.21.0 RC1 - updating the power drawn
+from the secondary PSU, each time we call the utilization function.
+This commit refactor the code, such that the update will be done as
+part of calling the power consumption function. Each time we call it,
+we update the power drawn from the main PSU and the secondary PSU (if
+it exists - in Gaudi 2 PCIe card, for example, it doesn't).
+
+Change-Id: Ifa30c63fba70cd6ab405e5986c7cb08b77b2eaf8
+Signed-off-by: Meron Cohen <mecohen@habana.ai>
+Signed-off-by: Ariel Aviad <aaviad@habana.ai>
+---
+
+diff --git a/app/hl-smi/info.cpp b/app/hl-smi/info.cpp
+index 52a875d..e474e86 100644
+--- a/app/hl-smi/info.cpp
++++ b/app/hl-smi/info.cpp
+@@ -254,21 +254,12 @@
+ {
+ 	int j;
+ 	hlml_return_int_t ret;
+-	unsigned long long power_consumption;
+ 
+ 	if (opts->query[QUERY_PWR]) {
+-		ret = hl_smi_power_consumption_get(aip, &power_consumption);
+-		aip->power = (unsigned int)(MW_TO_WATT(power_consumption));
+-		if (ret != HLML_INT_SUCCESS) {
+-			HL_SMI_LOG_ERR("Failed to get power information\n");
+-			aip->power = ERROR_SENSOR_VALUE;
+-		}
+-
+-		ret = hl_smi_sensors_get_info(aip, HL_SMI_SENSORS_INFO_SEC_POW);
++		ret = hl_smi_power_consumption_get(aip);
+ 		if (ret != HLML_INT_SUCCESS)
+-			HL_SMI_LOG_ERR("Failed to get power(12V PSU) information\n");
++			HL_SMI_LOG_ERR("Failed to get power information\n");
+ 	}
+-
+ 
+ 	if (opts->query[QUERY_TEMP]) {
+ 		ret = hl_smi_sensors_get_info(aip, HL_SMI_SENSORS_INFO_TEMP);
+@@ -569,32 +560,32 @@
+ {
+ 	hlml_return_t ret;
+ 	char info_field[VERSION_MAX_LEN] = {0};
+-	unsigned int result;
+-	hlml_enable_state_t pm_mng_mode;
+ 	char const *pm_mng_mode_state[] = {
+ 		[HLML_FEATURE_DISABLED] = "N/A",
+ 		[HLML_FEATURE_ENABLED] = "Supported",
+ 	};
+ 
+-	if (aip->main_psu_name)
+-		HL_SMI_LOG_INFO("\tPower Readings {}", aip->main_psu_name);
++	if (aip->psu_main_info.psu_main_name)
++		HL_SMI_LOG_INFO("\tPower Readings {}", aip->psu_main_info.psu_main_name);
+ 	else
+ 		HL_SMI_LOG_INFO("\tPower Readings");
+ 
+-	ret = hlml_device_get_power_management_mode(aip, &pm_mng_mode);
+-
++	ret = hlml_device_get_power_management_mode(aip, &aip->psu_main_info.psu_main_pm_mng_mode);
+ 	HL_SMI_LOG_INFO("\t\tPower Management\t: {}",
+-			(ret != HLML_SUCCESS) ? "N/A" : pm_mng_mode_state[pm_mng_mode]);
+-	if (aip->power != ERROR_SENSOR_VALUE)
+-		HL_SMI_LOG_INFO("\t\tPower Draw\t\t: {} W", aip->power);
++			(ret != HLML_SUCCESS) ?
++			"N/A" : pm_mng_mode_state[aip->psu_main_info.psu_main_pm_mng_mode]);
++
++	if (aip->psu_main_info.psu_main_power != ERROR_SENSOR_VALUE)
++		HL_SMI_LOG_INFO("\t\tPower Draw\t\t: {} W", aip->psu_main_info.psu_main_power);
+ 	else
+ 		HL_SMI_LOG_INFO("\t\tPower Draw\t\t: {}", HL_NA_STR);
+ 
+-	ret = hlml_device_get_power_management_limit(aip, &result);
++	ret = hlml_device_get_power_management_limit(aip, &aip->psu_main_info.psu_main_power_limit);
+ 	if (ret != HLML_SUCCESS)
+ 		HL_SMI_LOG_INFO("\t\tPower Max\t\t: {}", HL_NA_STR);
+ 	else
+-		HL_SMI_LOG_INFO("\t\tPower Max\t\t: {} W", MW_TO_WATT(result));
++		HL_SMI_LOG_INFO("\t\tPower Max\t\t: {} W",
++			(unsigned int)MW_TO_WATT(aip->psu_main_info.psu_main_power_limit));
+ 
+ 	if (aip->power_limit[0])
+ 		snprintf(info_field, VERSION_MAX_LEN, "%s W", aip->power_limit);
+@@ -610,7 +601,6 @@
+ 		HL_SMI_LOG_INFO("\t\tPower Max\t\t: {} W", aip->psu_sec_info->psu_sec_max_power);
+ 		HL_SMI_LOG_INFO("\t\tPower Limit\t\t: {} W", aip->psu_sec_info->psu_sec_max_power);
+ 	}
+-
+ }
+ 
+ static void hl_smi_aip_log_legacy_clk_limit(struct hl_smi_aip_info *aip)
+@@ -860,7 +850,6 @@
+ 	char aip_uuid[VERSION_MAX_LEN];
+ 	unsigned long long ecc_counts;
+ 	unsigned long long ecc_counts_all[HLML_ECC_ERR_COUNTER_MAX];
+-	unsigned long long power_consumption;
+ 	hlml_memory_error_type_t error_type;
+ 	unsigned long long energy;
+ 	hlml_enable_state_t current, pending;
+@@ -971,10 +960,9 @@
+ 			*len += snprintf(line + *len, HL_CSV_LINE_LEN - *len, "%s", HL_NA_STR);
+ 		break;
+ 	case QUERY_AIP_POWER_DRAW:
+-		ret = hl_smi_power_consumption_get(aip, &power_consumption);
++		ret = hl_smi_power_consumption_get(aip);
+ 		if (!ret) {
+-			aip->power = (unsigned int)MW_TO_WATT(power_consumption);
+-			*len += snprintf(line + *len, HL_CSV_LINE_LEN - *len, "%u", aip->power);
++			*len += snprintf(line + *len, HL_CSV_LINE_LEN - *len, "%u", aip->total_power);
+ 		} else {
+ 			*len += snprintf(line + *len, HL_CSV_LINE_LEN - *len, "%s", HL_NA_STR);
+ 		}
+@@ -1485,7 +1473,6 @@
+ 	hl_smi_events_count ecc_counts;
+ 	hlml_pci_info_t pci_info;
+ 	hlml_return_t hlml_ret;
+-	unsigned long long power_consumption;
+ 	char hl_smi_ver[VERSION_MAX_LEN] = {0};
+ 	char aip_name[AIP_NAME_LEN] = {0};
+ 	char device_bus_id[PCI_ADDR_LEN + 1];
+@@ -1609,19 +1596,11 @@
+ 		else
+ 			len += snprintf(line + len, TABLE_LINE_SIZE - len, "%-3s", HL_NA_STR);
+ 		/* Power usage vs Capability  */
+-		ret = hl_smi_power_consumption_get(aip, &power_consumption);
+-		if (!ret) {
+-			aip->power = (unsigned int)MW_TO_WATT(power_consumption);
+-			if (aip->psu_sec_info) {
+-				ret = hl_smi_sensors_get_info(aip, HL_SMI_SENSORS_INFO_SEC_POW);
+-				if (!ret)
+-					aip->power += aip->psu_sec_info->psu_sec_power;
+-			}
+-
+-			len += snprintf(line + len, TABLE_LINE_SIZE - len, "%4dW",  aip->power);
+-		} else {
++		ret = hl_smi_power_consumption_get(aip);
++		if (!ret)
++			len += snprintf(line + len, TABLE_LINE_SIZE - len, "%4dW", aip->total_power);
++		else
+ 			len += snprintf(line + len, TABLE_LINE_SIZE - len, "%5s", HL_NA_STR);
+-		}
+ 
+ 		if (aip->psu_sec_info)
+ 			psu_sec_max_power = aip->psu_sec_info->psu_sec_max_power;
+diff --git a/include/hl-smi.h b/include/hl-smi.h
+index 87b533c..4b2950e 100644
+--- a/include/hl-smi.h
++++ b/include/hl-smi.h
+@@ -163,6 +163,15 @@
+ 	SENSOR_NOT_ACTIVE,
+ };
+ 
++struct psu_main_data {
++	char *psu_main_name;
++	hlml_enable_state_t psu_main_pm_mng_mode;
++	unsigned int psu_main_power;
++	unsigned int psu_main_power_limit;
++	unsigned int psu_main_power_min;
++	unsigned int psu_main_power_max;
++};
++
+ struct psu_sec_data {
+ 	char psu_sec_name[NAME_MAX];
+ 	unsigned int psu_sec_millivolt;
+@@ -233,8 +242,9 @@
+ 	struct hl_dram_sysconf ddr_type_and_speed;
+ 	const char *mem_type_str;
+ 	uint32_t pci_rev;
+-	char *main_psu_name;
++	struct psu_main_data psu_main_info;
+ 	struct psu_sec_data *psu_sec_info;
++	unsigned int total_power;
+ 	struct hl_dev_shm_ctl shmctl;
+ 	bool is_linux_avail;
+ 	bool is_ib_sysfs_supported;
+diff --git a/src/gaudi2.c b/src/gaudi2.c
+index 97cafa7..9ca82b6 100755
+--- a/src/gaudi2.c
++++ b/src/gaudi2.c
+@@ -1102,9 +1102,9 @@
+ {
+ 	hl_smi_gaudi2_prepare_common(aip_info, GAUDI2_PROD_NUM_MEZZ);
+ 
+-	aip_info->main_psu_name = (char *)malloc(NAME_MAX);
+-	if (aip_info->main_psu_name)
+-		snprintf(aip_info->main_psu_name, NAME_MAX, "%s", "(54V PSU)");
++	aip_info->psu_main_info.psu_main_name = (char *)malloc(NAME_MAX);
++	if (aip_info->psu_main_info.psu_main_name)
++		snprintf(aip_info->psu_main_info.psu_main_name, NAME_MAX, "%s", "(54V PSU)");
+ 
+ 	aip_info->psu_sec_info = (struct psu_sec_data *)malloc(sizeof(struct psu_sec_data));
+ 	if (aip_info->psu_sec_info) {
+@@ -1121,9 +1121,9 @@
+ {
+ 	hl_smi_gaudi2_prepare_common(aip_info, GAUDI2_PROD_NUM_PCI);
+ 
+-	aip_info->main_psu_name = (char *)malloc(NAME_MAX);
+-	if (aip_info->main_psu_name)
+-		snprintf(aip_info->main_psu_name, NAME_MAX, "%s", "(12V PSU)");
++	aip_info->psu_main_info.psu_main_name = (char *)malloc(NAME_MAX);
++	if (aip_info->psu_main_info.psu_main_name)
++		snprintf(aip_info->psu_main_info.psu_main_name, NAME_MAX, "%s", "(12V PSU)");
+ 
+ 	return 0;
+ }
+diff --git a/src/gaudi3.c b/src/gaudi3.c
+index ed67850..4b7cfb6 100755
+--- a/src/gaudi3.c
++++ b/src/gaudi3.c
+@@ -793,10 +793,7 @@
+ 	aip_info->critical_err_events_id_size = ARRAY_SIZE(gaudi3_critical_err_events_id);
+ 	aip_info->num_of_events = GAUDI3_EVENT_SIZE;
+ 
+-	aip_info->main_psu_name = (char *)malloc(NAME_MAX);
+-
+ 	aip_info->psu_sec_info = (struct psu_sec_data *)malloc(sizeof(struct psu_sec_data));
+-
+ 
+ 	aip_info->is_linux_avail = false;
+ 	aip_info->is_ib_sysfs_supported = true;
+@@ -825,8 +822,9 @@
+ 
+ 	set_mezz_product_specific_data(aip_info);
+ 
+-	if (aip_info->main_psu_name)
+-		snprintf(aip_info->main_psu_name, NAME_MAX, "%s", "(54V PSU)");
++	aip_info->psu_main_info.psu_main_name = (char *)malloc(NAME_MAX);
++	if (aip_info->psu_main_info.psu_main_name)
++		snprintf(aip_info->psu_main_info.psu_main_name, NAME_MAX, "%s", "(54V PSU)");
+ 
+ 	if (aip_info->psu_sec_info) {
+ 		snprintf(aip_info->psu_sec_info->psu_sec_name, NAME_MAX, "%s", "(12V PSU)");
+@@ -854,8 +852,9 @@
+ 	aip_info->temp_stat = gaudi3_pci_ts_stat;
+ 	aip_info->max_idle_power = GAUDI3_MAX_IDLE_POWER_PCI;
+ 
+-	if (aip_info->main_psu_name)
+-		snprintf(aip_info->main_psu_name, NAME_MAX, "%s", "(12V PSU)");
++	aip_info->psu_main_info.psu_main_name = (char *)malloc(NAME_MAX);
++	if (aip_info->psu_main_info.psu_main_name)
++		snprintf(aip_info->psu_main_info.psu_main_name, NAME_MAX, "%s", "(12V PSU)");
+ 
+ 	if (aip_info->psu_sec_info) {
+ 		snprintf(aip_info->psu_sec_info->psu_sec_name, NAME_MAX, "%s", "(3.3V PSU)");
+diff --git a/src/hlml.c b/src/hlml.c
+index 1af6c19..06dd93e 100644
+--- a/src/hlml.c
++++ b/src/hlml.c
+@@ -431,8 +431,7 @@
+ 	hlml_return_int_t ret_int = HLML_INT_SUCCESS;
+ 	hlml_return_t ret = HLML_SUCCESS;
+ 	bool idle;
+-	unsigned long long power_consumption;
+-	int max_idle_power_mw;
++	unsigned int max_power_mw, max_idle_power_mw;
+ 	int dividend, divisor;
+ 
+ 	INIT_CHECK
+@@ -453,12 +452,11 @@
+ 	if (ret != HLML_SUCCESS)
+ 		goto dev_get_util_err;
+ 
+-	ret_int = hl_smi_power_consumption_get(aip_info, &power_consumption);
++	ret_int = hl_smi_power_consumption_get(aip_info);
+ 	if (ret_int != HLML_INT_SUCCESS) {
+ 		ret = HLML_ERROR_NO_DATA;
+ 		goto dev_get_util_err;
+ 	}
+-	aip_info->power = (unsigned int)MW_TO_WATT(power_consumption);
+ 
+ 	ret_int = hl_smi_sensors_get_info(aip_info, HL_SMI_SENSORS_INFO_SEC_POW);
+ 	if (ret_int != HLML_INT_SUCCESS) {
+@@ -468,23 +466,24 @@
+ 
+ 	if (aip_info->use_new_utilization_formula) {
+ 		/*
+-	 	 * The utilization formula is:
+-	 	 * utilization [%] = ROUND_TO_NEAREST_FIVE(100 * dividend / divisor)
+-	 	 *
+-	 	 * Where:
+-	 	 *
+-	 	 * 1. dividend [mW] = power-drawn from main PSU - power-drawn in IDLE state.
+-	 	 *    (In case the dividend is non-positive, then the utilization is set to 0%)
+-	 	 *
+-	 	 * 2. divisor [mW] = max-power of main PSU - power-drawn in IDLE state.
+-	 	 *    (The divisor cannot be 0, so the division operation is safe)
+-	 	 */
++		* The utilization formula is:
++		* utilization [%] = ROUND_TO_NEAREST_FIVE(100 * dividend / divisor)
++		*
++		* Where:
++		*
++		* 1. dividend [mW] = power-consumption from both PSUs - power-consumption in IDLE state.
++		*    (In case the dividend is non-positive, then the utilization is set to 0%)
++		*
++		* 2. divisor [mW] = max-power of both PSUs - power-consumption in IDLE state.
++		*    (The divisor cannot be 0, so the division operation is safe)
++		*/
++		max_power_mw = max_power + WATT_TO_MW(aip_info->psu_sec_info->psu_sec_max_power);
+ 		max_idle_power_mw = WATT_TO_MW(aip_info->max_idle_power);
+-		dividend = WATT_TO_MW(aip_info->power) - max_idle_power_mw;
+-		divisor = max_power - max_idle_power_mw;
++		dividend = WATT_TO_MW(aip_info->total_power) - max_idle_power_mw;
++		divisor = max_power_mw - max_idle_power_mw;
+ 		utilization->aip = dividend > 0 ? ROUND_TO_NEAREST_FIVE(100 * dividend / divisor) : 0;
+-		HLML_LOG_DBG("main-power-drawn [W] = %u, main-max-power [W] = %u",
+-			aip_info->power, (unsigned int)MW_TO_WATT(max_power));
++		HLML_LOG_DBG("total-power-consumption [W] = %u, total-max-power [W] = %u",
++			aip_info->total_power, (unsigned int)MW_TO_WATT(max_power_mw));
+ 		HLML_LOG_DBG("max-idle-power [W] = %u, aip-utilization = %u",
+ 			aip_info->max_idle_power, utilization->aip);
+ 	} else {
+@@ -496,20 +495,14 @@
+ 			utilization->aip = 0;
+ 		} else {
+ 			/*
+-		 	* calculate with the formula below
+-		 	* utilization = 100 * (main power + secondary power) /
+-		 	* 		 (main power max + secondary power max)
+-		 	* where:
+-		 	* aip_info->power = main power in Watt
+-			* aip_info->psu_sec_info->psu_sec_power = secondary power in Watt
+-		 	* max_power = main max power in milliwatt
+-		 	* aip_info->psu_sec_info->psu_sec_max_power = secondary max power in Watt
+-		 	*/
+-			utilization->aip = 100 * WATT_TO_MW(aip_info->power + aip_info->psu_sec_info->psu_sec_power) /
++			* Calculate with the formula below:
++			* utilization [%] = 100 * power-consumption from both PSUs / max power of both PSUs
++			*/
++			utilization->aip = 100 * WATT_TO_MW(aip_info->total_power) /
+ 				(max_power + WATT_TO_MW(aip_info->psu_sec_info->psu_sec_max_power));
+-			HLML_LOG_DBG("power_drawn_mw = %.0f, max_power_mw = %.0f, utilization->aip = %u",
+-				WATT_TO_MW(aip_info->power + aip_info->psu_sec_info->psu_sec_power),
+-				max_power + WATT_TO_MW(aip_info->psu_sec_info->psu_sec_max_power),
++			HLML_LOG_DBG("total-power-consumption [W] = %u, total-max-power [W] = %u, aip-utilization = %u",
++				aip_info->total_power,
++				(unsigned int)MW_TO_WATT(max_power) + aip_info->psu_sec_info->psu_sec_max_power,
+ 				utilization->aip);
+ 		}
+ 	}
+@@ -731,17 +724,16 @@
+ 	struct hl_smi_aip_info *aip_info = (struct hl_smi_aip_info *)device;
+ 	hlml_return_int_t ret_int;
+ 	hlml_return_t ret;
+-	unsigned long long power_consumed;
+ 
+ 	INIT_CHECK
+ 
+ 	if (!aip_info || !power)
+ 		return HLML_ERROR_INVALID_ARGUMENT;
+ 
+-	ret_int = hl_smi_power_consumption_get(aip_info, &power_consumed);
++	ret_int = hl_smi_power_consumption_get(aip_info);
+ 	ret = convert_internal_retcode(ret_int);
+ 	if (ret == HLML_SUCCESS)
+-		*power = power_consumed;
++		*power = WATT_TO_MW(aip_info->total_power);
+ 	else
+ 		HLML_LOG_ERR("Get total power consumption failed %d", ret_int);
+ 
+diff --git a/src/sensors.c b/src/sensors.c
+index 7452bb2..189ed31 100644
+--- a/src/sensors.c
++++ b/src/sensors.c
+@@ -240,12 +240,12 @@
+ 	}
+ 
+ 	if (info_type & HL_SMI_SENSORS_INFO_POW) {
+-		HLML_LOG_DBG("curr_input: %f A, voltage: %f V", curr, vin);
+-		aip_info->power = curr * vin;
++		HLML_LOG_DBG("main-psu: curr_input: %f A, voltage: %f V", curr, vin);
++		aip_info->psu_main_info.psu_main_power = curr * vin;
+ 	}
+ 
+ 	if (info_type & HL_SMI_SENSORS_INFO_SEC_POW && aip_info->psu_sec_info) {
+-		HLML_LOG_DBG("curr_input: %f A, voltage: %f V", curr, vin);
++		HLML_LOG_DBG("sec-psu: curr_input: %f A, voltage: %f V", curr, vin);
+ 		aip_info->psu_sec_info->psu_sec_power = round(curr * vin);
+ 	}
+ 
+diff --git a/src/utils.c b/src/utils.c
+index 2af367a..e21dbcc 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -1215,8 +1215,7 @@
+ #define NEW_POWER_API_MAJOR_VER	0
+ #define NEW_POWER_API_MINOR_VER	14
+ 
+-hlml_return_int_t hl_smi_power_consumption_get(struct hl_smi_aip_info *aip_info,
+-		unsigned long long *power_consumed)
++static hlml_return_int_t hl_smi_main_power_consumption_get(struct hl_smi_aip_info *aip_info)
+ {
+ 	int fd, rc;
+ 	struct hlthunk_power_info info;
+@@ -1232,16 +1231,19 @@
+ 	}
+ 
+ 	driver_version = hlthunk_get_version();
+-
+ 	ret = hl_smi_parse_driver_version(driver_version, &ver_major, &ver_minor, NULL, NULL);
+ 	hlthunk_free(driver_version);
+-	if (ret != HLML_INT_SUCCESS)
+-		goto default_api;
+ 
+-	if (ver_major == NEW_POWER_API_MAJOR_VER && ver_minor < NEW_POWER_API_MINOR_VER)
+-		goto default_api;
++	if (ret != HLML_INT_SUCCESS)
++		goto on_exit;
++
++	if (ver_major == NEW_POWER_API_MAJOR_VER && ver_minor < NEW_POWER_API_MINOR_VER) {
++		ret = HLML_ERROR_INT_NOT_SUPPORTED;
++		goto on_exit;
++	}
+ 
+ 	rc = hlthunk_get_power_info(fd, &info);
++
+ 	/*
+ 	 * If firmware cannot respond (this occurs, for example,
+ 	 * when power utilization jumps from almost 100% to 0%),
+@@ -1251,25 +1253,63 @@
+ 	 * Same thing is done for -ENOTTY return code. It can be
+ 	 * obtained from ioctl invocation. According to Linux docs:
+ 	 * When the ioctl callback is called with an unknown command number, the
+-	 * handler returns -ENOTTY - a case when there is no firmware support
++	 * handler returns -ENOTTY - a case when there is no firmware support.
++	 * In case of any failure, use the old API.
+ 	 */
+-	if (rc == -ENOTTY || rc == -EBUSY) {
+-		goto default_api;
+-	} else if (rc) {
++	if (rc) {
+ 		HLML_LOG_ERR("Call to hlthunk_get_power_info failed %d", rc);
+ 		ret = HLML_ERROR_INT_THUNK_GET;
++	} else {
++		aip_info->psu_main_info.psu_main_power = (unsigned int)MW_TO_WATT(info.power);
+ 	}
+ 
+-	*power_consumed = info.power;
+-
++on_exit:
+ 	hlthunk_close(fd);
++
+ 	return ret;
++}
+ 
+-default_api:
+-	hlthunk_close(fd);
++#define ERROR_SENSOR_VALUE	0xffffffff
+ 
+-	ret = hl_smi_sensors_get_info(aip_info, HL_SMI_SENSORS_INFO_POW);
+-	*power_consumed = WATT_TO_MW(aip_info->power);
++hlml_return_int_t hl_smi_power_consumption_get(struct hl_smi_aip_info *aip_info)
++{
++	hlml_return_int_t ret = HLML_INT_SUCCESS;
++
++	/* Read the main power consumption from the device */
++	ret = hl_smi_main_power_consumption_get(aip_info);
++
++	/* If failed, read it using libsensors APIs */
++	if (ret != HLML_INT_SUCCESS)
++		ret = hl_smi_sensors_get_info(aip_info, HL_SMI_SENSORS_INFO_POW);
++
++	/* If failed, set an error sensor value and return an error */
++	if (ret != HLML_INT_SUCCESS) {
++		aip_info->psu_main_info.psu_main_power = ERROR_SENSOR_VALUE;
++		return ret;
++	}
++
++	/* The total power is set to the power drawn from the main PSU at first */
++	aip_info->total_power = aip_info->psu_main_info.psu_main_power;
++
++	/* If a seconday PSU exists in the system, reat it using libsensors APIs */
++	if (aip_info->psu_sec_info) {
++		ret = hl_smi_sensors_get_info(aip_info, HL_SMI_SENSORS_INFO_SEC_POW);
++
++		/* If failed, set an error sensor value and return an error */
++		if (ret != HLML_INT_SUCCESS) {
++			aip_info->psu_sec_info->psu_sec_power = ERROR_SENSOR_VALUE;
++			return ret;
++		} else {
++			/* Add the power drawn from the secondary PSU to the total power */
++			aip_info->total_power += aip_info->psu_sec_info->psu_sec_power;
++
++			HLML_LOG_DBG("main-power [W] = %u, sec-power [W] = %u",
++				aip_info->psu_main_info.psu_main_power,
++				aip_info->psu_sec_info->psu_sec_power);
++		}
++	}
++
++	HLML_LOG_DBG("total-power [W] = %u", aip_info->total_power);
+ 
+ 	return ret;
+ }
+diff --git a/src/utils.h b/src/utils.h
+index 38521fb..b2301c3 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -93,8 +93,7 @@
+ 				unsigned long long *clk_throttle_reason_bitmap);
+ hlml_return_int_t hl_smi_total_energy_consumption_get(struct hl_smi_aip_info *aip_info,
+ 				unsigned long long *total_energy);
+-hlml_return_int_t hl_smi_power_consumption_get(struct hl_smi_aip_info *aip_info,
+-				unsigned long long *power_consumed);
++hlml_return_int_t hl_smi_power_consumption_get(struct hl_smi_aip_info *aip_info);
+ hlml_return_int_t hl_smi_get_hw_ip_info(struct hl_smi_aip_info *aip, struct hlthunk_hw_ip_info *hw_ip);
+ 
+ hlml_return_int_t hl_smi_pci_get_subsystem(struct hl_smi_aip_info *aip_info,

@@ -1,0 +1,464 @@
+From 4750402a0357e1bc4f6c1b9e18140bc3ac8ca224 Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Tue, 11 Mar 2025 18:32:27 +0200
+Subject: [PATCH] [SW-180232] pmc: persist effecters and thresholds
+
+Persist effecter data (op_state and value) and sensor threshold data
+across device resets. The data is stored in the oobi section and
+will be cleared on power loss. On start, the data is read from the
+oobi section and then applied to each effecter/sensor. Entries
+that are not found are ignored but not removed from oobi
+persistence (could be a soley preboot/runtime effecter).
+
+Change-Id: Iacf19589b5cef876e1e503e948c35c296aa5c8dd
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index 6955625..4a49d79 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -49,6 +49,7 @@
+ 	size_t num_state_effecters;
+ 	struct pldm_pmc_get_pdr_repo_info_rsp pdr_repo_info;
+ 	bool log_requests;
++	struct hl_oobi_pldm_effecters oobi_effecters;
+ } state = {
+ 	.pdr_repo_info = {
+ 		.update_time = {
+@@ -845,6 +846,37 @@
+ 	return 0;
+ }
+ 
++static void pldm_persist_numeric_effecter(
++	struct pldm_numeric_effecter_entry *entry, struct hl_oobi_pldm_effecters *oobi)
++{
++	struct hl_oobi_pldm_numeric_effecter *item = NULL;
++	struct hl_oobi_pldm_numeric_effecter *empty = NULL;
++
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->numeric_effecters); i++) {
++		if (oobi->numeric_effecters[i].effecter_id ==
++		    entry->pdr->numeric_effecter.effecter_id) {
++			item = &oobi->numeric_effecters[i];
++			break;
++		}
++		if (!empty && oobi->numeric_effecters[i].effecter_id == 0)
++			empty = &oobi->numeric_effecters[i];
++	}
++
++	if (!item)
++		item = empty;
++
++	if (!item) {
++		LOG_ERR("%s: Failed to persist effecter %d: table full.", __func__,
++			entry->pdr->numeric_effecter.effecter_id);
++		return;
++	}
++
++	item->effecter_id = entry->pdr->numeric_effecter.effecter_id;
++	item->op_state = entry->state.op_state;
++	item->value = entry->state.present_value;
++	hl_oobi_pldm_effecter_persist_data(oobi);
++}
++
+ static int pldm_do_pmc_set_numeric_effecter_enable(
+ 	pldm_t pldm, void *arg, struct pldm_transport_msg *msg, k_timeout_t timeout)
+ {
+@@ -871,6 +903,8 @@
+ 	if (err)
+ 		return pldm_respond_error(pldm, msg, timeout, err);
+ 
++	pldm_persist_numeric_effecter(entry, &state->oobi_effecters);
++
+ 	err = pldm_resp_prepare(pldm, msg, 0);
+ 	if (err) {
+ 		LOG_ERR("%s: failed to prepare response: %d", __func__, err);
+@@ -886,6 +920,48 @@
+ 	return 0;
+ }
+ 
++static int pldm_update_numeric_effecter_value(
++	struct pldm_numeric_effecter_entry *entry,
++	pldm_sensor_value_t value)
++{
++	const struct pldm_pdr_numeric_effecter *pdr;
++
++	pdr = &entry->pdr->numeric_effecter;
++
++	/* check range of value being set */
++	if (value.u32 < pdr->min_settable || value.u32 > pdr->max_settable) {
++		LOG_WRN("%s: effecter %d: invalid value=%d min=%d max=%d",
++			__func__, pdr->effecter_id, value.u32, pdr->min_settable,
++			pdr->max_settable);
++		return MCTP_STATUS_ERROR_INVALID_DATA;
++	}
++
++	/* verify effecter state */
++	if (!is_effecter_settable(entry->state.op_state)) {
++		LOG_WRN("%s: effector %u in invalid state %d for set",
++			__func__, pdr->effecter_id, entry->state.op_state);
++		return MCTP_STATUS_ERROR_UNSUPPORTED;
++	}
++
++	if (entry->api.set) {
++		int err;
++
++		/* callback is responsible for all updates to state */
++		err = entry->api.set(pdr, &entry->state, value);
++		if (err) {
++			LOG_ERR("%s: error: effecter %u err %d",
++				__func__, pdr->effecter_id, err);
++			return err;
++		}
++	} else {
++		/* no callback; immediate update of state */
++		entry->state.pending_value = value;
++		entry->state.present_value = value;
++		entry->state.op_state = PLDM_PMC_EFFECTER_OP_STATE_ENABLED_NO_UPDATE_PENDING;
++	}
++	return 0;
++}
++
+ static int pldm_do_pmc_set_numeric_effecter_value(
+ 	pldm_t pldm, void *arg, struct pldm_transport_msg *msg, k_timeout_t timeout)
+ {
+@@ -893,7 +969,6 @@
+ 		&msg->pldm.req.pmc_set_numeric_effecter_value;
+ 	struct pldm_pmc_state *state = arg;
+ 	struct pldm_numeric_effecter_entry *entry;
+-	const struct pldm_pdr_numeric_effecter *pdr;
+ 	int err;
+ 
+ 	if (state->log_requests)
+@@ -908,36 +983,19 @@
+ 		return pldm_respond_error(pldm, msg, timeout,
+ 			PLDM_PMC_GET_NUMERIC_EFFECTER_VALUE_INVALID_EFFECTER_ID);
+ 	}
+-	pdr = &entry->pdr->numeric_effecter;
+-
+-	/* check range of value being set */
+-	if (req->value.u32 < pdr->min_settable || req->value.u32 > pdr->max_settable) {
+-		LOG_WRN("%s: invalid value=%d min=%d max=%d",
+-			__func__, req->value.u32, pdr->min_settable, pdr->max_settable);
+-		return pldm_respond_error(pldm, msg, timeout, MCTP_STATUS_ERROR_INVALID_DATA);
+-	}
+ 
+ 	/* verify effecter state */
+ 	if (!is_effecter_settable(entry->state.op_state)) {
+ 		LOG_WRN("%s: effector %u in invalid state %d for set",
+-			__func__, pdr->effecter_id, entry->state.op_state);
+-		return pldm_respond_error(pldm, msg, timeout, MCTP_STATUS_ERROR_UNSUPPORTED);
++			__func__, req->effecter_id, entry->state.op_state);
++		return MCTP_STATUS_ERROR_UNSUPPORTED;
+ 	}
+ 
+-	if (entry->api.set) {
+-		/* callback is responsible for all updates to state */
+-		err = entry->api.set(pdr, &entry->state, req->value);
+-		if (err) {
+-			LOG_ERR("%s: error: effecter %u err %d",
+-				__func__, pdr->effecter_id, err);
+-			return pldm_respond_error(pldm, msg, timeout, err);
+-		}
+-	} else {
+-		/* no callback; immediate update of state */
+-		entry->state.pending_value = req->value;
+-		entry->state.present_value = req->value;
+-		entry->state.op_state = PLDM_PMC_EFFECTER_OP_STATE_ENABLED_NO_UPDATE_PENDING;
+-	}
++	err = pldm_update_numeric_effecter_value(entry, req->value);
++	if (err)
++		return pldm_respond_error(pldm, msg, timeout, err);
++
++	pldm_persist_numeric_effecter(entry, &state->oobi_effecters);
+ 
+ 	err = pldm_resp_prepare(pldm, msg, 0);
+ 	if (err) {
+@@ -1059,6 +1117,39 @@
+ 	return 0;
+ }
+ 
++static void pldm_persist_state_effecter(
++	struct pldm_state_effecter_entry *entry, struct hl_oobi_pldm_effecters *oobi)
++{
++	struct hl_oobi_pldm_state_effecter *item = NULL;
++	struct hl_oobi_pldm_state_effecter *empty = NULL;
++	const struct pldm_pdr_state_effecter *pdr = &entry->pdr->state_effecter;
++
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->state_effecters); i++) {
++		if (oobi->state_effecters[i].effecter_id == pdr->effecter_id) {
++			item = &oobi->state_effecters[i];
++			break;
++		}
++		if (!empty && oobi->state_effecters[i].effecter_id == 0)
++			empty = &oobi->state_effecters[i];
++	}
++
++	if (!item)
++		item = empty;
++
++	if (!item) {
++		LOG_ERR("%s: Failed to persist state effecter %d: table full", __func__,
++			pdr->effecter_id);
++		return;
++	}
++
++	item->effecter_id = pdr->effecter_id;
++	for (size_t c = 0; c < ARRAY_SIZE(item->composite_state); c++) {
++		item->composite_state[c].op_state = entry->state[c].op_state;
++		item->composite_state[c].state = entry->state[c].present_state;
++	}
++	hl_oobi_pldm_effecter_persist_data(oobi);
++}
++
+ static int pldm_do_pmc_set_state_effecter_enables(
+ 	pldm_t pldm, void *arg, struct pldm_transport_msg *msg, k_timeout_t timeout)
+ {
+@@ -1082,6 +1173,8 @@
+ 	err = apply_state_effecter_enable(entry, req);
+ 	if (err)
+ 		return pldm_respond_error(pldm, msg, timeout, err);
++
++	pldm_persist_state_effecter(entry, &state->oobi_effecters);
+ 
+ 	err = pldm_resp_prepare(pldm, msg, 0);
+ 	if (err) {
+@@ -1199,6 +1292,7 @@
+ 	if (err)
+ 		return pldm_respond_error(pldm, msg, timeout, err);
+ 
++	pldm_persist_state_effecter(entry, &state->oobi_effecters);
+ 
+ 	err = pldm_resp_prepare(pldm, msg, 0);
+ 	if (err) {
+@@ -1500,6 +1594,91 @@
+ 	}
+ }
+ 
++static void pldm_restore_numeric_effecter(struct pldm_pmc_state *state,
++	struct hl_oobi_pldm_effecters *oobi)
++{
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->numeric_effecters); ++i) {
++		struct pldm_numeric_effecter_entry *entry;
++		int err;
++
++		if (oobi->numeric_effecters[i].effecter_id == 0)
++			continue;
++
++		entry = find_numeric_effecter(state, oobi->numeric_effecters[i].effecter_id);
++		if (!entry)
++			continue;
++
++		err = pldm_update_numeric_effecter_value(entry, oobi->numeric_effecters[i].value);
++		if (err)
++			LOG_INF("%s: effecter value not set:  effecter %u err %d",
++				__func__, oobi->numeric_effecters[i].effecter_id, err);
++
++		entry->state.op_state = oobi->numeric_effecters[i].op_state;
++	}
++}
++
++static void pldm_restore_composite_state_effecter(
++	int index,
++	struct pldm_state_effecter_entry *entry,
++	const struct pldm_pdr_possible_states *possible_states,
++	struct hl_oobi_pldm_state_effecter *effecter)
++{
++	if (!is_valid_state_effecter_state(possible_states,
++					   effecter->composite_state[index].state)) {
++		LOG_WRN("%s: id %u composite %u unsupported new state %u",
++			__func__, effecter->effecter_id, index,
++			effecter->composite_state[index].state);
++		return;
++	}
++
++	if (entry->api.set) {
++		int err;
++
++		/* callback is responsible for all updates to state */
++		err = entry->api.set(&entry->pdr->state_effecter, &entry->state[index],
++				     index, effecter->composite_state[index].state);
++		if (err)
++			LOG_ERR("%s: error: effecter %u err %d", __func__,
++				effecter->effecter_id, err);
++	} else {
++		entry->state[index].pending_state = effecter->composite_state[index].state;
++		entry->state[index].present_state = effecter->composite_state[index].state;
++	}
++
++	entry->state[index].op_state = effecter->composite_state[index].op_state;
++}
++
++static void pldm_restore_state_effecter(struct pldm_pmc_state *state,
++	struct hl_oobi_pldm_effecters *oobi)
++{
++	struct hl_oobi_pldm_state_effecter *effecters = oobi->state_effecters;
++
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->state_effecters); i++) {
++		struct pldm_state_effecter_entry *entry;
++		const struct pldm_pdr_state_effecter *pdr;
++
++		if (oobi->state_effecters[i].effecter_id == 0)
++			continue;
++
++		entry = find_state_effecter(state, effecters[i].effecter_id);
++		if (!entry)
++			continue;
++
++		pdr = &entry->pdr->state_effecter;
++		for (size_t c = 0; c < ARRAY_SIZE(effecters[i].composite_state); c++)
++			pldm_restore_composite_state_effecter(c, entry, &pdr->possible_states[c],
++							      &effecters[i]);
++	}
++}
++
++static void pldm_restore_effecters(struct hl_oobi_pldm_effecters *oobi)
++{
++	hl_oobi_pldm_effecter_restore_data(oobi);
++
++	pldm_restore_numeric_effecter(&state, oobi);
++	pldm_restore_state_effecter(&state, oobi);
++}
++
+ void pldm_pmc_init_ex(pldm_t pldm, const struct pldm_pmc_init_data *init_data)
+ {
+ 	for (size_t i = 0; i < init_data->num_records; i++) {
+@@ -1532,6 +1711,8 @@
+ 	validate_pdrs(&state.pdr_repo_info);
+ 
+ 	pldm_handler_add(pldm, &pldm_pmc_handler_table);
++
++	pldm_restore_effecters(&state.oobi_effecters);
+ }
+ 
+ void pldm_pmc_log_requests(bool enable)
+diff --git a/src/sensord.c b/src/sensord.c
+index df88a3e..b16ba1e 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -7,6 +7,7 @@
+ 
+ #include <zephyr/sys_clock.h>
+ 
++#include <oobi.h>
+ #include <pldm.h>
+ #include <sensord.h>
+ #include <pldm_arch_common.h>
+@@ -43,6 +44,8 @@
+ 	uint64_t timestamp_save;
+ 
+ 	size_t pause_counter;
++
++	struct hl_oobi_pldm_sensors oobi;
+ } sensord_state;
+ 
+ static sensord_before_read_callback_fn_t sensord_before_read_callback;
+@@ -502,6 +505,20 @@
+ 		k_ticks_to_ms_ceil32(sys_clock_tick_get() - start_time));
+ }
+ 
++static int sensord_oobi_remove_sensor_thresholds(
++	struct hl_oobi_pldm_sensors *oobi, uint16_t sensor_id)
++{
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->sensor_thresholds); i++) {
++		if (oobi->sensor_thresholds[i].sensor_id == sensor_id) {
++			oobi->sensor_thresholds[i].sensor_id = 0;
++			hl_oobi_pldm_sensor_persist_data(oobi);
++
++			return 0;
++		}
++	}
++	return 0;
++}
++
+ int sensord_restore_thresholds(uint16_t sensor_id)
+ {
+ 	struct sensord_sensor_entry *sensor;
+@@ -577,6 +594,11 @@
+ 	}
+ 
+ 	state->polled = false;
++
++	/* We've restored the default thresholds, so just delete the data from
++	 * oobi persistence
++	 */
++	sensord_oobi_remove_sensor_thresholds(&sensord_state.oobi, sensor_id);
+ 
+ 	k_spin_unlock(&sensord_state.lock, key);
+ 
+@@ -658,6 +680,23 @@
+ 	}
+ }
+ 
++static void sensord_oobi_load_thresholds(void)
++{
++	struct hl_oobi_pldm_sensor_threshold *thresholds;
++
++	hl_oobi_pldm_sensor_restore_data(&sensord_state.oobi);
++
++	thresholds = sensord_state.oobi.sensor_thresholds;
++
++	for (size_t i = 0; i < ARRAY_SIZE(sensord_state.oobi.sensor_thresholds); i++) {
++		if (thresholds[i].sensor_id == 0)
++			continue;
++
++		sensord_update_thresholds(thresholds[i].sensor_id,
++					  &thresholds[i].thresholds);
++	}
++}
++
+ static int sensord_init_all_sensors(void)
+ {
+ 	uint8_t current_platform = pldm_get_current_platform();
+@@ -697,6 +736,8 @@
+ 			return -EINVAL;
+ 		}
+ 	}
++
++	sensord_oobi_load_thresholds();
+ 
+ 	return 0;
+ }
+@@ -954,6 +995,33 @@
+ 		values->lower_threshold_warning.u32 = thresh_values->lower_threshold_warning.u32;
+ }
+ 
++static void sensord_persist_sensor_thresholds(
++	struct hl_oobi_pldm_sensors *oobi, uint16_t sensor_id,
++	struct pldm_pmc_threshold_data *thresholds)
++{
++	struct hl_oobi_pldm_sensor_threshold *item = NULL;
++	struct hl_oobi_pldm_sensor_threshold *empty = NULL;
++
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->sensor_thresholds); i++) {
++		if (oobi->sensor_thresholds[i].sensor_id == sensor_id) {
++			item = &oobi->sensor_thresholds[i];
++			break;
++		}
++		if (!empty && oobi->sensor_thresholds[i].sensor_id == 0)
++			empty = &oobi->sensor_thresholds[i];
++	}
++	if (!item)
++		item = empty;
++	if (!item) {
++		LOG_ERR("%s: Failed to persist thresholds  %d: table_full", __func__, sensor_id);
++		return;
++	}
++
++	item->sensor_id = sensor_id;
++	item->thresholds = *thresholds;
++	hl_oobi_pldm_sensor_persist_data(oobi);
++}
++
+ int sensord_update_thresholds(
+ 	uint16_t sensor_id,
+ 	struct pldm_pmc_threshold_data *thresholds)
+@@ -1013,6 +1081,8 @@
+ 	if (!res)
+ 		state->polled = false;
+ 
++	sensord_persist_sensor_thresholds(&sensord_state.oobi, sensor_id,
++					  thresholds);
+ 	k_spin_unlock(&sensord_state.lock, key);
+ 
+ 	return res;

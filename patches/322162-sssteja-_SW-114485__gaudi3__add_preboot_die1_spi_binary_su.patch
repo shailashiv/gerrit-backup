@@ -1,0 +1,108 @@
+From 1137ef59178165333fe6224932db41c7a1142aec Mon Sep 17 00:00:00 2001
+From: sai surya teja <sssteja@habana.ai>
+Date: Fri, 17 Nov 2023 17:18:51 +0200
+Subject: [PATCH] [SW-114485] gaudi3: add preboot die1 spi binary support
+
+This patch adds preboot die1 pldm spi binary support.
+Preboot die1 binary is added to sector 20 in gaudi3 spi binary.
+
+Change-Id: If304b05bafac0080d255fefe44597498bab6080e
+---
+
+diff --git a/board/habanalabs/common/post-image-spi-arc_global.sh b/board/habanalabs/common/post-image-spi-arc_global.sh
+index c58350d..00bd867 100755
+--- a/board/habanalabs/common/post-image-spi-arc_global.sh
++++ b/board/habanalabs/common/post-image-spi-arc_global.sh
+@@ -303,6 +303,9 @@
+ 	# Pad preboot binary and then pack
+ 	zephyr_preboot_pack ${PREBOOT_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+ 
++	# Pad die1 preboot binary and then pack
++	zephyr_preboot_d1_pack ${PREBOOT_D1_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
++
+ 	## To be populated into FW SRAM
+ 
+ 	# create combined name of ppboot and pcie
+@@ -344,12 +347,14 @@
+ 	swap_file ${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.le ${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.be
+ 	swap_file  ${DEV_PREFIX}-images-pointers.bin.le  ${DEV_PREFIX}-images-pointers.bin.be
+ 	swap_file ${DEV_PREFIX}-fake-fuse.bin.le ${DEV_PREFIX}-fake-fuse.bin.be
++	swap_file ${DEV_PREFIX}-preboot_d1.bin.le ${DEV_PREFIX}-preboot_d1.bin.be
+ 
+ 	create_spi_image ${DEV_PREFIX}-spi-flash.bin.nocrc ${DEV_PREFIX}-security-arc.bin.${ENDIANNESS} \
+ 			 ${DEV_PREFIX}-images-pointers.bin.${ENDIANNESS} ${DEV_PREFIX}-preboot.bin.${ENDIANNESS} \
+ 			 ${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.${ENDIANNESS} ${DEV_PREFIX}-erom.bin.${ENDIANNESS} \
+ 			 ${DEV_PREFIX}-fake-fuse.bin.${ENDIANNESS} \
+-			 ${DEV_PREFIX}-${PIF_ICCM_BINFILE}.${ENDIANNESS} ${DEV_PREFIX}-${PIF_DCCM_BINFILE}.${ENDIANNESS}
++			 ${DEV_PREFIX}-${PIF_ICCM_BINFILE}.${ENDIANNESS} ${DEV_PREFIX}-${PIF_DCCM_BINFILE}.${ENDIANNESS} \
++			 ${DEV_PREFIX}-preboot_d1.bin.${ENDIANNESS}
+ 
+ 	# Prepare checksum
+ 	CKSUM=`${SHA_CHKSUM} ${DEV_PREFIX}-spi-flash.bin.nocrc | cut -d' ' -f1`
+diff --git a/board/habanalabs/gaudi2_arc/post-image-spi.sh b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+index 1ad2a91..8332655 100755
+--- a/board/habanalabs/gaudi2_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+@@ -61,8 +61,8 @@
+ function hl_copy_binaries {
+ 	# hl_copy_binaries function is called from post-image-spi-arc_global.sh
+ 	# common script. All the binaries required for creation of spi
+-	# are compiled as part of gaudi2_arc HL_TARGET so nothing needs
+-	# to be done here.
++	# are compiled as part of gaudi2_arc HL_TARGET
++	touch ${DEV_PREFIX}-preboot_d1.bin.le
+ 	return
+ }
+ 
+@@ -522,6 +522,11 @@
+ 	mv preboot-orig.bin ${PREBOOT_BINFILE}
+ }
+ 
++function zephyr_preboot_d1_pack {
++	# dummy function, not supported for gaudi2
++	return
++}
++
+ function prep_image_fake_fuse {
+ 	touch $1
+ }
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index 6bcdfad..e4679b1 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -232,6 +232,10 @@
+ 	return
+ }
+ 
++function zephyr_preboot_d1_pack {
++	zephyr_preboot_pack $1 $2 $3 $4
++}
++
+ function calculate_hash {
+ 	IN=$1
+ 	OUT=$2
+@@ -249,6 +253,7 @@
+ 	local FAKE_FUSE_BIN=${7}
+ 	local PIF_ICCM_BIN=${8}
+ 	local PIF_DCCM_BIN=${9}
++	local PREBOOT_D1_BIN=${10}
+ 
+ 	# Create dummy binary for EROM (sector 0, 1)
+ 	dd status=none conv=sync bs=128K if=${EROM_BIN}		> ${OUTF}
+@@ -273,8 +278,14 @@
+ 	# Preboot2 (sector 12, 13, 14, 15)
+ 	dd status=none conv=sync bs=256K	if=${PREBOOT_BIN}	>> ${OUTF}
+ 
+-	# empty (sector 16, 17, 18, 19, 20, 21, 22)
+-	dd status=none conv=sync bs=448K count=1 if=/dev/zero	>> ${OUTF}
++	# empty (sector 16, 17, 18, 19)
++	dd status=none conv=sync bs=256K count=1 if=/dev/zero	>> ${OUTF}
++
++	# Preboot D1 (sector 20) single sector(64K) is enough for preboot D1
++	dd status=none conv=sync bs=64K	if=${PREBOOT_D1_BIN}	>> ${OUTF}
++
++	# empty (sector 22)
++	dd status=none conv=sync bs=128K count=1 if=/dev/zero	>> ${OUTF}
+ 
+ 	# FAKE_FUSE (sector 23)
+ 	dd status=none conv=sync bs=64K	if=${FAKE_FUSE_BIN}	>> ${OUTF}

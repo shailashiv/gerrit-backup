@@ -1,0 +1,230 @@
+From 82bca7b50cc76ae39c3acfa9a3ac9e6a37e24f46 Mon Sep 17 00:00:00 2001
+From: Shivani Raval <sraval@habana.ai>
+Date: Mon, 22 Jul 2024 15:55:32 +0300
+Subject: [PATCH] [SW-182688] gaudi3: remapped binned component info
+
+While running TPC event test, in second iteration it is
+failing as we are not clearning interrupt correctly.
+So, remmaped all binning components interrupt
+correctly.
+
+Change-Id: I0b135c6c70cc5d1a3ff2fd633b3d779e526b5da2
+Signed-off-by: Shivani Raval <sraval@habana.ai>
+---
+
+diff --git a/src/gaudi3/interrupt.c b/src/gaudi3/interrupt.c
+index 34ab4a7..935a161 100644
+--- a/src/gaudi3/interrupt.c
++++ b/src/gaudi3/interrupt.c
+@@ -283,7 +283,7 @@
+ 	return 0;
+ }
+ 
+-static void gaudi3_update_comp_interrupt_map(struct hl_event_config *config,
++static void gaudi3_update_binned_comp_interrupt_map(struct hl_event_config *config,
+ 					     struct gaudi3_async_events_ids_map *intr_map)
+ {
+ 	uint32_t i;
+@@ -295,7 +295,18 @@
+ 				(gaudi3_irq_map_table[i].comp_type == intr_map->comp_type) &&
+ 				(gaudi3_irq_map_table[i].die_id == intr_map->die_id)) {
+ 			intr_map->cpu_id = gaudi3_irq_map_table[i].cpu_id;
+-			intr_map->index = gaudi3_irq_map_table[i].index;
++
++			/*
++			 * 1. For binned component, For SPI interrupt first index is for
++			 *    SPMU/BMON and second index gives correct cause so we have
++			 *    to increment it to get correct interrupt cause.
++			 * 2. Currently this is applicable for ROT, DEC and TPC components.
++			 */
++			if ((intr_map->grp_type == INT_GRP_TYPE_SPI) && (!(intr_map->index % 2)))
++				intr_map->index = gaudi3_irq_map_table[i].index + 1;
++			else
++				intr_map->index = gaudi3_irq_map_table[i].index;
++
+ 			return;
+ 		}
+ 	}
+@@ -793,7 +804,7 @@
+ 			      enum hl_intr_action action)
+ {
+ 	struct gaudi3_redundancy_ctx *ctx = &config->dev_data->redun_ctx;
+-	uint8_t idx, hdcore_offset, hdcore, inst;
++	uint8_t idx, hdcore_offset, hdcore, inst, intr_hdcore;
+ 
+ 	/*
+ 	 * comp_inst 8 indicates spare TPC is been used and needs
+@@ -802,21 +813,38 @@
+ 	 * 2. Every Dcore has 1 spare TPC engine, hence 1 of the 16 TPCs
+ 	 *    of the DCORE can be binned out.
+ 	 * 3. The spare TPC is replacing the binned out TPC, and not used otherwise.
+-	 * 4. Spare TPCs are part of HDCORE0 and HDCORE2
++	 * 4. Spare TPCs are part of HDCORE0 and HDCORE2 in die0
++	 * 5. Spare TPCs are part of HDCORE1 and HDCORE3 in die1
+ 	 */
+ 	if ((action != HL_UNMASK_INTR) && (intr_map->comp_inst != GAUDI3_NUM_TPC_PER_HDCORE))
+ 		return;
++
++	/*
++	 * 1. hdcore_offset: Each HDcore has 8 TPC This variable is used when to map in case of
++	 *    mask, if TPC more than 8 then search in next HDcore.
++	 * 2. intr_hdcore: This variable used to find the spare TPC in case of unmask like
++	 *    for die 0 spare TPC is in HDcore 1/HDcore 3 and
++	 *    for die 1 spare TPC is in HDcore 0/HDcore 2.
++	 */
+ 
+ 	switch (intr_map->hdcore_type) {
+ 	case 0:
+ 	case 1:
+ 		idx = 0;
+ 		hdcore_offset = 0;
++		if (intr_map->die_id)
++			intr_hdcore = 1;
++		else
++			intr_hdcore = 0;
+ 		break;
+ 	case 2:
+ 	case 3:
+ 		idx = 1;
+ 		hdcore_offset = 2;
++		if (intr_map->die_id)
++			intr_hdcore = 3;
++		else
++			intr_hdcore = 2;
+ 		break;
+ 	default:
+ 		return;
+@@ -833,12 +861,13 @@
+ 		if ((inst != intr_map->comp_inst) || (hdcore != intr_map->hdcore_type))
+ 			return;
+ 		intr_map->comp_inst = GAUDI3_NUM_TPC_PER_HDCORE;
+-		intr_map->hdcore_type = hdcore_offset;
+-		gaudi3_update_comp_interrupt_map(config, intr_map);
++		intr_map->hdcore_type = intr_hdcore;
++		gaudi3_update_binned_comp_interrupt_map(config, intr_map);
++
+ 	} else {
+ 		binned_intr_map->comp_inst = inst;
+ 		binned_intr_map->hdcore_type = hdcore;
+-		gaudi3_update_comp_interrupt_map(config, binned_intr_map);
++		gaudi3_update_binned_comp_interrupt_map(config, binned_intr_map);
+ 	}
+ }
+ 
+@@ -851,7 +880,8 @@
+ 	uint8_t inst, hdcore;
+ 
+ 	/*
+-	 * Last VDEC of die (ie. hdcore 3, vdec = 1) is spare VDEC
++	 * VDEC of die0 (ie. hdcore 3, vdec = 1) is spare VDEC
++	 * VDEC of die1 (ie. hdcore 0, vdec = 1) is spare VDEC
+ 	 * 1. For each die, up to one of the decoders can be binned out
+ 	 * 2. Binning is performed per die: a faulty decoder is replaced
+ 	 *    by a spare decoder on the same die
+@@ -871,12 +901,18 @@
+ 			return;
+ 
+ 		intr_map->comp_inst = 1;
+-		intr_map->hdcore_type = 3;
+-		gaudi3_update_comp_interrupt_map(config, intr_map);
++
++		if (intr_map->die_id)
++			intr_map->hdcore_type = 0;
++		else
++			intr_map->hdcore_type = 3;
++
++		gaudi3_update_binned_comp_interrupt_map(config, intr_map);
++
+ 	} else {
+ 		binned_intr_map->comp_inst = inst;
+ 		binned_intr_map->hdcore_type = hdcore;
+-		gaudi3_update_comp_interrupt_map(config, binned_intr_map);
++		gaudi3_update_binned_comp_interrupt_map(config, binned_intr_map);
+ 	}
+ }
+ 
+@@ -889,10 +925,12 @@
+ 	uint8_t hdcore, inst;
+ 
+ 	/*
+-	 * Last ROT of die (ie. hdcore 3, rot = 1) is spare ROT
++	 * ROT of die0 (ie. hdcore 3, rot = 1) is spare ROT
++	 * ROT of die1 (ie. hdcore 0, rot = 1) is spare ROT
+ 	 * 1. Each die has 4 rotator, 2 rotators per dcore.
+ 	 * 2. 1 of the 4 rotator in a die can be binned out.
+-	 * 3. ROT are placed in HDCORE1 and HDCORE3 (2 per HDCORE)
++	 * 3. ROT are placed in HDCORE1 and HDCORE3 (2 per HDCORE) in die0
++	 * 4. ROT are placed in HDCORE0 and HDCORE2 (2 per HDCORE) in die1
+ 	 */
+ 	if ((action != HL_UNMASK_INTR) &&
+ 		((intr_map->hdcore_type != 3) || (intr_map->comp_inst != 1)))
+@@ -904,22 +942,37 @@
+ 
+ 	if (ctx->redundant_rot[intr_map->die_id][0] != GAUDI3_NO_FAULTY_ROT) {
+ 		inst = ctx->redundant_rot[intr_map->die_id][0];
+-		hdcore = 1;
++
++		if (intr_map->die_id)
++			hdcore = 2;
++		else
++			hdcore = 1;
++
+ 	} else {
+ 		inst = ctx->redundant_rot[intr_map->die_id][1];
+-		hdcore = 3;
++
++		if (intr_map->die_id)
++			hdcore = 0;
++		else
++			hdcore = 3;
+ 	}
+ 
+ 	if (action == HL_UNMASK_INTR) {
+ 		if ((inst != intr_map->comp_inst) || (hdcore != intr_map->hdcore_type))
+ 			return;
+ 		intr_map->comp_inst = 1;
+-		intr_map->hdcore_type = 3;
+-		gaudi3_update_comp_interrupt_map(config, intr_map);
++
++		if (intr_map->die_id)
++			intr_map->hdcore_type = 0;
++		else
++			intr_map->hdcore_type = 3;
++
++		gaudi3_update_binned_comp_interrupt_map(config, intr_map);
++
+ 	} else {
+ 		binned_intr_map->comp_inst = inst;
+ 		binned_intr_map->hdcore_type = hdcore;
+-		gaudi3_update_comp_interrupt_map(config, binned_intr_map);
++		gaudi3_update_binned_comp_interrupt_map(config, binned_intr_map);
+ 	}
+ }
+ 
+@@ -4417,7 +4470,7 @@
+ 			intr_map.comp_type = INT_COMP_TYPE_TPC;
+ 			for (k = 0; k < INT_GRP_TYPE_MAX; k++)	{
+ 				intr_map.grp_type = k;
+-				gaudi3_update_comp_interrupt_map(config, &intr_map);
++				gaudi3_update_binned_comp_interrupt_map(config, &intr_map);
+ 				hl_intr_mask_interrupt(config->hl_intr_dev,
+ 					SOC_AGGREGATE_IRQ(intr_map.index, intr_map.cpu_id));
+ 			}
+@@ -4444,7 +4497,7 @@
+ 		intr_map.comp_type = INT_COMP_TYPE_ROT;
+ 		for (k = 0; k < INT_GRP_TYPE_MAX; k++)	{
+ 			intr_map.grp_type = k;
+-			gaudi3_update_comp_interrupt_map(config, &intr_map);
++			gaudi3_update_binned_comp_interrupt_map(config, &intr_map);
+ 			hl_intr_mask_interrupt(config->hl_intr_dev,
+ 				SOC_AGGREGATE_IRQ(intr_map.index, intr_map.cpu_id));
+ 		}
+@@ -4464,7 +4517,7 @@
+ 		intr_map.comp_type = INT_COMP_TYPE_DEC;
+ 		for (k = 0; k < INT_GRP_TYPE_MAX; k++)	{
+ 			intr_map.grp_type = k;
+-			gaudi3_update_comp_interrupt_map(config, &intr_map);
++			gaudi3_update_binned_comp_interrupt_map(config, &intr_map);
+ 			hl_intr_mask_interrupt(config->hl_intr_dev,
+ 				SOC_AGGREGATE_IRQ(intr_map.index, intr_map.cpu_id));
+ 		}

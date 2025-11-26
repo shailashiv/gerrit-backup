@@ -1,0 +1,74 @@
+From ac2b6aeb08e832589b2f352e483ba1e07168f79d Mon Sep 17 00:00:00 2001
+From: Vadim Idelchuk <vadim.idelchuk@intel.com>
+Date: Tue, 10 Jun 2025 15:50:58 +0300
+Subject: [PATCH] [SW-227587] g2: nic: add timer for solving nic_sts_event problem
+
+OAM sends NIC STS events to LKD immediately after receiving PCIe
+enable event from LKD. But because callback that responsible for sending
+ack to NIC STS event is part of dependent driver, the ack is not sent.
+Adding watch-dog timer per NIC STS event with timeout 10 seconds enable
+to repeat the loop with sending NIC STS events to LKD. At this time
+dependent driver already loaded and its callback sends ack as required
+
+Change-Id: Ibb16b75d43ff86753629b2d41bbe44fdba90cf37
+Signed-off-by: Vadim Idelchuk <vadim.idelchuk@intel.com>
+---
+
+diff --git a/arch/gaudi2/device.c b/arch/gaudi2/device.c
+index ff720ca..3638f7a 100644
+--- a/arch/gaudi2/device.c
++++ b/arch/gaudi2/device.c
+@@ -269,6 +269,11 @@
+ 			remove_irq_by_index(unmask_pkt, i);
+ }
+ 
++#define GAUDI2_NUM_OF_PORTS	24
++#define NIC_STS_TO		(10 * 1000)
++
++static struct k_timer nic_wd_timers[GAUDI2_NUM_OF_PORTS];
++
+ int hl_unmask_nic_sts_events(uint32_t *event_ids, unsigned int len)
+ {
+ 	uint32_t event_id, mask;
+@@ -283,6 +288,9 @@
+ 			k_sched_lock();
+ 			nic_sts_mask &= ~BIT(mask);
+ 			k_sched_unlock();
++
++			/* Restart WD timer */
++			k_timer_start(&nic_wd_timers[mask], K_MSEC(NIC_STS_TO), K_MSEC(NIC_STS_TO));
+ 		} else {
+ 			rc = 1;
+ 		}
+@@ -315,7 +323,15 @@
+ 		LOG_ERR("Failed to submit eq entry %u, err: %d", event, err);
+ }
+ 
+-#define GAUDI2_NUM_OF_PORTS		24
++static void nic_wd_timer_func(struct k_timer *timer)
++{
++	int nic = (int)k_timer_user_data_get(timer);
++
++	LOG_INF("NIC %d STS ACK no received - resend NIC STS packet", nic);
++
++	nic_sts_mask &= ~BIT(nic);
++}
++
+ #define NIC_STATUS_INTS_REG_DELAY_MS	100
+ #define NIC_STATUS_REQUEST_ELAPSE_MS	(5 * 1000)
+ #define NIC_STATUS_REQUEST_DELAY_MS	(NIC_STATUS_REQUEST_ELAPSE_MS / GAUDI2_NUM_OF_PORTS)
+@@ -336,6 +352,14 @@
+ 	while (!boot_status->lkd_eq_ready)
+ 		k_msleep(NIC_STATUS_INTS_REG_DELAY_MS);
+ 
++	/* Create WD timers with delay 10 seconds for unmasking NICs status events */
++	for (; i < GAUDI2_NUM_OF_PORTS; ++i) {
++		k_timer_init(&nic_wd_timers[i], nic_wd_timer_func, NULL);
++		k_timer_user_data_set(&nic_wd_timers[i], (void *)i);
++		k_timer_start(&nic_wd_timers[i], K_MSEC(NIC_STS_TO), K_MSEC(NIC_STS_TO));
++	}
++
++	i = 0;
+ 	while (1) {
+ 		if (nic_mask & BIT(i))
+ 			gaudi2_send_nic_sts_event(GAUDI2_EVENT_CPU0_STATUS_NIC0_ENG0 + i);

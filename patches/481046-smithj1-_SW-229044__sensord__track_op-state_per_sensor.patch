@@ -1,0 +1,327 @@
+From a1183449eba07003fd60232f950c44bff24cca1e Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Sun, 18 May 2025 09:04:40 -0400
+Subject: [PATCH] [SW-229044] sensord: track op-state per sensor
+
+For state sensors, track the operational state per composite sensor
+rather than a single state for the overall state sensor.  This is
+needed because it is the composite sensors that can be individually
+enabled/disabled, not the overall state sensor.
+
+This increases the memory needed to track state by 16 bytes per
+sensor.  In preboot this adds 928 bytes total.  In mgmt the
+sensor state is allocated dynamically out of the HBM memory pool.
+
+Change-Id: I1a49159834af877d419548ea249e3d5447e01acc
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/include/sensord.h b/include/sensord.h
+index 2da5d7d..37166b5 100644
+--- a/include/sensord.h
++++ b/include/sensord.h
+@@ -11,6 +11,7 @@
+ #include <pldm_base.h>
+ 
+ struct sensord_sensor_value_single {
++	pldm_sensor_op_state_t operational_state;
+ 	pldm_data_size_t data_size;
+ 	pldm_sensor_threshold_t present_state;
+ 	pldm_sensor_threshold_t previous_state;
+@@ -20,6 +21,7 @@
+ };
+ 
+ struct sensord_sensor_value_composite_element {
++	pldm_sensor_op_state_t operational_state;
+ 	uint8_t present_state;
+ 	uint8_t previous_state;
+ 	uint8_t event_state;
+@@ -31,7 +33,6 @@
+ };
+ 
+ struct sensord_sensor_value {
+-	pldm_sensor_op_state_t operational_state;
+ 	union {
+ 		struct sensord_sensor_value_single single;
+ 		struct sensord_sensor_value_composite composite;
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index 71b2a40..f722b85 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -505,7 +505,7 @@
+ 	}
+ 
+ 	rsp->data_size			= value.single.data_size;
+-	rsp->operational_state		= value.operational_state;
++	rsp->operational_state		= value.single.operational_state;
+ 	rsp->event_message_enable	= PLDM_SENSOR_EVENT_NONE;
+ 	rsp->present_state		= value.single.present_state;
+ 	rsp->previous_state		= value.single.previous_state;
+@@ -750,10 +750,13 @@
+ 
+ 	rsp->composite_sensor_count = composite->count;
+ 	for (i = 0; i < composite->count; ++i) {
+-		rsp->state_fields[i].sensor_operational_state = value.operational_state;
+-		rsp->state_fields[i].present_state = composite->element[i].present_state;
+-		rsp->state_fields[i].previous_state = composite->element[i].previous_state;
+-		rsp->state_fields[i].event_state = composite->element[i].event_state;
++		struct sensord_sensor_value_composite_element *element =
++				&composite->element[i];
++
++		rsp->state_fields[i].sensor_operational_state = element->operational_state;
++		rsp->state_fields[i].present_state = element->present_state;
++		rsp->state_fields[i].previous_state = element->previous_state;
++		rsp->state_fields[i].event_state = element->event_state;
+ 	}
+ 
+ 	err = pldm_resp_send(pldm, msg, timeout);
+diff --git a/src/sensord.c b/src/sensord.c
+index 0b98b42..67b8d37 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -123,11 +123,10 @@
+ 				struct sensord_sensor_state *state,
+ 				struct sensord_sample *sample)
+ {
+-	state->value.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+-
+ 	switch (sensor->pdr->common.type) {
+ 	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
+ 	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
++		state->value.single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 		state->value.single.present_reading = sample->single;
+ 		state->value.single.previous_state = state->value.single.present_state;
+ 		state->value.single.present_state = PLDM_SENSOR_THRESHOLD_NORMAL;
+@@ -139,6 +138,7 @@
+ 				&state->value.composite.element[i];
+ 			uint8_t initial_state = element->present_state;
+ 
++			element->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 			element->present_state = sample->composite[i];
+ 			element->event_state = element->present_state;
+ 
+@@ -149,9 +149,9 @@
+ 	}
+ }
+ 
+-static bool sensor_is_updatable(const struct sensord_sensor_state *state)
++static bool is_op_state_updatable(pldm_sensor_op_state_t operational_state)
+ {
+-	switch (state->value.operational_state) {
++	switch (operational_state) {
+ 	case PLDM_SENSOR_OP_STATE_FAILED:
+ 	case PLDM_SENSOR_OP_STATE_ENABLED:
+ 		return true;
+@@ -167,10 +167,35 @@
+ 	return false;
+ }
+ 
+-static bool sensor_is_updatable_safe(const struct sensord_sensor_state *state)
++static bool sensor_is_updatable(
++	const struct sensord_sensor_entry *sensor,
++	const struct sensord_sensor_state *state)
++{
++	switch (sensor->pdr->common.type) {
++	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
++	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
++		return is_op_state_updatable(state->value.single.operational_state);
++	case PLDM_PDR_TYPE_STATE_SENSOR:
++		for (size_t i = 0; i < state->value.composite.count; ++i) {
++			const struct sensord_sensor_value_composite_element *element =
++				&state->value.composite.element[i];
++
++			/* updatable if any composite sensor is updateable */
++			if (is_op_state_updatable(element->operational_state))
++				return true;
++		}
++		break;
++	}
++
++	return false;
++}
++
++static bool sensor_is_updatable_safe(
++	const struct sensord_sensor_entry *sensor,
++	const struct sensord_sensor_state *state)
+ {
+ 	k_spinlock_key_t key = k_spin_lock(&sensord_state.lock);
+-	bool updatable = sensor_is_updatable(state);
++	bool updatable = sensor_is_updatable(sensor, state);
+ 
+ 	k_spin_unlock(&sensord_state.lock, key);
+ 	return updatable;
+@@ -179,10 +204,10 @@
+ /* return true if we transitioned to error */
+ static bool set_numeric_sensor_failed(struct sensord_sensor_value *value)
+ {
+-	switch (value->operational_state) {
++	switch (value->single.operational_state) {
+ 	case PLDM_SENSOR_OP_STATE_ENABLED:
+ 		/* only transition to FAILED if currently ENABLED */
+-		value->operational_state = PLDM_SENSOR_OP_STATE_FAILED;
++		value->single.operational_state = PLDM_SENSOR_OP_STATE_FAILED;
+ 		value->single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 		value->single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 		value->single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+@@ -205,31 +230,37 @@
+ /* return true if we transitioned to error */
+ static bool set_state_sensor_failed(struct sensord_sensor_value *value)
+ {
+-	switch (value->operational_state) {
+-	case PLDM_SENSOR_OP_STATE_ENABLED:
+-		/* only transition to FAILED if currently ENABLED */
+-		break;
+-	case PLDM_SENSOR_OP_STATE_FAILED:
+-	case PLDM_SENSOR_OP_STATE_DISABLED:
+-		return false;
+-	case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
+-	case PLDM_SENSOR_OP_STATE_INITIALIZING:
+-	case PLDM_SENSOR_OP_STATE_IN_TEST:
+-	case PLDM_SENSOR_OP_STATE_UNKNOWN:
+-	case PLDM_SENSOR_OP_STATE_SHUTTING_DOWN:
+-		/* ignore currently unsupported states */
+-		return false;
+-	}
+-
+-	value->operational_state = PLDM_SENSOR_OP_STATE_FAILED;
++	bool modified = false;
+ 
+ 	for (uint8_t i = 0; i < value->composite.count; ++i) {
+-		value->composite.element[i].present_state = 0;
+-		value->composite.element[i].previous_state = 0;
+-		value->composite.element[i].event_state = 0;
++		struct sensord_sensor_value_composite_element *element =
++			&value->composite.element[i];
++
++		switch (element->operational_state) {
++		case PLDM_SENSOR_OP_STATE_ENABLED:
++			/* only transition to FAILED if currently ENABLED */
++			break;
++		case PLDM_SENSOR_OP_STATE_FAILED:
++		case PLDM_SENSOR_OP_STATE_DISABLED:
++			continue;
++		case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
++		case PLDM_SENSOR_OP_STATE_INITIALIZING:
++		case PLDM_SENSOR_OP_STATE_IN_TEST:
++		case PLDM_SENSOR_OP_STATE_UNKNOWN:
++		case PLDM_SENSOR_OP_STATE_SHUTTING_DOWN:
++			/* ignore currently unsupported states */
++			continue;
++		}
++
++		element->operational_state = PLDM_SENSOR_OP_STATE_FAILED;
++		element->present_state = 0;
++		element->previous_state = 0;
++		element->event_state = 0;
++
++		modified = true;
+ 	}
+ 
+-	return true;
++	return modified;
+ }
+ 
+ static bool sensord_process_numeric_sensor(
+@@ -249,7 +280,7 @@
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+ 	/* May have received a DISABLE during the poll; verify sensor is still enabled */
+-	if (!sensor_is_updatable(state))
++	if (!sensor_is_updatable(sensor, state))
+ 		goto unlock;
+ 
+ 	if (err)
+@@ -283,7 +314,7 @@
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+ 	/* May have received a DISABLE during the poll; verify sensor is still enabled */
+-	if (!sensor_is_updatable(state))
++	if (!sensor_is_updatable(sensor, state))
+ 		goto unlock;
+ 
+ 	if (err)
+@@ -420,7 +451,7 @@
+ 		/* Opportunistic check whether the sensor is enabled.  Will recheck
+ 		 * later after the poll is complete but before any changes are made.
+ 		 */
+-		if (!sensor_is_updatable_safe(state))
++		if (!sensor_is_updatable_safe(sensor, state))
+ 			continue;
+ 
+ 		if (sensord_before_read_callback)
+@@ -551,7 +582,7 @@
+ {
+ 	struct sensord_sensor_value *value = &state->value;
+ 
+-	value->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
++	value->single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 	value->single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 	value->single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 	value->single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+@@ -595,6 +626,7 @@
+ 		}
+ 		return -EINVAL;
+ 	}
++
+ 	value->single.data_size = PLDM_DATA_SIZE_UINT32;
+ 	sensord_restore_thresholds(get_sensor_id(sensor));
+ 
+@@ -607,9 +639,16 @@
+ {
+ 	struct sensord_sensor_value *value = &state->value;
+ 
+-	value->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+-	value->composite.count = sensor->pdr->state_sensor.composite_sensor_count;
+ 	memset(value->composite.element, 0, sizeof(value->composite.element));
++
++	value->composite.count = sensor->pdr->state_sensor.composite_sensor_count;
++
++	for (size_t i = 0; i < state->value.composite.count; ++i) {
++		struct sensord_sensor_value_composite_element *element =
++			&state->value.composite.element[i];
++
++		element->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
++	}
+ }
+ 
+ static int sensord_init_all_sensors(void)
+@@ -745,6 +784,8 @@
+ 
+ 	value = &state->value;
+ 
++	/* TODO: check if updatable before get()? */
++
+ 	if (sensor->api.get && !sensord_update_is_paused())
+ 		invoke_get_callback(sensor, state);
+ 
+@@ -757,6 +798,7 @@
+ 	return err;
+ }
+ 
++/* FIXME: this function is not used ... delete? */
+ int sensord_enable_set(
+ 	uint16_t sensor_id,
+ 	uint32_t pdr_type_mask,
+@@ -772,10 +814,11 @@
+ 
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+-	switch (state->value.operational_state) {
++	/* FIXME: assumes numeric sensor; add support for state sensors? */
++	switch (state->value.single.operational_state) {
+ 	case PLDM_SENSOR_OP_STATE_DISABLED:
+ 		if (enable) {
+-			state->value.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
++			state->value.single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 			state->value.single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 			state->value.single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 			state->value.single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+@@ -795,7 +838,7 @@
+ 	case PLDM_SENSOR_OP_STATE_SHUTTING_DOWN:
+ 	case PLDM_SENSOR_OP_STATE_IN_TEST:
+ 		if (!enable) {
+-			state->value.operational_state = PLDM_SENSOR_OP_STATE_DISABLED;
++			state->value.single.operational_state = PLDM_SENSOR_OP_STATE_DISABLED;
+ 			state->value.single.present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 			state->value.single.previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
+ 			state->value.single.event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;

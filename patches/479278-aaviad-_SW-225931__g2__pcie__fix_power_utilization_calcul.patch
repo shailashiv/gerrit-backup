@@ -1,0 +1,161 @@
+From 516db8012d8aa578c83bc10402bc5c3c554f66b0 Mon Sep 17 00:00:00 2001
+From: Ariel Aviad <aaviad@habana.ai>
+Date: Wed, 07 May 2025 13:40:08 +0300
+Subject: [PATCH] [SW-225931] g2  pcie: fix power utilization calculation
+
+In gaudi2 pcie card we don't have secondary though
+we need to calculate the power utilization differently
+than gaudi2 mezzanine card.
+Currently we are using legacy algorithm.
+This patch changes it to a new algorithm to calculate
+it's power utilization.
+
+Change-Id: Ia7cb21c8074173c8caa7979ad7851c00a59e12ce
+Signed-off-by: Ariel Aviad <aaviad@habana.ai>
+---
+
+diff --git a/include/hl-smi.h b/include/hl-smi.h
+index 659bf13..3cb30a3 100644
+--- a/include/hl-smi.h
++++ b/include/hl-smi.h
+@@ -180,6 +180,13 @@
+ 	unsigned int psu_sec_max_power;
+ };
+ 
++enum power_util_algo {
++	POWER_UTIL_ALGO_DEFAULT,		/* This is for legacy devices */
++	POWER_UTIL_ALGO_MAIN,			/* gaudi2 PCIe cards*/
++	POWER_UTIL_ALGO_MAIN_AND_SECONDARY,	/* gaudi2 */
++	POWER_UTIL_ALGO_MAIN_AND_IDLE		/* gaudi3 */
++};
++
+ struct hl_smi_aip_info {
+ 	unsigned int index;
+ 	char name[NAME_MAX];
+@@ -249,7 +256,7 @@
+ 	bool is_linux_available;
+ 	bool is_ib_sysfs_supported;
+ 	unsigned int max_idle_power;
+-	bool use_new_utilization_formula;
++	enum power_util_algo power_util_algo;
+ 	bool is_aip_error_counters_supported;
+ };
+ 
+diff --git a/src/gaudi2.c b/src/gaudi2.c
+index 2e2ee80..45f17b0 100755
+--- a/src/gaudi2.c
++++ b/src/gaudi2.c
+@@ -1094,7 +1094,7 @@
+ 
+ 	aip_info->is_linux_available = true;
+ 	aip_info->is_ib_sysfs_supported = true;
+-	aip_info->use_new_utilization_formula = false;
++	aip_info->power_util_algo = POWER_UTIL_ALGO_DEFAULT;
+ 	aip_info->is_aip_error_counters_supported = false;
+ }
+ 
+@@ -1112,6 +1112,7 @@
+ 		aip_info->psu_sec_info->psu_sec_millivolt = PSU_12V_PSU_VIN_INPUT;
+ 		aip_info->psu_sec_info->psu_sec_curr_idx = PSU_12V_SENSOR_CURR_ID;
+ 		aip_info->psu_sec_info->psu_sec_max_power = PSU_12V_PSU_MAX_POWER;
++		aip_info->power_util_algo = POWER_UTIL_ALGO_MAIN_AND_SECONDARY;
+ 	}
+ 
+ 	return 0;
+@@ -1122,8 +1123,10 @@
+ 	hl_smi_gaudi2_prepare_common(aip_info, GAUDI2_PROD_NUM_PCI);
+ 
+ 	aip_info->psu_main_info.psu_main_name = (char *)malloc(NAME_MAX);
+-	if (aip_info->psu_main_info.psu_main_name)
++	if (aip_info->psu_main_info.psu_main_name) {
+ 		snprintf(aip_info->psu_main_info.psu_main_name, NAME_MAX, "%s", "(12V PSU)");
++		aip_info->power_util_algo = POWER_UTIL_ALGO_MAIN;
++	}
+ 
+ 	return 0;
+ }
+diff --git a/src/gaudi3.c b/src/gaudi3.c
+index daead66..bd62c23 100755
+--- a/src/gaudi3.c
++++ b/src/gaudi3.c
+@@ -798,7 +798,7 @@
+ 	aip_info->is_linux_available = false;
+ 	aip_info->is_ib_sysfs_supported = true;
+ 	aip_info->product_num = product_num;
+-	aip_info->use_new_utilization_formula = true;
++	aip_info->power_util_algo = POWER_UTIL_ALGO_MAIN_AND_IDLE;
+ 	aip_info->is_aip_error_counters_supported = true;
+ 
+ 	snprintf(aip_info->product_num_str, NAME_LENGTH, "%d", product_num);
+diff --git a/src/hlml.c b/src/hlml.c
+index 0357883..0fdc960 100644
+--- a/src/hlml.c
++++ b/src/hlml.c
+@@ -439,9 +439,12 @@
+ 	if (!aip_info || !utilization)
+ 		return HLML_ERROR_INVALID_ARGUMENT;
+ 
++	HLML_LOG_DBG("Power utilization algorithm %d", aip_info->power_util_algo);
++
+ 	pthread_mutex_lock(&aips_data.driver_mutex);
+ 
+-	if (!aip_info->psu_sec_info) {
++	/* This is legacy and need to be before new apis */
++	if (aip_info->power_util_algo == POWER_UTIL_ALGO_DEFAULT) {
+ 		ret_int = hl_smi_get_aip_utilization(aip_info, &aip_utilization);
+ 		if (ret_int == HLML_INT_SUCCESS)
+ 			utilization->aip = aip_utilization;
+@@ -458,7 +461,12 @@
+ 		goto dev_get_util_err;
+ 	}
+ 
+-	if (aip_info->use_new_utilization_formula) {
++	ret_int = hl_smi_is_aip_idle(device, &idle);
++	if (ret_int != HLML_INT_SUCCESS)
++		goto dev_get_util_conv;
++
++	switch (aip_info->power_util_algo) {
++	case POWER_UTIL_ALGO_MAIN_AND_IDLE:
+ 		/*
+ 		 * The utilization formula is:
+ 		 * utilization [%] = ROUND_TO_NEAREST_FIVE(100 * dividend / divisor)
+@@ -479,11 +487,8 @@
+ 			aip_info->psu_main_info.psu_main_power, (unsigned int)MW_TO_WATT(max_power));
+ 		HLML_LOG_DBG("max-idle-power [W] = %u, aip-utilization = %u",
+ 			aip_info->max_idle_power, utilization->aip);
+-	} else {
+-		ret_int = hl_smi_is_aip_idle(device, &idle);
+-		if (ret_int != HLML_INT_SUCCESS)
+-			goto dev_get_util_conv;
+-
++		break;
++	case POWER_UTIL_ALGO_MAIN_AND_SECONDARY:
+ 		if (idle) {
+ 			utilization->aip = 0;
+ 		} else {
+@@ -498,6 +503,25 @@
+ 				(unsigned int)MW_TO_WATT(max_power) + aip_info->psu_sec_info->psu_sec_max_power,
+ 				utilization->aip);
+ 		}
++		break;
++	case POWER_UTIL_ALGO_MAIN:
++		if (idle) {
++			utilization->aip = 0;
++		} else {
++			/*
++			 * Calculate with the formula below:
++			 * utilization [%] = 100 * power-consumption from main PSUs / max power of main PSUs
++			 */
++			utilization->aip = 100 * WATT_TO_MW(aip_info->total_power) / (max_power);
++			HLML_LOG_DBG("total-power-consumption [W] = %u, total-max-power [W] = %u, aip-utilization = %u",
++				aip_info->total_power, (unsigned int)MW_TO_WATT(max_power), utilization->aip);
++		}
++		break;
++	default:
++		HLML_LOG_ERR("Power utilization algorithm %d is not supported",
++			aip_info->power_util_algo);
++		ret = HLML_ERROR_INVALID_ARGUMENT;
++		goto dev_get_util_err;
+ 	}
+ 
+ dev_get_mem_util:

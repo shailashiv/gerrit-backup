@@ -1,0 +1,87 @@
+From 5d37053df12bffccda724580fce911b630c6e630 Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Mon, 28 Apr 2025 21:04:31 +0300
+Subject: [PATCH] [SW-223026] g3: rack: adopt rack support to new defs
+
+Change rack EEPROM code according to modified
+cpucp_nic_info structure
+
+Change-Id: I8bfe60873627533358262d1e380f102b4991a021
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+---
+
+diff --git a/include/gaudi3/skyriver_rack_eeprom.h b/include/gaudi3/skyriver_rack_eeprom.h
+index 8c9362d..9afbc22 100644
+--- a/include/gaudi3/skyriver_rack_eeprom.h
++++ b/include/gaudi3/skyriver_rack_eeprom.h
+@@ -16,20 +16,20 @@
+ #define RS_EEPROM_DEV_LABEL	"HL_RS_EEPROM"
+ #define RS_EEPROM_DEV_INST	device_get_binding(RS_EEPROM_DEV_LABEL)
+ 
+-struct hl_lane_tap_raw {
+-	unsigned int tap : 22;
++struct hl_lane_tap {
++	unsigned int pre3 : 3;
++	unsigned int pre2 : 3;
++	unsigned int pre1 : 5;
++	unsigned int c0 : 6;
++	unsigned int post1 : 5;
+ 	unsigned int reserved : 2;
+ } __packed;
+ 
+-#ifndef HL_OAM_LANE_TAPS
+-#define HL_OAM_LANE_TAPS	48
+-#endif
+-
+ /* RS EEPROM magic: SDR */
+ #define HL_RS_EEPROM_MAGIC	0x524453
+-#define HL_RS_LANE_SIZE		sizeof(struct hl_lane_tap_raw)
++#define HL_RS_LANE_SIZE		sizeof(struct hl_lane_tap)
+ #define HL_RS_OAMS_IN_NODE	4
+-#define HL_RS_OAM_SIZE		(HL_OAM_LANE_TAPS * HL_RS_LANE_SIZE)
++#define HL_RS_OAM_SIZE		(CPUCP_NIC_DEFAULT_LANES_NUM * HL_RS_LANE_SIZE)
+ #define HL_RS_NODE_SIZE		(HL_RS_OAMS_IN_NODE * HL_RS_OAM_SIZE)
+ #define HL_RS_FILLER		0
+ struct hl_rs_eeprom_header {
+diff --git a/src/gaudi3/skyriver_rack_eeprom.c b/src/gaudi3/skyriver_rack_eeprom.c
+index eb502c1..a4af586 100644
+--- a/src/gaudi3/skyriver_rack_eeprom.c
++++ b/src/gaudi3/skyriver_rack_eeprom.c
+@@ -28,9 +28,10 @@
+ {
+ 	const struct device *eeprom_dev = RS_EEPROM_DEV_INST;
+ 	const struct eeprom_driver_api *api;
+-	struct hl_lane_tap_raw lane_taps[HL_OAM_LANE_TAPS];
++	struct hl_lane_tap lane_taps[CPUCP_NIC_DEFAULT_LANES_NUM];
++	struct hl_lane_tap *tap;
+ 	int offset;
+-	int rc;
++	int lane, rc;
+ 
+ 	if (!rs_eeprom_state.is_opened)
+ 		return -EIO;
+@@ -44,15 +45,22 @@
+ 	offset = node * HL_RS_NODE_SIZE + oam * HL_RS_OAM_SIZE;
+ 	api = (const struct eeprom_driver_api *)(eeprom_dev->api);
+ 	rc = api->read(eeprom_dev, offset, lane_taps,
+-			sizeof(struct hl_lane_tap_raw) * HL_OAM_LANE_TAPS);
++			sizeof(struct hl_lane_tap) * CPUCP_NIC_DEFAULT_LANES_NUM);
+ 	if (rc) {
+ 		LOG_ERR("Failed to read rack EEPROM, RC=%d", rc);
+ 		return -EIO;
+ 	}
+ 
++	for (lane = 0, tap = lane_taps; lane < CPUCP_NIC_DEFAULT_LANES_NUM; lane++, tap++) {
++		nic_info->pre3[lane] = tap->pre3;
++		nic_info->pre2[lane] = tap->pre2;
++		nic_info->pre1[lane] = tap->pre1;
++		nic_info->c0[lane] = tap->c0;
++		nic_info->post1[lane] = tap->post1;
++	}
++
+ 	return 0;
+ }
+-
+ 
+ static bool is_empty(uint8_t *buf, int size)
+ {

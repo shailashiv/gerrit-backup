@@ -1,0 +1,1230 @@
+From 513d2d634826390a7dcb39d707056cc876f8e22f Mon Sep 17 00:00:00 2001
+From: Shivani Raval <sraval@habana.ai>
+Date: Mon, 02 Jun 2025 17:23:36 +0300
+Subject: [PATCH] [JSW-806] build: clean up for jgs
+
+Cleaned buildroot-external scripts and used
+common functions from common files for JGS build.
+
+Change-Id: I2f5cf09d4f468d8ac20f8fbaa044a8d617f2e785
+---
+
+diff --git a/board/habanalabs/common/post-image-spi-arc_global.sh b/board/habanalabs/common/post-image-spi-arc_global.sh
+index ecc3a88..c125cfc 100755
+--- a/board/habanalabs/common/post-image-spi-arc_global.sh
++++ b/board/habanalabs/common/post-image-spi-arc_global.sh
+@@ -290,7 +290,7 @@
+ 	local -n spi_region_offsets=$1
+ 	local -n spi_region_sizes=$2
+ 	local platform_tokens=(${HL_DEV//_/ })
+-	local mem_addr_header_file=${BR2_EXTERNAL}/../specs/${platform_tokens[0]}/${platform_tokens[0]}_mem_addr_dt.h
++	local mem_addr_header_file=${SPECS_EMB_PROJ_DIR}/${DEV_PREFIX}/${DEV_PREFIX}_mem_addr_dt.h
+ 	local regex_offset="\#define(.*)SPI_FLASH_REGION_([A-Z_0-9]+)_OFFSET(\s+)([0-9a-fA-F]+)"
+ 	local regex_size="\#define(.*)SPI_FLASH_REGION_([A-Z_0-9]+)_SIZE(\s+)([0-9a-fA-F]+)"
+ 	local region_name
+@@ -458,8 +458,8 @@
+ 	## To be populated into FW SRAM
+ 
+ 	# create combined name of ppboot and pcie
+-	PPBOOT=$(echo "$PPBOOT_BINFILE" | cut -f 1 -d '.')
+-	PCIE_PHY=$(echo "$PCIE_PHY_BINFILE" | cut -f 1 -d '.')
++	PPBOOT=${PPBOOT_BINFILE%%.*}
++	PCIE_PHY=${PCIE_PHY_BINFILE%%.*}
+ 	PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
+ 
+ 	# concatenate both FW
+@@ -524,8 +524,4 @@
+ 	hl_pad_arcboot_rom
+ 	hl_palad_hex arcboot_rom ${BINS_PROD_DIR}/${ARCBOOT_BINFILE} 16 ${HEXS_DIR}
+ 
+-	if [ -f "${KEY_BASE}/spi-flash-layout-validator.sh" ]; then
+-		source ${KEY_BASE}/spi-flash-layout-validator.sh
+-		validate_spi_flash_layout
+-	fi
+ popd
+diff --git a/board/habanalabs/gaudi2_arc/gaudi2-post-image-spi-arc_global.sh b/board/habanalabs/gaudi2_arc/gaudi2-post-image-spi-arc_global.sh
+new file mode 100755
+index 0000000..8ec13dc
+--- /dev/null
++++ b/board/habanalabs/gaudi2_arc/gaudi2-post-image-spi-arc_global.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++set -e          # stop on any error in this script
++set -u          # stop on any reference to undefine variable
++set -o pipefail # stop on any error in pipeline
++
++source ${BR2_EXTERNAL}/board/habanalabs/common/post-image-spi-arc_global.sh
++
++pushd ${STAGE_DIR}
++
++	if [ -f "${KEY_BASE}/spi-flash-layout-validator.sh" ]; then
++		source ${KEY_BASE}/spi-flash-layout-validator.sh
++		validate_spi_flash_layout
++	fi
++
++popd
+diff --git a/board/habanalabs/gaudi3_arc/gaudi3-post-image-spi-arc_global.sh b/board/habanalabs/gaudi3_arc/gaudi3-post-image-spi-arc_global.sh
+new file mode 100755
+index 0000000..8ec13dc
+--- /dev/null
++++ b/board/habanalabs/gaudi3_arc/gaudi3-post-image-spi-arc_global.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++set -e          # stop on any error in this script
++set -u          # stop on any reference to undefine variable
++set -o pipefail # stop on any error in pipeline
++
++source ${BR2_EXTERNAL}/board/habanalabs/common/post-image-spi-arc_global.sh
++
++pushd ${STAGE_DIR}
++
++	if [ -f "${KEY_BASE}/spi-flash-layout-validator.sh" ]; then
++		source ${KEY_BASE}/spi-flash-layout-validator.sh
++		validate_spi_flash_layout
++	fi
++
++popd
+diff --git a/board/habanalabs/jgs/jgs-image-utility.sh b/board/habanalabs/jgs/jgs-image-utility.sh
+index ef02bb6..3cfbbc8 100755
+--- a/board/habanalabs/jgs/jgs-image-utility.sh
++++ b/board/habanalabs/jgs/jgs-image-utility.sh
+@@ -1,65 +1,5 @@
+-source ${BR2_EXTERNAL}/board/habanalabs/common/dirs.sh
+-
++source ${BR2_EXTERNAL}/board/habanalabs/common/image-utility.sh
+ BINS_CONFIG_DIR="${BR2_EXTERNAL}/output/${HL_DEV}/images/bins_config"
+-
+-function swap_file {
+-	local INF=$1
+-	local OUTF=$2
+-	local DBG=${3:-}
+-
+-	# SWAP needs this to be 4B aligned in size
+-	dd status=none conv=sync bs=4 if=${INF} > ${OUTF}.tmp
+-	# Sadly --endian=big is not swapping for -tx1 so I used some gawk magic
+-	od -Anone -v -tx1 -w4 ${OUTF}.tmp | gawk '{ print $4 $3 $2 $1 }' | xxd -r -p > ${OUTF}
+-
+-	if [ -z "$DBG" ]; then
+-		rm -f ${OUTF}.tmp
+-	fi
+-}
+-
+-function rev_bytes_stdin {
+-	local str=$(cat -)
+-
+-	local len=${#str}
+-	local reverse=""
+-
+-	[[ $len -eq 0 || $((len % 2)) -ne 0 ]] && return 1;
+-	for ((i=((len - 2)); i>=0; i-=2)); do
+-		reverse+=${str:$i:2}
+-	done
+-
+-	echo -n $reverse
+-}
+-
+-# get_image_property - returns value of a variable named: <name><property>
+-function get_image_property {
+-	local name=${1^^}
+-	local property=${2^^}
+-	local value=$(eval "echo \${${name}${property}}")
+-
+-	if [ -z "$value" ]; then
+-		echo "Error: no \"${name}${property}\" value exist..."
+-		exit 1;
+-	else
+-		echo $value
+-	fi
+-}
+-
+-function get_image_fname {
+-	get_image_property $1 "_BINFILE"
+-}
+-
+-function get_image_base {
+-	get_image_property $1 "_OFFSET"
+-}
+-
+-function get_image_loadaddr {
+-	get_image_property $1 "_TEXT_BASE"
+-}
+-
+-function get_image_startaddr {
+-	get_image_property $1 "_START_ADDR"
+-}
+ 
+ function get_image_size {
+ 	local name=${1^^}
+@@ -67,34 +7,7 @@
+ 	stat -Lc "%s" $(eval "echo \${${name}_BINFILE}")
+ }
+ 
+-function hl_zephyr_objcopy_sections() {
+-	local PREFIX=$1
+-	local MEM=$2
+-	local ALIGN=$3
+-	local SECTIONS=${*:4}
+-
+-	${OBJCOPY} -S --gap-fill 0xff --output-target=binary --remove-section=.comment --remove-section=COMMON \
+-	--remove-section=.eh_frame $(echo -n $SECTIONS | sed 's/[^ ]* */ --only-section=&/g') ${ELFS_DIR}/zephyr_${PREFIX}.elf \
+-	--set-section-flags=bss=alloc,load,contents --set-section-flags=noinit=alloc,load,contents \
+-	${STAGE_DIR}/zephyr-${PREFIX}-${MEM}.bin
+-
+-	dd status=none conv=sync bs=${ALIGN} if=${STAGE_DIR}/zephyr-${PREFIX}-${MEM}.bin > \
+-	${BINS_DIR}/${DEV_PREFIX}-zephyr-${PREFIX}-${MEM}.bin
+-}
+-
+-function hl_print_elf_sections_csv {
+-	local app=$1
+-
+-	echo "name,size,address"
+-	arc-linux-objdump -h ${ELFS_DIR}/zephyr_${app}.elf | \
+-		awk '/^[ \t]+[0-9]+ [^.]/ { printf("%s,0x%s,0x%s\n", $2, $3, $4);}'
+-}
+-
+-function hl_remove_empty_lines {
+-	sed '/^[[:space:]]*$/d'
+-}
+-
+-function hl_extract_zephyr_bins_sections {
++function jgs_extract_zephyr_bins_sections {
+ 	local app=$1
+ 	local bins_file=$2
+ 	local sections=()
+@@ -153,7 +66,7 @@
+ }
+ 
+ # This function should be called after hl_create_zephyr_bins_config
+-function hl_extract_zephyr_elf_sections {
++function jgs_extract_zephyr_elf_sections {
+ 	local elf_file
+ 	local bins_file
+ 	local app
+@@ -163,13 +76,13 @@
+ 		bins_file=$(hl_zephyr_get_bins ${app})
+ 
+ 		if [ -n "${bins_file}" ]; then
+-			hl_extract_zephyr_bins_sections ${app} ${bins_file}
++			jgs_extract_zephyr_bins_sections ${app} ${bins_file}
+ 			continue
+ 		fi
+ 	done
+ }
+ 
+-function hl_create_zephyr_bins_config {
++function jgs_create_zephyr_bins_config {
+ mkdir -p $BINS_CONFIG_DIR
+ 	rm $BINS_CONFIG_DIR/* -fr
+ 	mem_sections_hdr_path=${SPECS_EMB_PROJ_DIR}/${DEV_PREFIX}/${DEV_PREFIX}_mem_addr_dt.h
+@@ -204,14 +117,6 @@
+ 			done <<< `grep "_SECTION" $mem_sections_hdr_path | grep ${module^^} | cut -d '_' -f3`
+ 		fi
+ 	done <<< `grep "_SECTION" $mem_sections_hdr_path | cut -d '_' -f2,3 | tr [:upper:] [:lower:]`   #module}
+-}
+-
+-function hl_create_section_variables {
+-	local mem_sections_hdr_path=${SPECS_EMB_PROJ_DIR}/${DEV_PREFIX}/${DEV_PREFIX}_mem_addr_dt.h
+-
+-	while read line; do
+-		export $line
+-	done <<< `grep "define" $mem_sections_hdr_path | sed 's/[[:space:]]\+/ /g' | cut -d ' ' -f2-3 | sed  's/ /=/g'`
+ }
+ 
+ function get_struct_size {
+@@ -277,24 +182,4 @@
+ 	IFS=' ' read -r -a FAKE_FUSE_ARRAY <<< "$(echo "$ENUM_MEMBERS" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); gsub(/[[:space:]]+/, " ", $0); printf "%s ", $0}' | sed 's/ $//')"
+ 
+ 	export FAKE_FUSE_ARRAY
+-}
+-
+-function hl_palad_hex {
+-	local NAME=$(echo "$1" | cut -f 1 -d '.')
+-	local FULLFILENAME=$2
+-	local FILE=$(basename ${FULLFILENAME})
+-	local BYTES_PER_LINE=$3
+-	local DESTDIR=${4:-${HEXS_DIR}}
+-	# pad file to 128bit (16Byte) as pladium emulates 128bit memory, so xxd wont trunc lines
+-	dd status=none conv=sync bs=16 if=${FULLFILENAME} > ${STAGE_DIR}/${FILE}.tmp
+-	xxd -e -g ${BYTES_PER_LINE} ${STAGE_DIR}/${FILE}.tmp | xxd -r | xxd -ps -c${BYTES_PER_LINE} > ${DESTDIR}/${DEV_PREFIX}-${HL_TARGET}-${NAME}.hex
+-	rm ${STAGE_DIR}/${FILE}.tmp
+-}
+-
+-function hl_palad_flash_hex {
+-	local NAME=$(echo "$1" | cut -f 1 -d '.')
+-	local FILE=$2
+-	local DESTDIR=${3:-${HEXS_DIR}}
+-	# save hex as a 1 byte list of values
+-	xxd -e -g 4 ${FILE} | xxd -r | xxd -ps -c1 > ${DESTDIR}/${DEV_PREFIX}-${HL_TARGET}-${NAME}.hex
+ }
+diff --git a/board/habanalabs/jgs/jgs-post-image-fit-arc.sh b/board/habanalabs/jgs/jgs-post-image-fit-arc.sh
+deleted file mode 100755
+index 3f0499d..0000000
+--- a/board/habanalabs/jgs/jgs-post-image-fit-arc.sh
++++ /dev/null
+@@ -1,66 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -e          # stop on any error in this script
+-set -o pipefail # stop on any error in pipeline
+-
+-source ${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}/jgs-image-utility.sh
+-DEV_NAME=`echo $HL_DEV | cut -d'_' -f1`
+-BOARD_BASE=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}
+-MKIMAGE=${BR2_EXTERNAL}/output/${HL_DEV}/host/usr/bin/mkimage
+-LZOP=${BR2_EXTERNAL}/output/${HL_DEV}/host/usr/bin/lzop
+-
+-# Set hl-version = "x.y.z"; inside FIT header to be used for KMD/FW compatability validation
+-HL_VERSION=`cut -d- -f4 ${BR2_EXTERNAL}/output/${HL_DEV}/build/baremetal-custom/localversion-habanalabs`
+-
+-ZEPHYR_ITS_FILE=zephyr-${DEV_NAME}-${HL_TARGET}.its
+-ZEPHYR_ITB_FILE=${ITBS_DIR}/zephyr-fit.itb
+-
+-# Set compression to lzo
+-HL_COMPRESS=lzo
+-
+-source ${BOARD_BASE}/post-image-fit.sh
+-source ${BOARD_BASE}/post-image-common.sh
+-source ${BOARD_BASE}/post-image-exports.sh
+-
+-ZEPHYR_ITS_TEMPLATE=${BOARD_BASE}/jgs-zephyr.its
+-
+-ARC_MGMT_ICCM_EXT=${ARC_MGMT_ICCM_EXT:-iccm.bin.le}
+-ARC_MGMT_DCCM_EXT=${ARC_MGMT_DCCM_EXT:-dccm.bin.le}
+-
+-ITS_SED_PARAMS+="s/@DEV_PREFIX@/${DEV_PREFIX}/g;"
+-ITS_SED_PARAMS+="s/@HL_ARCH@/${HL_ARCH}/g;"
+-ITS_SED_PARAMS+="s/@DEV_NAME@/${DEV_NAME}/g;"
+-
+-KEY_BASE=${BR2_EXTERNAL}/board/habanalabs/${DEV_PREFIX}/
+-KEY_BASE_NAME=rsa3072
+-KEY_NAME=hl_${KEY_BASE_NAME}
+-
+-ITS_SED_PARAMS+="s/@KEY_DTB@/${KEY_NAME}.dtb/g;"
+-ITS_SED_PARAMS+="s/@KEY_EXT@/${KEY_NAME}_ext.bin.le/g;"
+-
+-# Replace ARC addresses
+-ITS_SED_PARAMS+="s/@ARC_PID_DCCM_HI@/${ARC_PID_DCCM_HI}/g;"
+-ITS_SED_PARAMS+="s/@ARC_PID_DCCM_LO@/${ARC_PID_DCCM_LO}/g;"
+-ITS_SED_PARAMS+="s/@ARC_PID_ICCM_HI@/${ARC_PID_ICCM_HI}/g;"
+-ITS_SED_PARAMS+="s/@ARC_PID_ICCM_LO@/${ARC_PID_ICCM_LO}/g;"
+-ITS_SED_PARAMS+="s/@ARC_MGMT_DCCM_HI@/${ARC_MGMT_DCCM_HI}/g;"
+-ITS_SED_PARAMS+="s/@ARC_MGMT_DCCM_LO@/${ARC_MGMT_DCCM_LO}/g;"
+-ITS_SED_PARAMS+="s/@ARC_MGMT_ICCM_HI@/${ARC_MGMT_ICCM_HI}/g;"
+-ITS_SED_PARAMS+="s/@ARC_MGMT_ICCM_LO@/${ARC_MGMT_ICCM_LO}/g;"
+-
+-# Replace ARC core IDs
+-ITS_SED_PARAMS+="s/@FIT_CORE_ID_IO0_PID@/${FIT_CORE_ID_IO0_PID}/g;"
+-ITS_SED_PARAMS+="s/@FIT_CORE_ID_IO0_MGMT@/${FIT_CORE_ID_IO0_MGMT}/g;"
+-
+-pushd ${STAGE_DIR}
+-	hl_copy_keys ${BINS_DIR}
+-
+-	hl_copy_binaries ${BINS_DIR}
+-
+-	mkdir -p ${ITBS_DIR}
+-
+-	sed ${ITS_SED_PARAMS} ${ZEPHYR_ITS_TEMPLATE} > ${ZEPHYR_ITS_FILE}
+-	${MKIMAGE} -D "-W no-unit_address_vs_reg" -f ${ZEPHYR_ITS_FILE} -k ${STAGE_DIR} ${ZEPHYR_ITB_FILE}
+-
+-	dd status=none conv=sync bs=4 if=${ZEPHYR_ITB_FILE} > ${ITBS_DIR}/${DEV_PREFIX}-boot-fit.itb
+-popd
+diff --git a/board/habanalabs/jgs/jgs-post-image-fit-create.sh b/board/habanalabs/jgs/jgs-post-image-fit-create.sh
+new file mode 100755
+index 0000000..aa2cd0d
+--- /dev/null
++++ b/board/habanalabs/jgs/jgs-post-image-fit-create.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++
++set -e          # stop on any error in this script
++set -o pipefail # stop on any error in pipeline
++
++source ${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}/jgs-image-utility.sh
++DEV_NAME=`echo $HL_DEV | cut -d'_' -f1`
++BOARD_BASE=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}
++MKIMAGE=${BR2_EXTERNAL}/output/${HL_DEV}/host/usr/bin/mkimage
++LZOP=${BR2_EXTERNAL}/output/${HL_DEV}/host/usr/bin/lzop
++
++# Set hl-version = "x.y.z"; inside FIT header to be used for KMD/FW compatability validation
++HL_VERSION=`cut -d- -f4 ${BR2_EXTERNAL}/output/${HL_DEV}/build/baremetal-custom/localversion-habanalabs`
++
++ZEPHYR_ITS_FILE=zephyr-${DEV_NAME}-${HL_TARGET}.its
++ZEPHYR_ITB_FILE=${ITBS_DIR}/zephyr-fit.itb
++
++# Set compression to lzo
++HL_COMPRESS=lzo
++
++source ${BOARD_BASE}/post-image-fit.sh
++source ${BOARD_BASE}/post-image-common.sh
++source ${BOARD_BASE}/post-image-exports.sh
++
++ZEPHYR_ITS_TEMPLATE=${BOARD_BASE}/jgs-zephyr.its
++
++ARC_MGMT_ICCM_EXT=${ARC_MGMT_ICCM_EXT:-iccm.bin.le}
++ARC_MGMT_DCCM_EXT=${ARC_MGMT_DCCM_EXT:-dccm.bin.le}
++
++ITS_SED_PARAMS+="s/@DEV_PREFIX@/${DEV_PREFIX}/g;"
++ITS_SED_PARAMS+="s/@HL_ARCH@/${HL_ARCH}/g;"
++ITS_SED_PARAMS+="s/@DEV_NAME@/${DEV_NAME}/g;"
++
++KEY_BASE=${BR2_EXTERNAL}/board/habanalabs/${DEV_PREFIX}/
++KEY_BASE_NAME=rsa3072
++KEY_NAME=hl_${KEY_BASE_NAME}
++
++ITS_SED_PARAMS+="s/@KEY_DTB@/${KEY_NAME}.dtb/g;"
++ITS_SED_PARAMS+="s/@KEY_EXT@/${KEY_NAME}_ext.bin.le/g;"
++
++# Replace ARC addresses
++ITS_SED_PARAMS+="s/@ARC_PID_DCCM_HI@/${ARC_PID_DCCM_HI}/g;"
++ITS_SED_PARAMS+="s/@ARC_PID_DCCM_LO@/${ARC_PID_DCCM_LO}/g;"
++ITS_SED_PARAMS+="s/@ARC_PID_ICCM_HI@/${ARC_PID_ICCM_HI}/g;"
++ITS_SED_PARAMS+="s/@ARC_PID_ICCM_LO@/${ARC_PID_ICCM_LO}/g;"
++ITS_SED_PARAMS+="s/@ARC_MGMT_DCCM_HI@/${ARC_MGMT_DCCM_HI}/g;"
++ITS_SED_PARAMS+="s/@ARC_MGMT_DCCM_LO@/${ARC_MGMT_DCCM_LO}/g;"
++ITS_SED_PARAMS+="s/@ARC_MGMT_ICCM_HI@/${ARC_MGMT_ICCM_HI}/g;"
++ITS_SED_PARAMS+="s/@ARC_MGMT_ICCM_LO@/${ARC_MGMT_ICCM_LO}/g;"
++
++# Replace ARC core IDs
++ITS_SED_PARAMS+="s/@FIT_CORE_ID_IO0_PID@/${FIT_CORE_ID_IO0_PID}/g;"
++ITS_SED_PARAMS+="s/@FIT_CORE_ID_IO0_MGMT@/${FIT_CORE_ID_IO0_MGMT}/g;"
++
++pushd ${STAGE_DIR}
++	hl_copy_keys ${BINS_DIR}
++
++	hl_copy_binaries ${BINS_DIR}
++
++	sed ${ITS_SED_PARAMS} ${ZEPHYR_ITS_TEMPLATE} > ${ZEPHYR_ITS_FILE}
++	${MKIMAGE} -D "-W no-unit_address_vs_reg" -f ${ZEPHYR_ITS_FILE} -k ${STAGE_DIR} ${ZEPHYR_ITB_FILE}
++
++	dd status=none conv=sync bs=4 if=${ZEPHYR_ITB_FILE} > ${ITBS_DIR}/${DEV_PREFIX}-boot-fit.itb
++popd
+diff --git a/board/habanalabs/jgs/jgs-post-image-spi-arc_global.sh b/board/habanalabs/jgs/jgs-post-image-spi-arc_global.sh
+deleted file mode 100755
+index f76cb0d..0000000
+--- a/board/habanalabs/jgs/jgs-post-image-spi-arc_global.sh
++++ /dev/null
+@@ -1,451 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -e          # stop on any error in this script
+-set -u          # stop on any reference to undefine variable
+-set -o pipefail # stop on any error in pipeline
+-
+-SHA256_SIZE=32
+-SHA256_CHKSUM=sha256sum
+-BOOTLOADER_BINFILE=${HL_TARGET}_bloader.bin
+-COMP_BOOTLOADER_BINFILE=${HL_TARGET}_bloader_comp.bin
+-HL_BASE_PATH=${BR2_EXTERNAL}/board/habanalabs
+-BOARD_BASE=${HL_BASE_PATH}/${HL_DEV}
+-DEVICE_BASE=${HL_BASE_PATH}/${HL_DEV}
+-KEY_BASE=${BR2_EXTERNAL}/board/habanalabs/${DEV_PREFIX}
+-SCRIPTS_DIR=${BR2_EXTERNAL}/scripts
+-source ${DEVICE_BASE}/jgs-image-utility.sh
+-OBJCOPY=objcopy
+-ARCBOOT_BINFILE=${ARCBOOT_BINFILE:-boot_rom.bin}
+-ARCBOOT_COMP_BINFILE=${ARCBOOT_COMP_BINFILE:-boot_rom_comp.bin}
+-PPBOOT_BINFILE=${PPBOOT_BINFILE:-ppboot.bin}
+-PREBOOT_BINFILE=${PREBOOT_BINFILE:-preboot.bin}
+-#PREBOOT_COMPUTE_BINFILE=${PREBOOT_COMPUTE_BINFILE:-preboot_compute.bin}
+-PCIE_PHY_BINFILE=${PCIE_PHY_BINFILE:-pcie_phy_fw.bin}
+-
+-#SECURITY_BOOT_MODE
+-SECURE_BOOT=1
+-
+-#[REVOKE/HASH/FW_VERSION]_LOCATION
+-ASIC_EFUSE=0
+-
+-#SPI_CONTROLLER
+-SPI_CONT=1
+-
+-# current efuse settings
+-REVOKE_LOCATION=${ASIC_EFUSE}
+-HASH_LOCATION=${ASIC_EFUSE}
+-SECURITY_BOOT_MODE=${SECURE_BOOT}
+-ENABLE_SECURITY_VALIDATION=1
+-DISBLE_DEBUG_IF=0
+-FW_VERSION_LOCATION=${ASIC_EFUSE}
+-SPI_CONTROLLER=${SPI_CONT}
+-
+-FLASH_BASE_ADDR=0x60000
+-
+-HABANA_KEY_REVOKE=0
+-PROD1_KEY_REVOKE=0
+-PROD2_KEY_REVOKE=0
+-PROD3_KEY_REVOKE=0
+-PROD4_KEY_REVOKE=0
+-
+-PRIME_IMAGE_PPBOOT_KEY=0
+-PRIME_IMAGE_RAM_KEY=0
+-
+-PRIME_IMAGE_PPBOOT_CRC_ERROR=0
+-PRIME_IMAGE_RAM_CRC_ERROR=0
+-
+-PRIME_IMAGE_PPBOOT_SIGN_ERROR=0
+-PRIME_IMAGE_RAM_SIGN_ERROR=0
+-
+-KEY_BASE_NAME=rsa3072
+-
+-SECURITY_VER_FILE=${SPECS_EMB_PROJ_DIR}/${DEV_PREFIX}/${DEV_PREFIX}_security.h
+-export BOOT_POINTER_HEADER=${SPECS_EMB_PROJ_DIR}/common/hl_boot_desc.h
+-export FW_IF_HEADER=${SPECS_EMB_PROJ_DIR}/jgs/jgs_fw_if.h
+-
+-source ${DEVICE_BASE}/post-image-spi.sh
+-
+-SECURITY_FW_VERSION=$(grep -owE "HL_SEC_FW_VERSION[[:space:]]+[0-9]+" $SECURITY_VER_FILE | sed 's/^.*[ \t]\([0-9]\+\)/\1/;')
+-ENDIANNESS="${ENDIANNESS:-be}"
+-
+-function hl_reverse_words {
+-	FILE=$1
+-	OUT_FILE=$2
+-	WORD_SIZE=${3}
+-
+-	local filesize=$(wc -c < $FILE)
+-	echo $FILE $filesize $WORD_SIZE
+-	${OBJCOPY}  -Ibinary --reverse-bytes=${WORD_SIZE} ${FILE} ${OUT_FILE}
+-}
+-function hl_calc_crc32 {
+-	FILE=$1
+-
+-	# reverse CRC32 source as DMA engine works like that
+-	hl_reverse_words ${FILE} ${FILE}.out 4
+-	CRC32=$(crc32 ${FILE}.out)
+-	echo ${CRC32} | xxd -r -p > ${FILE}.crc32
+-}
+-
+-function hl_sec_fw {
+-	FILE=${1}
+-	if [ ${2} -ge 64 ]; then
+-		VERSION=$(printf "%016x" $(( ~$((1<<${2})) )))
+-		VERSION+=$(printf "%016x" $(( ~0 )))
+-	else
+-		VERSION=$(printf "%016x" $(( ~0 )))
+-		VERSION+=$(printf "%016x" $(( ~$((1<<${2})) )))
+-	fi
+-	echo ${VERSION} | xxd -r -p | xxd -e -g16 | xxd -r		> ${FILE}.tmp
+-	dd status=none conv=notrunc seek=0 bs=16 if=${FILE}.tmp of=${FILE}
+-
+-	if [ ${HL_TARGET} == "palad" ]; then
+-		if [ ${2} -ge 64 ]; then
+-				VERSION=$(printf "%016x" $((1<<${2})))
+-				VERSION+=$(printf "%016x" $((0)))
+-			else
+-				VERSION=$(printf "%016x" $((0)))
+-				VERSION+=$(printf "%016x" $((1<<${2})))
+-		fi
+-		for i in {0..3}; do
+-			DWORD=$(echo ${VERSION} | xxd -r -p | xxd -g4 | cut -d' ' -f$(( 5 - ${i} )))
+-			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 59 + ${i}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.hex
+-		done
+-	fi
+-}
+-
+-function hl_sec_key {
+-	FILE=${1}
+-	NAME=${2}
+-        KEY_OFFSET=${3}
+-        KEY_BASE_NAME_PUB=${KEY_BASE_NAME}.pub
+-
+-	calculate_hash ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB} ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash
+-	cat ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash				> ${FILE}.tmp
+-	dd status=none conv=notrunc seek=$(( ${KEY_OFFSET}*2 + 1 )) bs=16 if=${FILE}.tmp of=${FILE}
+-
+-	if [ ${HL_TARGET} == "palad" ]; then
+-		for i in $(seq 1 $HASH_SZ); do
+-			DWORD=$(xxd -e -c32 -g4 ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
+-			OFFSET=$(( $(( ${KEY_OFFSET}*8 )) +  ${i} ))
+-			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 18 + ${OFFSET}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${STAGE_DIR}/${HL_TARGET}-force.hex
+-		done
+-	fi
+-}
+-
+-function hl_key_revoke {
+-	REVOKE_STATUS=$1
+-	if [ $REVOKE_STATUS -eq 1 ]; then
+-		echo -n fe >> ${STAGE_DIR}/revoke_status.hex
+-	else
+-		echo -n ff >> ${STAGE_DIR}/revoke_status.hex
+-	fi
+-}
+-
+-function hl_efuse_sys_config_generate {
+-	DWORD=${HABANA_KEY_REVOKE}
+-	DWORD=$(( DWORD + $((${PROD1_KEY_REVOKE}<<1))))
+-	DWORD=$(( DWORD + $((${PROD2_KEY_REVOKE}<<2))))
+-	DWORD=$(( DWORD + $((${PROD3_KEY_REVOKE}<<3))))
+-	DWORD=$(( DWORD + $((${PROD4_KEY_REVOKE}<<4))))
+-	DWORD=$(( DWORD + $((${REVOKE_LOCATION}<<5))))
+-	DWORD=$(( DWORD + $((${HASH_LOCATION}<<7))))
+-	DWORD=$(( DWORD + $((${SECURITY_BOOT_MODE}<<9))))
+-	DWORD=$(( DWORD + $((${ENABLE_SECURITY_VALIDATION}<<10))))
+-	DWORD=$(( DWORD + $((${DISBLE_DEBUG_IF}<<12))))
+-	DWORD=$(( DWORD + $((${FW_VERSION_LOCATION}<<13))))
+-	DWORD=$(( DWORD + $((${SPI_CONTROLLER}<<17))))
+-	DWORD=$(printf "%08x" ${DWORD})
+-	echo "force {h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_58_r.data_in_r[31:0]} 'h${DWORD}" > ${HEXS_DIR}${HL_TARGET}-force.hex
+-}
+-
+-function hl_report_missing_spi_region_offset_and_exit {
+-	local red=$(tput setaf 1)
+-	local normal=$(tput sgr0)
+-
+-	printf "$red The offset of SPI flash region %s is not defined $normal \n" $1
+-	exit 1
+-}
+-
+-function hl_report_missing_spi_region_size_and_exit {
+-	local red=$(tput setaf 1)
+-	local normal=$(tput sgr0)
+-
+-	printf "$red The size of SPI flash region %s is not defined $normal \n" $1
+-	exit 1
+-}
+-
+-# This function checks, that for each SPI flash region
+-# both offset and size are defined in jgs_mem_addr_dt.h
+-#
+-# Parameters:
+-# 1 - associative array region name to file name
+-# 2 - associative array region name to offset
+-# 3 - associative array region name to size
+-# Result:
+-# normal return if everything is OK
+-# printing error message and exit if problem encountered
+-function hl_validate_spi_flash_layout {
+-	local -n spi_region_to_file=$1
+-	local -n spi_region_offsets=$2
+-	local -n spi_region_sizes=$3
+-	local region_name
+-
+-	for region_name in "${!spi_region_to_file[@]}"; do
+-		if [[ -z "${spi_region_offsets[$region_name]+unset}" ]]; then
+-			hl_report_missing_spi_region_offset_and_exit $region_name
+-		fi
+-		if [[ -z "${spi_region_sizes[$region_name]+unset}" ]]; then
+-			hl_report_missing_spi_region_size_and_exit $region_name
+-		fi
+-	done
+-}
+-
+-# This function parses header file spec/jgs_mem_addr_dt.h
+-# and learns SPI flash layout: region names, their offsets
+-# and sizes
+-# Result:
+-# function fills 2 associaive arrays:
+-# region name to offset and region name to size
+-function hl_parse_spi_flash_regions {
+-	local -n spi_region_offsets=$1
+-	local -n spi_region_sizes=$2
+-	local platform=$3
+-	local mem_addr_header_file=${BR2_EXTERNAL}/../specs/gpu/${platform}/${platform}_mem_addr_dt.h
+-	local regex_offset="\#define(.*)SPI_FLASH_REGION_([A-Z_0-9]+)_OFFSET(\s+)([0-9a-fA-F]+)"
+-	local regex_size="\#define(.*)SPI_FLASH_REGION_([A-Z_0-9]+)_SIZE(\s+)([0-9a-fA-F]+)"
+-	local region_name
+-	local region_offset
+-	local region_size
+-	local red=$(tput setaf 1)
+-	local normal=$(tput sgr0)
+-
+-	if [ ! -f $mem_addr_header_file ]; then
+-		printf "$red File %s not exists $normal \n" "$mem_addr_header_file"
+-		exit 1
+-	fi
+-	IFS=$'\n'
+-	for line in $(cat "$mem_addr_header_file"); do
+-		if [[ $line =~ $regex_offset ]]; then
+-			region_name=${BASH_REMATCH[2]}
+-			region_offset=$(echo "ibase=16; ${BASH_REMATCH[4]^^}"|bc)
+-			spi_region_offsets[${region_name}]=$region_offset
+-		elif [[ $line =~ $regex_size ]]; then
+-			region_name=${BASH_REMATCH[2]}
+-			region_size=$(echo "ibase=16; ${BASH_REMATCH[4]^^}"|bc)
+-			spi_region_sizes[${region_name}]=$region_size
+-		fi
+-	done
+-}
+-
+-# This function is intended to check, that the length of
+-# given files does not exceed the size of appropriate SPI
+-# flash region
+-function hl_check_length_of_spi_files {
+-	local -n region_to_file=$1
+-	local -n region_to_size=$2
+-	local file_name
+-	local region_name
+-	local block_size
+-	local diff
+-	local red=$(tput setaf 1)
+-	local normal=$(tput sgr0)
+-
+-	for region_name in "${!region_to_file[@]}"; do
+-		file_name="${region_to_file[${region_name}]}"
+-		[[ $file_name == FF ]] && continue
+-		[[ $file_name == 00 ]] && continue
+-		block_size="${region_to_size[${region_name}]}"
+-		if [ ! -f $file_name ]; then
+-			printf "$red File %s not exists $normal \n" "$file_name"
+-			exit 1
+-		fi
+-		file_size=$(wc -c <"$file_name")
+-		if [ $file_size -eq 0 ]; then
+-			printf "$red File %s is empty $normal \n" "$file_name"
+-			exit 1
+-		fi
+-		if [ $file_size -gt $block_size ]; then
+-			diff=$(expr $file_size - $block_size)
+-			printf "$red File %s size %s exceeds SPI block size %s by %s bytes $normal \n" \
+-				"$file_name" "$file_size" "$block_size" "$diff"
+-			exit 1
+-		else
+-			printf "Region %s file size: %s    SPI block size: %s\n" \
+-				"$region_name" "$file_size" "$block_size"
+-		fi
+-	done
+-}
+-
+-# This function builds SPI flash file
+-function hl_build_spi_flash_file {
+-	local -n region_to_file=$1
+-	local -n region_to_offset=$2
+-	local -n region_to_size=$3
+-	local -n out_file=$4
+-	local file_length=0
+-	local input_file
+-	local file_length
+-	local offset
+-	local size
+-	local kb
+-	local end_of_region
+-	local current_region_offset=0
+-	local region_found
+-	local red=$(tput setaf 1)
+-	local normal=$(tput sgr0)
+-
+-	for region_name in "${!region_to_offset[@]}"; do
+-		offset="${region_to_offset[${region_name}]}"
+-		size="${region_to_size[${region_name}]}"
+-		end_of_region=$(expr $offset + $size)
+-		if [ $end_of_region -gt $file_length ]; then
+-			file_length=$end_of_region
+-		fi
+-	done
+-
+-	printf "\nLength of flash image file %s: 0x%x bytes \n\n" "$out_file" "$file_length"
+-	rm -f "$out_file"
+-	touch "$out_file"
+-
+-	while [ $current_region_offset -lt $file_length ]; do
+-		region_found=false
+-		for region_name in "${!region_to_offset[@]}"; do
+-			offset="${region_to_offset[${region_name}]}"
+-			size="${region_to_size[${region_name}]}"
+-			kb=$(expr "$size" \/ 1024)
+-			if [ $offset -eq $current_region_offset ]; then
+-				region_found=true
+-				input_file="${region_to_file[${region_name}]}"
+-				if [ "$input_file" = "FF" ]; then
+-					printf "Writing FF to offset 0x%x  %sK (Region name: %s)\n" "$offset" "$kb" "$region_name"
+-					dd status=none conv=sync bs=${kb}K count=1 if=/dev/zero | tr "\000" "\377" >> ${out_file}
+-				elif [ "$input_file" = "00" ]; then
+-					printf "Writing 00 to offset 0x%x  %sK (Region name: %s)\n" "$offset" "$kb" "$region_name"
+-					dd status=none conv=sync bs=${kb}K count=1 if=/dev/zero >> ${out_file}
+-				else
+-					printf "Writing %s from %s to offset 0x%x  %sK \n" "$region_name" "$input_file" "$offset" "$kb"
+-					dd status=none conv=sync bs=${kb}K if=${input_file} >> ${out_file}
+-				fi
+-				current_region_offset=$(expr $offset + $size)
+-				break
+-			fi
+-		done
+-		if [ "$region_found" = false ]; then
+-			printf "$red SPI flash region with offset 0x%x not defined $normal \n" "$current_region_offset"
+-			exit 1
+-		fi
+-	done
+-}
+-
+-pushd ${STAGE_DIR}
+-
+-	hl_copy_binaries ${BINS_DIR}
+-
+-	export IMG_PTR_SZ="$(get_struct_size $BOOT_POINTER_HEADER hl_fw_boot_ptrs)"
+-	export IMG_DESC_SZ="$(get_struct_size $BOOT_POINTER_HEADER hl_fw_img_desc)"
+-
+-	for i in $(seq 1 $NUM_PROD_KEYS); do
+-		CUST=cust${i}
+-		hl_gen_cert ${CUST} "Habana Embedded Team"
+-	done
+-
+-	## create otp spi image
+-	dd status=none conv=sync count=12 bs=16 if=/dev/zero | tr '\000' $'\xFF' > ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin
+-
+-	# get private and public keys
+-	copy_all_keys ${BINS_PROD_DIR}
+-
+-	#generate public key components
+-	generate_public_keys
+-
+-	# Create erom binaries
+-	prep_image_erom ${BINS_DIR}/${DEV_PREFIX}-erom.bin.le
+-
+-	# Create fake fuse binary
+-	prep_image_fake_fuse ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.le
+-
+-	# Pad preboot binary and then pack
+-	zephyr_preboot_pack ${BINS_DIR}/${PREBOOT_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+-	#zephyr_preboot_pack ${BINS_DIR}/${PREBOOT_COMPUTE_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+-
+-	# create combined name of ppboot and pcie
+-	PPBOOT=$(echo "$PPBOOT_BINFILE" | cut -f 1 -d '.')
+-	PCIE_PHY=$(echo "$PCIE_PHY_BINFILE" | cut -f 1 -d '.')
+-	PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
+-	PPBOOT_PCIE_PHY_PADDED_BINFILE=${PPBOOT_PCIE_PHY_BINFILE}.pad
+-
+-	# concatenate both FW
+-	hl_join_bin ${BINS_DIR}/${PPBOOT} ${PCIE_PHY} ${BINS_DIR}/${PPBOOT_PCIE_PHY_BINFILE}
+-
+-	# pack and sign image
+-	hl_pack_bin ${BINS_DIR}/${PPBOOT_PCIE_PHY_BINFILE} 64K ${PRIME_IMAGE_PPBOOT_KEY} ${PRIME_IMAGE_PPBOOT_CRC_ERROR} ${PRIME_IMAGE_PPBOOT_SIGN_ERROR}
+-
+-	# Create image pointers
+-	prep_image_ptrs ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.le
+-
+-	if [ ${HL_TARGET} == "palad" ]; then
+-		hl_efuse_sys_config_generate
+-	fi
+-	swap_file ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.le ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.be
+-	swap_file ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.le  ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.be
+-	swap_file ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.le ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.be
+-	swap_file ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.le ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.be
+-	#swap_file ${BINS_DIR}/${DEV_PREFIX}-preboot_compute.bin.le ${BINS_DIR}/${DEV_PREFIX}-preboot_compute.bin.be
+-
+-	# ToDo change it to unified wat from agent fw it check FSW-3432
+-	create_spi_image ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc \
+-			 ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.${ENDIANNESS} \
+-			 ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.${ENDIANNESS} \
+-			 ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.${ENDIANNESS} \
+-			 ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.${ENDIANNESS}
+-
+-	# SPI flash binary is provided as Big Endian, for manufacturing programmer.
+-	swap_file ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc.le
+-
+-	# Prepare checksum
+-	CKSUM=`${SHA256_CHKSUM} ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc.le | cut -d' ' -f1`
+-	echo ${CKSUM} | xxd -p -r								> ${BINS_DIR}/${DEV_PREFIX}-spi-flash.crc
+-	dd status=none conv=sync bs=64K			if=${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc.le	> ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin
+-	dd status=none conv=sync bs=$SHA256_SIZE	if=${BINS_DIR}/${DEV_PREFIX}-spi-flash.crc		>> ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin
+-
+-	rm -rf ${BINS_DIR}/${PPBOOT_PCIE_PHY_BINFILE}
+-
+-	if [ ${HL_TARGET} == "palad" ]; then
+-		# convert io die bootrom to pallad hex image
+-		hl_pad_arcboot_rom
+-		${SCRIPTS_DIR}/palad/convert_app_to_io_bootrom_hex.sh ${ARCBOOT_BINFILE}
+-		mv boot_rom_rom_ecc.hex ${HEXS_DIR}
+-
+-		# convert compute die bootrom to pallad hex images
+-		# ${SCRIPTS_DIR}/palad/convert_app_to_compute_bootrom_hex.sh ${ARCBOOT_COMP_BINFILE} jgs-${HL_TARGET}-bootrom_comp
+-		# mv jgs-${HL_TARGET}-bootrom_comp_*_ecc.hex ${HEXS_DIR}
+-
+-		# convert io die palad_bootloader to pallad hex image
+-		${SCRIPTS_DIR}/palad/convert_app_to_io_bootrom_hex.sh ${BOOTLOADER_BINFILE}
+-		mv palad_bloader_rom_ecc.hex ${HEXS_DIR}
+-
+-		# convert compute die palad_bootloader to pallad hex images
+-		${SCRIPTS_DIR}/palad/convert_app_to_compute_bootrom_hex.sh ${COMP_BOOTLOADER_BINFILE} jgs-${HL_TARGET}-bloader_comp
+-		mv jgs-${HL_TARGET}-bloader*.hex ${HEXS_DIR}
+-
+-		# convert preboot application to pallad hex images
+-		${SCRIPTS_DIR}/palad/convert_app_to_ccm_hex.sh preboot.bin
+-		mv iccm0_0.hex ${HEXS_DIR}/preboot_iccm0_0.hex
+-		mv iccm0_1.hex ${HEXS_DIR}/preboot_iccm0_1.hex
+-
+-		# convert preboot comp application to palad hex images
+-		# ${SCRIPTS_DIR}/palad/convert_app_to_ccm_hex.sh preboot_compute.bin
+-		# mv iccm0_0.hex ${HEXS_DIR}/preboot_comp_iccm0_0.hex
+-		# mv iccm0_1.hex ${HEXS_DIR}/preboot_comp_iccm0_1.hex
+-	fi
+-
+-	if [ -f "${KEY_BASE}/spi-flash-layout-validator.sh" ]; then
+-		source ${KEY_BASE}/spi-flash-layout-validator.sh
+-		validate_spi_flash_layout ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.${ENDIANNESS} \
+-					  ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.${ENDIANNESS} \
+-					  ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.${ENDIANNESS} \
+-					  ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.${ENDIANNESS}
+-	fi
+-popd
+diff --git a/board/habanalabs/jgs/jgs-post-image-spi-global.sh b/board/habanalabs/jgs/jgs-post-image-spi-global.sh
+new file mode 100755
+index 0000000..911de02
+--- /dev/null
++++ b/board/habanalabs/jgs/jgs-post-image-spi-global.sh
+@@ -0,0 +1,82 @@
++#!/usr/bin/env bash
++set -e          # stop on any error in this script
++set -u          # stop on any reference to undefine variable
++set -o pipefail # stop on any error in pipeline
++
++BOOTLOADER_BINFILE=${HL_TARGET}_bloader.bin
++COMP_BOOTLOADER_BINFILE=${HL_TARGET}_bloader_comp.bin
++SCRIPTS_DIR=${BR2_EXTERNAL}/scripts
++source ${BR2_EXTERNAL}/board/habanalabs/jgs/jgs-image-utility.sh
++ARCBOOT_BINFILE=${ARCBOOT_BINFILE:-boot_rom.bin}
++ARCBOOT_COMP_BINFILE=${ARCBOOT_COMP_BINFILE:-boot_rom_comp.bin}
++PPBOOT_BINFILE=${PPBOOT_BINFILE:-ppboot.bin}
++PREBOOT_BINFILE=${PREBOOT_BINFILE:-preboot.bin}
++PREBOOT_COMPUTE_BINFILE=${PREBOOT_COMPUTE_BINFILE:-preboot_compute.bin}
++PCIE_PHY_BINFILE=${PCIE_PHY_BINFILE:-pcie_phy_fw.bin}
++
++export BOOT_POINTER_HEADER=${SPECS_EMB_PROJ_DIR}/common/hl_boot_desc.h
++export FW_IF_HEADER=${SPECS_EMB_PROJ_DIR}/jgs/jgs_fw_if.h
++export PPBOOT=${PPBOOT_BINFILE%%.*}
++export PCIE_PHY=${PCIE_PHY_BINFILE%%.*}
++export PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
++export PPBOOT_PCIE_PHY_PADDED_BINFILE=${PPBOOT_PCIE_PHY_BINFILE}.pad
++export IMG_PTR_SZ="$(get_struct_size $BOOT_POINTER_HEADER hl_fw_boot_ptrs)"
++export IMG_DESC_SZ="$(get_struct_size $BOOT_POINTER_HEADER hl_fw_img_desc)"
++
++source ${BR2_EXTERNAL}/board/habanalabs/common/post-image-spi-arc_global.sh
++
++pushd ${STAGE_DIR}
++
++	# ToDo change it to unified wat from agent fw it check FSW-3432
++	create_spi_image ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc \
++			 ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.${ENDIANNESS} \
++			 ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.${ENDIANNESS} \
++			 ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.${ENDIANNESS} \
++			 ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.${ENDIANNESS}
++
++	# SPI flash binary is provided as Big Endian, for manufacturing programmer.
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc.le
++
++	# Prepare checksum
++	CKSUM=`${SHA256_CHKSUM} ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc.le | cut -d' ' -f1`
++	echo ${CKSUM} | xxd -p -r								> ${BINS_DIR}/${DEV_PREFIX}-spi-flash.crc
++	dd status=none conv=sync bs=64K			if=${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin.nocrc.le	> ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin
++	dd status=none conv=sync bs=$SHA256_SIZE	if=${BINS_DIR}/${DEV_PREFIX}-spi-flash.crc		>> ${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin
++
++	if [ ${HL_TARGET} == "palad" ]; then
++		# convert io die bootrom to pallad hex image
++		hl_pad_arcboot_rom
++		${SCRIPTS_DIR}/palad/convert_app_to_io_bootrom_hex.sh ${ARCBOOT_BINFILE}
++		mv boot_rom_rom_ecc.hex ${HEXS_DIR}
++
++		# convert compute die bootrom to pallad hex images
++		# ${SCRIPTS_DIR}/palad/convert_app_to_compute_bootrom_hex.sh ${ARCBOOT_COMP_BINFILE} jgs-${HL_TARGET}-bootrom_comp
++		# mv jgs-${HL_TARGET}-bootrom_comp_*_ecc.hex ${HEXS_DIR}
++
++		# convert io die palad_bootloader to pallad hex image
++		${SCRIPTS_DIR}/palad/convert_app_to_io_bootrom_hex.sh ${BOOTLOADER_BINFILE}
++		mv palad_bloader_rom_ecc.hex ${HEXS_DIR}
++
++		# convert compute die palad_bootloader to pallad hex images
++		${SCRIPTS_DIR}/palad/convert_app_to_compute_bootrom_hex.sh ${COMP_BOOTLOADER_BINFILE} jgs-${HL_TARGET}-bloader_comp
++		mv jgs-${HL_TARGET}-bloader*.hex ${HEXS_DIR}
++
++		# convert preboot application to pallad hex images
++		${SCRIPTS_DIR}/palad/convert_app_to_ccm_hex.sh preboot.bin
++		mv iccm0_0.hex ${HEXS_DIR}/preboot_iccm0_0.hex
++		mv iccm0_1.hex ${HEXS_DIR}/preboot_iccm0_1.hex
++
++		# convert preboot comp application to palad hex images
++		# ${SCRIPTS_DIR}/palad/convert_app_to_ccm_hex.sh preboot_compute.bin
++		# mv iccm0_0.hex ${HEXS_DIR}/preboot_comp_iccm0_0.hex
++		# mv iccm0_1.hex ${HEXS_DIR}/preboot_comp_iccm0_1.hex
++	fi
++
++	if [ -f "${KEY_BASE}/spi-flash-layout-validator.sh" ]; then
++		source ${KEY_BASE}/spi-flash-layout-validator.sh
++		validate_spi_flash_layout ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.${ENDIANNESS} \
++					  ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.${ENDIANNESS} \
++					  ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.${ENDIANNESS} \
++					  ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.${ENDIANNESS}
++	fi
++popd
+diff --git a/board/habanalabs/jgs/post-image-common.sh b/board/habanalabs/jgs/post-image-common.sh
+index 3def0e3..4eeedc8 100755
+--- a/board/habanalabs/jgs/post-image-common.sh
++++ b/board/habanalabs/jgs/post-image-common.sh
+@@ -3,8 +3,6 @@
+ source ${BR2_EXTERNAL}/board/habanalabs/common/dirs.sh
+ 
+ SHA_VERSION=sha384
+-BIN_IMG_DIR=${BR2_EXTERNAL}/output/${HL_DEV}_arc/images
+-KEYS_DIR=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}_arc/key/
+ 
+ # Set enum number of CORE IDs in FIT
+ FIT_CORE_ID_IO0_PID=$(grep -E "FIT_CORE_ID_IO0_PID[^_]" ${SPECS_EMBEDDED_DIR}/gpu/common/hl_fit_if.h | sed 's/.* = \(.*\),/\1/')
+diff --git a/board/habanalabs/jgs/post-image-exports.sh b/board/habanalabs/jgs/post-image-exports.sh
+index 38c21fc..ac0521e 100755
+--- a/board/habanalabs/jgs/post-image-exports.sh
++++ b/board/habanalabs/jgs/post-image-exports.sh
+@@ -1,15 +1,5 @@
+ #!/usr/bin/env bash
+ 
+-ITS_SED_PARAMS+="s/@HL_VERSION@/${HL_VERSION}/g;"
+-ITS_SED_PARAMS+="s/@HL_DEV@/${HL_DEV}/g;"
+-ITS_SED_PARAMS+="s/@HL_PREBOOT_VERSION@/${HL_PREBOOT_VERSION}/g;"
+-ITS_SED_PARAMS+="s/@HL_TARGET@/${HL_TARGET}/g;"
+-ITS_SED_PARAMS+="s/@FIT_LOAD_TYPE_FLASH@/${FIT_LOAD_TYPE_FLASH}/g;"
+-ITS_SED_PARAMS+="s/@FIT_LOAD_TYPE_RUN@/${FIT_LOAD_TYPE_RUN}/g;"
+-ITS_SED_PARAMS+="s/@HL_FW_VERSION@/${HL_FW_VERSION}/g;"
+-#ITS_SED_PARAMS+="s/@HL_KEY_INDEX@/${HL_SEC_KEY_INDEX}/g;";
+-#ITS_SED_PARAMS+="s/@HL_SEC_FW_VERSION@/${HL_SEC_FW_VERSION}/g;";
+-ITS_SED_PARAMS+="s/@SHA_VERSION@/${SHA_VERSION}/g;"
+-ITS_SED_PARAMS+="s#@BINS_DIR_PATH@#${BINS_DIR}#g;"
+-ITS_SED_PARAMS+="s#@BINS_PROD_DIR_PATH@#${BINS_PROD_DIR}#g;"
++source ${BR2_EXTERNAL}/board/habanalabs/common/post-image-exports.sh
++
+ ITS_SED_PARAMS+="s/@DEV_PREFIX@/${DEV_PREFIX}/g;"
+diff --git a/board/habanalabs/jgs/post-image-fit.sh b/board/habanalabs/jgs/post-image-fit.sh
+index aae75a1..c6780db 100755
+--- a/board/habanalabs/jgs/post-image-fit.sh
++++ b/board/habanalabs/jgs/post-image-fit.sh
+@@ -36,8 +36,8 @@
+ }
+ 
+ pushd ${STAGE_DIR}
+-	hl_create_zephyr_bins_config
+-	hl_extract_zephyr_elf_sections
++	jgs_create_zephyr_bins_config
++	jgs_extract_zephyr_elf_sections
+ popd
+ 
+ MGMT_STAT=${STATS_DIR}/zephyr_mgmt.stat
+diff --git a/board/habanalabs/jgs/post-image-spi.sh b/board/habanalabs/jgs/post-image-spi.sh
+index d46246c..a7fd635 100755
+--- a/board/habanalabs/jgs/post-image-spi.sh
++++ b/board/habanalabs/jgs/post-image-spi.sh
+@@ -48,6 +48,8 @@
+ 
+ ARCBOOT_BINFILE_ORIG=${ARCBOOT_BINFILE_PAD:-arcboot_rom-orig.bin}
+ 
++KEY_BASE=${BR2_EXTERNAL}/board/habanalabs/${DEV_PREFIX}
++
+ function hl_copy_binaries {
+ 	# TODO fill with content
+ 
+@@ -57,6 +59,12 @@
+ 	head -c 10000 /dev/urandom > jgs-ppboot-pcie_phy_fw.bin.le.int
+ 
+ 	cp ${KEY_BASE}/key/hl_${KEY_BASE_NAME}.* .
++
++	# hl_copy_binaries function is called from post-image-spi-arc_global.sh
++	# common script. All the binaries required for creation of spi
++	# are compiled as part of gaudi2_arc HL_TARGET so here we are creating
++	# dummy file for compilation.
++	touch ${BINS_DIR}/${DEV_PREFIX}-sram-mbist-data.bin.le
+ 
+ 	return
+ }
+@@ -739,9 +747,21 @@
+ 	declare -A SPI_REGION_OFFSETS
+ 	declare -A SPI_REGION_SIZES
+ 
+-	hl_parse_spi_flash_regions SPI_REGION_OFFSETS SPI_REGION_SIZES fs1
++	hl_parse_spi_flash_regions SPI_REGION_OFFSETS SPI_REGION_SIZES jgs
+ 	hl_validate_spi_flash_layout REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES
+ 	hl_check_length_of_spi_files  REGION_TO_FILENAME SPI_REGION_SIZES
+ 	hl_build_spi_flash_file REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES OUTF
+ }
+ 
++
++function prep_image_sram_mbist_data {
++	# dummy function, not supported for jgs
++	return
++}
++
++
++function calc_image_ptrs_sha384 {
++	# dummy function, not supported for jgs
++	return
++}
++
+diff --git a/board/habanalabs/jgs/spi-flash-layout-validator.sh b/board/habanalabs/jgs/spi-flash-layout-validator.sh
+index d7a13cb..ff0c495 100644
+--- a/board/habanalabs/jgs/spi-flash-layout-validator.sh
++++ b/board/habanalabs/jgs/spi-flash-layout-validator.sh
+@@ -32,7 +32,7 @@
+ 	declare -A SPI_REGION_OFFSETS
+ 	declare -A SPI_REGION_SIZES
+ 
+-	hl_parse_spi_flash_regions SPI_REGION_OFFSETS SPI_REGION_SIZES fs1
++	hl_parse_spi_flash_regions SPI_REGION_OFFSETS SPI_REGION_SIZES jgs
+ 	hl_validate_spi_flash_layout REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES
+ 	hl_check_length_of_spi_files  REGION_TO_FILENAME SPI_REGION_SIZES
+-}
+\ No newline at end of file
++}
+diff --git a/configs/gaudi2_arc_asic_defconfig b/configs/gaudi2_arc_asic_defconfig
+index fa2e65c..cf3cb21 100644
+--- a/configs/gaudi2_arc_asic_defconfig
++++ b/configs/gaudi2_arc_asic_defconfig
+@@ -11,7 +11,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi2-post-image-spi-arc_global.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+diff --git a/configs/gaudi2_arc_defconfig b/configs/gaudi2_arc_defconfig
+index fa2e65c..cf3cb21 100644
+--- a/configs/gaudi2_arc_defconfig
++++ b/configs/gaudi2_arc_defconfig
+@@ -11,7 +11,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi2-post-image-spi-arc_global.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+diff --git a/configs/gaudi2_arc_onix_defconfig b/configs/gaudi2_arc_onix_defconfig
+index fa2e65c..cf3cb21 100644
+--- a/configs/gaudi2_arc_onix_defconfig
++++ b/configs/gaudi2_arc_onix_defconfig
+@@ -11,7 +11,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi2-post-image-spi-arc_global.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+diff --git a/configs/gaudi2_arc_palad_defconfig b/configs/gaudi2_arc_palad_defconfig
+index fa2e65c..cf3cb21 100644
+--- a/configs/gaudi2_arc_palad_defconfig
++++ b/configs/gaudi2_arc_palad_defconfig
+@@ -11,7 +11,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi2-post-image-spi-arc_global.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+diff --git a/configs/gaudi3_arc_asic_defconfig b/configs/gaudi3_arc_asic_defconfig
+index 7e0aacf..75f86cd 100644
+--- a/configs/gaudi3_arc_asic_defconfig
++++ b/configs/gaudi3_arc_asic_defconfig
+@@ -12,7 +12,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi3-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+@@ -38,4 +38,4 @@
+ BR2_PACKAGE_AGENT_HBM=n
+ BR2_PACKAGE_AGENT_PCIE=y
+ BR2_PACKAGE_AGENT_SERDES=y
+-BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+\ No newline at end of file
++BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+diff --git a/configs/gaudi3_arc_defconfig b/configs/gaudi3_arc_defconfig
+index 73f306a..6e5b96e 100644
+--- a/configs/gaudi3_arc_defconfig
++++ b/configs/gaudi3_arc_defconfig
+@@ -12,7 +12,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi3-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+@@ -38,4 +38,4 @@
+ BR2_PACKAGE_ZEPHYR_AGENT_HBM=n
+ BR2_PACKAGE_AGENT_PCIE=y
+ BR2_PACKAGE_AGENT_SERDES=y
+-BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+\ No newline at end of file
++BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+diff --git a/configs/gaudi3_arc_onix_defconfig b/configs/gaudi3_arc_onix_defconfig
+index 550cb85..aa78bbd 100644
+--- a/configs/gaudi3_arc_onix_defconfig
++++ b/configs/gaudi3_arc_onix_defconfig
+@@ -12,7 +12,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi3-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+@@ -38,4 +38,4 @@
+ BR2_PACKAGE_AGENT_HBM=n
+ BR2_PACKAGE_AGENT_PCIE=n
+ BR2_PACKAGE_AGENT_SERDES=n
+-BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+\ No newline at end of file
++BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+diff --git a/configs/gaudi3_arc_palad_defconfig b/configs/gaudi3_arc_palad_defconfig
+index 550cb85..aa78bbd 100644
+--- a/configs/gaudi3_arc_palad_defconfig
++++ b/configs/gaudi3_arc_palad_defconfig
+@@ -12,7 +12,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/gaudi3-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-agents.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/create-fake-fuse-image.sh"
+ # BR2_PACKAGE_BUSYBOX is not set
+ # BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+ # BR2_TARGET_ROOTFS_TAR is not set
+@@ -38,4 +38,4 @@
+ BR2_PACKAGE_AGENT_HBM=n
+ BR2_PACKAGE_AGENT_PCIE=n
+ BR2_PACKAGE_AGENT_SERDES=n
+-BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+\ No newline at end of file
++BR2_PACKAGE_HOST_HL_LITTLEFS_GENERATE=y
+diff --git a/configs/jgs_asic_defconfig b/configs/jgs_asic_defconfig
+index 4074539..828b45e 100644
+--- a/configs/jgs_asic_defconfig
++++ b/configs/jgs_asic_defconfig
+@@ -17,7 +17,7 @@
+ BR2_SSP_NONE=y
+ BR2_RELRO_NONE=y
+ BR2_FORTIFY_SOURCE_NONE=y
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/post-image-agents.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-fit-create.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-spi-global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/post-image-agents.sh"
+ BR2_PACKAGE_BAREMETAL=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+diff --git a/configs/jgs_onix_defconfig b/configs/jgs_onix_defconfig
+index 6b096e2..dd9962f 100644
+--- a/configs/jgs_onix_defconfig
++++ b/configs/jgs_onix_defconfig
+@@ -12,7 +12,7 @@
+ BR2_INIT_NONE=y
+ BR2_SYSTEM_BIN_SH_NONE=y
+ # BR2_TARGET_GENERIC_GETTY is not set
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/post-image-agents.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-fit-create.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-spi-global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/post-image-agents.sh"
+ BR2_PACKAGE_BAREMETAL=y
+ BR2_PACKAGE_DSM=n
+ BR2_PACKAGE_PREBOOT=y
+diff --git a/configs/jgs_palad_defconfig b/configs/jgs_palad_defconfig
+index 682882a..4d10e06 100644
+--- a/configs/jgs_palad_defconfig
++++ b/configs/jgs_palad_defconfig
+@@ -17,7 +17,7 @@
+ BR2_SSP_NONE=y
+ BR2_RELRO_NONE=y
+ BR2_FORTIFY_SOURCE_NONE=y
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-fit-arc.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-spi-arc_global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/post-image-agents.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-fit-create.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/jgs-post-image-spi-global.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/jgs/post-image-agents.sh"
+ BR2_PACKAGE_BAREMETAL=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y

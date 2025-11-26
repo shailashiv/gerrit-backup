@@ -1,0 +1,55 @@
+From bf81ee5e9cbab3cd979cd688f5086872fd243bb9 Mon Sep 17 00:00:00 2001
+From: Michael Pauzner <mpauzner@habana.ai>
+Date: Thu, 22 May 2025 13:55:06 +0300
+Subject: [PATCH] [SW-225795] ras/nvme: fix nic error on linkup
+
+Sometimes, upon link-up, NIC uncorrectable errors and
+link toggle cross their high thresholds.
+It cause RAS / NVMe error report.
+
+This patch ignore errors during link-up process.
+
+Change-Id: I76afc8ffec35936a520daf73731383b6466c425c
+Signed-off-by: Michael Pauzner <mpauzner@habana.ai>
+---
+
+diff --git a/arch/common/gaudi/cpucp_info.c b/arch/common/gaudi/cpucp_info.c
+index 6e71a77..e724442 100644
+--- a/arch/common/gaudi/cpucp_info.c
++++ b/arch/common/gaudi/cpucp_info.c
+@@ -403,6 +403,7 @@
+ {
+ 	int ret, port_index = payload->port;
+ 	struct hl_eth_info_err_sts new_nic_err_sts;
++	int32_t diff;
+ 
+ 	if (port_index >= CONFIG_SERDES_NUM_OF_PORTS) {
+ 		LOG_ERR("Illegal port value %d", port_index);
+@@ -414,13 +415,20 @@
+ 	new_nic_err_sts.high_ser = nic_sts->err_sts.high_ser;
+ 	new_nic_err_sts.high_link_toggles = nic_sts->err_sts.high_link_toggles;
+ 
+-	/* raise ras alert incase of a NIC error */
+-	new_nic_err_sts.high_ser |=
+-		((payload->uncorrectable_err_cnt - nic_sts->port_sts[port_index].uncorrectable_cnt) >
+-		NIC_HIGH_SER_THRESHOLD);
+-	new_nic_err_sts.high_link_toggles |=
+-		((payload->port_toggle_cnt - nic_sts->port_sts[port_index].toggle_port_counter) >=
+-		NIC_LINK_TOGGLE_THRESHOLD);
++	/* test NIC errors when link is up, steady and phy is ready (pcs_link = true) */
++	if (payload->pcs_link) {
++		/* raise RAS allert in case of high ser */
++		diff = payload->uncorrectable_err_cnt -
++			nic_sts->port_sts[port_index].uncorrectable_cnt;
++		if (diff > NIC_HIGH_SER_THRESHOLD)
++			new_nic_err_sts.high_ser = 1;
++
++		/* raise RAS allert in case of high link toggles */
++		diff = payload->port_toggle_cnt -
++			nic_sts->port_sts[port_index].toggle_port_counter;
++		if (diff >= NIC_LINK_TOGGLE_THRESHOLD)
++			new_nic_err_sts.high_link_toggles = 1;
++	}
+ 
+ 	/* as long the port_index is < 64,  */
+ 	WRITE_BIT(nic_sts->link_phy_sts[0], port_index, payload->phy_ready);

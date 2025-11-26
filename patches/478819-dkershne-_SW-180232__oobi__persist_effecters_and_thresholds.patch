@@ -1,0 +1,150 @@
+From 0a16ea0c4cb1b114233dc274bc173e8074445400 Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Mon, 21 Apr 2025 18:07:17 +0300
+Subject: [PATCH] [SW-180232] oobi: persist effecters and thresholds
+
+Thresholds, effecter values and states can be modified by PLDM
+commands. Save off the values in the oobi structue to allow
+persistence between environments.
+
+Change-Id: I511d2f0f0fb505fe2fda05ffd046d3bfc14b245d
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/oobi.c b/oobi.c
+index 4240a4c..a2c2a93 100644
+--- a/oobi.c
++++ b/oobi.c
+@@ -44,7 +44,7 @@
+ #endif
+ 
+ #define OOBI_MAGIC		0x4F4F4249 /* "OOBI" */
+-#define OOBI_VERSION		2
++#define OOBI_VERSION		3
+ #define OOBI_MIN_VERSION	1
+ 
+ /* Out-of-Band Persistent Information (oobi)
+@@ -116,6 +116,12 @@
+ 	 * to hl_oobi_pldm_fu_poc_data; This was only valid because that data came
+ 	 * at the end of the existing OOB v1 block.
+ 	 */
++
++	/* v3 - Additional fields for sensor effecter persistent data */
++	struct {
++		struct hl_oobi_pldm_effecters pldm_effecter_data;
++		struct hl_oobi_pldm_sensors pldm_sensor_data;
++	} v3;
+ };
+ 
+ BUILD_ASSERT(sizeof(struct oobi) <= DT_REG_SIZE(DT_NODELABEL(oobi)),
+@@ -387,3 +393,45 @@
+ 	LOG_PLDM_FU("clearing");
+ 	memset(&info->v1.pldm_fu_poc, 0, sizeof(info->v1.pldm_fu_poc));
+ }
++
++void hl_oobi_pldm_effecter_restore_data(struct hl_oobi_pldm_effecters *data)
++{
++	struct oobi *info = _get();
++
++	memcpy(data, &info->v3.pldm_effecter_data, sizeof(*data));
++}
++
++void hl_oobi_pldm_effecter_persist_data(struct hl_oobi_pldm_effecters *data)
++{
++	struct oobi *info = _get();
++
++	memcpy(&info->v3.pldm_effecter_data, data, sizeof(*data));
++}
++
++void hl_oobi_pldm_effecter_clear_data(void)
++{
++	struct oobi *info = _get();
++
++	memset(&info->v3.pldm_effecter_data, 0, sizeof(info->v3.pldm_effecter_data));
++}
++
++void hl_oobi_pldm_sensor_restore_data(struct hl_oobi_pldm_sensors *data)
++{
++	struct oobi *info = _get();
++
++	memcpy(data, &info->v3.pldm_sensor_data, sizeof(*data));
++}
++
++void hl_oobi_pldm_sensor_persist_data(struct hl_oobi_pldm_sensors *data)
++{
++	struct oobi *info = _get();
++
++	memcpy(&info->v3.pldm_sensor_data, data, sizeof(*data));
++}
++
++void hl_oobi_pldm_sensor_clear_data(void)
++{
++	struct oobi *info = _get();
++
++	memset(&info->v3.pldm_sensor_data, 0, sizeof(info->v3.pldm_sensor_data));
++}
+diff --git a/oobi.h b/oobi.h
+index e34b487..ee572e9 100644
+--- a/oobi.h
++++ b/oobi.h
+@@ -31,7 +31,10 @@
+ /* NOTE: number of elements is hard-coded. If a change is needed, it would
+  * require setting a min_version dependency and so should not be done lightly.
+  */
+-#define OOBI_PLDM_MAX_NUM_COMPONENTS	16
++#define OOBI_PLDM_MAX_NUM_COMPONENTS		16
++#define OOBI_PLDM_MAX_NUM_NUMERIC_EFFECTERS	8
++#define OOBI_PLDM_MAX_NUM_STATE_EFFECTERS	16
++#define OOBI_PLDM_MAX_NUM_THRESHOLDS		64
+ 
+ struct hl_oobi_pldm_fu_component_state {
+ 	uint8_t state;
+@@ -77,8 +80,48 @@
+ 	uint8_t current_component;
+ } __packed;
+ 
++struct hl_oobi_pldm_numeric_effecter {
++	uint16_t effecter_id;
++	uint8_t op_state;
++	pldm_sensor_value_t value;
++} __packed;
++
++struct hl_oobi_pldm_state_effecter {
++	uint16_t effecter_id;
++	struct _composite_state {
++		uint8_t op_state;
++		uint8_t state;
++	} composite_state[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++} __packed;
++
++struct hl_oobi_pldm_sensor_threshold {
++	uint16_t sensor_id;
++	struct pldm_pmc_threshold_data thresholds;
++} __packed;
++
++/* Unordered collection effecter states, an effecter_id of 0 indicates
++ * entry is empty. Does not indicate end of list.
++ */
++struct hl_oobi_pldm_effecters {
++	struct hl_oobi_pldm_numeric_effecter numeric_effecters[OOBI_PLDM_MAX_NUM_NUMERIC_EFFECTERS];
++	struct hl_oobi_pldm_state_effecter state_effecters[OOBI_PLDM_MAX_NUM_STATE_EFFECTERS];
++};
++
++struct hl_oobi_pldm_sensors {
++	/* Unordered collection sensor_thresholds, a sensor_id of 0 indicates
++	 * entry is empty. Does not indicate end of list.
++	 */
++	struct hl_oobi_pldm_sensor_threshold sensor_thresholds[OOBI_PLDM_MAX_NUM_THRESHOLDS];
++} __packed;
++
+ void hl_oobi_pldm_fu_restore_poc_data(struct hl_oobi_pldm_fu_poc_data *data);
+ void hl_oobi_pldm_fu_persist_poc_data(struct hl_oobi_pldm_fu_poc_data *data);
+ void hl_oobi_pldm_fu_clear_poc_data(void);
++void hl_oobi_pldm_effecter_restore_data(struct hl_oobi_pldm_effecters *data);
++void hl_oobi_pldm_effecter_persist_data(struct hl_oobi_pldm_effecters *data);
++void hl_oobi_pldm_effecter_clear_data(void);
++void hl_oobi_pldm_sensor_restore_data(struct hl_oobi_pldm_sensors *data);
++void hl_oobi_pldm_sensor_persist_data(struct hl_oobi_pldm_sensors *data);
++void hl_oobi_pldm_sensor_clear_data(void);
+ 
+ #endif /* ZEPHYR_MODULE_BOOT_INFO_OOBI_H_ */

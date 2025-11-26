@@ -1,0 +1,131 @@
+From 7792c9406e1d0608efdb207a3a711dcc03c72889 Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Wed, 28 May 2025 17:00:16 -0400
+Subject: [PATCH] [SW-228486] i2c: handle spurious interrupts
+
+If the i2c_dw ISR is running while another interrupt is generated,
+a second invocation of the ISR will be queued.  The second ISR will
+read the device registers (specifically INTR_STAT) to decide what
+if anything it needs to do.  It is not uncommon for this second
+ISR to be a no-op and take no action.
+
+On rare occassions, the INTR_STAT register indicates a TX_EMPTY
+interrupt has been triggered. This is despite that the RAW_INTR_STAT
+register does NOT have this bit set.  The ISR incorrectly tries to
+complete the transfer by releasing the semaphore.  This breaks the
+handshake between i2c_dw_transfer() and i2c_dw_isr(), preventing
+any more transfers from being transmitted.
+
+As a workaround, this patch tweaks tracking of the 'SEND' bit in
+the driver state. When a transfer is completed successfully, the
+SEND bit is cleared, along with the RECV bit.  The TX_FIFO logic
+can then use this state to decide whether to ignore the TX EMPTY
+interrupt.
+
+Note that i2c_dw_isr() is used for both transmits and receives,
+and that in order to receive data the driver needs to write to
+the TX FIFO to 'ask' for the data.  This dual-use complicates
+the i2c_dw_isr() logic; as such this patch uses a targetted
+approach and mainly focuses on the TX_EMPTY case; it does not
+attempt to deal with every possible case of getting bad data
+from INTR_STAT or other registers.
+
+Change-Id: I8839855bd216ec5b62e252b79d1c1da625101bea
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/drivers/i2c/i2c_dw.c b/drivers/i2c/i2c_dw.c
+index ad3a87e..e94c917 100644
+--- a/drivers/i2c/i2c_dw.c
++++ b/drivers/i2c/i2c_dw.c
+@@ -312,21 +312,11 @@
+ 	return 0;
+ }
+ 
+-
+ static int i2c_dw_data_send(const struct device *dev)
+ {
+-	struct i2c_dw_dev_config * const dw = dev->data;
++	struct i2c_dw_dev_config *const dw = dev->data;
+ 	uint32_t data = 0U;
+ 	uintptr_t reg_base = get_regs(dev);
+-
+-	/* Nothing to send anymore, mask the interrupt */
+-	if (dw->xfr_len == 0U) {
+-		clear_bit_intr_mask_tx_empty(reg_base);
+-
+-		dw->state &= ~I2C_DW_CMD_SEND;
+-
+-		return 0;
+-	}
+ 
+ 	while (test_bit_status_tfnt(reg_base) && (dw->xfr_len > 0)) {
+ 		/* We have something to transmit to a specific host */
+@@ -387,6 +377,8 @@
+ 		dw->user_abort_pending = false;
+ 		dw->failure_reason = NULL;
+ 	}
++
++	dw->state &= ~(I2C_DW_CMD_RECV | I2C_DW_CMD_SEND);
+ 
+ 	write_intr_mask(DW_DISABLE_ALL_I2C_INT, reg_base);
+ 	value = read_clr_intr(reg_base);
+@@ -562,24 +554,36 @@
+ 		 */
+ 		if (intr_stat.bits.tx_empty) {
+ 			if ((dw->xfr_flags & I2C_MSG_RW_MASK) == I2C_MSG_WRITE) {
+-				ret = i2c_dw_data_send(port);
+-				if (ret) {
+-					dw->state = I2C_DW_CMD_ERROR;
+-					dw->failure_reason = "tx send";
+-					goto terminate_transfer;
++				if (!(dw->state & I2C_DW_CMD_SEND)) {
++					/* ignore */
++					LOG_DBG("%s: ignoring spurious tx_empty intr", __func__);
++				} else if (dw->xfr_len > 0U) {
++					ret = i2c_dw_data_send(port);
++					if (ret) {
++						dw->state = I2C_DW_CMD_ERROR;
++						dw->failure_reason = "tx send";
++						goto terminate_transfer;
++					}
++				} else {
++					/* TX FIFO has successfully written out all data */
++					clear_bit_intr_mask_tx_empty(reg_base);
++					dw->state &= ~I2C_DW_CMD_SEND;
++
++					if (!(dw->xfr_flags & I2C_MSG_STOP)) {
++						goto done;
++					}
+ 				}
+ 			} else {
+ 				i2c_dw_data_ask(port);
+-			}
+ 
+-			/* If STOP is not expected, finish processing this
+-			 * message if there is nothing left to do anymore.
+-			 */
+-			if ((dw->xfr_len == 0U)
+-			     && !(dw->xfr_flags & I2C_MSG_STOP)
+-			     && !(dw->xfr_flags & I2C_MSG_RECV_LEN)) {
+-				/* successful transfer */
+-				goto done;
++				/* If STOP is not expected, finish processing this
++				 * message if there is nothing left to do anymore.
++				 */
++				if ((dw->xfr_len == 0U) && !(dw->xfr_flags & I2C_MSG_STOP) &&
++				    !(dw->xfr_flags & I2C_MSG_RECV_LEN)) {
++					/* successful transfer */
++					goto done;
++				}
+ 			}
+ 		}
+ 	}
+@@ -622,7 +626,6 @@
+ done:
+ 	i2c_dw_transfer_complete(port);
+ }
+-
+ 
+ static int i2c_dw_setup(const struct device *dev, uint16_t slave_address)
+ {

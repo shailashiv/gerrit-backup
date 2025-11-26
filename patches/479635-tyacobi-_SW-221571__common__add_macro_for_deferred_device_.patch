@@ -1,0 +1,104 @@
+From 5ce4624519c28727cebd236daa3db2a640530917 Mon Sep 17 00:00:00 2001
+From: Tal Yacobi <tyacobi@habana.ai>
+Date: Tue, 13 May 2025 11:16:00 +0300
+Subject: [PATCH] [SW-221571] common: add macro for deferred device init
+
+Change ina236 function to match
+the other is_device_present functions.
+
+Add macro to init deferred devices if
+they're present and defined as okay in the dt.
+
+Change-Id: If130fc0162b4774928b88d1d1c38a67352c1e8f7
+Signed-off-by: Tal Yacobi <tyacobi@habana.ai>
+---
+
+diff --git a/drivers/misc/common_utils/gaudi/gaudi3/common_utils.c b/drivers/misc/common_utils/gaudi/gaudi3/common_utils.c
+index 0dd4313..c65345d 100644
+--- a/drivers/misc/common_utils/gaudi/gaudi3/common_utils.c
++++ b/drivers/misc/common_utils/gaudi/gaudi3/common_utils.c
+@@ -540,11 +540,9 @@
+ }
+ #endif
+ 
+-bool hl_is_ina236_present(uint16_t addr)
++bool hl_is_ina236_0_present(void)
+ {
+-	if (hl_is_card_type_pcie() && addr == INA236_12V_ADDR)
+-		return false;
+-	return true;
++	return !hl_is_card_type_pcie();
+ }
+ 
+ #ifdef CONFIG_HL_I2C_FILTER_RECOVERY
+diff --git a/drivers/misc/common_utils/gaudi/gaudi_utils.c b/drivers/misc/common_utils/gaudi/gaudi_utils.c
+index 942c919..de1827b 100644
+--- a/drivers/misc/common_utils/gaudi/gaudi_utils.c
++++ b/drivers/misc/common_utils/gaudi/gaudi_utils.c
+@@ -57,7 +57,7 @@
+ 	return true;
+ }
+ 
+-__weak bool hl_is_ina236_present(uint16_t addr)
++__weak bool hl_is_ina236_0_present(void)
+ {
+ 	return true;
+ }
+diff --git a/drivers/sensor/ti/ina23x/ina236.c b/drivers/sensor/ti/ina23x/ina236.c
+index 2b69092..4430fa2 100644
+--- a/drivers/sensor/ti/ina23x/ina236.c
++++ b/drivers/sensor/ti/ina23x/ina236.c
+@@ -17,6 +17,8 @@
+ 
+ LOG_MODULE_REGISTER(INA236, CONFIG_SENSOR_LOG_LEVEL);
+ 
++#define INA236_12V_ADDR			0x42
++
+ /**
+  * @brief Macro used to convert milli vot to volt
+  */
+@@ -338,7 +340,7 @@
+ 		return 1;
+ 	}
+ 
+-	if (!hl_is_ina236_present(config->bus.addr)) {
++	if (config->bus.addr == INA236_12V_ADDR && !hl_is_ina236_0_present()) {
+ 		LOG_DBG("INA236 %x is not present in this board", config->bus.addr);
+ 		return 1;
+ 	}
+diff --git a/include/zephyr/drivers/misc/common/common_utils.h b/include/zephyr/drivers/misc/common/common_utils.h
+index 3bce091..97fe05d 100644
+--- a/include/zephyr/drivers/misc/common/common_utils.h
++++ b/include/zephyr/drivers/misc/common/common_utils.h
+@@ -217,6 +217,22 @@
+ 	return val32;
+ }
+ 
++#define DEVICE_INIT_IF_EXIST(n, d)                                                                 \
++	do {                                                                                       \
++		if (hl_is_##n##_present()) {                                                       \
++			COND_CODE_1(DT_NODE_HAS_STATUS(d, okay),                                   \
++				    (const struct device *dev = DEVICE_DT_GET(d);                  \
++					int err = device_init(dev);                                \
++					if (err) {                                                 \
++						LOG_ERR("Failed deferred init of device: %s (%d)", \
++							#d, err);                                  \
++				     }),                                                           \
++				    (NULL));                                                       \
++		} else {                                                                           \
++			LOG_DBG("Unsupported device on this board: %s", #d);                       \
++		}                                                                                  \
++	} while (0)
++
+ /* TODO: Once the hl_ is fixed, remove this */
+ #if defined(CONFIG_GPU_UTILS)
+ #define hl_read_die_id		intel_gpu_read_die_id
+@@ -276,7 +292,7 @@
+ bool hl_is_adc121c027_present(void);
+ bool is_bis_compliant_device(void);
+ bool is_bis_e_compliant_device(void);
+-bool hl_is_ina236_present(uint16_t addr);
++bool hl_is_ina236_0_present(void);
+ bool hl_dev_is_valid_power(uint64_t value);
+ bool hl_is_security_enabled(void);
+ int spi_flash_is_wareout_attack_detected(const struct device *flash_dev);

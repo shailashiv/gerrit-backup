@@ -1,0 +1,138 @@
+From 4933c7362188df052f9ce969ab97efda30531f6b Mon Sep 17 00:00:00 2001
+From: Christopher Champagne <cjchampagne@habana.ai>
+Date: Mon, 09 Jun 2025 15:16:04 +0300
+Subject: [PATCH] [SW-222861] pdr: mask subsensors by platform
+
+Add support for masking state sensor sub-sensors based on which
+platform the firmware is running.
+An unsupported sub-sensor reports operational state unavailable.
+
+Change-Id: I30ca72773d1025c8b7281f60566e1380251d15e3
+Signed-off-by: Christopher Champagne <cjchampagne@habana.ai>
+---
+
+diff --git a/include/gaudi3/pldm_arch_common.h b/include/gaudi3/pldm_arch_common.h
+index 2a2d752..ff0ef8c 100644
+--- a/include/gaudi3/pldm_arch_common.h
++++ b/include/gaudi3/pldm_arch_common.h
+@@ -50,6 +50,7 @@
+ };
+ 
+ enum pldm_platform_mask {
++	PLDM_PLATFORM_MASK_NONE				= 0,
+ 	PLDM_PLATFORM_MASK_HL325			= BIT(0),
+ 	PLDM_PLATFORM_MASK_HL338			= BIT(1),
+ };
+diff --git a/include/pldm_base.h b/include/pldm_base.h
+index 9441368..ac9954b 100644
+--- a/include/pldm_base.h
++++ b/include/pldm_base.h
+@@ -1501,6 +1501,12 @@
+ 	uint8_t aux_names_pdr; /* bool */
+ 	uint8_t composite_sensor_count;
+ 	struct pldm_pdr_possible_states possible_states[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++	/* Support for masking PDR entries. Not part of PLDM spec and does not add to
++	 * reported PDR size.
++	 * If a bit is set, the sub-sensor is considered unavailable on the
++	 * corresponding platform.
++	 */
++	uint8_t composite_unsupported_platform_mask[PLDM_PDR_MAX_COMPOSITE_SENSORS];
+ } __packed;
+ 
+ #define PLDM_PDR_LANGUAGE_TAG_ENGLISH	"en"
+diff --git a/src/sensord.c b/src/sensord.c
+index fc76704..cd3998d 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -116,6 +116,24 @@
+ 	return NULL;
+ }
+ 
++static bool is_op_state_updatable(pldm_sensor_op_state_t operational_state)
++{
++	switch (operational_state) {
++	case PLDM_SENSOR_OP_STATE_FAILED:
++	case PLDM_SENSOR_OP_STATE_ENABLED:
++		return true;
++	case PLDM_SENSOR_OP_STATE_DISABLED:
++	case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
++	case PLDM_SENSOR_OP_STATE_UNKNOWN:
++	case PLDM_SENSOR_OP_STATE_INITIALIZING:
++	case PLDM_SENSOR_OP_STATE_SHUTTING_DOWN:
++	case PLDM_SENSOR_OP_STATE_IN_TEST:
++		return false;
++	}
++
++	return false;
++}
++
+ static void update_sensor_value(struct sensord_sensor_entry *sensor,
+ 				struct sensord_sensor_state *state,
+ 				struct sensord_sample *sample)
+@@ -135,6 +153,9 @@
+ 				&state->value.composite.element[i];
+ 			uint8_t initial_state = element->present_state;
+ 
++			if (!is_op_state_updatable(element->operational_state))
++				continue;
++
+ 			element->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 			element->present_state = sample->composite[i];
+ 			element->event_state = element->present_state;
+@@ -147,24 +168,6 @@
+ 		CODE_UNREACHABLE;
+ 		break;
+ 	}
+-}
+-
+-static bool is_op_state_updatable(pldm_sensor_op_state_t operational_state)
+-{
+-	switch (operational_state) {
+-	case PLDM_SENSOR_OP_STATE_FAILED:
+-	case PLDM_SENSOR_OP_STATE_ENABLED:
+-		return true;
+-	case PLDM_SENSOR_OP_STATE_DISABLED:
+-	case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
+-	case PLDM_SENSOR_OP_STATE_UNKNOWN:
+-	case PLDM_SENSOR_OP_STATE_INITIALIZING:
+-	case PLDM_SENSOR_OP_STATE_SHUTTING_DOWN:
+-	case PLDM_SENSOR_OP_STATE_IN_TEST:
+-		return false;
+-	}
+-
+-	return false;
+ }
+ 
+ static bool sensor_is_updatable(
+@@ -245,8 +248,8 @@
+ 			break;
+ 		case PLDM_SENSOR_OP_STATE_FAILED:
+ 		case PLDM_SENSOR_OP_STATE_DISABLED:
+-			continue;
+ 		case PLDM_SENSOR_OP_STATE_UNAVAILABLE:
++			continue;
+ 		case PLDM_SENSOR_OP_STATE_INITIALIZING:
+ 		case PLDM_SENSOR_OP_STATE_IN_TEST:
+ 		case PLDM_SENSOR_OP_STATE_UNKNOWN:
+@@ -645,6 +648,7 @@
+ 	struct sensord_sensor_state *state)
+ {
+ 	struct sensord_sensor_value *value = &state->value;
++	uint8_t current_platform = pldm_get_current_platform();
+ 
+ 	memset(value->composite.element, 0, sizeof(value->composite.element));
+ 
+@@ -653,8 +657,11 @@
+ 	for (size_t i = 0; i < state->value.composite.count; ++i) {
+ 		struct sensord_sensor_value_composite_element *element =
+ 			&state->value.composite.element[i];
+-
+-		element->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
++		if (sensor->pdr->state_sensor.composite_unsupported_platform_mask[i] &
++				current_platform)
++			element->operational_state = PLDM_SENSOR_OP_STATE_UNAVAILABLE;
++		else
++			element->operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 	}
+ }
+ 

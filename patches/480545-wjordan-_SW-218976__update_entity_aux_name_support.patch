@@ -1,0 +1,173 @@
+From 6013952d8fa50405d3bc32d970a7114c23ebada3 Mon Sep 17 00:00:00 2001
+From: William Jordan <bjordan@habana.ai>
+Date: Mon, 26 May 2025 18:28:08 +0300
+Subject: [PATCH] [SW-218976] update entity aux name support
+
+Change the Entity AUX Name PDR format to
+have a single name entry instead of an array.
+Unlike Sensor and Effector AUX Name PDRs,
+the Entity AUX Name PDR can only has a single
+name. This patch reduces the memory footprint
+of the Entity AUX Name PDRs.
+
+Change-Id: Ice12a897b0c62822c78f43be072c4e4a64423eb0
+Signed-off-by: William Jordan <bjordan@habana.ai>
+---
+
+diff --git a/include/pldm_base.h b/include/pldm_base.h
+index c634f22..9c14ffd 100644
+--- a/include/pldm_base.h
++++ b/include/pldm_base.h
+@@ -1566,9 +1566,9 @@
+ 	uint16_t entity_container_id;
+ 	uint8_t shared_name_count;
+ #if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+-	const char *names[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++	const char *name;
+ #else
+-	struct pldm_pdr_utf_strings names[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++	struct pldm_pdr_utf_strings name;
+ #endif
+ } __packed;
+ 
+diff --git a/scripts/g3-gen-pdrs.py b/scripts/g3-gen-pdrs.py
+index c2285e0..5d91b55 100755
+--- a/scripts/g3-gen-pdrs.py
++++ b/scripts/g3-gen-pdrs.py
+@@ -264,7 +264,7 @@
+ 	entityInstance: int
+ 	entityContainer: EntityContainer
+ 	sharedCount: int
+-	names: list[str]
++	aux_name: str
+ 
+ 	@staticmethod
+ 	def parse(wb):
+@@ -296,9 +296,7 @@
+ 				type = SensorType.from_string(sheet.cell_value(row, columns['entity']))
+ 				if type != SensorType.PLDM_PDR_TYPE_ENTITY_AUX_NAMES:
+ 					continue
+-				names = []
+-				name = sheet.cell_value(row, columns['name'])
+-				names.append(name)
++				aux_name = sheet.cell_value(row, columns['name'])
+ 				entity_aux_names[handle] = EntityAuxName(
+ 						name		= sheet.cell_value(row, columns['title']),
+ 						handle		= handle,
+@@ -307,7 +305,7 @@
+ 						entityInstance	= int(sheet.cell_value(row, columns['entityInstance'])),
+ 						entityContainer	= EntityContainer.to_string(int(sheet.cell_value(row, columns['entityContainer']))),
+ 						sharedCount	= int(sheet.cell_value(row, columns['sharedCount'])),
+-						names		= names,
++						aux_name	= aux_name,
+ 					)
+ 			except:
+ 				pass
+@@ -318,7 +316,7 @@
+ 	def generate_records(entity_aux_names, suffixes, output):
+ 		# handle the raw strings
+ 		name_string_map = {
+-			pdr.name : pdr.names for handle,pdr in entity_aux_names.items() if not is_repeated(handle) or is_repeated_base(handle)
++			pdr.name : [ pdr.aux_name ] for handle,pdr in entity_aux_names.items() if not is_repeated(handle) or is_repeated_base(handle)
+ 		}
+ 		generate_name_string_variables("Auxilary Name PDRs", name_string_map, output)
+ 
+@@ -349,27 +347,21 @@
+ 			.entity_instance = {pdr.entityInstance},
+ 			.entity_container_id = {pdr.entityContainer},
+ 			.shared_name_count = {pdr.sharedCount},
+-			.names = {{
+ #if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
+ ''')
+ 			# New format - array of char*
+-			for name in pdr.names:
+-				variable = variable_from_name(name)
+-				output.write(f'				{variable},\n')
++			variable = variable_from_name(pdr.aux_name)
++			output.write(f'			.name = {variable},\n')
+ 			output.write("#else /* old aux name format */\n")
+ 			# old format, array of name structs
+-			for name in pdr.names:
+-				variable = variable_from_name(name)
+-				output.write(f'''\
+-				{{
+-					.name_string_count = 1,
+-					.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
+-					.name = {variable},
+-				}},
+-''')
++			variable = variable_from_name(pdr.aux_name)
+ 			output.write(f'''\
+-#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
++			.name = {{
++				.name_string_count = 1,
++				.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
++				.name = {variable},
+ 			}},
++#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
+ 		}},
+ 	}},
+ ''')
+diff --git a/src/encode.c b/src/encode.c
+index c1d54cb..87ad315 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -179,6 +179,17 @@
+ 	return true;
+ }
+ 
++static bool encode_entity_aux_names(
++	struct encode_buffer *buffer,
++	const struct pldm_pdr_entity_aux_names_simple *pdr)
++{
++	size_t offset = offsetof(struct pldm_pdr_entity_aux_names_simple, name);
++
++	/* encode const-sized data, followed by variable-sized data */
++	return encode_buffer_append(buffer, pdr, offset) &&
++		generate_utf_string(buffer, pdr->name, NULL);
++}
++
+ static bool encode_oem_unit(
+ 	struct encode_buffer *buffer,
+ 	const struct pldm_pdr_oem_unit *pdr)
+@@ -332,6 +343,17 @@
+ 	return true;
+ }
+ 
++static bool encode_entity_aux_names(
++	struct encode_buffer *buffer,
++	const struct pldm_pdr_entity_aux_names_simple *pdr)
++{
++	size_t offset = offsetof(struct pldm_pdr_entity_aux_names_simple, name);
++
++	/* encode const-sized data, followed by variable-sized data */
++	return encode_buffer_append(buffer, pdr, offset) &&
++		encode_utf_strings(buffer, &pdr->name, NULL);
++}
++
+ static bool encode_oem_unit(
+ 	struct encode_buffer *buffer,
+ 	const struct pldm_pdr_oem_unit *pdr)
+@@ -414,22 +436,6 @@
+ 		output->header.record_handle += entry_index;
+ 		output->id += entry_index;
+ 	}
+-
+-	return true;
+-}
+-
+-static bool encode_entity_aux_names(
+-	struct encode_buffer *buffer,
+-	const struct pldm_pdr_entity_aux_names_simple *pdr)
+-{
+-	size_t offset = offsetof(struct pldm_pdr_entity_aux_names_simple, names);
+-
+-	/* encode const-sized data, followed by variable-sized data */
+-	if (!encode_buffer_append(buffer, pdr, offset))
+-		return false;
+-
+-	if (!encode_utf_strings_array(buffer, pdr->names, 1, NULL))
+-		return false;
+ 
+ 	return true;
+ }

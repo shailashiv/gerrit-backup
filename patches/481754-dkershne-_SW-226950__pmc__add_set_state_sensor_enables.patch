@@ -1,0 +1,286 @@
+From 0eea35169167940251de3ff3bfc4dc7045489fab Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Thu, 15 May 2025 21:34:36 +0300
+Subject: [PATCH] [SW-226950] pmc: add set state sensor enables
+
+Add the PLDM command SetStateSensorEnables. Each composite sensors
+can be manually set to ENABLED, DISABLED, or UNAVAILABLE. Sensor
+operational state is persisted across soft resets (oobi) as
+long as table is not full.
+
+Change-Id: I5b0dd80564ed05ee8e0d4c13f8e7d2eb756e3cdb
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/include/pldm_base.h b/include/pldm_base.h
+index ac9954b..a59d786 100644
+--- a/include/pldm_base.h
++++ b/include/pldm_base.h
+@@ -74,6 +74,7 @@
+ #define PLDM_CMD_PMC_GET_UID				0x03
+ #define PLDM_CMD_PMC_SET_NUMERIC_SENSOR_ENABLE		0x10
+ #define PLDM_CMD_PMC_GET_SENSOR_READING			0x11
++#define PLDM_CMD_PMC_SET_STATE_SENSOR_ENABLES		0x20
+ #define PLDM_CMD_PMC_GET_STATE_SENSOR_READINGS		0x21
+ #define PLDM_CMD_PMC_SET_NUMERIC_EFFECTER_ENABLE	0x30
+ #define PLDM_CMD_PMC_SET_NUMERIC_EFFECTER_VALUE		0x31
+@@ -419,6 +420,23 @@
+ 	uint16_t sensor_id;
+ 	uint8_t sensor_operational_state;
+ 	uint8_t sensor_event_message_enable;
++} __packed;
++
++typedef enum {
++	PLDM_PMC_SET_STATE_SENSOR_ENABLES_STATUS_INVALID_SENSOR_ID		= 0x80,
++	PLDM_PMC_SET_STATE_SENSOR_ENABLES_STATUS_INVALID_OP_STATE		= 0x81,
++	PLDM_PMC_SET_STATE_SENSOR_ENABLES_STATUS_EVENT_GEN_NOT_SUPPORTED	= 0x82,
++} pldm_pmc_set_state_sensor_enables_status_t;
++
++struct pldm_pmc_set_state_sensor_enables_op_field {
++	uint8_t sensor_op_state;
++	uint8_t event_msg_enable;
++} __packed;
++
++struct pldm_pmc_set_state_sensor_enables_req {
++	uint16_t sensor_id;
++	uint8_t composite_sensor_count;
++	struct pldm_pmc_set_state_sensor_enables_op_field op_field[PLDM_PDR_MAX_COMPOSITE_SENSORS];
+ } __packed;
+ 
+ typedef enum {
+@@ -958,6 +976,7 @@
+ 			PLDM_DEFINE_REQ(pmc_get_pdr);
+ 			PLDM_DEFINE_REQ(pmc_set_numeric_sensor_enable);
+ 			PLDM_DEFINE_REQ(pmc_get_sensor_reading);
++			PLDM_DEFINE_REQ(pmc_set_state_sensor_enables);
+ 			PLDM_DEFINE_REQ(pmc_get_state_sensor_readings);
+ 			PLDM_DEFINE_REQ(pmc_get_sensor_thresholds);
+ 			PLDM_DEFINE_REQ(pmc_set_sensor_thresholds);
+diff --git a/include/sensord.h b/include/sensord.h
+index 1ced43b..581482d 100644
+--- a/include/sensord.h
++++ b/include/sensord.h
+@@ -136,6 +136,11 @@
+ 	uint16_t sensor_id,
+ 	pldm_sensor_op_state_t op_state);
+ 
++int sensord_state_sensor_enables_set(
++	uint16_t sensor_id,
++	uint8_t op_state_count,
++	uint8_t *op_states);
++
+ int sensord_update_thresholds(
+ 	uint16_t sensor_id,
+ 	struct pldm_pmc_threshold_data *threshold_values);
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index 757eaa0..7556b6f 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -1327,6 +1327,53 @@
+ 	return 0;
+ }
+ 
++static int pldm_do_pmc_set_state_sensor_enables(
++	pldm_t pldm, void *arg, struct pldm_transport_msg *msg, k_timeout_t timeout)
++{
++	struct pldm_pmc_set_state_sensor_enables_req *req =
++		&msg->pldm.req.pmc_set_state_sensor_enables;
++	struct pldm_pmc_state *state = arg;
++	uint8_t op_states[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++	int comp_sensor_count = MIN(req->composite_sensor_count, PLDM_PDR_MAX_COMPOSITE_SENSORS);
++	int err = 0;
++
++	if (state->log_requests)
++		LOG_INF("PLDM:PMC:SetStateSensorEnables ID=%u", req->sensor_id);
++
++	for (int idx = 0; idx < comp_sensor_count; idx++) {
++		if (req->op_field[idx].event_msg_enable) {
++			err = PLDM_PMC_SET_STATE_SENSOR_ENABLES_STATUS_EVENT_GEN_NOT_SUPPORTED;
++			break;
++		}
++		if (req->op_field[idx].sensor_op_state > PLDM_SENSOR_OP_STATE_UNAVAILABLE) {
++			err = PLDM_PMC_SET_STATE_SENSOR_ENABLES_STATUS_INVALID_OP_STATE;
++			break;
++		}
++		op_states[idx] = req->op_field[idx].sensor_op_state;
++	}
++	if (err)
++		return pldm_respond_error(pldm, msg, timeout, err);
++
++	err = sensord_state_sensor_enables_set(req->sensor_id,
++					       comp_sensor_count,
++					       op_states);
++	if (err)
++		return pldm_respond_error(pldm, msg, timeout, err);
++
++	err = pldm_resp_prepare(pldm, msg, 0);
++	if (err) {
++		LOG_ERR("%s: failed to prepare response: %d", __func__, err);
++		return err;
++	}
++
++	err = pldm_resp_send(pldm, msg, timeout);
++	if (err) {
++		LOG_ERR("%s: failed to send response: %d", __func__, err);
++		return err;
++	}
++	return 0;
++}
++
+ static const struct pldm_handler pldm_pmc_handlers[] = {
+ 	{ PLDM_CMD_PMC_GET_PDR_REPO_INFO,		pldm_do_pmc_get_pdr_repo_info},
+ 	{ PLDM_CMD_PMC_GET_PDR,				pldm_do_pmc_get_pdr},
+@@ -1341,6 +1388,7 @@
+ 	{ PLDM_CMD_PMC_SET_STATE_EFFECTER_ENABLES,	pldm_do_pmc_set_state_effecter_enables},
+ 	{ PLDM_CMD_PMC_SET_STATE_EFFECTER_STATES,	pldm_do_pmc_set_state_effecter_states},
+ 	{ PLDM_CMD_PMC_GET_STATE_EFFECTER_STATES,	pldm_do_pmc_get_state_effecter_states},
++	{ PLDM_CMD_PMC_SET_STATE_SENSOR_ENABLES,	pldm_do_pmc_set_state_sensor_enables},
+ 	{ PLDM_CMD_PMC_SET_NUMERIC_SENSOR_ENABLE,	pldm_do_pmc_set_numeric_sensor_enable},
+ };
+ 
+diff --git a/src/sensord.c b/src/sensord.c
+index b65f806..5eb4907 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -695,11 +695,43 @@
+ 	}
+ }
+ 
++static void oobi_decode_state_sensor_state(uint8_t *op_states, uint16_t comp_op_state)
++{
++	for (int i = 0; i < PLDM_PDR_MAX_COMPOSITE_SENSORS; i++) {
++		if (HL_OOBI_PLDM_STATE_SENSOR_OP_STATE_IS_UNAVAILABLE(i, comp_op_state))
++			op_states[i] = PLDM_SENSOR_OP_STATE_UNAVAILABLE;
++		else if (HL_OOBI_PLDM_STATE_SENSOR_OP_STATE_IS_DISABLED(i, comp_op_state))
++			op_states[i] = PLDM_SENSOR_OP_STATE_DISABLED;
++		else
++			op_states[i] = PLDM_SENSOR_OP_STATE_ENABLED;
++	}
++}
++
++static void sensord_oobi_load_state_sensor_enables(void)
++{
++	struct hl_oobi_pldm_state_sensor_op_state *sensors;
++
++	sensors = sensord_state.oobi.state_op_state;
++
++	for (size_t i = 0; i < ARRAY_SIZE(sensord_state.oobi.state_op_state); i++) {
++		uint8_t op_states[PLDM_PDR_MAX_COMPOSITE_SENSORS] = {};
++
++		if (sensors[i].sensor_id == 0)
++			continue;
++
++		oobi_decode_state_sensor_state(op_states, sensors[i].comp_op_state);
++		sensord_state_sensor_enables_set(sensors[i].sensor_id,
++						 PLDM_PDR_MAX_COMPOSITE_SENSORS,
++						 op_states);
++	}
++}
++
+ static void sensord_oobi_load(void)
+ {
+ 	hl_oobi_pldm_sensor_restore_data(&sensord_state.oobi);
+ 
+ 	sensord_oobi_load_numeric_sensor_enable();
++	sensord_oobi_load_state_sensor_enables();
+ }
+ 
+ static int sensord_init_all_sensors(void)
+@@ -937,6 +969,97 @@
+ 	return MCTP_STATUS_SUCCESS;
+ }
+ 
++static void sensord_persist_state_sensor_enable(struct sensord_sensor_entry *sensor)
++{
++	struct hl_oobi_pldm_state_sensor_op_state *item = NULL;
++	struct hl_oobi_pldm_state_sensor_op_state *empty = NULL;
++	struct hl_oobi_pldm_sensors *oobi = &sensord_state.oobi;
++	uint16_t sensor_id = get_sensor_id(sensor);
++
++	for (size_t i = 0; i < ARRAY_SIZE(oobi->state_op_state); i++) {
++		if (oobi->state_op_state[i].sensor_id == sensor_id) {
++			item = &oobi->state_op_state[i];
++			break;
++		}
++		if (!empty && oobi->state_op_state[i].sensor_id == 0)
++			empty = &oobi->state_op_state[i];
++	}
++	if (!item)
++		item = empty;
++	if (!item) {
++		LOG_WRN("%s: Unable to persist sensor op_states  %d: table_full", __func__,
++			sensor_id);
++		return;
++	}
++
++	item->sensor_id = sensor_id;
++	item->comp_op_state = 0; /* ENABLE all composite sensors */
++	for (int idx = 0; idx < sensor->state->value.composite.count; idx++) {
++		uint8_t current_op_state =
++			sensor->state->value.composite.element[idx].operational_state;
++
++		if (current_op_state == PLDM_SENSOR_OP_STATE_UNAVAILABLE)
++			item->comp_op_state |= HL_OOBI_PLDM_STATE_SENSOR_OP_STATE_UNAVAILABLE(idx);
++		else if (current_op_state == PLDM_SENSOR_OP_STATE_DISABLED)
++			item->comp_op_state |= HL_OOBI_PLDM_STATE_SENSOR_OP_STATE_DISABLED(idx);
++	}
++
++	/* No composite sensor is disabled/unavailable remove from persistence */
++	if (!item->comp_op_state)
++		item->sensor_id = 0;
++
++	hl_oobi_pldm_sensor_persist_data(oobi);
++}
++
++int sensord_state_sensor_enables_set(
++	uint16_t sensor_id,
++	uint8_t op_state_count,
++	uint8_t *op_states)
++{
++	struct sensord_sensor_entry *sensor;
++	struct sensord_sensor_state *state;
++	uint8_t composite_sensor_count;
++	k_spinlock_key_t key;
++
++	sensor = find_sensor(sensor_id, STATE_SENSOR_TYPE_MASK);
++	if (!sensor)
++		return PLDM_PMC_SET_STATE_SENSOR_ENABLES_STATUS_INVALID_SENSOR_ID;
++
++	state = sensor->state;
++
++	composite_sensor_count = MIN(op_state_count, state->value.composite.count);
++
++	key = k_spin_lock(&sensord_state.lock);
++
++	for (int idx = 0; idx < composite_sensor_count; idx++) {
++		struct sensord_sensor_value_composite_element *element =
++			&state->value.composite.element[idx];
++		uint8_t current_op_state = element->operational_state;
++		uint8_t desired_op_state = op_states[idx];
++
++		if (current_op_state != desired_op_state) {
++			element->operational_state = desired_op_state;
++			element->present_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++			element->previous_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++			element->event_state = PLDM_SENSOR_THRESHOLD_UNKNOWN;
++
++			if (desired_op_state == PLDM_SENSOR_OP_STATE_ENABLED) {
++				state->polled = false; /* reset poll-once tracking */
++
++				/* trigger daemon poll immediately after enabling a sensor */
++				state->timestamp_next_poll = 0;
++				sensord_state.timestamp_next_poll = 0;
++			}
++		}
++	}
++
++	k_spin_unlock(&sensord_state.lock, key);
++
++	sensord_persist_state_sensor_enable(sensor);
++
++	return MCTP_STATUS_SUCCESS;
++}
++
+ static int update_if_enabled_u8(
+ 	const struct pldm_pdr_numeric_sensor_u8 *entry,
+ 	struct pldm_pmc_threshold_data *dst,

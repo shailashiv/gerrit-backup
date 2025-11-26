@@ -1,0 +1,106 @@
+From 0daca2267fc412b344c6bc51f1c51624300138c3 Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Thu, 22 May 2025 16:26:47 +0300
+Subject: [PATCH] [SW-210720] rma: apply ecc hbm thresholds per hbm
+
+Check the global ecc threshold per hbm which is settable via the
+pldm command SetSensorThresholds.
+
+Change-Id: I5856869d34b73650ca3f60ddf4343ff2f920eb94
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 3971a03..9432264 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -1080,8 +1080,10 @@
+ 	return gaudi2_change_hbm_pll_rate(rate);
+ }
+ 
+-uint8_t preboot_hbm_get_mbist_ecc_threshold(void)
++uint8_t preboot_hbm_get_mbist_ecc_threshold(uint8_t hbm_idx)
+ {
++	ARG_UNUSED(hbm_idx);
++
+ 	return GAUDI2_MBIST_ECC_THRESH;
+ }
+ 
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 4fc4d05..4224fab 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -30,6 +30,7 @@
+ #include <rma_if_dev.h>
+ #include <hl_device.h>
+ #include <hl_boot_info.h>
++#include <hl_mem_info.h>
+ #include <pcie_aux_masks.h>
+ #include <zephyr/drivers/flash.h>
+ #include <hl_fw_upd_if.h>
+@@ -501,9 +502,20 @@
+ 	regmap_writel(cold_rst_data.data, mmCOLD_RST_DATA);
+ }
+ 
+-uint8_t preboot_hbm_get_mbist_ecc_threshold(void)
++uint8_t preboot_hbm_get_mbist_ecc_threshold(uint8_t hbm_idx)
+ {
+-	return RMA_GLOBAL_HBM_MBIST_ECC_THRESHOLD;
++	uint8_t hbm_thresholds[HL_NUM_HBM_COUNT];
++	int ret;
++
++	ret = hl_mem_info_rd_field(hbm_thresholds, hbm_ecc_thresholds);
++	if (ret)
++		return RMA_GLOBAL_HBM_MBIST_ECC_THRESHOLD;
++
++	/* Value of 0 is invalid */
++	if (!hbm_thresholds[hbm_idx])
++		return RMA_GLOBAL_HBM_MBIST_ECC_THRESHOLD;
++
++	return hbm_thresholds[hbm_idx];
+ }
+ 
+ static void gaudi3_open_hbm_memory(void)
+diff --git a/lib/rma.c b/lib/rma.c
+index c0d7a2c..2f7baad 100644
+--- a/lib/rma.c
++++ b/lib/rma.c
+@@ -36,7 +36,7 @@
+ 
+ __weak void preboot_hbm_set_mbist_done(uint8_t hbm_idx) {}
+ __weak uint32_t preboot_change_hbm_pll_rate(uint32_t rate) { return rate; }
+-__weak uint8_t preboot_hbm_get_mbist_ecc_threshold(void) { return 0; }
++__weak uint8_t preboot_hbm_get_mbist_ecc_threshold(uint8_t hbm_idx) { return 0; }
+ __weak bool preboot_is_full_hbm_mode(void) { return true; }
+ __weak void oob_update_smbus_alert(struct rma_entry *rma_header) {}
+ 
+@@ -257,10 +257,6 @@
+ 	if (!preboot_is_full_hbm_mode())
+ 		return 0;
+ 
+-	mbist_ecc_threshold = preboot_hbm_get_mbist_ecc_threshold();
+-	if (!mbist_ecc_threshold)
+-		return 0; /* if no threshold, then return with no mbist run */
+-
+ 	/* Copy table header to read hbm global ecc counters */
+ 	memset(&tbl_hdr, 0, sizeof(tbl_hdr));
+ 	rma_table_table_hdr_copy(RMA_HBM_ECC_TABLE, &tbl_hdr);
+@@ -270,6 +266,7 @@
+ 		LOG_ERR("[hbm_rma]: failed to get num active hbms: %d", num_hbms);
+ 		return 0;
+ 	}
++
+ 	for (hbm_idx = 0; hbm_idx < num_hbms; hbm_idx++) {
+ 
+ 		/* Check if global ECC counter greater than threshold */
+@@ -287,6 +284,10 @@
+ 		 * If there are multiple HBM devices whose ECC counter crossed threshold, MBIST
+ 		 * for those will be run in the next boot
+ 		 */
++		mbist_ecc_threshold = preboot_hbm_get_mbist_ecc_threshold(hbm_idx);
++		if (!mbist_ecc_threshold)
++			continue; /* if no threshold, then check next hbm */
++
+ 		if (hbm_global_ecc_counter >= mbist_ecc_threshold)
+ 			break;
+ 	}

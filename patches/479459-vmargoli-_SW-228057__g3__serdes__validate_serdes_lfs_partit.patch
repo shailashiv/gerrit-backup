@@ -1,0 +1,180 @@
+From f3941653d6a2110ee6acff1d8c985b232a2ee145 Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Tue, 13 May 2025 16:54:52 +0300
+Subject: [PATCH] [SW-228057] g3: serdes: validate serdes lfs partition
+
+Validate Serdes LFS partition on Gaudi3 by
+calculating SHA3-384 digest and checking
+it against precalculated digest during
+building
+
+Change-Id: I833690b92f40f6f087265219173deeac95041237
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+---
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b951857..ae43380 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -34,6 +34,12 @@
+   list(APPEND lib_sources ${i2c_direct_sources})
+ endif()
+ 
++if (${HL_DEVICE} STREQUAL "gaudi3" AND  ${TARGET} STREQUAL "onix")
++  zephyr_ld_options(-Wl,--no-warn-rwx-segments,--just-symbols=$ENV{EMBEDDED_DIR}/preboot/arch/${HL_DEVICE}/arc/exports_onix.elf)
++else()
++  zephyr_ld_options(-Wl,--no-warn-rwx-segments,--just-symbols=$ENV{EMBEDDED_DIR}/preboot/arch/${HL_DEVICE}/arc/exports.elf)
++endif()
++
+   zephyr_library_sources(
+    ${lib_sources}
+   )
+diff --git a/include/hl_serdes.h b/include/hl_serdes.h
+index 432caf9..5d46d83 100644
+--- a/include/hl_serdes.h
++++ b/include/hl_serdes.h
+@@ -7,6 +7,7 @@
+ #define ZEPHYR_INCLUDE_HL_SERDES_H
+ 
+ #include <zephyr/device.h>
++#include <zephyr/sys/sys_heap.h>
+ #include <cpucp_if.h>
+ #include <gaudi3/gaudi3_serdes_if.h>
+ 
+@@ -30,6 +31,8 @@
+ int hl_serdes_get_serdes_table(struct hl_serdes_config **tbl, int *len);
+ 
+ void hl_serdes_serdes_init(void);
++void hl_serdes_serdes_init_with_validation(struct sys_heap *hbm_mem_pool);
++
+ uint16_t hl_serdes_get_serdes_type(void);
+ int hl_serdes_get_serdes_info_core(const struct device *dev, struct cpucp_nic_info *nic_info,
+ 				   uint16_t serdes_type);
+diff --git a/src/hl_serdes/gaudi3/serdes.c b/src/hl_serdes/gaudi3/serdes.c
+index 747e71a..86712af 100644
+--- a/src/hl_serdes/gaudi3/serdes.c
++++ b/src/hl_serdes/gaudi3/serdes.c
+@@ -9,6 +9,7 @@
+ 
+ #include <hl_platform_defs.h>
+ #include <hl_fw_if.h>
++#include <hl_fw_info.h>
+ #include <common_utils.h>
+ #include <hl_serdes.h>
+ #include <hl_boot_info.h>
+@@ -16,6 +17,7 @@
+ #include <cpucp_if.h>
+ #include <zephyr/logging/log.h>
+ #include <hl_devs.h>
++#include <arcboot_export_dev.h>
+ #include <zephyr/drivers/misc/hl_sfp/hl_sfp.h>
+ #include <zephyr/drivers/misc/hl_cpld/hl_cpld.h>
+ #ifdef CONFIG_LFS_ENABLED
+@@ -71,6 +73,8 @@
+ 
+ #define ETHERNET_DEFAULT_PORT_ENABLE	0x00FFFFFF
+ 
++struct sys_heap *sys_heap_hbm;
++
+ static uint32_t get_boot_nic_mask(void)
+ {
+ 	uint32_t nic_mask = ETHERNET_DEFAULT_PORT_ENABLE;
+@@ -93,11 +97,87 @@
+ #ifdef CONFIG_LFS_ENABLED
+ static struct lfs_zephyrbd *zephyrbd_state;
+ 
++static int read_flash_chunk(uint32_t addr, uint32_t size, uint8_t *buf)
++{
++	const struct device *storage_dev = FLASH_DEV_INST;
++	const struct flash_driver_api *api = storage_dev->api;
++	int loop_counter = 0, rc = -EPERM;
++	int spi_disabled_timeout_ms = 1000;
++
++	while (rc == -EPERM) {
++		rc = api->read(FLASH_DEV_INST, addr, buf, size);
++		if (rc == -EPERM) {
++			k_msleep(1);
++			if (++loop_counter == spi_disabled_timeout_ms)
++				break;
++		} else if (rc)
++			LOG_ERR("Failed to read SPI NOR flash. Address=0x%X Size=%d", addr, size);
++	}
++
++	return rc;
++}
++
++static int validate_lfs_serdes(void)
++{
++	int rc;
++	uint32_t start_addr;
++	uint32_t size;
++	uint8_t serdes_lfs_partition_hash[SHA384_SUM_LEN];
++	uint8_t digest[SHA384_SUM_LEN];
++	uint8_t *buf = NULL;
++
++	rc = hl_fw_info_rd_field(&start_addr, serdes_lfs_partition_offset);
++	if (!rc)
++		rc = hl_fw_info_rd_field(&size, serdes_lfs_partition_size);
++
++	if (!rc)
++		rc = hl_fw_info_rd_field(serdes_lfs_partition_hash, serdes_lfs_partition_checksum);
++
++	if (rc) {
++		LOG_ERR("Serdes: Failed to read LFS partition data, rc=%d", rc);
++		goto val_error;
++	}
++
++	rc = -ENOMEM;
++	if (!sys_heap_hbm) {
++		LOG_INF("Serdes: HBM heap not available");
++		return 0;
++	}
++
++	buf = sys_heap_alloc(sys_heap_hbm, size);
++	if (!buf) {
++		LOG_ERR("Serdes: failed to allocate validation buffer");
++		goto val_error;
++	}
++
++	rc = read_flash_chunk(start_addr, size, buf);
++	if (rc)
++		goto val_error;
++
++	sha384_csum(buf, size, digest, 0);
++	if (memcmp(serdes_lfs_partition_hash, digest, SHA384_SUM_LEN)) {
++		LOG_ERR("Serdes: Validation of LFS Serdes partition failed");
++		rc = -1;
++		goto val_error;
++	}
++
++	LOG_INF("Serdes: LFS Serdes partition validated successfully");
++
++val_error:
++	if (buf)
++		sys_heap_free(sys_heap_hbm, buf);
++
++	return rc;
++}
++
+ static int start_lfs_serdes(void)
+ {
+ 	int rc;
+ 
+-	rc = lfs_zephyrbd_init(&zephyrbd_state, LFS_SPI_SERDES_PARTITION);
++	rc = validate_lfs_serdes();
++	if (!rc)
++		rc = lfs_zephyrbd_init(&zephyrbd_state, LFS_SPI_SERDES_PARTITION);
++
+ 	if (rc)
+ 		LOG_ERR("Unable to mount SerDes LFS SPI NOR partition");
+ 	else
+@@ -401,3 +481,9 @@
+ 
+ 	hl_open_rack_eeprom();
+ }
++
++void hl_serdes_serdes_init_with_validation(struct sys_heap *hbm_mem_pool)
++{
++	sys_heap_hbm = hbm_mem_pool;
++	hl_serdes_serdes_init();
++}

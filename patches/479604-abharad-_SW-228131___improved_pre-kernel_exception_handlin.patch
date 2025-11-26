@@ -1,0 +1,92 @@
+From 7d922c50785804497fc7f892aedbb7064fb80ad4 Mon Sep 17 00:00:00 2001
+From: Akshay Pradip Bharad <apbharad@habana.ai>
+Date: Tue, 13 May 2025 04:59:35 +0000
+Subject: [PATCH] [SW-228131]: improved pre-kernel exception handling
+
+Current pre-kernel exception handling relies on thread name. But kernel
+provides an api k_is_pre_kernel. This patch
+- replaces the earlier code that used thread name to identify
+pre-kernel handling and uses this kernel api k_is_pre_kernel
+- changes severity of logs to warning if in pre-kernel
+
+Change-Id: I1de5e73d1b2634007beb67e407f07202a5526b1a
+Signed-off-by: Akshay Pradip Bharad <apbharad@habana.ai>
+---
+
+diff --git a/arch/arc/include/err_dump_handling.h b/arch/arc/include/err_dump_handling.h
+index 2bda8b8..b5ddeaa 100644
+--- a/arch/arc/include/err_dump_handling.h
++++ b/arch/arc/include/err_dump_handling.h
+@@ -8,7 +8,13 @@
+ #define ZEPHYR_ARCH_ARC_INCLUDE_ERR_DUMP_HANDLING_H_
+ 
+ #if defined CONFIG_LOG
+-#define ARC_EXCEPTION_DUMP(...) LOG_ERR(__VA_ARGS__)
++#define ARC_EXCEPTION_DUMP(fmt, ...) \
++	do { \
++		if (k_is_pre_kernel() && IS_ENABLED(CONFIG_RESET_IN_PRE_KERN_EXCEPTION)) \
++			LOG_WRN(fmt, ##__VA_ARGS__); \
++		else \
++			LOG_ERR(fmt, ##__VA_ARGS__); \
++	} while (0)
+ #else
+ #define ARC_EXCEPTION_DUMP(format, ...) printk(format "\n", ##__VA_ARGS__)
+ #endif
+diff --git a/kernel/fatal.c b/kernel/fatal.c
+index c0eb297..0cd0928 100644
+--- a/kernel/fatal.c
++++ b/kernel/fatal.c
+@@ -180,20 +180,6 @@
+ 
+ __weak void arch_handle_pre_kernel_exceptions(void) {}
+ 
+-static void handle_pre_kernel_exceptions(void)
+-{
+-	const char *name;
+-	struct k_thread *thread = IS_ENABLED(CONFIG_MULTITHREADING) ?
+-			k_current_get() : NULL;
+-
+-	if (thread) {
+-		name = k_thread_name_get((k_tid_t)thread);
+-
+-		if (strcmp(name, "dummy_thread") == 0)
+-			arch_handle_pre_kernel_exceptions();
+-	}
+-}
+-
+ /* LCOV_EXCL_START */
+ __weak void k_sys_fatal_error_handler(unsigned int reason,
+ 				      const struct arch_esf *esf)
+@@ -201,7 +187,9 @@
+ 	ARG_UNUSED(esf);
+ 
+ 	thread_dump();
+-	handle_pre_kernel_exceptions();
++	if (k_is_pre_kernel()) {
++		arch_handle_pre_kernel_exceptions();
++	}
+ 	LOG_ERR("Halting system");
+ 	arch_system_halt(reason);
+ 	CODE_UNREACHABLE;
+@@ -259,8 +247,10 @@
+ 	/* twister looks for the "ZEPHYR FATAL ERROR" string, don't
+ 	 * change it without also updating twister
+ 	 */
+-	LOG_ERR(">>> ZEPHYR FATAL ERROR %d: %s on CPU %d", reason,
+-		reason_to_str(reason), _current_cpu->id);
++	if (!k_is_pre_kernel() || !IS_ENABLED(CONFIG_RESET_IN_PRE_KERN_EXCEPTION)) {
++		LOG_ERR(">>> ZEPHYR FATAL ERROR %d: %s on CPU %d", reason,
++			reason_to_str(reason), _current_cpu->id);
++	}
+ 
+ 	/* FIXME: This doesn't seem to work as expected on all arches.
+ 	 * Need a reliable way to determine whether the fault happened when
+@@ -275,7 +265,7 @@
+ #endif /* CONFIG_ARCH_HAS_NESTED_EXCEPTION_DETECTION */
+ 
+ 	if (IS_ENABLED(CONFIG_MULTITHREADING)) {
+-		LOG_ERR("Current thread: %p (%s)", thread, thread_name_get(thread));
++		LOG_WRN("Current thread: %p (%s)", thread, thread_name_get(thread));
+ 	}
+ 
+ 	coredump(reason, esf, thread);

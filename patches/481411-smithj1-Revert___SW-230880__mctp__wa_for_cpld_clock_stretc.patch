@@ -1,0 +1,64 @@
+From 79c0db1c805a0722ccdcbc4135be6555884d9f09 Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Mon, 09 Jun 2025 15:02:26 +0000
+Subject: [PATCH] Revert "[SW-230880] mctp: wa for cpld clock stretch bug"
+
+This reverts commit 39ab0c6cf48c1aaf09ac90c353739685e1fdb99b, which was
+an attempted workaround for a CPLD issue.  Unfortunately, the workaround
+broke PLDM firmware update - see SW-231612.
+
+Change-Id: Ibc9b76282a38aff6fdabf67002ec777557bae89f
+---
+
+diff --git a/drivers/i2c/hl_i2c/hl_mctp.c b/drivers/i2c/hl_i2c/hl_mctp.c
+index 04abea0..ac4359f 100644
+--- a/drivers/i2c/hl_i2c/hl_mctp.c
++++ b/drivers/i2c/hl_i2c/hl_mctp.c
+@@ -162,46 +162,14 @@
+ 		.dst = data->i2c_partner_addr,
+ 	};
+ 	uint8_t pec = 0;
+-	uint8_t byte_count = packet->payload_bytes + HL_MCTP_SMBUS_OVERHEAD;
+ 	int err;
+ 
+ 	if (!data->initialized) {
+ 		return -ENODEV;
+ 	}
+ 
+-	/* Workaround for SYS-5217.
+-	 *
+-	 * If the last byte of an i2c transfer results in a clock stretch, the
+-	 * CPLD will receive the STOP from the OAM, but once the clock stretch
+-	 * is released it will not propagate the STOP to the BMC, resulting in
+-	 * an i2c bus hang.
+-	 *
+-	 * This workaround avoids the issue by padding the transfer to ensure it
+-	 * does not end on the clock stretch. The clock stretch will still occur,
+-	 * but since there is at least 1 more byte to send the CPLD will be able
+-	 * to correctly send the STOP condition.  The pad byte comes at the end
+-	 * of the MCTP/PLDM transfer and will be ignored by the upper layers when
+-	 * decoding the message.
+-	 *
+-	 * The clock stretch is issued by the HLS3 BMC at 16-byte intervals,
+-	 * where the byte count is the entire i2c transfer, excluding the ADDR
+-	 * byte.  Hence the calculation is the sum of:
+-	 *   - 1  : SMBus.command_code
+-	 *   - 1  : SMBus.byte_count
+-	 *   - <N>: payload: MCTP data
+-	 *   - 1  : PEC byte
+-	 * Note that "smbus.encoding/src_addr" is already counted via
+-	 * HL_MCTP_SMBUS_OVERHEAD.
+-	 */
+-	if ((byte_count < HL_MCTP_SMBUS_PKT_MAX) &&
+-		(byte_count + 3 * sizeof(uint8_t)) % 16 == 0) {
+-		packet->payload[packet->payload_bytes] = 0;
+-		packet->payload_bytes += 1;
+-		byte_count += 1;
+-	}
+-
+ 	smbus_hdr.command_code = HL_MCTP_COMMAND_CODE;
+-	smbus_hdr.byte_count = byte_count;
++	smbus_hdr.byte_count = packet->payload_bytes + HL_MCTP_SMBUS_OVERHEAD;
+ 	smbus_hdr.encoding = HL_MCTP_ENCODING_MCTP;
+ 	smbus_hdr.src_addr = GET_SHIM_CONFIG(cfg->i2c_rx.dev)->i2c_rx.slave_addr;
+ 

@@ -1,0 +1,1289 @@
+From d8aa7ddcdf62465d1bc27584057fba5ab22f7e39 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Fri, 16 May 2025 16:47:11 +0300
+Subject: [PATCH] [JSW-695] interrupt: initial framework support
+
+In jgs the interrupt will be handled in arcmgmt
+This patch adds the initial framework which splits
+into common, dev specific and component specific files.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: Iab78bca7a2433ef8caf411a75426d031687697bb
+---
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2ca8403..824a562 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -98,6 +98,10 @@
+ FILE(GLOB pldm_sources lib/ras/pldm/*.c arch/${DEVICE}/ras/pldm/*.c)
+ target_sources_ifdef(CONFIG_LIBPLDM app PRIVATE ${pldm_sources})
+ 
++FILE(GLOB intr_sources arch/common/intr/*.c arch/${DEVICE}/intr/*.c
++arch/${DEVICE}/intr/component/*.c)
++target_sources_ifdef(CONFIG_HANDLE_INTERRUPT app PRIVATE ${intr_sources})
++
+ target_sources_ifdef(CONFIG_LFS_ENABLED app PRIVATE ${ZEPHYR_MODULES_DIR}/littlefs/lfs.c
+ 							${ZEPHYR_MODULES_DIR}/littlefs/lfs_util.c)
+ target_sources_ifdef(CONFIG_LFS_OVER_SPI app PRIVATE ${ZEPHYR_MODULES_DIR}/littlefs/zephyr/lfs_zephyrbd.c
+diff --git a/app/io/mgmt.c b/app/io/mgmt.c
+index 5d4ea18..e6a7123 100644
+--- a/app/io/mgmt.c
++++ b/app/io/mgmt.c
+@@ -12,6 +12,7 @@
+ #include <stdlib.h>
+ #include <hl_boot_info.h>
+ #include <zephyr/drivers/watchdog.h>
++#include <intr.h>
+ #ifndef CONFIG_SOC_FS1_MGMT
+ #include <hl_boot_status.h>
+ #endif
+@@ -460,6 +461,9 @@
+ #endif
+ #endif
+ 
++#ifdef CONFIG_HANDLE_INTERRUPT
++	dev_intr_prepare(dev_config);
++#endif
+ 	/* must be set last, after all HW&SW inits */
+ 	sysmng_notify_boot_done();
+ 
+@@ -513,6 +517,9 @@
+ 
+ 		check_ints_status();
+ 
++		#ifdef CONFIG_HANDLE_INTERRUPT
++		process_interrupt(dev_config->intr_config, INTR_ACTION_PROCESS);
++		#endif
+ 		mgmt_exit();
+ 		k_msleep(SYSMNGD_POLLING_DELAY);
+ 	}
+diff --git a/arch/common/intr/intr.c b/arch/common/intr/intr.c
+new file mode 100644
+index 0000000..2a96945
+--- /dev/null
++++ b/arch/common/intr/intr.c
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(INTR);
++
++__weak int process_dev_interrupt(struct intr_config *config)
++{
++	return 0;
++}
++
++int process_interrupt(struct intr_config *config, enum intr_action action)
++{
++
++	config->arch_process_interrupt(config);
++
++	return 0;
++}
+diff --git a/arch/common/intr/intr_dispatch.c b/arch/common/intr/intr_dispatch.c
+new file mode 100644
+index 0000000..d6709c1
+--- /dev/null
++++ b/arch/common/intr/intr_dispatch.c
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(INTR_DISPATCH);
++
++typedef int (*intr_comp_handlers_t)(struct intr_config *intr_info);
++
++/* Macro to aggregate all group handlers for a given component type */
++#define ASSIGN_ALL_INTR_HANDLER_FOR(comp) { \
++	ASSIGN_INTR_HANDLER(serr, comp), \
++	ASSIGN_INTR_HANDLER(derr, comp), \
++	ASSIGN_INTR_HANDLER(sei, comp), \
++	ASSIGN_INTR_HANDLER(spi, comp), \
++	ASSIGN_INTR_HANDLER(eco, comp) \
++}
++
++/* 2D array of function pointers for each component type and each group type */
++static intr_comp_handlers_t intr_comp_handlers[INTR_COMP_TYPE_MAX][INTR_GRP_TYPE_MAX] = {
++#define INTR_COMP(name) ASSIGN_ALL_INTR_HANDLER_FOR(name),
++	INTR_COMPONENTS_LIST
++#undef INTR_COMP
++};
++
++
++int intr_dispatch_component_handler(struct intr_config *config)
++{
++	enum intr_agg_grp_type grp;
++	enum intr_agg_component_type comp_type;
++
++	if (config->intr_type(config, &grp, &comp_type)) {
++		LOG_ERR("Failed to get interrupt group and component type");
++		return -1;
++	}
++
++	if (grp < 0 || grp >= INTR_GRP_TYPE_MAX) {
++		LOG_ERR("Invalid group type: %d", grp);
++		return -1;
++	}
++
++	if (comp_type < 0 || comp_type >= INTR_COMP_TYPE_MAX) {
++		LOG_ERR("Invalid component type: %d", comp_type);
++		return -1;
++	}
++
++	if (intr_comp_handlers[comp_type][grp])
++		return intr_comp_handlers[comp_type][grp](config);
++
++	LOG_ERR("No handler found for group %d and component %d", grp, comp_type);
++	return -1;
++}
+diff --git a/arch/jgs/intr/component/arc_farm.c b/arch/jgs/intr/component/arc_farm.c
+new file mode 100644
+index 0000000..ce202fd
+--- /dev/null
++++ b/arch/jgs/intr/component/arc_farm.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(ARC_FARM_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, arc_farm)
++DEFINITION_INTR_HANDLER(derr, arc_farm)
++DEFINITION_INTR_HANDLER(sei, arc_farm)
++DEFINITION_INTR_HANDLER(spi, arc_farm)
++DEFINITION_INTR_HANDLER(eco, arc_farm)
+diff --git a/arch/jgs/intr/component/cpu.c b/arch/jgs/intr/component/cpu.c
+new file mode 100644
+index 0000000..da4651a
+--- /dev/null
++++ b/arch/jgs/intr/component/cpu.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(CPU_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, cpu)
++DEFINITION_INTR_HANDLER(derr, cpu)
++DEFINITION_INTR_HANDLER(sei, cpu)
++DEFINITION_INTR_HANDLER(spi, cpu)
++DEFINITION_INTR_HANDLER(eco, cpu)
+diff --git a/arch/jgs/intr/component/cs.c b/arch/jgs/intr/component/cs.c
+new file mode 100644
+index 0000000..0f2d093
+--- /dev/null
++++ b/arch/jgs/intr/component/cs.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(CS_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, cs)
++DEFINITION_INTR_HANDLER(derr, cs)
++DEFINITION_INTR_HANDLER(sei, cs)
++DEFINITION_INTR_HANDLER(spi, cs)
++DEFINITION_INTR_HANDLER(eco, cs)
+diff --git a/arch/jgs/intr/component/d2d_mac.c b/arch/jgs/intr/component/d2d_mac.c
+new file mode 100644
+index 0000000..d3d6604
+--- /dev/null
++++ b/arch/jgs/intr/component/d2d_mac.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(D2D_MAC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, d2d_mac)
++DEFINITION_INTR_HANDLER(derr, d2d_mac)
++DEFINITION_INTR_HANDLER(sei, d2d_mac)
++DEFINITION_INTR_HANDLER(spi, d2d_mac)
++DEFINITION_INTR_HANDLER(eco, d2d_mac)
+diff --git a/arch/jgs/intr/component/d2d_phy.c b/arch/jgs/intr/component/d2d_phy.c
+new file mode 100644
+index 0000000..36a2938
+--- /dev/null
++++ b/arch/jgs/intr/component/d2d_phy.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(D2D_PHY_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, d2d_phy)
++DEFINITION_INTR_HANDLER(derr, d2d_phy)
++DEFINITION_INTR_HANDLER(sei, d2d_phy)
++DEFINITION_INTR_HANDLER(spi, d2d_phy)
++DEFINITION_INTR_HANDLER(eco, d2d_phy)
+diff --git a/arch/jgs/intr/component/dch0.c b/arch/jgs/intr/component/dch0.c
+new file mode 100644
+index 0000000..813683c
+--- /dev/null
++++ b/arch/jgs/intr/component/dch0.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(DCH0_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, dch0)
++DEFINITION_INTR_HANDLER(derr, dch0)
++DEFINITION_INTR_HANDLER(sei, dch0)
++DEFINITION_INTR_HANDLER(spi, dch0)
++DEFINITION_INTR_HANDLER(eco, dch0)
+diff --git a/arch/jgs/intr/component/dch1.c b/arch/jgs/intr/component/dch1.c
+new file mode 100644
+index 0000000..8f8a4d7
+--- /dev/null
++++ b/arch/jgs/intr/component/dch1.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(DCH1_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, dch1)
++DEFINITION_INTR_HANDLER(derr, dch1)
++DEFINITION_INTR_HANDLER(sei, dch1)
++DEFINITION_INTR_HANDLER(spi, dch1)
++DEFINITION_INTR_HANDLER(eco, dch1)
+diff --git a/arch/jgs/intr/component/dec.c b/arch/jgs/intr/component/dec.c
+new file mode 100644
+index 0000000..823da0b
+--- /dev/null
++++ b/arch/jgs/intr/component/dec.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(DEC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, dec)
++DEFINITION_INTR_HANDLER(derr, dec)
++DEFINITION_INTR_HANDLER(sei, dec)
++DEFINITION_INTR_HANDLER(spi, dec)
++DEFINITION_INTR_HANDLER(eco, dec)
+diff --git a/arch/jgs/intr/component/drtr0.c b/arch/jgs/intr/component/drtr0.c
+new file mode 100644
+index 0000000..ffe4c43
+--- /dev/null
++++ b/arch/jgs/intr/component/drtr0.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(DRTR0_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, drtr0)
++DEFINITION_INTR_HANDLER(derr, drtr0)
++DEFINITION_INTR_HANDLER(sei, drtr0)
++DEFINITION_INTR_HANDLER(spi, drtr0)
++DEFINITION_INTR_HANDLER(eco, drtr0)
+diff --git a/arch/jgs/intr/component/drtr1.c b/arch/jgs/intr/component/drtr1.c
+new file mode 100644
+index 0000000..367fc62
+--- /dev/null
++++ b/arch/jgs/intr/component/drtr1.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(DRTR1_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, drtr1)
++DEFINITION_INTR_HANDLER(derr, drtr1)
++DEFINITION_INTR_HANDLER(sei, drtr1)
++DEFINITION_INTR_HANDLER(spi, drtr1)
++DEFINITION_INTR_HANDLER(eco, drtr1)
+diff --git a/arch/jgs/intr/component/econ.c b/arch/jgs/intr/component/econ.c
+new file mode 100644
+index 0000000..911a639
+--- /dev/null
++++ b/arch/jgs/intr/component/econ.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(ECON_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, econ)
++DEFINITION_INTR_HANDLER(derr, econ)
++DEFINITION_INTR_HANDLER(sei, econ)
++DEFINITION_INTR_HANDLER(spi, econ)
++DEFINITION_INTR_HANDLER(eco, econ)
+diff --git a/arch/jgs/intr/component/edma.c b/arch/jgs/intr/component/edma.c
+new file mode 100644
+index 0000000..f47fd11
+--- /dev/null
++++ b/arch/jgs/intr/component/edma.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(EDMA_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, edma)
++DEFINITION_INTR_HANDLER(derr, edma)
++DEFINITION_INTR_HANDLER(sei, edma)
++DEFINITION_INTR_HANDLER(spi, edma)
++DEFINITION_INTR_HANDLER(eco, edma)
+diff --git a/arch/jgs/intr/component/edup.c b/arch/jgs/intr/component/edup.c
+new file mode 100644
+index 0000000..4700ef3
+--- /dev/null
++++ b/arch/jgs/intr/component/edup.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(EDUP_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, edup)
++DEFINITION_INTR_HANDLER(derr, edup)
++DEFINITION_INTR_HANDLER(sei, edup)
++DEFINITION_INTR_HANDLER(spi, edup)
++DEFINITION_INTR_HANDLER(eco, edup)
+diff --git a/arch/jgs/intr/component/grtr1.c b/arch/jgs/intr/component/grtr1.c
+new file mode 100644
+index 0000000..7fa9651
+--- /dev/null
++++ b/arch/jgs/intr/component/grtr1.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(GRTR1_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, grtr1)
++DEFINITION_INTR_HANDLER(derr, grtr1)
++DEFINITION_INTR_HANDLER(sei, grtr1)
++DEFINITION_INTR_HANDLER(spi, grtr1)
++DEFINITION_INTR_HANDLER(eco, grtr1)
+diff --git a/arch/jgs/intr/component/grtr3.c b/arch/jgs/intr/component/grtr3.c
+new file mode 100644
+index 0000000..6caaa12
+--- /dev/null
++++ b/arch/jgs/intr/component/grtr3.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(GRTR3_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, grtr3)
++DEFINITION_INTR_HANDLER(derr, grtr3)
++DEFINITION_INTR_HANDLER(sei, grtr3)
++DEFINITION_INTR_HANDLER(spi, grtr3)
++DEFINITION_INTR_HANDLER(eco, grtr3)
+diff --git a/arch/jgs/intr/component/hft.c b/arch/jgs/intr/component/hft.c
+new file mode 100644
+index 0000000..3ac451b
+--- /dev/null
++++ b/arch/jgs/intr/component/hft.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(HFT_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, hft)
++DEFINITION_INTR_HANDLER(derr, hft)
++DEFINITION_INTR_HANDLER(sei, hft)
++DEFINITION_INTR_HANDLER(spi, hft)
++DEFINITION_INTR_HANDLER(eco, hft)
+diff --git a/arch/jgs/intr/component/hif.c b/arch/jgs/intr/component/hif.c
+new file mode 100644
+index 0000000..55d7a44
+--- /dev/null
++++ b/arch/jgs/intr/component/hif.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(HIF_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, hif)
++DEFINITION_INTR_HANDLER(derr, hif)
++DEFINITION_INTR_HANDLER(sei, hif)
++DEFINITION_INTR_HANDLER(spi, hif)
++DEFINITION_INTR_HANDLER(eco, hif)
+diff --git a/arch/jgs/intr/component/mc.c b/arch/jgs/intr/component/mc.c
+new file mode 100644
+index 0000000..fb491c6
+--- /dev/null
++++ b/arch/jgs/intr/component/mc.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(MC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, mc)
++DEFINITION_INTR_HANDLER(derr, mc)
++DEFINITION_INTR_HANDLER(sei, mc)
++DEFINITION_INTR_HANDLER(spi, mc)
++DEFINITION_INTR_HANDLER(eco, mc)
+diff --git a/arch/jgs/intr/component/mme.c b/arch/jgs/intr/component/mme.c
+new file mode 100644
+index 0000000..6b6831c
+--- /dev/null
++++ b/arch/jgs/intr/component/mme.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(MME_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, mme)
++DEFINITION_INTR_HANDLER(derr, mme)
++DEFINITION_INTR_HANDLER(sei, mme)
++DEFINITION_INTR_HANDLER(spi, mme)
++DEFINITION_INTR_HANDLER(eco, mme)
+diff --git a/arch/jgs/intr/component/nch.c b/arch/jgs/intr/component/nch.c
+new file mode 100644
+index 0000000..74e1144
+--- /dev/null
++++ b/arch/jgs/intr/component/nch.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(NCH_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, nch)
++DEFINITION_INTR_HANDLER(derr, nch)
++DEFINITION_INTR_HANDLER(sei, nch)
++DEFINITION_INTR_HANDLER(spi, nch)
++DEFINITION_INTR_HANDLER(eco, nch)
+diff --git a/arch/jgs/intr/component/nchl.c b/arch/jgs/intr/component/nchl.c
+new file mode 100644
+index 0000000..36a6af2
+--- /dev/null
++++ b/arch/jgs/intr/component/nchl.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(NCHL_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, nchl)
++DEFINITION_INTR_HANDLER(derr, nchl)
++DEFINITION_INTR_HANDLER(sei, nchl)
++DEFINITION_INTR_HANDLER(spi, nchl)
++DEFINITION_INTR_HANDLER(eco, nchl)
+diff --git a/arch/jgs/intr/component/nic.c b/arch/jgs/intr/component/nic.c
+new file mode 100644
+index 0000000..bcfb385
+--- /dev/null
++++ b/arch/jgs/intr/component/nic.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(NIC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, nic)
++DEFINITION_INTR_HANDLER(derr, nic)
++DEFINITION_INTR_HANDLER(sei, nic)
++DEFINITION_INTR_HANDLER(spi, nic)
++DEFINITION_INTR_HANDLER(eco, nic)
+diff --git a/arch/jgs/intr/component/nrtr0.c b/arch/jgs/intr/component/nrtr0.c
+new file mode 100644
+index 0000000..95054cc
+--- /dev/null
++++ b/arch/jgs/intr/component/nrtr0.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(NRTR0_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, nrtr0)
++DEFINITION_INTR_HANDLER(derr, nrtr0)
++DEFINITION_INTR_HANDLER(sei, nrtr0)
++DEFINITION_INTR_HANDLER(spi, nrtr0)
++DEFINITION_INTR_HANDLER(eco, nrtr0)
+diff --git a/arch/jgs/intr/component/nrtr2.c b/arch/jgs/intr/component/nrtr2.c
+new file mode 100644
+index 0000000..a1560e0
+--- /dev/null
++++ b/arch/jgs/intr/component/nrtr2.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(NRTR2_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, nrtr2)
++DEFINITION_INTR_HANDLER(derr, nrtr2)
++DEFINITION_INTR_HANDLER(sei, nrtr2)
++DEFINITION_INTR_HANDLER(spi, nrtr2)
++DEFINITION_INTR_HANDLER(eco, nrtr2)
+diff --git a/arch/jgs/intr/component/parc.c b/arch/jgs/intr/component/parc.c
+new file mode 100644
+index 0000000..b4d62a5
+--- /dev/null
++++ b/arch/jgs/intr/component/parc.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(PARC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, parc)
++DEFINITION_INTR_HANDLER(derr, parc)
++DEFINITION_INTR_HANDLER(sei, parc)
++DEFINITION_INTR_HANDLER(spi, parc)
++DEFINITION_INTR_HANDLER(eco, parc)
+diff --git a/arch/jgs/intr/component/pcie.c b/arch/jgs/intr/component/pcie.c
+new file mode 100644
+index 0000000..ebf009b
+--- /dev/null
++++ b/arch/jgs/intr/component/pcie.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(PCIE_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, pcie)
++DEFINITION_INTR_HANDLER(derr, pcie)
++DEFINITION_INTR_HANDLER(sei, pcie)
++DEFINITION_INTR_HANDLER(spi, pcie)
++DEFINITION_INTR_HANDLER(eco, pcie)
+diff --git a/arch/jgs/intr/component/pdma.c b/arch/jgs/intr/component/pdma.c
+new file mode 100644
+index 0000000..97b1cb5
+--- /dev/null
++++ b/arch/jgs/intr/component/pdma.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(PDMA_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, pdma)
++DEFINITION_INTR_HANDLER(derr, pdma)
++DEFINITION_INTR_HANDLER(sei, pdma)
++DEFINITION_INTR_HANDLER(spi, pdma)
++DEFINITION_INTR_HANDLER(eco, pdma)
+diff --git a/arch/jgs/intr/component/pll.c b/arch/jgs/intr/component/pll.c
+new file mode 100644
+index 0000000..127e9b9
+--- /dev/null
++++ b/arch/jgs/intr/component/pll.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(PLL_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, pll)
++DEFINITION_INTR_HANDLER(derr, pll)
++DEFINITION_INTR_HANDLER(sei, pll)
++DEFINITION_INTR_HANDLER(spi, pll)
++DEFINITION_INTR_HANDLER(eco, pll)
+diff --git a/arch/jgs/intr/component/pmmu.c b/arch/jgs/intr/component/pmmu.c
+new file mode 100644
+index 0000000..2f09e31
+--- /dev/null
++++ b/arch/jgs/intr/component/pmmu.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(PMMU_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, pmmu)
++DEFINITION_INTR_HANDLER(derr, pmmu)
++DEFINITION_INTR_HANDLER(sei, pmmu)
++DEFINITION_INTR_HANDLER(spi, pmmu)
++DEFINITION_INTR_HANDLER(eco, pmmu)
+diff --git a/arch/jgs/intr/component/psoc.c b/arch/jgs/intr/component/psoc.c
+new file mode 100644
+index 0000000..ad29f01
+--- /dev/null
++++ b/arch/jgs/intr/component/psoc.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(PSOC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, psoc)
++DEFINITION_INTR_HANDLER(derr, psoc)
++DEFINITION_INTR_HANDLER(sei, psoc)
++DEFINITION_INTR_HANDLER(spi, psoc)
++DEFINITION_INTR_HANDLER(eco, psoc)
+diff --git a/arch/jgs/intr/component/rft.c b/arch/jgs/intr/component/rft.c
+new file mode 100644
+index 0000000..1b6462f
+--- /dev/null
++++ b/arch/jgs/intr/component/rft.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(RFT_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, rft)
++DEFINITION_INTR_HANDLER(derr, rft)
++DEFINITION_INTR_HANDLER(sei, rft)
++DEFINITION_INTR_HANDLER(spi, rft)
++DEFINITION_INTR_HANDLER(eco, rft)
+diff --git a/arch/jgs/intr/component/rot.c b/arch/jgs/intr/component/rot.c
+new file mode 100644
+index 0000000..fc0425e
+--- /dev/null
++++ b/arch/jgs/intr/component/rot.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(ROT_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, rot)
++DEFINITION_INTR_HANDLER(derr, rot)
++DEFINITION_INTR_HANDLER(sei, rot)
++DEFINITION_INTR_HANDLER(spi, rot)
++DEFINITION_INTR_HANDLER(eco, rot)
+diff --git a/arch/jgs/intr/component/rrtr.c b/arch/jgs/intr/component/rrtr.c
+new file mode 100644
+index 0000000..a3a1f5b
+--- /dev/null
++++ b/arch/jgs/intr/component/rrtr.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(RRTR_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, rrtr)
++DEFINITION_INTR_HANDLER(derr, rrtr)
++DEFINITION_INTR_HANDLER(sei, rrtr)
++DEFINITION_INTR_HANDLER(spi, rrtr)
++DEFINITION_INTR_HANDLER(eco, rrtr)
+diff --git a/arch/jgs/intr/component/sob.c b/arch/jgs/intr/component/sob.c
+new file mode 100644
+index 0000000..bd385a4
+--- /dev/null
++++ b/arch/jgs/intr/component/sob.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(SOB_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, sob)
++DEFINITION_INTR_HANDLER(derr, sob)
++DEFINITION_INTR_HANDLER(sei, sob)
++DEFINITION_INTR_HANDLER(spi, sob)
++DEFINITION_INTR_HANDLER(eco, sob)
+diff --git a/arch/jgs/intr/component/stlb.c b/arch/jgs/intr/component/stlb.c
+new file mode 100644
+index 0000000..d65d347
+--- /dev/null
++++ b/arch/jgs/intr/component/stlb.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(STLB_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, stlb)
++DEFINITION_INTR_HANDLER(derr, stlb)
++DEFINITION_INTR_HANDLER(sei, stlb)
++DEFINITION_INTR_HANDLER(spi, stlb)
++DEFINITION_INTR_HANDLER(eco, stlb)
+diff --git a/arch/jgs/intr/component/tpc.c b/arch/jgs/intr/component/tpc.c
+new file mode 100644
+index 0000000..cfb3abb
+--- /dev/null
++++ b/arch/jgs/intr/component/tpc.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(TPC_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, tpc)
++DEFINITION_INTR_HANDLER(derr, tpc)
++DEFINITION_INTR_HANDLER(sei, tpc)
++DEFINITION_INTR_HANDLER(spi, tpc)
++DEFINITION_INTR_HANDLER(eco, tpc)
+diff --git a/arch/jgs/intr/component/ts.c b/arch/jgs/intr/component/ts.c
+new file mode 100644
+index 0000000..093e095
+--- /dev/null
++++ b/arch/jgs/intr/component/ts.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(TS_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, ts)
++DEFINITION_INTR_HANDLER(derr, ts)
++DEFINITION_INTR_HANDLER(sei, ts)
++DEFINITION_INTR_HANDLER(spi, ts)
++DEFINITION_INTR_HANDLER(eco, ts)
+diff --git a/arch/jgs/intr/component/vm.c b/arch/jgs/intr/component/vm.c
+new file mode 100644
+index 0000000..d3e5f4d
+--- /dev/null
++++ b/arch/jgs/intr/component/vm.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(VM_INTR, CONFIG_LOG_DEFAULT_LEVEL);
++
++DEFINITION_INTR_HANDLER(serr, vm)
++DEFINITION_INTR_HANDLER(derr, vm)
++DEFINITION_INTR_HANDLER(sei, vm)
++DEFINITION_INTR_HANDLER(spi, vm)
++DEFINITION_INTR_HANDLER(eco, vm)
+diff --git a/arch/jgs/intr/jgs_intr.c b/arch/jgs/intr/jgs_intr.c
+new file mode 100644
+index 0000000..5bca6d1
+--- /dev/null
++++ b/arch/jgs/intr/jgs_intr.c
+@@ -0,0 +1,97 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ *
++ * Copyright 2024 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <intr.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(JGS_INTR);
++
++static struct intr_config intr;
++/*
++ * Function to get the interrupt handler for a specific group and component
++ */
++static int jgs_get_intr_type(struct intr_config *config, enum intr_agg_grp_type *grp,
++	enum intr_agg_component_type *comp_type)
++{
++	/* TODO: Read grp and comp_type from config and set them accordingly */
++	if (grp)
++		*grp = INTR_GRP_TYPE_MAX;
++	if (comp_type)
++		*comp_type = INTR_COMP_TYPE_MAX;
++	return 0;
++}
++
++static int jgs_process_sei_interrupt(struct intr_config *config)
++{
++	int ret = intr_dispatch_component_handler(config);
++	/* TODO: SEI-specific post-processing. */
++	return ret;
++}
++
++static int jgs_process_spi_interrupt(struct intr_config *config)
++{
++	int ret = intr_dispatch_component_handler(config);
++	/* TODO: SPI-specific post-processing. */
++	return ret;
++}
++
++static int jgs_process_serr_interrupt(struct intr_config *config)
++{
++	int ret = intr_dispatch_component_handler(config);
++	/*  TODO: SERR-specific post-processing. */
++	return ret;
++}
++
++static int jgs_process_derr_interrupt(struct intr_config *config)
++{
++	int ret = intr_dispatch_component_handler(config);
++	/* TODO: DERR-specific post-processing. */
++	return ret;
++}
++
++static int jgs_process_eco_interrupt(struct intr_config *config)
++{
++	int ret = intr_dispatch_component_handler(config);
++	/* TODO: ECO-specific post-processing. */
++	return ret;
++}
++
++static int jgs_process_interrupt(struct intr_config *config)
++{
++	enum intr_agg_grp_type grp;
++	enum intr_agg_component_type comp_type;
++
++	if (config->intr_type(config, &grp, &comp_type)) {
++		LOG_ERR("Failed to get interrupt group and component type");
++		return -1;
++	}
++
++	switch (grp) {
++	case INTR_GRP_TYPE_SEI:
++		return jgs_process_sei_interrupt(config);
++	case INTR_GRP_TYPE_SPI:
++		return jgs_process_spi_interrupt(config);
++	case INTR_GRP_TYPE_SERR:
++		return jgs_process_serr_interrupt(config);
++	case INTR_GRP_TYPE_DERR:
++		return jgs_process_derr_interrupt(config);
++	case INTR_GRP_TYPE_ECO:
++		return jgs_process_eco_interrupt(config);
++	default:
++		LOG_ERR("Unknown group type: %d", grp);
++		return -1;
++	}
++}
++
++int dev_intr_prepare(struct hl_dev_config *dev_cfg)
++{
++	dev_cfg->intr_config = &intr;
++	intr.intr_type = jgs_get_intr_type;
++	intr.arch_process_interrupt = jgs_process_interrupt;
++
++	return 0;
++}
+diff --git a/include/intr.h b/include/intr.h
+new file mode 100644
+index 0000000..a0e0570
+--- /dev/null
++++ b/include/intr.h
+@@ -0,0 +1,82 @@
++/* SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++
++#ifndef ZEPHYR_INCLUDE_INTR_H_
++#define ZEPHYR_INCLUDE_INTR_H_
++
++#include <zephyr/kernel.h>
++#include <zephyr/types.h>
++#include <intr_comp_list.h>
++
++enum intr_agg_grp_type {
++	INTR_GRP_TYPE_SERR,
++	INTR_GRP_TYPE_DERR,
++	INTR_GRP_TYPE_SEI,
++	INTR_GRP_TYPE_SPI,
++	INTR_GRP_TYPE_ECO,
++	INTR_GRP_TYPE_MAX
++};
++
++enum intr_agg_component_type {
++#define INTR_COMP(name) INT_COMP_TYPE_##name,
++	INTR_COMPONENTS_LIST
++#undef INTR_COMP
++	INTR_COMP_TYPE_MAX
++};
++
++enum intr_action {
++	INTR_ACTION_ENABLE,
++	INTR_ACTION_DISABLE,
++	INTR_ACTION_MASK,
++	INTR_ACTION_UNMASK,
++	INTR_ACTION_PROCESS
++};
++
++struct intr_config {
++	uint32_t intr_data;
++	int (*intr_type)(struct intr_config *config, enum intr_agg_grp_type *grp,
++		enum intr_agg_component_type *comp_type);
++	int (*arch_process_interrupt)(struct intr_config *config);
++};
++
++int dev_intr_prepare(struct hl_dev_config *dev_cfg)
++int process_interrupt(struct intr_config *config, enum intr_action action);
++int intr_dispatch_component_handler(struct intr_config *config);
++
++/* Handler function declarations for each group/component type combination */
++#define DECLARE_INTR_HANDLER(GRP, COMP) \
++	int handle_##COMP##_##GRP##_interrupt(struct intr_config *intr_info);
++#define ASSIGN_INTR_HANDLER(GRP, COMP) handle_##COMP##_##GRP##_interrupt
++#define DEFINITION_INTR_HANDLER(GRP, COMP) \
++	__weak int handle_##COMP##_##GRP##_interrupt(struct intr_config *intr_info) \
++	{ \
++		LOG_WRN("%s is not implemented", __func__); \
++		return 0; \
++	}
++
++/* Macro to declare all handlers for a component if enabled */
++#define DECLARE_ALL_INTR_HANDLERS(comp) \
++	DECLARE_INTR_HANDLER(serr, comp) \
++	DECLARE_INTR_HANDLER(derr, comp) \
++	DECLARE_INTR_HANDLER(sei, comp) \
++	DECLARE_INTR_HANDLER(spi, comp) \
++	DECLARE_INTR_HANDLER(eco, comp)
++
++	/* Macro to aggregate all group handlers for a given component type */
++#define ASSIGN_ALL_INTR_HANDLER_FOR(comp) { \
++	ASSIGN_INTR_HANDLER(serr, comp), \
++	ASSIGN_INTR_HANDLER(derr, comp), \
++	ASSIGN_INTR_HANDLER(sei, comp), \
++	ASSIGN_INTR_HANDLER(spi, comp), \
++	ASSIGN_INTR_HANDLER(eco, comp) \
++}
++
++#define INTR_COMP(name) DECLARE_ALL_INTR_HANDLERS(name)
++INTR_COMPONENTS_LIST
++#undef INTR_COMP
++
++#endif /* ZEPHYR_INCLUDE_INTR_H_ */
+diff --git a/include/intr_comp_list.h b/include/intr_comp_list.h
+new file mode 100644
+index 0000000..03bf7a4
+--- /dev/null
++++ b/include/intr_comp_list.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright 2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef ZEPHYR_INCLUDE_INTR_COMP_LIST_H_
++#define ZEPHYR_INCLUDE_INTR_COMP_LIST_H_
++
++#define INTR_COMPONENTS_LIST	\
++	INTR_COMP(arc_farm)	\
++	INTR_COMP(cpu)		\
++	INTR_COMP(cs)		\
++	INTR_COMP(d2d_mac)	\
++	INTR_COMP(d2d_phy)	\
++	INTR_COMP(dch0)		\
++	INTR_COMP(dch1)		\
++	INTR_COMP(dec)		\
++	INTR_COMP(drtr0)	\
++	INTR_COMP(drtr1)	\
++	INTR_COMP(econ)		\
++	INTR_COMP(edma)		\
++	INTR_COMP(edup)		\
++	INTR_COMP(grtr1)	\
++	INTR_COMP(grtr3)	\
++	INTR_COMP(hft)		\
++	INTR_COMP(hif)		\
++	INTR_COMP(mc)		\
++	INTR_COMP(mme)		\
++	INTR_COMP(nch)		\
++	INTR_COMP(nchl)		\
++	INTR_COMP(nic)		\
++	INTR_COMP(nrtr0)	\
++	INTR_COMP(nrtr2)	\
++	INTR_COMP(parc)		\
++	INTR_COMP(pcie)		\
++	INTR_COMP(pdma)		\
++	INTR_COMP(pll)		\
++	INTR_COMP(pmmu)		\
++	INTR_COMP(psoc)		\
++	INTR_COMP(rft)		\
++	INTR_COMP(rot)		\
++	INTR_COMP(rrtr)		\
++	INTR_COMP(sob)		\
++	INTR_COMP(stlb)		\
++	INTR_COMP(tpc)		\
++	INTR_COMP(ts)		\
++	INTR_COMP(vm)
++
++#endif /* ZEPHYR_INCLUDE_INTR_COMP_LIST_H_ */
++
+diff --git a/include/io/common.h b/include/io/common.h
+index 069184c..4555b7d 100644
+--- a/include/io/common.h
++++ b/include/io/common.h
+@@ -151,6 +151,9 @@
+ 	int (*queue_init)(struct hl_dev_config *dev_config);
+ 	bool boot_done;
+ 	bool lkd_eq_ready;
++#ifdef CONFIG_HANDLE_INTERRUPT
++	struct intr_config *intr_config;
++#endif
+ };
+ 
+ static inline uint32_t hl_rreg32(uint32_t reg)

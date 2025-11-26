@@ -1,0 +1,141 @@
+From 1e4219377b0ea0cfb64322391285f32a957a4202 Mon Sep 17 00:00:00 2001
+From: Michael Pauzner <mpauzner@habana.ai>
+Date: Mon, 12 May 2025 14:26:51 +0300
+Subject: [PATCH] [SW-221409] g3: serdes: add ram lfs config
+
+Add support for serdes backup LFS partition in RAM.
+
+Change-Id: Ibca987477388b103ff4c2f45718cd7964483c9e6
+Signed-off-by: Michael Pauzner <mpauzner@habana.ai>
+---
+
+diff --git a/zephyr/lfs_serdes_partition_config.c b/zephyr/lfs_serdes_partition_config.c
+index 9700351..85aa521 100644
+--- a/zephyr/lfs_serdes_partition_config.c
++++ b/zephyr/lfs_serdes_partition_config.c
+@@ -10,6 +10,11 @@
+ #include <zephyr/logging/log.h>
+ #include "lfs_config_serdes.h"
+ 
++#ifdef CONFIG_LFS_IMAGE_IN_RAM
++#include "lfs_rambd.h"
++#include "gaudi3_mem_addr_dt.h"
++#endif
++
+ LOG_MODULE_REGISTER(lfs_serdes_partition, LOG_LEVEL_INF);
+ 
+ static uint8_t __aligned(4) lfs_read_buf[LFS_SERDES_READ_SIZE];
+@@ -19,7 +24,7 @@
+ static int setup_config(struct lfs_config *config);
+ 
+ static struct lfs zephyrbd_lfs;
+-static struct lfs_zephyrbd_context spi_context;
++static struct lfs_zephyrbd_context flashbd_context;
+ 
+ static struct lfs_config zephyrbd_config = {
+ 	.read_buffer	= lfs_read_buf,
+@@ -76,7 +81,7 @@
+ 		return -1;
+ 	}
+ 
+-	config->context	= &spi_context;
++	config->context	= &flashbd_context;
+ 	config->read	= lfs_zephyrbd_read;
+ 	config->prog	= lfs_zephyrbd_prog;
+ 	config->erase	= lfs_zephyrbd_erase;
+@@ -112,3 +117,54 @@
+ 
+ 	return 0;
+ }
++
++#ifdef CONFIG_LFS_IMAGE_IN_RAM
++static int setup_backup_config(struct lfs_config *config);
++
++static struct lfs_rambd_config rambd_cfg = {
++	.read_size = LFS_SERDES_READ_SIZE,
++	.prog_size = LFS_SERDES_PROG_SIZE,
++	.erase_size = CONFIG_SPI_NOR_FLASH_LAYOUT_PAGE_SIZE,
++	.erase_count = LFS_SERDES_PARTITION_SIZE / CONFIG_SPI_NOR_FLASH_LAYOUT_PAGE_SIZE,
++	.buffer = (void *)D1_ARC1_DCCM_OFFSET,
++};
++
++static lfs_rambd_t rambd_context = {
++	.buffer = (uint8_t *)D1_ARC1_DCCM_OFFSET,
++	.cfg = &rambd_cfg,
++};
++
++static struct lfs_zephyrbd backup_zephyrbd_state = {
++	.cfg = (const struct lfs_config *)(&zephyrbd_config),
++	.lfs = &zephyrbd_lfs,
++	.is_mounted = false,
++	.format_if_mount_failed = false,
++	.setup = setup_backup_config,
++};
++
++struct lfs_zephyrbd *lfs_serdes_get_backup_zephyrbd_state(void)
++{
++	return &backup_zephyrbd_state;
++}
++
++static int lfs_empty_lock(const struct lfs_config *c) { return 0; }
++static int lfs_empty_unlock(const struct lfs_config *c) { return 0; }
++
++static int setup_backup_config(struct lfs_config *config)
++{
++	lfs_rambd_t *ctx;
++
++	config->context	= &rambd_context;
++	config->read	= lfs_rambd_read;
++	config->prog	= lfs_rambd_prog;
++	config->erase	= lfs_rambd_erase;
++	config->sync	= lfs_rambd_sync;
++	config->lock	= lfs_empty_lock;
++	config->unlock	= lfs_empty_unlock;
++
++	ctx = config->context;
++	LOG_INF("Serdes backup LFS partition: Start addr: 0x%X", (uint32_t)ctx->buffer);
++
++	return 0;
++}
++#endif /* CONFIG_LFS_IMAGE_IN_RAM */
+diff --git a/zephyr/lfs_zephyr_init.h b/zephyr/lfs_zephyr_init.h
+index 6bf992b..97779a9 100644
+--- a/zephyr/lfs_zephyr_init.h
++++ b/zephyr/lfs_zephyr_init.h
+@@ -13,6 +13,9 @@
+ enum lfs_partition_type {
+ 	LFS_SPI_LOGGER_PARTITION = 0,
+ 	LFS_SPI_SERDES_PARTITION,
++#ifdef CONFIG_LFS_IMAGE_IN_RAM
++	LFS_RAM_SERDES_PARTITION,
++#endif
+ };
+ 
+ int lfs_zephyrbd_init(struct lfs_zephyrbd **lfs_handle, enum lfs_partition_type partition_type);
+diff --git a/zephyr/lfs_zephyrbd.c b/zephyr/lfs_zephyrbd.c
+index d6d2b09..38ca5a1 100644
+--- a/zephyr/lfs_zephyrbd.c
++++ b/zephyr/lfs_zephyrbd.c
+@@ -201,6 +201,10 @@
+ 		return lfs_log_get_zephyrbd_state();
+ 	case LFS_SPI_SERDES_PARTITION:
+ 		return lfs_serdes_get_zephyrbd_state();
++#ifdef CONFIG_LFS_IMAGE_IN_RAM
++	case LFS_RAM_SERDES_PARTITION:
++		return lfs_serdes_get_backup_zephyrbd_state();
++#endif
+ 	default:
+ 		break;
+ 	}
+diff --git a/zephyr/lfs_zephyrbd.h b/zephyr/lfs_zephyrbd.h
+index b5820d2..ce4165a 100644
+--- a/zephyr/lfs_zephyrbd.h
++++ b/zephyr/lfs_zephyrbd.h
+@@ -56,6 +56,7 @@
+ struct lfs_zephyrbd *lfs_get_zephyrbd_state(enum lfs_partition_type partition_type);
+ struct lfs_zephyrbd *lfs_log_get_zephyrbd_state(void);
+ struct lfs_zephyrbd *lfs_serdes_get_zephyrbd_state(void);
++struct lfs_zephyrbd *lfs_serdes_get_backup_zephyrbd_state(void);
+ 
+ #ifdef LFS_TEST_MODE
+ void lfs_flash_dump(uint32_t addr, uint32_t len);

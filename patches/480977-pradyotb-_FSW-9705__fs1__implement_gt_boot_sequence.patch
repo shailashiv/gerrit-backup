@@ -1,0 +1,912 @@
+From 1a8d1126f2775694c7faf0bffc93c8b5159d9e03 Mon Sep 17 00:00:00 2001
+From: Pradyot Bhattacharyya <pbhattacharyya@habana.ai>
+Date: Tue, 03 Jun 2025 14:55:15 +0300
+Subject: [PATCH] [FSW-9705] fs1: implement gt boot sequence
+
+Implementation of the gt boot sequence
+
+Change-Id: I2823e7a96396192bc7498bb7e92120eb62b1cb64
+Signed-off-by: Pradyot Bhattacharyya <pbhattacharyya@habana.ai>
+---
+
+diff --git a/app/compute/mgmt.c b/app/compute/mgmt.c
+index 805bac6..78eb32a 100644
+--- a/app/compute/mgmt.c
++++ b/app/compute/mgmt.c
+@@ -46,6 +46,14 @@
+ 		}
+ 	}
+ 
++	if (config.init_gt) {
++		ret = config.init_gt();
++		if (ret != 0) {
++			LOG_ERR("GT init failed ret: %d", ret);
++			goto err_loop;
++		}
++	}
++
+ 	while (1) {
+ 		/* Main loop. TODO: add code here */
+ 		k_msleep(SYSMNGD_POLLING_DELAY);
+diff --git a/arch/fs1/compute/device.c b/arch/fs1/compute/device.c
+index 8066f7a..05b8478 100644
+--- a/arch/fs1/compute/device.c
++++ b/arch/fs1/compute/device.c
+@@ -10,94 +10,374 @@
+ #include <bridge_if.h>
+ #include <ipm.h>
+ #include <hl_devs.h>
+-
+-#define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
++#include <hl_platform_defs.h>
++#include <fs1_blocks_linux_driver.h>
++#include <gt_misc_regs.h>
++#include <i2a_bridge_regs.h>
++#include <i2a_bridge_wrap_regs.h>
++#include <gt_sgunit_regs.h>
++#include <xbar_s_cfg_regs.h>
++#include <arc_regs.h>
++#include <axuser_lbw_regs.h>
++#include <axuser_lbw_masks.h>
+ #include <zephyr/logging/log.h>
++
++#define INITIATOR_SAI_REG_FORMAT(SAI_VAL)\
++		((SAI_VAL & AXUSER_LBW_LB_SAI_RD_M) | \
++		((SAI_VAL << AXUSER_LBW_LB_SAI_WR_S) & AXUSER_LBW_LB_SAI_WR_M))
++
++#define GT_BASE_CONFIG		0x8
++#define LOG_LEVEL		CONFIG_LOG_DEFAULT_LEVEL
++
+ LOG_MODULE_DECLARE(SYSMNGD_LOG_ID);
+ 
+ #define BRIDGE_SIZE_MIN		4
+ #define BRIDGE_SIZE_MAX		36
+ 
++#define GT_BOOT_TIMEOUT		1
++#define GT_BOOT_SUCCESS		0
++#define TIMEOUT_VAL		500
++#define MSLEEP_TIME		2
++
++#define GT_STACKSIZE		(2048 - CONFIG_HL_STACK_OVERFLOW_REDUCE_SIZE)
++
++/* For gt_c6_exit */
++/* TODO: Not available in master_next specs */
++#define KCR_CTX_SIZE			0x80000db0
++#define RC6_LOCATION			0x80000d40
++#define RC6_CTX_HI			0x80000d4c
++#define RC6_CTX_LO			0x80000d48
++#define GFXBDF				0x8010107c
++#define GU_CNTL_LMEM_INIT		0x80101010
++#define BGTSM_BASE_LO			0x80108100
++#define BGTSM_BASE_HI			0x80108104
++#define GMCH_GRAPHICS_CTRL		0x80108040
++#define BDSM_BASE_LO			0x801080C0
++#define BDSM_BASE_HI			0x801080C4
++#define TOLUD_BASE			0x80009090
++#define TOUUD_BASE_LO			0x80009098
++#define TOUUD_BASE_HI			0x8000909C
++#define TSEG_MEM_LO			0x80108400
++#define TSEG_MEM_HI			0x80108404
++#define PAVP_HI				0x801082c4
++#define PAVP_LO				0x801082c0
++#define GU_CNTL				0x8010100c
++#define PKG_ADDR_BASE			0x80108390
++#define SG_ADDR_RANGE_TILE0		0x801083a0
++#define TOTAL_LOCAL_MEMORY		0x80108430
++#define SRIOV_NUMOFVFS_0_2_0_PCI	0x80000330
++#define SRIOV_INITVFS_0_2_0_PCI		0x8000032c
++#define VF_ENABLE			0x80105040
++#define PF_ATS_ENABLE			0x80105044
++#define VF_ATS_ENABLE			0x80105048
++#define PASID_ENABLE			0x8010504c
++#define PF_FLR				0x80105060
++
++/* BISR Bypass*/
++#define ENABLE_BISR_BYPASS		0x8448012c
++
++#define MGMT_SAI_VAL			7
++
++#define MGMT_SAI_REG	\
++	((mmCOMPUTE_0_CFG_PSOC_ARC_MNG_MSTR_IF_LBW_AXI_OVRD_AXUSER_BASE) + (mmAXUSER_LBW_LB_SAI))
++
++#define MGMT_SAI_OVRD_REG	\
++	((mmCOMPUTE_0_CFG_PSOC_ARC_MNG_MSTR_IF_LBW_AXI_OVRD_AXUSER_BASE) + (mmAXUSER_LBW_LB_SAI_OVRD))
++
++#define GT_POLL_INTERVAL_MS		2
++#define NUM_FUSE_DATA_SETS		11
++#define IPM_DATA_SZ			10
++#define FINAL_FLIT_NUM			0x10
++#define MUTEX_TIMEOUT_MS		2000
++#define LSB_32BIT_MASK			0xFFFFFFFF
++/* Incorrect opcode given specs */
++#define BRIDGE_OPCODE_FUSE_PULL_OVERRIDE	0x45
++
++/* TODO: Explore better representation for the macros used */
++#define CLEAR_REG			0x0
++/* gt_misc register values */
++#define DOM_NUM_DTS_STRAP_VAL		0x2
++#define FUSE_CTLR_STRAP_VAL		0x2404
++#define PORTID_STAP_VAL			0x204
++#define FP_SAI_VAL			0x180026
++#define CONTROLS_VAL			0x2
++#define PMSB_VAL			0x2
++#define FUSE_STREAM_TO_VAL		0x16
++#define DEV_POSTBOOT_SAI_STRAP_VAL	0x6a
++#define PORT_ID_MEDIA_VAL		0x2020000
++#define PMSB_PORT_ID_VAL		0x402
++#define PHYSICAL_VAL			0x10f
++
++/* i2a_bridge reg values */
++#define GLOBAL_FID_0_VAL		0x78
++#define CFG_VAL				0x12
++#define IOSF_PORTS_VAL			0x1000077
++#define B1_ADD_MAN_OUT_0_VAL		0x108
++#define B1_ADD_MAN_OUT_1_VAL		0x108
++#define B1_ADD_MAN_OUT_2_VAL		0x108
++#define B1_ADD_MAN_OUT_3_VAL		0x108
++#define B0_ADD_MAN_OUT_0_VAL		0x100
++#define B0_ADD_MAN_OUT_1_VAL		0x103
++#define B0_ADD_MAN_OUT_2_VAL		0x101
++#define B0_ADD_MAN_OUT_3_VAL		0x102
++#define BRIDGE_I2A_CFG_VAL		0x8
++#define BRIDGE_WRAP_PCIE_ID_VAL		0x8b6
++
++/* GT reg values */
++#define RESET_BLOCK_PMSB		0x01000000
++#define GO_RES_INTF			0x80000010
++#define RAMP_TYPE_VAL			0x261
++#define WP1_VAL				0x405a01f4
++
++#define GT1_WP_ACM_VAL			0xb13c7f19
++#define GT1_WP_ACM_CTL0_VAL		0x387
++
++#define GT2_WP_ACM_VAL			0xb1bc871e
++#define GT2_WP_ACM_CTL0_VAL		0xd6f
++#define GT2_WP1_VAL			0xcefb
++#define GT2_TARGET_GT1_VAL		0x480
++
++#define GO_BLOCK_INTF			0x80000002
++#define GO_DEC_GB_ELEC			0x80000008
++
++#define RENDER_DEC_BGF_CONFIG_VAL	0x661
++
++#define C6_WP1_VAL			0x5e5a01ef
++#define C6_BGF_VAL			0x453
++#define MSGR_SHADOW_VAL			0x30003
++#define BISR_BYPASS_VAL			0x4
++
++/* SGUNIT ctx values */
++#define RC6_LOCATION_VAL		0x80000001
++#define RC6_CTX_HI_VAL			0x3f
++#define RC6_CTX_LO_VAL			0xffff0001
++#define GFXBDF_VAL			0x1000000
++#define GU_CNTL_LMEM_INIT_VAL		0x180
++#define BGTSM_BASE_LO_VAL		0xfd800000
++#define BTGSM_BASE_HI_VAL		0x3f
++#define GMCH_GRAPHICS_CTRL_VAL		0x1c0
++#define BDSM_BASE_LO_VAL		0xfe000000
++#define BDSM_BASE_HI_VAL		0x3f
++#define TSEG_MEM_HI_VAL			0x3f
++#define TOUUD_BASE_HI_VAL		0x100
++#define TSEG_MEM_LO_VAL			0xfd800000
++#define PAVP_HI_VAL			0x3f
++#define PAVP_LO_VAL			0xff8001c7
++#define GU_CNTL_VAL			0x20501
++#define PKG_ADDR_BASE_VAL		0x10000001
++#define SG_ADDR_RANGE_TILE0_VAL		0x10001
++#define TOTAL_LOCAL_MEMORY_VAL		0x80
++#define SRIOV_NUM_VF_VAL		0x1
++#define SRIOV_INIT_VF_VAL		0x1
++#define VF_ENABLE_VAL			0x3
++#define PF_ATS_ENABLE_VAL		0x1
++#define VF_ATS_ENABLE_VAL		0x1
++#define PASID_ENABLE_VAL		0x1
++
++static K_THREAD_STACK_DEFINE(gt_stack_poll, GT_STACKSIZE);
++static struct k_thread gt_thread_poll;
++static k_tid_t gt_poll_thread_id;
++
++/* Define the data sets for each mailbox population */
++static const uint32_t mbx_data_sets[NUM_FUSE_DATA_SETS][IPM_DATA_SZ] = {
++	/* Data set 1 */
++	{0x87210402, 0x2400, 0x10f0100, 0x0, 0x10f0101, 0x0, 0x10f0102, 0x0, 0x10f0103, 0},
++	/* Data set 2 */
++	{0x0, 0x10f0104, 0x109923, 0x10f0105, 0xfe000000, 0x10f0106, 0x7f801ff, 0x10f0107, 0x0, 0},
++	/* Data set 3 */
++	{0x10f0108, 0x0, 0x10f0109, 0x0, 0x10f010a, 0x78000000, 0x10f010b, 0x0, 0x10f010c, 0},
++	/* Data set 4 */
++	{0x0, 0x10f010d, 0x0, 0x10f010e, 0xf0000000, 0x10f010f, 0x0, 0x10f0110, 0x0, 0},
++	/* Data set 5 */
++	{0x10f0111, 0x0, 0x10f0112, 0x0, 0x10f0113, 0xffffff00, 0x10f0114, 0x880100e0, 0x10f0115, 0},
++	/* Data set 6 */
++	{0xc000000, 0x10f0116, 0x0, 0x10f0117, 0x0, 0x10f0118, 0x0, 0x10f0119, 0x100, 0},
++	/* Data set 7 */
++	{0x10f011a, 0x0, 0x10f011b, 0x0, 0x10f011c, 0x0, 0x10f011d, 0x0, 0x10f011e, 0},
++	/* Data set 8 */
++	{0x30410780, 0x10f011f, 0xa012c2, 0x10f0120, 0x0, 0x10f0121, 0x0, 0x10f0122, 0x0, 0},
++	/* Data set 9 */
++	{0x10f0123, 0x0, 0x10f0112, 0x0, 0x10f0125, 0x0, 0x10f0126, 0x0, 0x10f0127, 0},
++	/* Data set 10 */
++	{0x0, 0x10f0128, 0x0, 0x10f0129, 0x0, 0x10f012a, 0x0, 0x10f012b, 0x0, 0},
++	/* Data set 11 */
++	{0x10f012c, 0xfc000000, 0x10f012d, 0xffffffff, 0x10f012e, 0xffffffff, 0x10f012f, 0x3ffffff, 0x0, 0}
++};
++
++
++
++const char *boot_state_to_string(int state)
++{
++	switch (state) {
++	case STATE_INIT:
++		return "STATE_INIT";
++	case FUSE_PULL_REQ_RECVD:
++		return "FUSE_PULL_REQ_RECVD";
++	case IP_READY_RECVD:
++		return "IP_READY_RECVD";
++	case WAKE2_RECVD:
++		return "WAKE2_RECVD";
++	case DEC_GB_ELEC_DONE_1:
++		return "DEC_GB_ELEC_DONE_1";
++	case DEC_GB_ELEC_DONE_2:
++		return "DEC_GB_ELEC_DONE_2";
++	case RES_ACK_RECVD:
++		return "RES_ACK_RECVD";
++	case C6_EXIT_DONE:
++		return "C6_EXIT_DONE";
++	case RENDER_GO_BLOCK_ACK:
++		return "RENDER_GO_BLOCK_ACK";
++	case RENDER_GO_INC_ACK:
++		return "RENDER_GO_INC_ACK";
++	case RENDER_GO_DEC_ACK:
++		return "RENDER_GO_DEC_ACK";
++	case RENDER_IS_UP:
++		return "RENDER_IS_UP";
++	default:
++		return "UNKNOWN_BOOT_STATE";
++	}
++}
++
++static int get_boot_state(struct mgmt_compute_config *config)
++{
++	int boot_state;
++
++	if (k_mutex_lock(&config->bridge_wq_data.config_data_lock, K_MSEC(MUTEX_TIMEOUT_MS))) {
++		LOG_ERR("Failed to lock mutex for bridge_wq_data");
++		return -EBUSY;
++	}
++	boot_state = config->bridge_wq_data.boot_state;
++	k_mutex_unlock(&config->bridge_wq_data.config_data_lock);
++
++	return boot_state;
++}
++
++/* This should not be invoked from isr */
++static void i2a_bridge_process_ack(struct mgmt_compute_config *config)
++{
++	uint32_t interrupt_out = 0;
++	struct bridge_simple_msg msg;
++
++	/* decode header */
++	msg.hdr = *(uint64_t *)config->bridge_wq_data.ptr;
++	interrupt_out = (uint32_t)(msg.hdr & LSB_32BIT_MASK);
++
++	if (k_mutex_lock(&config->bridge_wq_data.config_data_lock, K_MSEC(MUTEX_TIMEOUT_MS))) {
++		LOG_ERR("Failed to lock mutex for bridge_wq_data");
++		ipm_clear(config->bridge_dev, 0);
++		return;
++	}
++	config->bridge_wq_data.boot_state++;
++	k_mutex_unlock(&config->bridge_wq_data.config_data_lock);
++
++	ipm_clear(config->bridge_dev, 0);
++}
++
++/* This should not be invoked from isr */
+ static void i2a_bridge_process_cst_wake(struct mgmt_compute_config *config)
+ {
+-	/* clear interrupt */
+-	ipm_clear(config->bridge_wq_data.dev, 0);
++	uint32_t interrupt_out = 0;
++	struct bridge_simple_msg msg;
+ 
+-	/* Step1: Workpoint */
++	/* decode header */
++	msg.hdr = *(uint64_t *)config->bridge_wq_data.ptr;
++	interrupt_out = (uint32_t)(msg.hdr & LSB_32BIT_MASK);
+ 
+-	/* Step2: GO DEC */
++	if (k_mutex_lock(&config->bridge_wq_data.config_data_lock, K_MSEC(MUTEX_TIMEOUT_MS))) {
++		LOG_ERR("Failed to lock mutex for bridge_wq_data");
++		ipm_clear(config->bridge_dev, 0);
++		return;
++	}
++	config->bridge_wq_data.boot_state++;
++	k_mutex_unlock(&config->bridge_wq_data.config_data_lock);
+ 
+-	/* Step3: GT performs Clear core state */
+-
+-	/*
+-	 * Step4: ACK GO DEC from GT
+-	 * TODO: Is it interrupt to FW? Does it indicates step3 is done?
+-	 */
+-
+-	/* Step5: GO RESUME */
+-
+-	/* Step6: ACK GO DEC from GT TODO: is it interrupt to FW? */
+-
++	ipm_clear(config->bridge_dev, 0);
+ }
+ 
+ static void i2a_bridge_process_ip_ready(struct mgmt_compute_config *config)
+ {
++	if (k_mutex_lock(&config->bridge_wq_data.config_data_lock, K_MSEC(MUTEX_TIMEOUT_MS))) {
++		LOG_ERR("Failed to lock mutex for bridge_wq_data");
++		ipm_clear(config->bridge_dev, 0);
++		return;
++	}
++
++	config->bridge_wq_data.boot_state = IP_READY_RECVD;
++	k_mutex_unlock(&config->bridge_wq_data.config_data_lock);
+ 
+ 	/* clear interrupt */
+-	ipm_clear(config->bridge_wq_data.dev, 0);
++	ipm_clear(config->bridge_dev, 0);
++}
+ 
+-	/* TODO: Details on TSC download command */
++static void populate_mbx_data(uint32_t data[], int sz, int flitnum, int set_idx)
++{
++	memcpy(data, mbx_data_sets[set_idx], sizeof(mbx_data_sets[set_idx]));
++	/* Always set flitnum as the last element */
++	data[IPM_DATA_SZ - 1] = flitnum;
+ }
+ 
+ static void i2a_bridge_process_fuse_pull(struct mgmt_compute_config *config)
+ {
+-	/* TODO: fuse read and delivery */
++	uint32_t mbx_data[IPM_DATA_SZ] = {0};
++	int flitnum;
++	int i;
+ 
+-	/* clear interrupt */
+-	ipm_clear(config->bridge_wq_data.dev, 0);
++	ipm_clear(config->bridge_dev, 0);
++
++	/* Send fuse data sets one by one */
++	for (i = 0; i < NUM_FUSE_DATA_SETS; i++) {
++		flitnum = (i == IPM_DATA_SZ) ? FINAL_FLIT_NUM : 0;
++		populate_mbx_data(mbx_data, sizeof(mbx_data), flitnum, i);
++		ipm_send(config->bridge_dev, 1, 0, mbx_data, sizeof(mbx_data));
++		memset(mbx_data, 0, sizeof(mbx_data));
++	}
++
++	if (k_mutex_lock(&config->bridge_wq_data.config_data_lock, K_MSEC(MUTEX_TIMEOUT_MS))) {
++		LOG_ERR("Failed to lock mutex for bridge_wq_data");
++		return;
++	}
++	config->bridge_wq_data.boot_state = FUSE_PULL_REQ_RECVD;
++	k_mutex_unlock(&config->bridge_wq_data.config_data_lock);
+ }
+ 
+ static void i2a_bridge_work_handler(struct k_work *work)
+ {
+ 	struct mgmt_compute_config *config = mgmt_get_compute_cfg();
+-	struct bridge_simple_msg *msg;
++	struct bridge_simple_msg msg;
+ 	uint32_t size = config->bridge_wq_data.size;
+ 
+ 	if ((size < BRIDGE_SIZE_MIN) || (size > BRIDGE_SIZE_MAX)) {
+ 		LOG_ERR("Invalid size received from driver, clear interrupt");
+-		ipm_clear(config->bridge_wq_data.dev, 0);
++		ipm_clear(config->bridge_dev, 0);
+ 		return;
+ 	}
+ 
+ 	/* decode header */
+-	msg = (struct bridge_simple_msg *) config->bridge_wq_data.ptr;
+-	LOG_INF("Received OPCODE: 0x%x from PORT_ID: 0x%x size: %d from I2A bridge",
+-			msg->opcode, msg->source_port_id, config->bridge_wq_data.size);
+-
++	msg.hdr = *(uint64_t *)config->bridge_wq_data.ptr;
++	LOG_DBG("Received Data: 0x%08llx, Opcode = 0x%x\n", msg.hdr, msg.opcode);
+ 	/*
+-	 * TODO: add processing of opcodes
+ 	 * some opcodes will need CR write as action to request and some
+ 	 * opcodes will need new response via I2C bridge in which case
+ 	 * create the header + data required and perform ipm_send.
+ 	 * CR details yet to be updated by ARCH team.
+ 	 */
+-	switch (msg->opcode) {
++
++	switch (msg.opcode) {
++	case BRIDGE_OPCODE_ACK_PHASE:
++		i2a_bridge_process_ack(config);
++		break;
+ 	case BRIDGE_OPCODE_CST_WAKE:
+ 		i2a_bridge_process_cst_wake(config);
+ 		break;
+ 	case BRIDGE_OPCODE_IP_READY:
+ 		i2a_bridge_process_ip_ready(config);
+ 		break;
+-	case BRIDGE_OPCODE_FUSE_PULL:
++	case BRIDGE_OPCODE_FUSE_PULL_OVERRIDE:
+ 		i2a_bridge_process_fuse_pull(config);
+ 		break;
+ 	default:
+-		LOG_ERR("OPCODE: 0x%x not supported", msg->opcode);
+-		break;
++		LOG_ERR("OPCODE: 0x%x not supported", msg.opcode);
+ 	}
+-
+-	/* clear interrupt */
+-	ipm_clear(config->bridge_wq_data.dev, 0);
+ }
+ 
+ static void i2a_bridge_callback(const struct device *dev,
+@@ -111,7 +391,7 @@
+ 	k_work_submit(&config->bridge_work);
+ }
+ 
+-static int fs_init_bridge(void)
++static int init_bridge(void)
+ {
+ 	struct mgmt_compute_config *config = mgmt_get_compute_cfg();
+ 
+@@ -128,11 +408,413 @@
+ 	return 0;
+ }
+ 
++static void configure_gt_misc_tmp_config(void)
++{
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_PMU_SG_IP_PG_WAKE), CLEAR_REG);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_DOM_GT_NUM_DTS_STRAP), DOM_NUM_DTS_STRAP_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_FP_FUSECTLR), FUSE_CTLR_STRAP_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_FP_PORT_ID), PORTID_STAP_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_FP_SAI), FP_SAI_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_GT_CONTROLS), CONTROLS_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_PMSB), PMSB_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_PMA_FUSE_STREAM_TIMEOUT_STRAP), FUSE_STREAM_TO_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_DEVICE_POSTBOOT_SAI_STRAP), DEV_POSTBOOT_SAI_STRAP_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_PORT_ID_MEDIA), PORT_ID_MEDIA_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_PMSB_PORT_ID), PMSB_PORT_ID_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_GT_MISC_BASE +
++				mmGT_MISC_PHYSICAL), PHYSICAL_VAL);
++}
++
++static void configure_i2a_wrap_tmp_config(void)
++{
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE2_BASE +
++						mmI2A_BRIDGE_I2A_GLOBAL_FID_0), GLOBAL_FID_0_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE1_BASE +
++				mmI2A_BRIDGE_I2A_CFG), CFG_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE1_BASE +
++				mmI2A_BRIDGE_IOSF_PORTS), IOSF_PORTS_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE1_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_0), B1_ADD_MAN_OUT_0_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE1_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_1), B1_ADD_MAN_OUT_1_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE1_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_2), B1_ADD_MAN_OUT_2_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE1_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_3), B1_ADD_MAN_OUT_3_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE0_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_0), B0_ADD_MAN_OUT_0_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE0_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_1), B0_ADD_MAN_OUT_1_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE0_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_2), B0_ADD_MAN_OUT_2_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE0_BASE +
++				mmI2A_BRIDGE_A2I_ADD_MAN_OUT_3), B0_ADD_MAN_OUT_3_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_I2A_BRIDGE0_BASE +
++				mmI2A_BRIDGE_I2A_CFG), BRIDGE_I2A_CFG_VAL);
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_I2A_WRAP_BASE +
++				mmI2A_BRIDGE_WRAP_PCIE_ID), BRIDGE_WRAP_PCIE_ID_VAL);
++}
++
++static int wait_for_boot_state(struct mgmt_compute_config *config, int target_state)
++{
++	int timeout = 0;
++
++	while (get_boot_state(config) != target_state) {
++		k_msleep(MSLEEP_TIME);
++		if (timeout++ > TIMEOUT_VAL)
++			return GT_BOOT_TIMEOUT;
++	}
++	return GT_BOOT_SUCCESS;
++}
++
++static inline void render_go_inc(struct mgmt_compute_config *config)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_RCSM_PHASE_COMMAND),
++			0x80000004);
++}
++
++static inline void unlock_iosf_pmsb(void)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_COMMAND2),
++		RESET_BLOCK_PMSB);
++}
++
++static inline void send_go_res_intf(struct mgmt_compute_config *config)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_RCSM_PHASE_COMMAND),
++		GO_RES_INTF);
++}
++
++static inline void send_ramp_type(void)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_VR_RAMP_TYPE),
++		RAMP_TYPE_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP1),
++		WP1_VAL);
++}
++
++static inline void target_gt1(void)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP_ACM),
++			GT1_WP_ACM_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP_ACM_CTL0),
++			GT1_WP_ACM_CTL0_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_GT1),
++			CLEAR_REG);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP1),
++		WP1_VAL);
++}
++
++static inline void target_gt2(void)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP_ACM),
++			GT2_WP_ACM_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP_ACM_CTL0),
++			GT2_WP_ACM_CTL0_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_GT1),
++			CLEAR_REG);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP1), GT2_WP1_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_GT1),
++			GT2_TARGET_GT1_VAL);
++}
++
++static inline void render_go_block(struct mgmt_compute_config *config)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_RCSM_PHASE_COMMAND), GO_BLOCK_INTF);
++}
++
++static inline void render_go_dec(struct mgmt_compute_config *config)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_BGF_CONFIG),
++		RENDER_DEC_BGF_CONFIG_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_RCSM_PHASE_COMMAND),
++		GO_DEC_GB_ELEC);
++}
++
++static inline void render_go_resume(struct mgmt_compute_config *config)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_RCSM_PHASE_COMMAND),
++		GO_RES_INTF);
++}
++
++static inline void write_to_workpoints(void)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_WP1),
++			C6_WP1_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_TARGET_GT1),
++			CLEAR_REG);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_BGF_CONFIG),
++			C6_BGF_VAL);
++	GT_WREG32((mem_addr_t)(mmGT_0_MEDIA_PMA_BASE + mmGT_SGUNIT_RCSM_PHASE_COMMAND),
++			GO_DEC_GB_ELEC);
++}
++
++static inline void write_to_msgr_shadow(void)
++{
++	GT_WREG32((mem_addr_t)(mmGT_0_SGUNIT_BASE + mmGT_SGUNIT_FORCE_WAKE_GPM_GRP_GCD), MSGR_SHADOW_VAL);
++}
++
++static inline void enable_bisr_bypass(void)
++{
++	GT_WREG32((mem_addr_t)ENABLE_BISR_BYPASS, BISR_BYPASS_VAL);
++}
++
++static inline void write_to_sg_ctx_reg(void)
++{
++	GT_WREG32((mem_addr_t)KCR_CTX_SIZE, CLEAR_REG);
++	GT_WREG32((mem_addr_t)RC6_LOCATION, RC6_LOCATION_VAL);
++	GT_WREG32((mem_addr_t)RC6_CTX_HI, RC6_CTX_HI_VAL);
++	GT_WREG32((mem_addr_t)RC6_CTX_LO, RC6_CTX_LO_VAL);
++	GT_WREG32((mem_addr_t)GFXBDF, GFXBDF_VAL);
++	GT_WREG32((mem_addr_t)GU_CNTL_LMEM_INIT, GU_CNTL_LMEM_INIT_VAL);
++	GT_WREG32((mem_addr_t)BGTSM_BASE_LO, BGTSM_BASE_LO_VAL);
++	GT_WREG32((mem_addr_t)BGTSM_BASE_HI, BTGSM_BASE_HI_VAL);
++	GT_WREG32((mem_addr_t)GMCH_GRAPHICS_CTRL, GMCH_GRAPHICS_CTRL_VAL);
++	GT_WREG32((mem_addr_t)BDSM_BASE_LO, BDSM_BASE_LO_VAL);
++	GT_WREG32((mem_addr_t)BDSM_BASE_HI, BDSM_BASE_HI_VAL);
++	GT_WREG32((mem_addr_t)TOLUD_BASE, CLEAR_REG);
++	GT_WREG32((mem_addr_t)TOUUD_BASE_LO, CLEAR_REG);
++	GT_WREG32((mem_addr_t)TOUUD_BASE_HI, TOUUD_BASE_HI_VAL);
++	GT_WREG32((mem_addr_t)TSEG_MEM_LO, TSEG_MEM_LO_VAL);
++	GT_WREG32((mem_addr_t)TSEG_MEM_HI, TSEG_MEM_HI_VAL);
++	GT_WREG32((mem_addr_t)PAVP_HI, PAVP_HI_VAL);
++	GT_WREG32((mem_addr_t)PAVP_LO, PAVP_LO_VAL);
++	GT_WREG32((mem_addr_t)GU_CNTL, GU_CNTL_VAL);
++	GT_WREG32((mem_addr_t)PKG_ADDR_BASE, PKG_ADDR_BASE_VAL);
++	GT_WREG32((mem_addr_t)SG_ADDR_RANGE_TILE0, SG_ADDR_RANGE_TILE0_VAL);
++	GT_WREG32((mem_addr_t)TOTAL_LOCAL_MEMORY, TOTAL_LOCAL_MEMORY_VAL);
++	GT_WREG32((mem_addr_t)SRIOV_NUMOFVFS_0_2_0_PCI, SRIOV_NUM_VF_VAL);
++	GT_WREG32((mem_addr_t)SRIOV_INITVFS_0_2_0_PCI, SRIOV_INIT_VF_VAL);
++	GT_WREG32((mem_addr_t)VF_ENABLE, VF_ENABLE_VAL);
++	GT_WREG32((mem_addr_t)PF_ATS_ENABLE, PF_ATS_ENABLE_VAL);
++	GT_WREG32((mem_addr_t)VF_ATS_ENABLE, VF_ATS_ENABLE_VAL);
++	GT_WREG32((mem_addr_t)PASID_ENABLE, VF_ATS_ENABLE_VAL);
++	GT_WREG32((mem_addr_t)PF_FLR, CLEAR_REG);
++}
++
++static int gt_render_powerup(struct mgmt_compute_config *config)
++{
++	int ret = 0;
++
++	send_ramp_type();
++
++	target_gt1();
++
++	target_gt2();
++
++	render_go_block(config);
++
++	ret = wait_for_boot_state(config, RENDER_GO_BLOCK_ACK);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for render go block ack");
++		return ret;
++	}
++
++	render_go_inc(config);
++
++	ret = wait_for_boot_state(config, RENDER_GO_INC_ACK);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for render go inc ack");
++		return ret;
++	}
++
++	render_go_dec(config);
++	ret = wait_for_boot_state(config, RENDER_GO_DEC_ACK);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for render go dec ack");
++		return ret;
++	}
++
++	render_go_resume(config);
++
++	ret = wait_for_boot_state(config, RENDER_IS_UP);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for render is up");
++		return ret;
++	}
++
++	LOG_DBG("Render is up");
++	return ret;
++}
++
++
++
++static int gt_c6_exit(struct mgmt_compute_config *config)
++{
++	int ret = 0;
++
++	write_to_sg_ctx_reg();
++
++	write_to_msgr_shadow();
++
++	enable_bisr_bypass();
++
++	write_to_workpoints();
++
++	ret = wait_for_boot_state(config, WAKE2_RECVD);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for wake2 message");
++		return ret;
++	}
++
++	ret = wait_for_boot_state(config, DEC_GB_ELEC_DONE_2);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for dec_gb_elec_done");
++		return ret;
++	}
++
++	send_go_res_intf(config);
++
++	ret = wait_for_boot_state(config, RES_ACK_RECVD);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for res_ack");
++		return ret;
++	}
++
++	ret = wait_for_boot_state(config, C6_EXIT_DONE);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for c6_fsm_idle");
++		return ret;
++	}
++
++	LOG_DBG("C6 exit done");
++	return ret;
++}
++
++static void send_tsc_sync(void)
++{
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_NOC_XBAR_S_XBAR_CFG_BASE +
++			mmXBAR_S_CFG_GT_TS_CFG), 0xE2);
++}
++
++static int gt_infra_domain_reset(struct mgmt_compute_config *config)
++{
++	int ret = 0;
++
++	/* Sending fuse data */
++	ret = wait_for_boot_state(config, FUSE_PULL_REQ_RECVD);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for fuse completion");
++		return ret;
++	}
++
++	LOG_DBG("Fuse completion done");
++
++	/* Wait for IP Ready */
++	ret = wait_for_boot_state(config, IP_READY_RECVD);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Timeout waiting for IP ready");
++		return ret;
++	}
++
++	/* GT addresses are mapped to 0x8xxxx */
++	CFG_WREG32((mem_addr_t)(mmCOMPUTE_0_CFG_PSOC_ARC_MNG_ARC_BASE + mmARC_LBW_ADDR_REGION_10),
++		GT_BASE_CONFIG);
++	unlock_iosf_pmsb();
++
++	send_tsc_sync();
++
++	return ret;
++}
++
++static void configure_init_regs(struct mgmt_compute_config *config)
++{
++	configure_gt_misc_tmp_config();
++
++	configure_i2a_wrap_tmp_config();
++}
++
++static void do_gt_boot(struct mgmt_compute_config *config)
++{
++	int ret = 0;
++
++	LOG_INF("Starting GT_INIT....");
++
++	ret = gt_infra_domain_reset(config);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Not getting GT_BOOT_SUCCESS for infra reset, aborting boot");
++		return;
++	}
++
++	LOG_INF("gt_infra_domain_reset done");
++
++	ret = gt_c6_exit(config);
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Not getting GT_BOOT_SUCCESS for c6 exit, aborting boot");
++		return;
++	}
++
++	LOG_INF("c6 exit done");
++
++	ret = gt_render_powerup(config);
++
++	if (ret != GT_BOOT_SUCCESS) {
++		LOG_ERR("Not getting GT_BOOT_SUCCESS for render powerup, aborting boot");
++		return;
++	}
++
++	LOG_INF("***GT BOOT IS DONE***");
++}
++
++static void gt_poll_thread(struct mgmt_compute_config *config, void *p2, void *p3)
++{
++	LOG_INF("Starting poll thread");
++
++	while (get_boot_state(config) != RENDER_IS_UP) {
++		LOG_INF("GT POLL...boot_state = %d (%s)", get_boot_state(config),
++			boot_state_to_string(get_boot_state(config)));
++		ipm_max_id_val_get(config->bridge_dev);
++		k_msleep(GT_POLL_INTERVAL_MS);
++	}
++	LOG_INF("Exiting poll thread...");
++}
++
++static int init_gt(void)
++{
++	struct mgmt_compute_config *config = mgmt_get_compute_cfg();
++
++	config->bridge_wq_data.res_ack_int = 0;
++	config->bridge_wq_data.c6_exit_done = 0;
++	config->bridge_wq_data.boot_state = STATE_INIT;
++
++	/*
++	 * TODO: This needs to happen in bootrom, before GT is brought out of reset
++	 * which happens in preboot
++	 */
++	configure_init_regs(config);
++
++	/* TODO: May have to modify mgmt SAI values */
++	CFG_WREG32((mem_addr_t)MGMT_SAI_REG, INITIATOR_SAI_REG_FORMAT(MGMT_SAI_VAL));
++	CFG_WREG32((mem_addr_t)MGMT_SAI_OVRD_REG, INITIATOR_SAI_REG_FORMAT(MGMT_SAI_VAL));
++
++	/* TODO: In jgs, there needs to be an interrupt mechanism */
++	gt_poll_thread_id = k_thread_create(&gt_thread_poll, gt_stack_poll, GT_STACKSIZE,
++		(k_thread_entry_t)gt_poll_thread, config, NULL, NULL,
++		0, K_INHERIT_PERMS, K_NO_WAIT);
++
++	k_thread_name_set(&gt_thread_poll, "GT-POLL-THREAD");
++
++	do_gt_boot(config);
++
++	return 0;
++}
+ 
+ int mgmt_dev_prepare(void)
+ {
+ 	struct mgmt_compute_config *config = mgmt_get_compute_cfg();
+ 
+-	config->init_bridge = fs_init_bridge;
++	config->init_bridge = init_bridge;
++	config->init_gt = init_gt;
+ 	return 0;
+ }
+diff --git a/include/compute/common.h b/include/compute/common.h
+index 634f4c8..393a335 100644
+--- a/include/compute/common.h
++++ b/include/compute/common.h
+@@ -10,15 +10,38 @@
+ #include <zephyr/types.h>
+ #include <zephyr/device.h>
+ #include <zephyr/kernel.h>
++#include <hl_platform_defs.h>
++
++enum gt_boot_state {
++	STATE_INIT	= 0,
++	FUSE_PULL_REQ_RECVD,
++	IP_READY_RECVD,
++	WAKE2_RECVD,
++	DEC_GB_ELEC_DONE_1,
++	DEC_GB_ELEC_DONE_2,
++	RES_ACK_RECVD,
++	C6_EXIT_DONE,
++	RENDER_GO_BLOCK_ACK,
++	RENDER_GO_INC_ACK,
++	RENDER_GO_DEC_ACK,
++	RENDER_IS_UP
++};
++
+ struct i2a_bridge_wq_data {
+ 	const struct device *dev;
+ 	void *ptr;
+ 	uint32_t size;
++	uint32_t res_ack_int;
++	uint32_t c6_exit_done;
++	uint32_t render_int;
++	enum gt_boot_state boot_state;
++	struct k_mutex config_data_lock;
+ };
+ 
+ struct mgmt_compute_config {
+ 	const struct device *bridge_dev;
+ 	int (*init_bridge)(void);
++	int (*init_gt)(void);
+ 	struct k_work bridge_work;
+ 	struct i2a_bridge_wq_data bridge_wq_data;
+ };

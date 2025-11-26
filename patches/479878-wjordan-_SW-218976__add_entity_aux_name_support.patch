@@ -1,0 +1,184 @@
+From 80b3f6cc14711388b7bfd1e05465a65a35438d9f Mon Sep 17 00:00:00 2001
+From: William Jordan <bjordan@habana.ai>
+Date: Fri, 16 May 2025 21:43:02 +0300
+Subject: [PATCH] [SW-218976] add entity aux name support
+
+Add support for Entity AUX Name PDRs to PLDM
+code.
+
+Change-Id: Icf5152822816f016b29d261aef49ed3f060d760a
+Signed-off-by: William Jordan <bjordan@habana.ai>
+---
+
+diff --git a/include/pldm.h b/include/pldm.h
+index b15f505..8dc4fb9 100644
+--- a/include/pldm.h
++++ b/include/pldm.h
+@@ -95,6 +95,21 @@
+ 	struct pldm_pdr_metadata				meta;
+ } __packed;
+ 
++/* Specialization of the PDR record entry for entity aux names. This is handled separate
++ * from the main pldm_pdr_record to avoid imposing its much larger size on the
++ * union.
++ *
++ * The same comments on pldm_pdr_record apply here, including which fields may
++ * be left uninitialized.
++ */
++struct pldm_pdr_entity_name_record {
++	union {
++		struct pldm_pdr_header				common;
++		struct pldm_pdr_entity_aux_names_simple		entity_aux_names;
++	} __packed;
++	struct pldm_pdr_metadata				meta;
++} __packed;
++
+ /* Specialization of the PDR record entry for OEM state sets. This is handled separate
+  * from the main pldm_pdr_record to avoid imposing its much larger size on the
+  * union.
+@@ -259,6 +274,8 @@
+ 	size_t num_records;
+ 	struct pldm_pdr_name_record *name_records;
+ 	size_t num_name_records;
++	struct pldm_pdr_entity_name_record *entity_name_records;
++	size_t num_entity_name_records;
+ 	struct pldm_pdr_oem_state_set_record *oem_state_set_records;
+ 	size_t num_oem_state_set_records;
+ 	struct pldm_pdr_oem_unit_record *oem_unit_records;
+diff --git a/include/pldm_base.h b/include/pldm_base.h
+index 9441368..c634f22 100644
+--- a/include/pldm_base.h
++++ b/include/pldm_base.h
+@@ -1556,6 +1556,22 @@
+ #endif
+ } __packed;
+ 
++/* Used for entity aux names PDRs.
++ * Simplified to only support 1x pair of tag+name strings per sensor/effecter.
++ */
++struct pldm_pdr_entity_aux_names_simple {
++	struct pldm_pdr_header header;
++	uint16_t entity_type;
++	uint16_t entity_instance;
++	uint16_t entity_container_id;
++	uint8_t shared_name_count;
++#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
++	const char *names[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++#else
++	struct pldm_pdr_utf_strings names[PLDM_PDR_MAX_COMPOSITE_SENSORS];
++#endif
++} __packed;
++
+ struct pldm_pdr_oem_unit {
+ 	struct pldm_pdr_header header;
+ 	uint16_t terminus_handle;
+diff --git a/src/encode.c b/src/encode.c
+index 81158d5..c1d54cb 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -418,6 +418,22 @@
+ 	return true;
+ }
+ 
++static bool encode_entity_aux_names(
++	struct encode_buffer *buffer,
++	const struct pldm_pdr_entity_aux_names_simple *pdr)
++{
++	size_t offset = offsetof(struct pldm_pdr_entity_aux_names_simple, names);
++
++	/* encode const-sized data, followed by variable-sized data */
++	if (!encode_buffer_append(buffer, pdr, offset))
++		return false;
++
++	if (!encode_utf_strings_array(buffer, pdr->names, 1, NULL))
++		return false;
++
++	return true;
++}
++
+ static bool encode_oem_state_set(
+ 	struct encode_buffer *buffer,
+ 	const struct pldm_pdr_oem_state_set *pdr)
+@@ -666,6 +682,9 @@
+ 	case PLDM_PDR_TYPE_EFFECTER_AUX_NAMES:
+ 		return encode_aux_names(buffer,
+ 			(const struct pldm_pdr_aux_names_simple *)header, meta, entry_index);
++	case PLDM_PDR_TYPE_ENTITY_AUX_NAMES:
++		return encode_entity_aux_names(buffer,
++			(const struct pldm_pdr_entity_aux_names_simple *)header);
+ 	case PLDM_PDR_TYPE_OEM_STATE_SET:
+ 		return encode_oem_state_set(buffer,
+ 			(const struct pldm_pdr_oem_state_set *)header);
+@@ -679,7 +698,6 @@
+ 	case PLDM_PDR_TYPE_NUMERIC_EFFECTER_INIT:
+ 	case PLDM_PDR_TYPE_STATE_EFFECTER_INIT:
+ 	case PLDM_PDR_TYPE_EFFECTER_OEM_SEMANTIC:
+-	case PLDM_PDR_TYPE_ENTITY_AUX_NAMES:
+ 	case PLDM_PDR_TYPE_OEM_ENTITY_ID:
+ 	case PLDM_PDR_TYPE_INTERRUPT_ASSOCIATION:
+ 	case PLDM_PDR_TYPE_PLDM_EVENT_LOG:
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index 71b2a40..4770cf0 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -37,6 +37,8 @@
+ 	size_t num_records;
+ 	const struct pldm_pdr_name_record *name_records;
+ 	size_t num_name_records;
++	const struct pldm_pdr_entity_name_record *entity_name_records;
++	size_t num_entity_name_records;
+ 	const struct pldm_pdr_oem_state_set_record *oem_state_set_records;
+ 	size_t num_oem_state_set_records;
+ 	const struct pldm_pdr_oem_unit_record *oem_unit_records;
+@@ -188,6 +190,12 @@
+ 			.header = &state->name_records[0].common,
+ 			.len	= state->num_name_records,
+ 			.stride = sizeof(state->name_records[0]),
++		},
++		{
++			.meta	= &state->entity_name_records[0].meta,
++			.header = &state->entity_name_records[0].common,
++			.len	= state->num_entity_name_records,
++			.stride = sizeof(state->entity_name_records[0]),
+ 		},
+ 		{
+ 			.meta	= &state->oem_state_set_records[0].meta,
+@@ -1378,6 +1386,7 @@
+ 	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
+ 	case PLDM_PDR_TYPE_SENSOR_AUX_NAMES:
+ 	case PLDM_PDR_TYPE_EFFECTER_AUX_NAMES:
++	case PLDM_PDR_TYPE_ENTITY_AUX_NAMES:
+ 	case PLDM_PDR_TYPE_OEM_STATE_SET:
+ 	case PLDM_PDR_TYPE_OEM_UNIT:
+ 	default:
+@@ -1398,6 +1407,8 @@
+ 	}
+ 
+ 	/* no checks for name_records[] */
++
++	/* no checks for entity_name_records[] */
+ 
+ 	/* no checks for oem_state_set_records[] */
+ 
+@@ -1423,6 +1434,12 @@
+ 			.header = &state->name_records[0].common,
+ 			.len	= state->num_name_records,
+ 			.stride = sizeof(state->name_records[0]),
++		},
++		{
++			.meta	= &state->entity_name_records[0].meta,
++			.header = &state->entity_name_records[0].common,
++			.len	= state->num_entity_name_records,
++			.stride = sizeof(state->entity_name_records[0]),
+ 		},
+ 		{
+ 			.meta	= &state->oem_state_set_records[0].meta,
+@@ -1492,6 +1509,8 @@
+ 	state.num_records = init_data->num_records;
+ 	state.name_records = init_data->name_records;
+ 	state.num_name_records = init_data->num_name_records;
++	state.entity_name_records = init_data->entity_name_records;
++	state.num_entity_name_records = init_data->num_entity_name_records;
+ 	state.oem_state_set_records = init_data->oem_state_set_records;
+ 	state.num_oem_state_set_records = init_data->num_oem_state_set_records;
+ 	state.oem_unit_records = init_data->oem_unit_records;

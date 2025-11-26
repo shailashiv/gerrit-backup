@@ -1,0 +1,3512 @@
+From df6a5277616d19fbb40f81e7c7c018b198bed476 Mon Sep 17 00:00:00 2001
+From: Shivani Raval <sraval@habana.ai>
+Date: Tue, 08 Apr 2025 12:55:31 +0300
+Subject: [PATCH] [JSW-31] arcboot: jgs repo build
+
+Currently FS1 repo code is ported to
+jgs repo. Asic build works fine.
+
+Change-Id: If7306d11795c74ced6298b56371b1e33810a7d45
+---
+
+diff --git a/Makefile b/Makefile
+index 9317b40..6598199 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,6 +4,9 @@
+ SPECS_EMB_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
+ HL_DEV_TYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f1)
+ HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
++ifeq ($(HL_DEV_SUBTYPE),)
++	HL_DEV_SUBTYPE := arc
++endif
+ HL_DEV_ARCH := arch/$(shell echo $(HL_DEV) | cut -d'_' -f1)/$(HL_DEV_SUBTYPE)
+ 
+ # removed liblto_plugin.so plugin from flags.
+diff --git a/arch/jgs/arc/Makefile b/arch/jgs/arc/Makefile
+new file mode 100644
+index 0000000..fad4b79
+--- /dev/null
++++ b/arch/jgs/arc/Makefile
+@@ -0,0 +1,19 @@
++
++BOOT_ROM_CFLAGS += -I$(SPECS_H17_DIR)
++BOOT_ROM_CFLAGS += -I$(SPECS_H17_DIR)/$(SPECS_DEV)/asic_reg
++
++BINARIES = boot_rom.bin boot_rom_comp.bin
++
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_tpm.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_pcie.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_uart.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_recovery.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_boot_info.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_dma.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_security.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_mem_copy.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/fake_fuse_flow.c)
+diff --git a/arch/jgs/arc/asic.c b/arch/jgs/arc/asic.c
+new file mode 100644
+index 0000000..be80653
+--- /dev/null
++++ b/arch/jgs/arc/asic.c
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include "dev_uart.h"
++#include <mem_io.h>
++#include <jgs_reg_map.h>
++#include <jgs_blocks_linux_driver.h>
++#include <pll_control_regs.h>
++#include <dev_efuse.h>
++#include <jgs_efuse.h>
++#include <common.h>
++#include <tpm.h>
++
++#define BOOTROM_UART_BAUDRATE	115200
++
++uint32_t boot_rom_get_baudrate()
++{
++	return BOOTROM_UART_BAUDRATE;
++}
++
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div)
++{
++	uint32_t div_sel, factor, offset;
++	uint32_t reg, fbdiv, refdiv, postdiv1, postdiv2;
++	uint64_t out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(uint32_t);
++	// 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk
++	div_sel = regmap_readl((IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
++
++	if (div_sel == PLL_PLL_CLK || div_sel == PLL_DIV_PLL) {
++		// If 2'd1 - pll_clk [or] 2'd3 - divided pll_clk
++		reg = regmap_readl(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG_DIV));
++		/* fbdiv : bits 0-11 */
++		fbdiv = EXTRACT_BITS(reg, 0, 12);
++		/* postdiv1 : bits 16-18 */
++		postdiv1 = EXTRACT_BITS(reg, 16, 3);
++		/* postdiv2 : bits 20-22 */
++		postdiv2 = EXTRACT_BITS(reg, 20, 3);
++		/* refdiv : bits 24-29 */
++		refdiv  = EXTRACT_BITS(reg, 24, 6);
++		// SPECS: Fout = Fin * FBDIV / (POSTDIV1+1) / (POSTDIV2+1) / REFDIV
++		out_freq = SYS_REF_CLOCK * fbdiv;
++		out_freq /= ((uint64_t)refdiv) * (postdiv1 + 1) * (postdiv2 + 1);
++	}
++
++	if (div_sel == PLL_DIV_REF || div_sel == PLL_DIV_PLL) {
++		// If 2'd2 - divided ref_clk [or] 2'd3 - divided pll_clk
++		factor = regmap_readl((IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
++		out_freq /= factor + 1;
++	}
++
++	return (uint32_t)out_freq;
++}
++
++bool fuse_valid_volt_prot_pattern(uint32_t config_fuse)
++{
++	if ((config_fuse & EFUSE_SYSCFG_VOLT_PROT_BITS) == FUSE_VOLT_PROT_PATTERN)
++		return true;
++
++	return false;
++}
++
++uint32_t boot_rom_tpm_spi_baudr_get(void)
++{
++	enum boot_rom_tpm_spi_freq_config freq_config;
++	uint32_t baudr;
++
++	freq_config = boot_rom_get_tpm_spi_freq_config();
++
++	if (freq_config == FREQ_CFG_12_5MHZ)
++		baudr = (SYS_REF_CLOCK / SPI_TPM_FREQ_12_5M);
++	else
++		baudr = (SYS_REF_CLOCK / SPI_TPM_FREQ_6_25M);
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	baudr = (baudr < 2) ? 2 : baudr;
++	baudr = (baudr + 1) & 0xFFFE;
++
++	return baudr;
++}
+diff --git a/arch/jgs/arc/asic_boot_rom.lds b/arch/jgs/arc/asic_boot_rom.lds
+new file mode 100644
+index 0000000..34786be
+--- /dev/null
++++ b/arch/jgs/arc/asic_boot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++INCLUDE boot_rom.lds
+diff --git a/arch/jgs/arc/boot_rom.lds b/arch/jgs/arc/boot_rom.lds
+new file mode 100644
+index 0000000..0215d6a
+--- /dev/null
++++ b/arch/jgs/arc/boot_rom.lds
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
++	SPI	: ORIGIN = 0x94000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x78980000, LENGTH = 128K
++	FWSRAM	: ORIGIN = 0x789A0000, LENGTH = 128K
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 128K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++	_persistent_sec_size = 3k;
++	_rom_global_data_size = 1024;
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		app/crt0_rom.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext + _persistent_sec_size;
++		_data = .;
++		/* TODO: Finalize design on persistent and non-persistent section */
++	    KEEP(*(.rom_persistent_section))
++	    . = _data + _rom_global_data_size; /* Reserve 512 memory for persistent data section */
++	    KEEP(*(.rom_manifest_section))
++	    . = _data + _persistent_sec_size; /* Reserve 2560 (3K - 512) memory for persistent data section */
++		_rom_non_persistent_dccm_start = .;
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 5k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 8k)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+diff --git a/arch/jgs/arc/boot_rom.txt b/arch/jgs/arc/boot_rom.txt
+new file mode 100644
+index 0000000..853431b
+--- /dev/null
++++ b/arch/jgs/arc/boot_rom.txt
+@@ -0,0 +1,11 @@
++# put list of symbols, one per line, to be exported
++boot_desc_get_img_desc
++boot_rom_mem_init
++boot_rom_mem_copy
++boot_rom_fw_mem_arc_addr
++boot_rom_spi_dma
++secure_boot_verify_image_hash384
++lfs_file_copy
++lfs_file_set
++lfs_file_copy_partial
++lfs_disk_set_empty
+diff --git a/arch/jgs/arc/common.c b/arch/jgs/arc/common.c
+new file mode 100644
+index 0000000..2643e80
+--- /dev/null
++++ b/arch/jgs/arc/common.c
+@@ -0,0 +1,488 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <arc_local_conf_regs.h>
++#include <arc_local_conf_masks.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_security_regs.h>
++#include <global_conf_regs.h>
++#include <jgs_reg_mask.h>
++#include <jgs_fw_if.h>
++#include <jgs_security.h>
++#include <hl_fw_upd_if.h>
++#include <status.h>
++#include <efuse.h>
++#include <hl_fw_upd_if.h>
++#include <string.h>
++#include "dev_uart.h"
++#include "progress_bits.h"
++#include <dev_mem_copy.h>
++#include <lfs_wrapper.h>
++#include <psoc_pad_conf_regs.h>
++#include <gpio_regs.h>
++#include <psoc_boot_conf_masks.h>
++#include <arc_regs.h>
++#include <boot_desc.h>
++#include <dev_spi_flash.h>
++#include <dev_boot_info.h>
++
++extern const int fs1_die_type;
++
++uint8_t boot_rom_get_die_id(void)
++{
++	uint32_t die_cpu_id = regmap_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_DIE_CPU_ID));
++
++	return ((die_cpu_id & ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_M)
++		>> ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_S);
++}
++
++uint8_t boot_rom_get_die_type(void)
++{
++	if (fs1_die_type == STATIC_DIE_TYPE_COMP) {
++		if (boot_rom_global.die_id <= FS1_COMPUTE_DIE_3)
++			return FS1_COMPUTE_DIE;
++	} else if (fs1_die_type == STATIC_DIE_TYPE_IO) {
++		if (boot_rom_global.die_id == FS1_IO_DIE_0)
++			return FS1_IO_DIE_MASTER;
++		else if (boot_rom_global.die_id == FS1_IO_DIE_1)
++			return FS1_IO_DIE_SLAVE;
++	}
++
++	/* TODO: Assert? */
++	return FS1_INVALID_DIE_TYPE;
++}
++
++void boot_rom_init_sku(void)
++{
++	boot_rom_global.sku = (boot_rom_global.config_fuse & EFUSE_SYSCFG_SKU)
++		>> EFUSE_SYSCFG_SKU_SHIFT;
++
++	if (boot_rom_global.sku >= FS1_INVALID_SKU) {
++		boot_rom_global.sku = FS1_FULL_PACKAGE;
++	}
++}
++
++bool boot_rom_in_multi_die_mode(void)
++{
++	return (boot_rom_global.sku != FS1_IO_DIE_SA);
++}
++
++bool boot_rom_in_master_die()
++{
++	return (boot_rom_global.die_type == FS1_IO_DIE_MASTER);
++}
++
++static void boot_rom_global_pre_init_values(void)
++{
++	/*
++	 * rom_persistent_section pre-init values.
++	 * Only assign during cold reset.
++	 * Below values modified during run time and used in next non-cold reset cases.
++	*/
++	boot_rom_global.die_id = FS1_INVALID_DIE_ID;
++	boot_rom_global.die_type = FS1_INVALID_DIE_TYPE;
++	boot_rom_global.sku = FS1_INVALID_SKU;
++	boot_rom_global.valid_manifest_idx = HL_FW_SPI_MANIFEST_MAX_NUM;
++}
++
++#define HL_ARC1_DCCM_PERSIST_SECTION_SIZE		(3 * 1024) /* 3KB */
++void boot_rom_persistent_dccm_init(uint8_t die_id)
++{
++	volatile uint32_t *dccm_addr = (uint32_t *) HL_DCCM_BASE;
++	uint32_t dccm_dwords = HL_ARC1_DCCM_PERSIST_SECTION_SIZE >> 2;
++	struct fs1_cold_rst_data cold_rst_data;
++	uint32_t i;
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++
++	if (cold_rst_data.arc1_persist_dccm_init_done)
++		goto non_zero_init;
++
++	for (i = 0; i < dccm_dwords; i++)
++		*dccm_addr++ = 0;
++
++	cold_rst_data.arc1_persist_dccm_init_done = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++
++	boot_rom_global_pre_init_values();
++
++non_zero_init:
++	/* Non zero initializers only required for master(die 0) */
++	if (die_id == FS1_IO_DIE_0) {
++		/*
++		 * Assign pre-init constants which never modified during run time.
++		 * So, upon any reset safe to re-init them.
++		 * For example, manifest constants.
++		 */
++		lfs_globals_pre_init();
++	}
++}
++
++void boot_rom_clear_status(void)
++{
++	/* As per Architecture recommendation, clear status reg */
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_STATUS));
++
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_0));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_1));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_2));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_3));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_4));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_5));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_6));
++	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_7));
++
++	/* Die indication register is on io die slave and compute */
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
++		regmap_writel(0, IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2));
++}
++
++uint32_t boot_rom_get_status_base(void)
++{
++	return IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_0);
++}
++
++void boot_rom_read_cold_flops(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++	enum fw_post_reset_cmd fw_upd_status =
++		regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_3));
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++
++	boot_rom_global.recovery_flag = cold_rst_data.recovery_flag;
++	boot_rom_global.validation_pass = cold_rst_data.validation_flag;
++	boot_rom_global.valid_manifest_idx = cold_rst_data.valid_manifest_idx;
++	boot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
++	boot_rom_global.boot_info_set_done = cold_rst_data.boot_info_set_done;
++	boot_rom_global.tpm_extend_done = cold_rst_data.tpm_validation_flag;
++	boot_rom_global.fuse_emulation_init_done = cold_rst_data.fuse_emulation_init_done;
++
++	if (fw_upd_status == FLOPS_UPD_PENDING)
++		boot_rom_global.fw_upd_switch_manifest = 1;
++	else
++		boot_rom_global.fw_upd_switch_manifest = 0;
++}
++
++int boot_rom_mem_init(uint64_t addr, uint32_t size)
++{
++	struct mem_copy_flag flag;
++
++	flag.mem_type = MEM_COPY_MEM_TYPE_LBW;
++	flag.copy_type = MEM_COPY_TYPE_CONSTANT;
++
++	return boot_rom_mem_copy(flag, MEM_COPY_CONSTANT_CLEAR, addr, size);
++}
++
++void boot_rom_iccm_init(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++	int ret;
++
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
++		return;
++
++	/* Perform arc1 iccm init only on cold reset */
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.arc1_iccm_init_done)
++		return;
++
++	ret = boot_rom_mem_init(MNG_ARC_ICCM_FULL_BASE, MNG_ARC_ICCM_SIZE);
++	if (ret) {
++		boot_rom_status_update(PROGRESS_INIT_ARC1_ICCM_INIT_FAILED);
++		return;
++	}
++
++	cold_rst_data.arc1_iccm_init_done = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++void boot_rom_halt(void)
++{
++	boot_rom_putc('h');
++	while (1) {
++		wfe();
++	}
++}
++
++enum boot_rom_status boot_rom_read_config_fuse(void)
++{
++	if ((boot_rom_fuse_read(IO_EFUSE_SYSCFG_OFFSET, &boot_rom_global.config_fuse)
++	    != BOOT_ROM_SUCCESS) ||
++	    (boot_rom_fuse_read(IO_EFUSE_SYSCFG2_OFFSET, &boot_rom_global.config2_fuse)
++	    != BOOT_ROM_SUCCESS))
++		return BOOT_ROM_FAIL;
++
++	return BOOT_ROM_SUCCESS;
++}
++
++void boot_rom_set_efuse_read(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.efuse_read_flag)
++		return;
++
++	/* efuse init successful, set cold flops */
++	cold_rst_data.efuse_read_flag = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++void boot_rom_set_spi_efuse_read(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.fuse_emulation_init_done)
++		return;
++
++	/* fake/spi efuse init successful, set cold flops */
++	cold_rst_data.fuse_emulation_init_done = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++void boot_rom_set_tpm_extend_done(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	boot_rom_global.tpm_extend_done = 1;
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.tpm_validation_flag)
++		return;
++
++	/* tpm pcr extend successful, set cold flops */
++	cold_rst_data.tpm_validation_flag = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++enum boot_rom_tpm_exec_stage boot_rom_get_tpm_exec_stage(void)
++{
++	return boot_rom_global.tpm_exec_stage;
++}
++
++uint8_t boot_rom_get_tpm_next_pcr_index(void)
++{
++	return boot_rom_global.tpm_next_pcr_index;
++}
++
++void boot_rom_set_tpm_next_pcr_index(uint8_t tpm_pcr_index)
++{
++	boot_rom_global.tpm_next_pcr_index = tpm_pcr_index;
++}
++
++void boot_rom_tpm_next_pcr_index_init(void)
++{
++	boot_rom_set_tpm_next_pcr_index(TPM2_SVN_PCR_IDX);
++}
++
++bool boot_rom_is_manifest_valid(void)
++{
++	return (bool)boot_rom_global.validation_pass;
++}
++
++static bool boot_rom_get_svn(uint8_t *svn)
++{
++	uint8_t fw_version_sec = boot_info_read_svn_data();
++
++	/*
++	 * If failed to get svn from boot info or boot info disabled,
++	 * Get svn from persistent dccm.
++	 */
++	if (fw_version_sec == 0)
++		fw_version_sec = boot_rom_global.sec_data.sec_ver;
++
++	if (fw_version_sec == 0)
++		return false;
++
++	memcpy(svn, &fw_version_sec, sizeof(fw_version_sec));
++
++	return true;
++}
++
++static bool boot_rom_get_manifest_hash(__unused uint8_t *hash)
++{
++	/*
++	 * TODO add code to fetch manifest hash from littlefs
++	 * This code will be added once the capability to compute
++	 * manifest hash and store it in littlefs is integrated
++	 */
++	return false;
++}
++
++bool boot_rom_get_hash_for_tpm_pcr(uint8_t tpm_pcr_index, uint8_t *hash)
++{
++	bool is_valid = false;
++
++	switch (tpm_pcr_index) {
++	case TPM2_SVN_PCR_IDX:
++		is_valid = boot_rom_get_svn(hash);
++		break;
++	case TPM2_MANIFEST_PCR_IDX:
++		is_valid = boot_rom_get_manifest_hash(hash);
++		break;
++	default:
++		is_valid = false;
++		break;
++	}
++
++	return is_valid;
++}
++
++enum boot_rom_progress boot_rom_get_tpm_extend_fail_prog_bit(uint8_t tpm_pcr_index)
++{
++	return (tpm_pcr_index == TPM2_SVN_PCR_IDX) ?
++		PROGRESS_BOOT_ROM_SVN_TPM_PCR_EXTEND_FAIL :
++		PROGRESS_BOOT_ROM_MANIFEST_TPM_PCR_EXTEND_FAIL;
++}
++
++enum boot_rom_tpm_spi_freq_config boot_rom_get_tpm_spi_freq_config(void)
++{
++	enum boot_rom_tpm_spi_freq_config freq_config;
++
++	freq_config = ((boot_rom_global.config_fuse & EFUSE_SYSCFG_SPI_TPM_BAUDR) == 0) ?
++		FREQ_CFG_12_5MHZ : FREQ_CFG_6_25MHZ;
++
++	return freq_config;
++}
++
++bool dev_spec_img_desc_is_valid(__unused struct hl_fw_img_desc *img_desc)
++{
++	/* TODO: implement for FS1 if required */
++
++	return true;
++}
++
++/* This function is only applicable for io die master */
++bool boot_rom_is_valid_address_range(uint64_t addr, uint32_t len)
++{
++	if (addr >= (uint64_t)SCRATCHPAD_SRAM_BASE &&
++	    addr + len <= (uint64_t)(SCRATCHPAD_SRAM_BASE + SCRATCHPAD_SRAM_SIZE))
++		return true;
++
++	if (addr >= SCRATCHPAD_SRAM_BASE_FULL &&
++	    addr + len <= SCRATCHPAD_SRAM_BASE_FULL + SCRATCHPAD_SRAM_SIZE)
++		return true;
++
++	if (addr >= RST_ARC_ICCM_FULL_BASE &&
++	    addr + len <= RST_ARC_ICCM_FULL_BASE + RST_ARC_MEM_SIZE)
++		return true;
++
++	if (addr >= MNG_ARC_ICCM_FULL_BASE &&
++	    addr + len <= MNG_ARC_ICCM_FULL_BASE + MNG_ARC_MEM_SIZE)
++		return true;
++
++	if (addr >= PID_ARC_ICCM_FULL_BASE &&
++	    addr + len <= PID_ARC_ICCM_FULL_BASE + PID_ARC_MEM_SIZE)
++		return true;
++
++	if (addr >= (uint64_t)(HL_FW_MEM_BASE + PSOC_FWSRAM_OFFSET) &&
++	    addr + len <= (uint64_t)(HL_FW_MEM_BASE + PSOC_FWSRAM_OFFSET + PSOC_FWSRAM_SIZE))
++		return true;
++
++	if (addr >= PSOC_FW_SRAM_FULL_BASE &&
++	    addr + len <= PSOC_FW_SRAM_FULL_BASE + PSOC_FWSRAM_SIZE)
++		return true;
++
++	return false;
++}
++
++uint32_t boot_rom_fw_mem_arc_addr(uint64_t addr)
++{
++	if (addr >= MNG_ARC_ICCM_FULL_BASE && addr <= MNG_ARC_ICCM_FULL_BASE + MNG_ARC_MEM_SIZE)
++		return CONV_64B_TO_ARC_FW_MEM(addr) - (HL_FW_MEM_BASE + MNG_ARC_ICCM_OFFSET);
++	else
++		return CONV_64B_TO_ARC_FW_MEM(addr);
++}
++
++uint32_t boot_rom_get_arc_addr(uint64_t addr)
++{
++	if (addr >= FW_MEM_BASE_FULL && addr <= FW_MEM_BASE_FULL + HL_FW_MEM_SIZE)
++		return boot_rom_fw_mem_arc_addr(addr);
++
++	return 0;
++}
++
++void boot_rom_check_rma_enabled(void)
++{
++	boot_rom_global.sec_data.rma_enabled = 0;
++
++	/* TODO: Check if TPM owner is removed */
++
++	if (boot_rom_global.config2_fuse & EFUSE_SYSCFG2_RMA_MODE)
++		boot_rom_global.sec_data.rma_enabled = 1;
++}
++
++void boot_rom_validation_status(bool validation_pass)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	/* validation pass, set validation flag and clear recovery or viceversa */
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	cold_rst_data.recovery_flag = (validation_pass ? 0 : 1);
++	cold_rst_data.validation_flag = (validation_pass ? 1 : 0);
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++void boot_rom_set_manifest_index(enum hl_fw_manifest_type man_idx)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	boot_rom_global.valid_manifest_idx = man_idx;
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.valid_manifest_idx == man_idx)
++		return;
++
++	cold_rst_data.valid_manifest_idx = man_idx;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++
++/*
++ * Request CPLD to start the watchdog, by asserting
++ * a GPIO_66 (Boot_WD).
++ */
++#define GPIOS_PER_BANK			16
++#define FS1_CPLD_WDOG_GPIO		66
++void boot_rom_start_cpld_wdtimer(void)
++{
++	uint32_t index = FS1_CPLD_WDOG_GPIO % GPIOS_PER_BANK;
++	uint32_t val, mask = BIT(index);
++
++	regmap_writel(GPIO_FUNC_1, IO0_H0_PSOC_CFG_PAD_CONF_PAD_SEL(mmPSOC_PAD_CONF_PAD_SEL_66));
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++	val = val | mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++
++	/* gpio is active high */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++	val = val | mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++}
++
++bool boot_rom_spi_efuse_enabled()
++{
++	return (((boot_rom_global.config_fuse & EFUSE_SYSCFG_DIS_EFUSE_OVERRIDE) == 0) &&
++		(regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_H)) &
++			PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_EFUSE_OVERRIDE_M));
++}
++
++void boot_rom_config_arc_regions(void)
++{
++	regmap_writel(FULL_ADDR_MSB, IO0_H0_MNG_ARC(mmARC_GP_MSB_ADDR_0));
++}
++
++bool boot_rom_second_image_enabled(void)
++{
++	return ((boot_rom_global.config_fuse & EFUSE_SYSCFG_DIS_SECONDARY_IMG) == 0);
++}
+diff --git a/arch/jgs/arc/dev_boot_info.c b/arch/jgs/arc/dev_boot_info.c
+new file mode 100644
+index 0000000..0300ce9
+--- /dev/null
++++ b/arch/jgs/arc/dev_boot_info.c
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <string.h>
++#include <stdbool.h>
++#include <boot_rom.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++#include <jgs_fw_if.h>
++#include <lfs_wrapper.h>
++#include <hl_sec_if.h>
++#include <status.h>
++#include "dev_efuse.h"
++#include <jgs_blocks_linux_driver.h>
++#include <psoc_boot_conf_regs.h>
++#include <jgs_reg_map.h>
++#include <boot_desc.h>
++#include <dev_boot_info.h>
++
++bool boot_rom_skip_boot_info(void)
++{
++	return !!(boot_rom_global.config2_fuse && EFUSE_SYSCFG2_DISABLE_BOOT_INFO);
++}
++
++void boot_rom_set_boot_info(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	if (!boot_rom_in_master_die())
++		return;
++
++	if(boot_rom_skip_boot_info())
++		return;
++
++	if (!boot_rom_global.boot_info_set_done || !boot_rom_global.validation_pass) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START);
++
++		boot_desc_save_manifest_boot_info_data();
++
++		cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++		cold_rst_data.boot_info_set_done = 1;
++		regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH);
++	}
++
++	/* Flag which is indication for other modules to know Boot ROM done with LFS */
++	boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FINISHED);
++
++	return;
++}
++
++void boot_rom_get_boot_info(void)
++{
++	if (!boot_rom_in_master_die())
++		return;
++
++	if(boot_rom_skip_boot_info())
++		return;
++
++	if (boot_rom_global.boot_info_set_done) {
++		/* Read and make sure proper data after any reset */
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START);
++
++		boot_desc_get_manifest_boot_info_data();
++
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH);
++	}
++
++	/* Flag which is indication for other modules to know Boot ROM done with LFS */
++	boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FINISHED);
++}
++
++void boot_info_write_svn_data(uint8_t fw_version_sec)
++{
++	if (boot_rom_skip_boot_info())
++		return;
++
++	if (lfs_file_set(LFS_TAG_BOOT_INFO, HL_BOOT_INFO_SECURE_VERSION_NUMBER,
++		&fw_version_sec, sizeof(fw_version_sec))) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_SVN_SET_FAIL);
++		return;
++	}
++}
++
++uint8_t boot_info_read_svn_data(void)
++{
++	uint8_t fw_version_sec = 0;
++
++	if (boot_rom_skip_boot_info())
++		return 0;
++
++	if (lfs_file_copy(LFS_TAG_BOOT_INFO, HL_BOOT_INFO_SECURE_VERSION_NUMBER,
++		&fw_version_sec, sizeof(fw_version_sec))) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_SVN_GET_FAIL);
++		return 0;
++	}
++
++	return fw_version_sec;
++}
+diff --git a/arch/jgs/arc/dev_boot_info.h b/arch/jgs/arc/dev_boot_info.h
+new file mode 100644
+index 0000000..7a547b8
+--- /dev/null
++++ b/arch/jgs/arc/dev_boot_info.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_BOOT_INFO_H_
++#define _DEV_BOOT_INFO_H_
++
++#include <soc.h>
++#include <boot_rom.h>
++
++#define LFS_TAG_BOOT_INFO		"boot_info_"
++
++#define OFFSET_32KB		(32 * 1024)
++#define CONFIG_BOOTINFO_ADDR	(HL_FW_MEM_BASE + SCRATCHPAD_SRAM_OFFSET)
++#define CONFIG_BOOTINFO_SIZE	OFFSET_32KB
++
++void boot_rom_set_boot_info(void);
++void boot_rom_get_boot_info(void);
++bool boot_rom_skip_boot_info(void);
++void boot_info_write_svn_data(uint8_t fw_version_sec);
++uint8_t boot_info_read_svn_data(void);
++
++#endif	/* _DEV_BOOT_INFO_H_ */
+diff --git a/arch/jgs/arc/dev_delay.c b/arch/jgs/arc/dev_delay.c
+new file mode 100644
+index 0000000..e8332ea
+--- /dev/null
++++ b/arch/jgs/arc/dev_delay.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <timestamp_regs.h>
++#include <timestamp_masks.h>
++
++void boot_rom_clear_ts_counter(void)
++{
++	regmap_writel(0x0, IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCR));
++}
++
++void boot_rom_start_timer(uint32_t timestamp_freq)
++{
++	regmap_writel(timestamp_freq, IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTFID0));
++	regmap_writel((TIMESTAMP_CNTCR_CNTCR_EN_M | TIMESTAMP_CNTCR_CNTCR_HDBG_M),
++		      IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCR)); /* EN | HDBG */
++}
++
++uint64_t boot_rom_get_timestamp_freq(void)
++{
++	/* TODO: Confirm timestamp frequency is always constant */
++	return SYS_REF_CLOCK / 2;
++}
++
++uint64_t boot_rom_udelay_get_ts(void)
++{
++	uint32_t low, up1, up2;
++
++	up1 = regmap_readl(IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVU));
++	low = regmap_readl(IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVL));
++	up2 = regmap_readl(IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVU));
++	/* In case of overlap read low part again */
++	if (up1 != up2)
++		low = regmap_readl(IO0_H0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVL));
++
++	return ((uint64_t)up2 << 32) + low;
++}
+diff --git a/arch/jgs/arc/dev_dma.c b/arch/jgs/arc/dev_dma.c
+new file mode 100644
+index 0000000..6ca647d
+--- /dev/null
++++ b/arch/jgs/arc/dev_dma.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_blocks_linux_driver.h>
++#include <parc_global_conf_masks.h>
++#include <parc_global_conf_regs.h>
++#include <jgs_reg_map.h>
++#include <dma.h>
++
++#define DMA_ADDRESS_LOW(x)	((x) & MASK_32_BIT)
++#define DMA_ADDRESS_HIGH(x)	(((x) >> 32) & MASK_32_BIT)
++#define DMA_SRC_BLOCK_SIZE	1024
++#define DMA_DST_BLOCK_SIZE	4
++
++enum dma_dest_type boot_rom_get_dma_dest_type(uint64_t addr)
++{
++	/* TODO: Add checks for all offsets in FW MEM  for other dies */
++	if (addr >= PSOC_FW_SRAM_FULL_BASE &&
++	    addr < (PSOC_FW_SRAM_FULL_BASE + PSOC_FWSRAM_SIZE))
++		return DMA_DEST_SRAM;
++
++	return DMA_DEST_HBW;
++}
++
++void dma_copy_image_internal(uint16_t image_size, uint32_t flash_offset,
++		uint64_t dest_offset, uint8_t fw_sram_dst, uint8_t restart_crc,
++		uint8_t mask_crc)
++{
++	uint32_t reg_spi_dma_ctrl_s =  0;
++	uint32_t spi_dma_dst_addr_l = DMA_ADDRESS_LOW(dest_offset);
++	uint32_t spi_dma_dst_addr_h = DMA_ADDRESS_HIGH(dest_offset);
++	uint32_t flash_offset_1k = flash_offset / DMA_SRC_BLOCK_SIZE;
++	uint32_t image_size_4b = (image_size / DMA_DST_BLOCK_SIZE);
++
++	regmap_writel(spi_dma_dst_addr_l,
++		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L));
++	regmap_writel(spi_dma_dst_addr_h,
++		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H));
++
++	/* enable DMA transfer */
++	reg_spi_dma_ctrl_s = PARC_GLOBAL_CONF_SPI_DMA_CTRL_EN_M;
++
++	/* sram=1 hbw=0 as destination */
++	reg_spi_dma_ctrl_s |= fw_sram_dst << PARC_GLOBAL_CONF_SPI_DMA_CTRL_DST_SRAM_S;
++
++	/* 0: continue crc calc 1: restart crc*/
++	reg_spi_dma_ctrl_s |= restart_crc << PARC_GLOBAL_CONF_SPI_DMA_CTRL_CRC_RESTART_S;
++
++	/* 0: pass crc error to status 1: mask crc error */
++	reg_spi_dma_ctrl_s |= mask_crc << PARC_GLOBAL_CONF_SPI_DMA_CTRL_MASK_CRC_ERR_S;
++
++	/* # of 4bytes to DMA copy */
++	reg_spi_dma_ctrl_s |= image_size_4b << PARC_GLOBAL_CONF_SPI_DMA_CTRL_MEM_SIZE_S;
++
++	/* spi offset in 1k chunks */
++	reg_spi_dma_ctrl_s |= flash_offset_1k << PARC_GLOBAL_CONF_SPI_DMA_CTRL_ADDR_SHIFT_S;
++
++	regmap_writel(reg_spi_dma_ctrl_s,
++		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_CTRL));
++}
++
++int dma_wait_finish(void)
++{
++	uint32_t reg_spi_dma_status_s = 0;
++
++	do {
++		reg_spi_dma_status_s =
++		  regmap_readl(IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_STATUS));
++	} while ((reg_spi_dma_status_s & PARC_GLOBAL_CONF_SPI_DMA_STATUS_DONE_M) == 0);
++
++	return (reg_spi_dma_status_s & PARC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_M);
++}
++
++enum dma_error dma_crc_check(uint32_t expected_crc)
++{
++	uint32_t reg_spi_dma_crc_s = 0;
++
++	reg_spi_dma_crc_s =
++		regmap_readl(IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_CRC));
++
++	if (reg_spi_dma_crc_s != expected_crc)
++		return DMA_INVALID_CRC_ERROR;
++
++	return DMA_SUCCESS;
++}
+diff --git a/arch/jgs/arc/dev_dma.h b/arch/jgs/arc/dev_dma.h
+new file mode 100644
+index 0000000..0dcfb9d
+--- /dev/null
++++ b/arch/jgs/arc/dev_dma.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_DMA_H_
++#define _DEV_DMA_H_
++
++int dma_wait_finish(void);
++void dma_copy_image_internal(uint16_t image_size, uint32_t flash_offset,
++			     uint64_t dest_offset, uint8_t fw_sram_dst,
++			     uint8_t restart_crc, uint8_t mask_crc);
++enum dma_error dma_crc_check(uint32_t expected_crc);
++
++#endif /* _DEV_DMA_H_ */
+diff --git a/arch/jgs/arc/dev_efuse.c b/arch/jgs/arc/dev_efuse.c
+new file mode 100644
+index 0000000..9b71cc8
+--- /dev/null
++++ b/arch/jgs/arc/dev_efuse.c
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include "boot_rom.h"
++#include "mem_io.h"
++#include <jgs_blocks_linux_driver.h>
++#include <efuse_masks.h>
++#include <jgs_reg_map.h>
++#include <efuse_regs.h>
++#include "delay.h"
++
++void fuse_prog_range_config(void)
++{
++	regmap_writel(EFUSE_PROG_ADDRESS_LAST_M, IO0_H0_PSOC_EFUSE(mmEFUSE_PROG_ADDRESS));
++}
++
++void fuse_prog_read_address(void)
++{
++	regmap_writel(EFUSE_READ_ADDRESS_LAST_M, IO0_H0_PSOC_EFUSE(mmEFUSE_READ_ADDRESS));
++}
++
++uint32_t fuse_read_data(uint32_t offset)
++{
++	return regmap_readl(IO0_H0_PSOC_EFUSE(mmEFUSE_DATA_0) + offset);
++}
++
++uint32_t fuse_get_read_ctrl_reg_val(void)
++{
++	return regmap_readl(IO0_H0_PSOC_EFUSE(mmEFUSE_RD));
++}
++
++void fuse_set_read_ctrl_reg_val(uint32_t fsm_trigger)
++{
++	regmap_writel(fsm_trigger, IO0_H0_PSOC_EFUSE(mmEFUSE_RD));
++}
++
++__weak bool fuse_valid_volt_prot_pattern(__unused uint32_t config_fuse) { return false; }
+diff --git a/arch/jgs/arc/dev_efuse.h b/arch/jgs/arc/dev_efuse.h
+new file mode 100644
+index 0000000..86153a1
+--- /dev/null
++++ b/arch/jgs/arc/dev_efuse.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_EFUSE_H_
++#define _DEV_EFUSE_H_
++
++#include <jgs_efuse.h>
++
++#define FLASH_VALID_MASK			0x1FFFFF
++
++#define FUSE_READ_FSM_TRIGGER		0x1
++#define FUSE_DELAY_US				5
++#define FUSE_TIMEOUT_US				500
++#define FUSE_RETRIES				(FUSE_TIMEOUT_US / FUSE_DELAY_US)
++#define FUSE_VOLT_PROT_PATTERN		0x14000
++
++void fuse_prog_range_config(void);
++void fuse_prog_read_address(void);
++uint32_t fuse_get_read_ctrl_reg_val(void);
++void fuse_set_read_ctrl_reg_val(uint32_t fsm_trigger);
++uint32_t fuse_read_data(uint32_t offset);
++bool fuse_valid_volt_prot_pattern(uint32_t config_fuse);
++
++#endif /* _DEV_EFUSE_H_ */
+diff --git a/arch/jgs/arc/dev_mem_copy.c b/arch/jgs/arc/dev_mem_copy.c
+new file mode 100644
+index 0000000..6ed325d
+--- /dev/null
++++ b/arch/jgs/arc/dev_mem_copy.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <soc.h>
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <delay.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <dev_mem_copy.h>
++#include <arc_local_conf_regs.h>
++#include <arc_local_conf_masks.h>
++#include <mem_copy_masks.h>
++#include <mem_copy_regs.h>
++#include <tran_chk_lbw_masks.h>
++#include <tran_chk_lbw_regs.h>
++
++static void axi_barrier()
++{
++	uint64_t start;
++	uint32_t val;
++
++	start = boot_rom_get_ts_us();
++	for (;;) {
++		val = regmap_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2));
++		if (val & ARC_LOCAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_NO_WR_INFLIGHT_M)
++			break;
++
++		if (boot_rom_timeout_expired(start, HL_W_BARRIER_TIMEOUT_US)) {
++			/* TODO: report timeout?? */
++			break;
++		}
++	}
++}
++
++static void boot_rom_mem_copy_lbw_size_check(uint32_t addr, uint32_t bit_pos, bool enable)
++{
++	uint32_t val;
++	uint32_t data = (1 << bit_pos);
++
++	val = regmap_readl(addr);
++	val &= ~data;
++	if (enable)
++		val |= data;
++	regmap_writel(val, addr);
++}
++
++/* if flag.copy_type is MEM_COPY_TYPE_CONSTANT, src should provide data. */
++int boot_rom_mem_copy(struct mem_copy_flag flag, uint64_t src, uint64_t dst, uint32_t size)
++{
++	uint64_t start = boot_rom_get_ts_us();
++	uint32_t cpy_sts, copy_sz;
++	uint32_t cp_err, wr_err, rd_err;
++	uint32_t sz_limit, sz_shift, sz_mask;
++
++	if (flag.mem_type == MEM_COPY_MEM_TYPE_HBW) {
++		sz_limit = MEM_CPY_HBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_HBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_HBW_SIZE_SHIFT_MASK;
++	} else {
++		sz_limit = MEM_CPY_LBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_LBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_LBW_SIZE_SHIFT_MASK;
++	}
++
++	if (size > sz_limit) {
++		return -1;
++	}
++
++	if (flag.copy_type == MEM_COPY_TYPE_CONSTANT) {
++		/* Make sure valid 32 bit data only received over source arg */
++		if ((src >> 32) != 0) {
++			return -1;
++		}
++
++		regmap_writel(src, IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_CONST_VAL_WR_DATA));
++		regmap_writel(MEM_COPY_CONST_VAL_WR_MODE_VAL_M,
++			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_CONST_VAL_WR_MODE));
++	} else {
++		regmap_writel((uint32_t)src & MEM_COPY_SRC_ADDR_LSB_BITS_31_4_M,
++				IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_LSB));
++		regmap_writel((uint32_t)(src >> 32), IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_MSB));
++	}
++
++	regmap_writel((uint32_t)dst & MEM_COPY_DEST_ADDR_LSB_BITS_31_4_M,
++			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_DEST_ADDR_LSB));
++	regmap_writel((uint32_t)(dst >> 32), IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_DEST_ADDR_MSB));
++
++	/* set size of in granuality of 4 bytes */
++	copy_sz = size >> sz_shift;
++	if (size & sz_mask) {
++		copy_sz++;
++	}
++
++	regmap_writel(copy_sz, IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_COPY_SIZE));
++
++	/* disable LBW size check per H15-255 */
++	boot_rom_mem_copy_lbw_size_check(
++		IO0_H0_PSOC_CFG_MEM_COPY_LBW_TRAN_CHK(mmTRAN_CHK_LBW_CHECK_EN),
++			TRAN_CHK_LBW_CHECK_EN_SIZE_CHK_S, false);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(MEM_COPY_COPY_EN_VAL_M, mmIO_0_CFG_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					      mmMEM_COPY_COPY_EN);
++
++	/* let 'enable' command propagate before polling on status */
++	axi_barrier();
++
++	while (1) {
++		cpy_sts = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_COPY_EN));
++		/* COPY_EN is set by FW, and cleared by HW when copy ends */
++		if (!(cpy_sts & MEM_COPY_COPY_EN_VAL_M))
++			break;
++
++		if (boot_rom_timeout_expired(start, HL_MEM_CPY_TIMEOUT_US)) {
++			/* TODO: report memcopy timeout?? */
++			return -1;
++		}
++	}
++
++	cp_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_COPY_ERR_STS));
++	wr_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_WR_ERR_STS));
++	rd_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_RD_ERR_STS));
++
++	if (cp_err || wr_err || rd_err)
++		return BOOT_ROM_FAIL;
++	else
++		return BOOT_ROM_SUCCESS;
++}
+diff --git a/arch/jgs/arc/dev_mem_copy.h b/arch/jgs/arc/dev_mem_copy.h
+new file mode 100644
+index 0000000..463eb04
+--- /dev/null
++++ b/arch/jgs/arc/dev_mem_copy.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_MEM_COPY_H_
++#define _DEV_MEM_COPY_H_
++
++#define MEM_CPY_LBW_SIZE_LIMIT		(SZ_1MB - SZ_16)
++#define MEM_CPY_LBW_SIZE_SHIFT		2
++#define MEM_CPY_LBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_LBW_SIZE_SHIFT) - 1)
++
++#define MEM_CPY_HBW_SIZE_LIMIT		(SZ_4MB - SZ_16)
++#define MEM_CPY_HBW_SIZE_SHIFT		4
++#define MEM_CPY_HBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_HBW_SIZE_SHIFT) - 1)
++
++#define HL_MEM_CPY_TIMEOUT_US		10000
++#define HL_W_BARRIER_TIMEOUT_US		100000
++
++/* Data copy from source or constant data to be copied */
++#define MEM_COPY_TYPE_CONSTANT		0
++#define MEM_COPY_TYPE_DATA		1
++
++#define MEM_COPY_CONSTANT_CLEAR		0
++
++/* Memory type selection for mem copy */
++#define MEM_COPY_MEM_TYPE_LBW		0
++#define MEM_COPY_MEM_TYPE_HBW		1
++
++struct mem_copy_flag {
++	uint8_t copy_type;
++	uint8_t mem_type;
++};
++
++int boot_rom_mem_copy(struct mem_copy_flag flag, uint64_t src, uint64_t dst, uint32_t size);
++
++#endif /* _DEV_MEM_COPY_H_ */
+diff --git a/arch/jgs/arc/dev_pcie.c b/arch/jgs/arc/dev_pcie.c
+new file mode 100644
+index 0000000..54f504f
+--- /dev/null
++++ b/arch/jgs/arc/dev_pcie.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <jgs_efuse.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_dbi_masks.h>
++#include <pcie_aux_masks.h>
++
++bool boot_rom_pcie_gen_limit_enabled(void)
++{
++	if ((boot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0)
++		return true;
++
++	return false;
++}
++
++void boot_rom_dbi_ro_write_en(bool enable)
++{
++	uint32_t val;
++
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++
++	if (enable)
++		val |= PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++	else
++		val &= ~PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++}
++
++void boot_rom_shadow_reg_access_en(bool enable)
++{
++	uint32_t val = 0;
++
++	if (enable)
++		val = PCIE_AUX_DBI_CS2_M;
++
++	regmap_writel(val, IO0_H0_PCIE_AUX(mmPCIE_AUX_DBI));
++}
++
++#define BAR_SIZE_1GB			(SZ_1G - 1)
++void boot_rom_set_pf_cfg_bar(void)
++{
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR1_REG));
++}
++
++void boot_rom_set_vf_cfg_bar(void)
++{
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR1_REG));
++}
++
++void boot_rom_disable_alt_protocol(void)
++{
++	uint32_t val;
++
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++	val &= ~PCIE_DBI_PL32G_CAPABILITY_REG_MOD_TS_ALT_PROTOCOL_SUPPORT_M;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++}
++
++#define SRIOV_MAX_NUM_VFS		0x4
++#define SRIOV_DEFAULT_NUM_VFS		0x1
++void boot_rom_set_number_of_vfs(uint32_t num_vfs)
++{
++	uint32_t val;
++
++	if (num_vfs > SRIOV_MAX_NUM_VFS)
++		num_vfs = SRIOV_DEFAULT_NUM_VFS;
++
++	val = num_vfs << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_INITIAL_VFS_S |
++		num_vfs << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_TOTAL_VFS_S;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG));
++}
++
++void boot_rom_skip_ats_capability(void)
++{
++	uint32_t val;
++
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++	val &= ~PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_M;
++	val |= mmPCIE_DBI_LTR_CAP_HDR_REG <<
++		PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_S;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++}
++
++#define LTTSM_EN_MASK		(PCIE_AUX_LTSSM_EN_IND_M | PCIE_AUX_LTSSM_EN_MASK_M)
++void boot_rom_pcie_set_ltssm_en(void)
++{
++	regmap_writel(LTTSM_EN_MASK, IO0_H0_PCIE_AUX(mmPCIE_AUX_LTSSM_EN));
++}
+diff --git a/arch/jgs/arc/dev_pcie.h b/arch/jgs/arc/dev_pcie.h
+new file mode 100644
+index 0000000..b5414d6
+--- /dev/null
++++ b/arch/jgs/arc/dev_pcie.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_PCIE_H_
++#define _DEV_PCIE_H_
++
++void boot_rom_dbi_ro_write_en(bool enable);
++void boot_rom_shadow_reg_access_en(bool enable);
++void boot_rom_set_pf_cfg_bar(void);
++void boot_rom_set_vf_cfg_bar(void);
++void boot_rom_disable_alt_protocol(void);
++void boot_rom_set_number_of_vfs(uint32_t num_vfs);
++void boot_rom_skip_ats_capability(void);
++void boot_rom_pcie_set_ltssm_en(void);
++bool boot_rom_pcie_gen_limit_enabled(void);
++
++#endif /* _DEV_PCIE_H_ */
+diff --git a/arch/jgs/arc/dev_recovery.c b/arch/jgs/arc/dev_recovery.c
+new file mode 100644
+index 0000000..72c5787
+--- /dev/null
++++ b/arch/jgs/arc/dev_recovery.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <recovery.h>
++#include <jgs_reg_map.h>
++#include <jgs_blocks_linux_driver.h>
++#include <global_conf_masks.h>
++#include <d2d_ctl_regs.h>
++#include <global_conf_regs.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
++#include <gpio_regs.h>
++#include <jgs_efuse.h>
++#include <mem_io.h>
++#include <jgs_fw_if.h>
++//TODO: remove
++//#include<dummy.h>
++
++/* TODO: we need to verify flow and params on test chip to finalize D2D link init */
++
++#define D2D_LINK_STATUS_UDELAY	10000 /* 10 ms */
++#define FORCE_REC_GPIO_MASK		BIT(1)
++
++#define FS1_REC_STS_GPIO		77
++#define GPIOS_PER_BANK			16
++void boot_rom_set_recovery_status(void)
++{
++	uint32_t index = FS1_REC_STS_GPIO % GPIOS_PER_BANK;
++	uint32_t val, mask = BIT(index);
++
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
++		return;
++
++	/* TODO: check if PAD_SEL for specific GPIO needs to be set */
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++	val = val | mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++
++	/* TODO: Confirm gpio is active low/high */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++	val |= mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++}
++
++/*
++ * TODO: waiting for recovery flow sequence from verification team.
++ */
++void boot_rom_notify_slave(void)
++{
++	uint32_t def_ovrd_en, def_ovrd_val, val;
++
++	/* Set Override en for recovery mode */
++	def_ovrd_en = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_EN));
++	val = def_ovrd_en | PSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_EN_RECOVERY_MODE_M;
++	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_EN));
++
++	/* Set recovery mode value */
++	def_ovrd_val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_VAL));
++	val = def_ovrd_val | PSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_VAL_RECOVERY_MODE_M;
++	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_VAL));
++
++	udelay(RECOVERY_PULSE_DURATION);
++
++	/* Clear recovery mode value */
++	def_ovrd_val &= ~(PSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_VAL_RECOVERY_MODE_M);
++	regmap_writel(def_ovrd_val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_VAL));
++
++	/* Clear Override en for recovery mode */
++	def_ovrd_en &= ~(PSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_EN_RECOVERY_MODE_M);
++	regmap_writel(def_ovrd_en, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_OVRD_EN ));
++}
++
++void boot_rom_d2d_link_init(void)
++{
++	if (boot_rom_global.sku == FS1_IO_DIE_SA)
++		return;
++
++	if (boot_rom_global.config2_fuse & EFUSE_SYSCFG2_D2D_DISABLE)
++		return; /* skip d2d init */
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_START);
++
++	/* TODO: check IO HALF0 FSM_STS and HALF1 FSM_STS are in sync */
++
++	/* Master Die and Slave Die's sync for d2d rec init */
++	if (boot_rom_global.die_type == FS1_IO_DIE_MASTER) {
++		/* Indicate slave die's that d2d init has started */
++		boot_rom_notify_slave();
++	} else {
++		boot_rom_wait_for_recovery_in();
++	}
++
++	/* Inter die indication for d2d link init handshaking */
++	boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC);
++
++	/* TODO: IO HALF0 FSM_CTL and HALF1 FSM_CTL are in sync, and set start bit of D2D init */
++
++	/* TODO: wait for DPYH FSM busy status */
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS);
++
++	/*
++	 * TODO: D2D link init success acknowledgement to initiator
++	 * If no ack back, initiator has to blindly proceed that all Die's init success.
++	*/
++}
++
++bool boot_rom_efuse_force_recovery_en(void)
++{
++	return ((boot_rom_global.config_fuse & EFUSE_SYSCFG_GPIO01_RECOVERY_CONTROL) == 0);
++}
++
++bool boot_rom_read_force_recovery_gpio(void)
++{
++	return ((regmap_readl(I0_H0_PSOC_GPIO0(mmGPIO_DATA)) & FORCE_REC_GPIO_MASK) > 0);
++}
+diff --git a/arch/jgs/arc/dev_security.c b/arch/jgs/arc/dev_security.c
+new file mode 100644
+index 0000000..d46a83b
+--- /dev/null
++++ b/arch/jgs/arc/dev_security.c
+@@ -0,0 +1,654 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_blocks_linux_driver.h>
++#include <psoc_security_regs.h>
++#include <jgs_reg_map.h>
++#include <jgs_efuse.h>
++#include <status.h>
++#include <dev_security.h>
++#include <security.h>
++#include <boot_desc.h>
++#include <psoc_security_masks.h>
++#include <psoc_pad_conf_regs.h>
++#include <range_reg_lbw_regs.h>
++#include <range_reg_lbw_masks.h>
++#include <axuser_lbw_regs.h>
++#include <axuser_lbw_masks.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
++#include <dev_boot_info.h>
++#include <special_regs_regs.h>
++#include <limits.h>
++//TODO: remove
++//#include<dummy.h>
++
++
++/*
++ * This key hash is calculated on the Public Key Properties -
++ *   -----------------------------------------------
++ * | R ^ 2 | modulus | exponent | inverse | num bits |
++ *   -----------------------------------------------
++ * Since the key props are directly given to the ROM, there is
++ * no need to explicitly include the Public key, which is
++ * usually the modulus.
++ */
++const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN] = {
++	/* Habana Public Key */
++	{
++		0x95, 0xa3, 0x2a, 0x03, 0xd4, 0xbd, 0xb1, 0xe0,
++		0x2b, 0x54, 0xc0, 0x9c, 0x61, 0x10, 0x80, 0x2c,
++		0x08, 0xc4, 0x5d, 0xdf, 0x4a, 0xf8, 0x03, 0x00,
++		0x2a, 0xf5, 0xac, 0x20, 0x6f, 0x2c, 0x8f, 0x27,
++		0x69, 0x2e, 0x63, 0x7d, 0x02, 0x33, 0x54, 0x29,
++		0x3e, 0x57, 0x46, 0xd9, 0xf4, 0xa9, 0x7e, 0x88
++	},
++	/* Production Key 1 */
++	{
++		0x60, 0x44, 0x16, 0xd8, 0x1b, 0xea, 0x2e, 0x66,
++		0x46, 0xf3, 0x01, 0x78, 0x2f, 0x3c, 0xf6, 0xfc,
++		0x88, 0x3d, 0xbb, 0x5d, 0x94, 0xe7, 0xd9, 0x94,
++		0x79, 0xea, 0x6e, 0xdc, 0x1d, 0xd8, 0x89, 0xe1,
++		0xa4, 0xeb, 0x28, 0x4a, 0x1b, 0x60, 0x87, 0xed,
++		0x58, 0x4a, 0xe1, 0xa0, 0xe9, 0x13, 0x6f, 0xb6
++	},
++	/* Production Key 2 */
++	{
++		0x0c, 0xbe, 0x41, 0xaa, 0x56, 0xd2, 0xe3, 0x29,
++		0x0f, 0x45, 0x2f, 0x48, 0x64, 0x1f, 0x61, 0x00,
++		0xa3, 0x94, 0x6c, 0x2b, 0xc0, 0xa5, 0xd0, 0x9a,
++		0x0d, 0x3d, 0xb3, 0x74, 0x85, 0x1c, 0xbc, 0x9b,
++		0xee, 0xc1, 0x3c, 0xbc, 0x7e, 0xae, 0xf0, 0x7c,
++		0x4a, 0x7e, 0x82, 0x52, 0x69, 0xbc, 0xdc, 0x5f
++	},
++	/* Production Key 3 */
++	{
++		0xd3, 0x21, 0x9d, 0xe5, 0xcf, 0x7e, 0x4c, 0x20,
++		0x98, 0x4e, 0x84, 0x4d, 0x00, 0x5f, 0xf8, 0x71,
++		0x98, 0xf6, 0x11, 0x8f, 0xd4, 0xfd, 0xf6, 0x29,
++		0x6a, 0xd3, 0xfd, 0x94, 0xcf, 0x21, 0xf5, 0x60,
++		0xe8, 0x78, 0x91, 0x4e, 0xc0, 0x51, 0xc6, 0x82,
++		0xe1, 0xae, 0xfe, 0xcf, 0xbf, 0x96, 0xcf, 0xaf
++	},
++	/* Production Key 4 */
++	{
++		0x98, 0xd0, 0x0c, 0xa3, 0xa4, 0xc3, 0xe8, 0x55,
++		0x8d, 0xcf, 0xd2, 0x48, 0x0d, 0x8a, 0x52, 0xd6,
++		0xf5, 0x4c, 0x45, 0x58, 0x6d, 0x20, 0xb9, 0xe2,
++		0x4f, 0xe7, 0x6d, 0x0b, 0xdc, 0x76, 0xf6, 0xad,
++		0x2f, 0x79, 0xca, 0x03, 0x92, 0xc9, 0x2a, 0x5f,
++		0x36, 0x19, 0xee, 0x61, 0x3a, 0x10, 0x69, 0xa9
++	}
++};
++
++struct security_initiator_ctx initiator_data[SECURITY_INITIATOR_MAX] = {
++	[SECURITY_INITIATOR_PCIE] = {
++		mmIO_0_CFG_CXL_EP_PCIE_MSTR_IF_LBW_TSRCLD_R_BASE,
++		mmIO_0_CFG_CXL_EP_PCIE_MSTR_IF_LBW_TSRCLD_AXI_OVRD_AXUSER_BASE,
++	},
++	[SECURITY_INITIATOR_I2C_S_MSTR] = {
++		mmIO_0_CFG_PSOC_PSOC_CFG_I2C_S_MSTR_IF_LBW_TSRL_R_BASE,
++		mmIO_0_CFG_PSOC_PSOC_CFG_I2C_S_MSTR_IF_LBW_TSRL_AXI_OVRD_BASE,
++	},
++	[SECURITY_INITIATOR_JTAG_MSTR] = {
++		mmIO_0_CFG_PSOC_PSOC_CFG_JT_MSTR_IF_LBW_TSRL_R_BASE,
++		mmIO_0_CFG_PSOC_PSOC_CFG_JT_MSTR_IF_LBW_TSRL_AXI_OVRD_AXUSER_BASE,
++	},
++};
++
++struct security_rr_ctx lbw_rr_ctx[SEC_ACCESS_CTRL_MAX] = {
++	/* controller enabled(ce) recovery */
++	[SEC_ACCESS_CTRL_QSPI] = {
++		.rr_idx = LBW_RR_IDX_0,
++		.acc_type = SEC_ACCESS_RD_WR,
++		.data_min = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_QSPI_MIN),
++		.data_max = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_QSPI_MAX),
++	},
++	[SEC_ACCESS_CTRL_PAD_SEL] = {
++		.rr_idx = LBW_RR_IDX_1,
++		.acc_type = SEC_ACCESS_RD_WR,
++		.data_min = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_PAD_SEL_MIN),
++		.data_max = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_PAD_SEL_MAX),
++	},
++	[SEC_ACCESS_CTRL_PSOC_SEC] = {
++		.rr_idx = LBW_RR_IDX_2,
++		.acc_type = SEC_ACCESS_WR_ONLY,
++		.data_min = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_SECURITY_MIN),
++		.data_max = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_SECURITY_MAX),
++	},
++	/* Direct memory mapped(mm) recovery */
++	[SEC_ACCESS_CTRL_GEN_MEM] = {
++		.rr_idx = LBW_RR_IDX_3,
++		.acc_type = SEC_ACCESS_WR_ONLY,
++		.data_min = CONV_ARC_REG_TO_GEN_MEM(BOOT_ROM_REC_RR_GEN_MEM_MIN),
++		.data_max = CONV_ARC_REG_TO_GEN_MEM(BOOT_ROM_REC_RR_GEN_MEM_MAX),
++	},
++};
++
++struct security_rr_ctx lbw_rr_jtag_ctx = {
++	.rr_idx = LBW_RR_IDX_0,
++	.acc_type = SEC_ACCESS_RD_WR,
++	.data_min = 0x0,
++	.data_max = 0x3FFFFFFF,
++};
++
++/* Assign memory to PB_REG_BITS */
++const uint32_t  rec_pb_cfg_psoc_boot_security[] = RECOVERY_PB_CFG_PSOC_BOOT_SECURITY;
++const uint32_t  rec_pb_cfg_psoc_cfg_pad_conf[] = RECOVERY_PB_CFG_PSOC_CFG_PAD_CONF;
++
++#define PROT_BITS_RECOVERY_CFG {	\
++	[PB_PAGE_PSOC_BOOT_SECURITY] = {	\
++		.spl_base = mmIO_0_CFG_PSOC_BOOT_SECURITY_SPECIAL_BASE,	\
++		.pb_grp_cfg[PB_GROUP_0] = {		\
++			.close_all = 0,		\
++			.access_type = PB_ACCESS_TYPE_RW,	\
++			.sai_mask = RECOVERY_INITIATORS_SAI,	\
++			.pb_mask = rec_pb_cfg_psoc_boot_security,	\
++			.pb_mask_len = ARRAY_SIZE(rec_pb_cfg_psoc_boot_security),	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_1] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_2] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++	},	\
++	[PB_PAGE_PSOC_CFG_PAD_CONF] = {	\
++		.spl_base = mmIO_0_CFG_PSOC_PSOC_CFG_PAD_CONF_SPECIAL_BASE,	\
++		.pb_grp_cfg[PB_GROUP_0] = {		\
++			.close_all = 0,		\
++			.access_type = PB_ACCESS_TYPE_RW,	\
++			.sai_mask = RECOVERY_INITIATORS_SAI,	\
++			.pb_mask = rec_pb_cfg_psoc_cfg_pad_conf,	\
++			.pb_mask_len = ARRAY_SIZE(rec_pb_cfg_psoc_cfg_pad_conf),	\
++			.pb_mask_filter = 0x80,	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_1] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_2] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++	},	\
++}
++
++static const uint32_t pb_access_reg[PB_GROUP_MAX] = {
++	mmSPECIAL_REGS_PROT_RO_GRP_0,
++	mmSPECIAL_REGS_PROT_RO_GRP_1,
++	mmSPECIAL_REGS_PROT_RO_GRP_2,
++};
++
++static const uint32_t pb_reg[PB_GROUP_MAX] = {
++	mmSPECIAL_REGS_PROT_BITS_GRP_0_0,
++	mmSPECIAL_REGS_PROT_BITS_GRP_1_0,
++	mmSPECIAL_REGS_PROT_BITS_GRP_2_0,
++};
++
++static const uint32_t pb_sai_reg[PB_GROUP_MAX] = {
++	mmSPECIAL_REGS_PROT_SAI_GRP_0,
++	mmSPECIAL_REGS_PROT_SAI_GRP_1,
++	mmSPECIAL_REGS_PROT_SAI_GRP_2,
++};
++
++enum prot_bits_sec_status {
++	PROT_BIT_NO_PROVISION,
++	PROT_BIT_SAI_PROVISIONED,
++};
++
++void security_load_revoke_bits(void)
++{
++	uint32_t key_revoke = boot_rom_global.config_fuse & EFUSE_SYSCFG_KEY_REVOCATION_BITS;
++
++	if (boot_rom_global.fake_fuse_en)
++		boot_rom_status_update(PROGRESS_REVOKE_LOC_FAKE_FUSE);
++	else
++		boot_rom_status_update(PROGRESS_REVOKE_LOC_ASIC_EFUSE);
++
++	/* store key_revoke map in PSOC */
++	regmap_writel(key_revoke, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_KEY_REVOKE));
++
++	boot_rom_global.sec_data.key_revoke = key_revoke;
++}
++
++void security_load_fw_version()
++{
++	uint8_t fw_version_sec = security_get_fw_version();
++
++	if (boot_rom_global.fake_fuse_en)
++		boot_rom_status_update(PROGRESS_VER_LOC_FAKE_FUSE);
++	else
++		boot_rom_status_update(PROGRESS_VER_LOC_ASIC_EFUSE);
++
++	/* store minimum allowed security version in PSOC */
++	regmap_writel(fw_version_sec,
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_MIN_FW_VERSION));
++
++	/* store minimum allowed security version in persistent DCCM */
++	boot_rom_global.sec_data.sec_ver = fw_version_sec;
++
++	boot_info_write_svn_data(fw_version_sec);
++}
++
++void security_report_fw_version(enum hl_fw_manifest_type manifest_idx)
++{
++	struct hl_fw_boot_ptrs *boot_ptr = NULL;
++	uint32_t boot_ptr_addr = 0;
++
++	boot_ptr_addr = boot_desc_get_boot_pointer(manifest_idx);
++
++	if (boot_ptr_addr == 0)
++		return;
++
++	boot_ptr = (struct hl_fw_boot_ptrs *)boot_ptr_addr;
++
++	regmap_writel(boot_ptr->sec_ver,
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_CURRENT_FW_VERSION));
++}
++
++void security_load_rom_key_hash()
++{
++	uint8_t key_idx, dword;
++	uint32_t key_reg;
++	uint32_t *hash = (uint32_t *)rom_key_hashes;
++	uint32_t key_reg_base_array[] = {
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_0_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_1_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_2_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_3_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_4_0)
++	};
++
++	/* KEY LOCATION: ROM */
++	boot_rom_status_update(PROGRESS_KEY_LOC_ROM);
++
++	/* TODO: Store keys in boot_info if required */
++
++	for (key_idx = 0; key_idx < NUM_KEYS_IN_ROM; key_idx++) {
++		key_reg = key_reg_base_array[key_idx];
++		for (dword = 0; dword < SECURITY_DWORD_PER_KEY; dword++) {
++			regmap_writel(hash[(key_idx * SECURITY_DWORD_PER_KEY) + dword],
++					key_reg);
++
++			key_reg += sizeof(uint32_t);
++		}
++	}
++}
++
++int security_efuse_image_validation_en(void)
++{
++	/* check efuse for security validation enable */
++	uint32_t sys_cfg = boot_rom_global.sec_data.efuse_sys_cfg;
++
++	return !!(sys_cfg & EFUSE_SYSCFG_SIG_VAL_EN);
++}
++
++void boot_rom_eom_overrides()
++{
++	uint32_t key_revoke;
++
++	if (boot_rom_global.config_fuse & EFUSE_SYSCFG_EOM_BIT)
++		boot_rom_global.config_fuse |= EFUSE_SYSCFG_PRE_PRODUCTION_FLAGS;
++
++	key_revoke = boot_rom_global.config_fuse & EFUSE_SYSCFG_KEY_REVOCATION_BITS;
++
++	/*
++	 * Validate key revokation bits. Expected values from fuse are
++	 * 0, 1, 3, 7, 15. If any other values are read from fuse override
++	 * them accordingly.
++	 */
++	if (key_revoke == 2)
++		boot_rom_global.config_fuse |=  EFUSE_SYSCFG_REVOKE_KEY_0_1;
++	else if ((key_revoke < 7) && (key_revoke > 3))
++		boot_rom_global.config_fuse |=  EFUSE_SYSCFG_REVOKE_KEY_0_1_2;
++	else if ((key_revoke < 17) && (key_revoke > 7))
++		boot_rom_global.config_fuse |=  EFUSE_SYSCFG_REVOKE_KEY_0_1_2_3;
++
++	boot_rom_global.config_fuse &= ~EFUSE_SYSCFG_REVOKE_KEY_4;
++}
++
++void boot_rom_report_image_status(enum hl_fw_manifest_type man_type, enum security_img_sts error)
++{
++	uint32_t val;
++	uint32_t reg_addr;
++
++	if (man_type == HL_FW_SPI_MANIFEST_1)
++		reg_addr = IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SEC_IMG_STATUS);
++	else
++		reg_addr = IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PRI_IMG_STATUS);
++
++	val = regmap_readl(reg_addr);
++	switch(error) {
++		case FW_VER_LOWER:
++			val |= PSOC_SECURITY_PRI_IMG_STATUS_FW_VER_LOWER_M;
++			break;
++		case AUTHENTICATE_FAIL:
++			val |= PSOC_SECURITY_SEC_IMG_STATUS_AUTHENTICATE_FAIL_M;
++			break;
++		case CRC_FAIL:
++			val |= PSOC_SECURITY_SEC_IMG_STATUS_CRC_FAIL_M;
++			break;
++		default:
++			return;
++	}
++
++	regmap_writel(val, reg_addr);
++}
++
++void boot_rom_report_security_status(enum security_status status_bit, uint8_t index)
++{
++	uint32_t reg = regmap_readl(IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_STATUS));
++
++	switch(status_bit)
++	{
++		case STATUS_IMG_VALIDATED:
++			reg |= PSOC_SECURITY_STATUS_IMG_VALIDATED_M;
++			break;
++		case STATUS_FW_UPGRADE:
++			reg |= PSOC_SECURITY_STATUS_FW_UPGRADE_M;
++			break;
++		case STATUS_KEY_REVOKED:
++			reg |= PSOC_SECURITY_STATUS_KEY_REVOKED_M;
++			reg |= (index << PSOC_SECURITY_STATUS_KEY_REVOKED_IND_S);
++			break;
++		case STATUS_MIN_FW_MODIFIED:
++			reg |= PSOC_SECURITY_STATUS_MIN_FW_MODIFIED_M;
++			break;
++		case STATUS_FW_VER_INC:
++			reg |= PSOC_SECURITY_STATUS_FW_VER_INC_M;
++			break;
++		case STATUS_SPI_IMG_MODIFIES:
++			if (index == 0)
++				reg &= ~(PSOC_SECURITY_STATUS_SPI_IMG_MODIFIES_M);
++			else if (index == 1)
++				reg |= PSOC_SECURITY_STATUS_SPI_IMG_MODIFIES_M;
++			break;
++		case STATUS_FW_AUTH_FAIL:
++			reg |= PSOC_SECURITY_STATUS_FW_AUTHENTICAION_FAIL_M;
++			break;
++		default:
++			reg = 0;
++	}
++
++	regmap_writel(reg, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_STATUS));
++}
++
++void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
++	const struct security_rr_ctx *rr_ip_ctx)
++{
++	uint32_t range_mask, rr_dist, initr_sai_val, initr_rd_sai, initr_wr_sai;
++	uint32_t wr_sai_val, rd_sai_val, rr_en_val;
++
++	if ((initr_data.base_addr == 0) || (initr_data.sai_base == 0)) {
++		return;
++	}
++
++	rr_dist = rr_ip_ctx->rr_idx * sizeof(uint32_t);
++
++	initr_sai_val = regmap_readl(initr_data.sai_base + mmAXUSER_LBW_LB_SAI);
++	initr_rd_sai = (initr_sai_val & AXUSER_LBW_LB_SAI_RD_M);
++	initr_wr_sai = ((initr_sai_val & AXUSER_LBW_LB_SAI_WR_M) >> AXUSER_LBW_LB_SAI_WR_S);
++
++	wr_sai_val = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_WR_RANGE_SEC_0 + rr_dist);
++	rd_sai_val = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_RD_RANGE_SEC_0 + rr_dist);
++
++	/*
++	 * TODO
++	 * 1. When efuse BLOCK_RR is 1/0, all range_en=0x11, rd/wr_range_sec=0x7fffffff?
++	 * 2. Before we use RR index which is already used for open_all, we need to clear?
++	 */
++	rr_en_val = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_RANGE_EN_0 + rr_dist);
++
++	if ((rr_ip_ctx->acc_type == SEC_ACCESS_WR_ONLY) || (rr_ip_ctx->acc_type == SEC_ACCESS_RD_WR)) {
++		rr_en_val |= RANGE_REG_LBW_RANGE_EN_0_WR_EN_M;
++		wr_sai_val |= (1 << initr_wr_sai);
++	}
++	if ((rr_ip_ctx->acc_type == SEC_ACCESS_RD_ONLY) || (rr_ip_ctx->acc_type == SEC_ACCESS_RD_WR)) {
++		rr_en_val |= RANGE_REG_LBW_RANGE_EN_0_RD_EN_M;
++		rd_sai_val |= (1 << initr_rd_sai);
++	}
++
++	range_mask = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_RANGE_MASK_0 + rr_dist);
++	regmap_writel(rr_ip_ctx->data_min & range_mask,
++		initr_data.base_addr + mmRANGE_REG_LBW_RANGE_MIN_ADDR_0 + rr_dist);
++	regmap_writel(rr_ip_ctx->data_max & range_mask,
++		initr_data.base_addr + mmRANGE_REG_LBW_RANGE_MAX_ADDR_0 + rr_dist);
++
++	regmap_writel(wr_sai_val & RANGE_REG_LBW_WR_RANGE_SEC_0_VAL_M,
++		initr_data.base_addr + mmRANGE_REG_LBW_WR_RANGE_SEC_0 + rr_dist);
++	regmap_writel(rd_sai_val & RANGE_REG_LBW_RD_RANGE_SEC_0_VAL_M,
++		initr_data.base_addr + mmRANGE_REG_LBW_RD_RANGE_SEC_0 + rr_dist);
++
++	regmap_writel(rr_en_val, initr_data.base_addr + mmRANGE_REG_LBW_RANGE_EN_0 + rr_dist);
++}
++
++static void security_rr_lbw_config_dis(struct security_initiator_ctx initr_data,
++	uint32_t rr_idx)
++{
++	uint32_t rr_dist, dis_val = 0;
++
++	rr_dist = rr_idx * sizeof(uint32_t);
++
++	regmap_writel(dis_val, initr_data.base_addr + mmRANGE_REG_LBW_RANGE_EN_0 + rr_dist);
++}
++
++void security_rr_recovery_config(bool rr_en)
++{
++	uint8_t i;
++
++	if (rr_en) {
++		for (i = SEC_ACCESS_CTRL_QSPI; i <= SEC_ACCESS_CTRL_PSOC_SEC; i++) {
++			security_rr_lbw_config_en(initiator_data[SECURITY_INITIATOR_PCIE], &lbw_rr_ctx[i]);
++			security_rr_lbw_config_en(initiator_data[SECURITY_INITIATOR_I2C_S_MSTR], &lbw_rr_ctx[i]);
++		}
++
++		/* Incase memory mapped firmware update enable below code */
++		/* security_rr_lbw_config_en(initiator_data[SECURITY_INITIATOR_PCIE], &lbw_rr_ctx[SEC_ACCESS_CTRL_GEN_MEM]); */
++		/* security_rr_lbw_config_en(initiator_data[SECURITY_INITIATOR_I2C_S_MSTR], &lbw_rr_ctx[SEC_ACCESS_CTRL_GEN_MEM]); */
++	} else {
++		/* TODO: Implement if required */
++	}
++}
++
++static void security_program_sai_levels(struct security_initiator_ctx initr_ctx, uint8_t sai_val)
++{
++	regmap_writel(INITIATOR_SAI_REG_FORMAT(sai_val), initr_ctx.sai_base +
++		mmAXUSER_LBW_LB_SAI);
++	regmap_writel(INITIATOR_SAI_REG_FORMAT(sai_val), initr_ctx.sai_base +
++		mmAXUSER_LBW_LB_SAI_OVRD);
++}
++
++static void security_rr_jtag_config(bool enable)
++{
++	uint32_t rr_idx;
++
++	security_program_sai_levels(initiator_data[SECURITY_INITIATOR_JTAG_MSTR],
++			SECURITY_JTAG_LBW_SAI_VALUE);
++
++	if (enable) {
++		security_rr_lbw_config_en(initiator_data[SECURITY_INITIATOR_JTAG_MSTR],
++			&lbw_rr_jtag_ctx);
++	} else {
++		for (rr_idx = LBW_RR_IDX_0; rr_idx <= LBW_RR_IDX_15; rr_idx++)
++			security_rr_lbw_config_dis(initiator_data[SECURITY_INITIATOR_JTAG_MSTR],
++				rr_idx);
++	}
++}
++
++void security_handle_jtag_if(void)
++{
++	uint32_t val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_JTAG_DISABLE_CTRL));
++
++	if ((boot_rom_global.config_fuse & EFUSE_SYSCFG_DIS_JTAG) == 0) {
++		/* Enable JTAG */
++		val &= ~(PSOC_BOOT_CONF_JTAG_DISABLE_CTRL_DISABLE_M);
++
++		security_rr_jtag_config(true);
++
++		/*
++		 * Protection Bits:
++		 * Already all PBs are opened for RW in all pages for all SAI levels.
++		 */
++	} else {
++		val |= (PSOC_BOOT_CONF_JTAG_DISABLE_CTRL_DISABLE_M);
++
++		security_rr_jtag_config(false);
++
++		/*
++		 * Protection Bits:
++		 * Blocked from RR level, so no need to change PB.
++		 */
++	}
++
++	/* Clear FSM timer */
++	val &= ~(PSOC_BOOT_CONF_JTAG_DISABLE_CTRL_COUNTER_EN_M);
++
++	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_JTAG_DISABLE_CTRL));
++}
++
++static uint32_t prepare_mask(uint8_t min, uint8_t max)
++{
++	uint32_t mask = PB_CONF_ALL_PROTECTED;
++
++	mask = mask >> min << min;
++	mask = mask << (31 - max) >> (31 - max);
++
++	return mask;
++}
++
++static void prepare_pb_mask_array(uint32_t min_bit, uint32_t max_bit, uint32_t mask_array[], uint8_t length)
++{
++	uint32_t array_index, cur_min, msb, i;
++
++	cur_min = min_bit;
++	for (i = 0; i < length; i++) {
++		array_index = cur_min / 32;
++		msb = (32 * (array_index + 1)) - 1;
++
++		if (max_bit <= msb) {
++			mask_array[array_index] = prepare_mask(cur_min, max_bit);
++			return;
++		} else {
++			mask_array[array_index] = prepare_mask(cur_min, msb);
++		}
++		cur_min = msb + 1;
++	}
++}
++
++static uint32_t set_bit_index(uint32_t filter)
++{
++	uint32_t i, count = 0;
++
++	for (i = 0; i < (sizeof(uint32_t) * CHAR_BIT); i++) {
++		if ((filter >> i) & 1)
++			count += 1;
++	}
++
++	return count;
++}
++
++static void program_prot_bit_reg(uint32_t spl_base, uint32_t grp, struct pb_grp_ctx grp_cfg)
++{
++	regmap_writel(grp_cfg.access_type, spl_base + pb_access_reg[grp]);
++	regmap_writel(grp_cfg.sai_mask, spl_base + pb_sai_reg[grp]);
++}
++
++static void write_protection_bits(uint32_t spl_base, uint32_t grp, uint32_t set_idx, uint32_t data)
++{
++	regmap_writel(data, spl_base + pb_reg[grp] + (set_idx * sizeof(uint32_t)));
++}
++
++static void boot_rom_program_prot_bits(struct pb_page_ctx *pb_cfg_data, uint32_t pb_cfg_size)
++{
++	uint32_t mask_array[PB_MAX_REG_COPY_PER_GROUP];
++	struct pb_grp_ctx grp_cfg;
++	uint8_t i, group, set_idx;
++	uint32_t page, spl_base, filter_bit_ind;
++	uint32_t pb_mask_len, pb_mask_filter;
++
++	for (page = 0; page < pb_cfg_size; page++) {
++		spl_base = pb_cfg_data[page].spl_base;
++
++		for(group = 0; group < PB_GROUP_MAX; group++) {
++			grp_cfg = pb_cfg_data[page].pb_grp_cfg[group];
++
++			if (grp_cfg.close_all != 0) {
++				program_prot_bit_reg(spl_base, group, grp_cfg);
++
++			} else if (grp_cfg.win_len == 0) {
++				program_prot_bit_reg(spl_base, group, grp_cfg);
++
++				pb_mask_filter = grp_cfg.pb_mask_filter;
++				pb_mask_len = grp_cfg.pb_mask_len;
++
++				if (pb_mask_filter == 0) {
++					/* Write pb_mask as it is, no bit sequence filter */
++					for (set_idx = 0; set_idx < pb_mask_len; set_idx++) {
++						write_protection_bits(spl_base, group, set_idx, grp_cfg.pb_mask[set_idx]);
++					}
++				} else {
++					/* Use pb_mask_filter bit sequence filter */
++					if (grp_cfg.pb_mask_set == 0) {
++						/* Write data from pb_mask based on pb_mask_filter bit sequence */
++						if (set_bit_index(pb_mask_filter) == pb_mask_len) {
++							filter_bit_ind = 0;
++							for (set_idx = 0; (set_idx < PB_MAX_REG_COPY_PER_GROUP) && (pb_mask_filter >> set_idx); set_idx++) {
++								if ((pb_mask_filter >> set_idx) & 1) {
++									write_protection_bits(spl_base, group, set_idx, grp_cfg.pb_mask[filter_bit_ind]);
++									filter_bit_ind += 1;
++								}
++							}
++						} else {
++							/* TODO: report if mask len not equal to bit set count in filter */
++						}
++					} else {
++						/* Write 32bit mask based on pb_mask_filter bit sequence */
++						for (set_idx = 0; (set_idx < PB_MAX_REG_COPY_PER_GROUP) && (pb_mask_filter >> set_idx); set_idx++) {
++							if ((pb_mask_filter >> set_idx) & 1) {
++								write_protection_bits(spl_base, group, set_idx, PB_CONF_ALL_PROTECTED);
++							}
++						}
++					}
++				}
++			} else if (grp_cfg.win_len != 0) {
++				for (i = 0; i < PB_MAX_REG_COPY_PER_GROUP; i++)
++					mask_array[i] = 0;
++
++				program_prot_bit_reg(spl_base, group, grp_cfg);
++
++				for (i = 0; i < grp_cfg.win_len; i++)
++					prepare_pb_mask_array(grp_cfg.win_strt[i], grp_cfg.win_stop[i], mask_array, PB_MAX_REG_COPY_PER_GROUP);
++
++				for (set_idx = 0; set_idx < PB_MAX_REG_COPY_PER_GROUP; set_idx++)
++					write_protection_bits(spl_base, group, set_idx, mask_array[set_idx]);
++			}
++		} /* group for loop */
++	} /* page for loop */
++}
++
++void security_pb_recovery_config(void)
++{
++	struct pb_page_ctx pb_rec_cfg[] = PROT_BITS_RECOVERY_CFG;
++
++	boot_rom_program_prot_bits(pb_rec_cfg, ARRAY_SIZE(pb_rec_cfg));
++}
++
++void security_program_pci_i2c_sai()
++{
++	security_program_sai_levels(initiator_data[SECURITY_INITIATOR_PCIE],
++		SECURITY_PCI_LBW_SAI_VALUE);
++	security_program_sai_levels(initiator_data[SECURITY_INITIATOR_I2C_S_MSTR],
++		SECURITY_I2C_LBW_SAI_VALUE);
++}
+diff --git a/arch/jgs/arc/dev_security.h b/arch/jgs/arc/dev_security.h
+new file mode 100644
+index 0000000..01a3cdf
+--- /dev/null
++++ b/arch/jgs/arc/dev_security.h
+@@ -0,0 +1,216 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_SECURITY_H_
++#define _DEV_SECURITY_H_
++
++#define NUM_KEYS_IN_ROM					5
++#define SIG_SIZE					384
++
++/* size of key properties in bytes */
++#define KEY_PROP_RR_SZ					384
++#define KEY_PROP_MOD_SZ					384
++#define KEY_PROP_EXP_SZ					8
++#define KEY_PROP_INV_SZ					4
++#define KEY_PROP_NB_SZ					4
++#define KEY_PROP_HDR_SZ					8
++
++/* 384 + 384 + 8 + 4 + 4 = 784 bytes */
++#define PUB_KEY_SZ		(KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
++				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
++				KEY_PROP_NB_SZ)
++
++/* 784 + 8 = 792 */
++#define TOTAL_PUB_KEY_PROPS_SZ		(PUB_KEY_SZ + KEY_PROP_HDR_SZ)
++
++enum security_img_sts {
++    FW_VER_LOWER,
++    AUTHENTICATE_FAIL,
++    CRC_FAIL,
++};
++
++enum security_status {
++	STATUS_IMG_VALIDATED,
++	STATUS_FW_UPGRADE,
++	STATUS_KEY_REVOKED,
++	STATUS_KEY_REVOKED_IND,
++	STATUS_MIN_FW_MODIFIED,
++	STATUS_FW_VER_INC,
++	STATUS_SPI_IMG_MODIFIES,
++	STATUS_FW_AUTH_FAIL,
++};
++
++/* RECOVERY QSPI */
++#define BOOT_ROM_REC_RR_QSPI_MIN		(mmIO_0_CFG_PSOC_PSOC_CFG_QSPI_BASE)
++#define BOOT_ROM_REC_RR_QSPI_MAX		(mmIO_0_CFG_PSOC_PSOC_CFG_QSPI_BASE) + \
++							(IO_0_CFG_PSOC_PSOC_CFG_QSPI_SECTION - 1)
++
++/* RECOVERY PAD_SEL */
++#define BOOT_ROM_REC_RR_PSOC_PAD_SEL_MIN	(mmIO_0_CFG_PSOC_PSOC_CFG_PAD_CONF_BASE) + \
++							(mmPSOC_PAD_CONF_PAD_SEL_8)
++#define BOOT_ROM_REC_RR_PSOC_PAD_SEL_MAX	(mmIO_0_CFG_PSOC_PSOC_CFG_PAD_CONF_BASE) + \
++							(mmPSOC_PAD_CONF_PAD_SEL_9 - 1)
++
++/* RECOVERY PSOC SECURITY */
++#define BOOT_ROM_REC_RR_PSOC_SECURITY_MIN	(mmIO_0_CFG_PSOC_BOOT_SECURITY_BASE) + \
++							(mmPSOC_SECURITY_FW_RST)
++#define BOOT_ROM_REC_RR_PSOC_SECURITY_MAX	(mmIO_0_CFG_PSOC_BOOT_SECURITY_BASE) + \
++							(mmPSOC_SECURITY_MIN_FW_VERSION - 1)
++
++/* RECOVERY GEN_MEM */
++#define BOOT_ROM_REC_RR_GEN_MEM_MIN		(HL_FLASH_BASE)
++#define BOOT_ROM_REC_RR_GEN_MEM_MAX		(HL_FLASH_BASE) + (HL_FLASH_SIZE - 1)
++
++/* SAI Table start */
++#define SECURITY_PCI_LBW_SAI_VALUE		2
++#define SECURITY_I2C_LBW_SAI_VALUE		11
++#define SECURITY_JTAG_LBW_SAI_VALUE		9 /* TODO: Consider JTAG Green from SAI Assignment Doc */
++/* SAI Table end */
++
++#define RECOVERY_INITIATORS_SAI	(BIT(SECURITY_PCI_LBW_SAI_VALUE) | BIT(SECURITY_I2C_LBW_SAI_VALUE))
++
++#define INITIATOR_SAI_REG_FORMAT(SAI_VAL)	(SAI_VAL & AXUSER_LBW_LB_SAI_RD_M) | \
++								((SAI_VAL << AXUSER_LBW_LB_SAI_WR_S) & AXUSER_LBW_LB_SAI_WR_M)
++
++enum security_pb_pages {
++	PB_PAGE_PSOC_BOOT_SECURITY,
++	PB_PAGE_PSOC_CFG_PAD_CONF,
++};
++
++#define PB_MAX_REG_COPY_PER_GROUP		29
++#define PB_CONF_ALL_PROTECTED			0xFFFFFFFF
++
++/* Various blocks to be configured during boot rom in recovery */
++enum security_access_ctrl_zones {
++	SEC_ACCESS_CTRL_QSPI,
++	SEC_ACCESS_CTRL_PAD_SEL,
++	SEC_ACCESS_CTRL_PSOC_SEC,
++	SEC_ACCESS_CTRL_GEN_MEM,
++	SEC_ACCESS_CTRL_MAX,
++};
++
++/* In FS1 total 16 sets of LBW RR's are there */
++enum security_lbw_rr_sets {
++	LBW_RR_IDX_0 = 0,
++	LBW_RR_IDX_1 = 1,
++	LBW_RR_IDX_2 = 2,
++	LBW_RR_IDX_3 = 3,
++	LBW_RR_IDX_15 = 15,
++	LBW_RR_INVALID_IDX = 16,
++};
++
++enum security_access {
++	SEC_ACCESS_RD_ONLY,
++	SEC_ACCESS_WR_ONLY,
++	SEC_ACCESS_RD_WR,
++	SEC_ACCESS_INVALID,
++};
++
++struct security_rr_ctx {
++	uint8_t rr_idx;
++	uint8_t acc_type;
++	uint32_t data_min;
++	uint32_t data_max;
++};
++
++/* List of transaction initiators */
++enum security_initiators {
++	SECURITY_INITIATOR_PCIE,
++	SECURITY_INITIATOR_I2C_S_MSTR,
++	SECURITY_INITIATOR_JTAG_MSTR,
++	SECURITY_INITIATOR_MAX,
++};
++
++struct security_initiator_ctx {
++	uint32_t base_addr;
++	uint32_t sai_base;
++};
++
++enum prot_bits_groups {
++	PB_GROUP_0,
++	PB_GROUP_1,
++	PB_GROUP_2,
++	PB_GROUP_MAX,
++};
++
++enum prot_bits_access_type {
++	PB_ACCESS_TYPE_RW,
++	PB_ACCESS_TYPE_RO,
++	PB_ACCESS_INVALID,
++};
++
++/* Group level configuration flags */
++struct pb_grp_ctx {
++	uint32_t sai_mask;
++	uint8_t access_type;
++	/*
++	 * Clear/close all PB regs and SAI reg
++	 */
++	uint8_t close_all;
++	/*
++	 * This filter used if 0's are in between data sets in pb_mask - {0x12, 0, 0x23, }
++	 * To save pb_mask length data set indexes are stored in filter - 0b'101
++	 * After filter is applied, pb_mask will become - {0x12, 0x23, }
++	 */
++	uint8_t pb_mask_filter;
++	/*
++	 * Length of pb_mask data set array.
++	 */
++	uint8_t pb_mask_len;
++	/*
++	 * Applicable when win_strt and win_stop is configured.
++	 * Indicates array length of win_strt/win_stop.
++	 * Make sure length(win_strt) == length(win_stop).
++	 */
++	uint8_t win_len;
++	/*
++	 * If this flag set, pb_mask array is not considered.
++	 * Set all bits in pb reg set based on pb_mask_filter
++	 * If pb_mask_filter = 0b'101
++	 * Equivalent pb reg set data = {0xFFFFFFFF, 0, 0xFFFFFFFF }
++	 */
++	uint8_t pb_mask_set;
++	uint16_t rsvd;
++	/* array of window start bit index */
++	const uint32_t *win_strt;
++	/* array of window stop bit index */
++	const uint32_t *win_stop;
++	/*
++	 * It has required data sets to written into pb reg sets.
++	 * If pb_mask_filter == 0, pb_mask array has valid data sets.
++	 * If pb_mask_filter != 0, data set access based on filter bit indexing.
++	 */
++	const uint32_t *pb_mask;
++};
++
++/* Page level configurationb */
++struct pb_page_ctx {
++	uint32_t spl_base;
++	struct pb_grp_ctx pb_grp_cfg[PB_GROUP_MAX];
++};
++
++/* Define your PB_REG_BITS here */
++#define RECOVERY_PB_CFG_PSOC_BOOT_SECURITY	{0x1, }
++#define RECOVERY_PB_CFG_PSOC_CFG_PAD_CONF	{0x100, }
++
++void security_load_revoke_bits(void);
++int security_efuse_image_validation_en(void);
++void boot_rom_eom_overrides(void);
++void security_load_fw_version(void);
++void security_load_rom_key_hash(void);
++void security_report_fw_version(enum hl_fw_manifest_type manifest_idx);
++void boot_rom_report_image_status(enum hl_fw_manifest_type man_type,
++		enum security_img_sts error);
++void boot_rom_report_security_status(enum security_status status_bit, uint8_t index);
++void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
++	const struct security_rr_ctx *rr_ip_ctx);
++void security_rr_recovery_config(bool enable);
++void security_handle_jtag_if(void);
++void security_pb_recovery_config(void);
++void security_program_pci_i2c_sai(void);
++
++extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
++
++#endif /* _DEV_SECURITY_H_ */
+diff --git a/arch/jgs/arc/dev_spi_flash.c b/arch/jgs/arc/dev_spi_flash.c
+new file mode 100644
+index 0000000..3c0613a
+--- /dev/null
++++ b/arch/jgs/arc/dev_spi_flash.c
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <spi_flash.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <global_conf_regs.h>
++#include <global_conf_masks.h>
++#include <spi_regs.h>
++
++void spi_flash_set_byte_swap(uint8_t enable)
++{
++	uint32_t reg_spi_direct_wr_rd_ctrl = 0;
++
++	/* clear BYTE SWAP in SPI DMA so we dont switch endianness */
++	reg_spi_direct_wr_rd_ctrl =
++		regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL));
++	if (enable)
++		reg_spi_direct_wr_rd_ctrl |=
++			GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL_BYTE_SWAP_M;
++	else
++		reg_spi_direct_wr_rd_ctrl &=
++			~GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL_BYTE_SWAP_M;
++
++	regmap_writel(reg_spi_direct_wr_rd_ctrl,
++		      IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL));
++}
++
++void spi_flash_set_baud_rate(uint8_t baud_rate)
++{
++	regmap_writel(baud_rate, IO0_H0_PSOC_QSPI(mmSPI_BAUDR));
++}
++
++void spi_flash_set_write_limit(enum flash_write_limit write_limit)
++{
++	regmap_writel(write_limit, IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_WRITE_LIMIT));
++}
++
++uint32_t spi_flash_readl(uint32_t offset)
++{
++	/* mask offset to valid range of flash */
++	offset &= FLASH_VALID_MASK;
++	uint32_t val = base_readl(HL_FLASH_BASE + offset);
++
++	return val;
++}
+diff --git a/arch/jgs/arc/dev_spi_flash.h b/arch/jgs/arc/dev_spi_flash.h
+new file mode 100644
+index 0000000..0ba4d90
+--- /dev/null
++++ b/arch/jgs/arc/dev_spi_flash.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_SPI_FLASH_H_
++#define _DEV_SPI_FLASH_H_
++
++void spi_flash_set_byte_swap(uint8_t enable);
++void spi_flash_set_baud_rate(uint8_t baud_rate);
++void spi_flash_set_write_limit(enum flash_write_limit write_limit);
++uint32_t spi_flash_readl(uint32_t offset);
++
++#endif /* _DEV_SPI_FLASH_H_ */
+diff --git a/arch/jgs/arc/dev_spi_tpm.c b/arch/jgs/arc/dev_spi_tpm.c
+new file mode 100644
+index 0000000..db80bbe
+--- /dev/null
++++ b/arch/jgs/arc/dev_spi_tpm.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_blocks_linux_driver.h>
++#include <jgs_reg_map.h>
++#include <spi_regs.h>
++#include <psoc_pad_conf_regs.h>
++#include <gpio_regs.h>
++#include "dev_spi_tpm.h"
++
++void spi_tpm_cs_gpio_set(bool cs_en)
++{
++	uint32_t reg = regmap_readl(I0_H0_PSOC_GPIO1(mmGPIO_DATAOUT));
++	uint32_t mask = BIT(TPM_CS_GPIO_PIN % GPIOS_PER_BANK);
++
++	/* CS is active low */
++	if (cs_en)
++		reg &= ~mask;
++	else
++		reg |= mask;
++
++	regmap_writel(reg, I0_H0_PSOC_GPIO1(mmGPIO_DATAOUT));
++}
++
++uint32_t spi_tpm_miso_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_15);
++}
++
++uint32_t spi_tpm_mosi_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_16);
++}
++
++uint32_t spi_tpm_sclk_out_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_17);
++}
++
++uint32_t spi_tpm_cs_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_18);
++}
++
++void spi_tpm_ssi_cs1_get(uint32_t *mask, uint32_t *data_offset,
++				uint32_t *out_en_offset)
++{
++	*mask = BIT(TPM_CS_GPIO_PIN % GPIOS_PER_BANK);
++	*data_offset = I0_H0_PSOC_GPIO1(mmGPIO_DATAOUT);
++	*out_en_offset = I0_H0_PSOC_GPIO1(mmGPIO_OUTENSET);
++}
++
++uint32_t spi_tpm_base_get(void)
++{
++	return IO0_H0_PSOC_SPI(mmSPI_CTRLR0);
++}
+diff --git a/arch/jgs/arc/dev_spi_tpm.h b/arch/jgs/arc/dev_spi_tpm.h
+new file mode 100644
+index 0000000..fa4bd67
+--- /dev/null
++++ b/arch/jgs/arc/dev_spi_tpm.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_SPI_TPM_H_
++#define _DEV_SPI_TPM_H_
++
++#define GPIOS_PER_BANK			16
++#define TPM_CS_GPIO_PIN			18
++
++void spi_tpm_cs_gpio_set(bool cs_en);
++uint32_t spi_tpm_miso_pad_sel_get(void);
++uint32_t spi_tpm_mosi_pad_sel_get(void);
++uint32_t spi_tpm_sclk_out_pad_sel_get(void);
++uint32_t spi_tpm_cs_pad_sel_get(void);
++void spi_tpm_ssi_cs1_get(uint32_t *mask, uint32_t *data_offset,
++				uint32_t *out_en_offset);
++uint32_t spi_tpm_base_get(void);
++
++#endif /* _DEV_SPI_TPM_H_ */
+diff --git a/arch/jgs/arc/dev_uart.c b/arch/jgs/arc/dev_uart.c
+new file mode 100644
+index 0000000..36b3fe0
+--- /dev/null
++++ b/arch/jgs/arc/dev_uart.c
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <jgs_reg_map.h>
++#include <jgs_blocks_linux_driver.h>
++#include <psoc_pad_conf_regs.h>
++#include <uart_regs.h>
++#include "dev_uart.h"
++#include <delay.h>
++
++void boot_rom_uart_dev_init(unsigned int val)
++{
++	regmap_writel(0x0, IO0_H0_PSOC_CFG_UART(mmUART_CTRL));
++	regmap_writel(val, IO0_H0_PSOC_CFG_UART(mmUART_BAUDDIV));
++	regmap_writel(UART_TX_ENABLE | UART_RX_ENABLE, IO0_H0_PSOC_CFG_UART(mmUART_CTRL));
++}
++
++void boot_rom_config_uart_gpio()
++{
++	/* TODO: Confirm with system team and remove rx config */
++	/* UART0 RXD */
++	regmap_writel(GPIO_FUNC_1, IO0_H0_PSOC_CFG_PAD_CONF_PAD_SEL(mmPSOC_PAD_CONF_PAD_SEL_49));
++
++	/* UART0 TXD */
++	regmap_writel(GPIO_FUNC_1, IO0_H0_PSOC_CFG_PAD_CONF_PAD_SEL(mmPSOC_PAD_CONF_PAD_SEL_50));
++}
++
++void boot_rom_putc(const char ch)
++{
++	uint64_t start;
++
++	/*
++	 * TODO: DIE_CHECK
++	 * Confirm with system team, uart required for slave's or not
++	 */
++
++	start = boot_rom_get_ts_us();
++	for (;;) {
++		if ((regmap_readl(IO0_H0_PSOC_CFG_UART(mmUART_STATE)) & UART_SR_TXFULL) == 0) {
++			regmap_writel(ch, IO0_H0_PSOC_CFG_UART(mmUART_DATA));
++			break;
++		}
++		if (boot_rom_timeout_expired(start, UART_TX_FULL_TIMEOUT_US))
++			break;
++	}
++}
+diff --git a/arch/jgs/arc/dev_uart.h b/arch/jgs/arc/dev_uart.h
+new file mode 100644
+index 0000000..4f9448c
+--- /dev/null
++++ b/arch/jgs/arc/dev_uart.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_UART_
++#define _DEV_UART_
++
++#define UART_TX_FULL_TIMEOUT_US	5
++
++/* UART state bits */
++#define UART_SR_TXFULL			(1 << 0) /* TX Buffer Full */
++#define UART_SR_RXFULL			(1 << 1) /* RX Buffer Full */
++
++/* UART control bits */
++#define UART_TX_ENABLE		BIT(0)
++#define UART_RX_ENABLE		BIT(1)
++
++enum boot_rom_pll_div {
++	PLL_DIV0,
++	PLL_DIV1,
++	PLL_DIV2,
++	PLL_DIV3,
++	PLL_DIV_SIZE,
++};
++
++enum boot_rom_pll_bypass {
++	PLL_REF_CLK,
++	PLL_PLL_CLK,
++	PLL_DIV_REF,
++	PLL_DIV_PLL
++};
++
++#define PLDM_UART_PLL_DIVIDER_VAL	3
++
++void boot_rom_config_uart_gpio(void);
++void boot_rom_uart_dev_init(unsigned int val);
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div);
++uint32_t boot_rom_get_baudrate();
++
++/*
++ * System status over UART
++ * h - System in halt state
++ * r - BOOT ROM in Recovery
++ * p - BOOT ROM handover to PPBOOT
++ */
++void boot_rom_putc(const char ch);
++
++#endif /* _DEV_UART_ */
+\ No newline at end of file
+diff --git a/arch/jgs/arc/fake_fuse_flow.c b/arch/jgs/arc/fake_fuse_flow.c
+new file mode 100644
+index 0000000..dfd26b5
+--- /dev/null
++++ b/arch/jgs/arc/fake_fuse_flow.c
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2025 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <jgs_blocks_linux_driver.h>
++#include <arc_local_conf_regs.h>
++#include <global_conf_regs.h>
++#include <boot_rom.h>
++#include <hl_boot_desc.h>
++#include <jgs_fw_if.h>
++#include <boot_desc.h>
++#include <status.h>
++#include <progress_bits.h>
++#include <common.h>
++#include <boot_flow.h>
++#include <jgs_efuse.h>
++#include <spi_flash.h>
++#include <dev_spi_flash.h>
++#include <jgs_reg_map.h>
++
++static uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
++
++void boot_rom_init_slave_spi_efuse(void)
++{
++	/* Align with enum fake_fuse_bin_index */
++	uint8_t die_id_arary[MAX_DIE_COUNT] = {FS1_IO_DIE_0, FS1_IO_DIE_1,
++		FS1_COMPUTE_DIE_0, FS1_COMPUTE_DIE_1, FS1_COMPUTE_DIE_2, FS1_COMPUTE_DIE_3};
++	uint32_t bank_offset, spi_offset, syscfg1_data, syscfg2_data;
++	uint8_t die_id_index;
++
++	for(die_id_index = 0 ; die_id_index < MAX_DIE_COUNT; die_id_index++) {
++
++		/* Note: master die, no need to export. */
++		if (die_id_index == FAKE_FUSE_IO_D0)
++			continue;
++
++		spi_offset = fake_fuse_offset_array[die_id_index];
++
++		if (spi_offset == 0)
++			continue;
++
++		/* read value from bank0 */
++		bank_offset = (IO_EFUSE_SYSCFG_OFFSET * sizeof(uint32_t));
++		syscfg1_data = spi_flash_readl(spi_offset + bank_offset);
++
++		/* read value from bank1 and OR with value from bank0 */
++		bank_offset = ((EFUSE_WORDS_PER_BANK + IO_EFUSE_SYSCFG_OFFSET) * sizeof(uint32_t));
++		syscfg1_data |= spi_flash_readl(spi_offset + bank_offset);
++
++		/* read value from bank0 */
++		bank_offset = (IO_EFUSE_SYSCFG2_OFFSET * sizeof(uint32_t));
++		syscfg2_data = spi_flash_readl(spi_offset + bank_offset);
++
++		/* read value from bank1 and OR with value from bank0 */
++		bank_offset = ((EFUSE_WORDS_PER_BANK + IO_EFUSE_SYSCFG2_OFFSET) * sizeof(uint32_t));
++		syscfg2_data |= spi_flash_readl(spi_offset + bank_offset);
++
++		/* Notify slave config fuse value in slave scratchpad 0/1 register */
++		regmap_writel_inter_die(
++			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
++			syscfg1_data,
++			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_0)),
++				die_id_arary[die_id_index]));
++
++		regmap_writel_inter_die(
++			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
++			syscfg2_data,
++			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_1)),
++				die_id_arary[die_id_index]));
++
++		/* Indicate slave die about fuse value is available */
++		regmap_writel_inter_die(
++			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
++			FFUSE_WRITE_IND_MAGIC,
++			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2)),
++				die_id_arary[die_id_index]));
++	}
++}
++
++uint8_t boot_desc_spi_efuse_init(enum hl_fw_manifest_type curr_manifest_idx, uint8_t *slv_en)
++{
++	uint8_t val = 0;
++
++	/* return 1 for all die fake fuse enabled, 2 for No need of slave fake fuse values */
++    val = boot_desc_spi_efuse_offset_init(MAX_DIE_COUNT, curr_manifest_idx, fake_fuse_offset_array);
++
++	if (val == 0)
++        return BOOT_ROM_FAIL;
++
++	if(val == 1)
++		(*slv_en) = 1;
++	else if(val == 2)
++		(*slv_en) = 0;
++
++    return BOOT_ROM_SUCCESS;
++}
++
++void boot_rom_fake_fuse(void)
++{
++	uint8_t slave_en = 0;
++
++	if (!boot_rom_spi_efuse_enabled())
++		return;
++
++	if (!boot_rom_in_master_die()) {
++		boot_rom_wait_for_spi_fuse_data();
++		return;
++	}
++
++	if (boot_rom_global.fuse_emulation_init_done)
++		return;
++
++	boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);
++
++	if (boot_flow_spi_efuse_manifest_init(&slave_en) == BOOT_ROM_FAIL) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DECODE_FAIL);
++		return;
++	}
++
++	boot_rom_global.fake_fuse_spi_offset = fake_fuse_offset_array[FAKE_FUSE_IO_D0];
++	boot_rom_global.fake_fuse_en = true;
++	if (boot_rom_read_config_fuse() != BOOT_ROM_SUCCESS) {
++		boot_rom_global.fake_fuse_en = false;
++		return;
++	}
++
++	boot_rom_init_sku();
++
++	if ((boot_rom_global.sku == FS1_FULL_PACKAGE)
++		&& boot_rom_in_master_die() && (slave_en == 1))
++		boot_rom_init_slave_spi_efuse();
++
++	boot_rom_set_spi_efuse_read();
++}
+diff --git a/arch/jgs/arc/onix.c b/arch/jgs/arc/onix.c
+new file mode 100644
+index 0000000..fa22678
+--- /dev/null
++++ b/arch/jgs/arc/onix.c
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <jgs_efuse.h>
++#include "dev_uart.h"
++#include <common.h>
++#include <tpm.h>
++
++#define ONIX_REF_CLK		35000000ULL
++#define ONIX_UART_BAUDRATE	57600
++
++uint32_t boot_rom_get_baudrate()
++{
++	return ONIX_UART_BAUDRATE;
++}
++
++uint32_t boot_rom_pll_get_freq(__unused enum boot_rom_pll_div div)
++{
++	return ONIX_REF_CLK;
++}
++
++bool fuse_valid_volt_prot_pattern(__unused uint32_t config_fuse)
++{
++	return true;
++}
++
++uint32_t boot_rom_tpm_spi_baudr_get(void)
++{
++	enum boot_rom_tpm_spi_freq_config freq_config;
++	uint32_t baudr;
++
++	freq_config = boot_rom_get_tpm_spi_freq_config();
++
++	if (freq_config == FREQ_CFG_12_5MHZ)
++		baudr = (ONIX_REF_CLK / SPI_TPM_FREQ_12_5M);
++	else
++		baudr = (ONIX_REF_CLK / SPI_TPM_FREQ_6_25M);
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	baudr = (baudr < 2) ? 2 : baudr;
++	baudr = (baudr + 1) & 0xFFFE;
++
++	return baudr;
++}
+diff --git a/arch/jgs/arc/onix_boot_rom.lds b/arch/jgs/arc/onix_boot_rom.lds
+new file mode 100644
+index 0000000..34786be
+--- /dev/null
++++ b/arch/jgs/arc/onix_boot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++INCLUDE boot_rom.lds
+diff --git a/arch/jgs/arc/palad.c b/arch/jgs/arc/palad.c
+new file mode 100644
+index 0000000..f989c94
+--- /dev/null
++++ b/arch/jgs/arc/palad.c
+@@ -0,0 +1,78 @@
++s// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include "dev_uart.h"
++#include <mem_io.h>
++#include <jgs_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <pll_control_regs.h>
++#include <uart_regs.h>
++#include <dev_efuse.h>
++#include <common.h>
++#include <tpm.h>
++#include <pll_control_masks.h>
++
++#define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
++#define PLDM_UART_REF_CLK	250000000ULL
++#define PLDM_UART_BAUDRATE	300
++
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div)
++{
++	uint32_t offset = div * sizeof(uint32_t);
++
++	/* 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk */
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_SEL */
++	/* Divider clock select */
++	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
++
++	/* Divison factor value */
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_FACTOR */
++	regmap_writel(PLDM_UART_PLL_DIVIDER_VAL,
++		(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
++
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_EN  */
++	regmap_writel(PLL_CONTROL_DIV_EN_0_VAL_M,
++		(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_EN_0)) + offset);
++
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ CFG */
++	regmap_writel(PLL_CONTROL_CFG_FOUTPOSTDIVEN_M | PLL_CONTROL_CFG_EN_M,
++		(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG)));
++
++	return PLDM_UART_REF_CLK;
++}
++
++uint32_t boot_rom_get_baudrate()
++{
++	return PLDM_UART_BAUDRATE;
++}
++
++bool fuse_valid_volt_prot_pattern(uint32_t config_fuse)
++{
++	if ((config_fuse & EFUSE_SYSCFG_VOLT_PROT_BITS) == FUSE_VOLT_PROT_PATTERN)
++		return true;
++
++	return false;
++}
++
++uint32_t boot_rom_tpm_spi_baudr_get(void)
++{
++	enum boot_rom_tpm_spi_freq_config freq_config;
++	uint32_t baudr;
++
++	freq_config = boot_rom_get_tpm_spi_freq_config();
++
++	if (freq_config == FREQ_CFG_12_5MHZ)
++		baudr = (SYS_CLOCK_FREQUENCY / SPI_TPM_FREQ_12_5M);
++	else
++		baudr = (SYS_CLOCK_FREQUENCY / SPI_TPM_FREQ_6_25M);
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	baudr = (baudr < 2) ? 2 : baudr;
++	baudr = (baudr + 1) & 0xFFFE;
++
++	return baudr;
++}
+diff --git a/arch/jgs/arc/palad_boot_rom.lds b/arch/jgs/arc/palad_boot_rom.lds
+new file mode 100644
+index 0000000..34786be
+--- /dev/null
++++ b/arch/jgs/arc/palad_boot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++INCLUDE boot_rom.lds
+diff --git a/arch/jgs/arc/progress_bits.h b/arch/jgs/arc/progress_bits.h
+new file mode 100644
+index 0000000..3ca8539
+--- /dev/null
++++ b/arch/jgs/arc/progress_bits.h
+@@ -0,0 +1,161 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _PROGRESS_BITS_H_
++#define _PROGRESS_BITS_H_
++
++enum boot_rom_progress {
++	PROGRESS_INIT = 0,
++	PROGRESS_INIT_ARC1_ICCM_INIT_FAILED = 1,
++	PROGRESS_INIT_SPI_MANIFEST_0_EXCEEDS_MAX_SIZE = 2,
++	PROGRESS_INIT_SPI_MANIFEST_0_DMA_START = 3,
++	PROGRESS_INIT_SPI_MANIFEST_0_CRC_FAIL = 4,
++	PROGRESS_INIT_SPI_MANIFEST_0_UNALIGNED_DEST = 5,
++	PROGRESS_INIT_SPI_MANIFEST_0_INVALID_IMG_SIZE = 6,
++	PROGRESS_INIT_SPI_MANIFEST_0_UNALIGNED_IMG_SIZE = 7,
++	PROGRESS_INIT_SPI_MANIFEST_0_INVALID_FLASH_OFFSET = 8,
++	PROGRESS_INIT_SPI_MANIFEST_0_DMA_ERROR = 9,
++	PROGRESS_INIT_SPI_MANIFEST_0_DMA_FINISH = 10,
++	PROGRESS_INIT_SPI_MANIFEST_0_HDR_MAGIC_FAIL = 11,
++	PROGRESS_INIT_SPI_MANIFEST_0_INVALID_IMG_OFFSET = 12,
++	PROGRESS_INIT_SPI_MANIFEST_0_VERIFICATION_FAIL = 13,
++	PROGRESS_INIT_SPI_MANIFEST_0_INFO_SET_FAIL = 14,
++	PROGRESS_INIT_SPI_MANIFEST_0_DATA_SET_FAIL = 15,
++	PROGRESS_INIT_SPI_MANIFEST_0_INFO_GET_FAIL = 16,
++	PROGRESS_INIT_SPI_MANIFEST_0_DATA_GET_FAIL = 17,
++	PROGRESS_INIT_SPI_MANIFEST_0_FAIL = 18,
++	PROGRESS_INIT_SPI_MANIFEST_1_EXCEEDS_MAX_SIZE = 19,
++	PROGRESS_INIT_SPI_MANIFEST_1_DMA_START = 20,
++	PROGRESS_INIT_SPI_MANIFEST_1_CRC_FAIL = 21,
++	PROGRESS_INIT_SPI_MANIFEST_1_UNALIGNED_DEST = 22,
++	PROGRESS_INIT_SPI_MANIFEST_1_INVALID_IMG_SIZE = 23,
++	PROGRESS_INIT_SPI_MANIFEST_1_UNALIGNED_IMG_SIZE = 24,
++	PROGRESS_INIT_SPI_MANIFEST_1_INVALID_FLASH_OFFSET = 25,
++	PROGRESS_INIT_SPI_MANIFEST_1_DMA_ERROR = 26,
++	PROGRESS_INIT_SPI_MANIFEST_1_DMA_FINISH = 27,
++	PROGRESS_INIT_SPI_MANIFEST_1_HDR_MAGIC_FAIL = 28,
++	PROGRESS_INIT_SPI_MANIFEST_1_INVALID_IMG_OFFSET = 29,
++	PROGRESS_INIT_SPI_MANIFEST_1_VERIFICATION_FAIL = 30,
++	PROGRESS_INIT_SPI_MANIFEST_1_INFO_SET_FAIL = 31,
++	PROGRESS_INIT_SPI_MANIFEST_1_DATA_SET_FAIL = 32,
++	PROGRESS_INIT_SPI_MANIFEST_1_INFO_GET_FAIL = 33,
++	PROGRESS_INIT_SPI_MANIFEST_1_DATA_GET_FAIL = 34,
++	PROGRESS_INIT_SPI_MANIFEST_1_FAIL = 35,
++	PROGRESS_INIT_SPI_VALID_MANIFEST_INDEX_FAIL = 36,
++	PROGRESS_INIT_EFUSE_INIT_FAIL = 37,
++	PROGRESS_INIT_EFUSE_SPI = 38,
++	PROGRESS_INIT_EFUSE_SPI_IMG_DESC_FAIL = 39,
++	PROGRESS_INIT_EFUSE_SPI_EXCEEDS_MAX_SIZE = 40,
++	PROGRESS_INIT_EFUSE_SPI_DMA_COPY_FAIL = 41,
++	PROGRESS_INIT_EFUSE_SPI_MAGIC_FAIL = 42,
++	PROGRESS_INIT_EFUSE_SPI_DESC_COUNT_FAIL = 43,
++	PROGRESS_INIT_EFUSE_SPI_DECODE_FAIL = 44,
++	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 45,
++	PROGRESS_REVOKE_LOC_ASIC_EFUSE = 46,
++	PROGRESS_REVOKE_LOC_FAKE_FUSE = 47,
++	PROGRESS_KEY_LOC = 48, /* TODO: Remove & rearrange */
++	PROGRESS_KEY_LOC_ROM = 49,
++	PROGRESS_KEY_LOC_1 = 50, /* TODO: Remove & rearrange */
++	PROGRESS_VER_LOC = 51, /* TODO: Remove & rearrange */
++	PROGRESS_VER_LOC_ASIC_EFUSE = 52,
++	PROGRESS_VER_LOC_FAKE_FUSE = 53,
++	PROGRESS_SLV_DIE_WAITING_ON_RECOVERY_IND = 54,
++	PROGRESS_SPI_MANIFEST_0_VERIFY_START = 55,
++	PROGRESS_SPI_MANIFEST_0_VERIFY_VERSION_FAIL = 56,
++	PROGRESS_SPI_MANIFEST_0_VERIFY_KEY_REVOKED = 57,
++	PROGRESS_SPI_MANIFEST_0_VERIFY_KEY_HASH_FAIL = 58,
++	PROGRESS_SPI_MANIFEST_0_VERIFY_AUTH_FAIL = 59,
++	PROGRESS_SPI_MANIFEST_0_VERIFY_SUCCESS = 60,
++	PROGRESS_SPI_MANIFEST_1_VERIFY_START = 61,
++	PROGRESS_SPI_MANIFEST_1_VERIFY_VERSION_FAIL = 62,
++	PROGRESS_SPI_MANIFEST_1_VERIFY_KEY_REVOKED = 63,
++	PROGRESS_SPI_MANIFEST_1_VERIFY_KEY_HASH_FAIL = 64,
++	PROGRESS_SPI_MANIFEST_1_VERIFY_AUTH_FAIL = 65,
++	PROGRESS_SPI_MANIFEST_1_VERIFY_SUCCESS = 66,
++	PROGRESS_BRINGUP_PCI_PRI = 67,
++	PROGRESS_BRINGUP_PCI_PRI_NO_TMG_DESC = 68,
++	PROGRESS_BRINGUP_PCI_PRI_LOADADDR_INVALID = 69,
++	PROGRESS_BRINGUP_PCI_PRI_STARTADDR_INVALID = 70,
++	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 71,
++	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 72,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 73,
++	PROGRESS_BRINGUP_PCI_PRI_INVALID_IMG_SIZE = 74,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 75,
++	PROGRESS_BRINGUP_PCI_PRI_DMA_ERROR = 76,
++	PROGRESS_BRINGUP_PCI_PRI_DMA = 77,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 78,
++	PROGRESS_BRINGUP_PCI_PRI_VERIFY_SUCCESS = 79,
++	PROGRESS_BRINGUP_PCI_SEC = 80,
++	PROGRESS_BRINGUP_PCI_SEC_NO_IMG_DESC = 81,
++	PROGRESS_BRINGUP_PCI_SEC_LOADADDR_INVALID = 82,
++	PROGRESS_BRINGUP_PCI_SEC_STARTADDR_INVALID = 83,
++	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 84,
++	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 85,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 86,
++	PROGRESS_BRINGUP_PCI_SEC_INVALID_IMG_SIZE = 87,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 88,
++	PROGRESS_BRINGUP_PCI_SEC_DMA_ERROR = 89,
++	PROGRESS_BRINGUP_PCI_SEC_DMA = 90,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 91,
++	PROGRESS_BRINGUP_PCI_SEC_VERIFY_SUCCESS = 92,
++	PROGRESS_BOOT_ROM_TPM = 93,
++	PROGRESS_BOOT_ROM_TPM_INIT_FAIL = 94,
++	PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL = 95,
++	PROGRESS_BOOT_ROM_SVN_TPM_PCR_EXTEND_FAIL = 96,
++	PROGRESS_BOOT_ROM_MANIFEST_TPM_PCR_EXTEND_FAIL = 97,
++ 	PROGRESS_BOOT_ROM_TPM_FSM_OUT_OF_SYNC = 98,
++	PROGRESS_BOOT_ROM_TPM_FINISH = 99,
++	PROGRESS_PPBOOT_START = 100,
++	PROGRESS_PPBOOT_FINISH = 101,
++	PROGRESS_BOOT_ROM_IN_RECOVERY = 102,
++	PROGRESS_BOOT_ROM_IN_ROM_RECOVERY = 103,
++	PROGRESS_BOOT_ROM_PCIE_LINK_START = 104,
++	PROGRESS_BOOT_ROM_PCIE_LINK_INIT = 105,
++	PROGRESS_BOOT_ROM_PCIE_PHY_SRAM_INIT_TIMEDOUT = 106,
++	PROGRESS_BOOT_ROM_PCIE_PHY_PARA_STS_CLR_TIMEDOUT = 107,
++	PROGRESS_BOOT_ROM_PCIE_LINK_LIMIT_GEN1 = 108,
++	PROGRESS_BOOT_ROM_PCIE_LINK_IATU_CONFIG = 109,
++	PROGRESS_BOOT_ROM_PCIE_LINK_FINISH = 110,
++	PROGRESS_BOOT_ROM_D2D_LINK_START = 111,
++	PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY = 112,
++	PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC = 113,
++	PROGRESS_BOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 114,
++	PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS = 115,
++	PROGRESS_BOOT_ROM_RECOVERY_END = 116,
++	PROGRESS_BOOT_ROM_IN_RECOVERY_IMG = 117,
++	PROGRESS_RECOVERY_IMG_IMG0 = 118,
++	PROGRESS_RECOVERY_IMG_IMG0_NO_IMG_DESC = 119,
++	PROGRESS_RECOVERY_IMG_IMG0_LOADADDR_INVALID = 120,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_STARTADDR_INVALID = 121,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_START = 122,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_CRC_FAILED = 123,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_UNALIGNED_DEST = 124,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_INVALID_IMG_SIZE = 125,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_UNALIGNED_IMG_SIZE = 126,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_INVALID_FLASH_OFFSET = 127,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_ERROR = 128,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_DMA_FINISH = 129,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_VERIFICATION_FAIL = 130,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_START = 131,
++	PROGRESS_BOOT_RECOVERY_IMG_IMG0_FINISH = 132,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START = 133,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 134,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 135,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 136,
++	PROGRESS_BOOT_INFO_LFS_DISK_MOUNT_FAIL = 137,
++	PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL = 138,
++	PROGRESS_BOOT_INFO_LFS_FILE_COPY_PART_FAIL = 139,
++	PROGRESS_BOOT_INFO_LFS_FILE_SET_FAIL = 140,
++	PROGRESS_BOOT_INFO_LFS_FILE_NAME_FAIL = 141,
++	PROGRESS_BOOT_INFO_LFS_FINISHED = 142,
++	PROGRESS_BOOT_INFO_MANIFEST_CONTEXT_SET_FAIL = 143,
++	PROGRESS_BOOT_INFO_MANIFEST_HEADER_SET_FAIL = 144,
++	PROGRESS_BOOT_INFO_MANIFEST_CONTEXT_GET_FAIL = 145,
++	PROGRESS_BOOT_INFO_MANIFEST_HEADER_GET_FAIL = 146,
++	PROGRESS_BOOT_INFO_SVN_SET_FAIL = 147,
++	PROGRESS_BOOT_INFO_SVN_GET_FAIL = 148,
++};
++
++#endif /* _PROGRESS_BITS_H_ */
+diff --git a/arch/jgs/arc/slave.c b/arch/jgs/arc/slave.c
+new file mode 100644
+index 0000000..70dc582
+--- /dev/null
++++ b/arch/jgs/arc/slave.c
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <status.h>
++#include <delay.h>
++#include <mem_io.h>
++#include <recovery.h>
++#include <global_conf_regs.h>
++#include <global_conf_masks.h>
++#include <jgs_blocks_linux_driver.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
++#include <jgs_reg_map.h>
++#include <dev_uart.h>
++#include <spi_flash.h>
++#include <jgs_fw_if.h>
++
++#define SPI_FUSE_EMULATION_DATA_UDELAY	5000 /* 5ms */
++
++void boot_rom_wait_for_recovery_in(void)
++{
++	uint32_t val;
++
++	boot_rom_putc('r');
++
++	/*
++	 * TODO: IO Die0 RECOVERY_MODE is connected to it's 2 nighbour Compute Die's?
++	 * or, IO Die0 to all slave Die's?
++	 */
++
++	/* Unmask the MASK_0 RECOVERY_MODE bit, if masked */
++	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_MASK_0));
++	if ((val & PSOC_BOOT_CONF_D2D_GPIO_UP_MASK_0_RECOVERY_MODE_M) != 0) {
++		val &= ~(PSOC_BOOT_CONF_D2D_GPIO_UP_MASK_0_RECOVERY_MODE_M);
++		regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_MASK_0));
++	}
++
++	/* Unmask the MASK_1 RECOVERY_MODE bit, if masked */
++	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_MASK_1));
++	if ((val & PSOC_BOOT_CONF_D2D_GPIO_UP_MASK_1_RECOVERY_MODE_M) != 0) {
++		val &= ~(PSOC_BOOT_CONF_D2D_GPIO_UP_MASK_1_RECOVERY_MODE_M);
++		regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP_MASK_1));
++	}
++
++	while(1) {
++		val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_UP));
++		if ((val & PSOC_BOOT_CONF_D2D_GPIO_UP_MASK_0_RECOVERY_MODE_M) != 0) {
++			udelay(RECOVERY_PULSE_DURATION);
++			break;
++		}
++	}
++}
++
++void boot_rom_wait_for_signal(void)
++{
++	if (boot_rom_global.die_type == FS1_IO_DIE_MASTER)
++		return;
++
++	boot_rom_status_update(PROGRESS_SLV_DIE_WAITING_ON_RECOVERY_IND);
++
++	boot_rom_wait_for_recovery_in();
++
++	execute_recovery();
++}
++
++void boot_rom_wait_for_spi_fuse_data(void)
++{
++	uint64_t start;
++	uint32_t val;
++
++	start = boot_rom_get_ts_us();
++	while (1) {
++		val = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2));
++		if (val == FFUSE_WRITE_IND_MAGIC)
++			break;
++
++		if (boot_rom_timeout_expired(start, SPI_FUSE_EMULATION_DATA_UDELAY)) {
++			boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT);
++			return;
++		}
++	}
++
++	boot_rom_global.config_fuse = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_0));
++	boot_rom_global.config2_fuse = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_1));
++}
+diff --git a/arch/jgs/arc/soc.h b/arch/jgs/arc/soc.h
+new file mode 100644
+index 0000000..570c622
+--- /dev/null
++++ b/arch/jgs/arc/soc.h
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _SOC_H_
++#define _SOC_H_
++
++enum region_idx {
++	REGION_ICCM_IDX = 0,
++	REGION_HBW_0_IDX = 1,
++	REGION_HBW_1_IDX = 2,
++	REGION_HBW_2_IDX = 3,
++	REGION_HBW_3_IDX = 4,
++	REGION_HBW_4_IDX = 5,
++	REGION_HBW_5_IDX = 6,
++	REGION_FW_MEM_IDX = 7,
++	REGION_DCCM_IDX = 8,
++	REGION_GEN_MEM_IDX = 9,
++	REGION_GT_TILE_0_IDX = 10,
++	REGION_GT_TILE_1_IDX = 11,
++	REGION_GT_TILE_2_IDX = 12,
++	REGION_GT_TILE_3_IDX = 13,
++	REGION_LBW_DBG_IDX = 14,
++	REGION_LBW_CFG_IDX = 15,
++};
++
++enum gpio_func {
++	GPIO_FUNC_0,
++	GPIO_FUNC_1,
++	GPIO_FUNC_2,
++	GPIO_FUNC_3,
++};
++
++#define REGION_BASE_ADDR(REG_IDX)	(REG_IDX << 28)
++#define SZ_16				0x00000010
++#define SZ_32K				0x00008000
++#define SZ_64K				0x00010000
++#define SZ_128K				0x00020000
++#define SZ_256K				0x00040000
++#define SZ_1MB				0x00100000
++#define SZ_4MB				0x00400000
++#define SZ_256MB			0x10000000
++#define SZ_1G				0x40000000
++
++#define FLASH_VALID_MASK		0x1FFFFF
++
++#define ARC_REG_BASE_MASK	REGION_BASE_ADDR(0xF)
++#define HL_CFG_BASE			REGION_BASE_ADDR(REGION_LBW_CFG_IDX)
++#define HL_CFG_SIZE			SZ_256MB   /* 256MB */
++
++#define HL_ICCM_BASE			REGION_BASE_ADDR(REGION_ICCM_IDX)
++#define HL_ICCM_SIZE			0x40000   /* 256KB */
++
++#define HL_DCCM_BASE			REGION_BASE_ADDR(REGION_DCCM_IDX)
++#define HL_DCCM_SIZE			0x20000   /* 128KB */
++
++#define HL_FW_MEM_REGION_BASE		REGION_BASE_ADDR(REGION_FW_MEM_IDX)
++#define HL_FW_MEM_OFFSET		0x8800000
++#define HL_FW_MEM_BASE			(HL_FW_MEM_REGION_BASE + HL_FW_MEM_OFFSET)
++#define HL_FW_MEM_SIZE			SZ_4MB
++
++#define HL_GEN_MEM_BASE			REGION_BASE_ADDR(REGION_GEN_MEM_IDX)
++#define HL_FLASH_OFFSET			0xF000000
++#define HL_FLASH_SIZE			(16 * SIZE_MB)
++
++/* Below definitions are applicable to IO Die 0 only */
++#define RST_ARC_ICCM_OFFSET		0x0000000
++#define RST_ARC_ICCM_SIZE		SZ_64K
++#define RST_ARC_DCCM_OFFSET		0x0010000
++#define RST_ARC_DCCM_SIZE		SZ_32K
++#define MNG_ARC_ICCM_OFFSET		0x0040000
++#define MNG_ARC_ICCM_SIZE		SZ_256K
++#define MNG_ARC_DCCM_OFFSET		0x0080000
++#define MNG_ARC_DCCM_SIZE		SZ_128K
++#define PID_ARC_ICCM_OFFSET		0x00C0000
++#define PID_ARC_ICCM_SIZE		SZ_128K
++#define PID_ARC_DCCM_OFFSET		0x00E0000
++#define PID_ARC_DCCM_SIZE		SZ_64K
++#define MISC_ARC_ICCM_OFFSET		0x0100000
++#define MISC_ARC_ICCM_SIZE		SZ_256K
++#define MISC_ARC_DCCM_OFFSET		0x0140000
++#define MISC_ARC_DCCM_SIZE		SZ_64K
++#define SBROM_OFFSET			0x0180000
++#define SBROM_SIZE			SZ_128K
++#define PSOC_FWSRAM_OFFSET		0x01A0000
++#define PSOC_FWSRAM_SIZE		SZ_128K
++#define SCRATCHPAD_SRAM_OFFSET		0x0200000
++#define SCRATCHPAD_SRAM_SIZE		SZ_1MB
++#define CXL_ARC_ICCM_OFFSET		0x0300000
++#define CXL_ARC_ICCM_SIZE		SZ_256K
++#define CXL_ARC_DCCM_OFFSET		0x0340000
++#define CXL_ARC_DCCM_SIZE		SZ_256K
++#define PCIE_FWSRAM_OFFSET		0x0380000
++#define PCIE_FWSRAM_SIZE		SZ_64K
++
++#define GEN_MEM_FULL_BASE		0x300007f00000000ull
++#define CFG_MEM_FULL_BASE		0x300007ff0000000ull
++#define FULL_ADDR_MSB			0x300007F
++#define FW_MEM_BASE_FULL		0x300007FF8800000ull
++#define SCRATCHPAD_SRAM_BASE		(HL_FW_MEM_BASE + SCRATCHPAD_SRAM_OFFSET)
++#define SCRATCHPAD_SRAM_BASE_FULL	(FW_MEM_BASE_FULL + SCRATCHPAD_SRAM_OFFSET)
++#define RST_ARC_ICCM_FULL_BASE		(FW_MEM_BASE_FULL + RST_ARC_ICCM_OFFSET)
++#define MNG_ARC_ICCM_FULL_BASE		(FW_MEM_BASE_FULL + MNG_ARC_ICCM_OFFSET)
++#define PID_ARC_ICCM_FULL_BASE		(FW_MEM_BASE_FULL + PID_ARC_ICCM_OFFSET)
++#define MISC_ARC_ICCM_FULL_BASE		(FW_MEM_BASE_FULL + MISC_ARC_ICCM_OFFSET)
++#define CXL_ARC_ICCM_FULL_BASE		(FW_MEM_BASE_FULL + CXL_ARC_ICCM_OFFSET)
++#define PSOC_FW_SRAM_FULL_BASE		(FW_MEM_BASE_FULL + PSOC_FWSRAM_OFFSET)
++
++#define RST_ARC_MEM_SIZE		(RST_ARC_ICCM_SIZE + RST_ARC_DCCM_SIZE)
++#define MNG_ARC_MEM_SIZE		(MNG_ARC_ICCM_SIZE + MNG_ARC_DCCM_SIZE)
++#define PID_ARC_MEM_SIZE		(PID_ARC_ICCM_SIZE + PID_ARC_DCCM_SIZE)
++#define MISC_ARC_MEM_SIZE		(MISC_ARC_ICCM_SIZE + MISC_ARC_DCCM_SIZE)
++#define CXL_ARC_MEM_SIZE		(CXL_ARC_ICCM_SIZE + CXL_ARC_DCCM_SIZE)
++
++#define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0x3FFFFF) + HL_FW_MEM_BASE)
++
++/* This 2 macro's to convert ARC based 32B address to LBW MEM map address of 32B */
++#define CONV_ARC_REG_TO_GEN_MEM(addr)	(((addr) & 0xFFFFFFF) + ((GEN_MEM_FULL_BASE) & 0xFFFFFFFF))
++#define CONV_ARC_REG_TO_CFG_MEM(addr)	(((addr) & 0xFFFFFFF) + ((CFG_MEM_FULL_BASE) & 0xFFFFFFFF))
++
++#define SPI_MANIFEST_IMG_0_FLASH_OFFSET		(0x0)
++/* manifest 0 boot pointers are DMA trans to MNG ARC ICCM at offset 0 */
++#define SPI_MANIFEST_IMG_0_ICCM_OFFSET		(0)
++#define SPI_MANIFEST_IMG_0_OFFSET		(MNG_ARC_ICCM_OFFSET + SPI_MANIFEST_IMG_0_ICCM_OFFSET)
++#define SPI_MANIFEST_IMG_0_DMA_DEST		(FW_MEM_BASE_FULL + SPI_MANIFEST_IMG_0_OFFSET)
++/* 32Bit arc viewpoint address of manifest 0 stored in ICCM */
++#define SPI_MANIFEST_IMG_0_DMA_DEST_ARC		(HL_FW_MEM_BASE + SPI_MANIFEST_IMG_0_OFFSET)
++
++#define SPI_MANIFEST_IMG_1_FLASH_OFFSET		(0x200000)
++/* manifest 1 boot pointers are DMA trans to MNG ARC ICCM at offset 64K */
++#define SPI_MANIFEST_IMG_1_ICCM_OFFSET		SZ_64K
++#define SPI_MANIFEST_IMG_1_OFFSET		(MNG_ARC_ICCM_OFFSET + SPI_MANIFEST_IMG_1_ICCM_OFFSET)
++#define SPI_MANIFEST_IMG_1_DMA_DEST		(FW_MEM_BASE_FULL + SPI_MANIFEST_IMG_1_OFFSET)
++/* 32Bit arc viewpoint address of manifest 1 stored in ICCM */
++#define SPI_MANIFEST_IMG_1_DMA_DEST_ARC		(HL_FW_MEM_BASE + SPI_MANIFEST_IMG_1_OFFSET)
++
++/* For Fake fuse manifest */
++#define SPI_MANIFEST_IMG_2_ICCM_OFFSET	SZ_128K
++#define SPI_MANIFEST_IMG_2_OFFSET		(MNG_ARC_ICCM_OFFSET + SPI_MANIFEST_IMG_2_ICCM_OFFSET)
++#define SPI_MANIFEST_IMG_2_DMA_DEST		(FW_MEM_BASE_FULL + SPI_MANIFEST_IMG_2_OFFSET)
++/* 32Bit arc viewpoint address of manifest 2 stored in ICCM */
++#define SPI_MANIFEST_IMG_2_DMA_DEST_ARC		(HL_FW_MEM_BASE + SPI_MANIFEST_IMG_2_OFFSET)
++
++#endif /* _SOC_H_ */
+diff --git a/common/recovery.c b/common/recovery.c
+index f2f0525..7fbf684 100644
+--- a/common/recovery.c
++++ b/common/recovery.c
+@@ -9,8 +9,8 @@
+ #include <boot_rom.h>
+ #include <boot_flow.h>
+ #include <common.h>
+-#include <fs1_reg_map.h>
+-#include <fs1_blocks_linux_driver.h>
++//#include <jgs_reg_map.h>
++//#include <jgs_blocks_linux_driver.h>
+ #include <global_conf_masks.h>
+ #include <global_conf_regs.h>
+ #include <pcie.h>
+diff --git a/common/security.c b/common/security.c
+index 3c6087d..a86e9e9 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -12,7 +12,7 @@
+ #include <mem_io.h>
+ #include <efuse.h>
+ #include <limits.h>
+-#include <fs1_efuse.h>
++//#include <jgs_efuse.h>
+ 
+ int security_check_valid_fw_version(uint32_t fw_version)
+ {

@@ -1,0 +1,301 @@
+From 68556d6e05a34ecb105fef139c0f5eb2225f49f9 Mon Sep 17 00:00:00 2001
+From: Akshay Pradip Bharad <apbharad@habana.ai>
+Date: Mon, 09 Jun 2025 13:03:16 +0300
+Subject: [PATCH] [SW-227647] ipm: improve robustness
+
+This commit improves the robustness of the IPM driver with the
+following changes:
+- Restructure the ipm_isr implementation for better clarity
+- Fully drain the mailbox when spurious interrupts are detected
+- Make ipm_send interrupt-safe and thread-safe.
+- Mark shared memory access variables as volatile to ensure correct
+  synchronization across contexts.
+
+Change-Id: Iae4f36c71463bf3a3d123d4dc3cf8c91deb85535
+Signed-off-by: Akshay Pradip Bharad <apbharad@habana.ai>
+---
+
+diff --git a/drivers/ipm/ipm_hl.c b/drivers/ipm/ipm_hl.c
+index 552cc6a..39b1d5b 100644
+--- a/drivers/ipm/ipm_hl.c
++++ b/drivers/ipm/ipm_hl.c
+@@ -17,28 +17,50 @@
+ #define LOG_MODULE_NAME			ipm_hl
+ LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_IPM_LOG_LEVEL);
+ 
++/*
++ * Beware that this function is called from ISR. It processes the message and
++ * sends an ACK to the sender.
++ */
++static void process_message(const struct device *dev, volatile struct ipm_hl_msg_hdr *msg)
++{
++	struct ipm_hl_data *data = DEV_DATA(dev);
++	uint8_t *addr = (uint8_t *)msg;
+ 
+-void ipm_hl_isr(const struct device *dev)
++	LOG_DBG("MSG RECEIVED: id: %d size: %d", msg->id, msg->size);
++	LOG_HEXDUMP_DBG((addr + sizeof(struct ipm_hl_msg_hdr)), msg->size, "receive");
++
++	/* Use zero copy */
++	if (data->callback)
++		data->callback(dev, data->user_data, msg->id,
++			(void *)(addr + sizeof(struct ipm_hl_msg_hdr)));
++	else
++		LOG_ERR("Callback not registered for IPM HL dev %p", dev);
++
++	msg->ack = true;
++	data->rx_ctrl->ci++;
++	HL_ARC_W_BARRIER();
++}
++
++/*
++ * Beware that this function is called from ISR. It finds the message in the mailbox
++ * and process it. If the message is not found, it returns -ENOMSG.
++ */
++
++static int find_and_process_message(const struct device *dev, bool process_all_msgs)
+ {
+ 	const struct ipm_hl_config *config = DEV_CFG(dev);
+ 	struct ipm_hl_data *data = DEV_DATA(dev);
+-	struct ipm_hl_msg_hdr *msg = NULL;
+-	uint8_t *addr;
++	volatile struct ipm_hl_msg_hdr *msg = NULL;
+ 	uint32_t i;
+ 
+-	if (data->rx_ctrl->pi == data->rx_ctrl->ci) {
+-		LOG_WRN("Spurious interrupt received. PI: %d, CI: %d",
+-			data->rx_ctrl->pi, data->rx_ctrl->ci);
+-		return;
+-	}
+-
+ 	for (i = 0; i < config->rx.num_non_data_chunks; i++) {
+-		msg = (struct ipm_hl_msg_hdr *) (data->rx_ndata_base +
+-						(i * data->chunk_hdr_sz));
++		msg = (volatile struct ipm_hl_msg_hdr *) (data->rx_ndata_base +
++			   (i * data->chunk_hdr_sz));
+ 
+ 		if ((msg->busy) && (!msg->ack)) {
+-			if (msg->seq_no == data->rx_ctrl->ci) {
+-				goto process_msg;
++			if ((msg->seq_no == data->rx_ctrl->ci) || process_all_msgs) {
++				process_message(dev, msg);
++				return 0;
+ 			} else {
+ 				LOG_DBG("Out of Order Msg. seq_no: %d expected: %d",
+ 					msg->seq_no, data->rx_ctrl->ci);
+@@ -47,12 +69,13 @@
+ 	}
+ 
+ 	for (i = 0; i < data->num_rx_data_chunks; i++) {
+-		msg = (struct ipm_hl_msg_hdr *) (data->rx_data_base +
++		msg = (volatile struct ipm_hl_msg_hdr *) (data->rx_data_base +
+ 						(i * config->rx.data_chunk_size));
+ 
+ 		if ((msg->busy) && (!msg->ack)) {
+-			if (msg->seq_no == data->rx_ctrl->ci) {
+-				goto process_msg;
++			if ((msg->seq_no == data->rx_ctrl->ci) || process_all_msgs) {
++				process_message(dev, msg);
++				return 0;
+ 			} else {
+ 				LOG_DBG("Out of Order Msg. seq_no: %d expected: %d",
+ 					msg->seq_no, data->rx_ctrl->ci);
+@@ -60,24 +83,37 @@
+ 		}
+ 	}
+ 
+-	LOG_WRN("Spurious interrupt received. Possibly due to sequence number mismatch");
++	if (!process_all_msgs) {
++		LOG_WRN("Spurious interrupt received. PI: %d, CI: %d",
++			data->rx_ctrl->pi, data->rx_ctrl->ci);
++	}
+ 
+-	return;
++	return -ENOMSG;
++}
+ 
+-process_msg:
+-	addr = (uint8_t *) msg;
+-	LOG_DBG("MSG RECEIVED: id: %d size: %d", msg->id, msg->size);
+-	LOG_HEXDUMP_DBG((addr + sizeof(struct ipm_hl_msg_hdr)), msg->size, "receive");
++void ipm_hl_isr(const struct device *dev)
++{
++	struct ipm_hl_data *data = DEV_DATA(dev);
++	bool process_all_msgs = false;
++	uint32_t num_of_msgs = (data->rx_ctrl->pi - data->rx_ctrl->ci) & UINT16_MAX;
++	int ret = 0;
+ 
+-	/* Use zero copy */
+-	if (data->callback)
+-		data->callback(dev, data->user_data, msg->id,
+-				(void *)(addr + sizeof(struct ipm_hl_msg_hdr)));
+-	else
+-		LOG_ERR("Callback not registered for IPM HL dev %p", dev);
++	if (num_of_msgs == 0) {
++		LOG_WRN("Spurious interrupt received");
++		/*
++		 * TODO: Ideally we should set ipm_hl_set_enabled(0) until all msgs are
++		 * drained but this will need thorugh review of the callers.
++		 */
++		process_all_msgs = true;
++	}
+ 
+-	msg->ack = true;
+-	data->rx_ctrl->ci++;
++	while (1) {
++		ret = find_and_process_message(dev, process_all_msgs);
++
++		if ((ret == -ENOMSG) || (!process_all_msgs)) {
++			break;
++		}
++	}
+ }
+ 
+ /*
+@@ -93,9 +129,10 @@
+ {
+ 	const struct ipm_hl_config *config = DEV_CFG(dev);
+ 	struct ipm_hl_data *dev_data = DEV_DATA(dev);
+-	struct ipm_hl_msg_hdr *msg = NULL;
++	volatile struct ipm_hl_msg_hdr *msg = NULL;
+ 	uint8_t *addr, num_chunks;
+ 	uint32_t i, base, chunk_sz;
++	int key = 0;
+ 
+ 	LOG_HEXDUMP_DBG_LOCAL(data, size, "send");
+ 
+@@ -121,9 +158,10 @@
+ 	}
+ 
+ 	for (i = 0; i < num_chunks; i++) {
+-		msg = (struct ipm_hl_msg_hdr *) (base + (i * chunk_sz));
++		msg = (volatile struct ipm_hl_msg_hdr *) (base + (i * chunk_sz));
+ 		if ((msg->busy) && (msg->id == id)) {
+ 			if (!msg->ack) {
++				/* Raise interrupt again to notify receiver about pending ack */
+ 				sys_write32(config->tx.irq_num, (mem_addr_t) config->intr_base);
+ 			}
+ 
+@@ -135,33 +173,39 @@
+ 	}
+ 
+ 	for (i = 0; i < num_chunks; i++) {
+-		msg = (struct ipm_hl_msg_hdr *) (base + (i * chunk_sz));
++		msg = (volatile struct ipm_hl_msg_hdr *) (base + (i * chunk_sz));
+ 		if (!msg->busy) { /* Chunk is free */
+-			break;
++			key = irq_lock();
++
++			/* Race is possible on msg->busy, please recheck if chunk is free */
++			if (msg->busy) {
++				/* Race detected recheck chunk */
++				irq_unlock(key);
++				i = 0;
++				continue;
++			}
++
++			msg->id = id;
++			msg->size = size;
++			msg->ack = false;
++			msg->seq_no = dev_data->tx_ctrl->pi;
++			dev_data->tx_ctrl->pi++;
++			addr = (uint8_t *) msg;
++			msg->busy = true;
++
++			memcpy((void *)(addr + sizeof(struct ipm_hl_msg_hdr)), data, size);
++
++			HL_ARC_W_BARRIER();
++
++			/* Raise interrupt */
++			sys_write32(config->tx.irq_num, (mem_addr_t) config->intr_base);
++			irq_unlock(key);
++			return 0;
+ 		}
+ 	}
+ 
+-	if (i == num_chunks) {
+-		LOG_DBG_LOCAL("mailbox is full, retry later");
+-		return -EBUSY;
+-	}
+-
+-	msg->id = id;
+-	msg->size = size;
+-	msg->ack = false;
+-	msg->busy = true;
+-	msg->seq_no = dev_data->tx_ctrl->pi++;
+-	addr = (uint8_t *) msg;
+-	LOG_DBG_LOCAL("MSG CREATED: id: %d size: %d seq no: %d\n",
+-			msg->id, msg->size, msg->seq_no);
+-
+-	memcpy((void *)(addr + sizeof(struct ipm_hl_msg_hdr)), data, size);
+-
+-	HL_ARC_W_BARRIER();
+-	/* Raise interrupt */
+-	sys_write32(config->tx.irq_num, (mem_addr_t) config->intr_base);
+-
+-	return 0;
++	LOG_DBG_LOCAL("mailbox is full, retry later");
++	return -EBUSY;
+ }
+ 
+ void ipm_hl_register_callback(const struct device *dev,
+@@ -169,6 +213,11 @@
+ 				       void *user_data)
+ {
+ 	struct ipm_hl_data *data = dev->data;
++
++	if (cb == NULL) {
++		LOG_ERR("Callback function is NULL");
++		return;
++	}
+ 
+ 	data->callback = cb;
+ 	data->user_data = user_data;
+@@ -209,15 +258,16 @@
+ {
+ 	const struct ipm_hl_config *config = DEV_CFG(dev);
+ 	struct ipm_hl_data *data = DEV_DATA(dev);
+-	struct ipm_hl_msg_hdr *msg = NULL;
++	volatile struct ipm_hl_msg_hdr *msg = NULL;
+ 	uint32_t i;
+ 
+ 	/* TODO: Based on usage, check arch_irq_lock/mutex required for ipm_hl_clear API */
+ 
+ 	for (i = 0; i < config->rx.num_non_data_chunks; i++) {
+-		msg = (struct ipm_hl_msg_hdr *) (data->rx_ndata_base + (i * data->chunk_hdr_sz));
++		msg = (volatile struct ipm_hl_msg_hdr *)
++			(data->rx_ndata_base + (i * data->chunk_hdr_sz));
+ 		if (msg->id == id) {
+-			/* Message is retrieved, Clear id for for TX to send next message */
++			/* Message is retrieved, Clear id for TX to send next message */
+ 			msg->id = 0;
+ 			msg->size = 0;
+ 			msg->ack = false;
+@@ -227,10 +277,10 @@
+ 	}
+ 
+ 	for (i = 0; i < data->num_rx_data_chunks; i++) {
+-		msg = (struct ipm_hl_msg_hdr *) (data->rx_data_base +
++		msg = (volatile struct ipm_hl_msg_hdr *) (data->rx_data_base +
+ 						(i * config->rx.data_chunk_size));
+ 		if (msg->id == id) {
+-			/* Message is retrieved, Clear id for for TX to send next message */
++			/* Message is retrieved, Clear id for TX to send next message */
+ 			msg->id = 0;
+ 			msg->size = 0;
+ 			msg->ack = false;
+diff --git a/drivers/ipm/ipm_hl_common.h b/drivers/ipm/ipm_hl_common.h
+index 7ef1a4e..ac2d712 100644
+--- a/drivers/ipm/ipm_hl_common.h
++++ b/drivers/ipm/ipm_hl_common.h
+@@ -80,8 +80,8 @@
+ 	uint8_t num_tx_data_chunks;
+ 	uint8_t num_rx_data_chunks;
+ 	uint32_t chunk_hdr_sz;
+-	struct ipm_hl_ctrl *tx_ctrl;
+-	struct ipm_hl_ctrl *rx_ctrl;
++	volatile struct ipm_hl_ctrl *tx_ctrl;
++	volatile struct ipm_hl_ctrl *rx_ctrl;
+ };
+ 
+ #define DEV_CFG(dev) \

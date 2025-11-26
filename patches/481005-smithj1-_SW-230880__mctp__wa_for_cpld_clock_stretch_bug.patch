@@ -1,0 +1,71 @@
+From 39ab0c6cf48c1aaf09ac90c353739685e1fdb99b Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Wed, 30 Apr 2025 08:20:45 -0400
+Subject: [PATCH] [SW-230880] mctp: wa for cpld clock stretch bug
+
+SYS-5217 tracks an issue with the CPLD and occassions when there is
+a clock stretch at the end of a transfer.  With HLS3 BMC, the clock
+stretch always occurs on 16-byte boundaries.
+
+This watch works around the issue by checking if the transfer ends
+at one of these 16-byte boundaries and if so pads the transfer by
+1 byte.  The clock stretch still occurs but now it no longer is the
+end of the transfer and the CPLD is able to recover and correctly
+send the STOP condition.
+
+Change-Id: Id3c99af2b97c9b0649f3a2c9ed1e0963e53c29aa
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/drivers/i2c/hl_i2c/hl_mctp.c b/drivers/i2c/hl_i2c/hl_mctp.c
+index ac4359f..04abea0 100644
+--- a/drivers/i2c/hl_i2c/hl_mctp.c
++++ b/drivers/i2c/hl_i2c/hl_mctp.c
+@@ -162,14 +162,46 @@
+ 		.dst = data->i2c_partner_addr,
+ 	};
+ 	uint8_t pec = 0;
++	uint8_t byte_count = packet->payload_bytes + HL_MCTP_SMBUS_OVERHEAD;
+ 	int err;
+ 
+ 	if (!data->initialized) {
+ 		return -ENODEV;
+ 	}
+ 
++	/* Workaround for SYS-5217.
++	 *
++	 * If the last byte of an i2c transfer results in a clock stretch, the
++	 * CPLD will receive the STOP from the OAM, but once the clock stretch
++	 * is released it will not propagate the STOP to the BMC, resulting in
++	 * an i2c bus hang.
++	 *
++	 * This workaround avoids the issue by padding the transfer to ensure it
++	 * does not end on the clock stretch. The clock stretch will still occur,
++	 * but since there is at least 1 more byte to send the CPLD will be able
++	 * to correctly send the STOP condition.  The pad byte comes at the end
++	 * of the MCTP/PLDM transfer and will be ignored by the upper layers when
++	 * decoding the message.
++	 *
++	 * The clock stretch is issued by the HLS3 BMC at 16-byte intervals,
++	 * where the byte count is the entire i2c transfer, excluding the ADDR
++	 * byte.  Hence the calculation is the sum of:
++	 *   - 1  : SMBus.command_code
++	 *   - 1  : SMBus.byte_count
++	 *   - <N>: payload: MCTP data
++	 *   - 1  : PEC byte
++	 * Note that "smbus.encoding/src_addr" is already counted via
++	 * HL_MCTP_SMBUS_OVERHEAD.
++	 */
++	if ((byte_count < HL_MCTP_SMBUS_PKT_MAX) &&
++		(byte_count + 3 * sizeof(uint8_t)) % 16 == 0) {
++		packet->payload[packet->payload_bytes] = 0;
++		packet->payload_bytes += 1;
++		byte_count += 1;
++	}
++
+ 	smbus_hdr.command_code = HL_MCTP_COMMAND_CODE;
+-	smbus_hdr.byte_count = packet->payload_bytes + HL_MCTP_SMBUS_OVERHEAD;
++	smbus_hdr.byte_count = byte_count;
+ 	smbus_hdr.encoding = HL_MCTP_ENCODING_MCTP;
+ 	smbus_hdr.src_addr = GET_SHIM_CONFIG(cfg->i2c_rx.dev)->i2c_rx.slave_addr;
+ 

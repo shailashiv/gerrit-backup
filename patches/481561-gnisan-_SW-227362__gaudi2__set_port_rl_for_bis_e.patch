@@ -1,0 +1,93 @@
+From e985226b1e664a31a0ec4dc541f0bb8684b5de0f Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 11 Jun 2025 11:01:09 +0300
+Subject: [PATCH] [SW-227362] gaudi2: set port rl for bis e
+
+Set port rate limiter for 50G limit for BIS-E device.
+
+Change-Id: Idae948ec126401661d5111ff4f7ca56412f51d31
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/app/io/mgmt.c b/app/io/mgmt.c
+index 4cfbf01..20c58ba 100644
+--- a/app/io/mgmt.c
++++ b/app/io/mgmt.c
+@@ -316,6 +316,7 @@
+ 
+ #if !defined(CONFIG_SOC_FS1_MGMT) && !defined(CONFIG_SOC_JGS_MGMT)
+ 	EMPTY_WEAK_FUNC(void hl_rtr_ctrl_init_rl_reg_once(void),)
++	EMPTY_WEAK_FUNC(void hl_nic_init_rl_reg_once(void),)
+ #endif
+ 
+ static void hl_mgmt_device_drivers_deferred_init(void)
+@@ -361,8 +362,10 @@
+ 
+ #if !defined(CONFIG_SOC_FS1_MGMT) && !defined(CONFIG_SOC_JGS_MGMT)
+ 	/* Set and enable HBM RLs */
+-	if (is_bis_e_compliant_device())
++	if (is_bis_e_compliant_device()) {
+ 		hl_rtr_ctrl_init_rl_reg_once();
++		hl_nic_init_rl_reg_once();
++	}
+ #endif
+ 
+ 	if (dev_config.queue_init) {
+diff --git a/arch/gaudi2/device.c b/arch/gaudi2/device.c
+index 9431091..a7ae53d 100644
+--- a/arch/gaudi2/device.c
++++ b/arch/gaudi2/device.c
+@@ -98,6 +98,7 @@
+ #include "gaudi2_bootrom.h"
+ #include "hl_i2c_slave_events.h"
+ #include "hl_serdes.h"
++#include "nic0_txb_regs.h"
+ 
+ #define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
+ #include <zephyr/logging/log.h>
+@@ -1420,3 +1421,45 @@
+ 		}
+ 	}
+ }
++
++static const struct {
++	mem_addr_t addr;
++	uint32_t val;
++} nic_rl[] =  {
++	{
++		.addr = mmNIC0_TXB_RL_PORT_SAT_0,
++		.val = 31,
++	},
++	{
++		.addr = mmNIC0_TXB_RL_PORT_RST_0,
++		.val = 60000,
++	},
++	{
++		.addr = mmNIC0_TXB_RL_PORT_TIMEOUT_0,
++		.val = 4500,
++	},
++	{
++		.addr = mmNIC0_TXB_RL_PORT_EN_0,
++		.val = 1,
++	},
++
++};
++
++#define NIC_RL_OFFSET	4
++#define NIC_RL_COUNT	4
++
++void hl_nic_init_rl_reg_once(void)
++{
++	mem_addr_t addr;
++	int nic, rl, reg;
++
++	for (nic = 0 ; nic < MGMT_NIC_NUMBER_OF_PORTS / 2; nic++) {
++		for (rl = 0; rl < NIC_RL_COUNT; rl++) {
++			for (reg = 0; reg < ARRAY_SIZE(nic_rl); reg++) {
++				addr = nic_rl[reg].addr + nic * NIC_OFFSET + rl * NIC_RL_OFFSET;
++				sys_write32(nic_rl[reg].val, HL_CFG_BASE + addr);
++			}
++		}
++
++	}
++}

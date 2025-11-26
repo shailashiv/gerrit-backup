@@ -1,0 +1,67 @@
+From ce36781707473a675c21891a93aa781676cdb0f7 Mon Sep 17 00:00:00 2001
+From: Meron Cohen <mecohen@habana.ai>
+Date: Mon, 16 Jun 2025 09:59:10 +0300
+Subject: [PATCH] [SW-227076] g2e: fix hbm rl for tpc binned cards
+
+The HBM RL solution didn't work well for TPC binned cards.
+The value of the reset_val should be adjusted accordingly,
+in case it is a TPC binned card.
+
+Change-Id: Ic91eb9a0165c7af75992df050e53451de63a652d
+Signed-off-by: Meron Cohen <mecohen@habana.ai>
+---
+
+diff --git a/arch/gaudi2/device.c b/arch/gaudi2/device.c
+index 2525785..ff52b47 100644
+--- a/arch/gaudi2/device.c
++++ b/arch/gaudi2/device.c
+@@ -37,6 +37,7 @@
+ #include <hl_gaudi2_engines.h>
+ #include <hl_utils.h>
+ #include <common/pci_ids.h>
++#include <efuse.h>
+ 
+ #include "psoc_global_conf_regs.h"
+ #include "cpu_if_regs.h"
+@@ -1362,6 +1363,10 @@
+ #define GAUDI2E_HBM_RL_MAX_TIMEOUT		99
+ #define GAUDI2E_HBM_RL_DCORE_NUM		4
+ #define GAUDI2E_HBM_RL_RTR_NUM			8
++#define GAUDI2E_TPC_BINNING_RESET_VAL_ADJUST	4
++#define TPC_REDUNDANCY_EFUSE_ROW		17
++#define TPC_EFUSE_LOW				0
++#define TPC_EFUSE_MASK				0x1ffffff
+ #define DCORE_N_OFFSET				0x200000
+ #define RTR_N_OFFSET				0x8000
+ #define WR_RL_MEM_OFFSET			0x108
+@@ -1376,7 +1381,29 @@
+ 
+ static int32_t hl_get_hbm_rl_reset_val(void)
+ {
+-	return hl_is_card_type_pcie() ? GAUDI2E_HBM_RL_RESET_VAL_PCI : GAUDI2E_HBM_RL_RESET_VAL_OAM;
++	int ret;
++	int32_t reset_val;
++	uint32_t redundancy_fuse_dword;
++	uint32_t tpc_redundancy;
++
++	reset_val = hl_is_card_type_pcie() ? GAUDI2E_HBM_RL_RESET_VAL_PCI :
++					GAUDI2E_HBM_RL_RESET_VAL_OAM;
++
++	ret = efuse_read_word(EFUSE_DEV_INST, TPC_REDUNDANCY_EFUSE_ROW, &redundancy_fuse_dword);
++	if (ret) {
++		LOG_ERR("Read efuse offset 0x%x failed - assume TPC binned card",
++			TPC_REDUNDANCY_EFUSE_ROW);
++		reset_val -= GAUDI2E_TPC_BINNING_RESET_VAL_ADJUST;
++		goto exit;
++	}
++
++	tpc_redundancy = (redundancy_fuse_dword >> TPC_EFUSE_LOW) & TPC_EFUSE_MASK;
++
++	if (tpc_redundancy)
++		reset_val -= GAUDI2E_TPC_BINNING_RESET_VAL_ADJUST;
++
++exit:
++	return reset_val;
+ }
+ 
+ void hl_rtr_ctrl_init_rl_reg_once(void)

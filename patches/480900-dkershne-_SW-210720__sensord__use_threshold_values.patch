@@ -1,0 +1,196 @@
+From 1b2b4ceee5991b5c538dbb9c509d1797bb74a52f Mon Sep 17 00:00:00 2001
+From: David Kershner <dkershner@habana.ai>
+Date: Fri, 16 May 2025 22:25:35 +0300
+Subject: [PATCH] [SW-210720] sensord: use threshold values
+
+The threshold states of each sensor were reporting NORMAL even if the
+numeric sensor crossed a threshold barrier. Set the appropriate
+threshold state based on the current sensor threshold instead of
+reporting NORMAL.
+
+Change-Id: I0185013bbbc55cb9af90f3eb4fe4c22dd47c0371
+Signed-off-by: David Kershner <dkershner@habana.ai>
+---
+
+diff --git a/src/sensord.c b/src/sensord.c
+index a87fa5b..04e1b9b 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -119,6 +119,167 @@
+ 	return NULL;
+ }
+ 
++/* Check to see if value greater or equal to given threshold */
++static bool threshold_ge(struct sensord_sensor_value_single *value,
++			 pldm_sensor_value_t threshold)
++{
++	switch (value->data_size) {
++	case PLDM_DATA_SIZE_UINT8:
++		return value->present_reading >= threshold.u8;
++	case PLDM_DATA_SIZE_SINT8:
++		return value->present_reading >= threshold.s8;
++	case PLDM_DATA_SIZE_UINT16:
++		return value->present_reading >= threshold.u16;
++	case PLDM_DATA_SIZE_SINT16:
++		return value->present_reading >= threshold.s16;
++	case PLDM_DATA_SIZE_UINT32:
++		return value->present_reading >= threshold.u32;
++	case PLDM_DATA_SIZE_SINT32:
++		return value->present_reading >= threshold.s32;
++	}
++	return false;
++}
++
++static bool threshold_le(struct sensord_sensor_value_single *value,
++			 pldm_sensor_value_t threshold)
++{
++	switch (value->data_size) {
++	case PLDM_DATA_SIZE_UINT8:
++		return value->present_reading <= threshold.u8;
++	case PLDM_DATA_SIZE_SINT8:
++		return value->present_reading <= threshold.s8;
++	case PLDM_DATA_SIZE_UINT16:
++		return value->present_reading <= threshold.u16;
++	case PLDM_DATA_SIZE_SINT16:
++		return value->present_reading <= threshold.s16;
++	case PLDM_DATA_SIZE_UINT32:
++		return value->present_reading <= threshold.u32;
++	case PLDM_DATA_SIZE_SINT32:
++		return value->present_reading <= threshold.s32;
++	}
++	return false;
++}
++
++static bool threshold_enabled(const struct sensord_sensor_entry *sensor,
++			      pldm_sensor_threshold_t selected_threshold)
++{
++	switch (sensor->pdr->common.type) {
++	case PLDM_PDR_TYPE_NUMERIC_SENSOR:
++		switch (sensor->pdr->numeric_sensor_common.data_size) {
++		case PLDM_DATA_SIZE_UINT8:
++		case PLDM_DATA_SIZE_SINT8:
++			switch (selected_threshold) {
++			case PLDM_SENSOR_THRESHOLD_UPPER_CRITICAL:
++				return sensor->pdr->numeric_sensor_u8.thresholds.upper_critical;
++			case PLDM_SENSOR_THRESHOLD_UPPER_FATAL:
++				return sensor->pdr->numeric_sensor_u8.thresholds.upper_fatal;
++			case PLDM_SENSOR_THRESHOLD_UPPER_WARNING:
++				return sensor->pdr->numeric_sensor_u8.thresholds.upper_warning;
++			case PLDM_SENSOR_THRESHOLD_LOWER_CRITICAL:
++				return sensor->pdr->numeric_sensor_u8.thresholds.lower_critical;
++			case PLDM_SENSOR_THRESHOLD_LOWER_FATAL:
++				return sensor->pdr->numeric_sensor_u8.thresholds.lower_fatal;
++			case PLDM_SENSOR_THRESHOLD_LOWER_WARNING:
++				return sensor->pdr->numeric_sensor_u8.thresholds.lower_warning;
++			default:
++				break;
++			}
++			break;
++		case PLDM_DATA_SIZE_UINT16:
++		case PLDM_DATA_SIZE_SINT16:
++			switch (selected_threshold) {
++			case PLDM_SENSOR_THRESHOLD_UPPER_CRITICAL:
++				return sensor->pdr->numeric_sensor_u16.thresholds.upper_critical;
++			case PLDM_SENSOR_THRESHOLD_UPPER_FATAL:
++				return sensor->pdr->numeric_sensor_u16.thresholds.upper_fatal;
++			case PLDM_SENSOR_THRESHOLD_UPPER_WARNING:
++				return sensor->pdr->numeric_sensor_u16.thresholds.upper_warning;
++			case PLDM_SENSOR_THRESHOLD_LOWER_CRITICAL:
++				return sensor->pdr->numeric_sensor_u16.thresholds.lower_critical;
++			case PLDM_SENSOR_THRESHOLD_LOWER_FATAL:
++				return sensor->pdr->numeric_sensor_u16.thresholds.lower_fatal;
++			case PLDM_SENSOR_THRESHOLD_LOWER_WARNING:
++				return sensor->pdr->numeric_sensor_u16.thresholds.lower_warning;
++			default:
++				break;
++			}
++			break;
++		case PLDM_DATA_SIZE_UINT32:
++		case PLDM_DATA_SIZE_SINT32:
++			switch (selected_threshold) {
++			case PLDM_SENSOR_THRESHOLD_UPPER_CRITICAL:
++				return sensor->pdr->numeric_sensor_u32.thresholds.upper_critical;
++			case PLDM_SENSOR_THRESHOLD_UPPER_FATAL:
++				return sensor->pdr->numeric_sensor_u32.thresholds.upper_fatal;
++			case PLDM_SENSOR_THRESHOLD_UPPER_WARNING:
++				return sensor->pdr->numeric_sensor_u32.thresholds.upper_warning;
++			case PLDM_SENSOR_THRESHOLD_LOWER_CRITICAL:
++				return sensor->pdr->numeric_sensor_u32.thresholds.lower_critical;
++			case PLDM_SENSOR_THRESHOLD_LOWER_FATAL:
++				return sensor->pdr->numeric_sensor_u32.thresholds.lower_fatal;
++			case PLDM_SENSOR_THRESHOLD_LOWER_WARNING:
++				return sensor->pdr->numeric_sensor_u32.thresholds.lower_warning;
++			default:
++				break;
++			}
++			break;
++		}
++		break;
++	case PLDM_PDR_TYPE_COMPACT_NUMERIC_SENSOR:
++		const struct pldm_pdr_compact_numeric_sensor *pdr =
++			&sensor->pdr->compact_numeric_sensor;
++
++		switch (selected_threshold) {
++		case PLDM_SENSOR_THRESHOLD_UPPER_CRITICAL:
++			return pdr->range_field_support.critical_high;
++		case PLDM_SENSOR_THRESHOLD_LOWER_CRITICAL:
++			return pdr->range_field_support.critical_low;
++		case PLDM_SENSOR_THRESHOLD_UPPER_FATAL:
++			return pdr->range_field_support.fatal_high;
++		case PLDM_SENSOR_THRESHOLD_LOWER_FATAL:
++			return pdr->range_field_support.fatal_low;
++		case PLDM_SENSOR_THRESHOLD_UPPER_WARNING:
++			return pdr->range_field_support.warning_high;
++		case PLDM_SENSOR_THRESHOLD_LOWER_WARNING:
++			return pdr->range_field_support.warning_low;
++		default:
++			break;
++		}
++		break;
++	default:
++		break;
++	}
++	return false;
++}
++
++static pldm_sensor_threshold_t get_threshold_state(struct sensord_sensor_entry *sensor,
++						   struct sensord_sensor_value_single *value)
++{
++	struct pldm_pmc_threshold_data *thresholds = &value->threshold_values;
++
++	if (threshold_enabled(sensor, PLDM_SENSOR_THRESHOLD_UPPER_FATAL) &&
++	    threshold_ge(value, thresholds->upper_threshold_fatal))
++		return PLDM_SENSOR_THRESHOLD_UPPER_FATAL;
++	if (threshold_enabled(sensor, PLDM_SENSOR_THRESHOLD_UPPER_CRITICAL) &&
++	    threshold_ge(value, thresholds->upper_threshold_critical))
++		return PLDM_SENSOR_THRESHOLD_UPPER_CRITICAL;
++	if (threshold_enabled(sensor, PLDM_SENSOR_THRESHOLD_UPPER_WARNING) &&
++	    threshold_ge(value, thresholds->upper_threshold_warning))
++		return PLDM_SENSOR_THRESHOLD_UPPER_WARNING;
++
++	if (threshold_enabled(sensor, PLDM_SENSOR_THRESHOLD_LOWER_FATAL) &&
++	    threshold_le(value, thresholds->lower_threshold_fatal))
++		return PLDM_SENSOR_THRESHOLD_LOWER_FATAL;
++	if (threshold_enabled(sensor, PLDM_SENSOR_THRESHOLD_LOWER_CRITICAL) &&
++	    threshold_le(value, thresholds->lower_threshold_critical))
++		return PLDM_SENSOR_THRESHOLD_LOWER_CRITICAL;
++	if (threshold_enabled(sensor, PLDM_SENSOR_THRESHOLD_LOWER_WARNING) &&
++	    threshold_le(value, thresholds->lower_threshold_warning))
++		return PLDM_SENSOR_THRESHOLD_LOWER_WARNING;
++
++	return PLDM_SENSOR_THRESHOLD_NORMAL;
++}
++
+ static void update_sensor_value(struct sensord_sensor_entry *sensor,
+ 				struct sensord_sensor_state *state,
+ 				struct sensord_sample *sample)
+@@ -129,7 +290,8 @@
+ 		state->value.single.operational_state = PLDM_SENSOR_OP_STATE_ENABLED;
+ 		state->value.single.present_reading = sample->single;
+ 		state->value.single.previous_state = state->value.single.present_state;
+-		state->value.single.present_state = PLDM_SENSOR_THRESHOLD_NORMAL;
++		state->value.single.present_state = get_threshold_state(sensor,
++									&state->value.single);
+ 		state->value.single.event_state = state->value.single.present_state;
+ 		break;
+ 	case PLDM_PDR_TYPE_STATE_SENSOR:

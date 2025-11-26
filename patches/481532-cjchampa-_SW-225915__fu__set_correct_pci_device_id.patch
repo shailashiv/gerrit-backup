@@ -1,0 +1,100 @@
+From 8531a49756994ec86b5879e2ebaf8054e7e91be6 Mon Sep 17 00:00:00 2001
+From: Christopher Champagne <cjchampagne@habana.ai>
+Date: Fri, 06 Jun 2025 16:30:39 +0300
+Subject: [PATCH] [SW-225915] fu: set correct pci device id
+
+Set the pci device id for the firmware update device descriptor
+based on card type.
+Add function to get the device descriptors and the descriptor count.
+This will allow platforms to make adjustments to the default
+descriptors during runtime and present fewer descriptors if needed.
+
+Change-Id: Ic364f5a61f660e71efa62475c360207164d3e8e9
+Signed-off-by: Christopher Champagne <cjchampagne@habana.ai>
+---
+
+diff --git a/arch/gaudi3/pldm_fu_desc.c b/arch/gaudi3/pldm_fu_desc.c
+index bf04948..60445fa 100644
+--- a/arch/gaudi3/pldm_fu_desc.c
++++ b/arch/gaudi3/pldm_fu_desc.c
+@@ -8,8 +8,9 @@
+ #include <pldm_fu_desc.h>
+ #include <hl_utils.h>
+ #include <common/pci_ids.h>
++#include <hl_platform_defs.h>
+ 
+-const struct pldm_fu_device_descriptor pldm_fu_device_descriptors[] = {
++static struct pldm_fu_device_descriptor pldm_fu_device_descriptors[] = {
+ 	{
+ 		.type = PLDM_FU_DESC_IDENTIFIER_PCI_VENDOR_ID,
+ 		.length = 2,
+@@ -18,6 +19,7 @@
+ 	{
+ 		.type = PLDM_FU_DESC_IDENTIFIER_PCI_DEVICE_ID,
+ 		.length = 2,
++		/* set default, but will override based on real device */
+ 		.value.u16 = PCI_IDS_GAUDI3,
+ 	},
+ 	{
+@@ -32,4 +34,14 @@
+ 	},
+ };
+ 
+-const size_t pldm_fu_num_device_descriptors = ARRAY_SIZE(pldm_fu_device_descriptors);
++#define PCI_DEVICE_ID_IDX	1
++
++struct pldm_fu_device_descriptor *pldm_get_device_descriptors(size_t *count)
++{
++	if (hl_is_card_type_pcie())
++		pldm_fu_device_descriptors[PCI_DEVICE_ID_IDX].value.u16 = PCI_IDS_GAUDI3_HL_338;
++
++	*count = ARRAY_SIZE(pldm_fu_device_descriptors);
++
++	return pldm_fu_device_descriptors;
++}
+diff --git a/include/pldm_fu_desc.h b/include/pldm_fu_desc.h
+index 2094243..f7de490 100644
+--- a/include/pldm_fu_desc.h
++++ b/include/pldm_fu_desc.h
+@@ -19,7 +19,6 @@
+ 	} __packed value;
+ } __packed;
+ 
+-extern const struct pldm_fu_device_descriptor pldm_fu_device_descriptors[];
+-extern const size_t pldm_fu_num_device_descriptors;
++struct pldm_fu_device_descriptor *pldm_get_device_descriptors(size_t *count);
+ 
+ #endif /* ZEPHYR_MODULE_PLDM_PLDM_FU_DESC_H_ */
+diff --git a/src/pldm_fu_common.c b/src/pldm_fu_common.c
+index 6a76aa1..a5fab74 100644
+--- a/src/pldm_fu_common.c
++++ b/src/pldm_fu_common.c
+@@ -26,9 +26,14 @@
+ {
+ 	struct pldm_fu_query_device_identifier_rsp *rsp =
+ 		&msg->pldm.rsp.fu_query_device_identifier;
+-	size_t desc_length = pldm_fu_num_device_descriptors * sizeof(pldm_fu_device_descriptors[0]);
++	size_t desc_length = 0;
++	size_t count = 0;
++	struct pldm_fu_device_descriptor *descriptors;
+ 	uint8_t *rsp_data;
+ 	int err;
++
++	descriptors = pldm_get_device_descriptors(&count);
++	desc_length = count * sizeof(struct pldm_fu_device_descriptor);
+ 
+ 	err = pldm_resp_prepare(pldm, msg, sizeof(*rsp) + desc_length);
+ 	if (err) {
+@@ -37,10 +42,10 @@
+ 	}
+ 
+ 	rsp->device_identifiers_length = desc_length;
+-	rsp->descriptor_count = pldm_fu_num_device_descriptors;
++	rsp->descriptor_count = count;
+ 
+ 	rsp_data = (uint8_t *)rsp + sizeof(*rsp);
+-	memcpy(rsp_data, pldm_fu_device_descriptors, desc_length);
++	memcpy(rsp_data, descriptors, desc_length);
+ 
+ 	err = pldm_resp_send(pldm, msg, timeout);
+ 	if (err) {

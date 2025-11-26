@@ -1,0 +1,132 @@
+From 666b7c1331a15a5c462f2d0c61b692597977ddef Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Mon, 19 May 2025 16:23:03 -0400
+Subject: [PATCH] [SW-229044] sensord: add sensor state to entry
+
+Include a pointer to the sensor state within the sensor entry struct.
+This will give all sensord handlers access to the current state,
+allowing handlers to adjust processing based on current operational
+state.
+
+This adds 4 bytes per sensor.  In total this adds about 200 bytes to
+preboot and 1400 bytes to mgmt DCCM. The alternative would be to pass
+the sensor state as a new parameter to hundreds of sensord handlers
+across preboot/mgmt/agents.
+
+Change-Id: I7bd70d99c3215594cdb13250c55d811e763cd3ae
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/include/sensord.h b/include/sensord.h
+index 53211b4..ff2db38 100644
+--- a/include/sensord.h
++++ b/include/sensord.h
+@@ -66,6 +66,7 @@
+ 
+ struct sensord_sensor_entry {
+ 	const struct pldm_pdr_record *pdr;
++	struct sensord_sensor_state *state;
+ 
+ 	struct {
+ 		/* Used to update the sensor value 'live' whenever it is being requested
+diff --git a/src/sensord.c b/src/sensord.c
+index 7f75616..fc76704 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -99,8 +99,7 @@
+ 
+ static struct sensord_sensor_entry *find_sensor(
+ 	uint16_t sensor_id,
+-	uint32_t pdr_type_mask,
+-	struct sensord_sensor_state **state)
++	uint32_t pdr_type_mask)
+ {
+ 	struct sensord_sensor_entry *sensor;
+ 	size_t i;
+@@ -110,10 +109,8 @@
+ 		sensor = &sensord_state.sensors[i];
+ 		if (is_sensor_type_match(sensor, pdr_type_mask)
+ 			&& is_sensor_id(sensor, sensor_id)
+-			&& !pldm_pmc_unsupported_pdr(&sensor->pdr->meta, current_platform)) {
+-			*state = get_sensor_state(i);
++			&& !pldm_pmc_unsupported_pdr(&sensor->pdr->meta, current_platform))
+ 			return sensor;
+-		}
+ 	}
+ 
+ 	return NULL;
+@@ -512,11 +509,12 @@
+ 	struct pldm_pmc_threshold_data *val;
+ 	k_spinlock_key_t key;
+ 
+-	sensor = find_sensor(sensor_id, NUMERIC_SENSOR_TYPE_MASK, &state);
++	sensor = find_sensor(sensor_id, NUMERIC_SENSOR_TYPE_MASK);
+ 	if (!sensor) {
+ 		LOG_INF("%s invalid sensor id: %d", __func__, sensor_id);
+ 		return -ENODEV;
+ 	}
++	state = sensor->state;
+ 	val = &state->value.single.threshold_values;
+ 
+ 	key = k_spin_lock(&sensord_state.lock);
+@@ -673,6 +671,7 @@
+ 		if (pldm_pmc_unsupported_pdr(&pdr->meta, current_platform))
+ 			continue;
+ 
++		sensor->state = state;
+ 		state->timestamp_next_poll = 0;
+ 
+ 		switch ((pldm_pdr_type_t) pdr->common.type) {
+@@ -782,21 +781,20 @@
+ 	struct sensord_sensor_value *sensor_value)
+ {
+ 	struct sensord_sensor_entry *sensor;
+-	struct sensord_sensor_state *state;
+ 	struct sensord_sensor_value *value;
+ 	k_spinlock_key_t key;
+ 	int err = 0;
+ 
+-	sensor = find_sensor(sensor_id, pdr_type_mask, &state);
++	sensor = find_sensor(sensor_id, pdr_type_mask);
+ 	if (!sensor)
+ 		return -ENODEV;
+ 
+-	value = &state->value;
++	value = &sensor->state->value;
+ 
+ 	/* TODO: check if updatable before get()? */
+ 
+ 	if (sensor->api.get && !sensord_update_is_paused())
+-		invoke_get_callback(sensor, state);
++		invoke_get_callback(sensor, sensor->state);
+ 
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+@@ -817,10 +815,11 @@
+ 	struct sensord_sensor_state *state;
+ 	k_spinlock_key_t key;
+ 
+-	sensor = find_sensor(sensor_id, pdr_type_mask, &state);
++	sensor = find_sensor(sensor_id, pdr_type_mask);
+ 	if (!sensor)
+ 		return -ENODEV;
+ 
++	state = sensor->state;
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+ 	/* FIXME: assumes numeric sensor; add support for state sensors? */
+@@ -964,12 +963,13 @@
+ 	k_spinlock_key_t key;
+ 	int res = 0;
+ 
+-	sensor = find_sensor(sensor_id, NUMERIC_SENSOR_TYPE_MASK, &state);
++	sensor = find_sensor(sensor_id, NUMERIC_SENSOR_TYPE_MASK);
+ 	if (!sensor) {
+ 		LOG_DBG("%s invalid sensor id: %d", __func__, sensor_id);
+ 		return -ENODEV;
+ 	}
+ 
++	state = sensor->state;
+ 	key = k_spin_lock(&sensord_state.lock);
+ 
+ 	switch ((pldm_pdr_type_t) sensor->pdr->common.type) {

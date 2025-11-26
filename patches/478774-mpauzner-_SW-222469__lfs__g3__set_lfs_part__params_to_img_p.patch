@@ -1,0 +1,143 @@
+From bacd09a6b3e494f66a16242a63fcac505887a32f Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Sun, 16 Mar 2025 14:45:48 +0200
+Subject: [PATCH] [SW-222469] lfs: g3: set lfs part. params to img ptrs
+
+Insert Serdes LFS partition parameters in flash
+(start and size) to image pointers
+
+Change-Id: I03a1182de626b2e6fd7454d3ecd66a6d95e87c8d
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+---
+
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index e48629a..bcdf092 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -379,6 +379,77 @@
+ 	done
+ }
+ 
++function print_raw_data_image_desc() {
++	local img_num=$1
++	local s_off=$2
++	local img_size=$3
++	local img_loadh=$4
++	local img_loadl=$5
++	local start_addr_h=$6
++	local start_addr_l=$7
++
++	# Prepare descriptor magic "PTR"0x$img_num
++	printf "%x%x%x%02x" "'P" "'T" "'R" $img_num | rev_bytes_stdin
++
++	# Prepare descriptor version
++	local ver=1
++	printf "%08x" $ver | rev_bytes_stdin
++
++	# Prepare image index (stable or modifiable)
++	local idx=0
++	printf "%08x" $idx | rev_bytes_stdin
++
++	# Prepare Stable image offset
++	printf "%08x" $s_off | rev_bytes_stdin
++
++	# Prepare Modifiable image offset
++	printf "%08x" $s_off | rev_bytes_stdin
++
++	# Prepare Stable image size
++	printf "%08x" $img_size | rev_bytes_stdin
++
++	# Prepare Modifiable image size
++	printf "%08x" $img_size | rev_bytes_stdin
++
++	# If one of the addresses is empty use 0x0 instead
++	# Prepare Stable and Modifiable image load address high
++	printf "%08x" $img_loadh | rev_bytes_stdin
++	printf "%08x" $img_loadh | rev_bytes_stdin
++	# Prepare Stable and Modifiable image load address low
++	printf "%08x" $img_loadl | rev_bytes_stdin
++	printf "%08x" $img_loadl | rev_bytes_stdin
++
++	# Prepare checksum
++	local img_path="${STAGE_DIR}/empty.bin"
++	if [ ! -f $img_path ]; then
++		dd bs=4 count=1 if=/dev/zero of=$img_path
++	fi
++
++	local PRE_CKSUM=`${SHA_CHKSUM} ${img_path} | cut -d' ' -f1`
++	hl_chksum_add ${PRE_CKSUM}
++
++	# Prepare Stable and Modifiable image start address high
++	printf "%08x" $start_addr_h | rev_bytes_stdin
++	printf "%08x" $start_addr_h | rev_bytes_stdin
++	# Prepare Stable and Modifiable image start address low
++	printf "%08x" $start_addr_l | rev_bytes_stdin
++	printf "%08x" $start_addr_l | rev_bytes_stdin
++
++	# Prepare component version
++	for i in $(seq 1 128); do
++		printf "%02x" 0
++	done
++}
++
++function  print_serdes_image_desc() {
++	local img_num=10
++	local serdes_partition_sector_num=28
++	local flash_sector_size=0x10000
++	local s_off=$(($serdes_partition_sector_num * $flash_sector_size))
++
++	print_raw_data_image_desc "$img_num" "$s_off" "$flash_sector_size" 0 "$s_off" 0 "$s_off"
++}
++
+ function print_image_desc {
+ 	local img_name=$1
+ 	local img_num=$2
+@@ -491,11 +562,13 @@
+ 	local imgs_num_corr=0
+ 	local ipnames_spi_img=("PREBOOT" "UBOOT" "PPBOOT" "FAKE_FUSE" "SPI_TPM" "PIF_ICCM" "PIF_DCCM" "PREBOOT_D1" "SRAM_MBIST_DATA")
+ 	local ipnames_erom=("EROM_PCIE" "EROM_RECOVERY")
++	local ipnames_raw_data=()
+ 	# Image pointers
+ 	if [ ${EROM_IMG} == 0 ]
+ 	then
+ 		imgs_num_corr=3
+ 		ipnames=("${ipnames_spi_img[@]}")
++		ipnames_raw_data+=("print_serdes_image_desc")
+ 	else
+ 		ipnames=("${ipnames_erom[@]}")
+ 	fi
+@@ -506,8 +579,7 @@
+ 	# UBOOT is not a valid image. But the index(already used for legacy platform) should not
+ 	# be used by other images. Hence it is still maintained in the array for indexing. The
+ 	# binary generated would not have a UBOOT image descriptor.
+-	local valid_imgs=$(($ipnum-$imgs_num_corr))
+-
++	local valid_imgs=$(($ipnum-$imgs_num_corr+${#ipnames_raw_data[@]}))
+ 	printf "%08x" $valid_imgs | rev_bytes_stdin | xxd -r -p -s +12 - $img_file
+ 
+ 	local pub_key_size=784
+@@ -539,7 +611,7 @@
+ 	printf "%08x" $offset_array | rev_bytes_stdin | xxd -r -p -s +28 - $img_file
+ 
+ 	# Pointer structure offsets
+-	local img_descs_base_off=$((img_ptrs_sz + (ipnum * 4)))
++	local img_descs_base_off=$((img_ptrs_sz + ((ipnum + ${#ipnames_raw_data[@]}) * 4)))
+ 	for ((i=0; i<$ipnum; i++)); do
+ 
+ 		# Even though uboot is a valid index, we do not need to store a dummy image
+@@ -562,6 +634,15 @@
+ 		print_image_desc ${ipnames[$i]} $((i + 1)) | xxd -r -p -s +$offset - $img_file
+ 	done
+ 
++	for raw_data_handler in "${ipnames_raw_data[@]}"; do
++		local offs_corr=$(($ipnum - offs_corr_fac))
++		local offset=$((img_descs_base_off + (offs_corr * img_desc_sz)))
++		local offloc=$((img_ptrs_sz + (offs_corr * 4)))
++		printf "%08x" $offset | rev_bytes_stdin | xxd -r -p -s +$offloc - $img_file
++		$raw_data_handler | xxd -r -p -s +$offset - $img_file
++		ipnum=$((ipnum + 1))
++	done
++
+ 	if [ ${KEY_NUM} -eq 0 ]; then
+ 		KEY_NAME=$(echo -n "hl_${KEY_BASE_NAME}")
+ 	else

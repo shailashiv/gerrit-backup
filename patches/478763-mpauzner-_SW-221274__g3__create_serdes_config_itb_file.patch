@@ -1,0 +1,150 @@
+From a4543b42b39e040334c4d6271d91c86783561b9f Mon Sep 17 00:00:00 2001
+From: Michael Pauzner <mpauzner@habana.ai>
+Date: Wed, 30 Apr 2025 11:02:19 +0300
+Subject: [PATCH] [SW-221274] g3: create serdes config itb file
+
+Create serdes configuration ITB file from binary image.
+Also, include serdes config section to
+gaudi3-agent-fw-loader.itb.
+
+Change-Id: Id56671226d13653a225d13a89dd3cfa854933a64
+Signed-off-by: Michael Pauzner <mpauzner@habana.ai>
+---
+
+diff --git a/board/habanalabs/gaudi3/create-serdes-config.sh b/board/habanalabs/gaudi3/create-serdes-config.sh
+new file mode 100755
+index 0000000..cb82785
+--- /dev/null
++++ b/board/habanalabs/gaudi3/create-serdes-config.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++
++if [ $# -lt 1 ]; then
++	echo "Usage $0 <serdes config image>" >&2
++	exit 1
++fi
++
++source ${BUILDROOT_ROOT}/board/habanalabs/common/image-utility.sh
++
++IMAGE_BIN=${1}
++
++SPECS_FILE=${SPECS_EMB_PROJ_DIR}/${DEV_PREFIX}/${DEV_PREFIX}_mem_addr_dt.h
++SERDES_OFFSET="SPI_SERDES_CONFIG_OFFSET"
++FLASH_OFFSET=0x"$(grep -E "^\#define[[:space:]]+$SERDES_OFFSET[[:space:]]+" "$SPECS_FILE" | sed "s/^\#define[[:space:]]\+$SERDES_OFFSET[[:space:]]\+//")"
++
++VERSION=`cat ${BR2_EXTERNAL}/output/${DEV_PREFIX}_arc/build/agent-fwl-custom/build/buildversion-habanalabs`
++
++MKIMAGE_FILE=${BR2_EXTERNAL}/output/${HL_DEV}/host/bin/mkimage
++SERDES_ITS_TEMPLATE=${BR2_EXTERNAL}/board/habanalabs/gaudi3/serdes-config.its
++SERDES_ITS_FILE=${STAGE_DIR}/${DEV_PREFIX}-serdes-config.its
++SERDES_ITB_FILE=${ITBS_DIR}/${DEV_PREFIX}-serdes-config.itb
++
++ITS_SED_PARAMS+="s/@HL_VERSION@/${VERSION}/g;"
++ITS_SED_PARAMS+="s/@DEV_PREFIX@/${DEV_PREFIX}/g;"
++
++ITS_SED_PARAMS+="s#@SERDES_CONFIG_IMAGE_BIN@#${IMAGE_BIN}#g;"
++ITS_SED_PARAMS+="s/@SERDES_CONFIG_FLASH_OFFSET@/${FLASH_OFFSET}/g;"
++
++sed ${ITS_SED_PARAMS} ${SERDES_ITS_TEMPLATE} > ${SERDES_ITS_FILE}
++$MKIMAGE_FILE -D "-W no-unit_address_vs_reg" -f ${SERDES_ITS_FILE} ${SERDES_ITB_FILE}
+diff --git a/board/habanalabs/gaudi3/serdes-config.its b/board/habanalabs/gaudi3/serdes-config.its
+new file mode 100644
+index 0000000..0e915b7
+--- /dev/null
++++ b/board/habanalabs/gaudi3/serdes-config.its
+@@ -0,0 +1,36 @@
++/*
++ * Gaudi3 specific image source file containing SerDes configuration
++ * image for HabanaLabs Zephyr fw loader agent
++ */
++
++/dts-v1/;
++
++/ {
++	hl-version = "@HL_VERSION@";
++	hl-device = "@DEV_PREFIX@";
++	description = "FIT image with serdes config";
++	#address-cells = <2>;
++
++	images {
++		serdes_conf_lfs {
++			description = "SerDes configuration in littlefs binary image for Gaudi3";
++			data = /incbin/("@SERDES_CONFIG_IMAGE_BIN@");
++			type = "standalone";
++			compression = "none";
++			offset = <@SERDES_CONFIG_FLASH_OFFSET@>;
++			hash {
++				algo = "sha384";
++			};
++		};
++	};
++
++	configurations {
++		default = "fw-loader-conf";
++
++		fw-loader-conf {
++			load-type = <4>; /* FIT_LOAD_TYPE_FLASH */
++			description = "Habanalabs device boot loader";
++			loadables = "serdes_conf_lfs";
++		};
++	};
++};
+diff --git a/board/habanalabs/gaudi3_arc/agent-fw_loader.its b/board/habanalabs/gaudi3_arc/agent-fw_loader.its
+index 5596615..c9e37bc 100644
+--- a/board/habanalabs/gaudi3_arc/agent-fw_loader.its
++++ b/board/habanalabs/gaudi3_arc/agent-fw_loader.its
+@@ -40,5 +40,16 @@
+ 				algo = "sha384";
+ 			};
+ 		};
++
++		serdes_conf_lfs {
++			description = "SerDes configuration in littlefs binary image for Gaudi3";
++			data = /incbin/("gaudi3-serdes-config.bin");
++			type = "standalone";
++			compression = "none";
++			offset = <0x001C0000>;
++			hash {
++				algo = "sha384";
++			};
++		};
+ 	};
+ };
+diff --git a/board/habanalabs/gaudi3_arc/post-image-agents.sh b/board/habanalabs/gaudi3_arc/post-image-agents.sh
+index 06dbc47..aa82adf 100644
+--- a/board/habanalabs/gaudi3_arc/post-image-agents.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-agents.sh
+@@ -21,7 +21,7 @@
+ ENDIANNESS="be"
+ AGENT_ARCH="arc"
+ 
+-LOADABLES="ppboot\", \"preboot\", \"img-ptr\", \"pif-iccm\", \"pif-dccm\", \"sram_mbist_data"
++LOADABLES="ppboot\", \"preboot\", \"img-ptr\", \"pif-iccm\", \"pif-dccm\", \"sram_mbist_data\", \"serdes_conf_lfs"
+ 
+ # Extract the load address and start address from stat file
+ ITS_SED_PARAMS+="s/@HL_PREBOOT_VERSION_SECUREBOOT@/${HL_PREBOOT_VERSION_SECUREBOOT}/g;"
+diff --git a/scripts/make/gaudi3/Makefile b/scripts/make/gaudi3/Makefile
+index 475f6ce..c04fab0 100644
+--- a/scripts/make/gaudi3/Makefile
++++ b/scripts/make/gaudi3/Makefile
+@@ -175,8 +175,8 @@
+ 	${DEV_PREFIX}-nic-ext-dis.itb			\
+ 	${DEV_PREFIX}-nic-all-dis.itb			\
+ 	${DEV_PREFIX}-cpld-verify-version.itb		\
+-	${DEV_PREFIX}-read-log-files.itb
+-
++	${DEV_PREFIX}-read-log-files.itb		\
++	${DEV_PREFIX}-serdes-config.itb
+ 
+ 
+ .PHONY: gaudi3-security-fit-create
+@@ -187,7 +187,8 @@
+ 				gaudi3-rma-erase-create gaudi3-rma-status-create	\
+ 				gaudi3-efuse-read-create				\
+ 				gaudi3-nic-en-create  gaudi3-create-cpld-verify-version	\
+-				gaudi3-create-read-log-files
++				gaudi3-create-read-log-files				\
++				gaudi3-serdes-config-create
+ 
+ 	@$(call hl-check-files,$(GAUDI3_SECURITY_FITS))
+ 	@tar czf $(IMAGES_DIR)/${DEV_PREFIX}-sec-fit.tgz -C $(ITBS_DIR)/ $(GAUDI3_SECURITY_FITS)

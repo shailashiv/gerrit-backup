@@ -1,0 +1,258 @@
+From 8a6f4ceee15a028c9794bf4c2bc28c98e8e33a91 Mon Sep 17 00:00:00 2001
+From: Michael Pauzner <mpauzner@habana.ai>
+Date: Thu, 08 May 2025 20:08:38 +0300
+Subject: [PATCH] [SW-221409] prepare for ram lfs partitions
+
+The current lfs bd configuration is highly tied for spi flash.
+Refactoring of a common initialization for future support of other
+lfs bd types.
+
+Change-Id: Id439c4d1c091750e22a32d41a2ae1d52f47ddafe
+Signed-off-by: Michael Pauzner <mpauzner@habana.ai>
+---
+
+diff --git a/zephyr/lfs_log_partition_config.c b/zephyr/lfs_log_partition_config.c
+index d1a034e..b99c08c 100644
+--- a/zephyr/lfs_log_partition_config.c
++++ b/zephyr/lfs_log_partition_config.c
+@@ -6,6 +6,9 @@
+ 
+ #include "lfs_zephyrbd.h"
+ #include "hl_devs.h"
++#include <zephyr/logging/log.h>
++
++LOG_MODULE_REGISTER(lfs_log_partition, LOG_LEVEL_INF);
+ 
+ #define LFS_PARTITION_NODE DT_NODELABEL(lfs)
+ #if DT_NODE_EXISTS(LFS_PARTITION_NODE)
+@@ -13,11 +16,12 @@
+ static uint8_t __aligned(4) lfs_prog_buf[DT_PROP(LFS_PARTITION_NODE, prog_size)];
+ static uint8_t __aligned(4) lfs_lookahead_buf[DT_PROP(LFS_PARTITION_NODE, lookahead_size)];
+ 
++static int setup_config(struct lfs_config *config);
++
++static struct lfs zephyrbd_lfs;
+ static struct lfs_zephyrbd_context context = {
+ 	.flash_partition_start_addr = DT_REG_ADDR(DT_PHANDLE(LFS_PARTITION_NODE, partition)),
+ 	.flash_partition_size = DT_REG_SIZE(DT_PHANDLE(LFS_PARTITION_NODE, partition)),
+-	.format_if_mount_failed = true,
+-	.setup = NULL,
+ };
+ 
+ static const struct lfs_config zephyrbd_config = {
+@@ -47,11 +51,12 @@
+ 	.compact_thresh	= -1,
+ };
+ 
+-static struct lfs zephyrbd_lfs;
+ static struct lfs_zephyrbd zephyrbd_state = {
+ 	.cfg = &zephyrbd_config,
+ 	.lfs = &zephyrbd_lfs,
+ 	.is_mounted = false,
++	.format_if_mount_failed = true,
++	.setup = setup_config,
+ };
+ 
+ struct lfs_zephyrbd *lfs_log_get_zephyrbd_state(void)
+@@ -59,6 +64,25 @@
+ 	return &zephyrbd_state;
+ }
+ 
++static int setup_config(struct lfs_config *config)
++{
++	struct lfs_zephyrbd_context *ctx = config->context;
++	const struct device *storage_dev = FLASH_DEV_INST;
++
++	if (!storage_dev) {
++		LOG_ERR("No SPI flash device");
++		return -1;
++	}
++
++	ctx->flash_api = storage_dev->api;
++	k_mutex_init(&ctx->lfs_mutex);
++
++	LOG_INF("Logger LFS partition: Start addr: 0x%X Size: 0x%X",
++		ctx->flash_partition_start_addr, ctx->flash_partition_size);
++
++	return 0;
++}
++
+ #else
+ #error "LittleFS not defined in device tree"
+ #endif
+\ No newline at end of file
+diff --git a/zephyr/lfs_serdes_partition_config.c b/zephyr/lfs_serdes_partition_config.c
+index fdd70eb..9700351 100644
+--- a/zephyr/lfs_serdes_partition_config.c
++++ b/zephyr/lfs_serdes_partition_config.c
+@@ -16,28 +16,12 @@
+ static uint8_t __aligned(4) lfs_prog_buf[LFS_SERDES_PROG_SIZE];
+ static uint8_t __aligned(4) lfs_lookahead_buf[LFS_SERDES_LOOKAHEAD_SIZE];
+ 
+-static int setup_context(struct lfs_zephyrbd_context *ctx);
++static int setup_config(struct lfs_config *config);
+ 
+-#ifdef CONFIG_LFS_FORMAT_IF_MOUNT_FAILED
+-static struct lfs_zephyrbd_context context = {
+-	.format_if_mount_failed = true,
+-	.setup = setup_context,
+-};
+-#else
+-static struct lfs_zephyrbd_context context = {
+-	.format_if_mount_failed = false,
+-	.setup = setup_context,
+-};
+-#endif
++static struct lfs zephyrbd_lfs;
++static struct lfs_zephyrbd_context spi_context;
+ 
+ static struct lfs_config zephyrbd_config = {
+-	.context	= &context,
+-	.read		= lfs_zephyrbd_read,
+-	.prog		= lfs_zephyrbd_prog,
+-	.erase		= lfs_zephyrbd_erase,
+-	.sync		= lfs_zephyrbd_sync,
+-	.lock		= lfs_zephyrbd_lock,
+-	.unlock		= lfs_zephyrbd_unlock,
+ 	.read_buffer	= lfs_read_buf,
+ 	.read_size	= LFS_SERDES_READ_SIZE,
+ 	.prog_buffer	= lfs_prog_buf,
+@@ -56,23 +40,53 @@
+ 	.compact_thresh	= -1,
+ };
+ 
+-static struct lfs zephyrbd_lfs;
++#ifdef CONFIG_LFS_FORMAT_IF_MOUNT_FAILED
+ static struct lfs_zephyrbd zephyrbd_state = {
+ 	.cfg = (const struct lfs_config *)(&zephyrbd_config),
+ 	.lfs = &zephyrbd_lfs,
+ 	.is_mounted = false,
++	.format_if_mount_failed = true,
++	.setup = setup_config,
+ };
++#else
++static struct lfs_zephyrbd zephyrbd_state = {
++	.cfg = (const struct lfs_config *)(&zephyrbd_config),
++	.lfs = &zephyrbd_lfs,
++	.is_mounted = false,
++	.format_if_mount_failed = false,
++	.setup = setup_config,
++};
++#endif
+ 
+ struct lfs_zephyrbd *lfs_serdes_get_zephyrbd_state(void)
+ {
+ 	return &zephyrbd_state;
+ }
+ 
+-static int setup_context(struct lfs_zephyrbd_context *ctx)
++static int setup_config(struct lfs_config *config)
+ {
++	struct lfs_zephyrbd_context *ctx;
++	const struct device *storage_dev = FLASH_DEV_INST;
+ 	int rc;
+ 	uint32_t start_addr;
+ 	uint32_t size;
++
++	if (!storage_dev) {
++		LOG_ERR("No SPI flash device");
++		return -1;
++	}
++
++	config->context	= &spi_context;
++	config->read	= lfs_zephyrbd_read;
++	config->prog	= lfs_zephyrbd_prog;
++	config->erase	= lfs_zephyrbd_erase;
++	config->sync	= lfs_zephyrbd_sync;
++	config->lock	= lfs_zephyrbd_lock;
++	config->unlock	= lfs_zephyrbd_unlock;
++
++	ctx = config->context;
++	ctx->flash_api = storage_dev->api;
++	k_mutex_init(&ctx->lfs_mutex);
+ 
+ 	rc = hl_fw_info_rd_field(&start_addr, serdes_lfs_partition_offset);
+ 	if (rc) {
+@@ -92,6 +106,9 @@
+ 	zephyrbd_config.block_count = size / CONFIG_SPI_NOR_FLASH_LAYOUT_PAGE_SIZE;
+ 	ctx->flash_partition_start_addr = start_addr;
+ 	ctx->flash_partition_size = size;
+-	LOG_INF("Serdes flash start addr: %08X, size: %X bytes", start_addr, size);
++
++	LOG_INF("Serdes LFS partition: Start addr: 0x%X Size: 0x%X",
++		ctx->flash_partition_start_addr, ctx->flash_partition_size);
++
+ 	return 0;
+ }
+diff --git a/zephyr/lfs_zephyr_init.c b/zephyr/lfs_zephyr_init.c
+index ca920e2..89b7b54 100644
+--- a/zephyr/lfs_zephyr_init.c
++++ b/zephyr/lfs_zephyr_init.c
+@@ -20,43 +20,24 @@
+ 
+ int lfs_zephyrbd_init(struct lfs_zephyrbd **lfs_handle, enum lfs_partition_type partition_type)
+ {
+-	const struct device *storage_dev = FLASH_DEV_INST;
+ 	struct lfs_zephyrbd *zephyrbd_state = lfs_get_zephyrbd_state(partition_type);
+-	struct lfs_zephyrbd_context *context =
+-				(struct lfs_zephyrbd_context *)zephyrbd_state->cfg->context;
+ 	const struct lfs_config *zephyrbd_config = zephyrbd_state->cfg;
+ 	struct lfs *zephyrbd_lfs = zephyrbd_state->lfs;
+ 	int ret = LFS_ERR_IO;
+-
+-	if (!storage_dev)
+-		return ret;
+ 
+ 	*lfs_handle = zephyrbd_state;
+ 	if (zephyrbd_state->is_mounted)
+ 		return LFS_ERR_OK;
+ 
+-	context->flash_api = storage_dev->api;
+-	if (context->setup) {
+-		if (context->setup(context))
++	if (zephyrbd_state->setup) {
++		if (zephyrbd_state->setup((struct lfs_config *)zephyrbd_config))
+ 			return LFS_ERR_IO;
+ 	}
+-
+-	LFS_ZEPHYRBD_TRACE("%s(LFS partition: Start addr: 0x%X     Size: 0x%X)",
+-			"lfs_zephyrbd_init",
+-			context->flash_partition_start_addr,
+-			context->flash_partition_size);
+-
+-	LFS_ZEPHYRBD_TRACE("%s(LFS partition: block size: %d     block count: %d)",
+-			"lfs_zephyrbd_init",
+-			zephyrbd_config->block_size,
+-			zephyrbd_config->block_count);
+-
+-	k_mutex_init(&context->lfs_mutex);
+ 
+ 	ret = lfs_mount(zephyrbd_lfs, zephyrbd_config);
+ 	if (ret < 0) {
+ 		zephyrbd_state->is_mounted = false;
+-		if (!context->format_if_mount_failed) {
++		if (!zephyrbd_state->format_if_mount_failed) {
+ 			LFS_WARN("can't mount (LFS %d)", ret);
+ 			return ret;
+ 		}
+diff --git a/zephyr/lfs_zephyrbd.h b/zephyr/lfs_zephyrbd.h
+index b047c52..b5820d2 100644
+--- a/zephyr/lfs_zephyrbd.h
++++ b/zephyr/lfs_zephyrbd.h
+@@ -34,14 +34,14 @@
+ 	uint32_t			flash_partition_start_addr;
+ 	uint32_t			flash_partition_size;
+ 	struct k_mutex			lfs_mutex;
+-	bool				format_if_mount_failed;
+-	int (*setup)(struct lfs_zephyrbd_context *context);
+ };
+ 
+ struct lfs_zephyrbd {
+ 	const struct lfs_config *cfg;
+ 	lfs_t *lfs;
+ 	bool is_mounted;
++	bool format_if_mount_failed;
++	int (*setup)(struct lfs_config *config);
+ };
+ 
+ int lfs_zephyrbd_read(const struct lfs_config *c, lfs_block_t block,

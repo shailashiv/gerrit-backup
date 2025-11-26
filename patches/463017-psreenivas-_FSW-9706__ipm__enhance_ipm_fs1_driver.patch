@@ -1,0 +1,551 @@
+From b2cf6a68012b4d5e0fea951000162e853ee16260 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Wed, 21 May 2025 08:17:05 +0300
+Subject: [PATCH] [FSW-9706] ipm: enhance ipm fs1 driver
+
+This patch enhances the ipm_fs driver
+to support exchanging message between
+arcs. following supports are added
+* psoc shared irq enable for rx.
+* mbx_idx field is added to indentify, the
+  SW mailbox index
+* intr_mask field is added to unmask psoc interrupt
+* Extended ipm_fs_mbx_regs fields as per the soconline
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I670017a1c3876b5913afc094e55595348c81269b
+---
+
+diff --git a/boards/intel/fs/fs1_mgmt_asic_defconfig b/boards/intel/fs/fs1_mgmt_asic_defconfig
+index 39f9d4c..e17f0f4 100644
+--- a/boards/intel/fs/fs1_mgmt_asic_defconfig
++++ b/boards/intel/fs/fs1_mgmt_asic_defconfig
+@@ -23,6 +23,4 @@
+ 
+ CONFIG_IPM=y
+ CONFIG_IPM_INTEL_FS=y
+-CONFIG_IPM_INTEL_FS_TX_MBX=y
+-CONFIG_IPM_INTEL_FS_RX_MBX=y
+ CONFIG_HL_EFUSE=y
+diff --git a/boards/intel/fs/fs1_mgmt_onix_defconfig b/boards/intel/fs/fs1_mgmt_onix_defconfig
+index f2b404b..097d9df 100644
+--- a/boards/intel/fs/fs1_mgmt_onix_defconfig
++++ b/boards/intel/fs/fs1_mgmt_onix_defconfig
+@@ -19,6 +19,4 @@
+ 
+ CONFIG_IPM=y
+ CONFIG_IPM_INTEL_FS=y
+-CONFIG_IPM_INTEL_FS_TX_MBX=y
+-CONFIG_IPM_INTEL_FS_RX_MBX=y
+ CONFIG_HL_EFUSE=y
+diff --git a/drivers/ipm/ipm_fs.c b/drivers/ipm/ipm_fs.c
+index 4b64cbb..da2d860 100644
+--- a/drivers/ipm/ipm_fs.c
++++ b/drivers/ipm/ipm_fs.c
+@@ -7,6 +7,7 @@
+ #include <zephyr/device.h>
+ #include <soc/intel/gpu/fs1/soc.h>
+ #include <zephyr/drivers/ipm.h>
++#include <zephyr/shared_irq.h>
+ 
+ #include <zephyr/logging/log.h>
+ #include "ipm_fs.h"
+@@ -34,8 +35,8 @@
+ 
+ 	*size = 0;
+ 
+-	data->mbx.pi = sys_read32((mem_addr_t) &reg_base->pi);
+-	data->mbx.ci = sys_read32((mem_addr_t) &reg_base->ci);
++	data->mbx.pi = sys_read32((mem_addr_t) &reg_base->pi[config->mbx_idx]);
++	data->mbx.ci = sys_read32((mem_addr_t) &reg_base->ci[config->mbx_idx]);
+ 
+ 	if (data->mbx.pi_to_cb >= data->mbx.ci) {
+ 		avail_len = (data->mbx.len - (data->mbx.pi_to_cb - data->mbx.ci));
+@@ -78,8 +79,8 @@
+ 
+ static int ipm_fs_mbx_manage_pi(const struct device *dev, uint32_t size)
+ {
+-	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_data *const data = DEV_DATA(dev);
++	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+ 	uint32_t claimed_len;
+ 
+@@ -93,15 +94,15 @@
+ 		return -EINVAL;
+ 
+ 	data->mbx.pi = (data->mbx.pi + size) % data->mbx.len;
+-	sys_write32(data->mbx.pi, (mem_addr_t) &reg_base->pi);
++	sys_write32(data->mbx.pi, (mem_addr_t) &reg_base->pi[config->mbx_idx]);
+ 	return 0;
+ }
+ 
+ static int fs_queue_manage_ci(const struct device *dev, uint32_t size)
+ {
++	struct ipm_fs_data *const data = DEV_DATA(dev);
+ 	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+-	struct ipm_fs_data *const data = DEV_DATA(dev);
+ 	uint32_t busy_len;
+ 
+ 	/* buffer is always filled len - 1 */
+@@ -118,15 +119,15 @@
+ 		return -EINVAL;
+ 
+ 	data->mbx.ci = (data->mbx.ci + size) % data->mbx.len;
+-	sys_write32(data->mbx.ci, (mem_addr_t) &reg_base->ci[0]);
++	sys_write32(data->mbx.ci, (mem_addr_t) &reg_base->ci[config->mbx_idx]);
+ 	return 0;
+ }
+ 
+ static void ipm_fs_mbx_process_data(const struct device *dev)
+ {
++	struct ipm_fs_data *const data = DEV_DATA(dev);
+ 	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+-	struct ipm_fs_data *const data = DEV_DATA(dev);
+ 	struct ipm_fs_mbx_buffer_data mbx_data, cb_data;
+ 	struct ipm_fs_msg_hdr msg_hdr;
+ 	uint32_t hdr_sz = sizeof(struct ipm_fs_msg_hdr);
+@@ -136,7 +137,7 @@
+ 	__ASSERT(data->callback != NULL,
+ 		 "No callback registered to ipm_fs interrupt driver %p", dev);
+ 
+-	data->mbx.pi = sys_read32((mem_addr_t) &reg_base->pi[0]);
++	data->mbx.pi = sys_read32((mem_addr_t) &reg_base->pi[config->mbx_idx]);
+ 	if (data->mbx.pi == data->mbx.ci) {
+ 		LOG_ERR("no data received, spurious interrupt");
+ 		return;
+@@ -262,7 +263,8 @@
+ 
+ callback_ops:
+ 		data->mbx.pi_to_cb = (data->mbx.pi_to_cb + m_size) % data->mbx.len;
+-		data->callback(dev, data->user_data, msg_hdr.id, &cb_data);
++		if (data->callback)
++			data->callback(dev, data->user_data, msg_hdr.id, &cb_data);
+ 
+ 		if (fs_queue_manage_ci(dev, m_size))
+ 			LOG_DBG_LOCAL("Incorrect size: %d passed to update mailbox CI dev:%p",
+@@ -273,12 +275,13 @@
+ 
+ static void ipm_fs_init_mbx_data(const struct device *dev)
+ {
+-	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_data *const data = DEV_DATA(dev);
++	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+ 
+-	data->mbx.base_addr = (uint32_t)sys_read32((mem_addr_t) &reg_base->base_addr_lsb);
+-	data->mbx.len = sys_read32((mem_addr_t) &reg_base->q_size);
++	data->mbx.base_addr =
++		(uint32_t)sys_read32((mem_addr_t) &reg_base->base_addr_lsb[config->mbx_idx]);
++	data->mbx.len = sys_read32((mem_addr_t) &reg_base->q_size[config->mbx_idx]);
+ 	data->mbx.ci = 0;
+ 	data->mbx.pi = 0;
+ 	data->mbx.pi_to_cb = 0;
+@@ -287,31 +290,58 @@
+ void ipm_fs_isr(const struct device *dev)
+ {
+ 	const struct ipm_fs_config *config = DEV_CFG(dev);
++	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+ 	/*
+ 	 * RX will get 2 interrupts
+ 	 * 1. mbx enable
+ 	 * 2. pi write
+-	 * TODO: add interrupt registers and check for particular en or write interrupt
+-	 * is associated with mailbox.
+ 	 */
++	uint32_t en_sts = (sys_read32((mem_addr_t)&reg_base->en_sts) & BIT(config->mbx_idx));
++	uint32_t pi_sts = (sys_read32((mem_addr_t)&reg_base->pi_sts) & BIT(config->mbx_idx));
+ 
+-	/* Enable routine*/
+-	if (config->mbx_type == MBX_RX_ONLY)
++	if (!en_sts && !pi_sts) {
++		LOG_DBG("Interrupt does not belong to dev %p", dev);
++		return;
++	}
++
++	/* mbx enable routine */
++	if (en_sts) {
+ 		ipm_fs_init_mbx_data(dev);
++		sys_write32(BIT(config->mbx_idx), (mem_addr_t)&(reg_base->en_sts));
++		return;
++	}
+ 
+ 	/* PI write routine */
+-	ipm_fs_mbx_process_data(dev);
++	if (pi_sts) {
++		ipm_fs_mbx_process_data(dev);
++		sys_write32(BIT(config->mbx_idx), (mem_addr_t)&reg_base->pi_sts);
++	}
+ }
+ 
++static inline int ipm_fs_rx_is_ready(const struct device *dev)
++{
++	const struct ipm_fs_config *config = DEV_CFG(dev);
++	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+ 
+-int ipm_fs_send(const struct device *dev, int wait, uint32_t id,
+-		   const void *data, int size)
++	if ((sys_read32((mem_addr_t)&reg_base->en_sts) & BIT(config->mbx_idx)) ||
++		!sys_read32((mem_addr_t)&reg_base->en[config->mbx_idx])) {
++		return false;
++	}
++	return true;
++}
++
++int ipm_fs_send(const struct device *dev, int wait, uint32_t id, const void *data, int size)
+ {
+ 	struct ipm_fs_mbx_buffer_data mbx_data;
+ 	struct ipm_fs_msg_hdr msg_hdr;
+ 	uint32_t hdr_sz = sizeof(struct ipm_fs_msg_hdr);
+ 	uint32_t req_sz = hdr_sz + size, cp_sz;
+ 	int ret;
++
++	if (!ipm_fs_rx_is_ready(dev)) {
++		LOG_DBG_LOCAL("Receiver not ready to accept message, please retry later");
++		return -EAGAIN;
++	}
+ 
+ 	if ((size) && (!data)) {
+ 		LOG_ERR_LOCAL("Null data buffer received for non-zero size: %d dev: %p",
+@@ -385,16 +415,37 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_IPM_INTEL_FS_RX_MBX
++int ipm_fs_irq_init(const struct device *dev)
++{
++	const struct ipm_fs_config *config = DEV_CFG(dev);
++	struct ipm_fs_data *const data = DEV_DATA(dev);
++	uint32_t val = sys_read32((mem_addr_t) config->intr_mask);
++
++	data->shared_irq_dev = DEVICE_DT_GET(DT_NODELABEL(sw_malibox_irq));
++	if (!data->shared_irq_dev) {
++		LOG_ERR("Failed to get sw_malibox_irq device binding");
++		return -ENODEV;
++	}
++
++	/* Register for interrupt */
++	shared_irq_isr_register(data->shared_irq_dev, (isr_t)ipm_fs_isr, dev);
++	/* Unmask the psoc interrupt */
++	val &= ~BIT(config->mask_idx);
++	sys_write32(val, config->intr_mask);
++	/* Enable the psoc interrupt */
++	shared_irq_enable(data->shared_irq_dev, dev);
++
++	return 0;
++}
++#endif
++
+ int ipm_fs_set_enabled(const struct device *dev, int enable)
+ {
+ 	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+ 
+-	if (config->mbx_type == MBX_TX_ONLY)
+-		sys_write32((enable) ? 0x1 : 0x0, (mem_addr_t) &reg_base->en[0]);
+-	else
+-		ipm_fs_init_mbx_data(dev);
+-
++	sys_write32((enable) ? 0x1 : 0x0, (mem_addr_t) &reg_base->en[config->mbx_idx]);
+ 	return 0;
+ }
+ 
+@@ -403,33 +454,44 @@
+ 	return 0;
+ }
+ 
+-int ipm_fs_init(const struct device *dev)
++void ipm_fs_tx_init(const struct device *dev)
+ {
+ 	const struct ipm_fs_config *config = DEV_CFG(dev);
+ 	struct ipm_fs_mbx_regs *reg_base = (struct ipm_fs_mbx_regs *)(config->cfg_base);
+ 
+-	LOG_INF("IPM FS mbx comms dev %p enumeration start", dev);
++	/*
++	 * TX will fill all the buffer content lo/hi addr and size
++	 * and then set enable interrupt in ipm_fs_set_enabled function.
++	 */
++	sys_write32(config->data_base, (mem_addr_t) &reg_base->base_addr_lsb[config->mbx_idx]);
++	sys_write32(0x0, (mem_addr_t) &reg_base->base_addr_msb[config->mbx_idx]);
++	sys_write32(config->data_size, (mem_addr_t) &reg_base->q_size[config->mbx_idx]);
++	sys_write32(0x0, (mem_addr_t) &reg_base->pi[config->mbx_idx]);
++	sys_write32(0x0, (mem_addr_t) &reg_base->ci[config->mbx_idx]);
++
++	/* Clear mailbox buffer */
++	memset((void *)config->data_base, 0x0, config->data_size);
++
++	/* init mbx buffer data */
++	ipm_fs_init_mbx_data(dev);
++}
++
++int ipm_fs_init(const struct device *dev)
++{
++	const struct ipm_fs_config *config = DEV_CFG(dev);
++
++	LOG_INF("IPM FS mbx comms %s dev %p enumeration start",
++		(config->mbx_type == MBX_TX_ONLY) ? "TX" : "RX", dev);
++
++	if (config->init) {
++		config->init(dev);
++	}
++
+ 	if (config->irq_config_func)
+ 		config->irq_config_func(dev);
+ 
+-	if (config->mbx_type == MBX_TX_ONLY) {
+-		/*
+-		 * TX will fill all the buffer content lo/hi addr and size
+-		 * and then set enable interrupt in ipm_fs_set_enabled function.
+-		 */
+-		sys_write32(config->data_base, (mem_addr_t) &reg_base->base_addr_lsb[0]);
+-		sys_write32(0x0, (mem_addr_t) &reg_base->base_addr_msb[0]);
+-		sys_write32(config->data_size, (mem_addr_t) &reg_base->q_size[0]);
+-		sys_write32(0x0, (mem_addr_t) &reg_base->pi[0]);
+-		sys_write32(0x0, (mem_addr_t) &reg_base->ci[0]);
++	LOG_INF("IPM FS mbx comms %s dev %p enumeration end",
++		(config->mbx_type == MBX_TX_ONLY) ? "TX" : "RX", dev);
+ 
+-		/* Clear mailbox buffer */
+-		memset((void *)config->data_base, 0x0, config->data_size);
+-
+-		/* init mbx buffer data */
+-		ipm_fs_init_mbx_data(dev);
+-	}
+-
+-	LOG_INF("IPM FS mbx comms dev %p enumeration end", dev);
+ 	return 0;
+ }
+diff --git a/drivers/ipm/ipm_fs.h b/drivers/ipm/ipm_fs.h
+index d3c3ff7..a3ef17e 100644
+--- a/drivers/ipm/ipm_fs.h
++++ b/drivers/ipm/ipm_fs.h
+@@ -29,10 +29,13 @@
+ #define IPM_FS_MAX_DATA_SIZE		256
+ #define IPM_FS_MAX_ID_VAL		(UINT32_MAX - 1)
+ 
++#define IPM_FS_MBX_MASK			0xFF
++#define IPM_FS_NUM_SW_MBX		4
++#define IPM_FS_SW_MBX_ADDR_MASK		0xFFFFFF00
+ struct ipm_fs_mbx_regs {
+-	uint32_t base_addr_lsb[4];	/* offset 0x0 */
++	uint32_t base_addr_msb[4];	/* offset 0x0 */
+ 	uint32_t rsvd1[28];
+-	uint32_t base_addr_msb[4];	/* offset 0x80 */
++	uint32_t base_addr_lsb[4];	/* offset 0x80 */
+ 	uint32_t rsvd2[28];
+ 	uint32_t q_size[4];		/* offset 0x100 */
+ 	uint32_t rsvd3[28];
+@@ -41,6 +44,10 @@
+ 	uint32_t ci[4];			/* offset 0x200 */
+ 	uint32_t rsvd5[28];
+ 	uint32_t en[4];			/* offset 0x280 */
++	uint32_t rsvd6[348];
++	uint32_t en_sts;		/* offset 0x800 */
++	uint32_t rsvd7[63];
++	uint32_t pi_sts;		/* offset 0x900 */
+ };
+ 
+ /*
+@@ -54,7 +61,6 @@
+ 	uint32_t size;
+ };
+ 
+-
+ enum ipm_fs_mbx_type {
+ 	MBX_TX_ONLY = 1,
+ 	MBX_RX_ONLY = 2
+@@ -62,11 +68,14 @@
+ 
+ struct ipm_fs_config {
+ 	enum ipm_fs_mbx_type mbx_type;
+-	void (*irq_config_func)(const struct device *dev);
+-	uint32_t intr_base;
++	int (*irq_config_func)(const struct device *dev);
++	void (*init)(const struct device *dev);
+ 	uint32_t cfg_base;
+ 	uint32_t data_base;
+ 	uint32_t data_size;
++	uint32_t intr_mask;
++	uint8_t mbx_idx;
++	uint8_t mask_idx;
+ 
+ 	LOG_INSTANCE_PTR_DECLARE(log);
+ };
+@@ -83,6 +92,7 @@
+ 	ipm_callback_t callback;
+ 	struct ipm_fs_mbx mbx;
+ 	void *user_data;
++	const struct device *shared_irq_dev;
+ };
+ 
+ #define IPM_FS_MBX_NUM_DATA_ELEMENT	2
+@@ -114,5 +124,7 @@
+ int ipm_fs_set_enabled(const struct device *dev, int enable);
+ int ipm_fs_clear(const struct device *dev, uint32_t id);
+ int ipm_fs_init(const struct device *dev);
++int ipm_fs_irq_init(const struct device *dev);
++void ipm_fs_tx_init(const struct device *dev);
+ 
+ #endif /* ZEPHYR_DRIVERS_IPM_FS_COMMON_H_ */
+diff --git a/drivers/ipm/ipm_fs_rx.c b/drivers/ipm/ipm_fs_rx.c
+index 1e51818..9a29a5d 100644
+--- a/drivers/ipm/ipm_fs_rx.c
++++ b/drivers/ipm/ipm_fs_rx.c
+@@ -7,7 +7,7 @@
+ #define DT_DRV_COMPAT intel_fs_mbx_rx
+ 
+ #include <zephyr/device.h>
+-#include <soc.h>
++#include <soc/intel/gpu/fs1/soc.h>
+ #include <zephyr/drivers/ipm.h>
+ 
+ #include <zephyr/logging/log.h>
+@@ -21,18 +21,22 @@
+ 	.register_callback = ipm_fs_register_callback,
+ 	.max_data_size_get = NULL,
+ 	.max_id_val_get = NULL,
+-	.set_enabled = ipm_fs_set_enabled,
++	.set_enabled = NULL,
+ 	.clear = ipm_fs_clear,
+ };
+ 
+ #define CREATE_IPM_FS_DEVICE(inst)								\
+ 	LOG_INSTANCE_REGISTER(LOG_MODULE_NAME, inst, DT_INST_PROP(inst, log_level));		\
+-	static void ipm_fs_##inst##_config_func(const struct device *dev);			\
+ 	static const struct ipm_fs_config ipm_fs_##inst##_config	= {			\
+-		.cfg_base = DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_rx), cfg),		\
+-		.data_base = DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_rx), data),		\
+-		.irq_config_func = ipm_fs_##inst##_config_func,					\
++		.cfg_base = DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_rx), cfg) &		\
++				IPM_FS_SW_MBX_ADDR_MASK,					\
++		.mbx_idx = ((DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_rx), cfg) &		\
++				IPM_FS_MBX_MASK) / IPM_FS_NUM_SW_MBX),				\
++		.irq_config_func = ipm_fs_irq_init,						\
++		.init = NULL,									\
+ 		.mbx_type = DT_INST_PROP(inst, mbx_type),					\
++		.intr_mask = (uint32_t) DT_INST_REG_ADDR_BY_NAME(inst, intr_mask),		\
++		.mask_idx = (uint8_t) DT_INST_PROP(inst, mask_idx),				\
+ 		LOG_INSTANCE_PTR_INIT(log, LOG_MODULE_NAME, inst)				\
+ 	};											\
+ 	static struct ipm_fs_data ipm_fs_##inst##_data;						\
+@@ -40,15 +44,9 @@
+ 	DEVICE_DT_INST_DEFINE(inst, &ipm_fs_init,						\
+ 				NULL,								\
+ 				&ipm_fs_##inst##_data,						\
+-				&ipm_fs_##inst##_config, PRE_KERNEL_2,				\
+-				CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,				\
++				&ipm_fs_##inst##_config, POST_KERNEL,				\
++				CONFIG_SHARED_IRQ_INIT_PRIORITY,				\
+ 				&ipm_fs_driver_api);						\
+ 												\
+-	static void ipm_fs_##inst##_config_func(const struct device *dev)			\
+-	{											\
+-		IRQ_CONNECT(DT_INST_IRQ_BY_IDX(inst, 0, irq),					\
+-				DT_INST_IRQ_BY_IDX(inst, 0, priority),				\
+-				ipm_fs_isr, DEVICE_DT_INST_GET(inst), inst);			\
+-	}
+ 
+ DT_INST_FOREACH_STATUS_OKAY(CREATE_IPM_FS_DEVICE)
+diff --git a/drivers/ipm/ipm_fs_tx.c b/drivers/ipm/ipm_fs_tx.c
+index 21706ea..ae5acff 100644
+--- a/drivers/ipm/ipm_fs_tx.c
++++ b/drivers/ipm/ipm_fs_tx.c
+@@ -7,7 +7,7 @@
+ #define DT_DRV_COMPAT intel_fs_mbx_tx
+ 
+ #include <zephyr/device.h>
+-#include <soc.h>
++#include <soc/intel/gpu/fs1/soc.h>
+ #include <zephyr/drivers/ipm.h>
+ #include <zephyr/logging/log.h>
+ #include "ipm_fs.h"
+@@ -21,7 +21,7 @@
+ 	.register_callback = NULL,
+ 	.max_data_size_get = ipm_fs_max_data_size_get,
+ 	.max_id_val_get = ipm_fs_max_id_val_get,
+-	.set_enabled = NULL,
++	.set_enabled = ipm_fs_set_enabled,
+ 	.clear = NULL,
+ };
+ 
+@@ -29,8 +29,12 @@
+ 	LOG_INSTANCE_REGISTER(LOG_MODULE_NAME, inst, DT_INST_PROP(inst, log_level));		\
+ 	static const struct ipm_fs_config ipm_fs_##inst##_config = {				\
+ 		.irq_config_func = NULL,							\
++		.init = ipm_fs_tx_init,								\
+ 		.mbx_type = DT_INST_PROP(inst, mbx_type),					\
+-		.cfg_base = DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_tx), cfg),		\
++		.cfg_base = DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_tx), cfg) &		\
++			IPM_FS_SW_MBX_ADDR_MASK,						\
++		.mbx_idx = ((DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_tx), cfg) &		\
++				IPM_FS_MBX_MASK) / IPM_FS_NUM_SW_MBX),				\
+ 		.data_base = DT_REG_ADDR_BY_NAME(DT_INST(inst, intel_fs_mbx_tx), data),		\
+ 		.data_size = DT_REG_SIZE_BY_NAME(DT_INST(inst, intel_fs_mbx_tx), data),		\
+ 		LOG_INSTANCE_PTR_INIT(log, LOG_MODULE_NAME, inst)				\
+@@ -40,8 +44,8 @@
+ 	DEVICE_DT_INST_DEFINE(inst, &ipm_fs_init,						\
+ 				NULL,								\
+ 				&ipm_fs_##inst##_data,						\
+-				&ipm_fs_##inst##_config, PRE_KERNEL_2,				\
+-				CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,				\
++				&ipm_fs_##inst##_config, POST_KERNEL,				\
++				CONFIG_SHARED_IRQ_INIT_PRIORITY,				\
+ 				&ipm_fs_tx_driver_api);						\
+ 
+ DT_INST_FOREACH_STATUS_OKAY(CREATE_IPM_FS_DEVICE)
+diff --git a/dts/bindings/interrupt-controller/shared-irq.yaml b/dts/bindings/interrupt-controller/shared-irq.yaml
+index 2fed0fa..8d63670 100644
+--- a/dts/bindings/interrupt-controller/shared-irq.yaml
++++ b/dts/bindings/interrupt-controller/shared-irq.yaml
+@@ -7,3 +7,6 @@
+ properties:
+   interrupts:
+     required: true
++  node_label:
++    type: string
++    required: false
+\ No newline at end of file
+diff --git a/dts/bindings/ipm/intel,fs_mbx_rx.yaml b/dts/bindings/ipm/intel,fs_mbx_rx.yaml
+index 314bda8..357abd4 100644
+--- a/dts/bindings/ipm/intel,fs_mbx_rx.yaml
++++ b/dts/bindings/ipm/intel,fs_mbx_rx.yaml
+@@ -22,3 +22,16 @@
+       required: false
+       default: 2
+       description: enum ipm_hl_mbx_type {MBX_TX_ONLY = 1, MBX_RX_ONLY = 2}
++
++    mask_idx:
++      type: int
++      description: ARC mask index (0 to 32)
++      default: 0
++
++    inter_die:
++      type: boolean
++      description: flag to indicate either mailbox or address is interdie
++
++    node_label:
++      type: string
++      required: false
+diff --git a/dts/bindings/ipm/intel,fs_mbx_tx.yaml b/dts/bindings/ipm/intel,fs_mbx_tx.yaml
+index 73141a6..c39223e 100644
+--- a/dts/bindings/ipm/intel,fs_mbx_tx.yaml
++++ b/dts/bindings/ipm/intel,fs_mbx_tx.yaml
+@@ -22,3 +22,16 @@
+       required: false
+       default: 1
+       description: enum ipm_hl_mbx_type {MBX_TX_ONLY = 1, MBX_RX_ONLY = 2}
++
++    mask_idx:
++      type: int
++      description: ARC mask index (0 to 32)
++      default: 0
++
++    inter_die:
++      type: boolean
++      description: flag to indicate either mailbox or address is interdie
++
++    node_label:
++      type: string
++      required: false

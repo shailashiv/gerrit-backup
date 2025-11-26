@@ -1,0 +1,63 @@
+From 96ae64ea6a9a31ba00e64f3a4e51374396b57c18 Mon Sep 17 00:00:00 2001
+From: William Jordan <bjordan@habana.ai>
+Date: Tue, 17 Jun 2025 16:25:03 +0300
+Subject: [PATCH] [SW-221070] g2: update temp cache atomically
+
+Original patch for temp cache used two static
+variables which were updated separately. It was
+possible to read them when while they were being
+updated and end up reporting a stale temperature.
+The new version uses a single int to store the
+temperature and status when temperature sensor
+read fails.
+
+Change-Id: I464e31884ee32e8d386a1c7faa38e1c43819bad9
+Signed-off-by: William Jordan <bjordan@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 9432264..4512bed 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -1554,28 +1554,28 @@
+ 	return FROM_MILLI(MAX(vrm1, vrm2));
+ }
+ 
+-static int composite_temp;
+-static bool composite_temp_sensor_fail;
++static atomic_t composite_temp;
++#define COMPOSITE_TEMP_UPDATE_FAIL INT_MIN
+ 
+ void hl_update_composite_temp(void)
+ {
+ 	int max_dram_adjusted_temp;
+-	int max_onchip_temp = hl_ts_get_max_temp();
++	int max_onchip_temp = FROM_MILLI(hl_ts_get_max_temp());
++	bool fail;
+ 
+-	max_dram_adjusted_temp = hl_dram_get_adjusted_max_temp(&composite_temp_sensor_fail);
+-	if (composite_temp_sensor_fail)
+-		return;
+-
+-	/* Convert from mC to C */
+-	max_onchip_temp /= 1000;
+-
+-	composite_temp = MAX(max_dram_adjusted_temp, max_onchip_temp);
++	max_dram_adjusted_temp = hl_dram_get_adjusted_max_temp(&fail);
++	if (fail)
++		atomic_set(&composite_temp, COMPOSITE_TEMP_UPDATE_FAIL);
++	else
++		atomic_set(&composite_temp, MAX(max_dram_adjusted_temp, max_onchip_temp));
+ }
+ 
+ int hl_get_composite_temp(bool *sensor_fail)
+ {
+-	*sensor_fail = composite_temp_sensor_fail;
+-	return composite_temp;
++	int temp = atomic_get(&composite_temp);
++
++	*sensor_fail = temp == COMPOSITE_TEMP_UPDATE_FAIL;
++	return temp;
+ }
+ 
+ int hl_dram_get_adjusted_max_temp(bool *sensor_fail)

@@ -1,0 +1,245 @@
+From 995e167f4acbca2b0ed2b29da6ec667d1da774d6 Mon Sep 17 00:00:00 2001
+From: Udita <udidua@habana.ai>
+Date: Tue, 06 May 2025 10:38:56 +0300
+Subject: [PATCH] [SW-220857] gaudi3: pinctrl driver changes
+
+The patch contains the  pinctrl driver
+changes.The pinctrl driver is supported
+by i2c and spi.
+Other peripherals continue to use the pinmux
+such as UART, efuse etc.
+
+Change-Id: If0a4326ff8d136739b84d63e90a857ca210a74a9
+Signed-off-by: Udita <udidua@habana.ai>
+---
+
+diff --git a/drivers/pinctrl/CMakeLists.txt b/drivers/pinctrl/CMakeLists.txt
+index 3209683..44f202e 100644
+--- a/drivers/pinctrl/CMakeLists.txt
++++ b/drivers/pinctrl/CMakeLists.txt
+@@ -39,5 +39,6 @@
+ zephyr_library_sources_ifdef(CONFIG_PINCTRL_IMX_SCU pinctrl_imx_scu.c)
+ zephyr_library_sources_ifdef(CONFIG_PINCTRL_MAX32 pinctrl_max32.c)
+ zephyr_library_sources_ifdef(CONFIG_PINCTRL_INTEL_GPU pinctrl_intel_gpu.c)
++zephyr_library_sources_ifdef(CONFIG_PINCTRL_HL_GAUDI3 pinctrl_hl_gaudi3.c)
+ 
+ add_subdirectory(renesas)
+diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
+index c5a40c5..0fa37ae 100644
+--- a/drivers/pinctrl/Kconfig
++++ b/drivers/pinctrl/Kconfig
+@@ -67,6 +67,7 @@
+ source "drivers/pinctrl/Kconfig.zynqmp"
+ source "drivers/pinctrl/Kconfig.max32"
+ source "drivers/pinctrl/Kconfig.intel_gpu"
++source "drivers/pinctrl/Kconfig.hl_gaudi3"
+ 
+ rsource "renesas/Kconfig"
+ 
+diff --git a/drivers/pinctrl/Kconfig.hl_gaudi3 b/drivers/pinctrl/Kconfig.hl_gaudi3
+new file mode 100644
+index 0000000..974f97b
+--- /dev/null
++++ b/drivers/pinctrl/Kconfig.hl_gaudi3
+@@ -0,0 +1,7 @@
++# Copyright (c) 2025 Intel Corporation
++# SPDX-License-Identifier: Apache-2.0
++
++config PINCTRL_HL_GAUDI3
++	bool "HL Gaudi3 pinctrl driver"
++	help
++	  Enable Gaudi3 pinctrl driver
+diff --git a/drivers/pinctrl/pinctrl_hl_gaudi3.c b/drivers/pinctrl/pinctrl_hl_gaudi3.c
+new file mode 100644
+index 0000000..82cdc4b
+--- /dev/null
++++ b/drivers/pinctrl/pinctrl_hl_gaudi3.c
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright 2025 Intel Ltd.
++ * All Rights Reserved.
++ */
++
++ #define DT_DRV_COMPAT hl_gaudi3_pinctrl
++
++ #include <zephyr/devicetree.h>
++ #include <zephyr/drivers/pinctrl.h>
++ #include <common_utils.h>
++ #include <pinctrl_soc.h>
++ #include <hl_fw_if.h>
++
++int pinctrl_configure_pins(const pinctrl_soc_pin_t *pins, uint8_t pin_cnt, uintptr_t reg)
++{
++	int i;
++
++	uint32_t num_dies = 1, die_id = hl_read_die_id();
++	bool spi_gw_dis = hl_get_spi_gw_disable();
++	uint8_t pin, func;
++	uint32_t pinctrl_base;
++
++	pinctrl_base = (uint32_t)DT_REG_ADDR(DT_NODELABEL(pinctrl));
++
++	if (hl_get_sku_type() == HL_DUAL_DIE_SKU)
++		num_dies = 2;
++
++	if (!hl_is_cfg_addr_valid((uint32_t)pinctrl_base, die_id, num_dies, spi_gw_dis))
++		return -EINVAL;
++
++	for (i = 0; i < pin_cnt; i++) {
++		pin = pins[i].pin;
++		func = pins[i].func;
++		sys_write32(func, pinctrl_base + (pin * sizeof(uint32_t)));
++	}
++
++	return 0;
++}
+diff --git a/dts/bindings/pinctrl/hl,gaudi3-pinctrl.yaml b/dts/bindings/pinctrl/hl,gaudi3-pinctrl.yaml
+new file mode 100644
+index 0000000..71813f9
+--- /dev/null
++++ b/dts/bindings/pinctrl/hl,gaudi3-pinctrl.yaml
+@@ -0,0 +1,46 @@
++# Copyright (c) 2025 Intel Corporation
++# SPDX-License-Identifier: Apache-2.0
++
++description: |
++  Intel Gaudi3 Pin controller.
++
++  Device pin configuration should be placed in the child nodes of this node.
++  Populate the 'pinmux' field with a pair consisting of a pin number and 'func'
++  for its IO function.
++
++  For example, setting SPI pins would look like this:
++
++    #include <zephyr/dt-bindings/pinctrl/gpio.h>
++
++    &pinctrl {
++      spi0_default: spi0_default {
++        pinmux = <GPIO_SPI_0_MISO GPIO_SPI_0_MOSI GPIO_SPI_0_SCLK_OUT GPIO_SPI_0_CS0>;
++        func = <0 0 0 1>;
++      };
++    };
++
++compatible: "hl,gaudi3-pinctrl"
++
++include: base.yaml
++
++properties:
++  reg:
++    required: true
++
++child-binding:
++  description: |
++    This binding gives a base representation of the HL Gaudi3 pins
++    configuration.
++
++  properties:
++    pinmux:
++      required: true
++      type: array
++      description: |
++        Gaudi3 pin's configuration
++
++    func:
++      required: true
++      type: array
++      description: |
++        Gaudi3 pin's alternate functions
+diff --git a/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h b/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h
+new file mode 100644
+index 0000000..5576d98
+--- /dev/null
++++ b/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright 2025 Intel Ltd.
++ * All Rights Reserved.
++ */
++#ifndef HL_GAUDI3_GPIO_H_
++#define HL_GAUDI3_GPIO_H_
++
++#define GPIO(n)				(n)
++#define GPIO_FUNC(n)			(n)
++
++#define GPIO_SPI_0_MISO			5
++#define GPIO_SPI_0_MOSI			6
++#define GPIO_SPI_0_SCLK_OUT		7
++#define GPIO_SPI_0_CS0			8
++
++#define GPIO_I2C_S_SCL			9
++#define GPIO_I2C_S_SDA			10
++#define GPIO_I2C_M0_SCL			11
++#define GPIO_I2C_M0_SDA			12
++#define GPIO_I2C_M1_SCL			13
++#define GPIO_I2C_M1_SDA			14
++
++#define GPIO_SPI_1_MISO			15
++#define GPIO_SPI_1_MOSI			16
++#define GPIO_SPI_1_SCLK_OUT		17
++#define GPIO_SPI_1_CS0			18
++
++#define GPIO_SMB_SLAVE_ALERT		19
++
++#define GPIO_FUSE_BURN			25
++
++#define GPIO_THERMAL_WARN_OUT0		45
++
++#define GPIO_SMBUS_MASTER0_ALERT	46
++#define GPIO_SMBUS_MASTER1_ALERT	47
++
++#define GPIO_UART0_RXD			48
++#define GPIO_UART0_TXD			49
++
++#define GPIO_PLL_RESET			50
++#define GPIO_THERMAL_WARN_OUT1		51
++#define GPIO_PLL_LOCK			52
++#define GPIO_PLL_DUMP_OUT		54
++#define GPIO_LED1_SYSTEM_UP		55
++
++#define GPIO_VOL_MON_WARNA		63
++#define GPIO_VOL_MON_WARNB		64
++
++#define GPIO_PSOC_WDT			62
++#define GPIO_HBM_PANIC			65
++#define GPIO_BOOT_WD			66
++
++#define GPIO_FLR			74
++#endif
+diff --git a/soc/hl/gaudi/gaudi3/pinctrl_soc.h b/soc/hl/gaudi/gaudi3/pinctrl_soc.h
+new file mode 100644
+index 0000000..a5977eb
+--- /dev/null
++++ b/soc/hl/gaudi/gaudi3/pinctrl_soc.h
+@@ -0,0 +1,30 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Copyright 2016-2025 Intel, Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef HL_SOC_GAUDI3_PINCTRL_SOC_H
++#define HL_SOC_GAUDI3_PINCTRL_SOC_H
++
++#include <zephyr/devicetree.h>
++#include <zephyr/sys/util.h>
++#include <zephyr/types.h>
++
++typedef struct pinctrl_soc_pin_t {
++	uint8_t pin;
++	uint8_t func;
++} pinctrl_soc_pin_t;
++
++#define HL_DT_PIN(node_id, prop, idx) {					\
++		.pin = DT_PROP_BY_IDX(node_id, pinmux, idx),		\
++		.func = DT_PROP_BY_IDX(node_id, func, idx),		\
++	},
++
++#define Z_PINCTRL_STATE_PINS_INIT(node_id, prop)			\
++		{DT_FOREACH_PROP_ELEM(DT_PHANDLE(node_id, prop),	\
++					pinmux,			\
++					HL_DT_PIN)}
++
++#endif

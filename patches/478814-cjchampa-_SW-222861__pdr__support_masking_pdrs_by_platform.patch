@@ -1,0 +1,209 @@
+From ceab8e86b4bac6f7e0ced63c650ec46628d5ed2c Mon Sep 17 00:00:00 2001
+From: Christopher Champagne <cjchampagne@habana.ai>
+Date: Tue, 29 Apr 2025 21:07:28 +0300
+Subject: [PATCH] [SW-222861] pdr: support masking pdrs by platform
+
+Add support for masking PDRs in the repository based on which platform
+the firmware is running. This changes the set of PDRs returned by GetPDR,
+and which sensors are supported.
+
+Change-Id: I18530e8f835b2bb0cc2f8fae3051a75d9e69e94b
+Signed-off-by: Christopher Champagne <cjchampagne@habana.ai>
+---
+
+diff --git a/include/gaudi3/pldm_arch_common.h b/include/gaudi3/pldm_arch_common.h
+index 91c882d..2a2d752 100644
+--- a/include/gaudi3/pldm_arch_common.h
++++ b/include/gaudi3/pldm_arch_common.h
+@@ -7,6 +7,8 @@
+ #ifndef ZEPHYR_MODULE_PLDM_PLDM_ARCH_COMMON_H
+ #define ZEPHYR_MODULE_PLDM_PLDM_ARCH_COMMON_H
+ 
++#include <common_utils.h>
++
+ /* Definitions specific to an architecture (gaudi3) but common across all
+  * firmwares for that architecture (preboot/mgmt/agent).
+  */
+@@ -47,4 +49,14 @@
+ 	PLDM_CONTAINER_ACCELERATOR			= 1000,
+ };
+ 
++enum pldm_platform_mask {
++	PLDM_PLATFORM_MASK_HL325			= BIT(0),
++	PLDM_PLATFORM_MASK_HL338			= BIT(1),
++};
++
++static inline uint8_t pldm_get_current_platform(void)
++{
++	return hl_is_card_type_pcie() ? PLDM_PLATFORM_MASK_HL338 : PLDM_PLATFORM_MASK_HL325;
++}
++
+ #endif /* ZEPHYR_MODULE_PLDM_PLDM_ARCH_COMMON_H */
+diff --git a/include/pldm.h b/include/pldm.h
+index 9197744..b15f505 100644
+--- a/include/pldm.h
++++ b/include/pldm.h
+@@ -46,6 +46,12 @@
+ 	 * for now to conserve memory.
+ 	 */
+ 	uint8_t entity_instance_number_base;
++
++	/* Support for masking PDR entries.
++	 * If a bit is set, the PDR will be masked and considered unsupported for the
++	 * corresponding platform.
++	 */
++	uint8_t unsupported_platform_mask;
+ } __packed;
+ 
+ /* Definition of a single entry in the PDR record database.
+@@ -265,6 +271,7 @@
+ 
+ void pldm_pmc_init_ex(pldm_t pldm, const struct pldm_pmc_init_data *init_data);
+ void pldm_pmc_log_requests(bool enable);
++bool pldm_pmc_unsupported_pdr(const struct pldm_pdr_metadata *meta, uint8_t current_platform);
+ 
+ void pldm_handler_add(pldm_t pldm, struct pldm_handler_table *table);
+ void pldm_tick_add(pldm_t pldm, struct pldm_tick_entry *entry);
+diff --git a/src/pldm_pmc.c b/src/pldm_pmc.c
+index 60c4604..71b2a40 100644
+--- a/src/pldm_pmc.c
++++ b/src/pldm_pmc.c
+@@ -12,6 +12,7 @@
+ #include <sensord.h>
+ #include <pldm_effecter.h>
+ #include "encode.h"
++#include <pldm_arch_common.h>
+ 
+ #ifdef CONFIG_SOC_HL_GAUDI3_PREBOOT
+ #define PLDM_RUNTIME_ENVIRONMENT	1
+@@ -202,10 +203,14 @@
+ 		},
+ 	};
+ 	size_t num_lists = ARRAY_SIZE(lists);
++	uint8_t current_platform = pldm_get_current_platform();
+ 
+ 	for (size_t i = 0; i < num_lists; ++i) {
+ 		if (!find_header_in_list(handle, &lists[i], iter, next_handle))
+ 			continue;
++
++		if (pldm_pmc_unsupported_pdr(iter->meta, current_platform))
++			return false;
+ 
+ 		/* if we hit the last record of the current list, then next_handle
+ 		 * is the first record of the next list (if it exists)
+@@ -227,8 +232,13 @@
+ 	struct pldm_pmc_state *state,
+ 	uint16_t effecter_id)
+ {
++	uint8_t current_platform = pldm_get_current_platform();
++
+ 	for (size_t i = 0; i < state->num_numeric_effecters; ++i) {
+ 		struct pldm_numeric_effecter_entry *entry = state->numeric_effecters + i;
++
++		if (pldm_pmc_unsupported_pdr(&entry->pdr->meta, current_platform))
++			continue;
+ 
+ 		if (entry->pdr->numeric_effecter.effecter_id == effecter_id)
+ 			return entry;
+@@ -241,8 +251,13 @@
+ 	struct pldm_pmc_state *state,
+ 	uint16_t effecter_id)
+ {
++	uint8_t current_platform = pldm_get_current_platform();
++
+ 	for (size_t i = 0; i < state->num_state_effecters; ++i) {
+ 		struct pldm_state_effecter_entry *entry = state->state_effecters + i;
++
++		if (pldm_pmc_unsupported_pdr(&entry->pdr->meta, current_platform))
++			continue;
+ 
+ 		if (entry->pdr->state_effecter.effecter_id == effecter_id)
+ 			return entry;
+@@ -1426,11 +1441,15 @@
+ 	struct pldm_pmc_get_pdr_repo_info_rsp *repo_info = &state->pdr_repo_info;
+ 	struct pdr_header_list_iter iter;
+ 	size_t size;
++	uint8_t current_platform = pldm_get_current_platform();
+ 
+ 	repo_info->record_count = 0;
+ 
+ 	for (size_t i = 0; i < num_lists; ++i) {
+ 		for (iter_init(&iter, &lists[i]); iter_is_valid(&iter); iter_inc(&iter)) {
++			if (pldm_pmc_unsupported_pdr(iter.meta, current_platform))
++				continue;
++
+ 			size = get_record_size(iter.header, iter.meta, iter.pdr_index);
+ 
+ 			repo_info->repository_size += size;
+@@ -1497,3 +1516,8 @@
+ {
+ 	state.log_requests = enable;
+ }
++
++bool pldm_pmc_unsupported_pdr(const struct pldm_pdr_metadata *meta, uint8_t current_platform)
++{
++	return meta->unsupported_platform_mask & current_platform;
++}
+diff --git a/src/sensord.c b/src/sensord.c
+index 274732f..0b98b42 100644
+--- a/src/sensord.c
++++ b/src/sensord.c
+@@ -9,6 +9,7 @@
+ 
+ #include <pldm.h>
+ #include <sensord.h>
++#include <pldm_arch_common.h>
+ 
+ #define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
+ #include <zephyr/logging/log.h>
+@@ -103,11 +104,13 @@
+ {
+ 	struct sensord_sensor_entry *sensor;
+ 	size_t i;
++	uint8_t current_platform = pldm_get_current_platform();
+ 
+ 	for (i = 0; i < sensord_state.num_sensors; ++i) {
+ 		sensor = &sensord_state.sensors[i];
+ 		if (is_sensor_type_match(sensor, pdr_type_mask)
+-			&& is_sensor_id(sensor, sensor_id)) {
++			&& is_sensor_id(sensor, sensor_id)
++			&& !pldm_pmc_unsupported_pdr(&sensor->pdr->meta, current_platform)) {
+ 			*state = get_sensor_state(i);
+ 			return sensor;
+ 		}
+@@ -366,6 +369,7 @@
+ 	struct sensord_sensor_state *state;
+ 	int64_t start_time;
+ 	int64_t current_time;
++	uint8_t current_platform = pldm_get_current_platform();
+ 	int num_reviewed = 0;
+ 	int num_polled = 0;
+ 
+@@ -393,6 +397,9 @@
+ 		state = get_sensor_state(sensord_state.next_sensor_to_poll);
+ 		sensord_state.next_sensor_to_poll++;
+ 		pdr = sensor->pdr;
++
++		if (pldm_pmc_unsupported_pdr(&sensor->pdr->meta, current_platform))
++			continue;
+ 
+ 		num_reviewed++;
+ 
+@@ -607,12 +614,17 @@
+ 
+ static int sensord_init_all_sensors(void)
+ {
++	uint8_t current_platform = pldm_get_current_platform();
++
+ 	for (size_t i = 0; i < sensord_state.num_sensors; i++) {
+ 		struct sensord_sensor_entry *sensor = &sensord_state.sensors[i];
+ 		struct sensord_sensor_state *state = get_sensor_state(i);
+ 		const struct pldm_pdr_record *pdr = sensor->pdr;
+ 		int err;
+ 
++		if (pldm_pmc_unsupported_pdr(&pdr->meta, current_platform))
++			continue;
++
+ 		state->timestamp_next_poll = 0;
+ 
+ 		switch (pdr->common.type) {

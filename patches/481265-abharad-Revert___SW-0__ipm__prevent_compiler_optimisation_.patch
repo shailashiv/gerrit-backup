@@ -1,0 +1,158 @@
+From ce0bce85283b37e636e9fb1337302bf3c395e35a Mon Sep 17 00:00:00 2001
+From: Akshay Pradip Bharad <apbharad@habana.ai>
+Date: Fri, 06 Jun 2025 07:33:14 +0000
+Subject: [PATCH] Revert "[SW-0] ipm: prevent compiler optimisation"
+
+This reverts commit 13d19f66a47ba5ecd15dac865e84e173e200df33.
+
+Change-Id: I523323959e56bb05f43a96b3001b6dac388d74b3
+---
+
+diff --git a/drivers/ipm/ipm_hl.c b/drivers/ipm/ipm_hl.c
+index 2a52730..ca79d53 100644
+--- a/drivers/ipm/ipm_hl.c
++++ b/drivers/ipm/ipm_hl.c
+@@ -17,24 +17,22 @@
+ #define LOG_MODULE_NAME			ipm_hl
+ LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_IPM_LOG_LEVEL);
+ 
+-typedef volatile struct ipm_hl_msg_hdr ipm_hl_msg_hdr_t;
+-
+ /*
+  * Beware that this function is called from ISR. It processes the message and
+  * sends an ACK to the sender.
+  */
+-static void process_message(const struct device *dev, ipm_hl_msg_hdr_t *msg)
++static void process_message(const struct device *dev, struct ipm_hl_msg_hdr *msg)
+ {
+ 	struct ipm_hl_data *data = DEV_DATA(dev);
+ 	uint8_t *addr = (uint8_t *)msg;
+ 
+ 	LOG_DBG("MSG RECEIVED: id: %d size: %d", msg->id, msg->size);
+-	LOG_HEXDUMP_DBG((addr + sizeof(ipm_hl_msg_hdr_t)), msg->size, "receive");
++	LOG_HEXDUMP_DBG((addr + sizeof(struct ipm_hl_msg_hdr)), msg->size, "receive");
+ 
+ 	/* Use zero copy */
+ 	if (data->callback)
+ 		data->callback(dev, data->user_data, msg->id,
+-			(void *)(addr + sizeof(ipm_hl_msg_hdr_t)));
++			(void *)(addr + sizeof(struct ipm_hl_msg_hdr)));
+ 	else
+ 		LOG_ERR("Callback not registered for IPM HL dev %p", dev);
+ 
+@@ -51,11 +49,11 @@
+ {
+ 	const struct ipm_hl_config *config = DEV_CFG(dev);
+ 	struct ipm_hl_data *data = DEV_DATA(dev);
+-	ipm_hl_msg_hdr_t *msg = NULL;
++	struct ipm_hl_msg_hdr *msg = NULL;
+ 	uint32_t i;
+ 
+ 	for (i = 0; i < config->rx.num_non_data_chunks; i++) {
+-		msg = (ipm_hl_msg_hdr_t *) (data->rx_ndata_base +
++		msg = (struct ipm_hl_msg_hdr *) (data->rx_ndata_base +
+ 			   (i * data->chunk_hdr_sz));
+ 
+ 		if ((msg->busy) && (!msg->ack)) {
+@@ -70,7 +68,7 @@
+ 	}
+ 
+ 	for (i = 0; i < data->num_rx_data_chunks; i++) {
+-		msg = (ipm_hl_msg_hdr_t *) (data->rx_data_base +
++		msg = (struct ipm_hl_msg_hdr *) (data->rx_data_base +
+ 						(i * config->rx.data_chunk_size));
+ 
+ 		if ((msg->busy) && (!msg->ack)) {
+@@ -120,8 +118,8 @@
+ {
+ 	const struct ipm_hl_config *config = DEV_CFG(dev);
+ 	struct ipm_hl_data *dev_data = DEV_DATA(dev);
+-	ipm_hl_msg_hdr_t *msg = NULL;
+-	volatile uint8_t *addr, num_chunks;
++	struct ipm_hl_msg_hdr *msg = NULL;
++	uint8_t *addr, num_chunks;
+ 	uint32_t i, base, chunk_sz;
+ 
+ 	LOG_HEXDUMP_DBG_LOCAL(data, size, "send");
+@@ -148,7 +146,7 @@
+ 	}
+ 
+ 	for (i = 0; i < num_chunks; i++) {
+-		msg = (ipm_hl_msg_hdr_t *) (base + (i * chunk_sz));
++		msg = (struct ipm_hl_msg_hdr *) (base + (i * chunk_sz));
+ 		if ((msg->busy) && (msg->id == id)) {
+ 			if (!msg->ack) {
+ 				sys_write32(config->tx.irq_num, (mem_addr_t) config->intr_base);
+@@ -162,7 +160,7 @@
+ 	}
+ 
+ 	for (i = 0; i < num_chunks; i++) {
+-		msg = (ipm_hl_msg_hdr_t *) (base + (i * chunk_sz));
++		msg = (struct ipm_hl_msg_hdr *) (base + (i * chunk_sz));
+ 		if (!msg->busy) { /* Chunk is free */
+ 			break;
+ 		}
+@@ -178,11 +176,11 @@
+ 	msg->ack = false;
+ 	msg->busy = true;
+ 	msg->seq_no = dev_data->tx_ctrl->pi++;
+-	addr = (volatile uint8_t *) msg;
++	addr = (uint8_t *) msg;
+ 	LOG_DBG_LOCAL("MSG CREATED: id: %d size: %d seq no: %d\n",
+ 			msg->id, msg->size, msg->seq_no);
+ 
+-	memcpy((void *)(addr + sizeof(ipm_hl_msg_hdr_t)), data, size);
++	memcpy((void *)(addr + sizeof(struct ipm_hl_msg_hdr)), data, size);
+ 
+ 	HL_ARC_W_BARRIER();
+ 	/* Raise interrupt */
+@@ -236,14 +234,13 @@
+ {
+ 	const struct ipm_hl_config *config = DEV_CFG(dev);
+ 	struct ipm_hl_data *data = DEV_DATA(dev);
+-	ipm_hl_msg_hdr_t *msg = NULL;
++	struct ipm_hl_msg_hdr *msg = NULL;
+ 	uint32_t i;
+ 
+ 	/* TODO: Based on usage, check arch_irq_lock/mutex required for ipm_hl_clear API */
+ 
+ 	for (i = 0; i < config->rx.num_non_data_chunks; i++) {
+-		msg = (ipm_hl_msg_hdr_t *)
+-			(data->rx_ndata_base + (i * data->chunk_hdr_sz));
++		msg = (struct ipm_hl_msg_hdr *) (data->rx_ndata_base + (i * data->chunk_hdr_sz));
+ 		if (msg->id == id) {
+ 			/* Message is retrieved, Clear id for for TX to send next message */
+ 			msg->id = 0;
+@@ -255,7 +252,7 @@
+ 	}
+ 
+ 	for (i = 0; i < data->num_rx_data_chunks; i++) {
+-		msg = (ipm_hl_msg_hdr_t *) (data->rx_data_base +
++		msg = (struct ipm_hl_msg_hdr *) (data->rx_data_base +
+ 						(i * config->rx.data_chunk_size));
+ 		if (msg->id == id) {
+ 			/* Message is retrieved, Clear id for for TX to send next message */
+@@ -281,7 +278,7 @@
+ 	if (config->irq_config_func)
+ 		config->irq_config_func(dev);
+ 
+-	data->chunk_hdr_sz = sizeof(ipm_hl_msg_hdr_t); /* 12 bytes */
++	data->chunk_hdr_sz = sizeof(struct ipm_hl_msg_hdr); /* 12 bytes */
+ 	if (config->mbx_type == MBX_TX_ONLY || config->mbx_type == MBX_BIDIRECTIONAL) {
+ 		data->tx_non_data_base = config->tx.mbx_base;
+ 		data->tx_data_base = data->tx_non_data_base +
+diff --git a/drivers/ipm/ipm_hl_common.h b/drivers/ipm/ipm_hl_common.h
+index ac2d712..7ef1a4e 100644
+--- a/drivers/ipm/ipm_hl_common.h
++++ b/drivers/ipm/ipm_hl_common.h
+@@ -80,8 +80,8 @@
+ 	uint8_t num_tx_data_chunks;
+ 	uint8_t num_rx_data_chunks;
+ 	uint32_t chunk_hdr_sz;
+-	volatile struct ipm_hl_ctrl *tx_ctrl;
+-	volatile struct ipm_hl_ctrl *rx_ctrl;
++	struct ipm_hl_ctrl *tx_ctrl;
++	struct ipm_hl_ctrl *rx_ctrl;
+ };
+ 
+ #define DEV_CFG(dev) \

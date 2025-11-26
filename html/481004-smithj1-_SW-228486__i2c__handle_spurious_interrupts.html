@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Change 481004: [SW-228486] i2c: handle spurious interrupts</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        h2, h3 {
+            color: #555;
+        }
+        .metadata {
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-left: 4px solid #4CAF50;
+            margin: 20px 0;
+        }
+        .metadata p {
+            margin: 5px 0;
+        }
+        .status {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 4px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .status.merged {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .status.new, .status.open {
+            background-color: #2196F3;
+            color: white;
+        }
+        .status.abandoned {
+            background-color: #f44336;
+            color: white;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+        .labels, .messages, .inline-comments, .files {
+            margin: 30px 0;
+        }
+        .diff-section {
+            margin: 30px 0;
+        }
+        .diff-file {
+            margin: 20px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .diff-filename {
+            background-color: #f6f8fa;
+            padding: 10px 15px;
+            margin: 0;
+            border-bottom: 1px solid #ddd;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            color: #24292e;
+        }
+        .diff-content {
+            background-color: #fff;
+            padding: 0;
+            margin: 0;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        .diff-content span {
+            display: block;
+            padding: 0 10px;
+            white-space: pre;
+        }
+        .diff-hunk {
+            background-color: #f1f8ff;
+            color: #0366d6;
+            font-weight: bold;
+        }
+        .diff-add {
+            background-color: #e6ffed;
+            color: #22863a;
+        }
+        .diff-del {
+            background-color: #ffeef0;
+            color: #cb2431;
+        }
+        .diff-ctx {
+            color: #24292e;
+        }
+        .message {
+            background-color: #f9f9f9;
+            padding: 15px;
+            margin: 10px 0;
+            border-left: 3px solid #2196F3;
+        }
+        .date {
+            color: #888;
+            font-size: 0.9em;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        li {
+            margin: 8px 0;
+        }
+        .file-comments {
+            margin: 15px 0;
+            padding: 10px;
+            background-color: #fff3cd;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Change 481004: [SW-228486] i2c: handle spurious interrupts</h1>
+        
+        <div class="metadata">
+            <p><strong>Project:</strong> zephyr</p>
+            <p><strong>Branch:</strong> master_next</p>
+            <p><strong>Status:</strong> <span class="status merged">MERGED</span></p>
+            <p><strong>Owner:</strong> Jason Smith &lt;jsmith@habana.ai&gt;</p>
+            <p><strong>Created:</strong> 2025-06-03 13:38:23.501000000</p>
+            <p><strong>Updated:</strong> 2025-06-04 17:49:34.430000000</p>
+        </div>
+        
+        <div class="commit-message">
+            <h2>Commit Message</h2>
+            <pre>[SW-228486] i2c: handle spurious interrupts
+
+If the i2c_dw ISR is running while another interrupt is generated,
+a second invocation of the ISR will be queued.  The second ISR will
+read the device registers (specifically INTR_STAT) to decide what
+if anything it needs to do.  It is not uncommon for this second
+ISR to be a no-op and take no action.
+
+On rare occassions, the INTR_STAT register indicates a TX_EMPTY
+interrupt has been triggered. This is despite that the RAW_INTR_STAT
+register does NOT have this bit set.  The ISR incorrectly tries to
+complete the transfer by releasing the semaphore.  This breaks the
+handshake between i2c_dw_transfer() and i2c_dw_isr(), preventing
+any more transfers from being transmitted.
+
+As a workaround, this patch tweaks tracking of the &#x27;SEND&#x27; bit in
+the driver state. When a transfer is completed successfully, the
+SEND bit is cleared, along with the RECV bit.  The TX_FIFO logic
+can then use this state to decide whether to ignore the TX EMPTY
+interrupt.
+
+Note that i2c_dw_isr() is used for both transmits and receives,
+and that in order to receive data the driver needs to write to
+the TX FIFO to &#x27;ask&#x27; for the data.  This dual-use complicates
+the i2c_dw_isr() logic; as such this patch uses a targetted
+approach and mainly focuses on the TX_EMPTY case; it does not
+attempt to deal with every possible case of getting bad data
+from INTR_STAT or other registers.
+
+Change-Id: I8839855bd216ec5b62e252b79d1c1da625101bea
+Signed-off-by: Jason Smith &lt;jsmith@habana.ai&gt;
+</pre>
+        </div>
+        
+        <div class="labels"><h3>Review Labels</h3><ul><li><strong>Code-Review</strong>: +2 by Michael J Ruhl</li><li><strong>Verified</strong>: +2 by Software Jenkins</li><li><strong>Finished</strong>: +2 by Software Jenkins</li></ul></div>
+        
+        <div class="files"><h3>Modified Files</h3><ul><li><code>drivers/i2c/i2c_dw.c</code> (M) +29 -26</li></ul></div>
+        
+        <div class="diff-section"><h3>Code Changes (Diff)</h3><div class="diff-file"><h4 class="diff-filename">b/drivers/i2c/i2c_dw.c</h4><pre class="diff-content"><span class="diff-hunk">@@ -312,21 +312,11 @@</span>
+<span class="diff-ctx"> 	return 0;</span>
+<span class="diff-ctx"> }</span>
+<span class="diff-ctx"> </span>
+<span class="diff-del">-</span>
+<span class="diff-ctx"> static int i2c_dw_data_send(const struct device *dev)</span>
+<span class="diff-ctx"> {</span>
+<span class="diff-del">-	struct i2c_dw_dev_config * const dw = dev-&gt;data;</span>
+<span class="diff-add">+	struct i2c_dw_dev_config *const dw = dev-&gt;data;</span>
+<span class="diff-ctx"> 	uint32_t data = 0U;</span>
+<span class="diff-ctx"> 	uintptr_t reg_base = get_regs(dev);</span>
+<span class="diff-del">-</span>
+<span class="diff-del">-	/* Nothing to send anymore, mask the interrupt */</span>
+<span class="diff-del">-	if (dw-&gt;xfr_len == 0U) {</span>
+<span class="diff-del">-		clear_bit_intr_mask_tx_empty(reg_base);</span>
+<span class="diff-del">-</span>
+<span class="diff-del">-		dw-&gt;state &amp;= ~I2C_DW_CMD_SEND;</span>
+<span class="diff-del">-</span>
+<span class="diff-del">-		return 0;</span>
+<span class="diff-del">-	}</span>
+<span class="diff-ctx"> </span>
+<span class="diff-ctx"> 	while (test_bit_status_tfnt(reg_base) &amp;&amp; (dw-&gt;xfr_len &gt; 0)) {</span>
+<span class="diff-ctx"> 		/* We have something to transmit to a specific host */</span>
+<span class="diff-hunk">@@ -387,6 +377,8 @@</span>
+<span class="diff-ctx"> 		dw-&gt;user_abort_pending = false;</span>
+<span class="diff-ctx"> 		dw-&gt;failure_reason = NULL;</span>
+<span class="diff-ctx"> 	}</span>
+<span class="diff-add">+</span>
+<span class="diff-add">+	dw-&gt;state &amp;= ~(I2C_DW_CMD_RECV | I2C_DW_CMD_SEND);</span>
+<span class="diff-ctx"> </span>
+<span class="diff-ctx"> 	write_intr_mask(DW_DISABLE_ALL_I2C_INT, reg_base);</span>
+<span class="diff-ctx"> 	value = read_clr_intr(reg_base);</span>
+<span class="diff-hunk">@@ -562,24 +554,36 @@</span>
+<span class="diff-ctx"> 		 */</span>
+<span class="diff-ctx"> 		if (intr_stat.bits.tx_empty) {</span>
+<span class="diff-ctx"> 			if ((dw-&gt;xfr_flags &amp; I2C_MSG_RW_MASK) == I2C_MSG_WRITE) {</span>
+<span class="diff-del">-				ret = i2c_dw_data_send(port);</span>
+<span class="diff-del">-				if (ret) {</span>
+<span class="diff-del">-					dw-&gt;state = I2C_DW_CMD_ERROR;</span>
+<span class="diff-del">-					dw-&gt;failure_reason = &quot;tx send&quot;;</span>
+<span class="diff-del">-					goto terminate_transfer;</span>
+<span class="diff-add">+				if (!(dw-&gt;state &amp; I2C_DW_CMD_SEND)) {</span>
+<span class="diff-add">+					/* ignore */</span>
+<span class="diff-add">+					LOG_DBG(&quot;%s: ignoring spurious tx_empty intr&quot;, __func__);</span>
+<span class="diff-add">+				} else if (dw-&gt;xfr_len &gt; 0U) {</span>
+<span class="diff-add">+					ret = i2c_dw_data_send(port);</span>
+<span class="diff-add">+					if (ret) {</span>
+<span class="diff-add">+						dw-&gt;state = I2C_DW_CMD_ERROR;</span>
+<span class="diff-add">+						dw-&gt;failure_reason = &quot;tx send&quot;;</span>
+<span class="diff-add">+						goto terminate_transfer;</span>
+<span class="diff-add">+					}</span>
+<span class="diff-add">+				} else {</span>
+<span class="diff-add">+					/* TX FIFO has successfully written out all data */</span>
+<span class="diff-add">+					clear_bit_intr_mask_tx_empty(reg_base);</span>
+<span class="diff-add">+					dw-&gt;state &amp;= ~I2C_DW_CMD_SEND;</span>
+<span class="diff-add">+</span>
+<span class="diff-add">+					if (!(dw-&gt;xfr_flags &amp; I2C_MSG_STOP)) {</span>
+<span class="diff-add">+						goto done;</span>
+<span class="diff-add">+					}</span>
+<span class="diff-ctx"> 				}</span>
+<span class="diff-ctx"> 			} else {</span>
+<span class="diff-ctx"> 				i2c_dw_data_ask(port);</span>
+<span class="diff-del">-			}</span>
+<span class="diff-ctx"> </span>
+<span class="diff-del">-			/* If STOP is not expected, finish processing this</span>
+<span class="diff-del">-			 * message if there is nothing left to do anymore.</span>
+<span class="diff-del">-			 */</span>
+<span class="diff-del">-			if ((dw-&gt;xfr_len == 0U)</span>
+<span class="diff-del">-			     &amp;&amp; !(dw-&gt;xfr_flags &amp; I2C_MSG_STOP)</span>
+<span class="diff-del">-			     &amp;&amp; !(dw-&gt;xfr_flags &amp; I2C_MSG_RECV_LEN)) {</span>
+<span class="diff-del">-				/* successful transfer */</span>
+<span class="diff-del">-				goto done;</span>
+<span class="diff-add">+				/* If STOP is not expected, finish processing this</span>
+<span class="diff-add">+				 * message if there is nothing left to do anymore.</span>
+<span class="diff-add">+				 */</span>
+<span class="diff-add">+				if ((dw-&gt;xfr_len == 0U) &amp;&amp; !(dw-&gt;xfr_flags &amp; I2C_MSG_STOP) &amp;&amp;</span>
+<span class="diff-add">+				    !(dw-&gt;xfr_flags &amp; I2C_MSG_RECV_LEN)) {</span>
+<span class="diff-add">+					/* successful transfer */</span>
+<span class="diff-add">+					goto done;</span>
+<span class="diff-add">+				}</span>
+<span class="diff-ctx"> 			}</span>
+<span class="diff-ctx"> 		}</span>
+<span class="diff-ctx"> 	}</span>
+<span class="diff-hunk">@@ -622,7 +626,6 @@</span>
+<span class="diff-ctx"> done:</span>
+<span class="diff-ctx"> 	i2c_dw_transfer_complete(port);</span>
+<span class="diff-ctx"> }</span>
+<span class="diff-del">-</span>
+<span class="diff-ctx"> </span>
+<span class="diff-ctx"> static int i2c_dw_setup(const struct device *dev, uint16_t slave_address)</span>
+<span class="diff-ctx"> {</span>
+<span class="diff-ctx"></span>
+</pre></div></div>
+        
+        <div class="messages"><h3>Review Messages</h3><div class="message"><strong>Jason Smith</strong> <span class="date">(2025-06-03 13:38:23.501000000)</span><pre>Uploaded patch set 1.</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-03 13:38:32.290000000)</span><pre>Patch Set 1: Finished-1
+
+Build Started https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Build_Embedded_FS_u22_master_next/8335/ (1/3)</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-03 13:38:33.256000000)</span><pre>Patch Set 1: Finished-1
+
+Build Started https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Build_Embedded_u22_master_next/36460/ (1/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-03 13:41:48.828000000)</span><pre>Patch Set 1:
+
+Build Started https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_zephyr_build_master_next/7523/ (2/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-03 13:41:48.856000000)</span><pre>Patch Set 1:
+
+Build Started https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_checkpatch_master_next/6833/ (3/3)</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-03 13:44:23.863000000)</span><pre>Patch Set 1:
+
+Build Started https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_zephyr_build_master_next/25151/ (2/3)</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-03 13:44:23.907000000)</span><pre>Patch Set 1:
+
+Build Started https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_checkpatch_master_next/22652/ (3/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-03 14:18:36.741000000)</span><pre>Patch Set 1: Finished+1 Verified+1
+
+Build Successful 
+
+https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Build_Embedded_FS_u22_master_next/8335/ : SUCCESS
+
+https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_zephyr_build_master_next/7523/ : SUCCESS
+
+https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_checkpatch_master_next/6833/ : SUCCESS</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-03 14:55:56.551000000)</span><pre>Patch Set 1: Finished+1 Verified+1
+
+Build Successful 
+
+https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_checkpatch_master_next/22652/ : SUCCESS
+
+https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_zephyr_build_master_next/25151/ : SUCCESS
+
+https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Build_Embedded_u22_master_next/36460/ : SUCCESS</pre></div><div class="message"><strong>Michael J Ruhl</strong> <span class="date">(2025-06-03 15:35:18.009000000)</span><pre>Patch Set 1: Code-Review-1
+
+(1 comment)
+
+one comment, but this makes sense to me.</pre></div><div class="message"><strong>Michael J Ruhl</strong> <span class="date">(2025-06-04 12:30:32.898000000)</span><pre>Patch Set 1: Code-Review+2
+
+(1 comment)</pre></div><div class="message"><strong>Jason Smith</strong> <span class="date">(2025-06-04 15:18:21.766000000)</span><pre>Uploaded patch set 2: Patch Set 1 was rebased.</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-04 15:18:31.382000000)</span><pre>Patch Set 2: Finished-1
+
+Build Started https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Build_Embedded_u22_master_next/36519/ (1/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-04 15:18:32.290000000)</span><pre>Patch Set 2: Finished-1
+
+Build Started https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Build_Embedded_FS_u22_master_next/8393/ (1/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-04 15:20:51.581000000)</span><pre>Patch Set 2:
+
+Build Started https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_zephyr_build_master_next/7575/ (2/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-04 15:20:51.592000000)</span><pre>Patch Set 2:
+
+Build Started https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_checkpatch_master_next/6878/ (3/3)</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-04 15:24:07.809000000)</span><pre>Patch Set 2:
+
+Build Started https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_checkpatch_master_next/22698/ (2/3)</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-04 15:24:07.811000000)</span><pre>Patch Set 2:
+
+Build Started https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_zephyr_build_master_next/25203/ (3/3)</pre></div><div class="message"><strong>Software Jenkins</strong> <span class="date">(2025-06-04 15:56:03.186000000)</span><pre>Patch Set 2: Finished+1 Verified+1
+
+Build Successful 
+
+https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Build_Embedded_FS_u22_master_next/8393/ : SUCCESS
+
+https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_zephyr_build_master_next/7575/ : SUCCESS
+
+https://sw-jenkins-ctrl15.habana-labs.com/job/Embedded_FS/job/Launchers/job/Launcher_Build_Embedded_FS_u22_Test_Embedded_FS_cpu_checkpatch_master_next/6878/ : SUCCESS</pre></div><div class="message"><strong>Jenkins EMB Service Account</strong> <span class="date">(2025-06-04 17:48:32.254000000)</span><pre>Patch Set 2: Finished+1 Verified+1
+
+Build Successful 
+
+https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_checkpatch_master_next/22698/ : SUCCESS
+
+https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Launchers/job/Launcher_Build_Embedded_u22_Test_Embedded_cpu_zephyr_build_master_next/25203/ : SUCCESS
+
+https://sw-jenkins-ctrl08.habana-labs.com/job/Embedded/job/Build_Embedded_u22_master_next/36519/ : SUCCESS</pre></div><div class="message"><strong>Jason Smith</strong> <span class="date">(2025-06-04 17:49:34.430000000)</span><pre>Change has been successfully merged by Jason Smith</pre></div></div>
+        
+        <div class="inline-comments"><h3>Inline Comments</h3><div class="file-comments"><h4>drivers/i2c/i2c_dw.c</h4><ul><li><strong>Michael J Ruhl</strong> (Line 586): i don&#x27;t see any code changes to this other that re-ordering the code?
+I would probably leave this alone unless there is a change.</li><li><strong>Michael J Ruhl</strong> (Line 586): this was moved to the receive block, so there is a code change.</li></ul></div></div>
+    </div>
+</body>
+</html>

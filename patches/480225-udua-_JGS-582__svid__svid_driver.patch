@@ -1,0 +1,579 @@
+From 5fd4d63aaa13c91456e32135868317f1f67a6497 Mon Sep 17 00:00:00 2001
+From: Udita <udidua@habana.ai>
+Date: Wed, 21 May 2025 10:26:25 +0300
+Subject: [PATCH] [JGS-582] svid: svid driver
+
+The patch contains a common SVID command
+send function which can be used to
+send all SVID commands. The patch also
+contains template for svid config and isr.
+As we develop and test svid  these can be
+enhanced later.
+
+Change-Id: I6a2b394a9150aefb294d8e06286807a658bd5991
+Signed-off-by: Udita <udidua@habana.ai>
+---
+
+diff --git a/drivers/svid/svid_intel.c b/drivers/svid/svid_intel.c
+index 0adc63d..7ed8386 100644
+--- a/drivers/svid/svid_intel.c
++++ b/drivers/svid/svid_intel.c
+@@ -1,48 +1,146 @@
+ /*
+  * SPDX-License-Identifier: Apache-2.0
+  *
+- * Copyright 2016-2025 Intel, Ltd.
++ * Copyright 2025 Intel, Ltd.
+  * All Rights Reserved.
+  */
+ 
+ #include <zephyr/types.h>
+ #include <zephyr/kernel.h>
+ #include <zephyr/device.h>
++#include <zephyr/devicetree.h>
++#include <zephyr/sys/util.h>
++#include <svid_regs.h>
++#include <hl_platform_defs.h>
++
+ 
+ #include <zephyr/drivers/svid/svid.h>
+-
+-#define DT_DRV_COMPAT intel_svid
+ 
+ #define LOG_LEVEL CONFIG_SVID_LOG_LEVEL
+ 
+ #include <zephyr/logging/log.h>
+ LOG_MODULE_REGISTER(svid);
+ 
++#if defined(CONFIG_PINCTRL)
++#include <zephyr/drivers/pinctrl.h>
++#endif
++
+ #include "svid_intel.h"
+ 
+-typedef int (*svid_api_configure_t)(const struct device *dev, uint32_t dev_config);
+-
+-struct svid_driver_api {
+-	svid_api_configure_t configure;
+-};
+-
+-int svid_configure(const struct device *dev, uint32_t config)
++int svid_config(const struct device *dev, uint32_t config)
+ {
++	/* TODO: Initialise below registers may be via NVM
++	 * fast slew rate reg (24h)
++	 * slow slew rate reg (25h)
++	 * vboot register (26h)
++	 */
++
++	/* TODO: set interrupt masks */
++
+ 	return 0;
+ };
+ 
++int svid_send_cmd(const struct device *dev,
++			uint8_t target_addr,
++			uint8_t command,
++			uint8_t payload,
++			uint16_t *response)
++{
++	const struct svid_config *conf = dev->config;
++	svid_req_t req;
++	uint8_t ack;
++
++	req.cmd_word.addr = target_addr;
++	req.cmd_word.cmd = command;
++	req.cmd_word.payload = payload;
++
++	SVID_WRITE32(req.raw, conf->base_addr + mmSVID_MASTER_REQ);
++
++	*response = SVID_READ32(conf->base_addr + mmSVID_SLAVE_RES);
++	ack = (*response & ACK_BIT_MASK) >> ACK_BIT_POS;
++
++	if (ack != SVID_RSP_ACK) {
++		LOG_ERR("SVID: ACK not received ack_bits = %x", ack);
++		return -1;
++	}
++	LOG_DBG("data read: %x", *response);
++	return 0;
++};
++
++int svid_isr(const struct device *dev)
++{
++	const struct svid_config *conf = dev->config;
++	uint8_t ret;
++
++	/* Read the SVID cause register */
++	ret = SVID_READ32(conf->base_addr + mmSVID_INTR_CTRL_CAUSE);
++
++	LOG_DBG("SVID ISR: cause: %x", ret);
++
++	/* Clear the interrupt */
++	SVID_WRITE32(ret, conf->base_addr + mmSVID_INTR_CTRL_CLEAR);
++
++	return 0;
++}
++
+ const struct svid_driver_api funcs = {
+-	.configure = svid_configure,
++	.configure = svid_config,
++	.send_command = svid_send_cmd,
+ };
+ 
+ int svid_init(const struct device *dev)
+ {
+-	LOG_INF("SVID Initialized");
+-	return 0;
++	const struct svid_config *conf = dev->config;
++	int ret = 0;
++	uint16_t rxd;
++	uint32_t val;
++
++#if defined(CONFIG_PINCTRL)
++	ret = pinctrl_apply_state(conf->pcfg, PINCTRL_STATE_DEFAULT);
++	if (ret) {
++		return ret;
++	}
++#endif
++
++	/* Enable SVID Peripheral clock */
++	SVID_WRITE32(ENABLE, conf->base_addr + mmSVID_CLK_O_EN);
++
++	/* Enable the SVID IP on PSOC */
++	SVID_WRITE32(ENABLE, conf->base_addr + mmSVID_SVID_EN);
++
++	/* Configure SVID timings
++	 * Fast clock is running at 500MHz (2ns)
++	 * BAUDIV 12 (2*12*2ns=48ns)
++	 * Generated SVID clock 20.83MHz
++	 * RQD 10 (delay between requests = 20ns)
++	 * RXD is 636
++	 * 2* 12 *(3 start + 18 command + 3 end + 2.5 TA)
++	 */
++	rxd = conf->baud_div * RXD_MULTIPLIER;
++	val = (rxd << RXD_POS_MASK) | (conf->rqd);
++	SVID_WRITE32(val, conf->base_addr + mmSVID_CFG_1);
++
++	val = ((conf->baud_div << BAUDIV_POS_MASK) | (conf->syncd));
++	SVID_WRITE32(val, conf->base_addr + mmSVID_CFG_2);
++
++	LOG_DBG("SVID driver initialized");
++
++	return ret;
+ };
+ 
+-#define SVID_DRIVER_INIT(inst) \
+-	DEVICE_DT_INST_DEFINE(inst, svid_init, NULL, NULL, NULL,  \
+-	POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &funcs);
++/* Macro to initialize the driver instance */
++#define SVID_DRIVER_INIT(n)						\
++	PINCTRL_SVID_DEFINE(n);						\
++	SVID_IRQ_CONFIG(n);						\
++	const struct svid_config svid_config_##n = {			\
++		PINCTRL_SVID_CONFIG(n)					\
++		.baud_div = DT_INST_PROP(n, baud_div),			\
++		.syncd = DT_INST_PROP(n, sync_delay),			\
++		.rqd = DT_INST_PROP(n, rq_delay),			\
++		.base_addr = DT_REG_ADDR(DT_NODELABEL(svid##n)),	\
++	};								\
++	DEVICE_DT_INST_DEFINE(n, svid_init, NULL,			\
++		NULL, &svid_config_##n, POST_KERNEL,			\
++		CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &funcs);
+ 
+ DT_INST_FOREACH_STATUS_OKAY(SVID_DRIVER_INIT)
+diff --git a/drivers/svid/svid_intel.h b/drivers/svid/svid_intel.h
+index e4020d9..fa5a295 100644
+--- a/drivers/svid/svid_intel.h
++++ b/drivers/svid/svid_intel.h
+@@ -1,10 +1,88 @@
+ /*
+  * SPDX-License-Identifier: Apache-2.0
+  *
+- * Copyright 2016-2025 Intel, Ltd.
++ * Copyright 2025 Intel, Ltd.
+  * All Rights Reserved.
+  */
+ #ifndef ZEPHYR_DRIVERS_SVID_INTEL_H_
+ #define ZEPHYR_DRIVERS_SVID_INTEL_H_
+ 
++#define DT_DRV_COMPAT intel_svid
++
++#if defined(CONFIG_PINCTRL)
++#define PINCTRL_SVID_DEFINE(n)	PINCTRL_DT_INST_DEFINE(n)
++#define PINCTRL_SVID_CONFIG(n)	.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),
++#else
++#define PINCTRL_DW_DEFINE(n)
++#define PINCTRL_DW_CONFIG(n)
++#endif
++
++#define ACK_BIT_MASK		0x3FF
++#define ACK_BIT_POS		0x8
++
++#define RXD_POS_MASK		0x10
++#define BAUDIV_POS_MASK		0x9
++
++#define SVID_START_BITS		3
++#define SVID_CMD_BITS		18
++#define SVID_END_BITS		3
++#define SVID_TA_BITS		2.5
++#define RXD_MULTIPLIER (2 * (SVID_START_BITS +	\
++				SVID_CMD_BITS +	\
++				SVID_END_BITS +	\
++				SVID_TA_BITS))
++
++#define SVID_IRQ_CONFIG(n)
++
++struct svid_config {
++	uint16_t baud_div;
++	uint16_t syncd;
++	uint16_t rqd;
++	uintptr_t base_addr;
++#if defined(CONFIG_PINCTRL)
++	const struct pinctrl_dev_config *pcfg;
++#endif
++};
++
++/**
++ * @brief Configure the SVID device with the specified configuration.
++ *
++ * @param dev Pointer to the SVID device structure.
++ * @param config Configuration value to apply.
++ * @return 0 on success, negative error code on failure.
++ */
++int svid_config(const struct device *dev, uint32_t config);
++
++/**
++ * @brief Send a command to the SVID device.
++ *
++ * @param dev Pointer to the SVID device structure.
++ * @param target_addr Target device address.
++ * @param command Command to send.
++ * @param payload Command payload.
++ * @param response Pointer to store the response from the device.
++ * @return 0 on success, negative error code on failure.
++ */
++int svid_send_cmd(const struct device *dev,
++			uint8_t target_addr,
++			uint8_t command,
++			uint8_t payload,
++			uint16_t *response);
++
++/**
++ * @brief SVID interrupt service routine.
++ *
++ * @param dev Pointer to the SVID device structure.
++ * @return 0 on success, negative error code on failure.
++ */
++int svid_isr(const struct device *dev);
++
++/**
++ * @brief Initialize the SVID device.
++ *
++ * @param dev Pointer to the SVID device structure.
++ * @return 0 on success, negative error code on failure.
++ */
++int svid_init(const struct device *dev);
++
+ #endif
+diff --git a/dts/bindings/svid/intel,svid.yaml b/dts/bindings/svid/intel,svid.yaml
+index 739d54b..3d9fdc9 100644
+--- a/dts/bindings/svid/intel,svid.yaml
++++ b/dts/bindings/svid/intel,svid.yaml
+@@ -5,13 +5,29 @@
+ 
+ compatible: "intel,svid"
+ 
+-include: base.yaml
++include: [base.yaml, pinctrl-device.yaml]
+ 
+ properties:
+   reg:
+     required: true
+ 
++  baud_div:
++    type: int
++    required: true
++    description: baud rate divider
++
++  rq_delay:
++    type: int
++    required: true
++    description: minimum delay between transactions.
++
++  sync_delay:
++    type: int
++    required: true
++    description: delay between slave ready and clock start time.
++
+   node_label:
+     type: string
+     required: true
+-    description: node label
+\ No newline at end of file
++    description: node label
++
+diff --git a/include/zephyr/drivers/svid/svid.h b/include/zephyr/drivers/svid/svid.h
+index 3c6985e..c7df9a3 100644
+--- a/include/zephyr/drivers/svid/svid.h
++++ b/include/zephyr/drivers/svid/svid.h
+@@ -1,10 +1,234 @@
+ /*
+  * SPDX-License-Identifier: Apache-2.0
+  *
+- * Copyright 2016-2025 Intel, Ltd.
++ * Copyright (c) 2025 Intel Corporation.
+  * All Rights Reserved.
+  */
+ #ifndef ZEPHYR_DRIVERS_SVID_H_
+ #define ZEPHYR_DRIVERS_SVID_H_
+ 
++#include <errno.h>
++#include <zephyr/sys/slist.h>
++#include <zephyr/types.h>
++#include <zephyr/device.h>
++
++#ifdef __cplusplus
++extern "C" {
+ #endif
++
++#define ENABLE				1
++#define DISABLE				0
++/*
++ * ACK1    ACK2    Type
++ * 0       0       Mixed Error
++ * 0       1       Not Acknowledged
++ * 1       0       Acknowledge
++ * 1       1       Reject
++ */
++#define SVID_RSP_MIXED_ERROR		0x00
++#define SVID_RSP_NAK			0x01
++#define SVID_RSP_ACK			0x10
++#define SVID_RSP_REJ			0x11
++
++/* SVID Target Register Macros */
++#define VENDOR_ID_REG			0x00
++#define PROD_ID_REG			0x01
++#define PROD_REV_REG			0x02
++#define PROD_DATE_REG			0x03
++#define LOT_CODE_REG			0x04
++#define PROTOCOL_ID_REG			0x05
++#define CAPABILITY_REG			0x06
++#define STEP_SIZE_REG			0x07
++#define BIAS_VID_TABLE_REG		0x08
++#define VIDOMAX_H_CAPA_REG		0x09
++#define VIDOMAX_L_REG			0x0A
++#define VIN_FULLSCALE_H_REG		0x0B
++#define VIN_FULLSCALE_L_REG		0x0C
++#define VOUT_FULLSCALE_H_REG		0x0D
++#define VOUT_FULLSCALE_L_REG		0x0E
++#define ALLCALL_ACT_REG			0x0F
++#define STATUS1_REG			0x10
++#define STATUS2_REG			0x11
++#define TEMPERATURE_REG			0x12
++#define PMIC_GLOBAL_ST_REG		0x13
++#define LASTREAD_REG			0x14
++#define IOUT_H_REG			0x15
++#define IOUT_L_REG			0x16
++#define VR_TEMP_REG			0x17
++#define POUT_H_REG			0x18
++#define IIN_H_REG			0x19
++#define VIN_H_REG			0x1A
++#define PIN_H_REG			0x1B
++#define STATUS2_LASTREAD_REG		0x1C
++#define PARERR_CNT_REG			0x1D
++#define CFG_FILE_ID_REG			0x1E
++#define I_C2CL_REG			0x1F
++#define ICC_IN_MAX_REG			0x20
++#define ICC_MAX_REG			0x21
++#define TEMP_MAX_REG			0x22
++#define DC_LL_REG			0x23
++#define SR_FAST_REG			0x24
++#define SR_SLOW_REG			0x25
++#define VBOOT_REG			0x26
++#define VR_TOLERANCE_REG		0x27
++#define I_OFFSET_REG			0x28
++#define T_OFFSET_REG			0x29
++#define SLOW_SR_SEL_HC_REG		0x2A
++#define PS4_EXIT_LAT_REG		0x2B
++#define PS3_EXIT_LAT_REG		0x2C
++#define EN_SVID_RDY_T_REG		0x2D
++#define PIN_MAX_REG			0x2E
++#define PIN_ALERT_TH_REG		0x2F
++#define VID_MAX_REG			0x30
++#define VID_SETTING_REG			0x31
++#define PWR_STATE_REG			0x32
++#define OFFSET_REG			0x33
++#define MULTI_VR_CFG_REG		0x34
++#define MAIN_ADDR_PTR_REG		0x35
++#define DC_LL_FINE_REG			0x36
++#define TRACKVID_REG			0x37
++#define WP0_REG				0x3A
++#define WP1_REG				0x3B
++#define WP2_REG				0x3C
++#define WP3_REG				0x3D
++#define WP4_REG				0x3E
++#define WP5_REG				0x3F
++#define WP6_REG				0x40
++#define WP7_REG				0x41
++#define IVID1_VID_REG			0x42
++#define IVID1_I_REG			0x43
++#define IVID2_VID_REG			0x44
++#define IVID2_I_REG			0x45
++#define IVID3_VID_REG			0x46
++#define IVID3_I_REG			0x47
++#define PSYSC_DBC_CLR_REG		0x49
++#define PSYS_CR_LVL_H_REG		0x4A
++#define PSYS_W2_LVL_H_REG		0x4B
++#define PSYS_W1_LVL_H_REG		0x4C
++#define PSYS_WARN2_CNT_REG		0x4D
++#define PSYS_WARN1_CNT_REG		0x4E
++#define PSYS_DBC_SET_REG		0x4F
++#define ICCMAX_ADD_REG			0x50
++
++/* SVID Target Address Macros */
++#define SVID_ADDR_0			0x0
++#define SVID_ADDR_1			0x1
++#define SVID_ADDR_2			0x2
++#define SVID_ADDR_3			0x3
++#define SVID_ADDR_4			0x4
++#define SVID_ADDR_5			0x5
++#define SVID_ADDR_6			0x6
++#define SVID_ADDR_7			0x7
++#define SVID_ADDR_8			0x8
++#define SVID_ADDR_9			0x9
++#define SVID_ADDR_10			0xA
++#define SVID_ADDR_11			0xB
++#define SVID_ADDR_12			0xC
++#define SVID_ADDR_13			0xD
++#define SVID_ADDR_14			0xE
++#define SVID_ADDR_15			0xF
++
++/* SVID Command Definitions */
++#define SETVID_FAST			1
++#define SETVID_SLOW			2
++#define SETVID_DECAY			3
++#define SETPS				4
++#define SETREGADDR			5
++#define SETREGDATA			6
++#define GETREG				7
++#define TEST_MODE			8
++#define SETWP				9
++#define SETREGADDR_VENDOR		10
++#define SETREGDATA_VENDOR		11
++#define GETREG_VENDOR			12
++#define GETREG_PKTRECENT		13
++#define GETREG_PKTALERT			14
++#define GETREG_PKTBAD			15
++#define GETREG_VREVENT			16
++#define SETREGADDR_TESTCFG		17
++#define SETREGDATA_TESTCFG		18
++
++/* Register read write helper macros */
++#define SVID_WRITE32(data, addr)	sys_write32(data, addr)
++#define SVID_READ32(addr)		sys_read32(addr)
++
++typedef union {
++	struct {
++		uint32_t addr: 4 __packed;
++		uint32_t cmd: 5 __packed;
++		uint32_t payload: 8 __packed;
++		uint32_t reserved: 15 __packed;
++	} cmd_word;
++
++	uint32_t raw;
++} svid_req_t;
++
++typedef int (*svid_api_configure_t)(const struct device *dev,
++				uint32_t dev_config);
++
++typedef int (*svid_api_send_cmd_t)(const struct device *dev,
++				uint8_t target_addr, uint8_t command,
++				uint8_t payload, uint16_t *response);
++
++__subsystem struct svid_driver_api {
++	svid_api_configure_t configure;
++	svid_api_send_cmd_t send_command;
++};
++
++/*
++ * @brief Configure the SVID controller
++ *
++ * @param dev    Pointer to the device structure for the driver instance.
++ * @param config Configuration value.
++ *
++ * @retval 0       If successful.
++ * @retval -ENOSYS If function is not implemented by the driver.
++ */
++__syscall int svid_configure(const struct device *dev, uint32_t config);
++
++static inline int z_impl_svid_configure(const struct device *dev, uint32_t config)
++{
++	const struct svid_driver_api *api = (const struct svid_driver_api *)dev->api;
++
++	if (api->configure) {
++		return api->configure(dev, config);
++	}
++
++	return -ENOSYS;
++}
++
++/*
++ * @brief Send a command to the SVID controller
++ *
++ * @param dev          Pointer to the device structure for the driver instance.
++ * @param target_addr  Target address for the command.
++ * @param command      Command to send.
++ * @param payload      Payload for the command.
++ * @param response     Pointer to store the response from the command.
++ *
++ * @retval 0       If successful.
++ * @retval -ENOSYS If function is not implemented by the driver.
++ */
++__syscall int svid_send_command(const struct device *dev,
++				uint8_t target_addr, uint8_t command,
++				uint8_t payload, uint16_t *response);
++
++static inline int z_impl_svid_send_command(const struct device *dev,
++				uint8_t target_addr, uint8_t command,
++				uint8_t payload, uint16_t *response)
++{
++	const struct svid_driver_api *api = (const struct svid_driver_api *)dev->api;
++
++	if (api->send_command) {
++		return api->send_command(dev, target_addr, command, payload, response);
++	}
++
++	return -ENOSYS;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#include <zephyr/syscalls/svid.h>
++
++#endif /* ZEPHYR_DRIVERS_SVID_H_ */
+diff --git a/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h b/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h
+index 5576d98..eb748d2 100644
+--- a/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h
++++ b/include/zephyr/dt-bindings/gpio/hl-gaudi3-gpio.h
+@@ -28,8 +28,20 @@
+ 
+ #define GPIO_SMB_SLAVE_ALERT		19
+ 
++#define GPIO_SVID_0_CLK			20
++#define GPIO_SVID_0_DATA		21
++#define GPIO_SVID_0_ALERT		22
++
+ #define GPIO_FUSE_BURN			25
+ 
++#define GPIO_SVID_1_CLK			26
++#define GPIO_SVID_1_DATA		27
++#define GPIO_SVID_1_ALERT		28
++
++#define GPIO_SVID_2_CLK			29
++#define GPIO_SVID_2_DATA		30
++#define GPIO_SVID_2_ALERT		31
++
+ #define GPIO_THERMAL_WARN_OUT0		45
+ 
+ #define GPIO_SMBUS_MASTER0_ALERT	46

@@ -1,0 +1,276 @@
+From 206c7110681d4a5eaa142749a5ca6c2bf8037442 Mon Sep 17 00:00:00 2001
+From: William Jordan <bjordan@habana.ai>
+Date: Fri, 16 May 2025 21:45:07 +0300
+Subject: [PATCH] [SW-218976] generate entity aux names
+
+Add support for Entity AUX Name PDRs to
+the pldm_pdr generator script.
+
+Change-Id: Ie51bd71f62c76ecb535b3a5be398caf790b4a558
+Signed-off-by: William Jordan <bjordan@habana.ai>
+---
+
+diff --git a/scripts/g3-gen-pdrs.py b/scripts/g3-gen-pdrs.py
+index 65bdc3b..c2285e0 100755
+--- a/scripts/g3-gen-pdrs.py
++++ b/scripts/g3-gen-pdrs.py
+@@ -83,6 +83,7 @@
+ class SensorType(Enum):
+ 	PLDM_PDR_TYPE_SENSOR_AUX_NAMES   = 0
+ 	PLDM_PDR_TYPE_EFFECTER_AUX_NAMES = 1
++	PLDM_PDR_TYPE_ENTITY_AUX_NAMES = 2
+ 
+ 	@staticmethod
+ 	def from_string(type:str) -> SensorType:
+@@ -90,7 +91,33 @@
+ 			return SensorType.PLDM_PDR_TYPE_SENSOR_AUX_NAMES
+ 		if type.lower() == "effecter":
+ 			return SensorType.PLDM_PDR_TYPE_EFFECTER_AUX_NAMES
++		if type.lower() == "entity":
++			return SensorType.PLDM_PDR_TYPE_ENTITY_AUX_NAMES
+ 		raise RuntimeError("bad type: '{}'".format(type))
++
++#-------------------------------------------------------------------------------
++class EntityId(str):
++	@staticmethod
++	def to_string(id:int) -> EntityId:
++		if id == 68:
++			return "PLDM_ENTITY_TYPE_ADDIN_CARD"
++		if id == 148:
++			return "PLDM_ENTITY_TYPE_CPLD"
++		if id == 149:
++			return "PLDM_ENTITY_TYPE_ACCELERATOR"
++		if id == 300:
++			return "PLDM_ENTITY_TYPE_ETHERNET"
++		raise RuntimeError("bad EntityId: '{}'".format(id))
++
++#-------------------------------------------------------------------------------
++class EntityContainer(str):
++	@staticmethod
++	def to_string(container:int) -> EntityContainer:
++		if container == 100:
++			return "PLDM_CONTAINER_ADDIN_CARD"
++		if container == 1000:
++			return "PLDM_CONTAINER_ACCELERATOR"
++		raise RuntimeError("bad EntityContainer: '{}'".format(container))
+ 
+ #-------------------------------------------------------------------------------
+ # Convert the AUX_NAME token into the expected SID token
+@@ -120,7 +147,7 @@
+ 		columns = {
+ 			'field'			: COLX['A'],
+ 			'title'			: COLX['B'],
+-			'description'	: COLX['C'],
++			'description'		: COLX['C'],
+ 			'entity'		: COLX['D'],
+ 			'handle'		: COLX['I'],
+ 			'version'		: COLX['J'],
+@@ -138,6 +165,9 @@
+ 					break
+ 
+ 				handle = int(sheet.cell_value(row, columns['handle']))
++				type = SensorType.from_string(sheet.cell_value(row, columns['entity']))
++				if type == SensorType.PLDM_PDR_TYPE_ENTITY_AUX_NAMES:
++					continue
+ 				count = int(sheet.cell_value(row, columns['count']))
+ 
+ 				names = []
+@@ -151,8 +181,8 @@
+ 				aux_names[handle] = AuxName(
+ 						name	= sheet.cell_value(row, columns['title']),
+ 						handle	= handle,
+-						id		= int(sheet.cell_value(row, columns['id'])),
+-						type	= SensorType.from_string(sheet.cell_value(row, columns['entity'])),
++						id	= int(sheet.cell_value(row, columns['id'])),
++						type	= type,
+ 						count	= count,
+ 						names	= names,
+ 					)
+@@ -169,7 +199,7 @@
+ 		}
+ 		generate_name_string_variables("Auxilary Name PDRs", name_string_map, output)
+ 
+-		# generate the PDR array
++		# generate the Aux names array
+ 		output.write(f"struct pldm_pdr_name_record pldm_pdr_name_records[] OFFLOAD_PDR_ATTR = {{\n")
+ 		for handle, pdr in aux_names.items():
+ 			if is_repeated(handle) and not is_repeated_base(handle):
+@@ -222,6 +252,130 @@
+ 
+ 		output.write("};\n")
+ 		output.write("const size_t pldm_pdr_name_records_length = ARRAY_SIZE(pldm_pdr_name_records);\n\n")
++
++#-------------------------------------------------------------------------------
++
++@dataclass
++class EntityAuxName:
++	name: str
++	handle: int
++	type: SensorType
++	entityId: EntityId
++	entityInstance: int
++	entityContainer: EntityContainer
++	sharedCount: int
++	names: list[str]
++
++	@staticmethod
++	def parse(wb):
++		entity_aux_names = dict()
++		sheet_name = "Auxiliary names PDRs"
++		columns = {
++			'field'			: COLX['A'],
++			'title'			: COLX['B'],
++			'description'		: COLX['C'],
++			'entity'		: COLX['D'],
++			'handle'		: COLX['I'],
++			'version'		: COLX['J'],
++			'type'			: COLX['K'],
++			'entityId'		: COLX['R'],
++			'entityInstance'	: COLX['S'],
++			'entityContainer'	: COLX['T'],
++			'sharedCount'		: COLX['U'],
++			'name'			: COLX['X'],
++		}
++		name_offset = COLX['AB'] - COLX['X']
++
++		sheet = wb.sheet_by_name(sheet_name)
++		for row in range(first_row(sheet), sheet.nrows):
++			try:
++				if sheet.cell(row, 0).value is None:
++					break
++
++				handle = int(sheet.cell_value(row, columns['handle']))
++				type = SensorType.from_string(sheet.cell_value(row, columns['entity']))
++				if type != SensorType.PLDM_PDR_TYPE_ENTITY_AUX_NAMES:
++					continue
++				names = []
++				name = sheet.cell_value(row, columns['name'])
++				names.append(name)
++				entity_aux_names[handle] = EntityAuxName(
++						name		= sheet.cell_value(row, columns['title']),
++						handle		= handle,
++						type		= type,
++						entityId	= EntityId.to_string(int(sheet.cell_value(row, columns['entityId']))),
++						entityInstance	= int(sheet.cell_value(row, columns['entityInstance'])),
++						entityContainer	= EntityContainer.to_string(int(sheet.cell_value(row, columns['entityContainer']))),
++						sharedCount	= int(sheet.cell_value(row, columns['sharedCount'])),
++						names		= names,
++					)
++			except:
++				pass
++		logging.debug("Parsed total of %u entity aux name PDRs", len(entity_aux_names))
++		return entity_aux_names
++
++	@staticmethod
++	def generate_records(entity_aux_names, suffixes, output):
++		# handle the raw strings
++		name_string_map = {
++			pdr.name : pdr.names for handle,pdr in entity_aux_names.items() if not is_repeated(handle) or is_repeated_base(handle)
++		}
++		generate_name_string_variables("Auxilary Name PDRs", name_string_map, output)
++
++		# generate the Entity Aux names array
++		output.write(f"struct pldm_pdr_entity_name_record pldm_pdr_entity_name_records[] OFFLOAD_PDR_ATTR = {{\n")
++		for handle, pdr in entity_aux_names.items():
++			if is_repeated(handle) and not is_repeated_base(handle):
++				continue # skip collapsed entries
++			suffix = suffixes[handle]
++			sid = get_sensor_id(suffix)
++			output.write(f"\t[PLDM_RIDX_{suffix}] = {{\n")
++			if is_repeated(handle):
++				output.write(f'''\
++		.meta = {{
++			.count				= {REPEATED_PDRS[handle]},
++			.entity_instance_number_base	= 1,
++		}},
++''')
++			output.write(f'''\
++		.entity_aux_names = {{
++			.header = {{
++				.record_handle = PLDM_RH_{suffix},
++				.header_version = PLDM_PDR_HEADER_VERSION,
++				.type = {pdr.type.name},
++				.record_change_number = 0,
++			}},
++			.entity_type = {pdr.entityId},
++			.entity_instance = {pdr.entityInstance},
++			.entity_container_id = {pdr.entityContainer},
++			.shared_name_count = {pdr.sharedCount},
++			.names = {{
++#if CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES
++''')
++			# New format - array of char*
++			for name in pdr.names:
++				variable = variable_from_name(name)
++				output.write(f'				{variable},\n')
++			output.write("#else /* old aux name format */\n")
++			# old format, array of name structs
++			for name in pdr.names:
++				variable = variable_from_name(name)
++				output.write(f'''\
++				{{
++					.name_string_count = 1,
++					.name_language_tag = PLDM_PDR_LANGUAGE_TAG_ENGLISH,
++					.name = {variable},
++				}},
++''')
++			output.write(f'''\
++#endif /* CONFIG_LIBPLDM_PDR_ASCII_AUX_NAMES */
++			}},
++		}},
++	}},
++''')
++
++		output.write("};\n")
++		output.write("const size_t pldm_pdr_entity_name_records_length = ARRAY_SIZE(pldm_pdr_entity_name_records);\n\n")
+ 
+ #-------------------------------------------------------------------------------
+ 
+@@ -470,6 +624,7 @@
+ 	input_file		: str
+ 	suffixes		: typing.Dict[int, str]
+ 	aux_names		: typing.Dict[int, AuxName]
++	entity_aux_names	: typing.Dict[int, EntityAuxName]
+ 	oem_state_sets	: typing.Dict[int, OEMStateSet]
+ 	oem_units		: typing.Dict[int, OEMUnit]
+ 
+@@ -487,6 +642,7 @@
+ 				input_file		= workbook,
+ 				suffixes		= suffixes,
+ 				aux_names		= _filter_handles(AuxName.parse(wb)),
++				entity_aux_names	= _filter_handles(EntityAuxName.parse(wb)),
+ 				oem_state_sets	= _filter_handles(OEMStateSet.parse(wb)),
+ 				oem_units		= _filter_handles(OEMUnit.parse(wb)),
+ 			)
+@@ -604,12 +760,16 @@
+ 		output.write(f"}};\n\n")
+ 
+ 	_print_ridx_enum("pldm_aux_ridx", db.aux_names)
++	_print_ridx_enum("pldm_entity_aux_ridx", db.entity_aux_names)
+ 	_print_ridx_enum("pldm_oem_state_set_ridx", db.oem_state_sets)
+ 	_print_ridx_enum("pldm_oem_unit_ridx", db.oem_units)
+ 
+ 	output.write(f'''\
+ extern struct pldm_pdr_name_record pldm_pdr_name_records[];
+ extern const size_t pldm_pdr_name_records_length;
++
++extern struct pldm_pdr_entity_name_record pldm_pdr_entity_name_records[];
++extern const size_t pldm_pdr_entity_name_records_length;
+ 
+ extern struct pldm_pdr_oem_state_set_record pldm_pdr_oem_state_set_records[];
+ extern const size_t pldm_pdr_oem_state_set_records_length;
+@@ -641,6 +801,7 @@
+ ''')
+ 
+ 	AuxName.generate_records(db.aux_names, db.suffixes, output)
++	EntityAuxName.generate_records(db.entity_aux_names, db.suffixes, output)
+ 	OEMStateSet.generate_records(db.oem_state_sets, db.suffixes, output)
+ 	OEMUnit.generate_records(db.oem_units, db.suffixes, output)
+ 	# done
+@@ -727,4 +888,4 @@
+ 
+ #-------------------------------------------------------------------------------
+ if __name__ == "__main__":
+-	main()
+\ No newline at end of file
++	main()

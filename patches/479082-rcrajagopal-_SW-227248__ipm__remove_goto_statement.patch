@@ -1,0 +1,98 @@
+From 8e30bad300c1b18b522bd7896235244fba5be82c Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Tue, 06 May 2025 09:16:52 +0300
+Subject: [PATCH] [SW-227248] ipm: remove goto statement
+
+Using while loop instead of goto statement
+to retry ipm send event.
+
+Change-Id: Ifc2b8ab477997ad2eee17374d1e84c68044ba96a
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+Signed-off-by: Akshay Pradip Bharad <apbharad@habana.ai>
+---
+
+diff --git a/arch/gaudi3/device.c b/arch/gaudi3/device.c
+index 68fcb39..4f572b8 100644
+--- a/arch/gaudi3/device.c
++++ b/arch/gaudi3/device.c
+@@ -231,53 +231,39 @@
+ 		return -1;
+ 	}
+ 
+-retry:
+-	/*
+-	 * To avoid preemption by other threads inform scheduler to temporarily treat
+-	 * this as co-operative thread
+-	 */
++	/* Temporarily treat this as a co-operative thread */
+ 	k_sched_lock();
+-	ret = ipm_send(mbx->dev, 0, mbx_msg_id.u32, data, size);
+ 
+-	if (ret) {
+-		/*
+-		 * If PID and EVENT take time to boot, we get storm of prints and
+-		 * also there is timedout print for error case hence avoiding print
+-		 * for HL_MBX_MSG_CHECK_ALIVE message
+-		 */
+-		if (mbx_msg_id.common.msg_id != HL_MBX_MSG_CHECK_ALIVE) {
+-			LOG_ERR("Unable to forward event %d to mbx %s ret: %d",
+-				mbx_msg_id.common.msg_id, mbx->dev->name, ret);
++	while (retries-- > 0) {
++		ret = ipm_send(mbx->dev, 0, mbx_msg_id.u32, data, size);
++
++		if (ret) {
++			if (raw_msg_id != HL_MBX_MSG_CHECK_ALIVE) {
++				LOG_ERR("Unable to forward event %d to mbx %s ret: %d",
++					raw_msg_id, mbx->dev->name, ret);
++			}
++			continue;
+ 		}
+-		goto exit;
++
++		LOG_DBG("forwarded event %d to mbx %s ret: %d",
++			raw_msg_id, mbx->dev->name, ret);
++
++		if (!wait_for_reply)
++			break;
++
++		ret = hl_ipm_poll_for_response(mbx, mbx_msg_id.u32);
++		if (!ret) {
++			if (reply)
++				*reply = *((uint32_t *)mbx->cb_poll.poll_event.signal->result);
++			ipm_clear(mbx->dev, mbx_msg_id.u32);
++			break;
++		}
++
++		if (raw_msg_id != HL_MBX_MSG_CHECK_ALIVE)
++			LOG_ERR("Timedout waiting for message id: %d", raw_msg_id);
+ 	}
+ 
+-	LOG_DBG("forwarded event %d to mbx %s ret: %d",
+-		mbx_msg_id.common.msg_id, mbx->dev->name, ret);
+-
+-	if (!wait_for_reply)
+-		goto exit;
+-
+-	ret = hl_ipm_poll_for_response(mbx, mbx_msg_id.u32);
+-	if (ret) {
+-		if (mbx_msg_id.common.msg_id != HL_MBX_MSG_CHECK_ALIVE)
+-			LOG_ERR("Timedout waiting for message id: %d timedout",
+-				mbx_msg_id.common.msg_id);
+-		goto exit;
+-	}
+-
+-	if (reply)
+-		*reply = *((uint32_t *)mbx->cb_poll.poll_event.signal->result);
+-
+-	ipm_clear(mbx->dev, mbx_msg_id.u32);
+-
+-exit:
+ 	k_sched_unlock();
+-
+-	/* If the message was not sent successfully, retry */
+-	if (ret && retries-- > 0)
+-		goto retry;
+-
+ 	return ret;
+ }
+ 

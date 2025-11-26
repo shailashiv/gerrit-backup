@@ -1,0 +1,889 @@
+From 0b6231674090b6de4c0ada520bf2954881606761 Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Sun, 25 May 2025 16:29:54 +0300
+Subject: [PATCH] [SW-224740] g3: lfs: refactor lfs logging
+
+Refactor LFS logging to simplify and eliminate
+some possible problems
+Now root folder of LFS partition will contain
+only 2 files: log.txt and log_backup.txt
+All components (preboot, arcmgmt) will write their
+logs to log.txt. When it reach max. size (configurable),
+it will be copied to log_backup.txt and recreated.
+
+Change-Id: I196f9931a87e762f3c56c17856dca2c014bb628d
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+---
+
+diff --git a/zephyr/lfs_log_console_sender.c b/zephyr/lfs_log_console_sender.c
+index b10aeb2..171bb8f 100644
+--- a/zephyr/lfs_log_console_sender.c
++++ b/zephyr/lfs_log_console_sender.c
+@@ -22,74 +22,67 @@
+ #error "CONFIG_LFS_LOG_FILE_SIZE undefined"
+ #endif
+ 
+-#ifndef CONFIG_LFS_LOG_FILES_LIMIT
+-#error "CONFIG_LFS_LOG_FILES_LIMIT undefined"
+-#endif
+-
+-#define DEFAULT_LOG_PARTITION	LFS_SPI_LOGGER_PARTITION
+-#define LOG_BACKEND_FILE_PREFIX	DT_PROP(LFS_PARTITION_NODE, mount_point)
+-#define	MAX_PATH_LEN		32
+-#define LOG_PREFIX_LEN		(strlen(LOG_BACKEND_FILE_PREFIX))
+-#define MAX_FILE_NUMERAL	9999
+-#define FILE_NUMERAL_LEN	4
+-#define LFS_SIZE_TO_SWAP_FILE	((CONFIG_LFS_LOG_FILE_SIZE * 7) >> 3) /* 7/8 from log file size */
+-#define LFS_MAX_CONSOLE_BUF_LEN	128
+-#define LFS_WQUEUE_STACK_SIZE	2048
+-#define LFS_FILE_SYNC_INTERVAL	K_SECONDS(5)
+-#define LFS_ROOT_FOLDER		"/"
+-#define LFS_SEVERITY_PREFIX_LEN	2
+-#define LFS_TRACE_PREFIX_LEN	10
+-#define LFS_TRACE_PREFIX	"lfs trace:"
+-
+-static struct {
+-	struct lfs_zephyrbd *zephyrbd;
+-	char mnt_point[MAX_PATH_LEN];
+-} fs_mnt;
++#define DEFAULT_LOG_PARTITION			LFS_SPI_LOGGER_PARTITION
++#define	MAX_PATH_LEN				32
++#define LFS_MAX_CONSOLE_BUF_LEN			128
++#define LFS_WQUEUE_STACK_SIZE			2048
++#define LFS_FILE_SYNC_INTERVAL			K_SECONDS(5)
++#define LFS_ROOT_FOLDER				"/"
++#define LOG_FILE_NAME				"log.txt"
++#define LOG_BACKUP_FILE_NAME			"log_backup.txt"
++#define LFS_SEVERITY_POS_WITHOUT_TIMESTAMP	0
++#define LFS_ERROR_WITHOUT_TIMESTAMP		"E: "
++#define LFS_SEVERITY_POS_WITH_TIMESTAMP		30
++#define LFS_ERROR_WITH_TIMESTAMP		" E: "
++#define LFS_CONSOLE_SEVERITY_POS_WITH_TIMESTAMP	44
++#define LFS_TRACE_PREFIX_LEN			10
++#define LFS_TRACE_PREFIX			"lfs trace:"
++#define LFS_QUEUE_THREAD_NAME			"LFS-QUEUE-THREAD"
+ 
+ enum backend_lfs_state {
+ 	BACKEND_LFS_NOT_INITIALIZED = 0,
+-	BACKEND_LFS_TEMPORARY_DISABLED,
+ 	BACKEND_LFS_CORRUPTED,
+ 	BACKEND_LFS_OK
+ };
+ 
+ enum lfs_work_type {
+ 	LFS_FILE_SYNC_WORK = 0,
+-	LFS_OPEN_NEW_FILE_WORK,
+-	LFS_WRITE_LOG_STRING
++	LFS_SWAP_LOG_FILE_WORK,
++	LFS_WRITE_LOG_STRING_WORK
+ };
+-
+ struct lfs_work {
+ 	struct k_work work;
+ 	enum lfs_work_type type;
+ 	void *data;
+ 	size_t len;
+ };
+-
+ struct lfs_logger_state {
+ 	uart_console_out_debug_hook_t *prev_hook;
+-	struct lfs_file current_file;
+-	bool current_file_ready;
+-	int file_ctr;
+-	int newest;
+-	int oldest;
+-	bool allocate_file_scheduled;
++	struct lfs_file log_file;
++	lfs_soff_t file_size;
++	bool swap_file_scheduled;
+ 	bool is_dirty;
+ 	bool is_suspended;
+ };
+ 
+ struct lfs_backend_data {
++	struct lfs_zephyrbd *zephyrbd;
+ 	enum backend_lfs_state backend_state;
+ 	struct k_work_q lfs_work_q;
+ 	k_tid_t lfs_work_q_thread_id;
+-	_thread_t backend_inactive;
++	bool time_critical;
+ };
+ 
+ static struct lfs_backend_data backend = {
+ 	.backend_state = BACKEND_LFS_NOT_INITIALIZED,
++	.time_critical = false,
+ };
+ 
+-static struct lfs_logger_state lfs_logger;
++static struct lfs_logger_state lfs_logger = {
++	.swap_file_scheduled = false,
++	.is_dirty = false,
++	.is_suspended = false,
++};
+ 
+ static char buf[LFS_MAX_CONSOLE_BUF_LEN] = {0};
+ static size_t buf_len;
+@@ -104,22 +97,16 @@
+ 	return true;
+ }
+ #else
+-/**
+- * Temporary fix until LFS logging feature
+- * will be refactored
+- * Must be:
+- * return hl_is_spi_flash_log_enabled();
+- */
+ bool is_lfs_log_enabled(void)
+ {
+-	return false;
++	return hl_is_spi_flash_log_enabled();
+ }
+ #endif
+ 
+ static bool is_ignored_msg(uint8_t *data, size_t length)
+ {
+-	if ((length >= LFS_SEVERITY_PREFIX_LEN) &&
+-		(memcmp(data, "!:", LFS_SEVERITY_PREFIX_LEN) == 0))
++	if ((length >= LFS_SEVERITY_POS_WITHOUT_TIMESTAMP + 2) &&
++		(memcmp(data, "!:", 2) == 0))
+ 		return true;
+ 
+ 	if ((length >= LFS_TRACE_PREFIX_LEN) &&
+@@ -131,7 +118,7 @@
+ 
+ lfs_t *get_lfs(void)
+ {
+-	return fs_mnt.zephyrbd->lfs;
++	return backend.zephyrbd->lfs;
+ }
+ 
+ static bool is_file_opened(struct lfs_file *file)
+@@ -148,7 +135,7 @@
+ 
+ static int lfs_submit_job(enum lfs_work_type type, void *data, size_t len)
+ {
+-	struct lfs_work *work = (struct lfs_work *)k_malloc(sizeof(struct lfs_work));
++	struct lfs_work *work = (struct lfs_work *)k_malloc(sizeof(struct lfs_work) + len);
+ 	int rc;
+ 
+ 	if (!work)
+@@ -158,20 +145,14 @@
+ 	work->data = NULL;
+ 	work->len = len;
+ 	if (data) {
+-		work->data = k_malloc(len);
+-		if (!work->data) {
+-			k_free(work);
+-			return -ENOMEM;
+-		}
++		work->data = (uint8_t *)work + sizeof(struct lfs_work);
+ 		memcpy(work->data, data, len);
+ 	}
++
+ 	k_work_init(&work->work, lfs_work_handler);
+ 
+ 	rc = k_work_submit_to_queue(&backend.lfs_work_q, &work->work);
+ 	if (rc < 0) {
+-		if (work->data)
+-			k_free(work->data);
+-
+ 		k_free(work);
+ 		rc = -EBUSY;
+ 	}
+@@ -179,322 +160,211 @@
+ 	return rc;
+ }
+ 
+-static int get_log_file_id(struct lfs_info *ent)
++static void lfs_sync_timer_handler(struct k_timer *dummy)
+ {
+-	size_t len;
+-	int num;
+-
+-	if (ent->type != LFS_TYPE_REG)
+-		return -1;
+-
+-	len = strlen(ent->name);
+-	if (len != LOG_PREFIX_LEN + FILE_NUMERAL_LEN)
+-		return -1;
+-
+-	if (memcmp(ent->name, LOG_BACKEND_FILE_PREFIX, LOG_PREFIX_LEN) != 0)
+-		return -1;
+-
+-	num = atoi(ent->name + LOG_PREFIX_LEN);
+-	if (num <= MAX_FILE_NUMERAL && num >= 0)
+-		return num;
+-
+-	return -1;
++	if (!lfs_logger.is_suspended)
++		lfs_submit_job(LFS_FILE_SYNC_WORK, NULL, 0);
+ }
+ 
+-static int check_log_file_exist(int num)
++static int lfs_format_filesystem(lfs_t *lfs)
+ {
+-	struct lfs_dir dir;
+-	struct lfs_info ent;
+-	int file_id;
+ 	int rc;
+ 
+-	rc = lfs_dir_open(get_lfs(), &dir, LFS_ROOT_FOLDER);
+-	if (rc)
+-		return -EIO;
++	LOG_INF("LFS: Formatting...");
++	rc = lfs_format(lfs, backend.zephyrbd->cfg);
++	if (rc == 0) {
++		LOG_INF("LFS: Mounting...");
++		rc = lfs_mount(lfs, backend.zephyrbd->cfg);
++		if (rc)
++			LOG_ERR("LFS: Failed to mount partition, RC=%d", rc);
++		else
++			LOG_INF("LFS: Mounted");
++	} else
++		LOG_ERR("LFS: Failed to format partition, RC=%d", rc);
+ 
+-	rc = 0;
+-	while (true) {
+-		if (lfs_dir_read(get_lfs(), &dir, &ent) < 0) {
+-			rc = -EIO;
+-			break;
+-		}
+-
+-		if (ent.name[0] == 0)
+-			break;
+-
+-		file_id = get_log_file_id(&ent);
+-		if (file_id == num) {
+-			rc = 1;
+-			break;
+-		}
+-	}
+-
+-	lfs_dir_close(get_lfs(), &dir);
+ 	return rc;
+ }
+ 
+-static int del_oldest_log(void)
++static int lfs_open_log_file(lfs_t *lfs, int mode)
+ {
+ 	int rc;
+-	char delete_filename[MAX_PATH_LEN];
+ 
+-	while (true) {
+-		snprintf(delete_filename, sizeof(delete_filename), "/%s%04d",
+-			 LOG_BACKEND_FILE_PREFIX, lfs_logger.oldest);
+-		rc = lfs_remove(get_lfs(), delete_filename);
++	rc = lfs_file_open(lfs,
++			&(lfs_logger.log_file),
++			LFS_ROOT_FOLDER LOG_FILE_NAME,
++			mode);
+ 
+-		if ((rc == 0) || (rc == -ENOENT)) {
+-			lfs_logger.oldest++;
+-			if (lfs_logger.oldest > MAX_FILE_NUMERAL)
+-				lfs_logger.oldest = 0;
++	if (rc == 0)
++		lfs_logger.file_size = lfs_file_size(lfs, &(lfs_logger.log_file));
+ 
+-			if (rc == 0) {
+-				--lfs_logger.file_ctr;
+-				break;
+-			}
+-		} else {
+-			break;
+-		}
++	return rc;
++}
++
++static int lfs_log_swap(lfs_t *lfs)
++{
++	int rc;
++
++	if (is_file_opened(&lfs_logger.log_file))
++		lfs_file_close(lfs, &lfs_logger.log_file);
++
++	lfs_remove(lfs, LFS_ROOT_FOLDER LOG_BACKUP_FILE_NAME);
++	rc = lfs_rename(lfs, LFS_ROOT_FOLDER LOG_FILE_NAME, LFS_ROOT_FOLDER LOG_BACKUP_FILE_NAME);
++
++	if (!rc)
++		rc = lfs_open_log_file(lfs, LFS_O_CREAT | LFS_O_WRONLY);
++
++	if (rc) {
++		backend.backend_state = BACKEND_LFS_CORRUPTED;
++		LOG_ERR("LFS: Failed to swap log files, RC=%d", rc);
+ 	}
+ 
+ 	return rc;
+ }
+ 
+-static int prepare_space_for_new_file(void)
++
++static int lfs_prepare_filesystem(void)
+ {
+-	struct lfs_fsinfo stat;
+-	ssize_t allocated_blocks;
++	lfs_t *lfs = get_lfs();
+ 	int rc;
+ 
+-	allocated_blocks = lfs_fs_size(get_lfs());
+-	rc = lfs_fs_stat(get_lfs(), &stat);
+-	if (rc < 0)
+-		return rc;
+-
+-	while ((lfs_logger.file_ctr >= CONFIG_LFS_LOG_FILES_LIMIT) ||
+-	       (((stat.block_count - allocated_blocks) * stat.block_size)
+-						<= CONFIG_LFS_LOG_FILE_SIZE)) {
+-		rc = del_oldest_log();
+-		if (rc < 0)
+-			return rc;
+-
+-		allocated_blocks = lfs_fs_size(get_lfs());
+-		rc = lfs_fs_stat(get_lfs(), &stat);
+-		if (rc < 0)
+-			return rc;
++	rc = lfs_open_log_file(lfs, LFS_O_WRONLY | LFS_O_APPEND);
++	if (rc && !backend.time_critical) {
++		rc = lfs_format_filesystem(lfs);
++		if (!rc)
++			rc = lfs_open_log_file(lfs, LFS_O_CREAT | LFS_O_WRONLY);
+ 	}
+ 
+-	return LFS_ERR_OK;
++	return rc;
+ }
+ 
+-static void get_range_of_existing_files(struct lfs_dir *dir, int *min, int *max)
++static int lfs_repair_filesystem(void)
+ {
+-	struct lfs_info ent;
+-	int rc = 0;
+-	int file_num = 0;
+-
+-	while (rc >= 0) {
+-		rc = lfs_dir_read(get_lfs(), dir, &ent);
+-		if ((rc < 0) || (ent.name[0] == 0))
+-			break;
+-
+-		file_num = get_log_file_id(&ent);
+-		if (file_num >= 0) {
+-			if (file_num > *max)
+-				*max = file_num;
+-
+-			if (file_num < *min)
+-				*min = file_num;
+-
+-			++lfs_logger.file_ctr;
+-		}
+-	}
+-}
+-
+-static int allocate_new_file(void)
+-{
+-	/* In case of no log file or current file fills up
+-	 * create new log file.
+-	 */
++	lfs_t *lfs = get_lfs();
+ 	int rc;
+-	int curr_file_num;
+-	struct lfs_info ent;
+-	char fname[MAX_PATH_LEN];
+-	int file_num;
+-	int open_flags = LFS_O_CREAT | LFS_O_WRONLY;
+ 
+-	if (backend.backend_state == BACKEND_LFS_NOT_INITIALIZED) {
+-		/* Search for the last used log number. */
+-		struct lfs_dir dir;
+-		int max = 0, min = MAX_FILE_NUMERAL;
+-
+-		curr_file_num = 0;
+-		rc = lfs_dir_open(get_lfs(), &dir, LFS_ROOT_FOLDER);
+-		if (rc < 0)
+-			return rc;
+-
+-		get_range_of_existing_files(&dir, &min, &max);
+-
+-		lfs_logger.oldest = min;
+-		if ((lfs_logger.file_ctr > 1) && ((max - min) > 2 * CONFIG_LFS_LOG_FILES_LIMIT)) {
+-			/* oldest log is in the range around the min */
+-			lfs_logger.newest = min;
+-			lfs_logger.oldest = max;
+-			lfs_dir_close(get_lfs(), &dir);
+-			rc = lfs_dir_open(get_lfs(), &dir, LFS_ROOT_FOLDER);
+-
+-			while (rc == 0) {
+-				rc = lfs_dir_read(get_lfs(), &dir, &ent);
+-				if ((rc < 0) || (ent.name[0] == 0))
+-					break;
+-
+-				file_num = get_log_file_id(&ent);
+-				if (file_num < 0)
+-					continue;
+-
+-				if (file_num < min + CONFIG_LFS_LOG_FILES_LIMIT)
+-					if (lfs_logger.newest < file_num)
+-						lfs_logger.newest = file_num;
+-
+-				if (file_num > max - CONFIG_LFS_LOG_FILES_LIMIT)
+-					if (lfs_logger.oldest > file_num)
+-						lfs_logger.oldest = file_num;
+-			}
+-		} else {
+-			lfs_logger.newest = max;
+-			lfs_logger.oldest = min;
+-		}
+-
+-		lfs_dir_close(get_lfs(), &dir);
+-		curr_file_num = lfs_logger.newest;
+-
+-		if (lfs_logger.file_ctr >= 1) {
+-			curr_file_num++;
+-			if (curr_file_num > MAX_FILE_NUMERAL)
+-				curr_file_num = 0;
+-		}
+-
+-		backend.backend_state = BACKEND_LFS_OK;
+-	} else {
+-		if (lfs_logger.current_file_ready)
+-			lfs_file_close(get_lfs(), &lfs_logger.current_file);
+-
+-		lfs_logger.current_file_ready = false;
+-		curr_file_num = lfs_logger.newest;
+-		curr_file_num++;
+-		if (curr_file_num > MAX_FILE_NUMERAL)
+-			curr_file_num = 0;
+-	}
+-
+-	rc = prepare_space_for_new_file();
+-	if (rc < 0)
+-		return rc;
+-
+-	/**
+-	 * Sometimes zero length file can be left
+-	 * This can occur in preboot, when LKD started
+-	 * In this case (for example we exit from LKD driver
+-	 * and enter preboot again), we will reuse it
+-	 * instead of new file creation
+-	 */
+-	if (curr_file_num > 0) {
+-		snprintf(fname, sizeof(fname), "/%s%04d", LOG_BACKEND_FILE_PREFIX,
+-			curr_file_num - 1);
+-		rc = lfs_file_open(get_lfs(), &lfs_logger.current_file, fname, LFS_O_RDONLY);
+-		if (rc >= 0) {
+-			rc = lfs_file_size(get_lfs(), &lfs_logger.current_file);
+-			if (rc == 0) {
+-				curr_file_num--;
+-				lfs_logger.file_ctr--;
+-				open_flags = LFS_O_WRONLY;
+-			}
+-
+-			lfs_file_close(get_lfs(), &lfs_logger.current_file);
+-		}
+-	}
+-
+-	snprintf(fname, sizeof(fname), "/%s%04d", LOG_BACKEND_FILE_PREFIX, curr_file_num);
+-	lfs_logger.is_dirty = false;
+-	rc = lfs_file_open(get_lfs(), &lfs_logger.current_file, fname, open_flags);
+-	if (rc < 0)
+-		return rc;
+-
+-	lfs_logger.current_file_ready = true;
+-	++lfs_logger.file_ctr;
+-	lfs_logger.newest = curr_file_num;
+-	if (backend.backend_state == BACKEND_LFS_TEMPORARY_DISABLED)
+-		backend.backend_state = BACKEND_LFS_OK;
++	LOG_INF("LFS: Attempt to repair...");
++	rc = lfs_fs_mkconsistent(lfs);
++	if (rc) {
++		LOG_INF("LFS: Repair failed, RC=%d", rc);
++		rc = lfs_format_filesystem(lfs);
++		if (!rc)
++			rc = lfs_open_log_file(lfs, LFS_O_CREAT | LFS_O_WRONLY);
++	} else
++		rc = lfs_prepare_filesystem();
+ 
+ 	return rc;
+ }
+ 
+ static bool is_error_msg(uint8_t *data, size_t length)
+ {
+-	return (length >= LFS_SEVERITY_PREFIX_LEN) &&
+-		(memcmp(data, "E:", LFS_SEVERITY_PREFIX_LEN) == 0);
++	bool res = false;
++
++	// This check is for preboot log lines:
++	// Category is in position 0
++	if (length >= LFS_SEVERITY_POS_WITHOUT_TIMESTAMP + strlen(LFS_ERROR_WITHOUT_TIMESTAMP))
++		if (memcmp(data + LFS_SEVERITY_POS_WITHOUT_TIMESTAMP,
++				LFS_ERROR_WITHOUT_TIMESTAMP,
++				strlen(LFS_ERROR_WITHOUT_TIMESTAMP)) == 0)
++			res = true;
++
++	// This check is for arcmgmt log lines:
++	// [27-05-2025 08:42:45:031:807]: W: Failed to poll PLDM sensor: sensor_id 237 err 1
++	// Category is in position 30
++	if (!res && length >= LFS_SEVERITY_POS_WITH_TIMESTAMP + strlen(LFS_ERROR_WITH_TIMESTAMP))
++		if (memcmp(data + LFS_SEVERITY_POS_WITH_TIMESTAMP,
++				LFS_ERROR_WITH_TIMESTAMP,
++				strlen(LFS_ERROR_WITH_TIMESTAMP)) == 0)
++			res = true;
++
++	// This check is for PID/EVT console in arcmgmt log lines:
++	// PID console: '[27-05-2025 08:42:45:000:000]: I: Host time set'
++	// Category is in position 44
++	if (!res && length >= LFS_CONSOLE_SEVERITY_POS_WITH_TIMESTAMP +
++			strlen(LFS_ERROR_WITH_TIMESTAMP))
++		if (memcmp(data + LFS_CONSOLE_SEVERITY_POS_WITH_TIMESTAMP,
++				LFS_ERROR_WITH_TIMESTAMP,
++				strlen(LFS_ERROR_WITH_TIMESTAMP)) == 0)
++			res = true;
++
++	return res;
+ }
+ 
+ static int write_log_to_file(uint8_t *data, size_t length)
+ {
+ 	int rc;
+ 	lfs_ssize_t bytes_written;
+-	lfs_soff_t fsize;
+ 
+ 	if (is_ignored_msg(data, length))
+ 		return 0;
+ 
+ 	if (backend.backend_state == BACKEND_LFS_OK) {
+ 
+-		fsize = lfs_file_tell(get_lfs(), &lfs_logger.current_file);
+-
+ 		/* Check if new data overwrites max file size.
+ 		 * If so, create new log file.
+ 		 */
+-		if ((fsize + length) > LFS_SIZE_TO_SWAP_FILE) {
+-			if (!lfs_logger.allocate_file_scheduled) {
+-				lfs_logger.allocate_file_scheduled = true;
+-				lfs_submit_job(LFS_OPEN_NEW_FILE_WORK, NULL, 0);
++		if ((lfs_logger.file_size + length) > CONFIG_LFS_LOG_FILE_SIZE) {
++			if (backend.time_critical) {
++				lfs_logger.is_suspended = true;
++				length = 0;
++				goto exit;
++			} else if (!lfs_logger.swap_file_scheduled) {
++				lfs_logger.swap_file_scheduled = true;
++				lfs_submit_job(LFS_SWAP_LOG_FILE_WORK, NULL, 0);
+ 			}
+ 		}
+ 
+-		bytes_written = lfs_file_write(get_lfs(), &lfs_logger.current_file, data, length);
++		bytes_written = lfs_file_write(get_lfs(), &lfs_logger.log_file, data, length);
+ 		if (bytes_written >= 0) {
++			lfs_logger.file_size += bytes_written;
+ 			if (bytes_written != length) {
+-				del_oldest_log();
+ 				length = 0;
+ 				goto exit;
+ 			}
++
+ 			/*
+ 			 * If error message, do file sync immediately
+ 			 * by issuing the relevant function synchronously
+ 			 */
+ 			if (is_error_msg(data, length)) {
+-				lfs_file_sync(get_lfs(), &lfs_logger.current_file);
++				lfs_file_sync(get_lfs(), &lfs_logger.log_file);
+ 				lfs_logger.is_dirty = false;
+ 			}
+ 
+ 			length = rc;
+-		} else {
+-			rc = check_log_file_exist(lfs_logger.newest);
+-			if (rc <= 0) {
+-				/* file was lost somehow
+-				 * try to get a new one
+-				 */
+-				lfs_logger.file_ctr--;
+-				backend.backend_state = BACKEND_LFS_TEMPORARY_DISABLED;
+-				if (!lfs_logger.allocate_file_scheduled) {
+-					lfs_logger.allocate_file_scheduled = true;
+-					lfs_submit_job(LFS_OPEN_NEW_FILE_WORK, NULL, 0);
+-				}
+-				lfs_submit_job(LFS_WRITE_LOG_STRING, data, length);
+-			}
+-
+-			length = 0;
+ 		}
+ 	}
+ 
+ exit:
+ 	return length;
++}
++
++static void lfs_work_handler(struct k_work *item)
++{
++	struct lfs_work *work = CONTAINER_OF(item, struct lfs_work, work);
++	lfs_t *lfs = get_lfs();
++
++	switch (work->type) {
++	case LFS_FILE_SYNC_WORK:
++		if (lfs_logger.is_dirty) {
++			lfs_file_sync(lfs, &lfs_logger.log_file);
++			lfs_fs_gc(lfs);
++			lfs_logger.is_dirty = false;
++		}
++
++		break;
++	case LFS_SWAP_LOG_FILE_WORK:
++		lfs_log_swap(lfs);
++		lfs_logger.swap_file_scheduled = false;
++		break;
++	case LFS_WRITE_LOG_STRING_WORK:
++		write_log_to_file(work->data, work->len);
++		lfs_logger.is_dirty = true;
++		break;
++	default:
++		break;
++	};
++
++	k_free(work);
+ }
+ 
+ static UART_CONSOLE_OUT_DEBUG_HOOK_SIG(console_out)
+@@ -511,8 +381,8 @@
+ 	if (buf_len == 0)
+ 		goto console_out_exit;
+ 
+-	if (!lfs_logger.is_suspended)
+-		lfs_submit_job(LFS_WRITE_LOG_STRING, buf, buf_len);
++	if (!lfs_logger.is_suspended && (backend.backend_state != BACKEND_LFS_CORRUPTED))
++		lfs_submit_job(LFS_WRITE_LOG_STRING_WORK, buf, buf_len);
+ 
+ 	buf_len = 0;
+ 
+@@ -520,43 +390,17 @@
+ 	return prev_hook_result;
+ }
+ 
+-static void lfs_work_handler(struct k_work *item)
+-{
+-	struct lfs_work *work = CONTAINER_OF(item, struct lfs_work, work);
+-
+-	switch (work->type) {
+-	case LFS_FILE_SYNC_WORK:
+-		if (lfs_logger.is_dirty) {
+-			lfs_file_sync(get_lfs(), &lfs_logger.current_file);
+-			lfs_logger.is_dirty = false;
+-		}
+-
+-		break;
+-	case LFS_OPEN_NEW_FILE_WORK:
+-		allocate_new_file();
+-		lfs_logger.allocate_file_scheduled = false;
+-		break;
+-	case LFS_WRITE_LOG_STRING:
+-		write_log_to_file(work->data, work->len);
+-		lfs_logger.is_dirty = true;
+-		break;
+-	default:
+-		break;
+-	};
+-
+-	if (work->data)
+-		k_free(work->data);
+-
+-	k_free(work);
+-}
+-
+-static void lfs_sync_timer_handler(struct k_timer *dummy)
+-{
+-	if (!lfs_logger.is_suspended)
+-		lfs_submit_job(LFS_FILE_SYNC_WORK, NULL, 0);
+-}
+-
+ K_TIMER_DEFINE(lfs_sync_timer, lfs_sync_timer_handler, NULL);
++
++static void lfs_start_logging(void)
++{
++	LOG_INF("LFS: logger started");
++	if (!backend.time_critical)
++		k_timer_start(&lfs_sync_timer, LFS_FILE_SYNC_INTERVAL, LFS_FILE_SYNC_INTERVAL);
++
++	backend.backend_state = BACKEND_LFS_OK;
++	lfs_logger.prev_hook = uart_console_out_debug_hook_add(console_out);
++}
+ 
+ int lfs_console_init(void)
+ {
+@@ -567,22 +411,25 @@
+ 
+ 	LOG_INF("LFS: logger initialization started");
+ 
+-	rc = lfs_zephyrbd_init(&fs_mnt.zephyrbd, DEFAULT_LOG_PARTITION);
+-	if (rc == 0 && fs_mnt.zephyrbd->is_mounted) {
++	rc = lfs_zephyrbd_init(&backend.zephyrbd, DEFAULT_LOG_PARTITION);
++	if (rc == 0 && backend.zephyrbd->is_mounted) {
+ 		lfs_logger.is_suspended = false;
+ 		k_work_queue_init(&backend.lfs_work_q);
+ 		k_work_queue_start(&backend.lfs_work_q, lfs_wqueue_stack_area,
+ 				K_THREAD_STACK_SIZEOF(lfs_wqueue_stack_area),
+ 				CONFIG_MAIN_THREAD_PRIORITY, NULL);
+ 		backend.lfs_work_q_thread_id = k_work_queue_thread_get(&backend.lfs_work_q);
+-		rc = allocate_new_file();
+-		if (rc == 0) {
+-			LOG_INF("LFS: logger started");
+-			k_timer_start(&lfs_sync_timer, LFS_FILE_SYNC_INTERVAL, LFS_FILE_SYNC_INTERVAL);
+-			lfs_logger.prev_hook = uart_console_out_debug_hook_add(console_out);
+-		} else {
+-			LOG_ERR("LFS: Failed to allocate new log file for %s. RC=%d",
+-				LOG_BACKEND_FILE_PREFIX, rc);
++		k_thread_name_set(backend.lfs_work_q_thread_id, LFS_QUEUE_THREAD_NAME);
++		rc = lfs_prepare_filesystem();
++		if (rc == 0)
++			lfs_start_logging();
++		else if (!backend.time_critical) {
++			LOG_INF("LFS: Failed to prepare file system, RC=%d", rc);
++			rc = lfs_repair_filesystem();
++			if (rc)
++				LOG_ERR("LFS: Failed to repair file system, RC=%d", rc);
++			else
++				lfs_start_logging();
+ 		}
+ 	} else {
+ 		LOG_ERR("Failed to initialize LFS. RC=%d", rc);
+@@ -591,10 +438,21 @@
+ 	return 0;
+ }
+ 
++int lfs_console_init_time_critical(void)
++{
++	backend.time_critical = true;
++	return lfs_console_init();
++}
++
+ k_tid_t module_lfs_setup(const char *thread_name)
+ {
++	k_tid_t inactive = (k_tid_t)(-1);
++
+ 	if (!is_lfs_log_enabled())
+-		return &backend.backend_inactive;
++		return inactive;
++
++	if (!backend.lfs_work_q_thread_id)
++		return inactive;
+ 
+ 	return backend.lfs_work_q_thread_id;
+ }
+@@ -607,41 +465,37 @@
+ 	return backend.lfs_work_q_thread_id;
+ }
+ 
+-void module_lfs_shutdown(void)
++static void module_lfs_drain_queue(bool block_queue)
+ {
+ 	if (!is_lfs_log_enabled())
+ 		return;
+ 
+ 	lfs_logger.is_suspended = true;
+-	k_work_queue_drain(&backend.lfs_work_q, true);
+-	if (is_file_opened(&lfs_logger.current_file))
+-		lfs_file_close(get_lfs(), &lfs_logger.current_file);
++	k_work_queue_drain(&backend.lfs_work_q, block_queue);
++	if (!backend.time_critical && is_file_opened(&lfs_logger.log_file))
++		lfs_file_close(get_lfs(), &lfs_logger.log_file);
++}
+ 
+-	lfs_logger.current_file_ready = false;
+-
++void module_lfs_shutdown(void)
++{
++	module_lfs_drain_queue(true);
+ }
+ 
+ void module_lfs_suspend(void)
+ {
+-	if (!is_lfs_log_enabled())
+-		return;
+-
+-	lfs_logger.is_suspended = true;
+-	k_work_queue_drain(&backend.lfs_work_q, false);
+-	if (is_file_opened(&lfs_logger.current_file))
+-		lfs_file_close(get_lfs(), &lfs_logger.current_file);
+-
+-	lfs_logger.current_file_ready = false;
++	module_lfs_drain_queue(false);
+ }
+ 
+ void module_lfs_resume(void)
+ {
++	int rc;
++
+ 	if (!is_lfs_log_enabled())
+ 		return;
+ 
+-	lfs_logger.allocate_file_scheduled = true;
+-	lfs_submit_job(LFS_OPEN_NEW_FILE_WORK, NULL, 0);
+-	lfs_logger.is_suspended = false;
++	rc = lfs_open_log_file(get_lfs(), LFS_O_WRONLY | LFS_O_APPEND);
++	if (!rc)
++		lfs_logger.is_suspended = false;
+ }
+ 
+ #else
+diff --git a/zephyr/lfs_zephyr_init.h b/zephyr/lfs_zephyr_init.h
+index 97779a9..5f913d4 100644
+--- a/zephyr/lfs_zephyr_init.h
++++ b/zephyr/lfs_zephyr_init.h
+@@ -25,6 +25,7 @@
+ struct lfs *get_lfs(void);
+ 
+ int lfs_console_init(void);
++int lfs_console_init_time_critical(void);
+ k_tid_t module_lfs_setup(const char *thread_name);
+ k_tid_t module_lfs_tid_get(void);
+ void module_lfs_shutdown(void);
+diff --git a/zephyr/lfs_zephyr_shell.c b/zephyr/lfs_zephyr_shell.c
+index 3332b52..205680c 100644
+--- a/zephyr/lfs_zephyr_shell.c
++++ b/zephyr/lfs_zephyr_shell.c
+@@ -95,6 +95,7 @@
+ 	}
+ 
+ 	lfs_flash_dump(addr, len);
++	return 0;
+ }
+ #endif
+ 
+diff --git a/zephyr/lfs_zephyrbd.c b/zephyr/lfs_zephyrbd.c
+index 38ca5a1..5ebde06 100644
+--- a/zephyr/lfs_zephyrbd.c
++++ b/zephyr/lfs_zephyrbd.c
+@@ -30,20 +30,17 @@
+ #ifdef LFS_TEST_MODE
+ void lfs_flash_dump(uint32_t addr, uint32_t len)
+ {
++	const struct device *flash = FLASH_DEV_INST;
++	const struct flash_driver_api *api = flash->api;
+ 	uint32_t offset = 0;
+ 	uint32_t num_of_lines = (len >> 4) + 1;
+ 	int i, j;
+ 	uint8_t buf[16];
+ 
+-	if (context.flash_api == NULL)
+-		return;
+-
+ 	for (i = 0; i < num_of_lines; i++) {
+-		context.flash_api->read(FLASH_DEV_INST,
+-				context.flash_partition_start_addr + addr,
+-				buf, 16);
++		api->read(flash, addr, buf, 16);
+ 
+-		printf("%04X : ", addr);
++		printf("%08X : ", addr);
+ 
+ 		for (j = 0; j < 16; j++) {
+ 			printf("%02X ", buf[j]);
+@@ -53,7 +50,7 @@
+ 
+ 		printf("    ");
+ 		for (j = 0; j < 16; j++) {
+-			printf("%c ", (char)buf[j]);
++			printf("%c ", buf[j] < 32 ? '.' : (char)buf[j]);
+ 			if (addr + j == len - 1) {
+ 				printf("\n\n");
+ 				return;

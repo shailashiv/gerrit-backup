@@ -1,0 +1,131 @@
+From f2336b104801be885577b0c723ccc0abeabbf1ab Mon Sep 17 00:00:00 2001
+From: Meron Cohen <mecohen@habana.ai>
+Date: Tue, 13 May 2025 22:30:28 +0300
+Subject: [PATCH] [SW-227605] g2e-pcie: support hbm rate limiters
+
+For G2E PCIe card, there is to support HBM RLs.
+Temporarily, the solution is not part of the hl_rl driver.
+HBM RLs are configured during initializtion of arcmgmt.
+The ticket defined reset_val and max_timeout only, so
+there was a need to set max_sat as well - the value is
+taken from G3 PID DT which is used by the hl_rl driver.
+
+Change-Id: Idc64571e003bbc4c0ac829a3d3152aa163726eba
+Signed-off-by: Meron Cohen <mecohen@habana.ai>
+---
+
+diff --git a/app/io/mgmt.c b/app/io/mgmt.c
+index ce5ccd3..5d4ea18 100644
+--- a/app/io/mgmt.c
++++ b/app/io/mgmt.c
+@@ -309,6 +309,10 @@
+ }
+ #endif
+ 
++#ifndef CONFIG_SOC_FS1_MGMT
++	EMPTY_WEAK_FUNC(void hl_rtr_ctrl_init_rl_reg_once(void),)
++#endif
++
+ void main(void)
+ {
+ 	int32_t ret;
+@@ -328,6 +332,12 @@
+ 		goto err_loop;
+ 	}
+ 
++#ifndef CONFIG_SOC_FS1_MGMT
++	/* Set and enable HBM RLs */
++	if (is_bis_e_compliant_device())
++		hl_rtr_ctrl_init_rl_reg_once();
++#endif
++
+ 	if (dev_config.queue_init) {
+ 		ret = dev_config.queue_init(&dev_config);
+ 		if (ret != 0) {
+diff --git a/arch/gaudi2/device.c b/arch/gaudi2/device.c
+index 49ff6e8..bc103a1 100644
+--- a/arch/gaudi2/device.c
++++ b/arch/gaudi2/device.c
+@@ -1323,3 +1323,70 @@
+ 		sys_write32(PCIE_HBM_CRDT_VAL, dev_config->cfg_base_addr + offset);
+ 	}
+ }
++
++#define GAUDI2E_HBM_RL_SATURATION_SHIFT		0		/* RL saturation value (log2) */
++#define GAUDI2E_HBM_RL_SATURATION_MASK		0xFF		/* Bits 0..7 */
++#define GAUDI2E_HBM_RL_RST_TOKEN_SHIFT		8		/* RL number of tokens to add */
++#define GAUDI2E_HBM_RL_RST_TOKEN_MASK		0xFF00		/* Bits 8..15 */
++#define GAUDI2E_HBM_RL_TIMEOUT_SHIFT		16		/* RL token addition window */
++#define GAUDI2E_HBM_RL_TIMEOUT_MASK		0xFF0000	/* Bits 16..23 */
++#define GAUDI2E_HBM_RL_EN_SHIFT			24		/* RL enable */
++#define GAUDI2E_HBM_RL_EN_MASK			0x1000000	/* Bit 24 */
++#define GAUDI2E_HBM_RL_MAX_SAT			5
++#define GAUDI2E_HBM_RL_RESET_VAL		11
++#define GAUDI2E_HBM_RL_MAX_TIMEOUT		19
++#define GAUDI2E_HBM_RL_DCORE_NUM		4
++#define GAUDI2E_HBM_RL_RTR_NUM			8
++#define DCORE_N_OFFSET				0x200000
++#define RTR_N_OFFSET				0x8000
++#define WR_RL_MEM_OFFSET			0x108
++#define RD_RL_MEM_OFFSET			0x114
++#define HL_CFG_BASE				0xF8000000
++#define mmDCORE0_RTR0_CTRL_BASE			(HL_CFG_BASE + 0x4140000)
++
++struct hl_rtr_ctrl_rl_regs {
++	uint32_t wr_rl_mem;
++	uint32_t rd_rl_mem;
++};
++
++void hl_rtr_ctrl_init_rl_reg_once(void)
++{
++	int32_t max_sat, reset_val, max_timeout, dcore, rtr;
++	struct hl_rtr_ctrl_rl_regs reg_base_pu;
++	uint32_t cfg = 0;
++
++	max_sat = GAUDI2E_HBM_RL_MAX_SAT;
++	reset_val = GAUDI2E_HBM_RL_RESET_VAL;
++	max_timeout = GAUDI2E_HBM_RL_MAX_TIMEOUT;
++
++	cfg |= (max_sat << GAUDI2E_HBM_RL_SATURATION_SHIFT);
++	cfg |= (reset_val << GAUDI2E_HBM_RL_RST_TOKEN_SHIFT);
++	cfg |= (max_timeout << GAUDI2E_HBM_RL_TIMEOUT_SHIFT);
++
++	LOG_INF("Setting HBM RLs: max_sat = %d, reset_val = %d, max_timeout = %d, cfg = 0x%x",
++		max_sat, reset_val, max_timeout, cfg);
++
++	/* Set HBM RL */
++	for (dcore = 0; dcore < GAUDI2E_HBM_RL_DCORE_NUM; dcore++) {
++		for (rtr = 0; rtr < GAUDI2E_HBM_RL_RTR_NUM; rtr++) {
++			reg_base_pu.wr_rl_mem = mmDCORE0_RTR0_CTRL_BASE +
++				(dcore * DCORE_N_OFFSET) + (rtr * RTR_N_OFFSET) + WR_RL_MEM_OFFSET;
++			reg_base_pu.rd_rl_mem = mmDCORE0_RTR0_CTRL_BASE +
++				(dcore * DCORE_N_OFFSET) + (rtr * RTR_N_OFFSET) + RD_RL_MEM_OFFSET;
++			sys_write32(cfg, (mem_addr_t)reg_base_pu.wr_rl_mem);
++			sys_write32(cfg, (mem_addr_t)reg_base_pu.rd_rl_mem);
++		}
++	}
++
++	/* Enable HBM RL */
++	for (dcore = 0; dcore < GAUDI2E_HBM_RL_DCORE_NUM; dcore++) {
++		for (rtr = 0; rtr < GAUDI2E_HBM_RL_RTR_NUM; rtr++) {
++			reg_base_pu.wr_rl_mem = mmDCORE0_RTR0_CTRL_BASE +
++				(dcore * DCORE_N_OFFSET) + (rtr * RTR_N_OFFSET) + WR_RL_MEM_OFFSET;
++			reg_base_pu.rd_rl_mem = mmDCORE0_RTR0_CTRL_BASE +
++				(dcore * DCORE_N_OFFSET) + (rtr * RTR_N_OFFSET) + RD_RL_MEM_OFFSET;
++			sys_rmwrite32((mem_addr_t)reg_base_pu.wr_rl_mem, 1, GAUDI2E_HBM_RL_EN_MASK);
++			sys_rmwrite32((mem_addr_t)reg_base_pu.rd_rl_mem, 1, GAUDI2E_HBM_RL_EN_MASK);
++		}
++	}
++}
+diff --git a/include/io/common.h b/include/io/common.h
+index c84b2a1..069184c 100644
+--- a/include/io/common.h
++++ b/include/io/common.h
+@@ -277,6 +277,7 @@
+ void milliunits_to_units(struct sensor_value *s, uint64_t *val);
+ void hl_pcie_init_drain_timeout(struct hl_dev_config *dev_config);
+ void hl_pcie_init_hbm_e2e(struct hl_dev_config *dev_config);
++void hl_rtr_ctrl_init_rl_reg_once(void);
+ #ifdef CONFIG_SOC_FS1_MGMT
+ int fs_init_queues(struct hl_dev_config *dev_config);
+ #endif /* CONFIG_SOC_FS1_MGMT */

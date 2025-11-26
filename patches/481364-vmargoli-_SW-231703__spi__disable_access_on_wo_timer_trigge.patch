@@ -1,0 +1,113 @@
+From e41729867bc47f6a5c517c4bf94dbd0379d55a57 Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Mon, 09 Jun 2025 10:42:38 +0300
+Subject: [PATCH] [SW-231703] spi: disable access on wo timer trigger
+
+Disable access to SPI NOR driver functions during
+wareout time triggering - this will prevent
+collision, when some other thread - for example
+LittleFS logger, will try to access flash.
+After triggering access is reenabled
+
+Change-Id: I46c912bafc7b6f07122eaba9018f9d70cbe744e7
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+---
+
+diff --git a/drivers/flash/spi_nor.c b/drivers/flash/spi_nor.c
+index 784569d..64aee31 100644
+--- a/drivers/flash/spi_nor.c
++++ b/drivers/flash/spi_nor.c
+@@ -2516,6 +2516,39 @@
+ 	return 1;
+ }
+ 
++static int spi_nor_disable(const struct device *dev, bool disable)
++{
++	const struct spi_nor_config *const driver_cfg = dev->config;
++	struct spi_nor_data *driver_data = dev->data;
++
++	if (disable) {
++		if (driver_data->access_disabled) {
++			LOG_WRN("Access to flash already disabled");
++			return 0;
++		}
++
++		acquire_device(dev);
++		spi_invalidate_ctx_dt(&driver_cfg->spi);
++		driver_data->access_disabled = true;
++
++		return 0;
++	}
++
++	/*
++	 * by design there are some unbalanced 'access enable' calls, like for example in
++	 * preboot LKD module and FWUPD module.
++	 */
++	if (!driver_data->access_disabled) {
++		LOG_DBG("Access to flash already enabled");
++		return 0;
++	}
++
++	driver_data->access_disabled = false;
++	release_device(dev);
++
++	return 0;
++}
++
+ #if defined(CONFIG_SPI_NOR_FLASH_HW_WO_PROTECTION)
+ static int spi_nor_is_wareout_attack_detected(const struct device *dev)
+ {
+@@ -2550,6 +2583,7 @@
+ 	sys_write32(spi_wo_timer_max_val_h, hl_cfg->cfg_base_h + hl_cfg->flash_wo_tmr_mx_cfg_h);
+ 	sys_write32(spi_wo_timer_max_val_l, hl_cfg->cfg_base_h + hl_cfg->flash_wo_tmr_mx_cfg_l);
+ 
++	spi_nor_disable(dev, true);
+ 	/* Configure pad sel to CS mode */
+ 	sys_write32(0, hl_cfg->cfg_base_h +  hl_cfg->spi_pad_sel);
+ 
+@@ -2558,44 +2592,11 @@
+ 
+ 	/* Configure pad sel back to GPIO mode */
+ 	sys_write32(1, hl_cfg->cfg_base_h + hl_cfg->spi_pad_sel);
+-
++	spi_nor_disable(dev, false);
+ 	return 0;
+ }
+ 
+ #endif /* CONFIG_SPI_NOR_FLASH_HW_WO_PROTECTION */
+-
+-static int spi_nor_disable(const struct device *dev, bool disable)
+-{
+-	const struct spi_nor_config *const driver_cfg = dev->config;
+-	struct spi_nor_data *driver_data = dev->data;
+-
+-	if (disable) {
+-		if (driver_data->access_disabled) {
+-			LOG_WRN("Access to flash already disabled");
+-			return 0;
+-		}
+-
+-		acquire_device(dev);
+-		spi_invalidate_ctx_dt(&driver_cfg->spi);
+-		driver_data->access_disabled = true;
+-
+-		return 0;
+-	}
+-
+-	/*
+-	 * by design there are some unbalanced 'access enable' calls, like for example in
+-	 * preboot LKD module and FWUPD module.
+-	 */
+-	if (!driver_data->access_disabled) {
+-		LOG_DBG("Access to flash already enabled");
+-		return 0;
+-	}
+-
+-	driver_data->access_disabled = false;
+-	release_device(dev);
+-
+-	return 0;
+-}
+ 
+ static const struct flash_driver_api spi_nor_api = {
+ 	.read = spi_nor_read,
