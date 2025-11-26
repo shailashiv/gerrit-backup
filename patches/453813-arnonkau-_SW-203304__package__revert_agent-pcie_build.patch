@@ -1,0 +1,170 @@
+From c81f3e2848fb17c8e188b04fae5e3223b06fa9c2 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Tue, 01 Oct 2024 22:55:05 +0300
+Subject: [PATCH] [SW-203304] package: revert agent-pcie build
+
+Manually reverted commit
+https://gerrit.habana-labs.com/#/c/412806/
+
+for SW-15774 to resolve the problem with corrupted agent-pcie
+build, that cannot be loaded by fw-loader
+Revert was done manually because of later fixes in same files
+
+Change-Id: Ibc031028089810a3ef2825cf950dcccf131f16bb
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/configs/gaudi2_arm_defconfig b/configs/gaudi2_arm_defconfig
+index 102a487..e688aec 100644
+--- a/configs/gaudi2_arm_defconfig
++++ b/configs/gaudi2_arm_defconfig
+@@ -64,9 +64,9 @@
+ BR2_PACKAGE_BTL=y
+ BR2_PACKAGE_EEPROM_UTIL=y
+ BR2_POST_IMAGE_UBOOT_ITS_TEMPLATE="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/uboot_extended.its"
+-BR2_PACKAGE_AGENT_PCIE=y
++BR2_PACKAGE_ZEPHYR_AGENT_PCIE=y
++BR2_PACKAGE_ZEPHYR_AGENT_HBM=y
+ BR2_PACKAGE_AGENT_SERDES=y
+-BR2_PACKAGE_AGENT_HBM=y
+ BR2_PACKAGE_AGENT_FWL=y
+ BR2_PIC_PIE=n
+ BR2_SSP_NONE=y
+diff --git a/configs/gaudi3_arc_defconfig b/configs/gaudi3_arc_defconfig
+index 62d711e..cb506e1 100644
+--- a/configs/gaudi3_arc_defconfig
++++ b/configs/gaudi3_arc_defconfig
+@@ -36,5 +36,7 @@
+ BR2_FORTIFY_SOURCE_NONE=y
+ BR2_PACKAGE_PALAD_BLOADER=y
+ BR2_PACKAGE_AGENT_HBM=n
+-BR2_PACKAGE_AGENT_PCIE=y
++BR2_PACKAGE_AGENT_PCIE=n
++BR2_PACKAGE_ZEPHYR_AGENT_HBM=n
++BR2_PACKAGE_ZEPHYR_AGENT_PCIE=y
+ BR2_PACKAGE_AGENT_SERDES=y
+diff --git a/package/agent-pcie/agent-pcie.mk b/package/agent-pcie/agent-pcie.mk
+index 055c695..c9cff0e 100644
+--- a/package/agent-pcie/agent-pcie.mk
++++ b/package/agent-pcie/agent-pcie.mk
+@@ -1,11 +1,12 @@
+-AGENT_PCIE_SITE = pcie
++AGENT_PCIE_SITE:= agent-pcie
+ AGENT_PCIE_APP_NAME = pcie
+ AGENT_PCIE_DEPENDENCIES = host-cmake host-lzop host-lz4
+-AGENT_PCIE_APP_MODULES = boot_info i2c-indirect mbedtls soc_init hl_shell mctp pldm
++AGENT_PCIE_APP_MODULES = eeprom mbedtls boot_info i2c-indirect soc_init hl_shell mctp pldm
+ 
+ AGENT_SRC_DIR=$(EMBEDDED_DIR)/zephyr-plugins
+ AGENT_MARGIN_TOOL_SRC_DIR=$(AGENT_SRC_DIR)/margin-tools
+ AGENT_PCIE_SRCDIR=$(AGENT_MARGIN_TOOL_SRC_DIR)/pcie
++AGENT_PCIE_SRC_DIR=$(AGENT_MARGIN_TOOL_SRC_DIR)/pcie
+ AGENT_PCIE_ZEPHYR_SRCDIR=$(EMBEDDED_DIR)/zephyr
+ AGENT_PCIE_APP_PROD_NAME = zephyr_$(HL_TARGET)_$(AGENT_PCIE_APP_NAME)
+ AGENT_PCIE_DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
+@@ -13,7 +14,7 @@
+ AGENT_PCIE_LOCAL_VERSION = $$(sed "s/^.*fw-\\([0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\).*$$/\\1/" $(@D)/localversion-habanalabs)
+ 
+ AGENT_PCIE_CONF_APP_EXTRA_CFLAGS = \
+-		-include $(SPECS_EMB_PROJ_DIR)/$(AGENT_PCIE_DEVICE_NAME)/$(AGENT_PCIE_DEVICE_NAME)_boot_info.h \
++		-include $(EMBEDDED_ROOT)/specs/$(AGENT_PCIE_DEVICE_NAME)/$(AGENT_PCIE_DEVICE_NAME)_boot_info.h \
+ 		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
+ 
+ AGENT_PCIE_CONF_APP_CFLAGS = \
+@@ -22,26 +23,8 @@
+ 		-I$(AGENT_SRC_DIR)/common/include \
+ 		-I$(AGENT_SRC_DIR)/common/include/$(HL_DEV)
+ 
+-AGENT_PCIE_CONF_APP_CFLAGS +=\
+-		-I$(SPECS_EMB_PROJ_DIR) \
+-		-I$(SPECS_EMB_PROJ_DIR)/$(DEV_PREFIX) \
+-		-I$(SPECS_EMB_PROJ_DIR)/common \
+-		-I$(SPECS_EMBEDDED_ROOT) \
+-		-I$(DEVICE_SPECS_ROOT) \
+-		-I$(DEVICE_SPECS_DIR) \
+-		-I$(DEVICE_SPECS_DIR)/asic_reg \
+-		-I$(SPECS_ROOT) \
+-		-I$(SPECS_ROOT)/$(DEV_PREFIX) \
+-		-I$(SPECS_ROOT)/$(DEV_PREFIX)/asic_reg \
+-		-I$(SPECS_EXT_ROOT)
+-
+ AGENT_PCIE_CONF_OPTS  = $(ZEPHYR_CONF_OPTS)
+-ifdef BR2_arcle
+-AGENT_PCIE_CONF_OPTS += -DBOARD=$(ZEPHYR_BOARD_PREFIX)_agent_$(HL_TARGET)
+-endif
+-ifdef BR2_aarch64
+-AGENT_PCIE_CONF_OPTS += -DBOARD=$(ZEPHYR_BOARD_PREFIX)_$(HL_TARGET)
+-endif
++AGENT_PCIE_CONF_OPTS += -DBOARD=hl_$(AGENT_PCIE_DEVICE_NAME)_$(HL_TARGET)
+ 
+ AGENT_PCIE_BUILD_DIR = $(@D)
+ AGENT_PCIE_ZEPHYR_BUILD_DIR ?= $(@D)/zephyr
+@@ -61,8 +44,15 @@
+ AGENT_PCIE_CONF_OPTS += -DFAKE_SECURITY=$(FAKE_SECURITY)
+ AGENT_PCIE_CONF_OPTS += -DBUILD_VERSION="$(AGENT_PCIE_APP_VERSION)"
+ AGENT_PCIE_CONF_OPTS += -DBUILD_MACHINE="$(shell hostname -s)"
+-AGENT_PCIE_CONF_OPTS += -DCMAKE_C_FLAGS="$(AGENT_PCIE_CONF_APP_CFLAGS)"
+-AGENT_PCIE_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMB_PROJ_DIR)"
++AGENT_PCIE_CONF_OPTS += -DCMAKE_C_FLAGS="\
++		-I$(SPECS_EMBEDDED_DIR) \
++		-I$(SPECS_EMBEDDED_DIR)/$(DEV_PREFIX) \
++		-I$(SPECS_ROOT) \
++		-I$(SPECS_EXT_ROOT) \
++		-I$(SPECS_ROOT)/$(DEV_PREFIX)/asic_reg \
++		$(AGENT_PCIE_CONF_APP_CFLAGS)"
++
++AGENT_PCIE_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMBEDDED_DIR)"
+ AGENT_PCIE_CONF_OPTS += -DDEVICE=$(AGENT_PCIE_DEVICE_NAME)
+ AGENT_PCIE_CONF_OPTS += -DAPP_NAME=$(AGENT_PCIE_APP_PROD_NAME)
+ AGENT_PCIE_CONF_OPTS += -DAPP_VERSION=$(AGENT_PCIE_APP_VERSION)
+@@ -116,9 +106,9 @@
+ endef
+ 
+ define AGENT_PCIE_INSTALL_TARGET_CMDS
+-	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.bin $(BINS_DIR)/zephyr_agent_$(AGENT_PCIE_APP_NAME).bin
+-	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_agent_$(AGENT_PCIE_APP_NAME).elf
+-	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.stat $(STATS_DIR)/zephyr_agent_$(AGENT_PCIE_APP_NAME).stat
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.bin $(BINARIES_DIR)/zephyr_agent_$(AGENT_PCIE_APP_NAME).bin
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_agent_$(AGENT_PCIE_APP_NAME).elf
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.stat $(BINARIES_DIR)/zephyr_agent_$(AGENT_PCIE_APP_NAME).stat
+ endef
+ 
+ agent-pcie-configure: $(AGENT_PCIE_DEPENDENCIES)
+diff --git a/package/zephyr/Config.in b/package/zephyr/Config.in
+index f7d036b..4165753 100644
+--- a/package/zephyr/Config.in
++++ b/package/zephyr/Config.in
+@@ -2,3 +2,16 @@
+ 	bool
+ 	help
+ 	  RTOS for ARC/ARM
++
++config BR2_PACKAGE_ZEPHYR_AGENT_HBM
++        bool "Zephyr agent hbm"
++        select BR2_PACKAGE_ZEPHYR
++        help
++          HBM on Zephyr
++
++config BR2_PACKAGE_ZEPHYR_AGENT_PCIE
++        bool "Zephyr agent PCIe"
++        select BR2_PACKAGE_ZEPHYR
++        help
++          PCIe on Zephyr
++
+diff --git a/package/zephyr/zephyr.mk b/package/zephyr/zephyr.mk
+index 9b83ba0..c24f11f 100644
+--- a/package/zephyr/zephyr.mk
++++ b/package/zephyr/zephyr.mk
+@@ -138,8 +138,10 @@
+ ZEPHYR_COMPONENTS_LIST += agent-serdes
+ endif
+ 
+-ifdef BR2_PACKAGE_AGENT_PCIE
+-ZEPHYR_COMPONENTS_LIST += agent-pcie
++ifdef BR2_PACKAGE_ZEPHYR_AGENT_PCIE
++ZEPHYR_PCIE_MODULES = boot_info i2c-indirect mbedtls soc_init hl_shell mctp pldm
++$(call CREATE_ZEPHYR_MARGIN_TOOL_AGENT,pcie, $(PCIE_EXTRA_CONF))
++ZEPHYR_CONFIGURE_CMDS += $(call CREATE_APP_VERSION,pcie,build-agent-pcie)
+ endif
+ 
+ ifdef BR2_PACKAGE_RESET

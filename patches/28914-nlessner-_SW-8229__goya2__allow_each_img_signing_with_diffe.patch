@@ -1,0 +1,144 @@
+From ab660e8e024131b7f34812b9845c5fdebf5f38d2 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sat, 22 Feb 2020 21:28:48 +0200
+Subject: [PATCH] [SW-8229] goya2: allow each img signing with differant keyDefine a configuration for each image primary/secondary and eachsection of image ppboot/arcboot_ram to be signed with a differant keyChange-Id: I6de205c751e9a2e87cd008d58d2d5f5799ba4b98Signed-off-by: Noam Lessner <nlessner@habana.ai>Change-Id: Ie31a870940930577a0a4503a04af3e6ddd678829Signed-off-by: Noam Lessner <nlessner@habana.ai>Change-Id: Id0669694e37ee8a809c8eac80c86f7c060deaad3Signed-off-by: Noam Lessner <nlessner@habana.ai>
+
+Change-Id: Ic1ba32a9edf4c91c7ade77a13004dd9536113d04
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/post-image-spi-arc.sh b/board/habanalabs/common/post-image-spi-arc.sh
+index 3d3ed99..df6f9c0 100755
+--- a/board/habanalabs/common/post-image-spi-arc.sh
++++ b/board/habanalabs/common/post-image-spi-arc.sh
+@@ -43,6 +43,11 @@
+ CUST3_KEY_REVOKE=0
+ CUST4_KEY_REVOKE=0
+ 
++PRIME_IMAGE_PPBOOT_KEY=0
++PRIME_IMAGE_RAM_KEY=0
++SECOND_IMAGE_PPBOOT_KEY=0
++SECOND_IMAGE_RAM_KEY=0
++
+ SBTOOL=../host/bin/sbtool
+ KEY_BASE_NAME=rsa3072
+ HL_KEY_BASE_NAME=hl_${KEY_BASE_NAME}
+@@ -134,12 +139,18 @@
+ function hl_pack_bin {
+ 	FILEPATH=$1
+ 	BSIZE=$2
++	KEY_NUM=$3
++	if [ ${KEY_NUM} -eq 0 ]; then
++		KEY_NAME=$(echo -n "hl_${KEY_BASE_NAME}")
++	else
++		KEY_NAME=$(echo -n "cust${KEY_NUM}_${KEY_BASE_NAME}")
++	fi
+ 	TEMPNAME=${FUNCNAME}-$(basename ${FILEPATH})
+ 	dd status=none conv=sync bs=16 if=${FILEPATH}			> ${TEMPNAME}
+ 	hl_get_ver ${TEMPNAME}
+ 	VPKFILE=${TEMPNAME}.ver.payload.key
+-	cat ${TEMPNAME}.ver ${TEMPNAME} ${HL_KEY_BASE_NAME}.pub		> ${VPKFILE}
+-	hl_sign_bin ${VPKFILE} ${HL_KEY_BASE_NAME}
++	cat ${TEMPNAME}.ver ${TEMPNAME} ${KEY_NAME}.pub			> ${VPKFILE}
++	hl_sign_bin ${VPKFILE} ${KEY_NAME}
+ 	SIGBINFILE=${VPKFILE}.sig.bin
+ 	cat ${VPKFILE} ${VPKFILE}.sig					> ${SIGBINFILE}
+ 	hl_get_size ${SIGBINFILE} 4
+@@ -166,8 +177,7 @@
+ 
+ function hl_sec_fw {
+ 	FILE=${1}
+-	if [ ${2} -ge 64 ]
+-	then
++	if [ ${2} -ge 64 ]; then
+ 		VERSION=$(printf "%016x" $(( ~$((1<<${2})) )))
+ 		VERSION+=$(printf "%016x" $(( ~0 )))
+ 	else
+@@ -178,16 +188,14 @@
+ 	dd status=none conv=notrunc seek=0 bs=16 if=${FILE}.tmp of=${FILE}
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+-		if [ ${2} -ge 64 ]
+-			then
++		if [ ${2} -ge 64 ]; then
+ 				VERSION=$(printf "%016x" $((1<<${2})))
+ 				VERSION+=$(printf "%016x" $((0)))
+ 			else
+ 				VERSION=$(printf "%016x" $((0)))
+ 				VERSION+=$(printf "%016x" $((1<<${2})))
+ 		fi
+-		for i in {0..3}
+-		do
++		for i in {0..3}; do
+ 			DWORD=$(echo ${VERSION} | xxd -r -p | xxd -g4 | cut -d' ' -f$(( 5 - ${i} )))
+ 			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 59 + ${i}))_r.data_in_r[31:0]}"
+ 			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.txt
+@@ -205,8 +213,7 @@
+ 	dd status=none conv=notrunc seek=$(( ${KEY_OFFSET}*2 + 1 )) bs=16 if=${FILE}.tmp of=${FILE}
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+-		for i in {0..7}
+-		do
++		for i in {0..7}; do
+ 			DWORD=$(xxd -e -c32 -g4 ${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
+ 			OFFSET=$(( $(( ${KEY_OFFSET}*8 )) +  ${i} ))
+ 			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 18 + ${OFFSET}))_r.data_in_r[31:0]}"
+@@ -256,6 +263,11 @@
+ }
+ 
+ pushd ${BINARIES_DIR}
++	for i in {1..4}; do
++		CUST=cust${i}
++		hl_gen_cert ${CUST} "Habana Embedded Team"
++	done
++
+ 	## create 64k empty padded start image
+ 	dd status=none conv=sync count=1 bs=64K if=/dev/zero of=${HL_DEV}-spi-flash.bin
+ 	dd status=none conv=sync count=12 bs=16 if=/dev/zero | tr '\000' $'\xFF' > ${HL_DEV}-spi-otp-flash.bin
+@@ -267,7 +279,7 @@
+ 	hl_img_offset ${HL_DEV}-spi-flash.bin ${PRIME_IMAGE}
+ 
+ 	## To be populated into ICCM
+-	hl_pack_bin ${ARCBOOT_BINFILE} 64K
++	hl_pack_bin ${ARCBOOT_BINFILE} 64K ${PRIME_IMAGE_RAM_KEY}
+ 	# trunk to round 128K as DMA spi can copy chunks of 1KB only
+ 	truncate -s 128K ${HL_DEV}-spi-flash.bin
+ 
+@@ -282,14 +294,14 @@
+ 	hl_join_bin ${PPBOOT} ${PCIE_PHY} ${PPBOOT_PCIE_PHY_BINFILE}
+ 
+ 	# pack and sign image
+-	hl_pack_bin ${PPBOOT_PCIE_PHY_BINFILE} 64k
++	hl_pack_bin ${PPBOOT_PCIE_PHY_BINFILE} 64K ${PRIME_IMAGE_PPBOOT_KEY}
+ 	truncate -s 192K ${HL_DEV}-spi-flash.bin
+ 	rm -rf ${PPBOOT_PCIE_PHY_BINFILE}
+ 
+ 	# update SECONDARY image offset in start 64k padded area
+ 	hl_img_offset ${HL_DEV}-spi-flash.bin ${SECOND_IMAGE}
+ 	## To be populated into ICCM
+-	hl_pack_bin ${ARCBOOT_BINFILE} 64K
++	hl_pack_bin ${ARCBOOT_BINFILE} 64K ${SECOND_IMAGE_RAM_KEY}
+ 	truncate -s 256K ${HL_DEV}-spi-flash.bin
+ 
+ 	# To be populated into FW SRAM
+@@ -297,7 +309,7 @@
+ 	PCIE_PHY=$(echo "$PCIE_PHY_BINFILE" | cut -f 1 -d '.')
+ 	PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
+ 	hl_join_bin ${PPBOOT} ${PCIE_PHY} ${PPBOOT_PCIE_PHY_BINFILE}
+-	hl_pack_bin ${PPBOOT_PCIE_PHY_BINFILE} 64k
++	hl_pack_bin ${PPBOOT_PCIE_PHY_BINFILE} 64K ${SECOND_IMAGE_PPBOOT_KEY}
+ 	truncate -s 320K ${HL_DEV}-spi-flash.bin
+ 	rm -rf ${PPBOOT_PCIE_PHY_BINFILE}
+ 
+@@ -313,10 +325,8 @@
+ 	hl_sec_key ${HL_DEV}-spi-otp-flash.bin hl 0
+ 
+ 	# generate 4 customer keys and hash them to spi security
+-	for i in {1..4}
+-	do
++	for i in {1..4}; do
+ 		CUST=cust${i}
+-		hl_gen_cert ${CUST} "Habana Embedded Team"
+ 		hl_sec_key ${HL_DEV}-spi-otp-flash.bin ${CUST} ${i}
+ 	done
+ 

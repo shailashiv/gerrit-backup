@@ -1,0 +1,276 @@
+From 9693fe40614851829e77fbc009acd26c9a61ea2f Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Thu, 21 Nov 2024 22:05:22 +0000
+Subject: [PATCH] Revert "[SW-195861] gaudi3: refactor pldm packages creation scripts"
+
+This reverts commit 134eb5129c75bcae065781334829391dc6b1dd5a.
+
+Change-Id: I3c3cb2da3fc937af2dda5eaadcaa2b13994c2928
+---
+
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-eeprom.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-eeprom.sh
+index cf663e7..a757a18 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-eeprom.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-eeprom.sh
+@@ -2,16 +2,16 @@
+ 
+ source ${BUILDROOT_ROOT}/board/habanalabs/${DEV_PREFIX}/create-pldm-fwup-package.sh
+ 
+-if [[ ! -f ${AGENT_FW_LOADER_FIT} ]]; then
+-        echo "$0: FW loader agent (${AGENT_FW_LOADER_FIT}) not found - cannot create PLDM package"
++VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/agent-fwl-custom/localversion-habanalabs"
++
++if [[ ! -f ${VERSION_FILE} ]]; then
++        echo "$0: FW loader agent not built - cannot create PLDM package"
+         exit 1
+ fi
+ 
+-if [[ ! -f ${EEPROM_FIT} ]]; then
+-        echo "$0: EEPORM fit (${EEPROM_FIT}) not found - cannot create PLDM package"
+-        exit 1
+-fi
+-
++AGENT_FW_LOADER_FIT_VERSION=$(cat ${VERSION_FILE})
++AGENT_FW_LOADER_FIT_VERSION=${AGENT_FW_LOADER_FIT_VERSION:1} # remove leading '-'
++EEPROM_VERSION=$(git describe --dirty --match="hl-${DEV_PREFIX}-*" 2>/dev/null | sed 's/.*-fw-\([^-]*\).*/\1/' | awk -F. '{ printf "eeprom-%d.%d.%d", $1, $2, $3 }')
+ PACKAGE_PREFIX="${ITBS_DIR}${DEV_PREFIX}-pldm-package-eeprom"
+ PACKAGE_JSON="${PACKAGE_PREFIX}.json"
+ PACKAGE_BIN="${PACKAGE_PREFIX}.bin"
+@@ -23,7 +23,7 @@
+                              --pci-device-id "${PCI_DEVICE_ID}" \
+                              --pci-subsystem-id "${PCI_SUBSYSTEM_ID}" \
+                              --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_FW_LOADER_1)) "${AGENT_FW_LOADER_FIT_VERSION}" \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_EEPROM))      "${EEPROM_FIT_VERSION}"          \
++                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_EEPROM)) "${EEPROM_VERSION}" \
+                              --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_FW_LOADER_2)) "${AGENT_FW_LOADER_FIT_VERSION}"
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+@@ -32,10 +32,9 @@
+ fi
+ 
+ ${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} ${PACKAGE_BIN} ${PACKAGE_JSON} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${EEPROM_FIT} \
+-        ${AGENT_FW_LOADER_FIT}
+-
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-eeprom.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+         echo "$0: ${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} failed with ${rv}"
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-pcie.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-pcie.sh
+index e32b7e7..ea6d462 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-pcie.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-pcie.sh
+@@ -1,3 +1,3 @@
+ #!/usr/bin/env bash
+ 
+-${BUILDROOT_ROOT}/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh pcie 1 ${AGENT_PCIE_FIT} ${AGENT_PCIE_FIT_VERSION}
++${BUILDROOT_ROOT}/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh pcie 1
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-serdes.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-serdes.sh
+index 23dda75..8887b62 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-serdes.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool-serdes.sh
+@@ -1,3 +1,3 @@
+ #!/usr/bin/env bash
+ 
+-${BUILDROOT_ROOT}/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh serdes 0 ${AGENT_SERDES_FIT} ${AGENT_SERDES_FIT_VERSION}
++${BUILDROOT_ROOT}/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh serdes 0
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh
+index 9abe414..9ffee68 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-margin-tool.sh
+@@ -4,32 +4,40 @@
+ 
+ MARGIN_TOOL="${1}"
+ COMPONENT_IDENTIFIER=$(($2))
+-MARGIN_TOOL_ITB_PATH=$3
+-MARGIN_TOOL_FIT_VERSION=$4
+ 
+-if [[ ! -f ${MARGIN_TOOL_ITB_PATH} ]]; then
+-        echo "$0: ${MARGIN_TOOL} agent not found ($MARGIN_TOOL_ITB_PATH) - cannot create PLDM package"
++VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/agent-${MARGIN_TOOL}-custom/localversion-habanalabs"
++
++# Temporary path support, needs to be removed after all agents will be split out of zephyr package
++if [[ ! -f ${VERSION_FILE} ]]; then
++	VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/zephyr-custom/build-agent-${MARGIN_TOOL}/localversion-habanalabs"
++fi
++
++if [[ ! -f ${VERSION_FILE} ]]; then
++        echo "$0: ${MARGIN_TOOL} agent not built - cannot create PLDM package"
+         exit 1
+ fi
+ 
++AGENT_FIT_VERSION=$(cat ${VERSION_FILE})
++AGENT_FIT_VERSION=${AGENT_FIT_VERSION:1} # remove leading '-'
+ PACKAGE_PREFIX="${ITBS_DIR}${DEV_PREFIX}-pldm-package-${MARGIN_TOOL}"
+ PACKAGE_JSON="${PACKAGE_PREFIX}.json"
+ PACKAGE_BIN="${PACKAGE_PREFIX}.bin"
+ 
+ ${PLDM_FWUP_JSON_CTOR_SCRIPT} --output-file ${PACKAGE_JSON} \
+                              --package-release-date-time "${PACKAGE_RELEASE_DATE_TIME}" \
+-                             --package-version "${MARGIN_TOOL_FIT_VERSION}" \
+-                             --component-image-set-version "${MARGIN_TOOL_FIT_VERSION}" \
++                             --package-version "${AGENT_FIT_VERSION}" \
++                             --component-image-set-version "${AGENT_FIT_VERSION}" \
+                              --pci-device-id "${PCI_DEVICE_ID}" \
+                              --pci-subsystem-id "${PCI_SUBSYSTEM_ID}" \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) ${COMPONENT_IDENTIFIER} "${MARGIN_TOOL_FIT_VERSION}"
++                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) ${COMPONENT_IDENTIFIER} "${AGENT_FIT_VERSION}"
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+         echo "$0: ${PLDM_FWUP_JSON_CTOR_SCRIPT} failed with ${rv}"
+         exit ${rv}
+ fi
+ 
+-${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} ${PACKAGE_BIN} ${PACKAGE_JSON} ${MARGIN_TOOL_ITB_PATH}
++${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} ${PACKAGE_BIN} ${PACKAGE_JSON} \
++        ${ITBS_DIR}${DEV_PREFIX}-agent-${MARGIN_TOOL}-fit.itb
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+         echo "$0: ${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} failed with ${rv}"
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-revoke-key.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-revoke-key.sh
+index d986c14..5d10021 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-revoke-key.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-revoke-key.sh
+@@ -2,16 +2,15 @@
+ 
+ source ${BUILDROOT_ROOT}/board/habanalabs/${DEV_PREFIX}/create-pldm-fwup-package.sh
+ 
+-if [[ ! -f ${AGENT_FW_LOADER_FIT} ]]; then
+-        echo "$0: FW loader agent (${AGENT_FW_LOADER_FIT}) doesn't exist - cannot create PLDM package"
++VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/agent-fwl-custom/localversion-habanalabs"
++
++if [[ ! -f ${VERSION_FILE} ]]; then
++        echo "$0: FW loader agent not built - cannot create PLDM package"
+         exit 1
+ fi
+ 
+-if [[ ! -f ${REVOKE_KEY_FIT} ]]; then
+-        echo "$0: Revoke key (${AGENT_FW_LOADER_FIT}) doesn't exist - cannot create PLDM package"
+-        exit 1
+-fi
+-
++AGENT_FW_LOADER_FIT_VERSION=$(cat ${VERSION_FILE})
++AGENT_FW_LOADER_FIT_VERSION=${AGENT_FW_LOADER_FIT_VERSION:1} # remove leading '-'
+ PACKAGE_PREFIX="${ITBS_DIR}${DEV_PREFIX}-pldm-package-revoke-key"
+ PACKAGE_JSON="${PACKAGE_PREFIX}.json"
+ PACKAGE_BIN="${PACKAGE_PREFIX}.bin"
+@@ -32,8 +31,8 @@
+ fi
+ 
+ ${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} ${PACKAGE_BIN} ${PACKAGE_JSON} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${REVOKE_KEY_FIT}
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-revoke_key.itb
+ 
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-unified.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-unified.sh
+index 0afd2dd..0b6ecef 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-unified.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-unified.sh
+@@ -2,24 +2,20 @@
+ 
+ source ${BUILDROOT_ROOT}/board/habanalabs/${DEV_PREFIX}/create-pldm-fwup-package.sh
+ 
++VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/agent-fwl-custom/localversion-habanalabs"
++EROM_VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/baremetal-custom/localversion-habanalabs"
++
++if [[ ! -f ${VERSION_FILE} ]]; then
++        echo "$0: FW loader agent not built - cannot create PLDM package"
++        exit 1
++fi
++
++AGENT_FW_LOADER_FIT_VERSION=$(cat ${VERSION_FILE})
++AGENT_FW_LOADER_FIT_VERSION=${AGENT_FW_LOADER_FIT_VERSION:1} # remove leading '-'
++EROM_FW_LOADER_FIT_VERSION=$(cat ${EROM_VERSION_FILE} | sed -E 's/.*-([0-9]+\.[0-9]+\.[0-9]+)-{0,1}[^-]*-fw-([0-9]+\.[0-9]+\.[0-9]+).*/main-\1-rec-\2/')
+ PACKAGE_PREFIX="${ITBS_DIR}${DEV_PREFIX}-pldm-package-unified"
+ PACKAGE_JSON="${PACKAGE_PREFIX}.json"
+ PACKAGE_BIN="${PACKAGE_PREFIX}.bin"
+-
+-if [[ ! -f ${AGENT_FW_LOADER_FIT} ]]; then
+-        echo "$0: FW loader agent (${AGENT_FW_LOADER_FIT}) doesn't exist - cannot create PLDM package"
+-        exit 1
+-fi
+-
+-if [[ ! -f ${EROM_FW_LOADER_FIT} ]]; then
+-        echo "$0: EROM FW loader agent (${EROM_FW_LOADER_FIT}) doesn't exist - cannot create PLDM package"
+-        exit 1
+-fi
+-
+-if [[ ! -f ${CPLD_FIT} ]]; then
+-        echo "$0: CPLD FW file (${CPLD_FIT}) doesn't exist - cannot create PLDM package"
+-        exit 1
+-fi
+ 
+ ${PLDM_FWUP_JSON_CTOR_SCRIPT} --output-file ${PACKAGE_JSON} \
+                              --package-release-date-time "${PACKAGE_RELEASE_DATE_TIME}" \
+@@ -31,8 +27,7 @@
+                              --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_SPI))    "${AGENT_FW_LOADER_FIT_VERSION}" \
+                              --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) "${AGENT_FW_LOADER_FIT_VERSION}" \
+                              --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_EROM))   "${EROM_FW_LOADER_FIT_VERSION}"  \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) "${AGENT_FW_LOADER_FIT_VERSION}" \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_CPLD))   "${CPLD_FIT_VERSION}"
++                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) "${AGENT_FW_LOADER_FIT_VERSION}"
+ 
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+@@ -41,12 +36,11 @@
+ fi
+ 
+ ${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} ${PACKAGE_BIN} ${PACKAGE_JSON} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${EROM_FW_LOADER_FIT} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${CPLD_FIT}
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit_erom.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb
+ 
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-update-svn.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-update-svn.sh
+index dd5300c..6ed9fdc 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-update-svn.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-update-svn.sh
+@@ -2,16 +2,15 @@
+ 
+ source ${BUILDROOT_ROOT}/board/habanalabs/${DEV_PREFIX}/create-pldm-fwup-package.sh
+ 
+-if [[ ! -f ${AGENT_FW_LOADER_FIT} ]]; then
+-        echo "$0: FW loader agent not found (${AGENT_FW_LOADER_FIT}) - cannot create PLDM package"
++VERSION_FILE="${BUILDROOT_ROOT}/output/${DEV_PREFIX}_arc/build/agent-fwl-custom/localversion-habanalabs"
++
++if [[ ! -f ${VERSION_FILE} ]]; then
++        echo "$0: FW loader agent not built - cannot create PLDM package"
+         exit 1
+ fi
+ 
+-if [[ ! -f ${UPDATE_SVN_FIT} ]]; then
+-        echo "$0: Update SVN not found (${UPDATE_SVN_FIT}) - cannot create PLDM package"
+-        exit 1
+-fi
+-
++AGENT_FW_LOADER_FIT_VERSION=$(cat ${VERSION_FILE})
++AGENT_FW_LOADER_FIT_VERSION=${AGENT_FW_LOADER_FIT_VERSION:1} # remove leading '-'
+ PACKAGE_PREFIX="${ITBS_DIR}${DEV_PREFIX}-pldm-package-update-svn"
+ PACKAGE_JSON="${PACKAGE_PREFIX}.json"
+ PACKAGE_BIN="${PACKAGE_PREFIX}.bin"
+@@ -32,8 +31,8 @@
+ fi
+ 
+ ${PLDM_FWUP_PACKAGE_CTOR_SCRIPT} ${PACKAGE_BIN} ${PACKAGE_JSON} \
+-        ${AGENT_FW_LOADER_FIT} \
+-        ${UPDATE_SVN_FIT}
++        ${ITBS_DIR}${DEV_PREFIX}-agent-fw_loader-fit.itb \
++        ${ITBS_DIR}${DEV_PREFIX}-update_svn.itb
+ 
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then

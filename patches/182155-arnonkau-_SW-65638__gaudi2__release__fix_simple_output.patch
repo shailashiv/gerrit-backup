@@ -1,0 +1,77 @@
+From bb2917c6f4c08f74286ee17efd1f68d2e236575a Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Tue, 22 Feb 2022 22:25:14 +0200
+Subject: [PATCH] [SW-65638] gaudi2: release: fix simple output
+
+Connect to the OAM output remotely, *only* output is available
+at this point. May add bi-directional in the future
+
+Change-Id: I31bf0776a3bd80af1fbb7aba8315987c816f643a
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index 17ee2b7..bb40ff7 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -1375,6 +1375,40 @@
+ 	return 0
+ }
+ 
++function console_simple_out()
++{
++	local port=$1
++	local run_args
++
++	pinfo "Console on [OAM${port}]"
++	run_args=( if \[ ! -e /dev/ttyOAM${port} \]\; then echo "Uart close, use --open-uart" \; else stty -F /dev/ttyOAM${port} -echo raw  \&\& echo "Minimal output console" \&\& cat /dev/ttyOAM${port}\;echo err=\$?\;fi)
++	hlp_ssh -p ${bmc_oam_ssh_passwd} ${bmc_oam_ssh_user}@${bmc_oam} "${run_args[@]}"
++}
++
++function console_ping()
++{
++	local port_num=$1
++	local device_port=/dev/ttyOAM${port_num}
++
++hlp_ssh -p ${bmc_oam_ssh_passwd} ${bmc_oam_ssh_user}@${bmc_oam} <<-END
++echo -n "T" > ${device_port}
++END
++}
++
++function handle_console_op()
++{
++	local port
++
++	[ ${console_f:-0} -eq 0 ] && return 0
++	[ ${#console_args[@]} -eq 0 ] && return 1
++
++	port=${console_args[0]:-0}
++	console_simple_out $port ${console_args[@]}
++
++	stage=exit
++	return 0
++}
++
+ function get_user_params()
+ {
+ 	local err
+@@ -1518,9 +1552,9 @@
+ 			#unset fwl_args[0]
+ 			;;
+ 		--console|--oam-con-out)
+-			rmt_run=bmc
++			console_f=1
+ 			no_log_f=1
+-			rmt_run_args=(stty -F /dev/ttyOAM${1:-0} -echo raw  \;cat /dev/ttyOAM${1:-0})
++			console_args=(${args[@]})
+ 			;;
+ 		--pci|--hl-lspci)
+ 			hl_lspci_f=1
+@@ -1929,6 +1963,7 @@
+ 	local err=0
+ 	show_env_op
+ 	rmt_run_op
++	handle_console_op
+ 	host_depended_ops
+ 	err=$?
+ 	run_test_func

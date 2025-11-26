@@ -1,0 +1,152 @@
+From 2cf5d0dfe990965f24c02a96feab09e3ee841600 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Tue, 01 Feb 2022 03:12:03 +0200
+Subject: [PATCH] WIP bidirectional console
+
+Change-Id: I415c72f4b4f0859c7122756a51045c4f5f2dd7ef
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/console-agent.rc b/scripts/fwi/console-agent.rc
+new file mode 100644
+index 0000000..26ea2ff
+--- /dev/null
++++ b/scripts/fwi/console-agent.rc
+@@ -0,0 +1,65 @@
++saved_cfg=()
++
++function serial_save_cfg()
++{
++	saved_cfg=($(stty -F $1 -g))
++}
++
++function serial_restore_cfg()
++{
++	stty -F $1 $saved_cfg
++}
++
++function serial_set_port()
++{
++	stty -F $1 raw -echo isig intr ^Q quit undef susp undef
++}
++
++function serial_req_res()
++{
++	local port=$1
++	local pid
++
++	shift
++
++	# spawn
++	(read -n128 -t10 RESP < $port; echo $RESP)&
++	pid=$!
++	# read -p "" -t 0.2
++	sleep 0.2s
++	echo -n $* > $1
++	wait $pid
++	return $?
++}
++
++function serial_console()
++{
++	local port=$1
++	local pid
++
++	serial_save_cfg
++	serial_set_port
++	(cat > $1)&
++	pid=$!
++	serial_restore_cfg
++	# should be wrapped so the kill will
++	# be triggered by trap
++	kill $pid
++}
++
++# in script use the trap to restore serial
++
++
++function console_bidirect()
++{
++(
++set -e
++prev_settings="$(stty -g -F /dev/ttyACM$1)"
++trap 'stty "${prev_settings}" -F /dev/ttyACM${1}' EXIT
++stty -F /dev/ttyACM${1} raw -echo -echoe -echok -echoctl -echoke
++cat < /dev/ttyACM${1} &
++cat > /dev/ttyACM${1}
++)
++}
++
++
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index d02669d..77ca155 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -1215,6 +1215,47 @@
+ 	return 0
+ }
+ 
++
++function console_simple_out()
++{
++	local port=$1
++	local run_args
++
++	pinfo "Console on [OAM${port}]"
++	run_args=(stty -F /dev/ttyOAM${port} -echo raw  \;echo "Minimal output console"\; cat /dev/ttyOAM${port})
++
++	hlp_ssh -p ${bmc_oam_ssh_passwd} ${bmc_oam_ssh_user}@${bmc_oam} "${run_args[@]}"
++}
++
++function console_bidirect()
++{
++	local port=$1
++	local run_args
++	run_args=(source \${HOME}/fwl/console-agent.rc\; console_bidirect $port)
++	hlp_ssh -p ${bmc_oam_ssh_passwd} ${bmc_oam_ssh_user}@${bmc_oam} "${run_args[@]}"
++	[ $? -ne 0 ] && {
++		host_cp_to ${scr_dir}/console-agent.rc \${HOME}/fwl/
++		[ $? -ne 0 ] && return 1
++	}
++	hlp_ssh -p ${bmc_oam_ssh_passwd} ${bmc_oam_ssh_user}@${bmc_oam} "${run_args[@]}"
++	#[ $? -ne 0 ] && return 1
++}
++
++function handle_console_op()
++{
++	local port
++
++	[ ${console_f:-0} -eq 0 ] && return 0
++	[ ${#console_args[@]} -eq 0 ] && return 1
++
++	port=${console_args[0]:-0}
++	console_bidirect ${console_args[@]}
++	[ $? -ne 0 ] && console_simple_out $port ${console_args[@]}
++
++	stage=exit
++	return 0
++}
++
+ function get_user_params()
+ {
+ 	local err
+@@ -1357,9 +1398,9 @@
+ 			#unset fwl_args[0]
+ 			;;
+ 		--console|--oam-con-out)
+-			rmt_run=bmc
++			console_f=1
++			console_args=${args[@]}
+ 			no_log_f=1
+-			rmt_run_args=(stty -F /dev/ttyOAM${1:-0} -echo raw  \;cat /dev/ttyOAM${1:-0})
+ 			;;
+ 		--pci|--hl-lspci)
+ 			hl_lspci_f=1
+@@ -1765,6 +1806,7 @@
+ 	show_env_op
+ 	login_shell_op
+ 	rmt_run_op
++	handle_console_op
+ 	host_depended_ops
+ 	err=$?
+ 	run_test_func

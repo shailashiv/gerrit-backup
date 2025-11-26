@@ -1,0 +1,290 @@
+From dd2fdf35bed733fd6c8ce16e5d3fdd198c344221 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sat, 29 Jan 2022 16:00:36 +0200
+Subject: [PATCH] [SW-65638] gaudi2: release: change the --* args
+
+Change the auto evaluate variable that holds the command line
+related arguments. It uses the original variable name wit the addition
+of a suffix.
+
+Two variables are created. ${var}_args and ${var}_f.
+The ${var}_f set to 1, when the parser handles it. The second arguments
+holds the arguments supplied with the command.
+
+Change-Id: I572074a53588dc3b2371ce313d77a3aecb6fd346
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index 317bb89..00fe0e6 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -429,20 +429,20 @@
+ 
+ function create_config_file_op()
+ {
++	[ ${create_cfg_f:-0} -eq 0 ] && return 0
++	[ ${#create_cfg_args[@]} -eq 0 ] && return 1
+ 
+-	[ "${create_cfg}" == "" ] && return 0
+-
+-	[ -f ${create_cfg:-""} ] && {
++	[ -f ${create_cfg_args:-" "} ] && {
+ 		hlp_answer_yn "File exist. Is it ok to overrun it?"
+ 		[ $? -ne 0 ] && return 1
+-		touch $create_cfg
++		touch $create_cfg_args
+ 		[ $? -ne 0 ] && {
+ 			perr "Can't create file $1, assuming permission issue"
+ 			return 1
+ 		}
+ 	}
+ 
+-	dump_env 0 $create_cfg
++	dump_env 0 $create_cfg_args
+ 
+ 	exit 0
+ }
+@@ -1364,7 +1364,7 @@
+ 				exit 1
+ 			}
+ 			pinfo -l 3 CMD="$cmd ($manip_cmd)=${args[@]}"
+-			eval "${manip_cmd}=(${args[@]})"
++			eval "${manip_cmd}_args=(${args[@]})"
+ 			eval ${manip_cmd}_f=1
+ 			auto_created_vars_list+=($cmd)
+ 			;;
+@@ -1546,7 +1546,7 @@
+ {
+ 	[[ ${config_link_f:-0} -ne 1 ]] && return 0
+ 
+-	case ${config_link[0]:-"NONE"} in
++	case ${config_link_args[0]:-"NONE"} in
+ 	1|on|enb|enable)
+ 		config_set_link ${cfg_file}
+ 		;;
+@@ -1568,7 +1568,7 @@
+ {
+ 	[[ ${snapshot_f:-0} -ne 1 ]] && return 0
+ 
+-	case ${snapshot[0]:-"NONE"} in
++	case ${snapshot_args[0]:-"NONE"} in
+ 	1|on|enb|enable|update)
+ 		[ -f ~/.hl_fwi.cfg.snapshot.sus ] && {
+ 			mv ~/.hl_fwi.cfg.snapshot{.sus,}
+diff --git a/scripts/fwi/hls_platform.rc b/scripts/fwi/hls_platform.rc
+index 03a5557..ca80e5c 100644
+--- a/scripts/fwi/hls_platform.rc
++++ b/scripts/fwi/hls_platform.rc
+@@ -3,6 +3,7 @@
+ 
+ mods_var_register i2c_scan
+ mods_var_register i2c_send
++mods_var_register btl_mode
+ mods_var_register bmc_raw
+ mods_var_register oam_enable_uart
+ mods_var_register oam_reset
+@@ -550,6 +551,8 @@
+ 	local i pciaddr oam_cpld_rev
+ 	local lspci_devs_list=()
+ 
++	[ ${show_status_f:-0} -eq 0 ] && return 0
++
+ 	if [[ "$rmt_host" != "" && ${rmt_host_ignore_f} -eq 0 ]]; then
+ 		pinfo "$(host_run "echo [HOST] hostname: \$(hostname), uptime: \$(uptime)")"
+ 		[ ${#lspci_devs_list[@]} -eq 0 ] && lspci_devs_list=($(host_lspci))
+@@ -772,6 +775,8 @@
+ {
+ 	local mode
+ 
++	[ ${#recovery_args[@]} -eq 0 ] && return 0
++
+ 	case ${recovery_args[0]:-"NONE"} in
+ 	NONE) return 0;;
+ 	off|OFF|dis|disable) mode=disable ;;
+@@ -805,7 +810,8 @@
+ 
+ function oams_set_btl_mode_op()
+ {
+-	[ ${#btl_mode[@]} -eq 0 ] && return 0
++	[ ${btl_mode_f:-0} -eq 0 ] && return 0
++	[ ${#btl_mode_args[@]} -lt 1 ] && return 1
+ 	run_per_selected_devs  oam_set_btl_mode  ${btl_mode}
+ 	[ $? -ne 0 ] && \
+ 		pwarn "[HLS] uknown BTL mode argument: $btl_mode. Ignoring"
+@@ -826,7 +832,10 @@
+ 
+ function oams_full_pwr_op()
+ {
+-	case ${oam_full_pwr:-"NONE"} in
++	[ ${oam_full_pwr_f:-0} -eq 0 ] && return 0
++	[ ${#oam_full_args[@]} -lt 1 ] && return 1
++
++	case ${oam_full_pwr_args:-"NONE"} in
+ 	0|off)
+ 		run_per_selected_devs oam_full_power off
+ 		;;
+@@ -839,7 +848,7 @@
+ 	NONE)
+ 		;;
+ 	*)
+-		pwarn "[HLS] uknown power mode argument: ${oams_pwr}. Ignoring"
++		pwarn "[HLS] uknown power mode argument: ${oam_full_pwr}. Ignoring"
+ 		return 1
+ 		;;
+ 	esac
+@@ -856,7 +865,10 @@
+ 
+ function oams_board_pwr_op()
+ {
+-	case ${oam_board_pwr:-"NONE"} in
++	[ ${oam_board_pwr_f:-0} -eq 0 ] && return 0
++	[ ${#oam_board_pwr_args[@]} -lt 1 ] && return 1
++
++	case ${oam_board_pwr_args:-"NONE"} in
+ 	0|off)
+ 		run_per_selected_devs oam_board_power
+ 		;;
+@@ -869,7 +881,7 @@
+ 	NONE)
+ 		;;
+ 	*)
+-		pwarn "[HLS] uknown power mode argument: ${oams_pwr}. Ignoring"
++		pwarn "[HLS] uknown board power mode argument: ${oam_board_pwr_args}. Ignoring"
+ 		return 1
+ 		;;
+ 	esac
+@@ -889,7 +901,11 @@
+ # Sival's CPLD reset
+ function oams_rst_op()
+ {
+-	case ${oam_reset:-"NONE"} in
++
++	[ ${oam_reset_f:-0} -eq 0 ] && return 0
++	[ ${#oam_reset_args[@]} -lt 1 ] && return 1
++
++	case ${oam_reset_args[0]} in
+ 	0|off)
+ 		pwarn "OAM reset off, not supported yet"
+ 		;;
+@@ -897,13 +913,12 @@
+ 		pwarn "OAM reset on, not supported yet"
+ 		;;
+ 	2|cyc|cycle)
+-		#run_per_all_devs oam_reset 2
+ 		run_per_selected_devs oam_reset_cycle
+ 		;;
+ 	NONE)
+ 		;;
+ 	*)
+-		pwarn "[HLS] uknown power mode argument: ${oams_pwr}. Ignoring"
++		pwarn "[HLS] uknown reset mode argument: ${oam_reset_args[0]}. Ignoring"
+ 		return 1
+ 		;;
+ 	esac
+@@ -912,7 +927,11 @@
+ function sys_pwr_op()
+ {
+ 	local msg
+-	case ${sys_pwr:-"NONE"} in
++
++	[ ${sys_pwr_f:-0} -eq 0 ] && return 0
++	[ ${#sys_pwr_args[@]} -lt 1 ] && return 1
++
++	case ${sys_pwr_args} in
+ 	NONE)
+ 		return 1
+ 		;;
+@@ -944,7 +963,11 @@
+ function his_pwr_op()
+ {
+ 	local msg err=0
+-	case ${hib_pwr:-"NONE"} in
++
++	[ ${hib_pwr_f:-0} -eq 0 ] && return 0
++	[ ${#hib_pwr_args[@]} -lt 1 ] && return 1
++
++	case ${hib_pwr_args} in
+ 	NONE)
+ 		return 0
+ 		;;
+@@ -984,38 +1007,52 @@
+ function bmc_i2c_send_op()
+ {
+ 	local ret err
++
++	[ ${i2c_send_f:-0} -eq 0 ] && return 0
++	[ ${#i2c_send_args[@]} -lt 1 ] && return 1
++
+ 	pinfo -l 2 "bmc_i2c_send ${i2c_send}"
+-	ret=($(bmc_i2c_send $(delimited_to_array ',' ${i2c_send})))
++	ret=($(bmc_i2c_send $(delimited_to_array ',' ${i2c_send_args[@]})))
+ 	err=$?
+-	pinfo "I2C Res: ${ret[@]}"
++	pinfo "I2C Res[${#ret[@]}]: ${ret[@]}"
+ }
+ 
+ function bmc_raw_op()
+ {
+ 	local ret err
+-	pinfo -l 2 "bmc_raw ${bmc_raw}"
+-	ret=($(bmc_raw_cmd $(delimited_to_array ',' ${bmc_raw})))
++
++	[ ${bmc_raw_f:-0} -eq 0 ] && return 0
++	[ ${#bmc_raw_args[@]} -lt 1 ] && return 1
++	pinfo -l 2 "bmc_raw ${bmc_raw_args[@]}"
++	ret=($(bmc_raw_cmd $(delimited_to_array ',' ${bmc_raw_args[@]})))
+ 	err=$?
+-	pinfo "Res: ${ret[@]}"
++	pinfo "Res[${#ret[@]}]: ${ret[@]}"
+ }
+ 
+ 
+ function oam_i2c_scan_op()
+ {
+ 	local ret err
++
++	[ ${i2c_scan_f:-0} -eq 0 ] && return 0
++	[ ${#i2c_scan_args[@]} -lt 1 ] && return 1
++
+ 	pinfo -l 3 "oam_i2c_scan_op"
+ 	[ "$i2c_scan" == "all" ] && {
+ 		run_per_all_devs oam_i2c_scan >& 3
+ 	} || {
+ 		# TODO: check range 0-7 [num of OAMs]
+-		ret=($(oam_i2c_scan ${i2c_scan}))
++		ret=($(oam_i2c_scan ${i2c_scan_args[@]}))
+ 		pinfo "I2C Scan[${i2c_scan}]: ${ret[@]}"
+ 	}
+ }
+ 
+-function set_pci_sw()
++function set_pci_sw_op()
+ {
+ 	local res1 res2
++
++	[ ${set_pci_sw_f:-0} -eq 0 ] &&  return 0
++
+ 	bmc_i2c_send 11 0x51 0xf4 0x0
+ 	res1=$($(bmc_i2c_send 11 0x51 0xf2))
+ 	res1=$((0x${res1}))
+@@ -1029,15 +1066,15 @@
+ 	res2=$((0x${res2[0]}))
+ 	[[ $((res1 & 0xf0)) -eq $((0x40)) && $((res2)) -eq 0x0 ]] && return 0
+ 
++	perr "Failed to set PCIe switches"
+ 	return 1
+ }
+ 
+ function oams_set_uart_op()
+ {
+-	[ ${oam_enable_uart_f:-0} -eq 1 ] && {
+-		pinfo "Opening UART on ${bmc_oam}"
+-		ipmi_open_uart -h ${bmc_oam} -u ${bmc_oam_user} -p ${bmc_oam_passwd}
+-	}
++	[ ${oam_enable_uart_f:-0} -eq 0 ] && return 0
++	pinfo "Opening UART on ${bmc_oam}"
++	ipmi_open_uart -h ${bmc_oam} -u ${bmc_oam_user} -p ${bmc_oam_passwd}
+ }
+ 
+ function sys_special_commands()

@@ -1,0 +1,101 @@
+From a702d778c168b1b585933a6299e97c885589453c Mon Sep 17 00:00:00 2001
+From: Varun <vyaparla@habana.ai>
+Date: Fri, 22 Apr 2022 07:18:25 +0300
+Subject: [PATCH] [SW-63387] common: add data part to security fit's
+
+This patch adds a provision to include data part in the
+security FIT's that will be used based on the need. For
+FIT's that doesn't need any data, this field can be
+ignored
+
+Change-Id: Ib91c1399a56e678d65c0c54830c188c84caf5fea
+---
+
+diff --git a/board/habanalabs/common/create-simple.sh b/board/habanalabs/common/create-simple.sh
+index 3abf387..ab088e1 100755
+--- a/board/habanalabs/common/create-simple.sh
++++ b/board/habanalabs/common/create-simple.sh
+@@ -1,5 +1,9 @@
+ #!/usr/bin/env bash
+ 
++set -e          # stop on any error in this script
++set -u          # stop on any reference to undefine variable
++set -o pipefail # stop on any error in pipeline
++
+ if [ $# -lt 4 ]; then
+ 	echo "Usage $0 <load type enum> <conf name> <use-elbi> <use-fw-loader>" >&2
+ 	exit 1
+@@ -10,8 +14,16 @@
+ USE_ELBI=${3}
+ USE_FWUPDATE=${4}
+ LOAD_BOOTLOADER=${5}
++
++if [ $# -ge 6 ]; then
++	BITMASK=${6}
++else
++	BITMASK=0x00000000
++fi
++
+ LOAD_TYPE_NAME=FIT_LOAD_TYPE_${1^^} # Upper case
+ LOAD_TYPE_NUMBER=$(grep ${LOAD_TYPE_NAME} ${SPECS_EMBEDDED_DIR}/fit_load_type.h | sed 's/.* = \(.*\),/\1/')
++SIMPLE_FIT_IMAGE_NAME=${LOAD_TYPE_SUFFIX}-mask.bin
+ 
+ if [ -z ${LOAD_TYPE_NUMBER} ]; then
+ 	echo "Failed to find ${LOAD_TYPE_NAME} numeric value" >&2
+@@ -21,18 +33,21 @@
+ BOARD_BASE=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}
+ MKIMAGE_FILE=${BR2_EXTERNAL}/output/${HL_DEV}/host/bin/mkimage
+ KEY_DIR=${BR2_EXTERNAL}/board/habanalabs/common/key/u-boot
+-IMAGE_DIRETORY=${BR2_EXTERNAL}/output/${HL_DEV}/images
++IMAGE_DIRECTORY=${BR2_EXTERNAL}/output/${HL_DEV}/images
++SIMPLE_FIT_IMAGE=${IMAGE_DIRECTORY}/${SIMPLE_FIT_IMAGE_NAME}
+ KEY_FILE_NAME=hl_rsa3072.key
+ SIMPLE_ITS_TEMPLATE=${BR2_EXTERNAL}/board/habanalabs/common/load-simple.its
+-SIMPLE_ITS_FILE=$IMAGE_DIRETORY/${HL_DEV}-${LOAD_TYPE_SUFFIX}.its
+-SIMPLE_ITB_FILE=$IMAGE_DIRETORY/${HL_DEV}-${LOAD_TYPE_SUFFIX}.itb
++SIMPLE_ITS_FILE=$IMAGE_DIRECTORY/${HL_DEV}-${LOAD_TYPE_SUFFIX}.its
++SIMPLE_ITB_FILE=$IMAGE_DIRECTORY/${HL_DEV}-${LOAD_TYPE_SUFFIX}.itb
+ KEYS_DIR=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}/key/u-boot/
+ 
+ source ${BOARD_BASE}/post-image-common.sh
+ 
++echo $BITMASK | xxd -r -p > ${SIMPLE_FIT_IMAGE}
+ ITS_SED_PARAMS+="s/@HL_DEV@/${HL_DEV}/g;"
+ ITS_SED_PARAMS+="s/@LOAD_TYPE_NAME@/${LOAD_TYPE_NAME}/g;"
+ ITS_SED_PARAMS+="s/@LOAD_TYPE_NUMBER@/${LOAD_TYPE_NUMBER}/g;"
++ITS_SED_PARAMS+="s#@SIMPLE_FIT_BIN@#${SIMPLE_FIT_IMAGE}#g;"
+ ITS_SED_PARAMS+="s/@CONF_NAME@/${CONF_NAME}/g;";
+ ITS_SED_PARAMS+="s/@USE_ELBI@/${USE_ELBI}/g;";
+ ITS_SED_PARAMS+="s/@USE_FWUPDATE@/${USE_FWUPDATE}/g;";
+@@ -40,3 +55,5 @@
+ ITS_SED_PARAMS+="s/@SHA_VERSION@/${SHA_VERSION}/g;"
+ sed ${ITS_SED_PARAMS} ${SIMPLE_ITS_TEMPLATE} > ${SIMPLE_ITS_FILE}
+ $MKIMAGE_FILE -D "-W no-unit_address_vs_reg" -f ${SIMPLE_ITS_FILE} ${SIMPLE_ITB_FILE}
++rm -f ${SIMPLE_FIT_IMAGE}
++echo done
+diff --git a/board/habanalabs/common/load-simple.its b/board/habanalabs/common/load-simple.its
+index e001074..4f63e8b 100644
+--- a/board/habanalabs/common/load-simple.its
++++ b/board/habanalabs/common/load-simple.its
+@@ -11,7 +11,7 @@
+ 		/* Signing a fit requires an image */
+ 		dummyimage {
+ 			description = "dummyimage";
+-			data = "dummydata";
++			data = /incbin/("@SIMPLE_FIT_BIN@");
+ 			type = "standalone";
+ 			compression = "none";
+ 			hash {
+diff --git a/scripts/make/hl-common/Makefile b/scripts/make/hl-common/Makefile
+index 187490e..570d0ae 100644
+--- a/scripts/make/hl-common/Makefile
++++ b/scripts/make/hl-common/Makefile
+@@ -156,7 +156,7 @@
+ .PHONY: %-security-enable-create
+ %-security-enable-create:
+ 	@$(if $(filter $(call hl-device, $@), $(HL_SEC_FIT_CREATE_ARCH)), \
+-		${BR2_EXTERNAL}/board/habanalabs/common/create-simple.sh security_enable fw-loader-conf no-use-elbi no-use-fwupdate load-bootloader)
++		${BR2_EXTERNAL}/board/habanalabs/common/create-simple.sh security_enable fw-loader-conf no-use-elbi no-use-fwupdate load-bootloader 0x00000003)
+ 
+ .PHONY: %-security-enable-install
+ %-security-enable-install:

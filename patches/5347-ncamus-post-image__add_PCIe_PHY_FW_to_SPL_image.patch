@@ -1,0 +1,79 @@
+From 3a502c3e66505288dc9ca385494fae025da859ed Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Mon, 02 Jul 2018 21:15:17 +0300
+Subject: [PATCH] post-image: add PCIe PHY FW to SPL image
+
+
+---
+
+diff --git a/board/habanalabs/dali/btl/Makefile b/board/habanalabs/dali/btl/Makefile
+index 4e561e6..30ecbbe 100644
+--- a/board/habanalabs/dali/btl/Makefile
++++ b/board/habanalabs/dali/btl/Makefile
+@@ -24,8 +24,8 @@
+ endif
+ COMMON_CPP_FLAGS += -DUBOOT_SPI_SIZE=$(UBOOT_SPI_SIZE)
+ 
+-PRIMARY_CPP_FLAGS = $(COMMON_CPP_FLAGS) -DUBOOT_SPI_OFFSET=0x040000 -DBTLID=0x31
+-SECONDARY_CPP_FLAGS = $(COMMON_CPP_FLAGS) -DUBOOT_SPI_OFFSET=0x140000 -DBTLID=0x32
++PRIMARY_CPP_FLAGS = $(COMMON_CPP_FLAGS) -DUBOOT_SPI_OFFSET=0x040000 -DPCIE_PHY_OFFSET=0x260000 -DBTLID=0x31
++SECONDARY_CPP_FLAGS = $(COMMON_CPP_FLAGS) -DUBOOT_SPI_OFFSET=0x140000 -DPCIE_PHY_OFFSET=0x270000 -DBTLID=0x32
+ 
+ all: sectors-be.bin
+ 
+diff --git a/board/habanalabs/dali/btl/primary.S b/board/habanalabs/dali/btl/primary.S
+index 05f90c8..0a543fd 100644
+--- a/board/habanalabs/dali/btl/primary.S
++++ b/board/habanalabs/dali/btl/primary.S
+@@ -21,6 +21,9 @@
+ /* Print BTL ID */
+ #include "uart.s"
+ 
++/* Save PCIe PHY FW for SPL */
++cfg 0xCC4B174, PCIE_PHY_OFFSET
++
+ /* Save U-Boot size for SPL */
+ cfg 0xCC4B178, UBOOT_SPI_SIZE
+ 
+diff --git a/board/habanalabs/dali/post-image.sh b/board/habanalabs/dali/post-image.sh
+index 546c23a..e8faecc 100755
+--- a/board/habanalabs/dali/post-image.sh
++++ b/board/habanalabs/dali/post-image.sh
+@@ -8,6 +8,16 @@
+ UBOOT_BINFILE=${UBOOT_BINFILE:-${UBOOT_FITFILE}}
+ LINUX_FITFILE=fit.itb
+ 
++function swap_file {
++	INF=$1
++	OUTF=$2
++
++	# SWAP needs this to be 4B aligned in size
++	dd status=none conv=sync bs=4 if=${INF} > ${OUTF}.tmp
++	# Sadly --endian=big is not swapping for -tx1 so I used some gawk magic
++	od -Anone -v -tx1 -w4 ${OUTF}.tmp | gawk '{ print $4 $3 $2 $1 }' | xxd -r -p > ${OUTF}
++}
++
+ pushd ${BINARIES_DIR}
+ 	cp ${BOARD_BASE}/dali_${DALI_TARGET}.its .
+ 	cp ${BASE_DIR}/build/linux-custom/arch/arm64/boot/Image .
+@@ -35,6 +45,9 @@
+ 	make -C btl clean all UBOOT_SPI_SIZE=${UBOOT_SPI_SIZE}
+ 	cp btl/sectors-be.bin .
+ 
++	# Swap FW
++	swap_file btl/pcie_phy_fw.bin pcie_phy_fw.bin.be
++
+ 	### Construct bin file
+ 	# BTL
+ 	dd status=none conv=sync bs=256K	if=sectors-be.bin				 > dali-spi-flash.bin.nocrc
+@@ -46,6 +59,10 @@
+ 	dd status=none conv=sync bs=64K		if=uboot-env.bin				>> dali-spi-flash.bin.nocrc
+ 	# U-Boot ENV Redundand
+ 	dd status=none conv=sync bs=64K		if=uboot-env.bin				>> dali-spi-flash.bin.nocrc
++	# PCIe FW
++	dd status=none conv=sync bs=64K		if=pcie_phy_fw.bin.be				>> dali-spi-flash.bin.nocrc
++	# PCIe FW Redundand
++	dd status=none conv=sync bs=64K		if=pcie_phy_fw.bin.be				>> dali-spi-flash.bin.nocrc
+ 
+ 	# Prepare checksum
+ 	CKSUM=`cksum dali-spi-flash.bin.nocrc | cut -d' ' -f1`

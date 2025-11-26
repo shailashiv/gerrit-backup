@@ -1,0 +1,72 @@
+From 89daab656ddae62a3216b0961dc0c988b4eaaa98 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Thu, 02 Aug 2018 17:54:27 +0300
+Subject: [PATCH] BTL: preperation for seperated prstn section
+
+For PCIe PHY FW update we need to handle prstn differently
+than primary i.e. without copy of FW (once at cold reboot)
+---
+
+diff --git a/board/habanalabs/dali/btl/Makefile b/board/habanalabs/dali/btl/Makefile
+index 53072a8..53fb13a 100644
+--- a/board/habanalabs/dali/btl/Makefile
++++ b/board/habanalabs/dali/btl/Makefile
+@@ -41,6 +41,9 @@
+ SECONDARY_CPP_FLAGS += -DUBOOT_OFFSET=0x160000
+ SECONDARY_CPP_FLAGS += -DUBOOT_SIZE=$(UBOOT_SIZE)
+ 
++PRSTN_CPP_FLAGS += $(PRIMARY_CPP_FLAGS)
++PRSTN_CPP_FLAGS += -DPRSTN
++
+ all: sectors-be.bin
+ 
+ sectors-be.bin: sect1.bin sect2.bin sect3.bin sect4.bin
+@@ -55,10 +58,10 @@
+ 	@dd status=none if=$< of=$@
+ s2.bin: secondary.bin
+ 	@dd status=none if=$< of=$@
+-s3.bin: s1.bin
++s3.bin: prstn.bin
+ 	@dd status=none conv=sync bs=1K count=64 if=$< of=$@
+ 
+-primary.bin secondary.bin: pcie_phy_fw.bin
++primary.bin secondary.bin prstn.bin: pcie_phy_fw.bin
+ 
+ %.bin: %.i
+ 	@./btl-as.py -v -o $@ $< > $@.log
+@@ -67,10 +70,13 @@
+ primary.i: $(BTL_ASMFILE)
+ 	@gcc -E -P -nostdinc $(PRIMARY_CPP_FLAGS) -o $@ $<
+ 
++prstn.i: $(BTL_ASMFILE)
++	@gcc -E -P -nostdinc $(PRSTN_CPP_FLAGS) -o $@ $<
++
+ pcie.i: $(PCIE_ASMFILE)
+ 	@gcc -E -P -nostdinc $(COMMON_CPP_FLAGS) -o $@ $<
+ 
+-secondary.i: primary.S
++secondary.i: $(BTL_ASMFILE)
+ 	@gcc -E -P -nostdinc $(SECONDARY_CPP_FLAGS) -o $@ $<
+ 
+ pcie_phy_fw.bin: pcie_phy_fw.i
+diff --git a/board/habanalabs/dali/btl/primary.S b/board/habanalabs/dali/btl/primary.S
+index 8008a61..04b11e8 100644
+--- a/board/habanalabs/dali/btl/primary.S
++++ b/board/habanalabs/dali/btl/primary.S
+@@ -9,6 +9,16 @@
+ /* CPU_BOOT_STATUS_IN_BTL -> mmPSOC_GLOBAL_CONF_WARM_REBOOT */
+ cfg 0xCC4B300, 0x4
+ 
++#if 0
++/* Configure prstn to reset entire SoC */
++cfg 0xCC4B470, 0x7FFFFF
++/* Clear masking of prstn from SW reset */
++cfg 0xCC4B484, 0x0
++#ifndef PRSTN
++mem 0x07FF9000000, pcie_phy_fw.bin
++#endif
++#endif
++
+ #include "i2c.s"
+ #ifdef TARGET_IS_PLDM
+ /* Disable PCIe PHY */

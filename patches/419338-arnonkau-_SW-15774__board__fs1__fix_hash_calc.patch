@@ -1,0 +1,147 @@
+From 64f9a4814581d3f05e37953a79e2dbf5054af81f Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Mon, 27 May 2024 20:16:21 +0300
+Subject: [PATCH] [SW-15774] board: fs1: fix hash calc
+
+fs1 build fails.
+
+Change-Id: Ie9a1568d591b874f90cb9157a3378106772dccbb
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/post-image-spi-arc_global.sh b/board/habanalabs/common/post-image-spi-arc_global.sh
+index e62aa6f..f040167 100755
+--- a/board/habanalabs/common/post-image-spi-arc_global.sh
++++ b/board/habanalabs/common/post-image-spi-arc_global.sh
+@@ -192,7 +192,7 @@
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+ 		for i in $(seq 1 $HASH_SZ); do
+-			DWORD=$(xxd -e -c32 -g4 ${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
++			DWORD=$(xxd -e -c32 -g4 ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
+ 			OFFSET=$(( $(( ${KEY_OFFSET}*8 )) +  ${i} ))
+ 			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 18 + ${OFFSET}))_r.data_in_r[31:0]}"
+ 			echo "force ${FORCE} 'h${DWORD}" >> ${HEXS_DIR}/${HL_TARGET}-force.hex
+diff --git a/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh b/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh
+index 0e1a122..4b27bbb 100755
+--- a/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh
++++ b/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh
+@@ -31,7 +31,7 @@
+ ITS_SED_PARAMS+="s/@HL_ARCH@/${HL_ARCH}/g;"
+ ITS_SED_PARAMS+="s/@DEV_NAME@/${DEV_NAME}/g;"
+ 
+-KEY_BASE=${BR2_EXTERNAL}/board/habanalabs/${DEV_PREFIX}_arc
++KEY_BASE=${BR2_EXTERNAL}/board/habanalabs/${DEV_PREFIX}_arc/
+ KEY_BASE_NAME=rsa3072
+ KEY_NAME=hl_${KEY_BASE_NAME}
+ 
+@@ -53,8 +53,7 @@
+ ITS_SED_PARAMS+="s/@FIT_CORE_ID_D0_PSOC_ARC1@/${FIT_CORE_ID_D0_PSOC_ARC1}/g;"
+ 
+ pushd ${STAGE_DIR}
+-
+-	hl_copy_keys ${STAGE_DIR}
++	hl_copy_keys ${BINS_DIR}
+ 
+ 	hl_copy_binaries ${BINS_DIR}
+ 
+diff --git a/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh b/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh
+index 31f32be..16a3a8a 100755
+--- a/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh
++++ b/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh
+@@ -114,7 +114,7 @@
+         KEY_OFFSET=${3}
+         KEY_BASE_NAME_PUB=${KEY_BASE_NAME}.pub
+ 
+-	calculate_hash ${NAME}_${KEY_BASE_NAME_PUB} ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash
++	calculate_hash ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB} ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash
+ 	cat ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash				> ${FILE}.tmp
+ 	dd status=none conv=notrunc seek=$(( ${KEY_OFFSET}*2 + 1 )) bs=16 if=${FILE}.tmp of=${FILE}
+ 
+@@ -170,7 +170,7 @@
+ 	dd status=none conv=sync count=12 bs=16 if=/dev/zero | tr '\000' $'\xFF' > ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin
+ 
+ 	# get private and public keys
+-	copy_all_keys
++	copy_all_keys ${BINS_PROD_DIR}
+ 
+ 	#generate public key components
+ 	generate_public_keys
+diff --git a/board/habanalabs/fs1_arc/post-image-spi.sh b/board/habanalabs/fs1_arc/post-image-spi.sh
+index 7386124..c6099a7 100755
+--- a/board/habanalabs/fs1_arc/post-image-spi.sh
++++ b/board/habanalabs/fs1_arc/post-image-spi.sh
+@@ -56,8 +56,9 @@
+ }
+ 
+ function copy_all_keys {
+-	# TODO fill with content
+-	return
++	cp ${KEY_BASE}/key/*.dtb ${1:-.}
++	cp ${KEY_BASE}/key/*.key ${1:-.}
++	cp ${KEY_BASE}/key/*.crt ${1:-.}
+ }
+ 
+ function generate_public_keys {
+@@ -323,11 +324,11 @@
+ 
+ function prep_img_desc_with_crc {
+ 	BINFILE=$1
+-	OUTFILENAME=$1
++	OUTFILENAME=$(basename $1)
+ 	cat ${BINFILE}>${BINFILE}.tmp.pad
+ 	dd status=none conv=sync bs=16 if=${BINFILE}.tmp.pad of=${BINFILE}.tmp.algn
+ 	hl_calc_crc32 ${BINFILE}.tmp.algn
+-	cat ${BINFILE}.tmp.algn ${BINFILE}.tmp.algn.crc32 > ${DEV_PREFIX}-${OUTFILENAME}
++	cat ${BINFILE}.tmp.algn ${BINFILE}.tmp.algn.crc32 > ${BINS_DIR}/${DEV_PREFIX}-${OUTFILENAME}
+ 	rm -rf ${BINFILE}.tmp*
+ }
+ 
+@@ -537,11 +538,13 @@
+ 		hl_get_key_props ${KEY_NUM}
+ 
+ 		TEMPNAME=${FUNCNAME}
+-		dd status=none conv=sync bs=16 if=$img_file			> ${TEMPNAME}
++		TEMPFULLNAME=${STAGE_DIR}/${FUNCNAME}
++		dd status=none conv=sync bs=16 if=$img_file			> ${TEMPFULLNAME}
+ 
+ 		PKFILE=${TEMPNAME}.payload.key
++		PKFULLFILE=${TEMPFULLNAME}.payload.key
+ 
+-		cat ${TEMPNAME} ${KEY_NAME}-key-props.bin > ${PKFILE}
++		cat ${TEMPFULLNAME} ${BINS_PROD_DIR}/${KEY_NAME}-key-props.bin > ${PKFULLFILE}
+ 
+ 		#The size of the complete image(Payload + Key + Signature) needs to be calculated
+ 		#and placed in the manifest even before hashing and signing over it as the size
+@@ -553,7 +556,7 @@
+ 		#Hence the final formula = ALIGN_16(Payload + Key + Signature) + CRC
+ 
+ 		#payload + key size
+-		local pk_sz=$(stat -Lc "%s" $(eval "echo \${PKFILE}"))
++		local pk_sz=$(stat -Lc "%s" $(eval "echo \${PKFULLFILE}"))
+ 		#size to be aligned to
+ 		local align_sz=16
+ 		#payload + key + signature size
+@@ -565,17 +568,17 @@
+ 
+ 		printf "%08x" $IMG_DESC_SZ | rev_bytes_stdin | xxd -r -p -s +4 - ${PKFILE}
+ 
+-		$OPENSSL dgst -sha384 -binary ${PKFILE} > ${PKFILE}.sha384
++		$OPENSSL dgst -sha384 -binary ${PKFULLFILE} > ${PKFULLFILE}.sha384
+ 
+-		hl_sign_bin ${PKFILE} ${KEY_NAME}
++		hl_sign_bin ${PKFULLFILE} ${STAGE_DIR}/${KEY_NAME}
+ 
+ 		SIGBINFILE=${PKFILE}.sig.bin
+ 
+-		cat ${PKFILE} ${PKFILE}.sig			>${SIGBINFILE}
++		cat ${PKFULLFILE} ${PKFULLFILE}.sig > ${STAGE_DIR}/${SIGBINFILE}
+ 
+-		prep_img_desc_with_crc ${SIGBINFILE}
++		prep_img_desc_with_crc ${STAGE_DIR}/${SIGBINFILE}
+ 
+-		hl_reverse_words ${DEV_PREFIX}-${SIGBINFILE} $out_file 4
++		hl_reverse_words ${STAGE_DIR}/${DEV_PREFIX}-${SIGBINFILE} $out_file 4
+ 	else
+ 		local boot_ptr_size=$(stat -Lc "%s" $(eval "echo \${img_file}"))
+ 		local align_sz=16

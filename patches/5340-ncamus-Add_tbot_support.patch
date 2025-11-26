@@ -1,0 +1,138 @@
+From 759614d05c6663d5c62222136a87fdc157c21084 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@gaudilabs.com>
+Date: Thu, 11 Jan 2018 22:17:11 +0200
+Subject: [PATCH] Add tbot support
+
+It will serve for testing Linux
+---
+
+diff --git a/Config.in b/Config.in
+index f9e9de2..14d49a3 100644
+--- a/Config.in
++++ b/Config.in
+@@ -3,5 +3,6 @@
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/spdlog/Config.in"
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/specs_external/Config.in"
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/uboot-test-hooks/Config.in"
++source "$BR2_EXTERNAL_HL_DALI_PATH/package/tbot/Config.in"
+ 
+ # Below can add to make it appear in the top-level configuration menu
+diff --git a/Makefile b/Makefile
+index 99f7243..f446bf9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -24,6 +24,11 @@
+ 	@echo
+ 	@echo 'Testing:'
+ 	@echo '  dali-<board>-test    - Run uboot test on <board> e.g. onix, pldm, asic'
++	@echo '  dali-<board>-tbot    - Run linux test on <board> e.g. onix, pldm, asic'
++	@echo '                           set HOST_TBOT_TC=<test name> to'
++	@echo '                             override dafault test tc_ub_help.py'
++	@echo '                           set HOST_TBOT_IP=<PC lab IP> to'
++	@echo '                             override <board> dafault IP'
+ 
+ export BR2_EXTERNAL := $(CURDIR)
+ OUTPUT_DIR := $(BR2_EXTERNAL)/output
+@@ -88,7 +93,7 @@
+ dali-distclean: $(OUTPUT_DIR)/.config
+ 	@$(MAKE) uboot-dirclean linux-dirclean armcp-dirclean	\
+ 		 spdlog-dirclean specs-dirclean specs_external-dirclean \
+-		 host-uboot-test-hooks-dirclean
++		 host-uboot-test-hooks-dirclean host-tbot-dirclean
+ 
+ .PHONY: dali-onix-test dali-pldm-test dali-asic-test
+ dali-onix-test: dali-onix-tools-install
+@@ -102,3 +107,31 @@
+ 	-cd board/habanalabs/common/ &&					\
+ 	sshpass -p123456 scp -r remote_power ip_pdu t32 vivado_lab	\
+ 	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
++
++HOST_TBOT_TC ?= tc_ub_help.py
++.PHONY: dali-onix-tbot dali-pldm-tbot dali-asic-tbot
++dali-onix-tbot: dali-onix-tools-install
++dali-onix-tbot: HOST_TBOT_IP ?= monster4-nuc
++dali-pldm-tbot: dali-pldm-tools-install
++dali-pldm-tbot: HOST_TBOT_IP ?= 192.168.10.45
++dali-asic-tbot: dali-asic-tools-install
++dali-asic-tbot: HOST_TBOT_IP ?= 192.168.10.109
++dali-onix-tbot dali-pldm-tbot dali-asic-tbot:
++	@HOST_TBOT_LAB=lab_dali					\
++	HOST_TBOT_CFG=dali					\
++	HOST_TBOT_BRD=$(patsubst dali-%-tbot,%,$@)		\
++	HOST_TBOT_CASE=$(HOST_TBOT_TC)				\
++	HOST_TBOT_LAB_IP=$(HOST_TBOT_IP)			\
++		$(MAKE) host-tbot-rebuild
++dali-pldm-tools-install: DALI_INSTALL_LAB_IP ?= 192.168.10.45
++.PHONY: dali-pldm-tools-install
++dali-pldm-tools-install:
++	-cd board/habanalabs/common/ &&				\
++	sshpass -p123456 scp -r remote_power ip_pdu		\
++	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
++dali-asic-tools-install: DALI_INSTALL_LAB_IP ?= 192.168.10.109
++.PHONY: dali-asic-tools-install
++dali-asic-tools-install:
++	-cd board/habanalabs/common/ &&					\
++	sshpass -p123456 scp -r remote_power ip_pdu t32 vivado_lab	\
++	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index d42503c..459e8cc 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -5,3 +5,4 @@
+ SPDLOG_OVERRIDE_SRCDIR = $(TOPDIR)/../3rd-parties/spdlog
+ SPECS_EXTERNAL_OVERRIDE_SRCDIR = $(TOPDIR)/../specs_external
+ UBOOT_TEST_HOOKS_OVERRIDE_SRCDIR = $(TOPDIR)/../uboot-test-hooks
++TBOT_OVERRIDE_SRCDIR = $(TOPDIR)/../tbot
+diff --git a/board/habanalabs/common/remote_power b/board/habanalabs/common/remote_power
+index 40ce1ec..b909d95 100755
+--- a/board/habanalabs/common/remote_power
++++ b/board/habanalabs/common/remote_power
+@@ -15,6 +15,10 @@
+ 	;;
+ *onix)
+ 	;;
++*pldm)
++	echo ON
++	exit 0
++	;;
+ *)
+ 	echo "error - Unknown board name: $board"
+ 	exit 2
+diff --git a/configs/dali_defconfig b/configs/dali_defconfig
+index c7fd96d..482d095 100644
+--- a/configs/dali_defconfig
++++ b/configs/dali_defconfig
+@@ -60,3 +60,4 @@
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+ BR2_PACKAGE_ARMCP=y
+ BR2_PACKAGE_UBOOT_TEST_HOOKS=y
++BR2_PACKAGE_TBOT=y
+diff --git a/package/tbot/Config.in b/package/tbot/Config.in
+new file mode 100644
+index 0000000..8dc3806
+--- /dev/null
++++ b/package/tbot/Config.in
+@@ -0,0 +1,4 @@
++config BR2_PACKAGE_TBOT
++	bool "TBOT Tools"
++	help
++	  tbot is used for testing uboot/linux on real HW
+diff --git a/package/tbot/tbot.mk b/package/tbot/tbot.mk
+new file mode 100644
+index 0000000..b4a692f
+--- /dev/null
++++ b/package/tbot/tbot.mk
+@@ -0,0 +1,13 @@
++TBOT_VERSION = 1.0.0
++TBOT_SITE = tbot
++TBOT_LICENSE = unclear
++
++define HOST_TBOT_BUILD_CMDS
++	(cd $(@D); 						\
++		./src/common/tbot.py	-c $(HOST_TBOT_CFG)	\
++					-s $(HOST_TBOT_LAB)	\
++					-t $(HOST_TBOT_CASE)	\
++	)
++endef
++
++$(eval $(host-generic-package))

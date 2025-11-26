@@ -1,0 +1,144 @@
+From 46701112584317e71b5a41225c4bfa32bd624d40 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 28 Jan 2022 22:18:15 +0200
+Subject: [PATCH] [SW-65638] gaudi2: release: reorder create_config
+
+Prepare the dump_env for the snapshot feature.
+
+Change-Id: I33eeceb701e08a6213846c1fee770ecd0c6e40e4
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index 056b6e9..a5d2219 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -328,23 +328,17 @@
+ 	echo "devs_list_pci_ids     = ${devs_list_pci_ids[@]}"
+ }
+ 
+-function create_config_file_op()
++
++
++function dump_env()
+ {
++	local level=${1:-1}
++	local file=${2:-"/dev/null"}
+ 
+-	[ "${create_cfg}" == "" ] && return 0
++#	[ $level -eq 0 ] && > $file
++	> $file
+ 
+-	[ -f ${create_cfg:-""} ] && {
+-		hlp_answer_yn "File exist. Is it ok to overrun it?"
+-		[ $? -ne 0 ] && return 1
+-		touch $create_cfg
+-		[ $? -ne 0 ] && {
+-			perr "Can't create file $1, assuming permission issue"
+-			return 1
+-		}
+-
+-	}
+-
+-	cat <<-END > $create_cfg
++	cat <<-END >> $file
+ 		#####################################################
+ 		# Automaticly created by fwi
+ 		# Date: $(date)
+@@ -391,6 +385,79 @@
+ 		#skip_install_f=$skip_install_f
+ 		#skip_copy_f=$skip_copy_f
+ 	END
++	[ $level -le 0 ] && return 0
++
++	cat <<-END >> $file
++		rmt_host_ignore_f=$rmt_host_ignore_f
++		ctrl_host_ignore_f=$ctrl_host_ignore_f
++		bmc_host_ignore_f=$bmc_host_ignore_f
++		bmc_oam_ignore_f=$bmc_oam_ignore_f
++	END
++
++	[ $level -le 1 ] && return 0
++	cat <<-END >> $file
++		eeprom_files_list=(${eeprom_files_list[@]})
++	END
++
++	[ $level -le 2 ] && return 0
++
++	for var_name in ${auto_created_vars_list[@]}; do
++		tmp_ref=$(echo ${var_name/--} | tr '-' '_')
++		echo "		${tmp_ref}=(${!tmp_ref})"
++	done
++
++	[ $level -le 3 ] && return 0
++
++	cat <<-END >> $file
++		verbose_lvl=$verbose_lvl
++		plog_lvl=$plog_lvl
++		is_burn_parallel_f=$is_burn_parallel_f
++	END
++	[ $level -le 4 ] && return 0
++
++	cat <<-END >> $file
++		exclude_devs_list=(${exclude_devs_list[@]})
++		user_devs_list=$user_devs_list
++	END
++}
++
++function create_config_file_op()
++{
++
++	[ "${create_cfg}" == "" ] && return 0
++
++	[ -f ${create_cfg:-""} ] && {
++		hlp_answer_yn "File exist. Is it ok to overrun it?"
++		[ $? -ne 0 ] && return 1
++		touch $create_cfg
++		[ $? -ne 0 ] && {
++			perr "Can't create file $1, assuming permission issue"
++			return 1
++		}
++	}
++
++	dump_env 0 $create_cfg
++
++	exit 0
++}
++
++function create_config_snapshot_op()
++{
++	[ "${snapshot}" == "" ] && return 0
++
++	[ -f ${snapshot:-""} ] && {
++		hlp_answer_yn "File exist. Is it ok to overrun it?"
++		[ $? -ne 0 ] && return 1
++		touch $create_cfg
++		[ $? -ne 0 ] && {
++			perr "Can't create file $1, assuming permission issue"
++			return 1
++		}
++
++	}
++
++	dump_env 0 $create_cfg
++
+ 	exit 0
+ }
+ 
+@@ -1438,7 +1505,7 @@
+ 	0|off|dis|disable)
+ 		config_clear_link
+ 		;;
+-	NONE)
++	NONE|sts|status)
+ 		pinfo "--config-link [on|off]"
+ 		[[ -f ~/.hl_fwi.cfg.link ]] && {
+ 			pinfo "config link: $(realpath ~/.hl_fwi.cfg.link)"
+@@ -1763,6 +1830,7 @@
+ 	mods_var_register bmc_oam bmc_oam_user bmc_oam_passwd
+ 	mods_var_register bmc_host bmc_host_user bmc_host_passwd
+ 	mods_var_register rmt_host rmt_user rmt_passwd
++	mods_var_register create_cfg
+ 	mods_var_register config_link show_env
+ 	# User config files and platform selection was already
+ 	# handled in the early param handling

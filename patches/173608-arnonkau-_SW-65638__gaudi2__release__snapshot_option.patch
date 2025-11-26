@@ -1,0 +1,164 @@
+From ae391bc15f71dadb291d4cb043ddadbf5de62f22 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 28 Jan 2022 22:18:47 +0200
+Subject: [PATCH] [SW-65638] gaudi2: release: snapshot option
+
+Allows a temporary caching of the environment variables.
+So consecutive, operation on the same setup can be done with reduced
+command line arguments.
+It differ froms config link, as the link just points to the
+configuration file, while the snapshot copy the current env and save it
+in a special snapshot file. The amount of saved variables is more
+extensive than the ones yo u get from the --create-cfg
+
+Change-Id: I17924e149620c9d7fa0a7e240e361d83593090d9
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index a5d2219..54845d2 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -248,6 +248,11 @@
+ 	--edit-cfg                : combine with the -c option will open the config file for editing
+ 	--config-link [on|off]    : combine with the -c option link the basic config file as a temporary default
+ 	                            when the link is off it want be treted as the deafult anymore
++	--snapshot    [on|off|update|suspend|status]
++	                          : creates a temporary config file with most of the environment variable included
++	                            it differs from the --config-link, as the current stage is snapshot into a file
++	                            it holds more variables,  can be manipulated, without changing the original, changes in
++	                            original file will not influance on the snapshot. disables by using [off]
+ 	--@<var> <val>            : pass argumets to the config file, allowing the file to becoame a template
+ 	                            ex. --@setup-num 10 on the commandline wil be trested as setup_num=10.
+ 	                                writing hls2-srv${setup_num}-csr, wil be expeanded as hls-srv10-csr
+@@ -443,22 +448,18 @@
+ 
+ function create_config_snapshot_op()
+ {
+-	[ "${snapshot}" == "" ] && return 0
++	[ ${snapshot_f:-0} -eq 0 ] && return 0
+ 
+-	[ -f ${snapshot:-""} ] && {
+-		hlp_answer_yn "File exist. Is it ok to overrun it?"
++	[ -f ~/.hl_fwi.cfg.snapshot ] && {
++		hlp_answer_yn "Still in Snapshot mode. Is it ok to update it?"
+ 		[ $? -ne 0 ] && return 1
+-		touch $create_cfg
++		touch ~/.hl_fwi.cfg.snapshot
+ 		[ $? -ne 0 ] && {
+-			perr "Can't create file $1, assuming permission issue"
++			perr "Can't create snapshot, assuming permission issue"
+ 			return 1
+ 		}
+-
+ 	}
+-
+-	dump_env 0 $create_cfg
+-
+-	exit 0
++	dump_env 2 ~/.hl_fwi.cfg.snapshot
+ }
+ 
+ function tools_install()
+@@ -482,17 +483,21 @@
+ 
+ function config_file_default_setup()
+ {
+-	[ -e ~/.hl_fwi.cfg.link ] && {
+-		dfl_cfg_file=~/.hl_fwi.cfg.link
++	[ -e ~/.hl_fwi.cfg.snapshot ] && {
++		dfl_cfg_file=~/.hl_fwi.cfg.snapshot
+ 	} || {
+-		[[ -e ./.hl_fwi.cfg ]] && {
+-			dfl_cfg_file=./.hl_fwi.cfg
++		[ -e ~/.hl_fwi.cfg.link ] && {
++			dfl_cfg_file=~/.hl_fwi.cfg.link
+ 		} || {
+-			[[ -e ~/.hl_fwi.cfg ]] && {
+-				dfl_cfg_file=~/.hl_fwi.cfg
++			[[ -e ./.hl_fwi.cfg ]] && {
++				dfl_cfg_file=./.hl_fwi.cfg
+ 			} || {
+-				[[ -e ${scr_dir}/.hl_fwi.cfg ]] && \
+-					dfl_cfg_file=${scr_dir}/.hl_fwi.cfg
++				[[ -e ~/.hl_fwi.cfg ]] && {
++					dfl_cfg_file=~/.hl_fwi.cfg
++				} || {
++					[[ -e ${scr_dir}/.hl_fwi.cfg ]] && \
++						dfl_cfg_file=${scr_dir}/.hl_fwi.cfg
++				}
+ 			}
+ 		}
+ 	}
+@@ -1516,6 +1521,53 @@
+ 	esac
+ }
+ 
++function handle_snapshot_registration()
++{
++	[[ ${snapshot_f:-0} -ne 1 ]] && return 0
++
++	case ${snapshot[0]:-"NONE"} in
++	1|on|enb|enable|update)
++		[ -f ~/.hl_fwi.cfg.snapshot.sus ] && {
++			mv ~/.hl_fwi.cfg.snapshot{.sus,}
++			[ $? -eq 0 ] && pinfo "snapshot back from suspension"
++		} || {
++			create_config_snapshot_op
++			[ $? -eq 0 ] && pinfo "snapshot mode enabled"
++		}
++		;;
++	0|off|dis|disable)
++		rm -f ~/.hl_fwi.cfg.snapshot
++		[ $? -eq 0 ] && pinfo "snapshot mode disabled"
++		exit 0
++		;;
++	sus|suspend)
++		if [ -f ~/.hl_fwi.cfg.snapshot.sus ]; then
++			pinfo "snapshot already suspended"
++		elif [ -f ~/.hl_fwi.cfg.snapshot ]; then
++			mv ~/.hl_fwi.cfg.snapshot{,.sus}
++			[ $? -eq 0 ] && pinfo "snapshot is suspended"
++		else
++			pinfo "snapshot is not active"
++		fi
++
++		;;
++	NONE)
++		pinfo "use --snapshot [on|off|sus|sts]"
++		;;
++	sts|status)
++
++		if [[ -f ~/.hl_fwi.cfg.snapshot.sus ]]; then
++			pinfo "snapshot suspended"
++		elif [[ -f ~/.hl_fwi.cfg.snapshot ]]; then
++				pinfo "snapshot is active"
++		else
++				pinfo "snapshot not active"
++		fi
++		;;
++	esac
++	exit 0
++}
++
+ function show_env_op()
+ {
+ 	[[ ${show_env_f} -eq 0 ]] && return 0
+@@ -1830,7 +1882,7 @@
+ 	mods_var_register bmc_oam bmc_oam_user bmc_oam_passwd
+ 	mods_var_register bmc_host bmc_host_user bmc_host_passwd
+ 	mods_var_register rmt_host rmt_user rmt_passwd
+-	mods_var_register create_cfg
++	mods_var_register create_cfg snapshot
+ 	mods_var_register config_link show_env
+ 	# User config files and platform selection was already
+ 	# handled in the early param handling
+@@ -1854,6 +1906,8 @@
+ 	show_help_op
+ 	create_config_file_op
+ 	[ $? -ne 0 ] && return 1
++	handle_snapshot_registration
++	[ $? -ne 0 ] && return 1
+ 	api_sanity_check
+ 	[ $? -ne 0 ] && return 1
+ 	handle_ignore_op

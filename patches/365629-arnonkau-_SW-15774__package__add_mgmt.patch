@@ -1,0 +1,166 @@
+From 5ef2f962e9b44b7d936fab9cffa7e22e361ee6fd Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 20 Oct 2023 16:36:32 +0300
+Subject: [PATCH] [SW-15774] package: add mgmt
+
+Add package to build arcmgmt
+
+Change-Id: I6fe3d55df64312a60f1193a65fb5e5d899d87966
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index 3fb105f..ada50ee 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -22,3 +22,4 @@
+ HLB325_BMC_OVERRIDE_SRCDIR = $(TOPDIR)/../openbmc
+ HL_TEST_OVERRIDE_SRCDIR = $(TOPDIR)/../hl-test
+ PID_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcpid
++MGMT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcmgmt
+diff --git a/package/mgmt/mgmt.mk b/package/mgmt/mgmt.mk
+new file mode 100644
+index 0000000..da3b653
+--- /dev/null
++++ b/package/mgmt/mgmt.mk
+@@ -0,0 +1,140 @@
++MGMT_APP_NAME = mgmt
++MGMT_DEPENDENCIES = host-cmake host-lzop host-lz4
++MGMT_APP_MODULES = eeprom mbedtls boot_info i2c-indirect soc_init hl_shell
++MGMT_SRC_DIR=$(EMBEDDED_DIR)/zephyr-apps/arcmgmt
++MGMT_ZEPHYR_SRCDIR=$(EMBEDDED_DIR)/zephyr
++
++MGMT_APP_PROD_NAME = zephyr_arc_$(MGMT_APP_NAME)
++MGMT_DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
++MGMT_APP_VERSION = $(shell cut -d- -f2- $(@D)/localversion-habanalabs)
++MGMT_LOCAL_VERSION = $$(sed "s/^.*fw-\\([0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\).*$$/\\1/" $(@D)/localversion-habanalabs)
++
++MGMT_BUILD_DIR = $(@D)
++MGMT_BUILDDIR = $(@D)
++MGMT_DIR = $(@D)
++MGMT_ZEPHYR_BUILD_DIR ?= $(@D)/zephyr
++
++MGMT_CONF_CFLAGS =\
++		-I$(MGMT_ZEPHYR_BUILD_DIR) \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/include \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu/$(HL_DEV) \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu/common \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu/$(HL_DEV) \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu/common \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/include/generated \
++		-I$(MGMT_ZEPHYR_BUILD_DIR)/include/generated/syscalls \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++MGMT_CONF_EXTRA_CFLAGS =\
++		-include $(EMBEDDED_ROOT)/specs/$(MGMT_DEVICE_NAME)/$(MGMT_DEVICE_NAME)_boot_info.h \
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++ifeq ($(HL_TARGET),pldm)
++MGMT_CONF_EXTRA_CFLAGS += -DTARGET_IS_PLDM
++ifeq ($(PLDM_SKIP_UBOOT),1)
++MGMT_CONF_EXTRA_CFLAGS += -DTARGET_IS_PLDM_REGRESSION
++endif
++endif
++
++ifeq ($(HL_TARGET),onix)
++MGMT_CONF_EXTRA_CFLAGS += -DTARGET_IS_ONIX
++endif
++
++MGMT_CONF_ENV = CROSS_COMPILE=$(TARGET_CROSS)
++MGMT_CONF_ENV += ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
++MGMT_CONF_ENV += ZEPHYR_BASE=$(MGMT_ZEPHYR_BUILD_DIR)
++
++MGMT_CONF_OPTS  = $(ZEPHYR_CONF_OPTS)
++MGMT_CONF_OPTS += -UCMAKE_TOOLCHAIN_FILE
++MGMT_CONF_OPTS += -DUSER_CACHE_DIR=$(@D)/.cache
++MGMT_CONF_OPTS += -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-e__start
++MGMT_CONF_OPTS += -DEXTRA_CFLAGS="\
++		-Werror \
++		-Wno-misleading-indentation \
++		$(MGMT_CONF_EXTRA_CFLAGS)"
++
++MGMT_CONF_OPTS += -DBUILD_VERSION="$(MGMT_APP_VERSION)"
++MGMT_CONF_OPTS += -DBUILD_MACHINE="$(shell hostname -s)"
++MGMT_CONF_OPTS += -DCMAKE_C_FLAGS="\
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(MGMT_CONF_CFLAGS)"
++
++MGMT_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMBEDDED_DIR)"
++MGMT_CONF_OPTS += -DBOARD=hl_$(MGMT_DEVICE_NAME)_$(MGMT_APP_NAME)_$(HL_TARGET)
++MGMT_CONF_OPTS += -DDEVICE=$(MGMT_DEVICE_NAME)
++MGMT_CONF_OPTS += -DAPP_NAME=$(MGMT_APP_PROD_NAME)
++MGMT_CONF_OPTS += -DAPP_VERSION=$(MGMT_APP_VERSION)
++
++MGMT_WEST_SRC_DIR :=
++MGMT_WEST_DEST_DIR :=
++
++define MGMT_COPY_ZEPHYR_SRC
++	rsync -au --chmod=u=rwX,go=rX  --exclude .svn --exclude .git --exclude .hg --exclude .bzr --exclude CVS $(MGMT_ZEPHYR_SRCDIR) $(MGMT_BUILD_DIR)
++endef
++
++# Arguments:
++# - module name
++# - component dir
++# - component name
++#
++define MGMT_DEFINE_MODULE_ENVVARS
++	$(eval MODULE_NAME=$(strip $1))
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $(MODULE_NAME) | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(eval $(MODULE_NAME_UPPER_CASE)_SRCDIR=$(EMBEDDED_DIR)/zephyr-modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_DIR=$(@D)/build/modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_NAME=$2_$(MODULE_NAME))
++endef
++
++$(foreach module,$(MGMT_APP_MODULES),$(call MGMT_DEFINE_MODULE_ENVVARS,$(module),$(MGMT_APP_PROD_NAME)))
++
++# Arguments:
++# - module (mbedtls, eeprom, etc.)
++define MGMT_MODULE_VERSION_HOOK
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $1 | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(call HL_VERSION_GEN, ${${MODULE_NAME_UPPER_CASE}_SRCDIR}, ${${MODULE_NAME_UPPER_CASE}_DIR}, ${${MODULE_NAME_UPPER_CASE}_NAME})
++endef
++
++define ZEPHR_MGMT_APP_VERSION_GEN
++	@$(call HL_VERSION_GEN, ${MGMT_SRCDIR},.,${MGMT_APP_NAME})
++	@$(call HL_VERSION_GEN, ${MGMT_SRCDIR},build,${MGMT_APP_NAME})
++	@$(foreach module,$(MGMT_APP_MODULES),$(call MGMT_MODULE_VERSION_HOOK,$(module)))
++endef
++
++define MGMT_CREATE_HL_VERSION
++	@mkdir -p $(MGMT_BUILD_DIR)/include
++	@echo "#ifndef _HL_VERSION_" >  $(MGMT_BUILD_DIR)/include/hl_version.h
++	@echo "#define _HL_VERSION_" >>  $(MGMT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MAJOR $$(echo $(MGMT_LOCAL_VERSION) | cut -d. -f1)" >> $(MGMT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MINOR $$(echo $(MGMT_LOCAL_VERSION) | cut -d. -f2)" >> $(MGMT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_PATCH $$(echo $(MGMT_LOCAL_VERSION) | cut -d. -f3)" >> $(MGMT_BUILD_DIR)/include/hl_version.h
++	@echo "#endif" >>  $(MGMT_BUILD_DIR)/include/hl_version.h
++endef
++
++define MGMT_CONFIGURE_CMDS
++	@$(call MGMT_CREATE_HL_VERSION)
++	@$(MGMT_CONF_ENV) $(HOST_DIR)/bin/cmake $(MGMT_CONF_OPTS) -S $(MGMT_BUILD_DIR) -B $(MGMT_BUILD_DIR)/build
++endef
++
++MGMT_POST_RSYNC_HOOKS += HL_VERSION_GEN
++MGMT_POST_RSYNC_HOOKS += MGMT_COPY_ZEPHYR_SRC
++MGMT_POST_RSYNC_HOOKS += ZEPHR_MGMT_APP_VERSION_GEN
++
++define MGMT_BUILD_CMDS
++	@$(TARGET_MAKE_ENV) $(MAKE) -C $(MGMT_BUILD_DIR)/build all
++endef
++
++define MGMT_INSTALL_TARGET_CMDS
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_$(MGMT_APP_NAME).elf
++endef
++
++mgmt-configure: $(MGMT_DEPENDENCIES)
++mgmt-menuconfig mgmt-guiconfig: | mgmt-configure
++	$(TARGET_MAKE_ENV) $(MAKE) -C $(MGMT_BUILD_DIR)/build all
++	rm -f $(MGMT_BUILD_DIR)/.stamp_{configured,built}
++
++$(eval $(cmake-package))

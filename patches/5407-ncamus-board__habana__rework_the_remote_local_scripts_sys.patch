@@ -1,0 +1,461 @@
+From 5d91ac9e1ae92f118472bed8d98699e0e421d8e9 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 07 Aug 2018 11:19:56 +0300
+Subject: [PATCH] board: habana: rework the remote/local scripts system
+
+Move all the functionality to run locally on the dali host machine.
+The control stays on the remote machine, but united into one script
+with parameters.
+This enables for a better code shring and different invokations of
+the same scripting system.
+
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/local_install_packages b/board/habanalabs/common/local_install_packages
+deleted file mode 100755
+index ef84496..0000000
+--- a/board/habanalabs/common/local_install_packages
++++ /dev/null
+@@ -1,60 +0,0 @@
+-#!/bin/bash -l
+-
+-pre_pkg_lst="protobuf-compiler libprotoc-dev dkms"
+-habana_pkg_lst="habanalabs habanatools libhabana"
+-fw_ldr=$HOME/fw_loader
+-
+-function local_msg() {
+-	local msg=$1
+-	echo -e   "********************************************************"
+-	echo -e   "$msg"
+-	echo -e   "********************************************************"
+-}
+-
+-function local_remove_packages() {
+-	local_msg "************* Removing old habana packages *************"
+-	sudo apt-get purge --auto-remove $habana_pkg_lst -y
+-	sudo apt-get clean
+-}
+-
+-function local_install_packages() {
+-	local_msg "************ Installing habana prerequisites ***********"
+-	sudo apt update				|| return 1;
+-	sudo apt-get install ${pre_pkg_lst} -y	|| return 1;
+-	local_msg "************ Installing new habana packages ************"
+-	sudo apt install ${habana_pkg_lst} -y	|| return 1;
+-}
+-
+-function local_program_flash() {
+-	local hl_vid=1da3
+-	local hl_did=0001
+-	local hl_slot=$(lspci -Dd ${hl_vid}:${hl_did} | cut -d\  -f1)
+-	local pci_rescan=/sys/bus/pci/rescan
+-	local hl_remove=/sys/bus/pci/devices/${hl_slot}/remove
+-	local hl_syspath=/sys/class/habanalabs
+-
+-	local_msg "***************** Programming SPI flash ****************"
+-	sudo $fw_ldr || return 1;
+-	sleep 5;
+-	sudo bash -c "echo 1 > $hl_remove" || return 1;
+-	sleep 5;
+-	sudo bash -c "echo 1 > $pci_rescan" || return 1;
+-	local_msg "************** New SPI flash FW versions ***************"
+-	sleep 5;
+-	cat $hl_syspath/hl*/*_ver
+-}
+-
+-local_remove_packages
+-local_install_packages
+-if [ $? -ne 0 ]; then
+-	local_msg "************* Failed installing packages ***************"
+-	local_remove_packages
+-	exit 3;
+-fi
+-
+-local_program_flash
+-if [ $? -ne 0 ]; then
+-        local_msg "************** Failed programming flash ****************"
+-        local_remove_packages
+-        exit 3;
+-fi
+diff --git a/board/habanalabs/common/local_remote_common b/board/habanalabs/common/local_remote_common
+new file mode 100755
+index 0000000..903c178
+--- /dev/null
++++ b/board/habanalabs/common/local_remote_common
+@@ -0,0 +1,15 @@
++#!/bin/bash
++
++function print_msg() {
++	local msg=$1
++	echo -e   "********************************************************"
++	echo -e   "***** $msg"
++	echo -e   "********************************************************"
++}
++
++function print_dmesg() {
++        print_msg "*************** dmesg start ***********************"
++        sudo dmesg -c
++        print_msg "*************** dmesg end *************************"
++}
++
+diff --git a/board/habanalabs/common/local_run b/board/habanalabs/common/local_run
+new file mode 100755
+index 0000000..f813477
+--- /dev/null
++++ b/board/habanalabs/common/local_run
+@@ -0,0 +1,104 @@
++#!/bin/bash -l
++
++params=$*
++remove_pkgs=$(echo $params | grep -ow remove | uniq)
++install_pkgs=$(echo $params | grep -ow install | uniq)
++program_flash=$(echo $params | grep -ow program | uniq)
++
++pre_pkg_lst="dkms"
++habana_pkg_lst="habanalabs"
++fw_ldr=$HOME/fw_loader
++
++source local_remote_common
++
++if [[ -z "$remove_pkgs" && -z "$install_pkgs" && -z "$program_flash" ]]; then
++	print_msg "Error: no arguments provided"
++	exit 10;
++fi
++
++function local_purge_leftovers() {
++	print_msg "Start Purging leftovers"
++	DKMS_HABANA_DIR=/var/lib/dkms/habanalabs
++	HABANA_KO="/lib/modules/$(uname -r)/updates/dkms/habanalabs.ko"
++	if [ $(lsmod | grep -ci habana) -ne 0 ]; then
++		echo habanalabs is still inserted... removing...;
++		sudo modprobe -r habanalabs;
++	fi
++	if [ -e $DKMS_HABANA_DIR ]; then
++		echo $DKMS_HABANA_DIR is still present... removing...;
++		sudo rm -fr $DKMS_HABANA_DIR;
++	fi
++	if [ -e $HABANA_KO ]; then
++		echo $(basename $HABANA_KO) is still present... removing...;
++		sudo rm -f $HABANA_KO;
++	fi
++	print_msg "Finished Purging leftovers"
++}
++
++function local_remove_packages() {
++	print_msg "Removing old habana packages"
++	sudo apt-get purge --auto-remove $habana_pkg_lst -y
++	sudo apt-get clean
++}
++
++function local_install_packages() {
++	print_msg "Installing habana prerequisites"
++	sudo apt update				|| return 1;
++	sudo apt-get install ${pre_pkg_lst} -y	|| return 1;
++	print_msg "Installing new habana packages"
++	sudo apt install ${habana_pkg_lst} -y	|| return 1;
++}
++
++function local_program_flash() {
++#	local hl_vid=1da3
++#	local hl_did=0001
++#	local hl_slot=$(lspci -Dd ${hl_vid}:${hl_did} | cut -d\  -f1)
++#	local pci_rescan=/sys/bus/pci/rescan
++#	local hl_remove=/sys/bus/pci/devices/${hl_slot}/remove
++	local hl_syspath=/sys/class/habanalabs
++
++	print_msg "Programming SPI flash"
++	sudo $fw_ldr || return 1;
++	sleep 5;
++#	sudo bash -c "echo 1 > $hl_remove" || return 1;
++	sudo modprobe -r habanalabs
++	sleep 5;
++#	sudo bash -c "echo 1 > $pci_rescan" || return 1;
++	sudo modprobe habanalabs "heartbeat=0"
++	print_msg "New SPI flash FW versions"
++	sleep 5;
++	cat $hl_syspath/hl*/*_ver
++	
++}
++
++function local_err_exit() {
++	local err=$1
++	print_dmesg
++	exit $err;
++}
++
++# Clean the dmesg buffer
++sudo dmesg -C
++
++if [[ -n "$remove_pkgs" || -n "$install_pkgs" ]]; then
++	local_remove_packages
++	local_purge_leftovers
++fi
++	
++if [ -n "$install_pkgs" ]; then
++	local_install_packages
++	if [ $? -ne 0 ]; then
++		print_msg "Failed installing packages"
++		local_err_exit 1;
++	fi
++	print_dmesg
++fi
++
++if [ -n "$program_flash" ]; then
++	local_program_flash
++	if [ $? -ne 0 ]; then
++        	print_msg "Failed programming flash"
++	        local_err_exit 2;
++	fi
++	print_dmesg
++fi
+diff --git a/board/habanalabs/common/remote_cleanup b/board/habanalabs/common/remote_cleanup
+deleted file mode 100755
+index 5104b1c..0000000
+--- a/board/habanalabs/common/remote_cleanup
++++ /dev/null
+@@ -1,67 +0,0 @@
+-#!/bin/bash -l
+-
+-host=$1
+-habana_pkg_lst="habanalabs habanatools libhabana"
+-result=~/remote_cleanup.result
+-
+-# TODO: this script can share code with the other scripts of this family.
+-
+-function local_msg() {
+-	local msg=$1
+-	echo -e   "********************************************************"
+-	echo -e   "$msg"
+-	echo -e   "********************************************************"
+-}
+-
+-function remote_purge_leftovers() {
+-	local_msg "****************** Purging leftovers *******************"
+-	DKMS_HABANA_DIR=/var/lib/dkms/habanalabs
+-	ssh -t $host "HABANA_KO=\"/lib/modules/\`uname -r\`/updates/dkms/habanalabs.ko\"
+-			if [ \`lsmod | grep -ci habana\` -ne 0 ]; then
+-				echo habanalabs is still inserted...;
+-				sudo modprobe -r habanalabs;
+-			fi;
+-			if [ -e $DKMS_HABANA_DIR ]; then
+-				echo $DKMS_HABANA_DIR is still present...;
+-				sudo rm -fr $DKMS_HABANA_DIR;
+-			fi
+-			if [ -e $HABANA_KO ]; then
+-				sudo rm -f $HABANA_KO;
+-			fi;" | tee -a $result
+-
+-	local pipestat=${PIPESTATUS[0]}
+-	echo ssh purge leftovers status: $pipestat
+-	return $pipestat;
+-}
+-
+-function remote_remove_packages() {
+-	local_msg "************* Removing old habana packages *************"
+-	ssh -t $host "sudo apt-get purge --auto-remove $habana_pkg_lst -y" | tee -a $result
+-	local pipestat=${PIPESTATUS[0]}
+-	echo ssh apt-get purge status: $pipestat
+-	if [ $pipestat -ne 0 ]; then
+-		return $pipestat;
+-	fi
+-
+-	ssh -t $host "sudo apt-get clean" | tee -a $result
+-	pipestat=${PIPESTATUS[0]}
+-	echo ssh apt-get clean status: $pipestat
+-	return $pipestat;
+-}
+-
+-for ((i=100; i>0; i--)); do
+-	echo $i
+-	sleep 1;
+-	ping -c 1 -W 1 $host
+-	if [ $? -eq 0 ]; then
+-		rm -f $result
+-		ssh -t $host "echo booted"	|| continue;
+-		remote_remove_packages		|| break;
+-		remote_purge_leftovers		|| break;
+-		echo done;
+-		exit 0;
+-	fi
+-done
+-
+-echo error
+-exit 1;
+diff --git a/board/habanalabs/common/remote_load_firmware b/board/habanalabs/common/remote_load_firmware
+deleted file mode 100755
+index e2bb15c..0000000
+--- a/board/habanalabs/common/remote_load_firmware
++++ /dev/null
+@@ -1,75 +0,0 @@
+-#!/bin/bash
+-
+-host=$1
+-success_str="1000"
+-result=~/remote_load_firmware.result
+-fw_dir=/lib/firmware/habanalabs/dali
+-local_scr_dir=/var/lib/tftpboot/tests
+-scr_name=local_install_packages
+-fw_ldr=fw_loader
+-remote_scr_dir="."
+-
+-
+-function remote_prepare_work_dirs() {
+-	ssh -t $host "sudo mkdir -p $fw_dir;" | tee -a $result
+-
+-	local pipestat=${PIPESTATUS[0]}
+-	echo ssh mkdir $fw_dir status: $pipestat
+-
+-	return $pipestat;
+-}
+-
+-function remote_copy_fw_scripts() {
+-	# sync the latest built binaries
+-	for ((j=0; j<3; j++)); do
+-		sshpass -p123456 scp ${fw_dir}/* root@${host}:${fw_dir}/	|| break;
+-		sshpass -p123456 scp ${local_scr_dir}/${fw_ldr} ${host}:${remote_scr_dir}/	|| break;
+-		sshpass -p123456 scp ${local_scr_dir}/${scr_name} ${host}:${remote_scr_dir}/	|| break;
+-		return 0;
+-	done
+-
+-	echo "Failed copying the latest firmware binaries or remote script..."
+-	return 1;
+-}
+-
+-function remote_run_script() {
+-	ssh -t $host "${remote_scr_dir}/${scr_name};" | tee -a $result
+-
+-	local pipestat=${PIPESTATUS[0]}
+-	case $pipestat in
+-	0)
+-		;;
+-	1)
+-		echo "Failed preparing dirs (tmpfs) for packages"
+-		;;
+-	2)
+-		echo "Failed downloading packages"
+-		;;
+-	3)
+-		echo "Failed installing packages"
+-		;;
+-	*)
+-		echo "Unknown error returned from script"
+-		;;
+-	esac
+-
+-	echo Installation script status: $pipestat
+-	return $pipestat;
+-}
+-
+-for ((i=100; i>0; i--)); do
+-	echo $i
+-	sleep 1;
+-	ping -c 1 -W 1 $host
+-	if [ $? -eq 0 ]; then
+-		rm -f $result
+-		remote_prepare_work_dirs	|| continue;
+-		remote_copy_fw_scripts		|| break;
+-		remote_run_script		|| break;
+-		echo done;
+-		exit 0;
+-	fi
+-done
+-
+-echo error
+-exit 1;
+diff --git a/board/habanalabs/common/remote_run b/board/habanalabs/common/remote_run
+new file mode 100755
+index 0000000..3821ae9
+--- /dev/null
++++ b/board/habanalabs/common/remote_run
+@@ -0,0 +1,90 @@
++#!/bin/bash
++
++host=$1
++shift
++params=$*
++remove_pkgs=$(echo $params | grep -ow remove | uniq)
++install_pkgs=$(echo $params | grep -ow install | uniq)
++program_flash=$(echo $params | grep -ow program | uniq)
++
++result=~/$(basename $0).result
++fw_dir=/lib/firmware/habanalabs/dali
++local_scr_dir=/var/lib/tftpboot/tests
++scr_name=(local_run local_remote_common)
++fw_ldr=fw_loader
++remote_scr_dir="."
++
++source $local_scr_dir/local_remote_common
++
++rm -f $result
++
++if [[ -z "$remove_pkgs" && -z "$install_pkgs" && -z "$program_flash" ]]; then
++	print_msg "Error: no arguments provided" | tee -a $result
++	exit 10;
++fi
++
++function remote_prepare_work_dirs() {
++	ssh -t $host "sudo mkdir -p $fw_dir;" | tee -a $result
++
++	local pipestat=${PIPESTATUS[0]}
++	print_msg "ssh mkdir $fw_dir status: $pipestat" | tee -a $result
++
++	return $pipestat;
++}
++
++function remote_copy_fw_scripts() {
++	local scripts=(${scr_name[*]/local_/${local_scr_dir}/local_})
++	# sync the latest built binaries
++	for ((j=0; j<3; j++)); do
++		sshpass -p123456 scp ${fw_dir}/* root@${host}:${fw_dir}/	|| break;
++		sshpass -p123456 scp ${local_scr_dir}/${fw_ldr} ${host}:${remote_scr_dir}/	|| break;
++		sshpass -p123456 scp ${scripts[*]} ${host}:${remote_scr_dir}/	|| break;
++		print_msg "Finished copying the firmware and scripts" | tee -a $result
++		return 0;
++	done
++
++	print_msg "Failed copying the firmware and scripts" | tee -a $result
++	return 1;
++}
++
++function remote_run_script() {
++	print_msg "Starting ${scr_name[0]}, args: $remove_pkgs $install_pkgs $program_flash" | tee -a $result
++
++	ssh -t $host "${remote_scr_dir}/${scr_name[0]} $remove_pkgs $install_pkgs $program_flash;" | tee -a $result
++
++	local pipestat=${PIPESTATUS[0]}
++	case $pipestat in
++	0)
++		print_msg "${scr_name[0]}: returned success" | tee -a $result
++		;;
++	1)
++		print_msg "${scr_name[0]}: Failed installing packages" | tee -a $result
++		;;
++	2)
++		print_msg "${scr_name[0]}: Failed programming SPI flash" | tee -a $result
++		;;
++	*)
++		print_msg "${scr_name[0]}: Unknown error" | tee -a $result
++		;;
++	esac
++
++	print_msg "${scr_name[0]} script status: $pipestat" | tee -a $result
++	return $pipestat;
++}
++
++for ((i=100; i>0; i--)); do
++	echo $i
++	sleep 1;
++	ping -c 1 -W 1 $host
++	if [ $? -eq 0 ]; then
++		rm -f $result
++		remote_prepare_work_dirs	|| continue;
++		remote_copy_fw_scripts		|| break;
++		remote_run_script		|| break;
++		echo done;
++		exit 0;
++	fi
++done
++
++echo error
++exit 1;

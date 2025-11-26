@@ -1,0 +1,118 @@
+From ceb84bc5aa07870e26285e5c6dfc13e5df6f9e3c Mon Sep 17 00:00:00 2001
+From: Jason Smith <jsmith@habana.ai>
+Date: Sun, 10 Nov 2024 20:25:01 -0500
+Subject: [PATCH] [SW-196915] g3: pldm: set spi comparison stamp
+
+Support the version comparison stamp when generating PLDM packages.
+
+Leverage this to set the correct version stamp for the SPI package.
+
+Change-Id: I025f060c177912688d73b510a23a19ef9d456d54
+Signed-off-by: Jason Smith <jsmith@habana.ai>
+---
+
+diff --git a/board/habanalabs/gaudi3/create-pldm-fwup-package-spi-flash.sh b/board/habanalabs/gaudi3/create-pldm-fwup-package-spi-flash.sh
+index 7a0b51c..b34c425 100755
+--- a/board/habanalabs/gaudi3/create-pldm-fwup-package-spi-flash.sh
++++ b/board/habanalabs/gaudi3/create-pldm-fwup-package-spi-flash.sh
+@@ -9,21 +9,37 @@
+         exit 1
+ fi
+ 
+-AGENT_FW_LOADER_FIT_VERSION=$(cat ${VERSION_FILE})
+-AGENT_FW_LOADER_FIT_VERSION=${AGENT_FW_LOADER_FIT_VERSION:1} # remove leading '-'
++VERSION_STR=$(cat ${VERSION_FILE})
++VERSION_STR=${VERSION_STR:1} # remove leading '-'
++VERSION_STAMP=
++
++if [[ "${VERSION_STR}" =~ hl-gaudi3-.*-fw-([0-9]+)\.([0-9]+)\.([0-9]+).* ]]
++then
++        _major=${BASH_REMATCH[1]}
++        _minor=${BASH_REMATCH[2]}
++        _patch=${BASH_REMATCH[3]}
++        VERSION_STAMP=$((_major << 24 | _minor << 16 | _patch << 8))
++else
++        echo "%0: Failed to parse version string for comparison stamp"
++        exit 1
++fi
++
+ PACKAGE_PREFIX="${ITBS_DIR}${DEV_PREFIX}-pldm-package-spi-flash"
+ PACKAGE_JSON="${PACKAGE_PREFIX}.json"
+ PACKAGE_BIN="${PACKAGE_PREFIX}.bin"
+ 
+ ${PLDM_FWUP_JSON_CTOR_SCRIPT} --output-file ${PACKAGE_JSON} \
+-                             --package-release-date-time "${PACKAGE_RELEASE_DATE_TIME}" \
+-                             --package-version "${AGENT_FW_LOADER_FIT_VERSION}" \
+-                             --component-image-set-version "${AGENT_FW_LOADER_FIT_VERSION}" \
+-                             --pci-device-id "${PCI_DEVICE_ID}" \
+-                             --pci-subsystem-id "${PCI_SUBSYSTEM_ID}" \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) "${AGENT_FW_LOADER_FIT_VERSION}" \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_SPI))    "${AGENT_FW_LOADER_FIT_VERSION}" \
+-                             --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) "${AGENT_FW_LOADER_FIT_VERSION}"
++        --package-release-date-time "${PACKAGE_RELEASE_DATE_TIME}" \
++        --package-version "${VERSION_STR}" \
++        --component-image-set-version "${VERSION_STR}" \
++        --pci-device-id "${PCI_DEVICE_ID}" \
++        --pci-subsystem-id "${PCI_SUBSYSTEM_ID}" \
++        --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) \
++                "${VERSION_STR}" ${VERSION_STAMP} \
++        --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_SPI)) \
++                "${VERSION_STR}" ${VERSION_STAMP} \
++        --component $((COMPONENT_CLASSIFICATION_FIRMWARE)) $((COMPONENT_ID_LOADER)) \
++                "${VERSION_STR}" ${VERSION_STAMP}
+ rv=$?
+ if [[ ${rv} -ne 0 ]]; then
+         echo "$0: ${PLDM_FWUP_JSON_CTOR_SCRIPT} failed with ${rv}"
+diff --git a/scripts/pldm/hl_pldm_fwup_package_json_creator.py b/scripts/pldm/hl_pldm_fwup_package_json_creator.py
+index 3c5903a..408e92c 100755
+--- a/scripts/pldm/hl_pldm_fwup_package_json_creator.py
++++ b/scripts/pldm/hl_pldm_fwup_package_json_creator.py
+@@ -14,10 +14,28 @@
+ PLDM_DESCRIPTOR_TYPE_PCI_SUBSYSTEM_ID		= 0x0102
+ PLDM_COMPONENT_COMPARISON_STAMP_NOT_SUPPORTED	= "0xFFFFFFFF"
+ 
++# Possible bits for ComponentOptions bitfield, per Table 6 in DSP0267.
++PLDM_COMPONENT_OPTIONS_FORCE_UPDATE_BIT		= 0
++PLDM_COMPONENT_OPTIONS_USE_COMPARISON_STAMP_BIT	= 1
++
+ # Vendor ID is 0x1da3.
+ # Must encode in little-endian byte order for PLDM
+ HL_PCIE_VENDOR_ID				= "a31d"
+ HL_PCIE_VENDOR_SUBSYSTEM_ID			= "a31d"
++
++def comparison_stamp(component):
++	# The comparison stamp is the optional 4th argument to --component.  Use it if
++	# present, else fall back to the 'invalid' stamp as defined by DSP0267.
++	try:
++		return hex(int(component[3]))
++	except:
++		return PLDM_COMPONENT_COMPARISON_STAMP_NOT_SUPPORTED
++
++def component_options(component):
++	opts = []
++	if comparison_stamp(component) != PLDM_COMPONENT_COMPARISON_STAMP_NOT_SUPPORTED:
++		opts.append(PLDM_COMPONENT_OPTIONS_USE_COMPARISON_STAMP_BIT)
++	return opts
+ 
+ def generate_json_data(args):
+ 	return {
+@@ -56,8 +74,8 @@
+ 			{
+ 				"ComponentClassification": int(c[0]),
+ 				"ComponentIdentifier": int(c[1]),
+-				"ComponentOptions": [],
+-				"ComponentComparisonStamp": PLDM_COMPONENT_COMPARISON_STAMP_NOT_SUPPORTED,
++				"ComponentOptions": component_options(c),
++				"ComponentComparisonStamp": comparison_stamp(c),
+ 				"RequestedComponentActivationMethod": [],
+ 				"ComponentVersionString": c[2],
+ 			} for c in args.component
+@@ -75,7 +93,7 @@
+ 	parser.add_argument('--pci-subsystem-id', type=str, required=True)
+ 	parser.add_argument('--pci-vendor-id', type=str, default=HL_PCIE_VENDOR_ID)
+ 	parser.add_argument('--pci-subsystem-vendor-id', type=str, default=HL_PCIE_VENDOR_SUBSYSTEM_ID)
+-	parser.add_argument('--component', nargs='+', action='append', required=True)
++	parser.add_argument('--component', nargs='+', action='append', required=True, help="<class> <id> <ver> [<stamp>]")
+ 	args = parser.parse_args()
+ 
+ 	json_data = generate_json_data(args)

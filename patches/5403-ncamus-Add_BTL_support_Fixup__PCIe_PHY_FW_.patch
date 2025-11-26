@@ -1,0 +1,139 @@
+From 95c88d07ee4293f78176511f7bbb4f6bf56cabb5 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Tue, 07 Aug 2018 11:52:48 +0300
+Subject: [PATCH] Add BTL support Fixup [PCIe PHY FW]
+
+Update to support PCIe PHY FW update
+---
+
+diff --git a/board/habanalabs/dali/btl/Makefile b/board/habanalabs/dali/btl/Makefile
+index 4c30eb7..11500d6 100644
+--- a/board/habanalabs/dali/btl/Makefile
++++ b/board/habanalabs/dali/btl/Makefile
+@@ -16,15 +16,8 @@
+ ifneq ($(TARGET_IS_TESTER),)
+ 	COMMON_CPP_FLAGS += -DTARGET_IS_TESTER
+ endif
+-ifneq ($(BTL_PCIE_BAR4_4G),)
+-	COMMON_CPP_FLAGS += -DPCIE_BAR4_4G
+-endif
+-ifneq ($(BTL_PCIE_UPGRADE),)
+-	COMMON_CPP_FLAGS += -DPCIE_UPGRADE
+-endif
+ 
+ PRIMARY_CPP_FLAGS += $(COMMON_CPP_FLAGS)
+-PRIMARY_CPP_FLAGS += -DBTLID=0x31
+ PRIMARY_CPP_FLAGS += -DPCIE_PHY_FW_OFFSET=0x1b0000
+ PRIMARY_CPP_FLAGS += -DPCIE_PHY_FW_SIZE=$(PCIE_PHY_FW_SIZE)
+ PRIMARY_CPP_FLAGS += -DSPL_OFFSET=0xa0000
+@@ -33,7 +26,6 @@
+ PRIMARY_CPP_FLAGS += -DUBOOT_SIZE=$(UBOOT_SIZE)
+ 
+ SECONDARY_CPP_FLAGS += $(COMMON_CPP_FLAGS)
+-SECONDARY_CPP_FLAGS += -DBTLID=0x32
+ SECONDARY_CPP_FLAGS += -DPCIE_PHY_FW_OFFSET=0x9b0000
+ SECONDARY_CPP_FLAGS += -DPCIE_PHY_FW_SIZE=$(PCIE_PHY_FW_SIZE)
+ SECONDARY_CPP_FLAGS += -DSPL_OFFSET=0x8a0000
+@@ -68,16 +60,16 @@
+ 	@od -v -Ax -tx1 -w12 $@ > $@.hex
+ 
+ primary.i: $(BTL_ASMFILE)
+-	@gcc -E -P -nostdinc $(PRIMARY_CPP_FLAGS) -o $@ $<
++	@gcc -E -P -nostdinc $(PRIMARY_CPP_FLAGS) -DBTLID=0x31 -o $@ $<
+ 
+ prstn.i: $(BTL_ASMFILE)
+-	@gcc -E -P -nostdinc $(PRSTN_CPP_FLAGS) -o $@ $<
++	@gcc -E -P -nostdinc $(PRSTN_CPP_FLAGS) -DBTLID=0x33 -o $@ $<
+ 
+ pcie.i: $(PCIE_ASMFILE)
+ 	@gcc -E -P -nostdinc $(COMMON_CPP_FLAGS) -o $@ $<
+ 
+ secondary.i: $(BTL_ASMFILE)
+-	@gcc -E -P -nostdinc $(SECONDARY_CPP_FLAGS) -o $@ $<
++	@gcc -E -P -nostdinc $(SECONDARY_CPP_FLAGS) -DBTLID=0x32 -o $@ $<
+ 
+ pcie_phy_fw.bin: pcie_phy_fw.i
+ 	@cut -d' ' -f3- $< | xxd -r -p | dd status=none bs=16 conv=sync,swab of=$@
+diff --git a/board/habanalabs/dali/btl/pcie_phy.s b/board/habanalabs/dali/btl/pcie_phy.s
+index bccd4b2..f500f59 100644
+--- a/board/habanalabs/dali/btl/pcie_phy.s
++++ b/board/habanalabs/dali/btl/pcie_phy.s
+@@ -1,6 +1,8 @@
+ /*
+  * This file is for PCIe PHY initialization
+  */
++
++#ifndef TARGET_IS_PLDM
+ /*
+  * Set PCIe PHY CR Para I/F to CFG.
+  * Select CR PARA I/F instead of JTAG
+@@ -10,9 +12,11 @@
+ cfg 0xCC10858, 0x00000001
+ cfg 0xCC1085C, 0x00000001
+ 
+-#ifdef PCIE_UPGRADE
+ /* Select indirect access to CR PARA I/F instead of PRBI */
+ cfg 0xCC10920, 0x00000001
++
++/* Errata: disable unused design that cause PCIe phy SRAM DERR */
++cfg 0xCC10840, 0x0
+ #endif
+ 
+ /* Clear phy_init (removes the workaround provided by SNPS) */
+@@ -21,18 +25,11 @@
+ /* Take PCIe PHY out of reset */
+ cfg 0xCC01300, 0x00000001
+ 
+-#ifdef PCIE_UPGRADE
++#ifdef PRSTN
+ /* Enable PCIe FW download FSM */
+ cfg 0xCC4B020, 0x00000001
++#endif
+ 
++#ifndef TARGET_IS_PLDM
+ mem 0x07FF9000000, pcie_phy_fw.bin
+-#else
+-/*
+- * Write ext_ld_done x 4,
+- * without waiting for sram_init_done
+- */
+-cfg 0xCC10660, 0x00000001
+-cfg 0xCC10664, 0x00000001
+-cfg 0xCC10668, 0x00000001
+-cfg 0xCC1066C, 0x00000001
+ #endif
+diff --git a/board/habanalabs/dali/btl/primary.S b/board/habanalabs/dali/btl/primary.S
+index 2d68d70..df27c5a 100644
+--- a/board/habanalabs/dali/btl/primary.S
++++ b/board/habanalabs/dali/btl/primary.S
+@@ -9,24 +9,18 @@
+ /* CPU_BOOT_STATUS_IN_BTL -> mmPSOC_GLOBAL_CONF_WARM_REBOOT */
+ cfg 0xCC4B300, 0x4
+ 
+-#if 0
++/* To avoid false prstn configurae pad as schmitt trigger */
++cfg 0xCC4B668, 0x41
++
+ /* Configure prstn to reset entire SoC */
+ cfg 0xCC4B470, 0x7FFFFF
++
+ /* Clear masking of prstn from SW reset */
+ cfg 0xCC4B484, 0x0
+-#ifndef PRSTN
+-mem 0x07FF9000000, pcie_phy_fw.bin
+-#endif
+-#endif
++
++#include "pcie_phy.s"
+ 
+ #include "i2c.s"
+-#ifdef TARGET_IS_PLDM
+-/* Disable PCIe PHY */
+-cfg 0xCC07100, 0x0
+-#endif
+-
+-/* To avoid false perst configurae pad as schmitt trigger */
+-cfg 0xCC4B668, 0x41
+ 
+ /* Copy PREBOOT to SRAM */
+ mem PREBOOT_ADDR, PREBOOT_FILE

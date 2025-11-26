@@ -1,0 +1,478 @@
+From cbecc994eb57af5facaeae04f973865769a5f644 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 14 Aug 2023 14:29:24 +0300
+Subject: [PATCH] [SW-153648] scripts: add bmc_update
+
+Add bmc update scripts for HLS2
+
+Change-Id: I6d1eaba51711c831fd1b07d00a122f426a4aaff6
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/scripts/bmc_update/Yafuflash b/scripts/bmc_update/Yafuflash
+new file mode 100755
+index 0000000..98d8b62
+--- /dev/null
++++ b/scripts/bmc_update/Yafuflash
+Binary files differ
+diff --git a/scripts/bmc_update/baremetal.sh b/scripts/bmc_update/baremetal.sh
+new file mode 100755
+index 0000000..1165918
+--- /dev/null
++++ b/scripts/bmc_update/baremetal.sh
+@@ -0,0 +1,224 @@
++#!/bin/bash
++
++set +xe
++
++echo " "
++export CYAN="\033[0;36m"
++export GREEN="\033[0;32m"
++export YELLOW="\033[0;33m"
++export MAGNETA="\033[0;35m"
++export BLUE="\033[0;34m"
++export RED="\033[0;31m"
++export NC="\033[0m" # No Color
++echo " "
++
++if [ $# -lt 7 ]; then
++	echo "$0 <kvm host> <oam bmc> <ipmi username> <ipmi password> <bmc ssh username> <bmc ssh password> <image file>"
++	exit 1
++fi
++
++CURRENT_KVM=$1
++CURRENT_HLS=$2
++USERNAME=$3
++PASSWORD=$4
++SYS_USERNAME=$5
++SYS_PASSWORD=$6
++IMG=$7
++
++printf "${MAGNETA}Testing Connection To Host...${NC}\n"
++echo " "
++PING_CMD="nc -zv ${CURRENT_HLS} 22 -w 1"
++eval $PING_CMD
++if [[ $? -eq 0 ]]; then
++    echo " "
++    printf "${GREEN}${CURRENT_HLS}${NC} is up & running!!!\n"
++    echo " "
++    if [ ! -f "${IMG}" ]; then
++	    echo "File not found ${IMG}"
++	    exit 1
++    fi
++    echo " "
++    printf "Retrive HIB Interface IP address on ${CURRENT_HLS} Host...\n"
++    echo " "
++        HIB_IP_ADDRESS=$(getent hosts ${CURRENT_HLS} | awk '{ print $1 }')
++
++    printf "HIB Interface IP Address Is ---> ${CYAN}${HIB_IP_ADDRESS}${NC}\n"
++    echo " "
++    printf "${BLUE}Programming HIB Version On Primary Flash For:${NC} ${CURRENT_HLS}... \n"
++    echo " "
++    ./Yafuflash -non-interactive -mse 1 -nw -ip ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD ${IMG}; RC=$?; echo $RC > hib_err.txt; ALL_RC=$(grep -v "0" hib_err.txt | wc -l); echo " "
++    echo " "
++else
++    echo " "
++    printf "${RED}${CURRENT_HLS} is Not Accessible!!!${NC}\n"
++    echo " "
++    exit 13
++fi
++printf "${CYAN}Sleep for ~3 minutes before secondary flash...${NC}\n"
++sleep 200
++echo " "
++printf "${YELLOW}Programming HIB Version On Secondary Flash For:${NC} ${CURRENT_HLS}... \n"
++echo " "
++./Yafuflash -non-interactive -mse 2 -nw -ip ${HIB_IP_ADDRESS} -U admin -P admin ${IMG}; RC=$?; echo $RC >> hib_err.txt; ALL_RC=$(grep -v "0" hib_err.txt | wc -l); echo " "
++echo " "
++echo "${MAGNETA}Testing Connection To Host...${NC}\n"
++echo " "
++PING_CMD="nc -zv ${HIB_IP_ADDRESS} 22 -w 1"
++eval $PING_CMD
++if [[ $? -eq 0 ]]; then
++    echo -e -n "${GREEN}${CURRENT_HLS}${NC} is up & running!!"
++    else
++    echo -e -n "${CYAN}Waiting for connection...${NC}"
++    echo " "
++    echo " "
++    wait_period=0
++    while true; do
++    eval $PING_CMD
++    if [[ $? -eq 0 ]]; then
++        echo " "
++        echo -e -n "${GREEN}${CURRENT_HLS}${NC} is up & running!!"
++        echo " "
++        break
++    else
++        echo " "
++        echo "Time Now: `date +%H:%M:%S`"
++        echo " "
++        echo -e -n "${YELLOW}Sleeping for two minutes...${NC}"
++        echo " "
++        wait_period=$(($wait_period+120))
++        # Below 600 is 600 seconds i.e. 10 minutes * 60 = 600 sec
++        if [ $wait_period -gt 600 ];then
++            echo " "
++            echo ===================================================================
++            echo " "
++            echo -e -n "Connection check timeout has been set to 10 minutes.\nPlease check whats wrong with ${RED}${CURRENT_HLS}${NC} host, exiting now..."
++            echo " "
++            echo " "
++            exit 13
++            echo ===================================================================
++            break
++        else
++            echo " "
++            sleep 120
++            echo " "
++        fi
++    fi
++    done
++fi
++echo " "
++echo " "
++PING_CMD="nc -zv ${HIB_IP_ADDRESS} 22 -w 1"
++eval $PING_CMD
++if [[ $? -ne 0 ]]; then
++    echo " "
++    printf "${RED}${CURRENT_HLS} is Not Accessible!!!${NC}\n"
++    echo " "
++else
++    echo " "
++    printf " Sleep ~2 minutes before continue with ${GREEN}${CURRENT_HLS}${NC} settings restoration...\n"
++    sleep 100
++    echo " "
++    printf "${BLUE}Setting Back User passwd...${NC}\n"
++    echo " "
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U admin -P admin user set password 2 $PASSWORD
++    echo " "
++    printf "${YELLOW}Activating HostName Method...${NC}\n"
++    echo " "
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x2 0x0 0x21 0x01 0x0
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x3 0x0 0x1 0x0 0x1 0x0
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x5 0x0 0x1 0x0 0x1
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x7 0
++    echo " "
++    printf "${CYAN}Set HIB HostName...${NC}\n"
++    echo " "
++    ipmitool -U $USERNAME -P $PASSWORD -H ${HIB_IP_ADDRESS} -I lanplus dcmi set_mc_id_string ${CURRENT_HLS}
++    echo " "
++    printf " Sleep ~2 minutes allowing name registartion in DNS for ${GREEN}${CURRENT_HLS}${NC}...\n"
++    sleep 150
++    echo " "
++    printf "${MAGNETA}Testing Connection To Host...${NC}\n"
++    echo " "
++    PING_CMD="nc -z ${CURRENT_KVM} 22 -w 1"
++    eval $PING_CMD
++    if [[ $? -eq 0 ]]; then
++        echo " "
++        printf "${GREEN}${CURRENT_KVM}${NC} is up & running!!!\n"
++        echo " "
++        printf "Retrive JC Interface IP address from ${CURRENT_KVM} Host...\n"
++        echo " "
++	JC_IP_ADDRESS=$(sshpass -p Hab12345 ssh -q -o StrictHostKeyChecking=no labuser@${CURRENT_KVM} ' IP=$(sudo ipmitool lan print 8 | grep "IP Address" | cut -d ":" -f2 | egrep -o '[0-9.]+'); if [[ $IP == *0.0.0.0* ]]; then IP=$(sudo ipmitool lan print 1 | grep "IP Address" | cut -d ":" -f2 | egrep -o '[0-9.]+'); echo ${IP}; else echo ${IP}; fi ')
++        echo " "
++        printf "JC IP ADDRESS IS ---> ${CYAN}${JC_IP_ADDRESS}${NC}\n"
++        echo " "
++        printf "Restore ${MAGNETA}SSH${NC} Access Settings...\n"
++        echo " "
++	ssh-keygen -f "/home/${USER}/.ssh/known_hosts" -R "${HIB_IP_ADDRESS}"
++        sshpass -p superuser ssh -q -o StrictHostKeyChecking=no ${SYS_USERNAME}@${HIB_IP_ADDRESS} ' mkdir -p /conf/user_home/sysadmin/.ssh/ && cat >> /conf/user_home/sysadmin/.ssh/authorized_keys ' < /software/releases/igorr/K8S/sysadmin_ssh/all_habana_lab_ssh_keys.pub
++        echo " "
++        printf "${BLUE}Restore AD Settings...${NC}\n"
++        echo " "
++        DN="0x68 0x61 0x62 0x61 0x6e 0x61 0x2d 0x6c 0x61 0x62 0x73 0x2e 0x63 0x6f 0x6d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 0 0 1
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 3 0 1
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 3 1 ${DN}
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 3 0 0
++        DNS1="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x33 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 5 0 1
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 5 1 ${DNS1}
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 5 0 0
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 6 0 1
++        DNS2="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x34 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 6 1 ${DNS2}
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 6 0 0
++        echo " "
++        printf "${YELLOW}Restore NTP Server & Time Zone Settings...${NC}\n"
++        echo " "
++        NTP_1="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x34 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        NTP_2="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x33 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        TIME_ZONE="0x41 0x73 0x69 0x61 0x2f 0x4a 0x65 0x72 0x75 0x73 0x61 0x6c 0x65 0x6d"
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x03 0x01
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x01 ${NTP_1}
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x02 ${NTP_2}
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa5 ${TIME_ZONE}
++        ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x04
++        echo " "
++        printf "${BLUE}Restore AD GROUPS Settings...${NC}\n"
++        echo " "
++        ADMIN="0x4b 0x38 0x53 0x2d 0x41 0x64 0x6d 0x69 0x6e 0x2d 0x48 0x4c 0x44 0x43 0x2d 0x53 0x47 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        HLDC="0x4b 0x38 0x53 0x2d 0x48 0x4c 0x44 0x43 0x2d 0x53 0x47 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        TELAD="0x54 0x65 0x6c 0x41 0x44 0x2d 0x53 0x47 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++        printf "Restore ${YELLOW}K8S-Admin-HLDC-SG${NC} Group Settings...\n"
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 1
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 1 ${ADMIN}
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 2 ${DN}
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 3 4 0 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 4 3 0 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 0
++        echo " "
++        printf "Restore ${CYAN}K8S-Admin-HLDC-SG${NC} Group Settings...\n"
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 1
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 0 1
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 1 ${HLDC}
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 2 ${DN}
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 3 2 0 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 4 1 0 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 0
++        printf "Restore ${MAGNETA}TelAD-SG${NC} Group Settings...\n"
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 1
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 0 2
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 1 ${TELAD}
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 2 ${DN}
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 3 4 0 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 4 3 0 0 0
++        ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 0
++        echo " "
++        exit $ALL_RC
++    else
++        echo " "
++        printf "${RED}${CURRENT_KVM} is Not Accessible!!!${NC}\n"
++        echo " "
++        exit 13
++    fi
++fi
++
+diff --git a/scripts/bmc_update/cluster.sh b/scripts/bmc_update/cluster.sh
+new file mode 100755
+index 0000000..e24d947
+--- /dev/null
++++ b/scripts/bmc_update/cluster.sh
+@@ -0,0 +1,214 @@
++#!/bin/bash
++
++set +xe
++
++echo " "
++export CYAN="\033[0;36m"
++export GREEN="\033[0;32m"
++export YELLOW="\033[0;33m"
++export MAGNETA="\033[0;35m"
++export BLUE="\033[0;34m"
++export RED="\033[0;31m"
++export NC="\033[0m" # No Color
++echo " "
++
++if [ $# -lt 7 ]; then
++	echo "$0 <kvm host> <oam bmc> <ipmi username> <ipmi password> <bmc ssh username> <bmc ssh password> <image file>"
++	exit 1
++fi
++
++CURRENT_JC=$1
++CURRENT_HLS=$2
++USERNAME=$3
++PASSWORD=$4
++SYS_USERNAME=$5
++SYS_PASSWORD=$6
++IMG=$7
++
++printf "${MAGNETA}Testing Connection To Host...${NC}\n"
++echo " "
++PING_CMD="nc -zv ${CURRENT_HLS} 22 -w 1"
++eval $PING_CMD
++if [[ $? -eq 0 ]]; then
++    echo " "
++    printf "${GREEN}${CURRENT_HLS}${NC} is up & running!!!\n"
++    echo " "
++    if [ ! -f "${IMG}" ]; then
++	    echo "File not found ${IMG}"
++	    exit 1
++    fi
++    echo " "
++    printf "Retrive HIB Interface IP address on ${CURRENT_HLS} Host...\n"
++    echo " "
++    ssh-keygen -f "/home/gnisan/.ssh/known_hosts" -R "${CURRENT_HLS}"
++    HIB_IP_ADDRESS=$(sshpass -p ${SYS_PASSWORD} ssh -q -o StrictHostKeyChecking=no ${SYS_USERNAME}@${CURRENT_HLS} ' ip route | grep src | grep eth0 | cut -d " " -f9 ')
++    if [ -z "$HIB_IP_ADDRESS" ]; then
++    HIB_IP_ADDRESS=$(sshpass -p superuser ssh -q -o StrictHostKeyChecking=no ${SYS_USERNAME}@${CURRENT_HLS} ' ip route | grep src | grep eth0 | cut -d " " -f9 ')
++    fi
++    printf "HIB Interface IP Address Is ---> ${CYAN}${HIB_IP_ADDRESS}${NC}\n"
++    echo " "
++    printf "${BLUE}Programming HIB Version On Primary Flash For:${NC} ${CURRENT_HLS}... \n"
++    echo " "
++    ./Yafuflash -non-interactive -mse 1 -nw -ip ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD ${IMG}; RC=$?; echo $RC > hib_err.txt; ALL_RC=$(grep -v "0" hib_err.txt | wc -l); echo " "
++    echo " "
++else
++    echo " "
++    printf "${RED}${CURRENT_HLS} is Not Accessible!!!${NC}\n"
++    echo " "
++    exit 13
++fi
++printf "${CYAN}Sleep for ~3 minutes before secondary flash...${NC}\n"
++sleep 200
++echo " "
++printf "${YELLOW}Programming HIB Version On Secondary Flash For:${NC} ${CURRENT_HLS}... \n"
++echo " "
++./Yafuflash -non-interactive -mse 2 -nw -ip ${HIB_IP_ADDRESS} -U admin -P admin ${IMG}; RC=$?; echo $RC >> hib_err.txt; ALL_RC=$(grep -v "0" hib_err.txt | wc -l); echo " "
++echo " "
++echo "${MAGNETA}Testing Connection To Host...${NC}\n"
++echo " "
++PING_CMD="nc -zv ${HIB_IP_ADDRESS} 22 -w 1"
++eval $PING_CMD
++if [[ $? -eq 0 ]]; then
++    echo -e -n "${GREEN}${CURRENT_HLS}${NC} is up & running!!"
++    else
++    echo -e -n "${CYAN}Waiting for connection...${NC}"
++    echo " "
++    echo " "
++    wait_period=0
++    while true; do
++    eval $PING_CMD
++    if [[ $? -eq 0 ]]; then
++        echo " "
++        echo -e -n "${GREEN}${CURRENT_HLS}${NC} is up & running!!"
++        echo " "
++        break
++    else
++        echo " "
++        echo "Time Now: `date +%H:%M:%S`"
++        echo " "
++        echo -e -n "${YELLOW}Sleeping for two minutes...${NC}"
++        echo " "
++        wait_period=$(($wait_period+120))
++        # Below 600 is 600 seconds i.e. 10 minutes * 60 = 600 sec
++        if [ $wait_period -gt 600 ];then
++            echo " "
++            echo ===================================================================
++            echo " "
++            echo -e -n "Connection check timeout has been set to 10 minutes.\nPlease check whats wrong with ${RED}${CURRENT_HLS}${NC} host, exiting now..."
++            echo " "
++            echo " "
++            exit 13
++            echo ===================================================================
++            break
++        else
++            echo " "
++            sleep 120
++            echo " "
++        fi
++    fi
++    done
++fi
++echo " "
++echo " "
++PING_CMD="nc -zv ${HIB_IP_ADDRESS} 22 -w 1"
++eval $PING_CMD
++if [[ $? -ne 0 ]]; then
++    echo " "
++    printf "${RED}${CURRENT_HLS} is Not Accessible!!!${NC}\n"
++    echo " "
++else
++    echo " "
++    printf " Sleep ~2 minutes before continue with ${GREEN}${CURRENT_HLS}${NC} settings restoration...\n"
++    sleep 100
++    echo " "
++    printf "${BLUE}Setting Back User passwd...${NC}\n"
++    echo " "
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U admin -P admin user set password 2 $PASSWORD
++    echo " "
++    printf "${YELLOW}Activating HostName Method...${NC}\n"
++    echo " "
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x2 0x0 0x21 0x01 0x0
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x3 0x0 0x1 0x0 0x1 0x0
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x5 0x0 0x1 0x0 0x1
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD raw 0x32 0x6c 0x7 0
++    echo " "
++    printf "${CYAN}Set HIB HostName...${NC}\n"
++    echo " "
++    ipmitool -U $USERNAME -P $PASSWORD -H ${HIB_IP_ADDRESS} -I lanplus dcmi set_mc_id_string ${CURRENT_HLS}
++    echo " "
++    printf " Sleep ~2 minutes allowing name registartion in DNS for ${GREEN}${CURRENT_HLS}${NC}...\n"
++    sleep 150
++    echo " "
++    JC_IP_ADDRESS=${CURRENT_JC}
++    echo " "
++    printf "JC IP ADDRESS IS ---> ${CYAN}${JC_IP_ADDRESS}${NC}\n"
++    echo " "
++    printf "Restore ${MAGNETA}SSH${NC} Access Settings...\n"
++    echo " "
++    sshpass -p superuser ssh -q -o StrictHostKeyChecking=no ${SYS_USERNAME}@${HIB_IP_ADDRESS} ' mkdir -p /conf/user_home/sysadmin/.ssh/ && cat >> /conf/user_home/sysadmin/.ssh/authorized_keys ' < /software/releases/igorr/K8S/sysadmin_ssh/all_habana_lab_ssh_keys.pub
++    echo " "
++    printf "Restore ${GREEN}SYSADMIN${NC} Credentials...\n"
++    echo " "
++    ssh-keygen -f "/home/gnisan/.ssh/known_hosts" -R "${CURRENT_HLS}"
++    echo " "
++    printf "${BLUE}Restore AD Settings...${NC}\n"
++    echo " "
++    DN="0x68 0x61 0x62 0x61 0x6e 0x61 0x2d 0x6c 0x61 0x62 0x73 0x2e 0x63 0x6f 0x6d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 0 0 1
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 3 0 1
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 3 1 ${DN}
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 3 0 0
++    DNS1="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x33 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 5 0 1
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 5 1 ${DNS1}
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 5 0 0
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 6 0 1
++    DNS2="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x34 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 6 1 ${DNS2}
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 6 0 0
++    echo " "
++    printf "${YELLOW}Restore NTP Server & Time Zone Settings...${NC}\n"
++    echo " "
++    NTP_1="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x34 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    NTP_2="0x31 0x30 0x2e 0x31 0x31 0x31 0x2e 0x38 0x2e 0x31 0x33 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    TIME_ZONE="0x41 0x73 0x69 0x61 0x2f 0x4a 0x65 0x72 0x75 0x73 0x61 0x6c 0x65 0x6d"
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x03 0x01
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x01 ${NTP_1}
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x02 ${NTP_2}
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa5 ${TIME_ZONE}
++    ipmitool -I lanplus -H ${HIB_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xa8 0x04
++    echo " "
++    printf "${BLUE}Restore AD GROUPS Settings...${NC}\n"
++    echo " "
++    ADMIN="0x4b 0x38 0x53 0x2d 0x41 0x64 0x6d 0x69 0x6e 0x2d 0x48 0x4c 0x44 0x43 0x2d 0x53 0x47 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    HLDC="0x4b 0x38 0x53 0x2d 0x48 0x4c 0x44 0x43 0x2d 0x53 0x47 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    TELAD="0x54 0x65 0x6c 0x41 0x44 0x2d 0x53 0x47 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
++    printf "Restore ${YELLOW}K8S-Admin-HLDC-SG${NC} Group Settings...\n"
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 1
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 1 ${ADMIN}
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 2 ${DN}
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 3 4 0 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 4 3 0 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 0
++    echo " "
++    printf "Restore ${CYAN}K8S-Admin-HLDC-SG${NC} Group Settings...\n"
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 1
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 0 1
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 1 ${HLDC}
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 2 ${DN}
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 3 2 0 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 4 1 0 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 0
++    printf "Restore ${MAGNETA}TelAD-SG${NC} Group Settings...\n"
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 1
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 0 2
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 1 ${TELAD}
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 2 ${DN}
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 3 4 0 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 1 4 3 0 0 0
++    ipmitool -I lanplus -H ${JC_IP_ADDRESS} -U $USERNAME -P $PASSWORD -I lanplus raw 0x32 0xc5 10 0 0
++    echo " "
++    exit $ALL_RC
++fi
++
+diff --git a/scripts/bmc_update/example.txt b/scripts/bmc_update/example.txt
+new file mode 100644
+index 0000000..3eab123
+--- /dev/null
++++ b/scripts/bmc_update/example.txt
+@@ -0,0 +1,5 @@
++baremetal.sh hls2-srv88-kfs hls2-bmc-srv88 admin Th1s1s8LdCPa55 sysadmin D3vL0g8L rom.ima 
++cluster.sh bmc-srv89-c06f-kfs hls2-bmc89-c06f-kfs admin Th1s1s8LdCPa55 sysadmin D3vL0g8L rom.ima 
++
++Set BMC password:
++set_pass.sh hls2-bmc89-c06f-kfs

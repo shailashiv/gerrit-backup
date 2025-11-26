@@ -1,0 +1,176 @@
+From 4d533a552935f18f97b5937fb09da00f4a588fc3 Mon Sep 17 00:00:00 2001
+From: Nadav Hugim <nhugim@habana.ai>
+Date: Wed, 16 Feb 2022 13:11:16 +0200
+Subject: [PATCH] [SW-68159] post_build: remove post-image-spi.sh
+
+this common script no longer is use.
+board specific script still used as before
+
+Change-Id: I66605eea3b2069e4239af96ed7bba506a46a1e72
+Signed-off-by: Nadav Hugim <nhugim@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/post-image-spi.sh b/board/habanalabs/common/post-image-spi.sh
+deleted file mode 100755
+index 02915dc..0000000
+--- a/board/habanalabs/common/post-image-spi.sh
++++ /dev/null
+@@ -1,158 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -e  	# stop on any error in this script
+-set -u 		# stop on any reference to undefine variable
+-set -o pipefail # stop on any error in pipeline
+-
+-HL_BASE_PATH=${BR2_EXTERNAL_HABANALABS_PATH}/board/habanalabs
+-COMMON_BASE=${HL_BASE_PATH}/common
+-BOARD_BASE=${HL_BASE_PATH}/${HL_DEV}
+-PREBOOT_BINFILE=${PREBOOT_BINFILE:-preboot.bin}
+-UBOOT_CMDFILE=${UBOOT_CMDFILE:-${BOARD_BASE}/uboot-eeprom.cmd}
+-UBOOT_FITFILE=u-boot.itb
+-UBOOT_BINFILE=${UBOOT_BINFILE:-${UBOOT_FITFILE}}
+-SPEC_BOOT_DESC_FILE=${BR2_EXTERNAL_HABANALABS_PATH}/../specs/${HL_DEV}/${HL_DEV}_boot_info.h
+-
+-source ${COMMON_BASE}/image-utility.sh
+-
+-function get_image_size {
+-	local name=${1^^}
+-
+-	stat -Lc "%s" $(eval "echo \${${name}_BINFILE}")
+-}
+-
+-source ${BOARD_BASE}/post-image-spi.sh
+-
+-function hl_chksum_padding {
+-	# Add zero padding for compatibility with image descriptors size.
+-	local pad_dwords=$1
+-	local pad_data=0
+-
+-	for i in $(seq 1 $pad_dwords); do
+-		printf "%08x" $pad_data
+-	done
+-}
+-
+-function print_image_desc {
+-	local img_name=$1
+-	local img_num=$2
+-	local img_base=$(get_image_base $img_name)
+-	local img_size=$(get_image_size $img_name)
+-	local img_load=$(get_image_loadaddr $img_name)
+-	local img_loadh=$((img_load >> 32))		# take upper bytes
+-	local img_loadl=$((img_load & 0xFFFFFFFF))	# take lower bytes
+-	local s_off=$img_base
+-	# Here we assume the second (modifiable) image is named by
+-	# the first one with addition of '2'
+-	local m_off=$(get_image_base "${img_name}2")
+-
+-	# Prepare descriptor magic "PTR"0x$img_num
+-	printf "%x%x%x%02x" "'P" "'T" "'R" $img_num | rev_bytes_stdin
+-
+-	# Prepare descriptor version
+-	local ver=$(grep CUR_VER ${SPEC_BOOT_DESC_FILE} | awk '{print $3}')
+-	printf "%08x" $ver | rev_bytes_stdin
+-
+-	# Prepare image index (stable or modifiable)
+-	local idx=0
+-	printf "%08x" $idx | rev_bytes_stdin
+-
+-	# Prepare Stable image offset
+-	printf "%08x" $s_off | rev_bytes_stdin
+-
+-	# Prepare Modifiable image offset
+-	printf "%08x" $m_off | rev_bytes_stdin
+-
+-	# Prepare Stable image size
+-	printf "%08x" $img_size | rev_bytes_stdin
+-
+-	# Prepare Modifiable image size
+-	printf "%08x" $img_size | rev_bytes_stdin
+-
+-	# If one of the addresses is empty use 0x0 instead
+-	# Prepare Stable and Modifiable image load address high
+-	printf "%08x" $img_loadh | rev_bytes_stdin
+-	printf "%08x" $img_loadh | rev_bytes_stdin
+-	# Prepare Stable and Modifiable image load address low
+-	printf "%08x" $img_loadl | rev_bytes_stdin
+-	printf "%08x" $img_loadl | rev_bytes_stdin
+-
+-	# Prepare checksum
+-	local preboot_file=`echo ${PREBOOT_BINFILE} | cut -f1 -d"."`
+-	local preboot_le="${preboot_file}.bin.le"
+-	local PRE_CKSUM=`${SHA_CHKSUM} ${preboot_le} | cut -d' ' -f1`
+-	hl_chksum_add ${PRE_CKSUM}
+-}
+-
+-function prep_image_ptrs {
+-	local img_file=$1
+-	local img_ptrs_sz=16
+-	local img_desc_sz=44
+-
+-	# Prepare the NEXT and MODIFIABLE for backward compatibility
+-	echo "11110000" > ${HL_DEV}-next-image.txt
+-	dd status=none conv=sync bs=8 count=1 if=${HL_DEV}-next-image.txt of=$img_file
+-
+-	# Pointers structure magic "NXT"0x0
+-	printf "%x%x%x00" "'N" "'X" "'T" | rev_bytes_stdin | xxd -r -p -s +8 - $img_file
+-
+-	# Image pointers
+-	local ipnames=("preboot")
+-	local ipnum=${#ipnames[*]}
+-	printf "%08x" $ipnum | rev_bytes_stdin | xxd -r -p -s +12 - $img_file
+-
+-	# Pointer structure offsets
+-	local img_descs_base_off=$((img_ptrs_sz + (ipnum * 4)))
+-	for ((i=0; i<$ipnum; i++)); do
+-		local offset=$((img_descs_base_off + (i * img_desc_sz)))
+-		local offloc=$((img_ptrs_sz + (i * 4)))
+-
+-		# Prepare pointer (offset) to descriptor
+-		printf "%08x" $offset | rev_bytes_stdin | xxd -r -p -s +$offloc - $img_file
+-
+-		# Prepare descriptor
+-		print_image_desc ${ipnames[$i]} $((i + 1)) | xxd -r -p -s +$offset - $img_file
+-	done
+-}
+-
+-pushd ${BINARIES_DIR}
+-	${HOST_DIR}/usr/bin/mkimage -C none -A arm64 -T script -d ${UBOOT_CMDFILE} boot.scr
+-
+-	handle_btl sectors-be.bin ${HL_DEV}-sectors.bin
+-	BTL_BINFILE=${HL_DEV}-sectors.bin
+-
+-	dd status=none conv=sync bs=8 if=${PREBOOT_BINFILE}				 > ${HL_DEV}-preboot.bin.le
+-	# Swap Preboot
+-	swap_file ${HL_DEV}-preboot.bin.le ${HL_DEV}-preboot.bin.be
+-	PREBOOT_BINFILE=${HL_DEV}-preboot.bin.be
+-	hl_compress_bin ${HL_DEV}-preboot.bin.le
+-
+-	dd status=none conv=sync bs=8 if=u-boot.bin					 > ${HL_DEV}-u-boot.bin.le
+-	# Swap U-boot
+-	swap_file ${HL_DEV}-u-boot.bin.le ${HL_DEV}-u-boot.bin.be
+-	UBOOT_BINFILE=${HL_DEV}-u-boot.bin.be
+-
+-	# Used by TRACE32 (Lauterbach JTAG)
+-	dd status=none conv=sync bs=4 if=u-boot.bin					 > ${HL_DEV}-u-boot.bin
+-
+-	# Reserved space filled by 0xFF
+-	dd status=none conv=sync bs=64K count=1 if=/dev/zero |  tr "\000" "\377"	 > 64K-0xff.bin
+-	dd status=none conv=sync bs=128K count=1 if=/dev/zero | tr "\000" "\377"	 > 128K-0xff.bin
+-
+-	# Metadata: Pointers
+-	prep_image_ptrs ${HL_DEV}-images-pointers.bin.le
+-	swap_file ${HL_DEV}-images-pointers.bin.le ${HL_DEV}-images-pointers.bin.be
+-	dd status=none conv=sync bs=64K count=1 if=64K-0xff.bin				 > ${HL_DEV}-images-pointers.bin.be.spi
+-	dd status=none conv=sync,notrunc bs=4 if=${HL_DEV}-images-pointers.bin.be of=${HL_DEV}-images-pointers.bin.be.spi
+-
+-	create_spi_image ${BTL_BINFILE} ${PREBOOT_BINFILE} ${HL_DEV}-images-pointers.bin.be.spi ${HL_DEV}-spi-flash.bin.nocrc
+-
+-	# Prepare checksum
+-	CKSUM=`${SHA_CHKSUM} ${HL_DEV}-spi-flash.bin.nocrc | cut -d' ' -f1`
+-	echo ${CKSUM} | xxd -p -r							 > ${HL_DEV}-spi-flash.crc
+-	dd status=none conv=sync bs=64K		if=${HL_DEV}-spi-flash.bin.nocrc	 > ${HL_DEV}-spi-flash.bin
+-	dd status=none conv=sync bs=32		if=${HL_DEV}-spi-flash.crc		>> ${HL_DEV}-spi-flash.bin
+-
+-	# Convert bin file into Palladium hex format
+-	xxd -p -c1 -g1				${HL_DEV}-spi-flash.bin	 		 > ${HL_DEV}-spi-flash.hex
+-popd

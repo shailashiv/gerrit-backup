@@ -1,0 +1,215 @@
+From 8b3fee690b9509fc8e31760beeedd9a11ec6e36d Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sun, 30 Jan 2022 02:39:32 +0200
+Subject: [PATCH] eeprom + relocate the functions
+
+Change-Id: Ib8c10fc68bd75971c538145d608448d69cdefb0e
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index b7e666f..f6ca681 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -658,55 +658,6 @@
+ 	return 0
+ }
+ 
+-function remote_fwl()
+-{
+-	$dry_run host_run sudo hl-fw-loader *$
+-	[ $? -ne 0 ] && {
+-		perr "[${pci_dev}] FWL failed"
+-		return 1
+-	} || {
+-		pok "[${pci_dev}] FWL Succeed"
+-	}
+-	return 0
+-}
+-
+-function remote_fwl_loacl_itb()
+-{
+-	local local_itb_path=$1
+-	local file_name=$(basename ${local_itb_path})
+-
+-	shift
+-
+-	 [ ! -f ${local_itb_path:-""} ] && {
+-		 perr "fwl-loc: File not exist: ${local_itb_path}"
+-		 return 1
+-	}
+-
+-	#TODO move the host_* from SA/HLS modules
+-	#     into a common module, so calling host_cp_to etc.
+-	#     will be legit.
+-
+-	host_cp_to ${local_itb_path} /tmp/${file_name}
+-
+-	remote_fwl -f /tmp/${file_name} *$ >&3
+-	[ $? -ne 0 ] && {
+-		perr "[${pci_dev}] Failed to update eeprom: $file_name"
+-		return 1
+-	} || {
+-		pok "[${pci_dev}] Succeed to update eeprom: $file_name"
+-	}
+-}
+-
+-function read_eeprom()
+-{
+-	local oam=$1
+-	local pci_dev=$2
+-	local local_itb_path=$3
+-	local file_name=$(basename ${local_itb_path})
+-
+-	return 0
+-}
+-
+ function burn_device()
+ {
+ 	local pci_dev=$1
+@@ -1162,31 +1113,6 @@
+ 	return 0
+ }
+ 
+-function remote_fwl_op()
+-{
+-	[ ${fwl_f:-0} -eq 0 ] && return 0
+-
+-	#redirect remote_fwl ${fwl_args[@]}
+-	remote_fwl ${fwl_args[@]} >&3
+-}
+-
+-function remote_fwl_local_itb_op()
+-{
+-	local loc_file
+-
+-	[ ${fwl_loc_f:-0} -eq 0 ] && retrun 0
+-	[ ${#fwl_loc_args[@]} -eq 0 ] && return 1
+-
+-	loc_file=${fwl_loc_itb_args[0]}
+-	unset fwl_loc_itb_args[0]
+-
+-	[ ! -f ${loc_file} -eq 0 ] && {
+-		perr "fwl-loc: local file not exist: ${loc_file}"
+-		return 1
+-	}
+-
+-}
+-
+ function handle_ignore_op()
+ {
+ 	[ ${#ignore_args[@]} -eq 0 ] && ignore_args=(host)
+@@ -1474,6 +1400,86 @@
+ 	hlp_ssh_add
+ }
+ 
++function remote_fwl_raw()
++{
++	$dry_run host_run sudo hl-fw-loader *$
++	[ $? -ne 0 ] && {
++		perr "[${pci_dev}] FWL failed"
++		return 1
++	} || {
++		pok "[${pci_dev}] FWL Succeed"
++	}
++	return 0
++}
++
++function remote_fwl_devs_list()
++{
++	local args=()
++	for dev in ${devs_list_pci_ids[@]}; do
++		args+=(-d $dev)
++	done
++
++	$dry_run host_run sudo hl-fw-loader $args *$
++	[ $? -ne 0 ] && {
++		perr "[${pci_dev}] FWL failed"
++		return 1
++	} || {
++		pok "[${pci_dev}] FWL Succeed"
++	}
++	return 0
++}
++
++function remote_fwl_op()
++{
++	[ ${fwl_f:-0} -eq 0 ] && return 0
++
++	#redirect remote_fwl ${fwl_args[@]}
++	remote_fwl ${fwl_args[@]} >&3
++}
++
++function remote_fwl_loacl_itb()
++{
++	local local_itb_path=$1
++	local file_name=$(basename ${local_itb_path})
++
++	shift
++
++	 [ ! -f ${local_itb_path:-""} ] && {
++		 perr "fwl-loc: File not exist: ${local_itb_path}"
++		 return 1
++	}
++
++	#TODO move the host_* from SA/HLS modules
++	#     into a common module, so calling host_cp_to etc.
++	#     will be legit.
++
++	host_cp_to ${local_itb_path} /tmp/${file_name}
++
++	remote_fwl -f /tmp/${file_name} *$ >&3
++	[ $? -ne 0 ] && {
++		perr "[${pci_dev}] Failed to update eeprom: $file_name"
++		return 1
++	} || {
++		pok "[${pci_dev}] Succeed to update eeprom: $file_name"
++	}
++}
++
++function remote_fwl_local_itb_op()
++{
++	local loc_file
++
++	[ ${fwl_loc_f:-0} -eq 0 ] && retrun 0
++	[ ${#fwl_loc_args[@]} -eq 0 ] && return 1
++
++	loc_file=${fwl_loc_itb_args[0]}
++	unset fwl_loc_itb_args[0]
++
++	[ ! -f ${loc_file} -eq 0 ] && {
++		perr "fwl-loc: local file not exist: ${loc_file}"
++		return 1
++	}
++}
++
+ function fwl_reset_device()
+ {
+ 	local oam_id=$1
+@@ -1508,6 +1514,18 @@
+ 	run_per_selected_devs fwl_reset_device
+ }
+ 
++function fwl_read_eeprom()
++{
++	remote_fwl -y -f /lib/firmware/habanalabs/gaudi2/gaudi2-eeprom_read.itb
++	return 0
++}
++
++function fwl_read_eeprom_op()
++{
++	[ ${read_eeprom_f:-0} -eq 0 ] && return 0
++	read_eeprom
++}
++
+ function host_depended_ops()
+ {
+ 	# The place to locate all the operation depend on the host
+@@ -1516,6 +1534,7 @@
+ 			host_run lspci -d 1da3:
+ 		}
+ 		fwl_reset_devices_op
++		fwl_read_eeprom_op
+ 	} || true
+ }
+ 

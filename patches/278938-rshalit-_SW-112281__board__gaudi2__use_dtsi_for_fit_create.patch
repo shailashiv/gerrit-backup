@@ -1,0 +1,106 @@
+From 02f3310181867a6243e36febb3acb2e416061c40 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Mon, 05 Dec 2022 17:35:21 +0200
+Subject: [PATCH] [SW-112281] board: gaudi2: use dtsi for fit create
+
+Until now we had duplication of binaries offset and size
+in several places in build scripts.
+This patch is is using device tree (dtsi) offset and size
+for configuring the constants which are used for fit
+creation.
+
+Change-Id: Ie4b3140720dd8f511f29f9875d8570a00554f480
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/board/habanalabs/gaudi2/post-image-fit.sh b/board/habanalabs/gaudi2/post-image-fit.sh
+index c83d313..70f01d3 100644
+--- a/board/habanalabs/gaudi2/post-image-fit.sh
++++ b/board/habanalabs/gaudi2/post-image-fit.sh
+@@ -16,17 +16,75 @@
+ UBOOT_ADDR_HI=0x1000FFFF
+ fi
+ 
+-ARC_MGMT_DCCM_HI=0x1000007F
+-ARC_MGMT_DCCM_LO=0xF7060000
+-ARC_MGMT_ICCM_HI=0x1000007F
+-ARC_MGMT_ICCM_LO=0xF7040000
+-ARC_MGMT_RELOC_HI=0x1000007F
+-ARC_MGMT_RELOC_LO=0xF7012400
+-ARC_PID_DCCM_HI=0x1000007F
+-# Should be aligned with arcpid DCCM_START
+-ARC_PID_DCCM_LO=0xF7020000
+-ARC_PID_ICCM_HI=0x1000007F
+-ARC_PID_ICCM_LO=0xF7000000
++ARC0_CORE=0
++ARC1_CORE=1
++ABS_ADDR_HI_BITS=0
++ABS_ADDR_LO_BITS=1
++ARC0_ICCM=0x1000007ff7000000
++ARC0_DCCM=0x1000007ff7020000
++ARC1_ICCM=0x1000007ff7040000
++ARC1_DCCM=0x1000007ff7060000
++ARC_ICCM_RANGE=0x00000000
++ARC_DCCM_RANGE=0x80000000
++ARC_GENERAL_RANGE=0x20000000
++ARC_RANGE_MASK=0xF0000000
++HI_ADDR_SHIFT_BITS=32
++LO_ADDR_MASK_BITS=0xFFFFFFFF
++
++source ${COMMON_BASE}/image-utility.sh
++
++function convert_arc_to_abs_view {
++	arc_range=$(($1 & $ARC_RANGE_MASK))
++	case $arc_range in
++	$(($ARC_ICCM_RANGE)))
++		if (($2 == $ARC0_CORE)); then
++			addr=$ARC0_ICCM
++		else
++			addr=$ARC1_ICCM
++		fi
++		;;
++	$(($ARC_GENERAL_RANGE)))
++		# convert general range to absolute address
++		tmp=$(($1 & 0x0FFFFFFF))
++		addr=$(($tmp | 0x1000007ff0000000))
++		;;
++	$(($ARC_DCCM_RANGE)))
++		if (($2 == $ARC0_CORE)); then
++			addr=$ARC0_DCCM
++		else
++			addr=$ARC1_DCCM
++		fi
++		;;
++	*)
++		echo "Failed to convert to absolute addressing"
++		exit 1
++		;;
++	esac
++	if (($3 == $ABS_ADDR_HI_BITS)); then
++		echo $(($addr >> $HI_ADDR_SHIFT_BITS))
++	elif (($3 == $ABS_ADDR_LO_BITS)); then
++		echo $(($addr & $LO_ADDR_MASK_BITS))
++	fi
++}
++
++DEV_NAME=`echo $HL_DEV | cut -d'_' -f1`
++
++function update_fit_variable
++{
++	offset=$(hl_get_off_sz_from_dtsi offset $3 $4)
++	eval "$2_HI"=$(convert_arc_to_abs_view $offset $1 $ABS_ADDR_HI_BITS)
++	eval "$2_LO"=$(convert_arc_to_abs_view $offset $1 $ABS_ADDR_LO_BITS)
++}
++
++pid_dtsi_file=${BR2_EXTERNAL}/../zephyr/dts/arc/hl_${DEV_NAME}_pid.dtsi
++mgmt_dtsi_file=${BR2_EXTERNAL}/../zephyr/dts/arc/hl_${DEV_NAME}_mgmt.dtsi
++
++fit_variables=("${mgmt_dtsi_file} ARC1_CORE ARC_MGMT_DCCM dccm" "${mgmt_dtsi_file} ARC1_CORE ARC_MGMT_ICCM iccm" "${mgmt_dtsi_file} ARC1_CORE ARC_MGMT_RELOC reloc" "${pid_dtsi_file} ARC0_CORE ARC_PID_DCCM dccm" "${pid_dtsi_file} ARC0_CORE ARC_PID_ICCM iccm")
++
++for fit_var in ${fit_variables[@]}; do
++	IFS=' ' read -r -a fit_var_args <<< "$fit_var"
++	update_fit_variable ${fit_var_args[1]} ${fit_var_args[2]} ${fit_var_args[3]} ${fit_var_args[0]}
++done
+ 
+ UBOOT_ZEPHYR_ITS_EXT=_reloc
+ ARC_MGMT_SRAM_HI=0x1000007F

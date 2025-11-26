@@ -1,0 +1,411 @@
+From 522ce381f8618930a6192bb35a55bcdf6348a2a7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sat, 16 May 2020 16:41:47 +0300
+Subject: [PATCH] [SW-11875]: goya2: remove flash creation for goya2_arc_gnu
+
+Since we have added new target goya2_arc_common to create flash image
+for goya2_arc, remove the flash creation from goya2_arc_gnu target.
+
+Change-Id: I1f02776ce18da7295ab3982e15777aa1dd5762df
+---
+
+diff --git a/board/habanalabs/common/post-image-spi-arc_gnu.sh b/board/habanalabs/common/post-image-spi-arc_gnu.sh
+index 498f3c3..4e1ba96 100755
+--- a/board/habanalabs/common/post-image-spi-arc_gnu.sh
++++ b/board/habanalabs/common/post-image-spi-arc_gnu.sh
+@@ -1,377 +1,5 @@
+ #!/usr/bin/env bash
+ 
+-BOARD_BASE=${BR2_EXTERNAL_HABANALABS_PATH}/board/habanalabs/${HL_DEV}
+-OBJCOPY=objcopy
+-ARCBOOT_BINFILE=${ARCBOOT_BINFILE:-preboot.bin}
+-PPBOOT_BINFILE=${PREBOOT_BINFILE:-ppboot.bin}
+-PCIE_PHY_BINFILE=${PCIE_PHY_BINFILE:-pcie_phy_fw.bin}
+-PRIME_IMAGE=0
+-SECOND_IMAGE=1
+-EFUSE_IMAGE=2
+-
+-CREATE_DUMMY_FLASH_SIZE_MIN=0
+-CREATE_DUMMY_FLASH_SIZE_MAX=960
+-
+-CREATE_DUMMY_FLASH=0
+-CREATE_DUMMY_FLASH_SIZE_64B_COUNT=${CREATE_DUMMY_FLASH_SIZE_MIN}
+-
+-## efuse configuration
+-
+-#SECURITY_BOOT_MODE
+-LEGACY=0
+-SECURE_BOOT=1
+-
+-#[REVOKE/HASH/FW_VERSION]_LOCATION
+-ASIC_EFUSE=0
+-SPI_FLASH=1
+-SPI_OTP=2
+-
+-#SPI_CONTROLLER
+-MEMORY_MAP=0
+-SPI_CONT=1
+-
+-# current efuse settings
+-REVOKE_LOCATION=${ASIC_EFUSE}
+-HASH_LOCATION=${ASIC_EFUSE}
+-SECURITY_BOOT_MODE=${SECURE_BOOT}
+-ENABLE_SECURITY_VALIDATION=1
+-DISBLE_DEBUG_IF=0
+-FW_VERSION_LOCATION=${ASIC_EFUSE}
+-SPI_CONTROLLER=${SPI_CONT}
+-
+-FLASH_BASE_ADDR=0x60000
+-
+-SECURITY_FW_VERSION=0
+-
+-HABANA_KEY_REVOKE=0
+-CUST1_KEY_REVOKE=0
+-CUST2_KEY_REVOKE=0
+-CUST3_KEY_REVOKE=0
+-CUST4_KEY_REVOKE=0
+-
+-PRIME_IMAGE_PPBOOT_KEY=0
+-PRIME_IMAGE_RAM_KEY=0
+-SECOND_IMAGE_PPBOOT_KEY=0
+-SECOND_IMAGE_RAM_KEY=0
+-
+-PRIME_IMAGE_PPBOOT_CRC_ERROR=0
+-PRIME_IMAGE_RAM_CRC_ERROR=0
+-SECOND_IMAGE_PPBOOT_CRC_ERROR=0
+-SECOND_IMAGE_RAM_CRC_ERROR=0
+-
+-PRIME_IMAGE_PPBOOT_SIGN_ERROR=0
+-PRIME_IMAGE_RAM_SIGN_ERROR=0
+-SECOND_IMAGE_PPBOOT_SIGN_ERROR=0
+-SECOND_IMAGE_RAM_SIGN_ERROR=0
+-
+-SBTOOL=../host/bin/sbtool
+-KEY_BASE_NAME=rsa3072
+-HL_KEY_BASE_NAME=hl_${KEY_BASE_NAME}
+-
+-# Using keys generated offline (once) by:
+-# ${SBTOOL} certgen -b ${HL_KEY_BASE_NAME} -p 123456 -k ${KEY_BASE_NAME} -r /distinguishedName="Habana Embedded Team" -s
+-# ${SBTOOL} export -b ${HL_KEY_BASE_NAME} -s
+-
+-function hl_gen_cert {
+-	NAME=$1
+-	STRING=$2
+-	GEN_KEY_NAME=${NAME}_${KEY_BASE_NAME}
+-	${SBTOOL} certgen -b ${GEN_KEY_NAME} -p 123456 -k ${KEY_BASE_NAME} -r /distinguishedName=${STRING}
+-	${SBTOOL} export -b ${GEN_KEY_NAME}
+-}
+-
+-function hl_sign_bin {
+-	BASENAME=$1
+-	CERT=$2
+-	${SBTOOL} sign -i ${BASENAME} -b ${CERT} -p 123456 -o ${BASENAME}.sig
+-}
+-
+-function hl_get_ver {
+-	FILE=$1
+-
+-	HL_VERSION=$(cut -d'-' -f4 ${BASE_DIR}/build/preboot-custom/localversion-habanalabs)
+-	W=${SECURITY_FW_VERSION}
+-	X=$(echo ${HL_VERSION} | cut -d'.' -f1)
+-	Y=$(echo ${HL_VERSION} | cut -d'.' -f2)
+-	Z=$(echo ${HL_VERSION} | cut -d'.' -f3)
+-	VERSION=$(printf "%02x%02x%02x%02x" ${Z} ${Y} ${X} ${W})
+-	echo ${VERSION} | xxd -r -p					> ${FILE}.ver
+-}
+-
+-function hl_get_size {
+-	FILE=$1
+-	PADD=$2
+-	SIZE=$(printf "%08x\n" $(( $(stat --printf="%s" ${FILE}) + ${PADD} )))
+-	echo ${SIZE} | xxd -r -p | xxd -e | cut -d' ' -f2 | xxd -r -p	> ${FILE}.size
+-}
+-
+-function hl_calc_crc32 {
+-	FILE=$1
+-
+-	# reverse CRC32 source as DMA engine works like that
+-	${OBJCOPY}  -Ibinary --reverse-bytes=4 ${FILE} ${FILE}.out
+-	CRC32=$(crc32 ${FILE}.out)
+-	echo ${CRC32} | xxd -r -p > ${FILE}.crc32
+-}
+-
+-function hl_pldm_hex {
+-	NAME=$(echo "$1" | cut -f 1 -d '.')
+-	FILE=$2
+-	# pad file to 128bit (16Byte) as pladium emulates 128bit memory, so xxd wont trunc lines
+-	dd status=none conv=sync bs=16 if=${FILE} > ${FILE}.tmp
+-	xxd -e -g 16 ${FILE}.tmp | xxd -r | xxd -ps -c16 > ${HL_DEV}-${HL_TARGET}-${NAME}.hex
+-	rm ${FILE}.tmp
+-}
+-
+-function hl_pldm_flash_hex {
+-	NAME=$(echo "$1" | cut -f 1 -d '.')
+-	FILE=$2
+-	# save hex as a 1 byte list of values
+-	xxd -e -g 4 ${FILE} | xxd -r | xxd -ps -c1			> ${HL_DEV}-${HL_TARGET}-${NAME}.hex
+-}
+-
+-function hl_join_bin {
+-	NAME_1=$1
+-	NAME_2=$2
+-	PACK_NAME=$3
+-	# later we add total image size, version and name_1 size (each DWORD) at
+-	# start of file. we have to make sure that this will lineup to 16byte
+-	# inorder for SPI DMA to copy whole chunks only, we padd the 3 DWORDs
+-	# now so that later when we replace these placeholders the file will
+-	# still lineup to 16byte chunk borders
+-	dd status=none conv=sync count=3 bs=4 if=/dev/zero		> ${NAME_1}.bin.prep
+-	cat ${NAME_1}.bin						>> ${NAME_1}.bin.prep
+-	# make file lineup to 16byte chunks
+-	dd status=none conv=sync bs=16 if=${NAME_1}.bin.prep 		> ${NAME_1}.bin.algn
+-	# calculate name_1 size
+-	hl_get_size ${NAME_1}.bin.algn 0
+-	# we dont need to copy empty padding on start, this was just for padding
+-	dd status=none conv=sync skip=3 bs=4 if=${NAME_1}.bin.algn	> ${NAME_1}.bin.pad
+-	# copy name_1 size, name_1 file and then name_2 file as one package
+-	cat ${NAME_1}.bin.algn.size ${NAME_1}.bin.pad ${NAME_2}.bin	>> ${PACK_NAME}
+-	rm ${NAME_1}.bin.* -rf
+-}
+-
+-function hl_pack_bin {
+-	FILEPATH=$1
+-	BSIZE=$2
+-	KEY_NUM=$3
+-	CRC_ERROR=$4
+-	SIGN_ERROR=$5
+-	if [ ${KEY_NUM} -eq 0 ]; then
+-		KEY_NAME=$(echo -n "hl_${KEY_BASE_NAME}")
+-	else
+-		KEY_NAME=$(echo -n "cust${KEY_NUM}_${KEY_BASE_NAME}")
+-	fi
+-	TEMPNAME=${FUNCNAME}-$(basename ${FILEPATH})
+-	dd status=none conv=sync bs=16 if=${FILEPATH}			> ${TEMPNAME}
+-	hl_get_ver ${TEMPNAME}
+-	VPKFILE=${TEMPNAME}.ver.payload.key
+-	cat ${TEMPNAME}.ver ${TEMPNAME} ${KEY_NAME}.pub			> ${VPKFILE}
+-	hl_sign_bin ${VPKFILE} ${KEY_NAME}
+-	if [ ${SIGN_ERROR} -eq 1 ]; then
+-		dd status=none conv=sync count=24 bs=16 if=/dev/urandom	> ${VPKFILE}.sig
+-	fi
+-	SIGBINFILE=${VPKFILE}.sig.bin
+-	cat ${VPKFILE} ${VPKFILE}.sig					> ${SIGBINFILE}
+-	hl_get_size ${SIGBINFILE} 4
+-	FULLBINFILE=${SIGBINFILE}.full
+-	cat ${SIGBINFILE}.size ${SIGBINFILE}				> ${FULLBINFILE}
+-	PADFULLBINFILE=${FULLBINFILE}.pad
+-	dd status=none conv=sync bs=16 if=${FULLBINFILE}		> ${PADFULLBINFILE}
+-	hl_get_size ${FULLBINFILE} 4
+-	dd status=none conv=notrunc seek=0 bs=8 if=${FULLBINFILE}.size of=${PADFULLBINFILE}
+-	hl_calc_crc32 ${PADFULLBINFILE}
+-	if [ ${CRC_ERROR} -eq 0 ]; then
+-		cat ${PADFULLBINFILE}.crc32				>> ${PADFULLBINFILE}
+-	fi
+-	dd status=none conv=sync bs=${BSIZE} if=${PADFULLBINFILE}	>> ${HL_DEV}-spi-flash.bin
+-	hl_pldm_hex $(basename ${FILEPATH}) ${SIGBINFILE}.full
+-	rm -f ${FUNCNAME}-*
+-}
+-
+-function hl_img_offset {
+-	FILE=$1
+-	IMAGE_NUM=$2
+-	hl_get_size ${1} FLASH_BASE_ADDR
+-	dd status=none conv=notrunc seek=${IMAGE_NUM} bs=4 if=${FILE}.size of=${HL_DEV}-spi-flash.bin
+-	rm -rf ${FILE}.size
+-}
+-
+-function hl_sec_fw {
+-	FILE=${1}
+-	if [ ${2} -ge 64 ]; then
+-		VERSION=$(printf "%016x" $(( ~$((1<<${2})) )))
+-		VERSION+=$(printf "%016x" $(( ~0 )))
+-	else
+-		VERSION=$(printf "%016x" $(( ~0 )))
+-		VERSION+=$(printf "%016x" $(( ~$((1<<${2})) )))
+-	fi
+-	echo ${VERSION} | xxd -r -p | xxd -e -g16 | xxd -r		> ${FILE}.tmp
+-	dd status=none conv=notrunc seek=0 bs=16 if=${FILE}.tmp of=${FILE}
+-
+-	if [ ${HL_TARGET} == "pldm" ]; then
+-		if [ ${2} -ge 64 ]; then
+-				VERSION=$(printf "%016x" $((1<<${2})))
+-				VERSION+=$(printf "%016x" $((0)))
+-			else
+-				VERSION=$(printf "%016x" $((0)))
+-				VERSION+=$(printf "%016x" $((1<<${2})))
+-		fi
+-		for i in {0..3}; do
+-			DWORD=$(echo ${VERSION} | xxd -r -p | xxd -g4 | cut -d' ' -f$(( 5 - ${i} )))
+-			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 59 + ${i}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.hex
+-		done
+-	fi
+-}
+-
+-function hl_sec_key {
+-	FILE=${1}
+-	NAME=${2}
+-        KEY_OFFSET=${3}
+-        KEY_BASE_NAME_PUB=${KEY_BASE_NAME}.pub
+-	${SBTOOL} hash -i ${NAME}_${KEY_BASE_NAME_PUB} -o ${NAME}_${KEY_BASE_NAME_PUB}.hash
+-	cat ${NAME}_${KEY_BASE_NAME_PUB}.hash				> ${FILE}.tmp
+-	dd status=none conv=notrunc seek=$(( ${KEY_OFFSET}*2 + 1 )) bs=16 if=${FILE}.tmp of=${FILE}
+-
+-	if [ ${HL_TARGET} == "pldm" ]; then
+-		for i in {0..7}; do
+-			DWORD=$(xxd -e -c32 -g4 ${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
+-			OFFSET=$(( $(( ${KEY_OFFSET}*8 )) +  ${i} ))
+-			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 18 + ${OFFSET}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.hex
+-		done
+-	fi
+-}
+-
+-function hl_key_revoke {
+-	REVOKE_STATUS=$1
+-	if [ $REVOKE_STATUS -eq 1 ]; then
+-		echo -n fe >> revoke_status.hex
+-	else
+-		echo -n ff >> revoke_status.hex
+-	fi
+-}
+-
+-function hl_efuse_sys_config_generate {
+-	DWORD=${HABANA_KEY_REVOKE}
+-	DWORD=$(( DWORD + $((${CUST1_KEY_REVOKE}<<1))))
+-	DWORD=$(( DWORD + $((${CUST2_KEY_REVOKE}<<2))))
+-	DWORD=$(( DWORD + $((${CUST3_KEY_REVOKE}<<3))))
+-	DWORD=$(( DWORD + $((${CUST4_KEY_REVOKE}<<4))))
+-	DWORD=$(( DWORD + $((${REVOKE_LOCATION}<<5))))
+-	DWORD=$(( DWORD + $((${HASH_LOCATION}<<7))))
+-	DWORD=$(( DWORD + $((${SECURITY_BOOT_MODE}<<9))))
+-	DWORD=$(( DWORD + $((${ENABLE_SECURITY_VALIDATION}<<10))))
+-	DWORD=$(( DWORD + $((${DISBLE_DEBUG_IF}<<12))))
+-	DWORD=$(( DWORD + $((${FW_VERSION_LOCATION}<<13))))
+-	DWORD=$(( DWORD + $((${SPI_CONTROLLER}<<17))))
+-	DWORD=$(printf "%08x" ${DWORD})
+-	echo "force {h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_58_r.data_in_r[31:0]} 'h${DWORD}" > ${HL_TARGET}-force.hex
+-}
+-
+-function hl_set_revoke_status {
+-	FILE=${1}
+-	hl_key_revoke ${HABANA_KEY_REVOKE}
+-	hl_key_revoke ${CUST1_KEY_REVOKE}
+-	hl_key_revoke ${CUST2_KEY_REVOKE}
+-	hl_key_revoke ${CUST3_KEY_REVOKE}
+-	hl_key_revoke ${CUST4_KEY_REVOKE}
+-
+-	cat revoke_status.hex | xxd -r -p > ${FILE}.tmp
+-	dd status=none conv=notrunc seek=11 bs=16 if=${FILE}.tmp of=${FILE}
+-
+-	rm -rf revoke_status.hex
+-}
+-
+ pushd ${BINARIES_DIR}
+-	for i in {1..4}; do
+-		CUST=cust${i}
+-		hl_gen_cert ${CUST} "Habana Embedded Team"
+-	done
+-
+-	## create 64k empty padded start image
+-	dd status=none conv=sync count=1 bs=64K if=/dev/zero of=${HL_DEV}-spi-flash.bin
+-	dd status=none conv=sync count=12 bs=16 if=/dev/zero | tr '\000' $'\xFF' > ${HL_DEV}-spi-otp-flash.bin
+-
+-	if [ ${CREATE_DUMMY_FLASH} -eq 1 ]; then
+-		dd status=none conv=sync count=${CREATE_DUMMY_FLASH_SIZE_64B_COUNT} bs=64 if=/dev/zero > ${HL_DEV}-dummy.bin
+-
+-		ARCBOOT_BINFILE=${HL_DEV}-dummy.bin
+-		PPBOOT_BINFILE=${HL_DEV}-dummy.bin
+-		PCIE_PHY_BINFILE=${HL_DEV}-dummy.bin
+-
+-	fi
+-
+-	# get private and public keys
+-	cp ${BOARD_BASE}/${HL_KEY_BASE_NAME}.* .
+-
+-	# update PRIMARY image offset in start 64k padded area
+-	hl_img_offset ${HL_DEV}-spi-flash.bin ${PRIME_IMAGE}
+-
+-	## To be populated into ICCM
+-	hl_pack_bin ${ARCBOOT_BINFILE} 64K ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+-	# trunk to round 128K as DMA spi can copy chunks of 1KB only
+-	truncate -s 128K ${HL_DEV}-spi-flash.bin
+-
+-	## To be populated into FW SRAM
+-
+-	# create combined name of ppboot and pcie
+-	PPBOOT=$(echo "$PPBOOT_BINFILE" | cut -f 1 -d '.')
+-	PCIE_PHY=$(echo "$PCIE_PHY_BINFILE" | cut -f 1 -d '.')
+-	PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
+-
+-	# concatenate both FW
+-	hl_join_bin ${PPBOOT} ${PCIE_PHY} ${PPBOOT_PCIE_PHY_BINFILE}
+-
+-	# pack and sign image
+-	hl_pack_bin ${PPBOOT_PCIE_PHY_BINFILE} 64K ${PRIME_IMAGE_PPBOOT_KEY} ${PRIME_IMAGE_PPBOOT_CRC_ERROR} ${PRIME_IMAGE_PPBOOT_SIGN_ERROR}
+-	truncate -s 192K ${HL_DEV}-spi-flash.bin
+-	rm -rf ${PPBOOT_PCIE_PHY_BINFILE}
+-
+-	# update SECONDARY image offset in start 64k padded area
+-	hl_img_offset ${HL_DEV}-spi-flash.bin ${SECOND_IMAGE}
+-	## To be populated into ICCM
+-	hl_pack_bin ${ARCBOOT_BINFILE} 64K ${SECOND_IMAGE_RAM_KEY} ${SECOND_IMAGE_RAM_CRC_ERROR} ${SECOND_IMAGE_RAM_SIGN_ERROR}
+-	truncate -s 256K ${HL_DEV}-spi-flash.bin
+-
+-	# To be populated into FW SRAM
+-	PPBOOT=$(echo "$PPBOOT_BINFILE" | cut -f 1 -d '.')
+-	PCIE_PHY=$(echo "$PCIE_PHY_BINFILE" | cut -f 1 -d '.')
+-	PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
+-	hl_join_bin ${PPBOOT} ${PCIE_PHY} ${PPBOOT_PCIE_PHY_BINFILE}
+-	hl_pack_bin ${PPBOOT_PCIE_PHY_BINFILE} 64K ${SECOND_IMAGE_PPBOOT_KEY} ${SECOND_IMAGE_PPBOOT_CRC_ERROR} ${SECOND_IMAGE_PPBOOT_SIGN_ERROR}
+-	truncate -s 320K ${HL_DEV}-spi-flash.bin
+-	rm -rf ${PPBOOT_PCIE_PHY_BINFILE}
+-
+-	## create EFUSE image location
+-	hl_img_offset ${HL_DEV}-spi-flash.bin ${EFUSE_IMAGE}
+-
+-	if [ ${HL_TARGET} == "pldm" ]; then
+-		hl_efuse_sys_config_generate
+-	fi
+-
+-	hl_sec_fw ${HL_DEV}-spi-otp-flash.bin ${SECURITY_FW_VERSION}
+-
+-	hl_sec_key ${HL_DEV}-spi-otp-flash.bin hl 0
+-
+-	# generate 4 customer keys and hash them to spi security
+-	for i in {1..4}; do
+-		CUST=cust${i}
+-		hl_sec_key ${HL_DEV}-spi-otp-flash.bin ${CUST} ${i}
+-	done
+-
+-	# set revoke status as a 40bit (8bit * 5) binary value
+-	hl_set_revoke_status ${HL_DEV}-spi-otp-flash.bin
+-
+-	cat ${HL_DEV}-spi-otp-flash.bin					>> ${HL_DEV}-spi-flash.bin
+-
+-	## Convert bin file into Palladium hex format ##
+-	# for SPI flash
+-	hl_pldm_flash_hex spi-flash ${HL_DEV}-spi-flash.bin
+-
+-	# for otp flash
+-	hl_pldm_flash_hex spi-otp-flash ${HL_DEV}-spi-otp-flash.bin
+ 
+ popd
+diff --git a/board/habanalabs/goya2_arc_gnu/hl_rsa3072.cert b/board/habanalabs/goya2_arc_gnu/hl_rsa3072.cert
+deleted file mode 100644
+index dd21863..0000000
+--- a/board/habanalabs/goya2_arc_gnu/hl_rsa3072.cert
++++ /dev/null
+Binary files differ
+diff --git a/board/habanalabs/goya2_arc_gnu/hl_rsa3072.pk8 b/board/habanalabs/goya2_arc_gnu/hl_rsa3072.pk8
+deleted file mode 100644
+index f30f36b..0000000
+--- a/board/habanalabs/goya2_arc_gnu/hl_rsa3072.pk8
++++ /dev/null
+Binary files differ
+diff --git a/board/habanalabs/goya2_arc_gnu/hl_rsa3072.pub b/board/habanalabs/goya2_arc_gnu/hl_rsa3072.pub
+deleted file mode 100644
+index 666fce3..0000000
+--- a/board/habanalabs/goya2_arc_gnu/hl_rsa3072.pub
++++ /dev/null
+Binary files differ

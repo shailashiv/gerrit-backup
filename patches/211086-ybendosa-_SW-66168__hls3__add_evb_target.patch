@@ -1,0 +1,635 @@
+From 2f1540ca9276a1b9d551d2aace1ba01fc947358e Mon Sep 17 00:00:00 2001
+From: Yotam Ben Dosa <ybendosa@habana.ai>
+Date: Thu, 19 May 2022 16:41:30 +0300
+Subject: [PATCH] [SW-66168] hls3: add evb target
+
+HLS-3 setups have 2 variations, one is based on an HLS-2 (which will
+later be replaced with the custom HLS-3), and and the other on AST2600
+evb.
+
+In order to accommodate both variation, hls3-evb-bmc target needs to be
+added.
+
+Change-Id: Ic6e676a9a0de48bb5bbfb74e6a9da45785ad32d6
+Signed-off-by: Yotam Ben Dosa <ybendosa@habana.ai>
+---
+
+diff --git a/package/hls3-evb-bmc/.hls3-evb-bmc.mk.swp b/package/hls3-evb-bmc/.hls3-evb-bmc.mk.swp
+new file mode 100644
+index 0000000..b541c61
+--- /dev/null
++++ b/package/hls3-evb-bmc/.hls3-evb-bmc.mk.swp
+Binary files differ
+diff --git a/package/hls3-evb-bmc/Config.in b/package/hls3-evb-bmc/Config.in
+new file mode 100644
+index 0000000..06926c6
+--- /dev/null
++++ b/package/hls3-evb-bmc/Config.in
+@@ -0,0 +1,4 @@
++config BR2_PACKAGE_HLS3_BMC
++	bool "HLS3_BMC"
++	help
++	  Build OpenBMC software stack for HLS3.
+diff --git a/package/hls3-evb-bmc/hls3-evb-bmc.mk b/package/hls3-evb-bmc/hls3-evb-bmc.mk
+new file mode 100644
+index 0000000..f03b905
+--- /dev/null
++++ b/package/hls3-evb-bmc/hls3-evb-bmc.mk
+@@ -0,0 +1,32 @@
++HLS3_BMC_VERSION = 1.0.0
++HLS3_BMC_SITE = openbmc
++HLS3_BMC_LICENSE = unclear
++
++HLS3_IMAGE = $(HLS3_EVB_IMAGE_DIR)/$(HLS3_IMAGE_NAME)
++HLS3_PHOSPHOR_IMAGE = $(HLS3_EVB_IMAGE_DIR)/$(HLS3_EVB_PHOSPHOR_IMAGE_NAME)
++HLS3_PHOSPHOR_FULLCHIP_IMAGE = $(HLS3_EVB_IMAGE_DIR)/$(HLS3_EVB_PHOSPHOR_FULLCHIP_IMAGE_NAME)
++
++define HLS3_EVB_SET_VERSION_INFO
++	export HL_VERSION=$(shell cut -c2- $(HLS3_VERSION_FILE))
++endef
++
++define HLS3_EVB_BMC_BUILD_CMDS
++	(cd $(HLS3_DEPLOY_DIR);						\
++		$(HLS3_SET_VERSION_INFO);				\
++		$(HLS3_ENV)						\
++		$(HLS3_BITBAKE_ENV)					\
++		MACHINE=hls3-evb					\
++		bitbake obmc-phosphor-image;				\
++	)
++endef
++
++HLS3_EVB_BMC_INSTALL_IMAGES = YES
++
++define HLS3_EVB_BMC_INSTALL_IMAGES_CMDS
++	$(INSTALL) -m 0644 -D $(@D)/$(HLS3_PHOSPHOR_IMAGE) $(BINARIES_DIR)/$(HLS3_EVB_PHOSPHOR_IMAGE_NAME)
++	$(INSTALL) -m 0644 -D $(@D)/$(HLS3_PHOSPHOR_FULLCHIP_IMAGE) $(BINARIES_DIR)/$(HLS3_EVB_PHOSPHOR_FULLCHIP_IMAGE_NAME)
++	$(INSTALL) -m 0755 -D ${BR2_EXTERNAL_HABANALABS_PATH}/package/hls3-bmc/install-hls3.sh $(BINARIES_DIR)/install-hls3.sh
++	$(INSTALL) -m 0755 -D ${BR2_EXTERNAL_HABANALABS_PATH}/package/hls3-bmc/install-hls3-check-dependencies.sh $(BINARIES_DIR)/install-hls3-check-dependencies.sh
++endef
++
++$(eval $(generic-package))
+diff --git a/package/hls3-evb-bmc/install-hls3-check-dependencies.sh b/package/hls3-evb-bmc/install-hls3-check-dependencies.sh
+new file mode 100644
+index 0000000..34bdcc8
+--- /dev/null
++++ b/package/hls3-evb-bmc/install-hls3-check-dependencies.sh
+@@ -0,0 +1,109 @@
++#!/bin/bash
++#
++# Copyright (c) 2022, Habana Labs.
++# All rights reserved.
++#
++# This program is free software;  you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 2 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY;  without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
++# the GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program;  if not, write to the Free Software
++# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++#
++
++declare -a SupportedOsDistribution=("Ubuntu" "CentOS")
++declare -a RequiredPackages=("curl" "sshpass")
++OStype='none'
++
++function check_dependencies_Ubuntu
++{
++	# in case of missing package, dont brack the loop - go over all the dependencies aray
++	local retval=0
++	for i in "${RequiredPackages[@]}"
++	do
++		dpkg -s $i &> /dev/null
++		if [[ $? > 0 ]]; then
++			echo	"******************FAILURE! *********************"
++			echo	"The $i package is not installed in your system."
++			echo -e "please install it:\n\tsudo apt-get install $i"
++			echo	"************************************************"
++			retval=1
++		else
++			echo "****************** OK ******************"
++			echo "The $i package already installed."
++			echo "****************************************"
++		fi
++	done
++	return $retval
++}
++
++
++function check_dependencies_CentOS
++{
++	# in case of missing package, dont brack the loop - go over all the dependencies aray
++	local retval=0
++	for i in "${RequiredPackages[@]}"
++	do
++		yum list installed $i &> /dev/null
++		if [[ $? != 0 ]]; then
++			echo	"******************FAILURE! *********************"
++			echo	"The $i package is not installed in your system."
++			echo -e "please install it:\n\tyum install $i"
++			echo	"************************************************"
++			retval=1
++		else
++			echo "****************** OK ******************"
++			echo "The $i package already installed."
++			echo "****************************************"
++		fi
++	done
++	return $retval
++}
++
++function obtian_os_distribution
++{
++	for i in "${SupportedOsDistribution[@]}"
++	do
++		cat /etc/issue | grep $i &> /dev/null
++		if [[ $? == 0 ]]; then
++			OStype=$i
++			break
++		fi
++	done
++}
++
++function main
++{
++	echo "Checking dependencies..."
++	local retval=0
++	obtian_os_distribution
++
++	case "$OStype" in
++	Ubuntu|CentOS)
++		;;
++	*)
++		echo "****************** ERROR ******************"
++		echo "your OS type/distribution is not supported "
++		echo "*******************************************"
++		return 1;
++		;;
++	esac
++
++	check_dependencies_$OStype
++	if [[ $? != 0 ]]; then
++		retval=1
++	fi
++
++	return $retval
++}
++
++main
++
++
+diff --git a/package/hls3-evb-bmc/install-hls3.sh b/package/hls3-evb-bmc/install-hls3.sh
+new file mode 100644
+index 0000000..f201244
+--- /dev/null
++++ b/package/hls3-evb-bmc/install-hls3.sh
+@@ -0,0 +1,417 @@
++#!/bin/bash
++#
++# Copyright (c) 2022, Habana Labs.
++# All rights reserved.
++#
++# This program is free software;  you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 2 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY;  without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
++# the GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program;  if not, write to the Free Software
++# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++#
++function usage
++{
++	echo "Usage: $0 [<options>] <BMC IP ADDRESS>"
++	echo "	--force					Force Version update"
++	echo "	-f | --file		<image file>	Path to BMC image file"
++	echo "	-p | --passowrd		<password>	Password to root user in BMC"
++	echo "	-w | --whole-chip			Program the flash chip disregarding partitions"
++	echo "	-a | --all				Program both flash chips"
++	echo "	-c | --clean-overlay			Clean overlay partition (Factory reset)"
++	echo "	--only-clean-overlay			Only clean overlay partition (Factory reset), don't update FW"
++	echo "	-6 | --ipv6				Required when using IPv6 address"
++	echo "	-h | --help				Print this help message"
++}
++
++OPTS=`getopt -o f:p:wac6h --long force,file:,password:,whole-chip,all,only-clean-overlay,clean-overlay,ipv6,help -- "$@"`
++
++if [ $? != 0 ]; then
++	usage
++	exit 1
++fi
++
++eval set -- "$OPTS"
++
++p=${HL_BMC_ROOT_PASS:-root}
++
++export SSH_FLAGS='-q -o UserKnownHostsFile="/dev/null" -o StrictHostKeyChecking="no"'
++
++while true; do
++	case "$1" in
++		--force)
++			ignore_version="yes"
++			shift
++			;;
++		-f | --file)
++			f=$2
++			shift 2
++			;;
++		-p | --password)
++			p=$2
++			shift 2
++			;;
++		-w | --whole-chip)
++			export whole_chip="yes"
++			export wc_type="all."
++			shift 1
++			;;
++		-a | --all)
++			export flash_all="yes"
++			shift 1
++			;;
++		-c | --clean-overlay)
++			export clean_overlay="yes"
++			shift 1
++			;;
++		--only-clean-overlay)
++			export only_clean_overlay="yes"
++			shift 1
++			;;
++		-6 | --ipv6)
++			echo "Adding IPv6 flags..."
++			export use_ipv6="yes"
++			shift 1
++			;;
++		-h | --help)
++			usage
++			exit 0
++			;;
++		-- )
++			shift
++			break
++			;;
++		*)
++			echo Unknown paramemeter "'-${OPTARG}'"
++			usage
++			exit 1
++			;;
++	esac
++done
++
++if [ -z "${1}" ]; then
++	echo missing BMC IP address
++	usage
++	exit 2
++fi
++
++function test_bmc_connection
++{
++	echo Checking connectivity...
++
++	sshpass -p $BMC_ROOT_PASSWORD ssh ${SSH_FLAGS} root@${BMC_ADDRESS} 'true'
++	ret=$?
++	if [ $ret -ne 0 ]; then
++		echo Failed to connect to BMC
++		exit $ret
++	fi
++}
++
++function whole_chip_and_clear_overlay
++{
++	echo -e "\tFactory reset can't be done while $1."
++	echo -e "\tPlease reset to factory with --only-clean-overlay flag"
++	echo -e "\tand then try again.\n"
++	exit 10
++}
++
++function prepare_connection
++{
++	export curl_flags=" --retry 5 --connect-timeout 5 "
++	if [[ "$use_ipv6" = "yes" ]]; then
++		export curl_flags="${curl_flags} -g -6"
++		export opt_wrap_bmc_addr="[${BMC_ADDRESS}]"
++	else
++		export opt_wrap_bmc_addr="${BMC_ADDRESS}"
++	fi
++
++	rest_prefix='https://'${opt_wrap_bmc_addr}'/xyz/openbmc_project'
++	bus_prefix="xyz.openbmc_project"
++	raw_token=$(curl ${curl_flags} -sS -k -H "Content-Type: application/json" -X POST \
++		https://${opt_wrap_bmc_addr}/login -d \
++		'{"username" :  "root", "password" : "'${BMC_ROOT_PASSWORD}'"}')
++	token=$(echo "${raw_token}" | grep token | awk '{print $2;}' | tr -d '"')
++	if [ -z $token ]; then
++                echo Failed to obtain token
++                exit 1
++	fi
++}
++
++function prepare_image_update
++{
++	echo Preparing image update...
++
++	prepare_connection
++
++	local img_ver_info=$(tar xfO ${BMC_IMAGE} MANIFEST)
++	if [ $? -ne 0 ]; then
++		echo Failed to find version manifest
++		exit 2
++	fi
++
++	new_ver=$(echo "${img_ver_info}" | sed -ne  \
++		'/version=/ {s/version=//;p}' | head -n1 | tr -d '\n')
++	if [[ "$ignore_version" != "yes" ]]; then
++		img_id=$(echo -n ${new_ver} | sha512sum | cut -b 1-8)
++	else
++		img_id=ForcedUpdate
++	fi
++
++	function mtd_num ()
++	{
++		echo "${mtd_list}" | grep \"$1\" | cut -d ':' -f1 | grep -Eo '[0-9]+$'
++	}
++
++	mtd_list=$(sshpass -p $BMC_ROOT_PASSWORD ssh ${SSH_FLAGS} \
++		root@$BMC_ADDRESS "cat /proc/mtd")
++
++	uboot_part_offset=$(mtd_num u-boot)
++	kernel_part_offset=$(mtd_num kernel)
++	rofs_part_offset=$(mtd_num rofs)
++	rwfs_part_offset=$(mtd_num rwfs)
++}
++
++function is_image_updated
++{
++	echo Checking if image already updated...
++
++	local curr_ver=$(echo "${bmc_ver_info}" | grep VERSION_ID | \
++		cut -d "=" -f2 | tr -d "\"")
++	if [[ "$curr_ver" = "$new_ver" ]]; then
++		echo Image version already installed
++		exit 6
++	fi
++}
++
++function copy_image
++{
++	echo Copying image...
++
++	sshpass -p $BMC_ROOT_PASSWORD scp ${SSH_FLAGS} \
++		$BMC_IMAGE 'root@'${opt_wrap_bmc_addr}':/tmp/images'
++}
++
++function is_image_loaded
++{
++	echo Checking if image was loaded...
++
++	curl ${curl_flags} -sS -k -H "X-Auth-Token: ${token}" \
++		-b cjar -k ${rest_prefix}/software/enumerate | \
++		grep ${img_id} > /dev/null
++	if [ $? -ne 0 ]; then
++		echo Image is not loaded on the BMC
++		exit 7
++	fi
++}
++
++function flash_unmounted_chip ()
++{
++	echo "Deploying update image to secondary chip..."
++
++	tar xf ${PWD}/obmc-phosphor-image-hls.static.mtd.all.tar
++	sshpass -p $BMC_ROOT_PASSWORD scp ${SSH_FLAGS} \
++		${PWD}/image-bmc root@$BMC_ADDRESS:/run/initramfs/image-bmc-recovery
++}
++
++function verify_partition_size {
++	# Verify that the chip is big enough to program the image
++	local mtd=${1}
++	local partition_image=${2}
++	local mtd_hex_size=$(echo "$mtd_list" | grep -w "$mtd" | cut -d' ' -f2)
++	local mtd_size=$((16#${mtd_hex_size}))
++	local img_size=$(tar -vtf ${BMC_IMAGE} ${partition_image} |  \
++			sed 's/ \+/ /g' | cut -d ' ' -f3)
++
++	if [ ${img_size} -gt ${mtd_size} ]; then
++		echo 0
++	else
++		echo 1
++	fi
++}
++
++function verify_partition_sizes
++{
++	echo Verifying partition sizes...
++	local invalid="false"
++	local res=$(verify_partition_size mtd${uboot_part_offset} image-u-boot)
++	if [ ${res} != 1 ] ; then
++		echo "mtd${uboot_part_offset} partition size verification failed"
++		invalid="true"
++	fi
++
++	res=$(verify_partition_size mtd${kernel_part_offset} image-kernel)
++	if [ ${res} != 1 ] ; then
++		echo "mtd${kernel_part_offset} partition size verification failed"
++		invalid="true"
++	fi
++
++	res=$(verify_partition_size mtd${rofs_part_offset} image-rofs)
++	if [ ${res} != 1 ] ; then
++		echo "mtd${rofs_part_offset} partition size verification failed"
++		invalid="true"
++	fi
++
++	res=$(verify_partition_size mtd${rwfs_part_offset} image-rwfs)
++	if [ ${res} != 1 ] ; then
++		echo "mtd${rwfs_part_offset} partition size verification failed"
++		invalid="true"
++	fi
++
++	if [[ "$invalid" = "true"  ]] ; then
++		echo "Partition sizes changed, triggering update of the entire chip..."
++		whole_chip="yes"
++		export BMC_IMAGE=${PWD}/obmc-phosphor-image-hls.static.mtd.all.tar
++	fi
++}
++
++function activate_image
++{
++	echo Activating image...
++
++	local bus_req_active="Software.Activation.RequestedActivations.Active"
++	local rest_req_active="software/${img_id}/attr/RequestedActivation"
++
++	curl ${curl_flags} -sS -k -H "X-Auth-Token: ${token}" -b cjar -k \
++		-H "Content-Type: application/json" -X PUT -d '{"data":
++		"'${bus_prefix}.${bus_req_active}'"}' \
++		${rest_prefix}/${rest_req_active} > /dev/null
++
++	curl ${curl_flags} -sS -k -H "X-Auth-Token: ${token}" -b cjar -k \
++		${rest_prefix}/software/${img_id} | grep Active > /dev/null
++	if [ $? -ne 0 ]; then
++		echo Image is not activated
++		exit 10
++	fi
++}
++
++function clean_overlay
++{
++	echo "Requesting Factory Reset..."
++
++	local rest_req_rst="software/action/Reset"
++
++	curl ${curl_flags} -sS -k -H "X-Auth-Token: $token" -b cjar -k \
++		 -H "Content-Type: application/json" -X POST -d '{"data":[]}' \
++		 ${rest_prefix}/${rest_req_rst} > /dev/null
++	if [ $? -ne 0 ]; then
++		echo Factory reset request failed
++		exit 10
++	fi
++}
++
++function request_forced_update
++{
++	echo "Requesting forced update"
++
++	local rest_force_update="software/control/attr/ForcedUpdate"
++
++	curl ${curl_flags} -sS -k -H "X-Auth-Token: $token" -b cjar -k \
++		 -H "Content-Type: application/json" -X PUT -d '{"data": "true"}' \
++		 ${rest_prefix}/${rest_force_update} > /dev/null
++}
++
++function reboot_bmc
++{
++	echo Rebooting BMC...
++
++	local bus_req_reboot="State.BMC.Transition.Reboot"
++	local rest_req_reboot="state/bmc0/attr/RequestedBMCTransition"
++
++	curl ${curl_flags} -sS -k -H "X-Auth-Token: ${token}" -b cjar -k \
++		-H "Content-Type: application/json" -X PUT \
++		-d '{"data": "'${bus_prefix}.${bus_req_reboot}'"}' \
++		${rest_prefix}/${rest_req_reboot} > /dev/null
++}
++
++function only_clean_overlay
++{
++	prepare_connection
++	clean_overlay
++	reboot_bmc
++}
++
++function flash_hls3
++{
++	if [[ "$only_clean_overlay" = "yes" ]]; then
++		only_clean_overlay
++		exit 0
++	fi
++
++	prepare_image_update
++
++	if [[ "$ignore_version" != "yes" ]]; then
++		is_image_updated
++	else
++		request_forced_update
++	fi
++
++	if [[ "$whole_chip" != "yes" ]]; then
++		verify_partition_sizes
++	fi
++
++	copy_image
++	is_image_loaded
++
++	if [[ "$flash_all" = "yes" ]]; then
++		flash_unmounted_chip
++	fi
++
++	if [[ "$clean_overlay" = "yes" ]]; then
++		clean_overlay
++	fi
++
++	if [[ "$whole_chip" = "yes" ]]; then
++		sshpass -p $BMC_ROOT_PASSWORD ssh root@$BMC_ADDRESS ${SSH_FLAGS} \
++			"cp /tmp/images/${img_id}/image-bmc /run/initramfs/"
++	else
++		activate_image
++	fi
++
++	reboot_bmc
++}
++
++function main
++{
++
++	source install-hls3-check-dependencies.sh
++	if [[ $? != 0 ]]; then
++		exit 2
++	fi
++
++	if [ -z ${f} ]; then
++		export BMC_IMAGE=${PWD}/obmc-phosphor-image-hls3.static.mtd.${wc_type}tar
++	else
++		export BMC_IMAGE=${f}
++	fi
++
++	export BMC_ROOT_PASSWORD=${p}
++	export BMC_ADDRESS=${1}
++
++	local install_script_suffix=curr
++
++	if [[ "$clean_overlay" = "yes" && "$whole_chip" = "yes" ]]; then
++		whole_chip_and_clear_overlay "whole chip"
++	fi
++
++	test_bmc_connection
++
++	if [[ "$only_clean_overlay" = "yes" ]]; then
++		source install-hls-${install_script_suffix}.sh
++	fi
++
++	if [ ! -f "${BMC_IMAGE}" ]; then
++		echo missing image file
++		exit 2
++	fi
++
++	flash_hls3
++}
++
++main $1
+diff --git a/scripts/make/hls3/Makefile b/scripts/make/hls3/Makefile
+index 5783e31..5a911ab 100644
+--- a/scripts/make/hls3/Makefile
++++ b/scripts/make/hls3/Makefile
+@@ -4,7 +4,11 @@
+ export HLS3_PHOSPHOR_IMAGE_BASENAME = obmc-phosphor-image-hls3
+ export HLS3_PHOSPHOR_IMAGE_NAME = $(HLS3_PHOSPHOR_IMAGE_BASENAME).static.mtd.tar
+ export HLS3_PHOSPHOR_FULLCHIP_IMAGE_NAME = $(HLS3_PHOSPHOR_IMAGE_BASENAME).static.mtd.all.tar
++export HLS3_EVB_PHOSPHOR_IMAGE_NAME = $(HLS3_PHOSPHOR_IMAGE_BASENAME)-evb.static.mtd.tar
++export HLS3_EVB_PHOSPHOR_FULLCHIP_IMAGE_NAME = $(HLS3_PHOSPHOR_IMAGE_BASENAME)-evb.static.mtd.all.tar
+ export HLS3_IMAGE_DIR = $(HLS3_WORK_DIR)/tmp/deploy/images/hls3
++export HLS3_DEPLOY_DIR = $(OUTPUT_DIR)/build/hls3-bmc-custom
++export HLS3_EVB_IMAGE_DIR = $(HLS3_WORK_DIR)/tmp/deploy/images/hls3-evb
+ export HLS3_DEPLOY_DIR = $(OUTPUT_DIR)/build/hls3-bmc-custom
+ unexport TEMPLATECONF
+ 
+@@ -47,6 +51,10 @@
+ 	@$(MAKE) hls3-bmc-rebuild
+ 	@$(MAKE) hls3-archive
+ 
++hls3-evb-build hls3-evb-asic-build: hls3-asic-prepare
++	@$(MAKE) hls3-evb-bmc-rebuild
++	@$(MAKE) hls3-archive
++
+ hls3-asic-install:
+ 	@echo '***************HLS ASIC INSTALL***************'
+ 	sshpass -p$(HL_PASSWD) $(SCP) $(IMAGES_DIR)/hls3-pkg.tgz	root@$(HL_INSTALL_LAB_IP):/tmp/

@@ -1,0 +1,1369 @@
+From 37ebe9af7a6ffb3edcff8b54af099c8b54f27e1d Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@gaudilabs.com>
+Date: Sat, 06 Jan 2018 10:17:50 +0200
+Subject: [PATCH] Add uboot-test-hooks support
+
+It will serve for testing U-Boot
+---
+
+diff --git a/Config.in b/Config.in
+index e51bc76..f9e9de2 100644
+--- a/Config.in
++++ b/Config.in
+@@ -2,5 +2,6 @@
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/specs/Config.in"
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/spdlog/Config.in"
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/specs_external/Config.in"
++source "$BR2_EXTERNAL_HL_DALI_PATH/package/uboot-test-hooks/Config.in"
+ 
+ # Below can add to make it appear in the top-level configuration menu
+diff --git a/Makefile b/Makefile
+index d9e54a9..99f7243 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,6 +21,9 @@
+ 	@echo '                             override <board> default lab IP'
+ 	@echo '                           set DALI_INSTALL_HOST_IP=<host IP> to'
+ 	@echo '                             override <board> default host IP'
++	@echo
++	@echo 'Testing:'
++	@echo '  dali-<board>-test    - Run uboot test on <board> e.g. onix, pldm, asic'
+ 
+ export BR2_EXTERNAL := $(CURDIR)
+ OUTPUT_DIR := $(BR2_EXTERNAL)/output
+@@ -49,6 +52,7 @@
+ IMAGES_DIR := ${OUTPUT_DIR}/images
+ UBOOT_BASE := ${OUTPUT_DIR}/build/uboot-custom
+ LINUX_BASE := ${OUTPUT_DIR}/build/linux-custom
++UBOOT_XMPL := ${UBOOT_BASE}/examples/standalone
+ .PHONY: dali-onix-install dali-pldm-install dali-asic-install
+ dali-onix-install: DALI_INSTALL_LAB_IP ?= monster4-nuc
+ dali-onix-install: DALI_INSTALL_HOST_IP ?= monster4
+@@ -68,6 +72,7 @@
+ 	-sshpass -p123456        scp $(IMAGES_DIR)/dali-spi-flash.bin	root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
+ 	-sshpass -p123456        scp $(UBOOT_BASE)/u-boot		root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
+ 	-sshpass -p123456        scp $(LINUX_BASE)/vmlinux		root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
++	-sshpass -p123456        scp -r $(UBOOT_XMPL)/dali_*.bin        root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+ dali-onix-install dali-pldm-install dali-asic-install: dali-install
+ dali-onix-install:
+ 	@
+@@ -82,4 +87,18 @@
+ .PHONY: dali-distclean
+ dali-distclean: $(OUTPUT_DIR)/.config
+ 	@$(MAKE) uboot-dirclean linux-dirclean armcp-dirclean	\
+-		 spdlog-dirclean specs-dirclean specs_external-dirclean
++		 spdlog-dirclean specs-dirclean specs_external-dirclean \
++		 host-uboot-test-hooks-dirclean
++
++.PHONY: dali-onix-test dali-pldm-test dali-asic-test
++dali-onix-test: dali-onix-tools-install
++dali-onix-test dali-pldm-test dali-asic-test:
++	@HOST_UBOOT_TEST_HOOKS_BRD=$(patsubst dali-%-test,dali_%,$@)	\
++		$(MAKE) host-uboot-test-hooks-rebuild
++
++dali-onix-tools-install: DALI_INSTALL_LAB_IP ?= monster4-nuc
++.PHONY: dali-onix-tools-install
++dali-onix-tools-install:
++	-cd board/habanalabs/common/ &&					\
++	sshpass -p123456 scp -r remote_power ip_pdu t32 vivado_lab	\
++	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+diff --git a/board/habanalabs/common/ip_pdu b/board/habanalabs/common/ip_pdu
+index 10f0d05..f031064 100755
+--- a/board/habanalabs/common/ip_pdu
++++ b/board/habanalabs/common/ip_pdu
+@@ -1,8 +1,5 @@
+ #!/bin/bash
+ 
+-pdu_uri=http://192.168.10.80
+-pdu_cred="--user=snmp --password=1234"
+-
+ if [ $# -eq 2 ]; then
+ 	board=$1
+ 	action=$2
+@@ -11,8 +8,14 @@
+ 	exit 1
+ fi
+ 
++pdu_cred="--user=snmp --password=1234"
+ case "$board" in
++*asic)
++	pdu_uri=http://192.168.10.120
++	pwr_id=1
++	;;
+ *onix)
++	pdu_uri=http://192.168.10.80
+ 	pwr_id=1
+ 	;;
+ *)
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index 9b00fd1..d42503c 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -4,3 +4,4 @@
+ SPECS_OVERRIDE_SRCDIR = $(TOPDIR)/../specs
+ SPDLOG_OVERRIDE_SRCDIR = $(TOPDIR)/../3rd-parties/spdlog
+ SPECS_EXTERNAL_OVERRIDE_SRCDIR = $(TOPDIR)/../specs_external
++UBOOT_TEST_HOOKS_OVERRIDE_SRCDIR = $(TOPDIR)/../uboot-test-hooks
+diff --git a/board/habanalabs/common/remote_power b/board/habanalabs/common/remote_power
+new file mode 100755
+index 0000000..40ce1ec
+--- /dev/null
++++ b/board/habanalabs/common/remote_power
+@@ -0,0 +1,55 @@
++#!/bin/bash
++
++cd `dirname $0`
++
++if [ $# -eq 2 ]; then
++	board=$1
++	action=$2
++else
++	echo "error - usage: $0 <board name> <-l | on | off>"
++	exit 1
++fi
++
++case "$board" in
++*asic)
++	;;
++*onix)
++	;;
++*)
++	echo "error - Unknown board name: $board"
++	exit 2
++	;;
++esac
++
++case "$action" in
++-l)
++	status=`./t32/t32.sh -l`
++	case "$status" in
++	FALSE)
++		echo off
++		;;
++	TRUE)
++		echo ON
++		;;
++	*)
++		echo "error - Unknown state: $status"
++		exit 3
++		;;
++	esac
++	;;
++on)
++	./t32/t32.sh full
++	#./ip_pdu $board off
++	#./ip_pdu $board on
++	;;
++off)
++	#./ip_pdu $board on
++	#sleep 180
++	./vivado_lab/viv.sh $board erase
++	#./ip_pdu $board off
++	;;
++*)
++	echo "error - Unknown action: $action"
++	exit 4
++	;;
++esac
+diff --git a/board/habanalabs/common/t32/asic.cmm b/board/habanalabs/common/t32/asic.cmm
+new file mode 100644
+index 0000000..5446871
+--- /dev/null
++++ b/board/habanalabs/common/t32/asic.cmm
+@@ -0,0 +1,198 @@
++; --------------------------------------------------------------------------------------------------
++; @Title: Startup script for the DALI SoC
++; @Description: This script configures the base addresses for debug and attaches to the core
++; @Author: Oded Gabbay
++; @SoC: DALI
++; @Chip: Cortex-A53
++; @Copyright: (C) 2016-2017 HabanaLabs, Ltd.
++; --------------------------------------------------------------------------------------------------
++; NOTE: Interrupts are disabled with SYStem.Option IMASKASM and IMASKHLL per default
++;
++; -------------------------------------------------------------------------------------------------
++; Calling convention:
++;
++;   CD.DO onix.cmm <cpu_num> <cfg_mode>
++;
++;     <cpu_num>    The number of CPUs to be debugged. If this parameter is omitted, the CPU number
++;                  will default to 2. (2x Cortex-A53).
++;
++;     <cfg_mode>   Determines whether the sript attaches to the CPU or not. If PREPAREONLY is
++;                  passed, then only the Coresight configuration will be done.
++;                  if no parameter or ATTACH is passed, then the script will attach to the cores.
++; -------------------------------------------------------------------------------------------------
++; Examples:
++;
++;   1) Call without parameters. In this case four cores will be debugged.
++;      The script will wait for system power and automatically attach to the CPU.
++;        CD.DO onix.cmm
++;
++;   2) Call with a defined number of CPUs, example 2 CPUs. The script will wait for system power
++;      and automatically attach to the CPU.
++;        CD.DO onix.cmm 2.
++;
++;   3) Call with a defined number of CPUs, example 2 CPUs. Just configure, do not attach.
++;        CD.DO onix.cmm 2. PREPAREONLY
++; -------------------------------------------------------------------------------------------------
++
++LOCAL &cpuNumber &prepare
++ENTRY &cpuNumber &prepare
++
++;--------------------------------------------------------------------------------------------------
++; Parameters
++
++; Possible values: 1. - 2. . 2. means 2x Cortex-A53
++; 1. is default
++IF "&cpuNumber"==""
++(
++  &cpuNumber=1.
++)
++
++; Possible values: ATTACH, PREPAREONLY
++; PREPAREONLY is default
++IF "&prepare"==""
++   &prepare="PREPAREONLY"
++
++; Make sure that case of parameter is ignored
++&prepare=STRing.UPpeR("&prepare")
++
++;--------------------------------------------------------------------------------------------------
++; Configuration
++
++SYStem.RESet
++SYStem.CPU CORTEXA53
++SYStem.JtagClock 20MHz
++SYStem.option dismode aarch64
++
++SYStem.CONFIG CORENUMBER 2.
++
++IF (&cpuNumber<1.)||(&cpuNumber>2.)
++(
++  DIALOG.OK "Invalid number of CPUs: &cpuNumber - End of script"
++  ENDDO
++)
++
++; Assignment:
++IF &cpuNumber==1.
++  CORE.ASSIGN 1.
++IF &cpuNumber==2.
++  CORE.ASSIGN 1. 2.
++
++; Cortex-A53 ROM-Table: 0x81000000
++;
++;
++; Cortex-A53 | debug      | CTI        | BMC        | ETM (Trace)
++;------------------------------------------------------------------
++;   core 0   | 0x81010000 | 0x81020000 | 0x81030000 | 0x81040000
++;   core 1   | 0x81110000 | 0x81120000 | 0x81130000 | 0x81140000
++;
++; Base ROM-Table: 0x80000000
++;
++
++; Access port numbers are
++SYStem.CONFIG APBACCESSPORT 1.
++SYStem.CONFIG DEBUGACCESSPORT 1.
++SYStem.CONFIG AXIACCESSPORT 0.
++SYStem.CONFIG MEMORYACCESSPORT 0.
++
++SYStem.CONFIG COREDEBUG BASE DAP:0xfe810000 DAP:0xfe910000
++SYStem.CONFIG CTI BASE DAP:0xfe820000 DAP:0xfe920000
++SYStem.CONFIG BMC BASE DAP:0xfe830000 DAP:0xfe930000
++SYStem.CONFIG ETM BASE DAP:0xfe840000 DAP:0xfe940000
++
++SYStem.CONFIG.STM.Base DAP:0xfe486000
++SYStem.CONFIG.ETF.Base DAP:0xfe481000 DAP:0xfe482000
++SYStem.CONFIG.ETF1.ATBSource STM1
++
++; Disable interrupts in debug mode.
++; Set to off to debug interrupt routines
++SYStem.Option IMASKASM ON
++SYStem.Option IMASKHLL ON
++SYStem.Option EnReset OFF               ; Avoid that reset line is pulled low during Prepare mode
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011000
++
++LOCAL &edscr &connected &edlar &wasrunning
++
++&connected=TRUE()
++&wasrunning=TRUE()
++
++IF !STATE.POWER()
++(
++  DIALOG.OK "Board is not powered."
++
++  PRINT "Waiting for SYStem.Power"
++  ON TIME 10.0s GOTO powerdown                  ; Wait max 10 sec for VTREF to go to 1.8V
++
++WHILE !STATE.POWER()
++(
++  WAIT 0.5s
++)
++
++  ON TIME                                       ; Disable time out again
++)
++
++PRINT "System power detected, waiting for debug registers"
++
++ON ERROR GOSUB ConnectHandler                   ; On bus error set connection attempt to false
++SYStem.Mode Prepare                             ; Go to prepare mode for debug register polling
++CORE 0.                                         ; Select core 0 to wait for debug registers
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011111
++
++; Poll EDLAR register until no further bus error occurs.
++waitconnect:
++&connected=TRUE()                               ; Assume that next read will succeed
++&edlar=Data.Long(eapb:(corebase()+0xFB0))       ; Use EDLAR to check connection. EDLAR should
++IF !&connected                                  ; also be available even when a lock is active
++(
++  WAIT 0.5s
++  GOTO waitconnect
++)
++
++; Make sure reset vector for all cores is 0x7ff0010000
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441108 %LE %Long 0xf0010000
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++D.S axi:0x7FFC441118 %LE %Long 0x7f
++
++;--------------------------------------------------------------------------------------------------
++; Attach
++
++IF "&prepare"=="ATTACH"
++(
++  ; Finally attach to the target
++  SYStem.Mode Attach
++
++  IF RUN()
++    Break.direct
++  ELSE
++    &wasrunning=FALSE()
++
++  ; Toggle ETM to make trace work
++  ETM.OFF
++;  ETM.ON
++
++  IF &wasrunning
++    Go.direct
++
++  PRINT "Target is up and running"
++)
++
++ENDDO
++
++; -------------------------------------------------------------------------------------------------
++; Support handlers
++ConnectHandler:
++
++  &connected=FALSE()
++
++RETURN
++
++; -------------------------------------------------------------------------------------------------
++; Error handlers
++
++powerdown:
++  DIALOG.OK "Board power did not come up. Please check the power supply and if the debug connector is correctly plugged"
++ENDDO
+diff --git a/board/habanalabs/common/t32/config.t32 b/board/habanalabs/common/t32/config.t32
+new file mode 100644
+index 0000000..e05cd81
+--- /dev/null
++++ b/board/habanalabs/common/t32/config.t32
+@@ -0,0 +1,14 @@
++OS=
++ID=T32
++SYS=/opt/t32
++TMP=/tmp
++
++PBI=
++USB
++AUTOCONNECT
++
++RCL=NETASSIST
++PORT=200000
++
++SCREEN=OFF
++
+diff --git a/board/habanalabs/common/t32/onix.cmm b/board/habanalabs/common/t32/onix.cmm
+new file mode 100644
+index 0000000..5713e10
+--- /dev/null
++++ b/board/habanalabs/common/t32/onix.cmm
+@@ -0,0 +1,198 @@
++; --------------------------------------------------------------------------------------------------
++; @Title: Startup script for the DALI SoC
++; @Description: This script configures the base addresses for debug and attaches to the core
++; @Author: Oded Gabbay
++; @SoC: DALI
++; @Chip: Cortex-A53
++; @Copyright: (C) 2016-2017 HabanaLabs, Ltd.
++; --------------------------------------------------------------------------------------------------
++; NOTE: Interrupts are disabled with SYStem.Option IMASKASM and IMASKHLL per default
++;
++; -------------------------------------------------------------------------------------------------
++; Calling convention:
++;
++;   CD.DO onix.cmm <cpu_num> <cfg_mode>
++;
++;     <cpu_num>    The number of CPUs to be debugged. If this parameter is omitted, the CPU number
++;                  will default to 2. (2x Cortex-A53).
++;
++;     <cfg_mode>   Determines whether the sript attaches to the CPU or not. If PREPAREONLY is
++;                  passed, then only the Coresight configuration will be done.
++;                  if no parameter or ATTACH is passed, then the script will attach to the cores.
++; -------------------------------------------------------------------------------------------------
++; Examples:
++;
++;   1) Call without parameters. In this case four cores will be debugged.
++;      The script will wait for system power and automatically attach to the CPU.
++;        CD.DO onix.cmm
++;
++;   2) Call with a defined number of CPUs, example 2 CPUs. The script will wait for system power
++;      and automatically attach to the CPU.
++;        CD.DO onix.cmm 2.
++;
++;   3) Call with a defined number of CPUs, example 2 CPUs. Just configure, do not attach.
++;        CD.DO onix.cmm 2. PREPAREONLY
++; -------------------------------------------------------------------------------------------------
++
++LOCAL &cpuNumber &prepare
++ENTRY &cpuNumber &prepare
++
++;--------------------------------------------------------------------------------------------------
++; Parameters
++
++; Possible values: 1. - 2. . 2. means 2x Cortex-A53
++; 1. is default
++IF "&cpuNumber"==""
++(
++  &cpuNumber=1.
++)
++
++; Possible values: ATTACH, PREPAREONLY
++; PREPAREONLY is default
++IF "&prepare"==""
++   &prepare="PREPAREONLY"
++
++; Make sure that case of parameter is ignored
++&prepare=STRing.UPpeR("&prepare")
++
++;--------------------------------------------------------------------------------------------------
++; Configuration
++
++SYStem.RESet
++SYStem.CPU CORTEXA53
++SYStem.JtagClock 20MHz
++SYStem.option dismode aarch64
++
++SYStem.CONFIG CORENUMBER 2.
++
++IF (&cpuNumber<1.)||(&cpuNumber>2.)
++(
++  DIALOG.OK "Invalid number of CPUs: &cpuNumber - End of script"
++  ENDDO
++)
++
++; Assignment:
++IF &cpuNumber==1.
++  CORE.ASSIGN 1.
++IF &cpuNumber==2.
++  CORE.ASSIGN 1. 2.
++
++; Cortex-A53 ROM-Table: 0x81000000
++;
++;
++; Cortex-A53 | debug      | CTI        | BMC        | ETM (Trace)
++;------------------------------------------------------------------
++;   core 0   | 0x81010000 | 0x81020000 | 0x81030000 | 0x81040000
++;   core 1   | 0x81110000 | 0x81120000 | 0x81130000 | 0x81140000
++;
++; Base ROM-Table: 0x80000000
++;
++
++; Access port numbers are
++SYStem.CONFIG APBACCESSPORT 0.
++SYStem.CONFIG DEBUGACCESSPORT 0.
++SYStem.CONFIG AXIACCESSPORT 1.
++SYStem.CONFIG MEMORYACCESSPORT 1.
++
++SYStem.CONFIG COREDEBUG BASE DAP:0x81010000 DAP:0x81110000
++SYStem.CONFIG CTI BASE DAP:0x81020000 DAP:0x81120000
++SYStem.CONFIG BMC BASE DAP:0x81030000 DAP:0x81130000
++SYStem.CONFIG ETM BASE DAP:0x81040000 DAP:0x81140000
++
++;SYStem.CONFIG.STM.Base DAP:0xfe486000
++;SYStem.CONFIG.ETF.Base DAP:0xfe481000 DAP:0xfe482000
++;SYStem.CONFIG.ETF1.ATBSource STM1
++
++; Disable interrupts in debug mode.
++; Set to off to debug interrupt routines
++SYStem.Option IMASKASM ON
++SYStem.Option IMASKHLL ON
++SYStem.Option EnReset OFF               ; Avoid that reset line is pulled low during Prepare mode
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011000
++
++LOCAL &edscr &connected &edlar &wasrunning
++
++&connected=TRUE()
++&wasrunning=TRUE()
++
++IF !STATE.POWER()
++(
++  DIALOG.OK "Board is not powered."
++
++  PRINT "Waiting for SYStem.Power"
++  ON TIME 10.0s GOTO powerdown                  ; Wait max 10 sec for VTREF to go to 1.8V
++
++WHILE !STATE.POWER()
++(
++  WAIT 0.5s
++)
++
++  ON TIME                                       ; Disable time out again
++)
++
++PRINT "System power detected, waiting for debug registers"
++
++ON ERROR GOSUB ConnectHandler                   ; On bus error set connection attempt to false
++SYStem.Mode Prepare                             ; Go to prepare mode for debug register polling
++CORE 0.                                         ; Select core 0 to wait for debug registers
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011111
++
++; Poll EDLAR register until no further bus error occurs.
++waitconnect:
++&connected=TRUE()                               ; Assume that next read will succeed
++&edlar=Data.Long(eapb:(corebase()+0xFB0))       ; Use EDLAR to check connection. EDLAR should
++IF !&connected                                  ; also be available even when a lock is active
++(
++  WAIT 0.5s
++  GOTO waitconnect
++)
++
++; Make sure reset vector for all cores is 0x7ff0010000
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441108 %LE %Long 0xf0010000
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++D.S axi:0x7FFC441118 %LE %Long 0x7f
++
++;--------------------------------------------------------------------------------------------------
++; Attach
++
++IF "&prepare"=="ATTACH"
++(
++  ; Finally attach to the target
++  SYStem.Mode Attach
++
++  IF RUN()
++    Break.direct
++  ELSE
++    &wasrunning=FALSE()
++
++  ; Toggle ETM to make trace work
++  ETM.OFF
++;  ETM.ON
++
++  IF &wasrunning
++    Go.direct
++
++  PRINT "Target is up and running"
++)
++
++ENDDO
++
++; -------------------------------------------------------------------------------------------------
++; Support handlers
++ConnectHandler:
++
++  &connected=FALSE()
++
++RETURN
++
++; -------------------------------------------------------------------------------------------------
++; Error handlers
++
++powerdown:
++  DIALOG.OK "Board power did not come up. Please check the power supply and if the debug connector is correctly plugged"
++ENDDO
+diff --git a/board/habanalabs/common/t32/pldm.cmm b/board/habanalabs/common/t32/pldm.cmm
+new file mode 100644
+index 0000000..3cd743a
+--- /dev/null
++++ b/board/habanalabs/common/t32/pldm.cmm
+@@ -0,0 +1,198 @@
++; --------------------------------------------------------------------------------------------------
++; @Title: Startup script for the DALI SoC
++; @Description: This script configures the base addresses for debug and attaches to the core
++; @Author: Oded Gabbay
++; @SoC: DALI
++; @Chip: Cortex-A53
++; @Copyright: (C) 2016-2017 HabanaLabs, Ltd.
++; --------------------------------------------------------------------------------------------------
++; NOTE: Interrupts are disabled with SYStem.Option IMASKASM and IMASKHLL per default
++;
++; -------------------------------------------------------------------------------------------------
++; Calling convention:
++;
++;   CD.DO onix.cmm <cpu_num> <cfg_mode>
++;
++;     <cpu_num>    The number of CPUs to be debugged. If this parameter is omitted, the CPU number
++;                  will default to 2. (2x Cortex-A53).
++;
++;     <cfg_mode>   Determines whether the sript attaches to the CPU or not. If PREPAREONLY is
++;                  passed, then only the Coresight configuration will be done.
++;                  if no parameter or ATTACH is passed, then the script will attach to the cores.
++; -------------------------------------------------------------------------------------------------
++; Examples:
++;
++;   1) Call without parameters. In this case four cores will be debugged.
++;      The script will wait for system power and automatically attach to the CPU.
++;        CD.DO onix.cmm
++;
++;   2) Call with a defined number of CPUs, example 2 CPUs. The script will wait for system power
++;      and automatically attach to the CPU.
++;        CD.DO onix.cmm 2.
++;
++;   3) Call with a defined number of CPUs, example 2 CPUs. Just configure, do not attach.
++;        CD.DO onix.cmm 2. PREPAREONLY
++; -------------------------------------------------------------------------------------------------
++
++LOCAL &cpuNumber &prepare
++ENTRY &cpuNumber &prepare
++
++;--------------------------------------------------------------------------------------------------
++; Parameters
++
++; Possible values: 1. - 2. . 2. means 2x Cortex-A53
++; 1. is default
++IF "&cpuNumber"==""
++(
++  &cpuNumber=1.
++)
++
++; Possible values: ATTACH, PREPAREONLY
++; PREPAREONLY is default
++IF "&prepare"==""
++   &prepare="PREPAREONLY"
++
++; Make sure that case of parameter is ignored
++&prepare=STRing.UPpeR("&prepare")
++
++;--------------------------------------------------------------------------------------------------
++; Configuration
++
++SYStem.RESet
++SYStem.CPU CORTEXA53
++SYStem.JtagClock 149KHz
++SYStem.option dismode aarch64
++
++SYStem.CONFIG CORENUMBER 2.
++
++IF (&cpuNumber<1.)||(&cpuNumber>2.)
++(
++  DIALOG.OK "Invalid number of CPUs: &cpuNumber - End of script"
++  ENDDO
++)
++
++; Assignment:
++IF &cpuNumber==1.
++  CORE.ASSIGN 1.
++IF &cpuNumber==2.
++  CORE.ASSIGN 1. 2.
++
++; Cortex-A53 ROM-Table: 0x81000000
++;
++;
++; Cortex-A53 | debug      | CTI        | BMC        | ETM (Trace)
++;------------------------------------------------------------------
++;   core 0   | 0x81010000 | 0x81020000 | 0x81030000 | 0x81040000
++;   core 1   | 0x81110000 | 0x81120000 | 0x81130000 | 0x81140000
++;
++; Base ROM-Table: 0x80000000
++;
++
++; Access port numbers are
++SYStem.CONFIG APBACCESSPORT 1.
++SYStem.CONFIG DEBUGACCESSPORT 1.
++SYStem.CONFIG AXIACCESSPORT 0.
++SYStem.CONFIG MEMORYACCESSPORT 0.
++
++SYStem.CONFIG COREDEBUG BASE DAP:0xfe810000 DAP:0xfe910000
++SYStem.CONFIG CTI BASE DAP:0xfe820000 DAP:0xfe920000
++SYStem.CONFIG BMC BASE DAP:0xfe830000 DAP:0xfe930000
++SYStem.CONFIG ETM BASE DAP:0xfe840000 DAP:0xfe940000
++
++SYStem.CONFIG.STM.Base DAP:0xfe486000
++SYStem.CONFIG.ETF.Base DAP:0xfe481000 DAP:0xfe482000
++SYStem.CONFIG.ETF1.ATBSource STM1
++
++; Disable interrupts in debug mode.
++; Set to off to debug interrupt routines
++SYStem.Option IMASKASM ON
++SYStem.Option IMASKHLL ON
++SYStem.Option EnReset OFF               ; Avoid that reset line is pulled low during Prepare mode
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011000
++
++LOCAL &edscr &connected &edlar &wasrunning
++
++&connected=TRUE()
++&wasrunning=TRUE()
++
++IF !STATE.POWER()
++(
++  DIALOG.OK "Board is not powered."
++
++  PRINT "Waiting for SYStem.Power"
++  ON TIME 10.0s GOTO powerdown                  ; Wait max 10 sec for VTREF to go to 1.8V
++
++WHILE !STATE.POWER()
++(
++  WAIT 0.5s
++)
++
++  ON TIME                                       ; Disable time out again
++)
++
++PRINT "System power detected, waiting for debug registers"
++
++ON ERROR GOSUB ConnectHandler                   ; On bus error set connection attempt to false
++SYStem.Mode Prepare                             ; Go to prepare mode for debug register polling
++CORE 0.                                         ; Select core 0 to wait for debug registers
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011111
++
++; Poll EDLAR register until no further bus error occurs.
++waitconnect:
++&connected=TRUE()                               ; Assume that next read will succeed
++&edlar=Data.Long(eapb:(corebase()+0xFB0))       ; Use EDLAR to check connection. EDLAR should
++IF !&connected                                  ; also be available even when a lock is active
++(
++  WAIT 0.5s
++  GOTO waitconnect
++)
++
++; Make sure reset vector for all cores is 0x7ff0010000
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441108 %LE %Long 0xf0010000
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++D.S axi:0x7FFC441118 %LE %Long 0x7f
++
++;--------------------------------------------------------------------------------------------------
++; Attach
++
++IF "&prepare"=="ATTACH"
++(
++  ; Finally attach to the target
++  SYStem.Mode Attach
++
++  IF RUN()
++    Break.direct
++  ELSE
++    &wasrunning=FALSE()
++
++  ; Toggle ETM to make trace work
++  ETM.OFF
++;  ETM.ON
++
++  IF &wasrunning
++    Go.direct
++
++  PRINT "Target is up and running"
++)
++
++ENDDO
++
++; -------------------------------------------------------------------------------------------------
++; Support handlers
++ConnectHandler:
++
++  &connected=FALSE()
++
++RETURN
++
++; -------------------------------------------------------------------------------------------------
++; Error handlers
++
++powerdown:
++  DIALOG.OK "Board power did not come up. Please check the power supply and if the debug connector is correctly plugged"
++ENDDO
+diff --git a/board/habanalabs/common/t32/prog_spi.cmm b/board/habanalabs/common/t32/prog_spi.cmm
+new file mode 100644
+index 0000000..ac9a5dd
+--- /dev/null
++++ b/board/habanalabs/common/t32/prog_spi.cmm
+@@ -0,0 +1,137 @@
++; --------------------------------------------------------------------------------
++; @Title: Template Serial FLASH Programming Script for Gaudilabs
++; @Description:
++;
++; S(D)RAM : 0xXXXXxxxx 
++; Serial FLASH Controller(SM_SPI0_REG) Addr: 0xXXXXxxxx
++;
++; @Copyright: (C) 1989-2018 Lauterbach GmbH, licensed for use with TRACE32(R) only
++; --------------------------------------------------------------------------------
++; $Id:  $
++
++&SPI_BASE=0x7ffcc43000
++&RAM_BASE=0x7ff0000000
++
++/////////////////////////////////
++// SYStem up procedure
++/////////////////////////////////
++SYStem.cpu CORTEXA53
++SYStem.Up
++
++
++////////////////////////////////////////
++// SPI clock & pin muxing configuration
++///////////////////////////////////////
++// Data.Set <address> %L <data>
++
++//Init SPI controller
++Data.Set AXI:&SPI_BASE+0x08 %LE %Long 0x0
++Data.Set AXI:&SPI_BASE+0x00 %LE %Long 0x70007
++Data.Set AXI:&SPI_BASE+0x04 %LE %Long 0x0
++Data.Set AXI:&SPI_BASE+0x10 %LE %Long 0x0
++Data.Set AXI:&SPI_BASE+0x14 %LE %Long 0xA
++Data.Set AXI:&SPI_BASE+0x08 %LE %Long 0x1
++
++
++///////////////////////////////////////
++// READ ID TEST
++///////////////////////////////////////
++AREA.CLEAR
++AREA.view
++GOSUB READ_ID_TEST
++
++///////////////////////////////////////
++// FLASHFILE configuration
++///////////////////////////////////////
++programFlash:
++
++  Break.RESet
++
++  FLASHFILE.RESet
++//FLASFILE.CONFIG  <SPI Base Reg>       <slave select number, ss_x_n>
++  FLASHFILE.CONFIG  AXI:&SPI_BASE           0
++
++// FLASHFILE.TARGET <<code range>>       <<data range>>                  <<algorithm file>>
++  FLASHFILE.TARGET &RAM_BASE++0x1FFF    (&RAM_BASE+0x2000)++0x23FF       ~~/demo/arm64/flash/byte/spi4b64_dwssi.bin   /KEEP  /stacksize 0x200
++
++  FLASHFILE.GETID
++
++  ;FLASHFILE.DUMP 0x0
++
++  FLASHFILE.unlock 0x0--0x27FFFF
++  FLASHFILE.erase 0x0--0x27FFFF
++  FLASHFILE.load /lib/firmware/habanalabs/dali/dali-spi-flash.bin 0x0
++  FLASHFILE.load /lib/firmware/habanalabs/dali/dali-spi-flash.bin 0x0  /ComPare
++
++ENDDO
++
++READ_ID_TEST:
++
++Data.Set AXI:&SPI_BASE+0x60  %LE %Long 0x9F
++Data.Set AXI:&SPI_BASE+0x60  %LE %Long 0x00
++Data.Set AXI:&SPI_BASE+0x60  %LE %Long 0x00
++Data.Set AXI:&SPI_BASE+0x60  %LE %Long 0x00
++
++Data.Set AXI:&SPI_BASE+0x10 %LE %Long 0x1  ;serial transfer begins.
++
++&status=Data.Long(AXI:&SPI_BASE+0x28)
++
++PRINT "Read 1st = 0x" Data.Long(AXI:&SPI_BASE+0x60)
++PRINT "Read 2nd = 0x" Data.Long(AXI:&SPI_BASE+0x60) " (Manufacture ID)"
++PRINT "Read 3rd = 0x" Data.Long(AXI:&SPI_BASE+0x60) " (Device ID)"
++PRINT "Read 4th = 0x" Data.Long(AXI:&SPI_BASE+0x60)
++
++RETURN
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/board/habanalabs/common/t32/program.cmm b/board/habanalabs/common/t32/program.cmm
+new file mode 100644
+index 0000000..ae3ae7d
+--- /dev/null
++++ b/board/habanalabs/common/t32/program.cmm
+@@ -0,0 +1,4 @@
++CD /var/lib/tftpboot/tests/t32
++DO onix.cmm
++DO prog_spi.cmm
++QUIT
+diff --git a/board/habanalabs/common/t32/reset_asic.cmm b/board/habanalabs/common/t32/reset_asic.cmm
+new file mode 100644
+index 0000000..84c8cce
+--- /dev/null
++++ b/board/habanalabs/common/t32/reset_asic.cmm
+@@ -0,0 +1,6 @@
++CD /var/lib/tftpboot/tests/t32
++DO asic.cmm
++DO uboot.cmm
++SYStem.MODE Up
++SYStem.MODE Go
++QUIT
+diff --git a/board/habanalabs/common/t32/reset_onix.cmm b/board/habanalabs/common/t32/reset_onix.cmm
+new file mode 100644
+index 0000000..1bfddbf
+--- /dev/null
++++ b/board/habanalabs/common/t32/reset_onix.cmm
+@@ -0,0 +1,5 @@
++CD /var/lib/tftpboot/tests/t32
++DO onix.cmm
++DO uboot.cmm
++SYStem.MODE Go
++QUIT
+diff --git a/board/habanalabs/common/t32/state.cmm b/board/habanalabs/common/t32/state.cmm
+new file mode 100644
+index 0000000..4340b0c
+--- /dev/null
++++ b/board/habanalabs/common/t32/state.cmm
+@@ -0,0 +1,200 @@
++; --------------------------------------------------------------------------------------------------
++; @Title: Startup script for the DALI SoC
++; @Description: This script configures the base addresses for debug and attaches to the core
++; @Author: Oded Gabbay
++; @SoC: DALI
++; @Chip: Cortex-A53
++; @Copyright: (C) 2016-2017 HabanaLabs, Ltd.
++; --------------------------------------------------------------------------------------------------
++; NOTE: Interrupts are disabled with SYStem.Option IMASKASM and IMASKHLL per default
++;
++; -------------------------------------------------------------------------------------------------
++; Calling convention:
++;
++;   CD.DO onix.cmm <cpu_num> <cfg_mode>
++;
++;     <cpu_num>    The number of CPUs to be debugged. If this parameter is omitted, the CPU number
++;                  will default to 2. (2x Cortex-A53).
++;
++;     <cfg_mode>   Determines whether the sript attaches to the CPU or not. If PREPAREONLY is
++;                  passed, then only the Coresight configuration will be done.
++;                  if no parameter or ATTACH is passed, then the script will attach to the cores.
++; -------------------------------------------------------------------------------------------------
++; Examples:
++;
++;   1) Call without parameters. In this case four cores will be debugged.
++;      The script will wait for system power and automatically attach to the CPU.
++;        CD.DO onix.cmm
++;
++;   2) Call with a defined number of CPUs, example 2 CPUs. The script will wait for system power
++;      and automatically attach to the CPU.
++;        CD.DO onix.cmm 2.
++;
++;   3) Call with a defined number of CPUs, example 2 CPUs. Just configure, do not attach.
++;        CD.DO onix.cmm 2. PREPAREONLY
++; -------------------------------------------------------------------------------------------------
++
++LOCAL &cpuNumber &prepare
++ENTRY &cpuNumber &prepare
++
++;--------------------------------------------------------------------------------------------------
++; Parameters
++
++; Possible values: 1. - 2. . 2. means 2x Cortex-A53
++; 1. is default
++IF "&cpuNumber"==""
++(
++  &cpuNumber=1.
++)
++
++; Possible values: ATTACH, PREPAREONLY
++; PREPAREONLY is default
++IF "&prepare"==""
++   &prepare="PREPAREONLY"
++
++; Make sure that case of parameter is ignored
++&prepare=STRing.UPpeR("&prepare")
++
++;--------------------------------------------------------------------------------------------------
++; Configuration
++
++SYStem.RESet
++SYStem.CPU CORTEXA53
++SYStem.JtagClock 20MHz
++SYStem.option dismode aarch64
++
++SYStem.CONFIG CORENUMBER 2.
++
++IF (&cpuNumber<1.)||(&cpuNumber>2.)
++(
++  DIALOG.OK "Invalid number of CPUs: &cpuNumber - End of script"
++  ENDDO
++)
++
++; Assignment:
++IF &cpuNumber==1.
++  CORE.ASSIGN 1.
++IF &cpuNumber==2.
++  CORE.ASSIGN 1. 2.
++
++; Cortex-A53 ROM-Table: 0x81000000
++;
++;
++; Cortex-A53 | debug      | CTI        | BMC        | ETM (Trace)
++;------------------------------------------------------------------
++;   core 0   | 0x81010000 | 0x81020000 | 0x81030000 | 0x81040000
++;   core 1   | 0x81110000 | 0x81120000 | 0x81130000 | 0x81140000
++;
++; Base ROM-Table: 0x80000000
++;
++
++; Access port numbers are
++SYStem.CONFIG APBACCESSPORT 0.
++SYStem.CONFIG DEBUGACCESSPORT 0.
++SYStem.CONFIG AXIACCESSPORT 1.
++SYStem.CONFIG MEMORYACCESSPORT 1.
++
++SYStem.CONFIG COREDEBUG BASE DAP:0x81010000 DAP:0x81110000
++SYStem.CONFIG CTI BASE DAP:0x81020000 DAP:0x81120000
++SYStem.CONFIG BMC BASE DAP:0x81030000 DAP:0x81130000
++SYStem.CONFIG ETM BASE DAP:0x81040000 DAP:0x81140000
++
++;SYStem.CONFIG.STM.Base DAP:0xfe486000
++;SYStem.CONFIG.ETF.Base DAP:0xfe481000 DAP:0xfe482000
++;SYStem.CONFIG.ETF1.ATBSource STM1
++
++; Disable interrupts in debug mode.
++; Set to off to debug interrupt routines
++SYStem.Option IMASKASM ON
++SYStem.Option IMASKHLL ON
++SYStem.Option EnReset OFF               ; Avoid that reset line is pulled low during Prepare mode
++
++; <Target register address> < ~mask> < reset value > < value to be written on out of reset >
++system.option.RESetREGister axi:0x7FFC441124 0x210000 0x011000 0x011111
++
++LOCAL &edscr &connected &edlar &wasrunning
++
++&connected=TRUE()
++&wasrunning=TRUE()
++
++IF !STATE.POWER()
++(
++  DIALOG.OK "Board is not powered."
++
++  PRINT "Waiting for SYStem.Power"
++  ON TIME 10.0s GOTO powerdown                  ; Wait max 10 sec for VTREF to go to 1.8V
++
++WHILE !STATE.POWER()
++(
++  WAIT 0.5s
++)
++
++  ON TIME                                       ; Disable time out again
++)
++
++PRINT "System power detected, waiting for debug registers"
++
++ON ERROR GOSUB AttachHandler
++SYStem.Mode Attach
++AREA.Create state
++AREA state
++PRINT State.run()
++AREA.save state state.txt
++QUIT
++
++AttachHandler:
++RETURN                                          ; Ignore
++
++ON ERROR GOSUB ConnectHandler                   ; On bus error set connection attempt to false
++SYStem.Mode Prepare                             ; Go to prepare mode for debug register polling
++CORE 0.                                         ; Select core 0 to wait for debug registers
++
++; Poll EDLAR register until no further bus error occurs.
++waitconnect:
++&connected=TRUE()                               ; Assume that next read will succeed
++&edlar=Data.Long(eapb:(corebase()+0xFB0))       ; Use EDLAR to check connection. EDLAR should
++IF !&connected                                  ; also be available even when a lock is active
++(
++  WAIT 0.5s
++  GOTO waitconnect
++)
++
++;--------------------------------------------------------------------------------------------------
++; Attach
++
++IF "&prepare"=="ATTACH"
++(
++  ; Finally attach to the target
++  SYStem.Mode Attach
++
++  IF RUN()
++    Break.direct
++  ELSE
++    &wasrunning=FALSE()
++
++  ; Toggle ETM to make trace work
++  ETM.OFF
++;  ETM.ON
++
++  IF &wasrunning
++    Go.direct
++
++  PRINT "Target is up and running"
++)
++
++ENDDO
++
++; -------------------------------------------------------------------------------------------------
++; Support handlers
++ConnectHandler:
++
++  &connected=FALSE()
++
++RETURN
++
++; -------------------------------------------------------------------------------------------------
++; Error handlers
++
++powerdown:
++  DIALOG.OK "Board power did not come up. Please check the power supply and if the debug connector is correctly plugged"
++ENDDO
+diff --git a/board/habanalabs/common/t32/t32.sh b/board/habanalabs/common/t32/t32.sh
+new file mode 100755
+index 0000000..b388a8d
+--- /dev/null
++++ b/board/habanalabs/common/t32/t32.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++board=${1:-onix}
++T32_BASE=/opt/t32/bin/pc_linux64
++cd /var/lib/tftpboot/tests/t32
++sudo chmod 777 .
++
++${T32_BASE}/t32rem localhost port=200000 QUIT >& /dev/null
++if [ $# -eq 0 ]; then
++	${T32_BASE}/t32marm64-qt -s reset_${board}.cmm -c config.t32 > /dev/null
++elif [ "$1" == "full" ]; then
++	${T32_BASE}/t32marm64-qt -s program.cmm -c config.t32 > /dev/null
++	${T32_BASE}/t32marm64-qt -s reset_${board}.cmm -c config.t32 > /dev/null
++else
++	rm -f state.txt
++	${T32_BASE}/t32marm64-qt -s state.cmm -c config.t32 > /dev/null
++	if [ -f state.txt ]; then
++		cat state.txt | tr -d ' '
++	else
++		echo FALSE
++	fi
++fi
+diff --git a/board/habanalabs/common/t32/uboot.cmm b/board/habanalabs/common/t32/uboot.cmm
+new file mode 100644
+index 0000000..a7d5560
+--- /dev/null
++++ b/board/habanalabs/common/t32/uboot.cmm
+@@ -0,0 +1,16 @@
++; Make sure reset vector for all cores is 0
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441104 %LE %Long 0xf0010000
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++D.S axi:0x7FFC441114 %LE %Long 0x7f
++
++; Load u-boot
++B::data.LOAD.Binary /lib/firmware/habanalabs/dali/dali-u-boot.bin axi:0x7ff0010000
++B::data.LOAD.Binary /lib/firmware/habanalabs/dali/dali-u-boot-spl.bin axi:0x7ff0200000
++B::data.LOAD.elf /lib/firmware/habanalabs/dali/u-boot /NoCODE /NoClear
++B::data.LOAD.elf /lib/firmware/habanalabs/dali/u-boot 0x164000 /NoCODE /NoClear
++B::data.LOAD.elf /lib/firmware/habanalabs/dali/vmlinux /NoCODE /NoClear
+diff --git a/board/habanalabs/common/vivado_lab/erase.tcl b/board/habanalabs/common/vivado_lab/erase.tcl
+new file mode 100644
+index 0000000..e8c7584
+--- /dev/null
++++ b/board/habanalabs/common/vivado_lab/erase.tcl
+@@ -0,0 +1,8 @@
++open_hw
++connect_hw_server
++open_hw_target
++create_hw_cfgmem -hw_device [lindex [get_hw_devices] 0] -mem_dev [lindex [get_cfgmem_parts {mt25qu512-spi-x1_x2_x4_x8}] 0]
++set_property PROGRAM.FILES [list "/lib/firmware/habanalabs/dali/dali-spi-flash.bin" "/lib/firmware/habanalabs/dali/dali-spi-flash.bin" ] [ get_property PROGRAM.HW_CFGMEM [lindex [get_hw_devices xcvu440_0] 0]]
++set_property PROGRAM.ERASE  1 [ get_property PROGRAM.HW_CFGMEM [lindex [get_hw_devices xcvu440_0] 0]]
++program_hw_cfgmem -hw_cfgmem [ get_property PROGRAM.HW_CFGMEM [lindex [get_hw_devices xcvu440_0] 0]]
++exit
+diff --git a/board/habanalabs/common/vivado_lab/program-avnet.tcl b/board/habanalabs/common/vivado_lab/program-avnet.tcl
+new file mode 100644
+index 0000000..77a507d
+--- /dev/null
++++ b/board/habanalabs/common/vivado_lab/program-avnet.tcl
+@@ -0,0 +1,10 @@
++open_hw
++connect_hw_server
++open_hw_target
++set_property PROGRAM.FILE {/opt/Xilinx/Vivado_Lab/h2_cpu_top_onix_avnet_070618.bit} [get_hw_devices xcvu440_0]
++current_hw_device [get_hw_devices xcvu440_0]
++refresh_hw_device [lindex [get_hw_devices xcvu440_0] 0]
++set_property PROGRAM.FILE {/opt/Xilinx/Vivado_Lab/h2_cpu_top_onix_avnet_070618.bit} [get_hw_devices xcvu440_0]
++program_hw_devices [get_hw_devices xcvu440_0]
++refresh_hw_device [lindex [get_hw_devices xcvu440_0] 0]
++exit
+diff --git a/board/habanalabs/common/vivado_lab/program-dspg.tcl b/board/habanalabs/common/vivado_lab/program-dspg.tcl
+new file mode 100644
+index 0000000..f8293a7
+--- /dev/null
++++ b/board/habanalabs/common/vivado_lab/program-dspg.tcl
+@@ -0,0 +1,10 @@
++open_hw
++connect_hw_server
++open_hw_target
++set_property PROGRAM.FILE {/opt/Xilinx/Vivado_Lab/h2_cpu_top_onix_dspg_070618.bit} [get_hw_devices xcvu440_0]
++current_hw_device [get_hw_devices xcvu440_0]
++refresh_hw_device [lindex [get_hw_devices xcvu440_0] 0]
++set_property PROGRAM.FILE {/opt/Xilinx/Vivado_Lab/h2_cpu_top_onix_dspg_070618.bit} [get_hw_devices xcvu440_0]
++program_hw_devices [get_hw_devices xcvu440_0]
++refresh_hw_device [lindex [get_hw_devices xcvu440_0] 0]
++exit
+diff --git a/board/habanalabs/common/vivado_lab/viv.sh b/board/habanalabs/common/vivado_lab/viv.sh
+new file mode 100755
+index 0000000..f88fb61
+--- /dev/null
++++ b/board/habanalabs/common/vivado_lab/viv.sh
+@@ -0,0 +1,40 @@
++#!/bin/bash
++
++board=${1:-onix}
++action=${2:-none}
++
++case "$board" in
++*asic)
++        ;;
++*onix)
++        ;;
++*pldm)
++        ;;
++*)
++        echo "error - Unknown board name: $board"
++        exit 2
++        ;;
++esac
++
++# Expected hostname is monster<id>-nuc and relevant ONIX mounted on monster<id>
++HOST_NAME=${HOSTNAME%-*}
++if [ "${HOST_NAME}" == "monster4" ]; then
++	DEBUG_BRD_VENDOR=dspg
++else
++	DEBUG_BRD_VENDOR=avnet
++fi
++
++VIV_PROG_TCL=program-${DEBUG_BRD_VENDOR}.tcl
++VIV_ERASE_TCL=erase.tcl
++VIV_ARGS="-nojournal -nolog -mode batch"
++VIV_BASE=/opt/Xilinx/Vivado_Lab/2017.4/bin
++VIV_PROG_CMD="${VIV_BASE}/vivado_lab ${VIV_ARGS} -source ${VIV_PROG_TCL}"
++VIV_ERASE_CMD="${VIV_BASE}/vivado_lab ${VIV_ARGS} -source ${VIV_ERASE_TCL}"
++VIV_WORK=/var/lib/tftpboot/tests/vivado_lab
++
++if [ "${action}" == "erase" ]; then
++	sshpass -p123456 scp ${VIV_WORK}/${VIV_ERASE_TCL} root@${HOST_NAME}:${VIV_WORK}/
++	sshpass -p123456 ssh root@${HOST_NAME} "cd ${VIV_WORK} && ${VIV_ERASE_CMD} > /dev/null"
++fi
++sshpass -p123456 scp ${VIV_WORK}/${VIV_PROG_TCL} root@${HOST_NAME}:${VIV_WORK}/
++sshpass -p123456 ssh root@${HOST_NAME} "cd ${VIV_WORK} && ${VIV_PROG_CMD} > /dev/null"
+diff --git a/configs/dali_defconfig b/configs/dali_defconfig
+index e348e25..c7fd96d 100644
+--- a/configs/dali_defconfig
++++ b/configs/dali_defconfig
+@@ -59,3 +59,4 @@
+ BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+ BR2_PACKAGE_ARMCP=y
++BR2_PACKAGE_UBOOT_TEST_HOOKS=y
+diff --git a/package/uboot-test-hooks/Config.in b/package/uboot-test-hooks/Config.in
+new file mode 100644
+index 0000000..d0227db
+--- /dev/null
++++ b/package/uboot-test-hooks/Config.in
+@@ -0,0 +1,4 @@
++config BR2_PACKAGE_UBOOT_TEST_HOOKS
++	bool "U-Boot Test hooks"
++	help
++	  This is U-Boot primary testing option
+diff --git a/package/uboot-test-hooks/uboot-test-hooks.mk b/package/uboot-test-hooks/uboot-test-hooks.mk
+new file mode 100644
+index 0000000..fe403e2
+--- /dev/null
++++ b/package/uboot-test-hooks/uboot-test-hooks.mk
+@@ -0,0 +1,22 @@
++UBOOT_TEST_HOOKS_VERSION = 1.0.0
++UBOOT_TEST_HOOKS_SITE = https://github.com/swarren/uboot-test-hooks.git
++UBOOT_TEST_HOOKS_LICENSE = unclear
++
++HOST_UBOOT_TEST_HOOKS_DEPENDENCIES = uboot
++
++HOST_UBOOT_TEST_HOOKS_MAKE_OPTS += --build-dir=$(UBOOT_DIR)
++HOST_UBOOT_TEST_HOOKS_MAKE_OPTS += --board-type=$(HOST_UBOOT_TEST_HOOKS_BRD)
++HOST_UBOOT_TEST_HOOKS_MAKE_OPTS +=  -s
++HOST_UBOOT_TEST_HOOKS_MAKE_OPTS +=  -k dali
++HOST_UBOOT_TEST_HOOKS_MAKE_ENV   += PATH=$(PATH):$(@D)/bin
++HOST_UBOOT_TEST_HOOKS_MAKE_ENV   += PYTHONPATH=$(PYTHONPATH):$(@D)/py/habanalabs
++
++define HOST_UBOOT_TEST_HOOKS_BUILD_CMDS
++	(cd $(@D);					\
++		$(HOST_UBOOT_TEST_HOOKS_MAKE_ENV)	\
++		$(UBOOT_DIR)/test/py/test.py		\
++		$(HOST_UBOOT_TEST_HOOKS_MAKE_OPTS)	\
++	)
++endef
++
++$(eval $(host-generic-package))

@@ -1,0 +1,61 @@
+From eb9bbda0e0a9bdca0341977164471a79bf03f23e Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Wed, 29 Nov 2023 20:23:56 +0200
+Subject: [PATCH] [SW-156330] gaudi3: add sha384 to ppboot & preboot
+
+This patch adds pre-calculated sha384 to  ppboot and preboot images,
+as calculating at runtime will significantly slow down the process.
+Same method was followed in gaudi2.
+
+Change-Id: I92c773f4977c075c460cac1b13e416769903ab21
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index 14e740d..363a3bf 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -5,6 +5,7 @@
+ OPENSSL=/usr/bin/openssl
+ OBJCOPY=arc-linux-objcopy
+ SHA_CHKSUM=sha384sum
++SHA384_MAGIC=0x6a56ca1c
+ 
+ SPEC_BOOT_DESC_HDR_FILE=${BR2_EXTERNAL_HABANALABS_PATH}/../specs/gaudi3/gaudi3_boot_info.h
+ SPEC_SECURITY_HDR_FILE=${BR2_EXTERNAL_HABANALABS_PATH}/../specs/gaudi3/gaudi3_security.h
+@@ -153,8 +154,12 @@
+ 	CRC_ERROR=$4
+ 	SIGN_ERROR=$5
+ 
++	TEMPNAME=${FUNCNAME}-$(basename ${FILEPATH})
++	dd status=none conv=sync bs=16 if=${FILEPATH}			> ${TEMPNAME}
++	append_sha384 ${TEMPNAME}
++
+ 	PADFULLBINFILE=${FILEPATH}.pad
+-	dd status=none conv=sync bs=16 if=${FILEPATH} of=${PADFULLBINFILE}
++	dd status=none conv=sync bs=16 if=${TEMPNAME} of=${PADFULLBINFILE}
+ 
+ 	SIZE_WITHOUT_CRC=$(stat --printf="%s" ${PADFULLBINFILE})
+ 	NUM_SLICES=$((SIZE_WITHOUT_CRC/MAX_SPI_DMA_DATA_TRANSFER))
+@@ -452,6 +457,21 @@
+ 	printf "%08x" $start_addr_l | rev_bytes_stdin
+ }
+ 
++function append_sha384 {
++	IMG=${1}
++	SHA384_BINFILE=img-hash-${IMG%.*}.sha384
++
++	rm -f ${SHA384_BINFILE}.sha384
++
++	$OPENSSL dgst -sha384 -binary ${IMG} > ${SHA384_BINFILE}
++
++	# Pad magic to be 16 byte - aligned
++	dd status=none conv=sync bs=4 if=/dev/zero count=3 >> ${IMG}
++
++	echo ${SHA384_MAGIC} | xxd -r -p - >> ${IMG}
++	dd status=none conv=sync bs=1 if=${SHA384_BINFILE} >> ${IMG}
++}
++
+ function prep_image_ptrs_common_v4 {
+ 	local img_file=$1
+ 	local img_ptrs_sz=32

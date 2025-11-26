@@ -1,0 +1,2504 @@
+From e0d44f0f1aa523e51aff1c794b76ca5d6ed368e0 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 27 Aug 2024 12:15:18 +0300
+Subject: [PATCH] [FSW-7268] scripts: add palad conversion scripts
+
+Add 2 useful image conversion scripts for palladium:
+1. convert_app_to_ccm_hex.sh - gets a path to an app binary and
+   produces hex files that can be loaded directly to CCM memories.
+2. convert_app_to_io_bootrom_hex.sh - gets a path to an app binary and
+   produces hex file that can be loaded directly to IO die bootrom
+   memory.
+
+Additional tools are added to allow those scripts to do their thing.
+
+Change-Id: Ib81c72fe50ddec2687f544b572a2acdad03518ab
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/configs/fs1_arc_pldm_defconfig b/configs/fs1_arc_pldm_defconfig
+index e0a1e83..0a5f433 100644
+--- a/configs/fs1_arc_pldm_defconfig
++++ b/configs/fs1_arc_pldm_defconfig
+@@ -17,8 +17,8 @@
+ BR2_PACKAGE_DSM=y
+ BR2_PACKAGE_PREBOOT=y
+ BR2_PACKAGE_MGMT=y
+-BR2_PACKAGE_MGMT_COMPUTE=y
+-BR2_PACKAGE_RESET=y
++#BR2_PACKAGE_MGMT_COMPUTE=y
++#BR2_PACKAGE_RESET=y
+ BR2_POST_IMAGE_FW_LOADER_ITS_TEMPLATE="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/fs1/agent-fw_loader.its"
+ BR2_PIC_PIE=n
+ BR2_SSP_NONE=y
+@@ -29,5 +29,5 @@
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT=y
+ BR2_PACKAGE_ARCBOOT=y
+-BR2_PACKAGE_PREBOOT_COMPUTE=y
+-BR2_PACKAGE_RESET_COMPUTE=y
++#BR2_PACKAGE_PREBOOT_COMPUTE=y
++#BR2_PACKAGE_RESET_COMPUTE=y
+diff --git a/scripts/palad/bin2hex.sh b/scripts/palad/bin2hex.sh
+new file mode 100755
+index 0000000..4892890
+--- /dev/null
++++ b/scripts/palad/bin2hex.sh
+@@ -0,0 +1,51 @@
++#!/bin/bash
++
++function hl_pldm_hex {
++	local NAME=$(basename "$1" | cut -f 1 -d '.')
++	local FILE=$1
++	local BYTES_PER_LINE=$2
++
++	# pad file to 128bit (16Byte) as pladium emulates 128bit memory, so xxd wont trunc lines
++	dd status=none conv=sync bs=16 if=${FILE} > ${FILE}.tmp
++	xxd -e -g ${BYTES_PER_LINE} ${FILE}.tmp | xxd -r | xxd -ps -c${BYTES_PER_LINE} > ${NAME}.hex
++	rm ${FILE}.tmp
++}
++
++# Function to display help menu
++show_help() {
++    echo "Usage: $0 [options] <file-path>"
++    echo
++    echo "Options:"
++    echo "  -h          Show this help message and exit"
++    echo
++    echo "Arguments:"
++    echo "  <file-path> Path to the application binary image"
++    echo "  <bytes-per-line> data with in target hex file"
++}
++
++# Check for the -h flag
++if [[ "$1" == "-h" ]]; then
++    show_help
++    exit 0
++fi
++
++# Check if the correct number of arguments is provided
++if [[ $# -ne 2 ]]; then
++    echo "Error: Invalid number of arguments."
++    show_help
++    exit 1
++fi
++
++# File path from the first argument
++FILE_PATH="$1"
++TRGT_BYTES=$2
++#SCRIPT_DIR=$(dirname "$(realpath "$0")")
++#TOOLS_DIR="${SCRIPT_DIR}/ext_tools/"
++
++# Check if the file exists
++if [[ ! -e "$FILE_PATH" ]]; then
++    echo "File '$FILE_PATH' does not exist."
++    exit 1
++fi
++
++hl_pldm_hex ${FILE_PATH} ${TRGT_BYTES}
+diff --git a/scripts/palad/convert_app_to_ccm_hex.sh b/scripts/palad/convert_app_to_ccm_hex.sh
+new file mode 100755
+index 0000000..faa64f5
+--- /dev/null
++++ b/scripts/palad/convert_app_to_ccm_hex.sh
+@@ -0,0 +1,48 @@
++#!/bin/bash
++
++# Function to display help menu
++show_help() {
++    echo "Usage: $0 [options] <file-path>"
++    echo
++    echo "Options:"
++    echo "  -h          Show this help message and exit"
++    echo
++    echo "Arguments:"
++    echo "  <file-path> Path to the application bin image"
++}
++
++# Check for the -h flag
++if [[ "$1" == "-h" ]]; then
++    show_help
++    exit 0
++fi
++
++# Check if the correct number of arguments is provided
++if [[ $# -ne 1 ]]; then
++    echo "Error: Invalid number of arguments."
++    show_help
++    exit 1
++fi
++
++# File path from the first argument
++FILE_PATH="$1"
++FILE_NAME=$(basename "${FILE_PATH}" | cut -f 1 -d '.')
++SCRIPT_DIR=$(dirname "$(realpath "$0")")
++TOOLS_DIR="${SCRIPT_DIR}/ext_tools/"
++
++# Check if the file exists
++if [[ -e "$FILE_PATH" ]]; then
++    echo "Converting '$FILE_PATH'"
++else
++    echo "File '$FILE_PATH' does not exist."
++fi
++
++# reverse endianess, as CCM converter expects big endian binary
++objcopy -Ibinary --reverse-bytes=4 ${FILE_PATH} ${FILE_NAME}_be.bin
++
++${SCRIPT_DIR}/bin2hex.sh ${FILE_NAME}_be.bin 1
++perl ${TOOLS_DIR}/convert_hex.pl ${FILE_NAME}_be.hex ccm_temp_conv.hex
++${TOOLS_DIR}/eccgen -hex ccm_temp_conv.hex -build ${TOOLS_DIR}/build_configuration.txt -a
++rm -f ccm_temp_conv.hex ${FILE_NAME}_be.hex ${FILE_NAME}_be.bin
++
++echo "Conversion done"
+diff --git a/scripts/palad/convert_app_to_io_bootrom_hex.sh b/scripts/palad/convert_app_to_io_bootrom_hex.sh
+new file mode 100755
+index 0000000..cf738eb
+--- /dev/null
++++ b/scripts/palad/convert_app_to_io_bootrom_hex.sh
+@@ -0,0 +1,46 @@
++#!/bin/bash
++
++# Function to display help menu
++show_help() {
++    echo "Usage: $0 [options] <file-path>"
++    echo
++    echo "Options:"
++    echo "  -h          Show this help message and exit"
++    echo
++    echo "Arguments:"
++    echo "  <file-path> Path to the application binary image"
++}
++
++# Check for the -h flag
++if [[ "$1" == "-h" ]]; then
++    show_help
++    exit 0
++fi
++
++# Check if the correct number of arguments is provided
++if [[ $# -ne 1 ]]; then
++    echo "Error: Invalid number of arguments."
++    show_help
++    exit 1
++fi
++
++# File path from the first argument
++FILE_PATH="$1"
++FILE_NAME=$(basename "${FILE_PATH}" | cut -f 1 -d '.')
++SCRIPT_DIR=$(dirname "$(realpath "$0")")
++TOOLS_DIR="${SCRIPT_DIR}/ext_tools/"
++
++# Check if the file exists
++if [[ -e "$FILE_PATH" ]]; then
++    echo "Converting '$FILE_PATH'"
++else
++    echo "File '$FILE_PATH' does not exist."
++    exit 1
++fi
++
++${SCRIPT_DIR}/bin2hex.sh ${FILE_PATH} 16
++${TOOLS_DIR}/eccgen3 -DDATA_WIDTH=128 -DECC_WIDTH=9 ${TOOLS_DIR}/DW_ecc_equations_128_9.alg ${FILE_NAME}.hex > ${FILE_NAME}_rom_ecc.hex
++
++rm -f ${FILE_NAME}.hex
++
++echo "Conversion done"
+diff --git a/scripts/palad/ext_tools/DW_ecc_equations_128_9.alg b/scripts/palad/ext_tools/DW_ecc_equations_128_9.alg
+new file mode 100755
+index 0000000..ff5eefe
+--- /dev/null
++++ b/scripts/palad/ext_tools/DW_ecc_equations_128_9.alg
+@@ -0,0 +1,41 @@
++
++void generate_ecc(bits<32> Addr, bits<DATA_WIDTH> Data) {
++
++  bits<ECC_WIDTH> ecc;
++
++  // This is the same as (Data[0] ^ Data[4] ^ Data[6] ... and so on)
++
++  ecc[0] = Data{^0,4,6,7,8,9,11,14,17,18,19,21,26,28,29,31,32,36,38,39,40,41,43,46,49,50,51,53,58,60,61,63,64,68,70,71,72,73,75,78,81,82,83,85,90,92,93,95,97,98,99,101,106,108,109,111,112,116,118,119,120,121,123,126};
++
++  ecc[1] = Data{^0,1,2,4,6,8,10,12,16,17,18,20,22,24,26,28,32,33,34,36,38,40,42,44,48,49,50,52,54,56,58,60,64,65,66,68,70,72,74,76,80,81,82,84,86,88,90,92,96,97,98,100,102,104,106,108,112,113,114,116,118,120,122,124};
++
++  // You can use the "complement" operator or 1 ^ Data{^0,3,...}
++
++  ecc[2] = ~Data{^0,3,4,7,9,10,13,15,16,19,20,23,25,26,29,31,32,35,36,39,41,42,45,47,48,51,52,55,57,58,61,63,64,67,68,71,73,74,77,79,80,83,84,87,89,90,93,95,96,99,100,103,105,106,109,111,112,115,116,119,121,122,125,127};
++
++  ecc[3] = ~Data{^0,1,5,6,7,11,12,13,16,17,21,22,23,27,28,29,32,33,37,38,39,43,44,45,48,49,53,54,55,59,60,61,64,65,69,70,71,75,76,77,80,81,85,86,87,91,92,93,96,97,101,102,103,107,108,109,112,113,117,118,119,123,124,125};
++
++  ecc[4] = Data{^2,3,4,5,6,7,14,15,18,19,20,21,22,23,30,31,34,35,36,37,38,39,46,47,50,51,52,53,54,55,62,63,66,67,68,69,70,71,78,79,82,83,84,85,86,87,94,95,98,99,100,101,102,103,110,111,114,115,116,117,118,119,126,127};
++
++  ecc[5] = Data{^8,9,10,11,12,13,14,15,24,25,26,27,28,29,30,31,40,41,42,43,44,45,46,47,56,57,58,59,60,61,62,63,72,73,74,75,76,77,78,79,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,112,113,114,115,116,117,118,119};
++
++  ecc[6] = Data{^0,1,2,3,4,5,6,7,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,56,57,58,59,60,61,62,63,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119};
++
++  ecc[7] = Data{^0,1,2,3,4,5,6,7,24,25,26,27,28,29,30,31,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,64,65,66,67,68,69,70,71,88,89,90,91,92,93,94,95,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119};
++
++  ecc[8] = Data{^0,1,2,3,4,5,6,7,24,25,26,27,28,29,30,31,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,96,97,98,99,100,101,102,103,120,121,122,123,124,125,126,127};
++
++  bits<DATA_WIDTH + ECC_WIDTH + 1> Output;
++
++  // The customer test cases appear to put the ECC bits on the right (LSB)
++  // The customer case appears to shift the output left by 1 (unused?)
++
++  Output[0] = 0;
++  Output[1:ECC_WIDTH] = ecc;
++  Output[ECC_WIDTH+1:DATA_WIDTH+ECC_WIDTH] = Data;
++
++  // This outputs the data like C++ stream I/O except that bits are
++  // printed in lowercase hex
++
++  stdout << hex(Output) << "\n";
++}
+diff --git a/scripts/palad/ext_tools/build_configuration.txt b/scripts/palad/ext_tools/build_configuration.txt
+new file mode 100644
+index 0000000..7d163aa
+--- /dev/null
++++ b/scripts/palad/ext_tools/build_configuration.txt
+@@ -0,0 +1,2194 @@
++######## IP Libraries: ########
++# ARCv2HS, v3.1.47                       /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARCv2HS_v3.1.47.iplib/arcv2hs/ip_library
++# ARC Debug, v2.1.6                      /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARC_Debug_v2.1.6.iplib
++# ARC RTT, v2.0.32                       /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARC_RTT_v2.0.32.iplib
++# ARC xCAM, v4.3.14                      /tools/synopsys/architect/Q-2020.03/ARChitect/lib/ARC_xCAM.iplib
++# ARConnect, v2.1.18                     /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARConnect_2.1.18.iplib
++# ARCv2_FPGA_RDF, v1.5.4                 /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_RDF_IP-Libraries.tar/ARC_RDF_IP-Libraries/ARCv2_FPGA_RDF_v1.5.4.iplib
++# ARCv2_HAPS_RDF, v1.1.9                 /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_RDF_IP-Libraries.tar/ARC_RDF_IP-Libraries/ARCv2_HAPS_RDF_v1.1.9.iplib
++# ARCv2CC, v2.1.33                       /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARCv2CC_v2.1.33.iplib
++# ARCv2HS_CCT, v3.1.47                   /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARCv2HS_v3.1.47.iplib/ccths/ip_library
++# ARCv2MSS, v2.1.30                      /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARCv2MSS_v2.1.30.iplib
++# FastMath, v1.0.3                       /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARCv2_FastMath_v1.0.3.iplib
++# Implementation, v3.1.47                /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_HS_3_10a_IP-Libraries/ARCv2HS_v3.1.47.iplib/implementation/ip_library
++# Synopsys Based Reference Design Flow, v9.0.17 /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_RDF_IP-Libraries.tar/ARC_RDF_IP-Libraries/ARC_RDF_Synopsys_v9.0.17.iplib
++# Synopsys Clock Gate Replacement Flow, v3.0.5 /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_RDF_IP-Libraries.tar/ARC_RDF_IP-Libraries/ARC_RDF_CGR_v3.0.5.iplib
++# Synopsys Embed-it Integrator Flow, v7.0.11 /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_RDF_IP-Libraries.tar/ARC_RDF_IP-Libraries/ARC_RDF_SEIF_v7.0.11.iplib
++# Synopsys SMS Integrator Flow, v2.0.7   /technology/N7/ips/arc/synopsys/arc_hs47d_processor/v3p1a/ARC_RDF_IP-Libraries.tar/ARC_RDF_IP-Libraries/ARC_RDF_SMS_v2.0.7.iplib
++# Tool Configuration, v1.0.79            /tools/synopsys/architect/Q-2020.03/ARChitect/lib/cgen.iplib
++
++######## h6_arc_wo_rtt --- com.arc.templates.project.Empty.1_0 ########
++
++# BuildHTMLDocs --- Creates custom HTML documentation in the 'docs' directory.
++-build_html_docs true
++
++# BuildSoftware --- Creates software under the Software directory.
++-build_software false
++
++# BuildTestCode --- Creates test source code under the 'tests' directory.
++-build_test_code true
++
++# BuildScripts --- Creates synthesis scripts and configuration files, which are required for hierarchy generation.
++-build_scripts true
++
++# BuildHDL --- Creates the behavioural and synthesisable HDL source code.
++-build_hdl true
++
++# CompileTestCode --- Compiles and assembles the test code.
++-compile_test_code true
++
++# GenerateStructuralHDL --- Generate the necessary structural HDL
++-generate_structural_hdl true
++
++# CompileForHDLSimulation --- Compile the HDL ready for simulation, using the selected Simulator.
++-compile_hdl_for_simulation false
++
++# BuildXCAM --- 
++# When true, build the XCAM cycle accurate model from HDL.
++# This happens only when the VTOC component (in the XCAM library) has been added to the design.
++# 
++-build_xcam true
++
++# RunARCsyn --- Synthesize design using ARCsyn
++-run_arcsyn false
++
++# RunSEIF --- Run Synopsys Embedit Integrator Flow to generate configured memory instances
++-run_seif false
++
++# RunARCrams --- Run ARCrams on the current build, this will stitch in vendor supplied RAM models and update the synthesis and simulation environment to use the models.
++-run_arcrams false
++
++# RunARCformal --- Formal Verification using ARCformal
++-run_arcformal false
++
++# RunARCpower --- Run the Power Analysis using RTL simulation to derive the activity
++-run_arcpower false
++
++# compile_nsim_user_extensions --- Build nSIM extensions for any APEX components in the current design using their C Models.
++-compile_nsim_user_extension false
++
++# compile_translated_nsim_extensions --- Converts APEX extensions from Verilog to C++ and compiles the model for nSIM.
++-compile_translated_nsim_extensions false
++
++
++######## System --- com.arc.hardware.System.1_0 ########
++
++# Create System
++-create com.arc.hardware.System.1_0 System
++
++# Testbench --- 
++# Only the rascal testbench is supported, and is required by ARCtest.
++# 	
++-testbench rascal
++
++# SynthesisLevel --- 
++# Sets the top level module name for synthesis.  
++# 
++# If not using core_sys: for single-core designs, cpu_isle is used; for multicore designs, archipelago is used.
++# 	
++-synthesislevel cpu_isle/archipelago
++
++# GateLevelSim --- When selected the gate level sim test code and scripts would be installed to run ARCgatesim
++-gatesim true
++
++# UserLibraryName --- The name for your HDL library
++-library_name user
++
++# OPTION_SimulatorName --- The name of the simulator you wish to use
++-simulator vcs
++
++# sim64 --- When selected, the 64-bit version of the simulator is used.  Be sure you have the 64-bit-capable simulator installed  and $ARCHITECT_ROOT/lib/linux_x86_64/ added to your LD_LIBRARY_PATH.
++# The setting of this option affects the content of the generated makefile_interface_*_verilog, where * is the simulator name.
++-sim64 true
++
++# verilog_2001 --- Enable Verilog 2001 file-io syntax (if false: use pli)
++-verilog_2001 true
++
++# copy_prefix --- 
++# A Copy Prefix P causes creation of a separate copy of the entire Verilog build where each Verilog filename, module, and `define is prefixed with P and copied to a separate directory named P.
++# 	
++-copy_prefix no_rtt_
++
++
++######## ARCv2HS CCT --- cct.HS.1_0 ########
++
++# Create ARCv2HS CCT
++-create cct.HS.1_0 "System.ARCv2HS CCT"
++
++# cct --- 
++# 	Option used to add a CCT to the design for command-line builds
++# 	Without this architect can't add this component to a build
++# 	via a cmdline -create command.  
++# 	with old scripts.
++# 	
++-cct true
++
++# no_hostlink --- 
++# This prevents the inclusion of the hostlink library when compiling
++# C or C++ programs.  The resultant executable, if it contains printfs,
++# will print to an internal fixed buffer __mwwrite_buf.  
++# Other hostlink operations that require debugger assistance, such as file
++# opens, will fail.
++# 
++# Hostlink references incur memory cycles at unpredictable times and 
++# so can perturb cycle-timing results.  Without hostlink,
++# the debugger will not in any way interfere with the target while it is running.  
++# Therefore this option is useful for simulation in which you want precisely the
++# same cycle timing to occur each time you run, or for accurate power consumption results.
++# 	
++-cct_no_hostlink false
++
++
++######## BusFabric --- com.arc.hardware.ARCv2MSS.BusFabric.1_0 ########
++
++# Create BusFabric
++-create com.arc.hardware.ARCv2MSS.BusFabric.1_0 System.BusFabric
++
++# alb_mss_fab_def_div2ref --- This specifies the clock division factor at reset. It is used for mss clock controller to generate mss fabric clock, and the value N means mss fabric is running at (1/N) x ref_clk.
++-alb_mss_fab_def_div2ref 2
++
++# alb_mss_fab_lat --- This specifies the maximum latency in the master latency units.
++-alb_mss_fab_lat 0
++
++# alb_mss_fab_def_lat --- This specifies the latency after reset for the master latency units.
++-alb_mss_fab_def_lat 0
++
++# alb_mss_fab_def_wr_bw --- This specifies the write channel bandwidth parameter after reset for the master bandwidth control units.
++-alb_mss_fab_def_wr_bw 0
++
++# alb_mss_fab_def_rd_bw --- This specifies the read channel bandwidth parameter after reset for the master bandwidth control units.
++-alb_mss_fab_def_rd_bw 0
++
++# alb_mss_ccm_base --- This specifies the base address at which the ICCM and DCCM DMIs will be placed in the memory map. The address should be divided by 4KB i.e. do not specify the lower 12 bits of the address.
++-alb_mss_ccm_base 0x4_0000
++
++
++######## ClkCtrl --- com.arc.hardware.ARCv2MSS.ClkCtrl.1_0 ########
++
++# Create ClkCtrl
++-create com.arc.hardware.ARCv2MSS.ClkCtrl.1_0 System.ClkCtrl
++
++# alb_mss_clkctrl_base_addr --- This specifies the clock controller base address in the memory map, divided by 4KB i.e. do not specify the lower 12 bits of the address.
++-alb_mss_clkctrl_base_addr 0xc_0000
++
++# alb_mss_clkctrl_bypass_mode --- If true then all clock dividers/gaters in the clock controller are bypassed, clock ratio is not supported and the division options/registers are overriden
++-alb_mss_clkctrl_bypass_mode false
++
++
++######## ClockGateReplacementFlow --- com.synopsys.ClockGateReplacementFlow.1_0 ########
++
++# Create ClockGateReplacementFlow
++-create com.synopsys.ClockGateReplacementFlow.1_0 System.ClockGateReplacementFlow
++
++# ClockGateReplacementFlow --- Add the Synopsys Clock Gate Replacement Flow Component
++-cgr true
++
++# BackCompat --- Retain the unused rst_a pin on clkgate modules for  backwards compatability with older RTL
++-back_compat false
++
++
++######## Cluster --- com.arc.hardware.CC.Cluster.1_0 ########
++
++# Create Cluster
++-create com.arc.hardware.CC.Cluster.1_0 System.Cluster
++
++# cluster_id --- This number uniquely identifies this cluster from all other clusters.  It is placed in the CLUSTER_ID auxiliary register visible in each core of the cluster.
++-cluster_id 0
++
++# vector_proc_profile --- Any scalar HS core(s) within cluster will use the vector unit compatible scalar instruction set.
++-vector_proc_profile false
++
++# cc_allow_csm_l2_share_memory --- The memory inside L2 cache can be shared with CSM to accommodate different applications
++-cc_allow_csm_l2_share_memory false
++
++# cc_add_ppb_duncach --- Add zero, one or two levels of pipeline stages for the data non-cacheable transactions from each core. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cc_add_ppb_duncach 0
++
++# cc_add_ppb_dcach --- Add zero, one or two levels of pipeline stages for the data cacheable transactions from each core. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cc_add_ppb_dcach 0
++
++# cc_add_ppb_per --- Add zero, one or two levels of pipeline stages for the data peripheral transactions from each core. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cc_add_ppb_per 0
++
++# cc_add_ppb_ifetch --- Add zero, one or two levels of pipeline stages for the instruction fetch transactions from each core. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cc_add_ppb_ifetch 0
++
++# cc_add_ppb_scu --- Add zero, one or two levels of pipeline stages for the transactions from Shared Coherent Unit (SCU) to downstream L2 Cache (if L2 Cache has been configured) or memory bus initiator port (if L2 Cache has not been configured). This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency. Please note this option is only relevant when Shared Coherent Unit (SCU) has been configured.
++-cc_add_ppb_scu 0
++
++# cc_add_ppb_snp --- Add zero, one or two levels of pipeline stages for the snooping transactions from Shared Coherent Unit (SCU) to each core. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency. Please note this option is only relevant when Shared Coherent Unit (SCU) has been configured.
++-cc_add_ppb_snp 0
++
++# cc_add_ppb_l2c --- Add zero, one or two levels of pipeline stages for the L2 Cache-miss transactions to BIU memory bus initiator port. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency. Please note this option is only relevant when L2 Cache has been configured.
++-cc_add_ppb_l2c 0
++
++# cc_xnn_uaux_num --- This specifies the number of Cluster_Extension_uAUX interfaces. For example: if specifies 4, there will be Cluster_Extension_uAUX0/Cluster_Extension_uAUX1/Cluster_Extension_uAUX2/Cluster_Extension_uAUX3 configured out
++-cc_xnn_uaux_num 0
++
++# cc_xnn_uaux0_client --- This names the interface instance so it can be connected to by a client using the same name.  In the absence of a client name, the interface is stubbed.
++-cc_xnn_uaux0_client ""
++
++# cc_xnn_uaux1_client --- This names the interface instance so it can be connected to by a client using the same name.  In the absence of a client name, the interface is stubbed.
++-cc_xnn_uaux1_client ""
++
++# cc_xnn_uaux2_client --- This names the interface instance so it can be connected to by a client using the same name.  In the absence of a client name, the interface is stubbed.
++-cc_xnn_uaux2_client ""
++
++# cc_xnn_uaux3_client --- This names the interface instance so it can be connected to by a client using the same name.  In the absence of a client name, the interface is stubbed.
++-cc_xnn_uaux3_client ""
++
++# instances --- Description to follow
++-instances 1
++
++# unique_name --- Description to follow
++-unique_name ""
++
++
++######## Bus interface unit --- com.arc.hardware.CC.Bus_interface_unit.1_0 ########
++
++# Create Bus interface unit
++-create com.arc.hardware.CC.Bus_interface_unit.1_0 "System.Cluster.Bus interface unit"
++
++# biu_mem_bus_num --- This specifies the number of memory busses. 
++# This option is ignored if a System-level cache is present, as the number of busses is computed automatically.
++-biu_mem_bus_num 1
++
++# biu_mem_bus_option --- Protocol to connect to external memory. Please NOTE that BVCI is supported only for single core builds.
++-biu_mem_bus_option AXI
++
++# biu_mem_bus_data_w --- This specifies the data width of the memory busses
++-biu_mem_bus_data_w 64
++
++# biu_mem_bus_add_pipe_stage --- Place one more pipeline stage on memory initiator port. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-biu_mem_bus_add_pipe_stage true
++
++# biu_per_bus_num --- This option is only valid when any of the connected core has component dmp_peripheral configured on.
++-biu_per_bus_num 1
++
++# biu_per0_bus_option --- Protocol to connect to external peripherals. This option is only valid when any of the connected core has DMP PERIPHERAL0 component configured on. Please NOTE that BVCI is supported only for single core builds.
++-biu_per0_bus_option AXI
++
++# biu_per0_bus_data_w --- This specifies the data width of the peripheral initiator bus0
++-biu_per0_bus_data_w 32
++
++# biu_per0_dedicated_bus --- True: Each core have dedicated peripheral initiator port ; False: Only one peripheral initiator port for entire cluster shared by all cores.
++-biu_per0_dedicated_bus false
++
++# biu_per0_bus_add_pipe_stage --- Place one more pipeline stage on peripheral initiator port. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-biu_per0_bus_add_pipe_stage true
++
++# biu_per1_bus_option --- Protocol to connect to external peripherals. This option is only valid when any of the connected core has DMP PERIPHERAL1 component configured on. Please NOTE that BVCI is supported only for single core builds.
++-biu_per1_bus_option AXI
++
++# biu_per1_bus_data_w --- This specifies the data width of the peripheral initiator bus1
++-biu_per1_bus_data_w 32
++
++# biu_per1_dedicated_bus --- True: Each core have dedicated peripheral initiator port ; False: Only one peripheral initiator port for entire cluster shared by all cores.
++-biu_per1_dedicated_bus false
++
++# biu_per1_bus_add_pipe_stage --- Place one more pipeline stage on peripheral initiator port. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-biu_per1_bus_add_pipe_stage false
++
++# biu_dmi_bus_num --- This option is only valid when any of the connected core has iccm0_dmi/iccm1_dmi/dccm_dmi configured on. Option 0: No target bus interface for ICCMs and DCCMs; Option 1: All cores ICCMs and DCCMs share same target bus interface; Option 2: All cores ICCMs have dedicated target bus interface, and all cores DCCMs have another dedicated target bus interface.
++-biu_dmi_bus_num 2
++
++# biu_dmi_bus_option --- This specifies the protocol of the DMI busses. Please NOTE that BVCI is supported only for single core builds.
++-biu_dmi_bus_option AXI
++
++# biu_dmi_bus_data_w --- This specifies the data width of the DMI busses
++-biu_dmi_bus_data_w 64
++
++# biu_dmi_bus_axi_idw --- This speciries the AXI ID width of the DMI busses. This option is only valid when the DMI port is configured as AXI protocol.
++-biu_dmi_bus_axi_idw 16
++
++# biu_dmi_add_pipe_stage --- Place one more pipeline stage on DMI bus bridge. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-biu_dmi_add_pipe_stage false
++
++# biu_udmi_bus_num --- Option 1 , all slave components within HS cluster are accessed via one unified slave interface, including ICCM0/ICCM1/DCCM/VMEM of each processor core, STU (streaming transfer unit), CSM, as well as the IOC bus. Option 0, there are dedicated DMI interfaces (such as DMI port, VMEM DMI port, STU_DMI, CSM_DMI) and dedicated IOC bus for slave accessing.
++-biu_udmi_bus_num 0
++
++# biu_udmi_support_ioc --- This specifies whether this unified slave port supports accessing to coherency space (like IOC port of HS cluster) or not. 
++-biu_udmi_support_ioc false
++
++# biu_udmi_ioc_full_coherent --- This specifies whether the transactions from the unified slave port targeting coherency space are fully coherent or not. If fully coherent, the transactions will directly route to SCU for coherency snooping, otherwise, an internal address decoder will judge whether the transactions fall into coherency region, or non-coherent CSM or external memory space. NOTE: When fully coherent, there will no AUX register to define I/O coherency region. While non-fully coherent, AUX registers (such as COH_EN/COH_AP/COH_BASE) will be used to define the I/O coherency region 
++-biu_udmi_ioc_full_coherent false
++
++# biu_udmi_access_per1 --- This specifies whether this unified slave port supports accessing to second peripheral port or not. 
++-biu_udmi_access_per1 false
++
++# biu_udmi_bus_option --- This specifies the protocol of the unified slave port.
++-biu_udmi_bus_option AXI
++
++# biu_udmi_bus_data_w --- This specifies the data width of the unified slave port.
++-biu_udmi_bus_data_w 64
++
++# biu_udmi_bus_axi_idw --- This speciries the AXI ID width of the unified slave port. This option is only valid when it's configured as AXI protocol.
++-biu_udmi_bus_axi_idw 16
++
++# biu_udmi_add_pipe_stage --- Place one more pipeline stage on unified slave bus bridge. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-biu_udmi_add_pipe_stage false
++
++# biu_ioc_bus_num --- This specifies the number of I/O coherency busses. NOTE: the bus protocol and data width of IOC port is specified by -biu_mem_bus_option
++-biu_ioc_bus_num 0
++
++# biu_xnn_ioc_bus_num --- This specifies the number of I/O coherency busses dedicated for ARC internal components, e.g., CNN2.0. NOTE: the bus protocol and data width of IOC port is specified by -biu_mem_bus_option
++-biu_xnn_ioc_bus_num 0
++
++# biu_xnn_ioc_bus0_client --- This names the interface instance so it can be connected to by a client using the same name.
++-biu_xnn_ioc_bus0_client ""
++
++# biu_xnn_ioc_bus1_client --- This names the interface instance so it can be connected to by a client using the same name.
++-biu_xnn_ioc_bus1_client ""
++
++# biu_xnn_ioc_bus2_client --- This names the interface instance so it can be connected to by a client using the same name.
++-biu_xnn_ioc_bus2_client ""
++
++# biu_xnn_ioc_bus3_client --- This names the interface instance so it can be connected to by a client using the same name.
++-biu_xnn_ioc_bus3_client ""
++
++# biu_ioc_add_pipe_stage --- Place one more pipeline stage on IOC bus bridge. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-biu_ioc_add_pipe_stage false
++
++# biu_ioc_bus_axi_idw --- This specifies the AXI ID width of the IOC bus. This option is only valid when the IOC port is configured as AXI protocol.
++-biu_ioc_bus_axi_idw 16
++
++
++######## CPUisle --- com.arc.hardware.HS.CPU_isle.1_0 ########
++
++# Create CPUisle
++-create com.arc.hardware.HS.CPU_isle.1_0 System.Cluster.CPUisle
++
++# unique_name --- verilog module modifier prefix
++-unique_name ""
++
++# ArcNum --- The processor number as read back in the ARCNUM field of the IDENTITY register.
++-arc_num 0
++
++# instances --- 
++# The number of instantiations of this core.
++# 
++-instances 1
++
++# CPUFloorplan --- Floorplan giving relative placement of the RAMs  for the given configuration of ARCv2HS or ARCv2EM in this CPUisle
++-cpu_floorplan HS36_base
++
++# userCPUFloorplanPath --- Pathname of user floorplan for the CPU when using a hierarchical implementation
++-usercpufloorplan_path ""
++
++# pinLocationConstraintsFile --- Pathname+filename of the physical pin location constraints file or just "side1" (all pins on l.h.s) or "side2" (pins on top only) or "side3" (pins on r.h.s. only) or "side4" (pins on bottom only) to get a template file generated
++-pin_location_constraints_file ""
++
++
++######## ARCv2HS --- com.arc.hardware.HS.ARCv2HS.1_0 ########
++
++# Create ARCv2HS
++-create com.arc.hardware.HS.ARCv2HS.1_0 System.Cluster.CPUisle.ARCv2HS
++
++# halt_on_reset --- This defines whether the core is halted initially on reset.
++-halt_on_reset true
++
++# atomic_option --- This option enables the LLOCK/SCOND (and LLOCKD/SCONDD if ll64_option) instructions
++-atomic_option false
++
++# div_rem_option --- The DIV/REM option adds non-blocking multi-cycle implementation of integer divide/remainder functions. Added instructions are DIV, DIVU (integer divide), REM and REMU (integer divide remainder).radix4_enhanced takes 3 to 19 cycles per operation.
++-div_rem_option radix4_enhanced
++
++# mpy_option --- The Multiplier ISA option allows selection between several multiplier configurations to tradeoff performance with silicon area. Cycle count for all multiply options is fixed:  4 clocks latency with sustained throughput of 1 clock per instruction, including back-to-back multiply-accumulate operations.
++# Note that some vector-add/sub operations are included with certain multiply options, in order to enhance performance of light DSP code.
++# <pre>
++# 
++# 
++#  option         Instructions
++#  ----------     -------------------------------
++#       
++#  none                       None 
++#  mpy                        MPYW/U, MPY/U, MPYH/U
++#  plus_dmpy      mpy       + DMACH, DMPYH, MAC, 
++#                             VADD2H,..
++#  plus_macd      plus_dmpy + MACD, MPYD, 
++#                             VMPY2H,...
++#  plus_qmacw     plus_macd + DMACWH, DMPYWH,
++#                             QMACH, QMPYH,
++#                             VADD2,...
++# </pre>
++# 
++-mpy_option plus_qmacw
++
++# stack_checking --- Stack checking is a mechanism for checking stack accesses and raising an exception when a stack overflow or underflow is detected.
++-stack_checking true
++
++# ll64_option --- This enables support for Load and Store instructions that transfer register pairs to/from memory.
++-ll64_option true
++
++# intvbase_preset --- This sets the upper 22 bits of the interrupt vector base configuration register, VECBASE_AC_BUILD.  On reset, that register is loaded into the interrupt vector base address register, INT_VECTOR_BASE.  Because this value is the upper 22 bits, the vector base is aligned to a 1K-byte boundary.
++-intvbase_preset 0x0
++
++# intvbase_ext --- Set this option to drive the upper 22 bits of the interrupt base vector externally, using signal intvbase_in.
++-intvbase_ext true
++
++# nmi_option --- Set this option to enable non-maskable interrupt. 
++-nmi_option false
++
++# rgf_num_regs --- This defines the size (in 32b registers) of the processor register file.
++-rgf_num_regs 32
++
++# rgf_num_banks --- two or more register banks are useful when Fast IRQ option is selected, but multiple banks may be selected even without Fast IRQ.
++-rgf_num_banks 2
++
++# infer_alu_adder --- infer: datapath is described as behavioral code: A + B
++# instantiate: datapath is instantiated as a detailed multi-stage code of a carry-lookahead adder.  It is generally preferable to use the infer option when using DesignWare library components and add directives for your target synthesizer.
++-infer_alu_adder instantiate
++
++# infer_mpy_wtree --- infer: datapath is described as behavioral code: A * B
++# instantiate: datapath is instantiated as a detailed multi-stage code of a Wallace Tree multiplier.   It is preferable  to use the instantiate option; the infer option is intended for simulation only.
++-infer_mpy_wtree instantiate
++
++# aux_volatile_base --- Sets the initial base memory region (inclusive) assignment for volatile system memory
++-aux_volatile_base 1
++
++# aux_volatile_limit --- Sets the initial upper limit (exclusive) memory region assignment for volatile system memory
++-aux_volatile_limit 0
++
++# aux_volatile_disable --- Sets the initial value of Disable Volatile Region bit (on reset)
++-aux_volatile_disable false
++
++# aux_volatile_strict_ordering --- Sets the initial value of Strict Ordering bit for the volatile region (on reset)
++-aux_volatile_strict_ordering true
++
++# scantest_ram_bypass_mux --- This mux is used to make logic trapped between flops and memory (aka shadow logic) to be covered by scantest without requiring advanced sequential ATPG on the memory to be applied. Will add delay to functional access time
++-scantest_ram_bypass_mux false
++
++# power_domains --- Add power domains and propagates power-gate control signals to the top level. Also generates UPF constraints and commands in the low-power scripts
++-power_domains false
++
++# isolate_has_cdc --- Add 2 flip-flop synchronization registers for isolation signals when they are crossed different clock domain
++-isolate_has_cdc false
++
++# pd1_clk_gate_ctrl --- provide an input port to gated/ungated PD1 domain clock
++-pd1_clk_gate_ctrl false
++
++# pwr_up_on_int --- Place interrupt and timer logic in core's always-on power domain to support wake-up on interrupt or timer expiry
++-pwr_up_on_int false
++
++# dvfs --- Add logics to allow dynamic controlling of voltage and frequency and propagates the associated control signals to the top level
++-dvfs false
++
++# clock_gating --- This enables the insertion of architectural clock gate elements in the design. By enabling this option, the clocks to various parts of the design will be disabled when the logic they drive is not in use to save power.
++-clock_gating true
++
++# cpu_top_add_ppb_dccm_dmi --- Add a pipeline stage for DCCM DMI. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_dccm_dmi true
++
++# cpu_top_add_ppb_lqwq_mem --- Add a pipeline stage for LQWQ MEM. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_lqwq_mem false
++
++# cpu_top_add_ppb_lqwq_per0 --- Add a pipeline stage for LQWQ PER0. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_lqwq_per0 false
++
++# cpu_top_add_ppb_lqwq_per1 --- Add a pipeline stage for LQWQ PER1. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_lqwq_per1 false
++
++# cpu_top_add_ppb_dcache_rf --- Add a pipeline stage for DCACHE RF. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_dcache_rf false
++
++# cpu_top_add_ppb_dcache_cb --- Add a pipeline stage for DCACHE CB. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_dcache_cb false
++
++# cpu_top_add_ppb_iccm0_dmi --- Add a pipeline stage for ICCM0 DMI. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_iccm0_dmi true
++
++# cpu_top_add_ppb_iccm1_dmi --- Add a pipeline stage for ICCM1 DMI. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_iccm1_dmi false
++
++# cpu_top_add_ppb_icache_rf --- Add a pipeline stage for ICACHE RF. This may be helpful for large clusters and hierarchical layout to assist timing closure at high frequency, but adds cycle latency.
++-cpu_top_add_ppb_icache_rf false
++
++# br_bc_entries --- The number of entries in the branch cache of the branch prediction unit. An entry can store information about 2 branch or jump instructions. More entries means that the branch predictor can keep track of more branch instructions at the same time.
++-br_bc_entries 512
++
++# br_pt_entries --- The number of 2-bit predictors in the branch prediction unit to predict the direction (taken or not taken) of conditional branches. The prediction algorithm is Gshare. More entries means more bits of global branch history can be tracked for more branch or jump instructions at the same time.
++-br_pt_entries 8192
++
++# br_rs_entries --- The number of entries in the return address stack of the branch prediction unit. For subroutine calls and returns the return address is predicted using this stack. More entries means deeper subroutine nesting levels can be predicted accurately.
++-br_rs_entries 4
++
++# br_bc_full_tag --- The size of the tag used in the branch cache of the branch prediction unit. A full size tag avoids aliasing of branches in the branch cache, but is more costly in hardware.
++-br_bc_full_tag true
++
++# br_bc_tag_size --- If a partial tag is used, this option sets the size of that tag. The chance of aliasing declines exponentially with the size of the tag and in a lot of applications a small tag works fine.
++-br_bc_tag_size 4
++
++# br_tosq_entries --- The Top-Of-Stack queue keeps track of subroutine calls and returns that are in progress at the same time in the processor. A small number saves hardware, a large number gives highest performance even when there are dense subroutine call and return patterns.
++-br_tosq_entries 5
++
++# br_fb_entries --- The size of the instruction buffer that stores instructions that have been fetched but not yet executed in the processor. A larger buffer allows better performance on complex branch and jump patterns at the expense of hardware.
++-br_fb_entries 2
++
++# lpb_num --- 0 indicates no loop buffer configured. This specifies the size of loop buffer.A larger buffer number allows better power saving on longer loop at the expense of hardwareFor instruction lp, lpcc, dbnz, access from loop buffer instead of icache, iccm, external bus and bpu.After detection of the loop, capture these instructions of the loop in the loop buffer.These instructions will be sent to fetch buffer
++-lpb_num 8
++
++# grad_entries --- Graduation entries track post-commit instructions awaiting result retirement. For example, long non-blocking instructions such as divide or certain deeply pipelined APEX instructions.
++-grad_entries 8
++
++# uaux_option --- Include a user auxiliary register interface
++-uaux_option true
++
++
++######## ARCHS_dual_issue --- com.arc.hardware.HS.ARCHS_dual_issue.1_0 ########
++
++# Create ARCHS_dual_issue
++-create com.arc.hardware.HS.ARCHS_dual_issue.1_0 System.Cluster.CPUisle.ARCv2HS.ARCHS_dual_issue
++
++######## Actionpoints --- com.arc.hardware.HS.Actionpoints.1_0 ########
++
++# Create Actionpoints
++-create com.arc.hardware.HS.Actionpoints.1_0 System.Cluster.CPUisle.ARCv2HS.Actionpoints
++
++# num_actionpoints --- This is the number of trigger events available.
++-num_actionpoints 8
++
++# aps_feature --- Selects Actionpoint feature set
++-aps_feature min
++
++
++######## DCCM --- com.arc.hardware.HS.DCCM.1_0 ########
++
++# Create DCCM
++-create com.arc.hardware.HS.DCCM.1_0 System.Cluster.CPUisle.ARCv2HS.DCCM
++
++# dccm_size --- This defines the size of the Data Closely Coupled Memory (DCCM) in bytes
++-dccm_size 32768
++
++# dccm_base --- Sets the initial memory region assignment for DCCM base address
++-dccm_base 8
++
++# dccm_dmi --- This enables external access through a DMI (direct memory interface) port.
++-dccm_dmi true
++
++# dccm_dmi_partial_ecc --- This enables the partial write support through a DMI (direct memory interface) port.
++-dccm_dmi_partial_ecc true
++
++# dccm_mem_cycles --- This defines the number of cycles dedicated to the each DCCM Memory bank.
++-dccm_mem_cycles 2
++
++# dccm_mem_posedge --- This option clocks the DCCM memory banks on the positive edge of the clock
++-dccm_mem_posedge true
++
++# dccm_mem_banks --- This option selects the number of DCCM memory banks
++-dccm_mem_banks 4
++
++# dccm_ecc_option --- This specifies error checking for on-chip DCCM rams.
++# SECDED means single-error correction and double-error detection.
++-dccm_ecc_option SECDED
++
++
++######## DMP Peripheral0 --- com.arc.hardware.HS.DMP_Peripheral0.1_0 ########
++
++# Create DMP Peripheral0
++-create com.arc.hardware.HS.DMP_Peripheral0.1_0 "System.Cluster.CPUisle.ARCv2HS.DMP Peripheral0"
++
++# per0_base --- Sets the base region assignment for DMP Peripheral region
++-per0_base 15
++
++# per0_limit --- Sets the end region assignment for DMP Peripheral region
++-per0_limit 0
++
++
++######## Data Cache --- com.arc.hardware.HS.Data_Cache.1_0 ########
++
++# Create Data Cache
++-create com.arc.hardware.HS.Data_Cache.1_0 "System.Cluster.CPUisle.ARCv2HS.Data Cache"
++
++# dc_size --- This defines the total size of the Data Cache in bytes.
++-dc_size 8192
++
++# dc_bsize --- This defines the cache line length in bytes.
++-dc_bsize 128
++
++# dc_bus_data_width --- This defines the cache bus width for refills and evictions.
++-dc_bus_data_width 128
++
++# dc_mem_cycles --- This defines the number of cycles dedicated to the Data Cache data memories.
++-dc_mem_cycles 2
++
++# dc_mem_posedge --- This option clocks the Data Cache memories on the positive edge of the clock
++-dc_mem_posedge true
++
++# dc_ecc_option --- This specifies error checking for DCACHE Tag, Data rams.
++# SECDED means single-error correction and double-error detection.
++-dc_ecc_option SECDED
++
++
++######## Debug Interface --- com.arc.hardware.HS.Debug_Interface.1_0 ########
++
++# Create Debug Interface
++-create com.arc.hardware.HS.Debug_Interface.1_0 "System.Cluster.CPUisle.ARCv2HS.Debug Interface"
++
++# dbg_en_option --- Adds an enable pin to the existing debug interface
++-dbg_en_option false
++
++# dbg_apb_option --- Adds an additional APB debug port alongside the BVCI one
++-dbg_apb_option true
++
++# dbg_apb_ratio --- Sets the clock ratio for the APB debug port to core clock
++-dbg_apb_ratio 1
++
++
++######## Floating-point unit --- com.arc.hardware.HS.Floating_point_unit.1_0 ########
++
++# Create Floating-point unit
++-create com.arc.hardware.HS.Floating_point_unit.1_0 "System.Cluster.CPUisle.ARCv2HS.Floating-point unit"
++
++# fpu_dp_option --- This enables double-precision floating point instructions.
++-fpu_dp_option true
++
++# fpu_div_option --- This enables divide & square-root instructions
++-fpu_div_option true
++
++# fpu_fma_option --- This enables the multiply & accumulate instructions.
++-fpu_fma_option true
++
++
++######## ICCM0 --- com.arc.hardware.HS.ICCM0.1_0 ########
++
++# Create ICCM0
++-create com.arc.hardware.HS.ICCM0.1_0 System.Cluster.CPUisle.ARCv2HS.ICCM0
++
++# iccm0_size --- This defines the size of ICCM0 in bytes.This ICCM has 0 wait states.
++-iccm0_size 131072
++
++# iccm0_base --- Sets the initial memory region assignment for ICCM0
++-iccm0_base 0
++
++# iccm0_dmi --- This enables external access through a DMI (direct memory interface) port.
++-iccm0_dmi true
++
++# iccm0_ecc_option --- This specifies error checking for on-chip ICCM0
++-iccm0_ecc_option SECDED
++
++
++######## Instruction Cache --- com.arc.hardware.HS.Instruction_Cache.1_0 ########
++
++# Create Instruction Cache
++-create com.arc.hardware.HS.Instruction_Cache.1_0 "System.Cluster.CPUisle.ARCv2HS.Instruction Cache"
++
++# ic_size --- This defines the total size of the instruction cache in bytes.
++-ic_size 16384
++
++# ic_ways --- This defines the number of cache ways
++-ic_ways 4
++
++# ic_bsize --- This defines the cache line length in bytes.
++-ic_bsize 128
++
++# ic_disable_on_reset --- The instruction cache may be enabled immediately after reset, depending on this option.  If this option is set to true, the instruction cache is disabled and instruction fetches bypass the cache, accessing system memory directly.
++-ic_disable_on_reset true
++
++# ic_pipeline_bus --- This option inserts a pipeline register on the instruction cache's refill bus from memory. This option can be used to ease timing in configurations where cores are not closely located with level-2 cache, for example.
++-ic_pipeline_bus true
++
++# ic_ecc_option --- This specifies error checking for ICACHE Tag, Data rams.
++# SECDED means single-error correction and double-error detection.
++-ic_ecc_option SECDED
++
++
++######## Interrupt Controller --- com.arc.hardware.HS.Interrupt_Controller.1_0 ########
++
++# Create Interrupt Controller
++-create com.arc.hardware.HS.Interrupt_Controller.1_0 "System.Cluster.CPUisle.ARCv2HS.Interrupt Controller"
++
++# number_of_interrupts --- This is the total number of interrupts available to the core.  Some interrupts are allocated statically to a specific interrupt line (for example, timer interrupts).  For more information on Interrupt and register-file options, see DesignWare ARCv2 ISA Programmers Reference Manual.
++-number_of_interrupts 184
++
++# number_of_levels --- Priority levels in the interrupt controller.
++-number_of_levels 4
++
++# external_interrupts --- This is the total number of interrupt pins available for external system components.  This parameter must be less than the total number of interrupts.
++-external_interrupts 181
++
++# firq_option --- This enables the fast-interrupts option, (priority level 0 interrupts), which uses an alternate register bank (if configured) instead of saving the context to memory.
++-firq_option true
++
++
++######## JTAG Interface --- com.arc.hardware.HS.JTAG_Interface.1_0 ########
++
++# Create JTAG Interface
++-create com.arc.hardware.HS.JTAG_Interface.1_0 "System.Cluster.CPUisle.ARCv2HS.JTAG Interface"
++
++######## Performance Monitor --- com.arc.hardware.HS.Performance_Monitor.1_0 ########
++
++# Create Performance Monitor
++-create com.arc.hardware.HS.Performance_Monitor.1_0 "System.Cluster.CPUisle.ARCv2HS.Performance Monitor"
++
++# pct_counters --- Number of counters for performance monitoring.
++-pct_counters 4
++
++# pct_interrupt --- When a counter overflows, an interrupt is generated.
++-pct_interrupt true
++
++
++######## Timer 0 --- com.arc.hardware.HS.Timer_0.1_0 ########
++
++# Create Timer 0
++-create com.arc.hardware.HS.Timer_0.1_0 "System.Cluster.CPUisle.ARCv2HS.Timer 0"
++
++# timer_0_int_level --- This sets the interrupt level (and implicitly the priority: level 0 is highest) of timer 0.
++-timer_0_int_level 0
++
++
++######## Timer 1 --- com.arc.hardware.HS.Timer_1.1_0 ########
++
++# Create Timer 1
++-create com.arc.hardware.HS.Timer_1.1_0 "System.Cluster.CPUisle.ARCv2HS.Timer 1"
++
++# timer_1_int_level --- This sets the interrupt level (and implicitly the priority: level 0 is highest) of timer 1.
++-timer_1_int_level 1
++
++
++######## Generic ASIC Library Data --- com.synopsys.GenericTechnologyLibrary.1_0 ########
++
++# Create Generic ASIC Library Data
++-create com.synopsys.GenericTechnologyLibrary.1_0 "System.Generic ASIC Library Data"
++
++# Geometry --- The desired ASIC geometry used for synthesis.
++-geometry 0.045
++
++# DontUseList --- List of synthesis library cells NOT to be used.
++-dont_use_list ""
++
++# DrivingCellName --- The name of the driving cell used to set the context for synthesis.
++-driving_cell_name SEN_BUF_8
++
++# DrivingCellPin --- The name of the ouput pin on the driving cell.
++-driving_cell_pin X
++
++# LoadPin --- The load pin of the driving cell.
++-load_pin A
++
++# TechLibPath --- The path to the synthesis technology library (i.e. where *.db files are located) 
++-tech_lib_path "/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/liberty/logic_synth /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npksdst/latest/liberty/logic_synth /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkspdt/latest/liberty/logic_synth"
++
++# TechCellFile --- The path and file name of the Verilog technology library cell file.
++-tech_cell_path "/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/verilog/3.0/ts40npkldst.v /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npksdst/latest/verilog/3.0/ts40npksdst.v /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkspdt/latest/verilog/3.0/ts40npkspdt.v"
++
++# TechCellLef --- A comma separated list of LEF files. The first file must contain the LEF technology information in addition to any macros defined. Subsequent files may contain additional macro definitions e.g. definitions of the standard cells.
++-tech_cell_lef /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/lef/5.6/ts40npkldst_m07f0f2_RDL.lef,/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/lef/5.6/ts40npkldst.lef,/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npksdst/latest/lef/5.6/ts40npksdst.lef,/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkspdt/latest/lef/5.6/ts40npkspdt.lef
++
++# SymbolLib --- The name of the file that contains the symbol library for synthesis.
++-symbol_lib ""
++
++# MaxLibFile --- The file name of the max synthesis library
++-max_lib_file "ts40npkldst_ss0p99v125c.db  ts40npksdst_ss0p99v125c.db   ts40npkspdt_ss0p99v125c.db ts40npkspdt_pg_ss0p99v125c.db ts40npkspdt_dlvl_ss0p99v125c.db ts40npkspdt_dlvl_ss0p99v125c_i1p08v.db ts40npkspdt_dlvl_ss0p99v125c_i1p1v.db ts40npkspdt_ulvl_ss0p99v125c.db ts40npkspdt_ulvl_ss0p99v125c_i0p66v.db ts40npkspdt_ulvl_ss0p99v125c_i0p81v.db ts40npkspdt_ulvl_ss0p99v125c_i0p88v.db"
++
++# MaxLibName --- The name of the max library used for synthesis.
++-max_lib_name "ts40npkldst_ss0p99v125c  ts40npksdst_ss0p99v125c  ts40npkspdt_ss0p99v125c ts40npkspdt_pg_ss0p99v125c ts40npkspdt_dlvl_ss0p99v125c ts40npkspdt_dlvl_ss0p99v125c_i1p08v ts40npkspdt_dlvl_ss0p99v125c_i1p1v ts40npkspdt_ulvl_ss0p99v125c ts40npkspdt_ulvl_ss0p99v125c_i0p66v ts40npkspdt_ulvl_ss0p99v125c_i0p81v ts40npkspdt_ulvl_ss0p99v125c_i0p88v"
++
++# MinLibFile --- The name of the file containing the min synthesis library.
++-min_lib_file "ts40npkldst_ff1p21vn40c.db  ts40npksdst_ff1p21vn40c.db  ts40npkspdt_ff1p21vn40c.db ts40npkspdt_pg_ff1p21vn40c.db ts40npkspdt_dlvl_ff1p21vn40c.db ts40npkspdt_dlvl_ff1p21vn40c_i1p26v.db ts40npkspdt_ulvl_ff1p21vn40c.db ts40npkspdt_ulvl_ff1p21vn40c_i0p99v.db"
++
++# MinLibName --- The name of the min synthesis library.
++-min_lib_name "ts40npkldst_ff1p21vn40c ts40npksdst_ff1p21vn40c  ts40npkspdt_ff1p21vn40c ts40npkspdt_pg_ff1p21vn40c ts40npkspdt_dlvl_ff1p21vn40c ts40npkspdt_dlvl_ff1p21vn40c_i1p26v ts40npkspdt_ulvl_ff1p21vn40c ts40npkspdt_ulvl_ff1p21vn40c_i0p99v"
++
++# TypLibFile --- The name of the file containing the typical synthesis library.
++-typ_lib_file "ts40npkldst_tt1p1v25c.db  ts40npksdst_tt1p1v25c.db ts40npkspdt_tt1p1v25c.db ts40npkspdt_pg_tt1p1v25c.db ts40npkspdt_dlvl_tt1p1v25c.db ts40npkspdt_ulvl_tt1p1v25c.db ts40npkspdt_ulvl_tt1p1v25c_i0p9v.db"
++
++# TypLibName --- The name of the typical synthesis library.
++-typ_lib_name "ts40npkldst_tt1p1v25c  ts40npksdst_tt1p1v25c ts40npkspdt_tt1p1v25c ts40npkspdt_pg_tt1p1v25c ts40npkspdt_dlvl_tt1p1v25c ts40npkspdt_ulvl_tt1p1v25c ts40npkspdt_ulvl_tt1p1v25c_i0p9v"
++
++# SynOperatingCon --- The synthesis operating conditions.
++-syn_operating_con SS0P99V125C
++
++# LibraryList --- List of library names used in this component. Order must be same as ,db model names
++-library_list "ts40npkldst  ts40npksdst ts40npkspdt ts40npkspdt_pg ts40npkspdt_dlvl ts40npkspdt_ulvl ts40npkspdt_ulvl"
++
++# PtSlowOpCons --- The operating conditions to be used for worst case static timing analysis
++-pt_slow_op_cons SS0P99V125C
++
++# PtFastOpCons --- The operating conditions to be used for best case static timing analysis.
++-pt_fast_op_cons FF1P21VN40C
++
++# PtTypicalOpCons --- The operating conditions to be used for typical case static timing analysis.
++-pt_typical_op_cons TT1P1V25C
++
++# PhysLibPath --- The path to the Synopsys physical synthesis libraries.
++-phys_lib_path ""
++
++# PhysLib --- The Synopsys physical synthesis library name.
++-phys_lib ""
++
++# DataBasePath --- The path and name of the 'map file' located at the top level of the DataBase containing the pre-compiled Vendor RAM models and wrapper files.
++-data_base_path arcrams_lib/map_file.txt
++
++# CapTable --- File containing lookup tables for fast estimation of parasitics in Cadence's FirstEncounter tool
++-cap_table ""
++
++# BufFootprint --- The names of the footprints in the library that represent buffers
++-buf_footprint SST_BUF
++
++# InvFootprint --- The names of the footprints in the library that represent inverters
++-inv_footprint SST_INV
++
++# DelFootprint --- The names of the footprints in the library that represent delay cells
++-del_footprint SST_DEL_L4
++
++# ClockGatingCell --- Name of clock gating cell to be used as architectural clock gate or as RTL-inferred ICG
++-clock_gating_cell CKLNQD8BWP240H11P57PDULVT
++
++# ClockNGatingCell --- Name of the negedge clock gating cell to be used as architectural clock gate or as RTL-inferred ICG
++-clockn_gating_cell CKLNQD8BWP240H11P57PDULVT
++
++# DecapCells --- list of decap cells for this library
++-decap_cells "SEL_DCAP64 SEL_DCAP32 SEL_DCAP16 SEL_DCAP8 SEL_DCAP4"
++
++# FillerCells --- list of filler cells for this library
++-filler_cells "SEL_FILL64 SEL_FILL32 SEL_FILL16 SEL_FILL12 SEL_FILL8 SEL_FILL6 SEL_FILL5  SEL_FILL4  SEL_FILL3 SEL_FILL2  SEL_FILL1"
++
++# AntDiodeCells --- list of antenna diode protection cells for this library
++-ant_diode_cells SEL_TIEDIN_1
++
++# MinWellTapDistance --- Minimum required distance between well-tap cells ( in microns ) 
++-min_nwell_tap_distance 110
++
++# NwellTapCell --- Name of nwell tap cell to be used
++-nwell_tap_cell SEL_TAPDS1T5
++
++# NwellAoTapCell --- Name of nwell always-on tap cell to be used
++-nwell_ao_tap_cell PEL_TAPPP
++
++# EndCapCellLeft --- Name of end cap cells to be used at left side of row
++-end_cap_cell_left SEL_CAPL8
++
++# EndCapCellRight --- Name of end cap cells to be used at right side of row
++-end_cap_cell_right SEL_CAPR8
++
++# EndCapCellTop --- Name of end cap cells to be used at top side of row
++-end_cap_cell_top ""
++
++# EndCapCellBottom --- Name of end cap cells to be used at bottom side of row
++-end_cap_cell_bottom ""
++
++# EndCapCellTopLeftOutside --- Name of end cap cells to be used at top left outside corner
++-end_cap_cell_top_left_outside ""
++
++# EndCapCellTopRightOutside --- Name of end cap cells to be used at top right outside corner
++-end_cap_cell_top_right_outside ""
++
++# EndCapCellBottomLeftOutside --- Name of end cap cells to be used at bottom left outside corner
++-end_cap_cell_bottom_left_outside ""
++
++# EndCapCellBottomRightOutside --- Name of end cap cells to be used at bottom right outside corner
++-end_cap_cell_bottom_right_outside ""
++
++# EndCapCellTopLeftInside --- Name of end cap cells to be used at top left inside corner
++-end_cap_cell_top_left_inside ""
++
++# EndCapCellTopRightInside --- Name of end cap cells to be used at top right inside corner
++-end_cap_cell_top_right_inside ""
++
++# EndCapCellBottomLeftInside --- Name of end cap cells to be used at bottom left inside corner
++-end_cap_cell_bottom_left_inside ""
++
++# EndCapCellBottomRightInside --- Name of end cap cells to be used at bottom right inside corner
++-end_cap_cell_bottom_right_inside ""
++
++# GdsLayerMapFile --- Name of file mapping layers names to GDS2 layer numbers
++-gds_layer_map_file ""
++
++# MetalFillDeck --- Name of file ICV/Hercules deck for doing metal fill on GDS2 view
++-metal_fill_deck ""
++
++# AntRuleDeck --- Name of file ICV/Hercules deck for doing Antenna rule checking
++-ant_rule_deck ""
++
++# DrcRuleDeck --- Name of file ICV/Hercules deck for doing DRC checking
++-drc_rule_deck ""
++
++# LvsRuleDeck --- Name of file ICV/Hercules deck for doing LVS checking
++-lvs_rule_deck ""
++
++# AntRuleFile --- Name of file TCL rule file for doing Antenna fixing
++-ant_rule_file /remote/arc/arc6000/libext/stdcell/28HPC/ts28_hpc_lvt_gate_30nm_hd_base/latest/milkyway/antenna/antenna_rule_db_update_m10f2f0f2_RDL.tcl
++
++# EmRuleFile --- Name of file ALF rule file for doing ElectoMigration Analysis
++-em_rule_file /remote/arc/arc6000/libext/stdcell/28HPC/ts28_hpc_lvt_gate_30nm_hd_base/latest/milkyway/alf/ts28nchllogl30hdl140f_m10f2f0f2_RDL.alf
++
++# DblViaOrderFile --- Name of file with foundry-preferred order of doubled vias when doing via doubling
++-dbl_via_order_file /remote/arc/arc6000/libext/stdcell/28HPC/ts28_hpc_lvt_gate_30nm_uhd_base/latest/demo/pnr/ICC/cmds/ts28.rvi.map
++
++# ClockBufferCells --- A list of buffers and inverters in the library that may be used in the construction of a clock tree
++-clock_buffers "SEL_BUF_S_2 SEL_BUF_S_4 SEL_BUF_S_6 SEL_BUF_S_8 SEL_BUF_S_12 SEL_INV_S_2 SEL_INV_S_4 SEL_INV_S_6 SEL_INV_S_8 SEL_INV_S_12"
++
++# ClockTransition --- The maximum transition time allowed on clock nets
++-clock_transition 0.3
++
++# QxTechnology --- Technology file for Cadence's 3D extraction engine, QX
++-qx_techfile /remote/arc/arc6000/libext/iclibs/TSMC45/PcC040LP_CRN45SHRINK_7M4X0Y2Z0UPDK/0.2/tools/cadence_ext/7.1.2/GXL/LP/GXL_LP_rcworst/qrcTechFile
++
++# QxLibrary --- The location of the QX library data
++-qx_library /remote/arc/arc6000/libext/iclibs/TSMC45/PcC045LP_CRN45_7M4X0Y2Z0UPDK/1.1.1/tools/cadence_anls/xtc
++
++# RAMWePolarity --- Defines the polarity of the write enable signals for all RAMs in the ARC700.
++-ram_we_polarity 0
++
++# RAMCkPolarity --- Defines the polarity of the clock enable signals for all RAMs in the ARC700.
++-ram_ck_polarity 0
++
++# MilkywayTechFile --- The path to the technology file for milkyway libraries.
++-mw_tech_file /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/tf/ts40npkldst_m10f2f2_RDL.tf
++
++# MilkywaySearchPath --- A comma separated list of directories to use when searching for milkyway libraries
++-mw_search_path "/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npksdst/latest/milkyway /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkspdt/latest/milkyway"
++
++# MilkywayCellLibraries --- A comma separated list of milkyway databases to be found on the search path
++-mw_cell_libs "/remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/ts40npkldst_m10f2f2_RDL  /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npksdst/latest/milkyway/ts40npksdst_m10f2f2_RDL /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkspdt/latest/milkyway/ts40npkspdt_m10f2f2_RDL"
++
++# MilkywayPowerNet --- The name of the power net needed by write_milkyway
++-mw_power_net VDD
++
++# MilkywayGroundNet --- The name of the ground net needed by write_milkyway
++-mw_ground_net VSS
++
++# TLUPlusMaxFile --- The TLU+ file which contains the parameters for max extraction
++-tluplus_max_file /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/tlup/tsmc_cln40lp_1p10m+alrdl_5x2y2z_cworst_1.1_1p1.tluplus
++
++# TLUPlusMinFile --- The TLU+ file which contains the parameters for min extraction
++-tluplus_min_file /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/tlup/tsmc_cln40lp_1p10m+alrdl_5x2y2z_cbest_1.1_1p1.nxtgrd
++
++# TLUMapFile --- The TLU+ map file to map layers names to the Milkyway layer names
++-tluplus_map_file /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/tlup/layers.map
++
++# max_NXTGRD --- The NXTGRD file is used for parasitic extraction with StarRC
++-max_nxtgrd /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/tlup/tsmc_cln40lp_1p10m+alrdl_5x2y2z_cworst_1.1_1p1.nxtgrd
++
++# min_NXTGRD --- The NXTGRD file is used for parasitic extraction with StarRC
++-min_nxtgrd /remote/arc/arc6000/libext/stdcell/40LP/HighDensity/ts40npkldst/latest/milkyway/tlup/tsmc_cln40lp_1p10m+alrdl_5x2y2z_cbest_1.1_1p1.nxtgrd
++
++# IcgCellCkPinName --- Name of clock input pin on integrated clock gating cell
++-icgcell_ck_pin_name CP
++
++# IcgCellQPinName --- Name of gated clock output pin on integrated clock gating cell
++-icgcell_q_pin_name Q
++
++# IcgCellFEPinName --- Name of the functional enable pin on integrated clock gating cell
++-icgcell_fe_pin_name E
++
++# IcgCellTEPinName --- Name of the test enable pin on integrated clock gating cell
++-icgcell_te_pin_name TE
++
++# SupplyVolt_wc --- Worst-case operating voltage
++-supply_volt_wc 0.99
++
++# SupplyVolt_bc --- Best-case operating voltage
++-supply_volt_bc 1.21
++
++# IsoCellClampHigh --- Name of isolation cell to be used as clamp high
++-iso_cell_clamp_high PEN_ISOS0CL1_*
++
++# IsoCellClampLow --- Name of isolation cell to be used as clamp low
++-iso_cell_clamp_low PEN_ISOS1CL0_*
++
++# PwrSwitchCell --- Name of power switch cell to be used
++-pwr_switch_cell PEN_PGATDRV_OW_12
++
++# PwrSwitchCellResWc --- Worst case power switch cell resistance
++-power_switch_cell_res_wc 233.4
++
++# PwrSwitchCellPinLayers --- Primary and secondary (=always on and gated) power pins and associated layer names
++-power_switch_cell_pin_layers "VDDP M2 VDDC M2"
++
++# SupplyVoltULP_wc --- Worst-case ultra low power operating voltage for std cell parts
++-supply_volt_ulp_wc 0.63
++
++# LSCellHigh2Low --- Level shifter cell from high to low voltage domain
++-ls_cell_high_2_low "PTQ_LVLDBUF_DP_* PTQ_LVLDBUF_D_*"
++
++# LSCellLow2High --- level shifter cell from low to high voltage domain
++-ls_cell_low_2_high "PTQ_LVLDBUF_PU_* PTQ_LVLDBUF_U_* PTQ_LVLDBUF_PY2_* PTQ_LVLDBUF_Y2_*"
++
++
++######## Implementation --- com.arc.hardware.implementation.1_0 ########
++
++# Create Implementation
++-create com.arc.hardware.implementation.1_0 System.Implementation
++
++# ClockSpeed --- Target clock speed of the system
++-clock_speed 200
++
++# ClockSkew --- The clock skew for the system
++-clock_skew 0.2
++
++# HoldMargin --- Margin for hold time checks
++-hold_margin 0.05
++
++# Floorplan --- Floorplan giving relative placement of the RAMs (or hard macro cpus for 2nd tier floorplan) for the given configuration
++-floorplan HS36_base
++
++# JTAGFrequency --- Select the frequency of the JTAG clock Tck (in MHz).
++# 
++# The JTAG clock speed has to be less than 1/2 of the cpu clock otherwise the signals on the BVCI interface are not guaranteed to be valid.
++# 
++# NOTE: The RTL simulations will work when the JTAG clock frequency is set to half the CPU clock, however this may not be the case when simulating at gate level due to delays on the IO pads.
++# 
++# The default is set to 10 MHz so that there is no conflict when simulating with an ARCangel3 at 30MHz. (30 > 10*2)
++# 
++# The speed of simulation can be greatly increased by using a faster JTAG clock, but a dependency will warn if it exceeds 1/2 of the cpu clock.
++# 
++-jtag_tclk 10
++
++# execution_trace_level --- 
++# This traces committed instructions as they execute, and gathers statistics
++# visible in the debugger for counting instructions & cycle delays.
++# At the "stats" level ony the statistics are gathered and no trace is printed.
++# "file" is equivalent to "full", but the results go to a trace .txt file instead.
++# 
++-execution_trace_level stats
++
++# zero_based_arcnum --- 
++# In a multicore build, number ARCs from 0.
++# If this is not selected, arcs are numbered from 1.
++# (This provides the initial value to the arcnum signal.)
++# 
++-zero_based_arcnum true
++
++# generate_ipxact --- 
++# Generate ipxact.xml file describing the CPUisle or archipelago frontier
++# 
++-generate_ipxact true
++
++# ipxact_relative_path_names --- 
++# Use relative path names for Verilog files in the ipxact.
++# Otherwise, absolute path names are used.
++# 
++-ipxact_relative_path_names true
++
++# optional_encryption --- 
++# When selected, encrypted RTL output is generated.
++# 	
++-optional_encryption false
++
++# ignore_encrypt_license --- 
++# When selected, pretend the encryption license is missing.  For testing.
++# 	
++-ignore_encrypt_license false
++
++# ignore_clear_license --- 
++# When selected, pretend the cleartest license is missing.  For testing.
++# 	
++-ignore_clear_license false
++
++
++######## SRAMCtrl --- com.arc.hardware.ARCv2MSS.SRAMCtrl.1_0 ########
++
++# Create SRAMCtrl
++-create com.arc.hardware.ARCv2MSS.SRAMCtrl.1_0 System.SRAMCtrl
++
++# alb_mss_mem_region_num --- The number of regions supported in SRAMCtrl component
++-alb_mss_mem_region_num 1
++
++# alb_mss_mem0_base_addr --- This specifies the base address of memory region 0 in the memory map, divided by 4KB i.e. do no specify the lower 12 bits of the address.
++-alb_mss_mem0_base_addr 0
++
++# alb_mss_mem0_size --- This specifies the memory size of memory region 0.
++-alb_mss_mem0_size 1MB
++
++# alb_mss_mem0_attr --- This specifies the memory access attribute of memory region 0.
++-alb_mss_mem0_attr Read-Write
++
++# alb_mss_mem0_secure --- This specifies the memory secure attribute of memory region 0.
++-alb_mss_mem0_secure Non-Secure
++
++# alb_mss_mem0_lat --- This specifies the maximum latency of memory region 0 .
++-alb_mss_mem0_lat 0
++
++# alb_mss_mem0_def_lat --- This specifies the latency after reset of memory region 0.
++-alb_mss_mem0_def_lat 0
++
++# alb_mss_mem1_base_addr --- This specifies the base address of memory region 1 in the memory map, divided by 4KB i.e. do no specify the lower 12 bits of the address.
++-alb_mss_mem1_base_addr 1048576
++
++# alb_mss_mem1_size --- This specifies the memory size of memory region 1.
++-alb_mss_mem1_size 1MB
++
++# alb_mss_mem1_attr --- This specifies the memory access attribute of memory region 1.
++-alb_mss_mem1_attr Read-Write
++
++# alb_mss_mem1_secure --- This specifies the memory secure attribute of memory region 1.
++-alb_mss_mem1_secure Non-Secure
++
++# alb_mss_mem1_lat --- This specifies the maximum latency of memory region 1 .
++-alb_mss_mem1_lat 0
++
++# alb_mss_mem1_def_lat --- This specifies the latency after reset of memory region 1.
++-alb_mss_mem1_def_lat 0
++
++# alb_mss_mem2_base_addr --- This specifies the base address of memory region 2 in the memory map, divided by 4KB i.e. do no specify the lower 12 bits of the address.
++-alb_mss_mem2_base_addr 1048576
++
++# alb_mss_mem2_size --- This specifies the memory size of memory region 2.
++-alb_mss_mem2_size 1MB
++
++# alb_mss_mem2_attr --- This specifies the memory access attribute of memory region 2.
++-alb_mss_mem2_attr Read-Write
++
++# alb_mss_mem2_secure --- This specifies the memory secure attribute of memory region 2.
++-alb_mss_mem2_secure Non-Secure
++
++# alb_mss_mem2_lat --- This specifies the maximum latency of memory region 2 .
++-alb_mss_mem2_lat 0
++
++# alb_mss_mem2_def_lat --- This specifies the latency after reset of memory region 2.
++-alb_mss_mem2_def_lat 0
++
++# alb_mss_mem3_base_addr --- This specifies the base address of memory region 3 in the memory map, divided by 4KB i.e. do no specify the lower 12 bits of the address.
++-alb_mss_mem3_base_addr 1048576
++
++# alb_mss_mem3_size --- This specifies the memory size of memory region 3.
++-alb_mss_mem3_size 1MB
++
++# alb_mss_mem3_attr --- This specifies the memory access attribute of memory region 3.
++-alb_mss_mem3_attr Read-Write
++
++# alb_mss_mem3_secure --- This specifies the memory secure attribute of memory region 3.
++-alb_mss_mem3_secure Non-Secure
++
++# alb_mss_mem3_lat --- This specifies the maximum latency of memory region 3 .
++-alb_mss_mem3_lat 0
++
++# alb_mss_mem3_def_lat --- This specifies the latency after reset of memory region 3.
++-alb_mss_mem3_def_lat 0
++
++# alb_mss_mem_is_default_slave --- If true then all transactions without destination will be routed here.
++-alb_mss_mem_is_default_slave true
++
++# alb_mss_mem_default_space --- This specifies the memory space width of the system.
++-alb_mss_mem_default_space 32
++
++# alb_mss_mem_data_width --- This specifies the memory data width
++-alb_mss_mem_data_width 64
++
++
++######## Synopsys Gate Level Simulation --- com.synopsys.GateLevelSimulation.1_0 ########
++
++# Create Synopsys Gate Level Simulation
++-create com.synopsys.GateLevelSimulation.1_0 "System.Synopsys Gate Level Simulation"
++
++# VCSGateLevelSimulation --- Specify the use of VCS for gate level simulation
++-vcs_gate_level_simulation true
++
++
++######## Synopsys ICC2 Physical Flow --- com.synopsys.PhysicalFlowICC2.1_0 ########
++
++# Create Synopsys ICC2 Physical Flow
++-create com.synopsys.PhysicalFlowICC2.1_0 "System.Synopsys ICC2 Physical Flow"
++
++# SynopsysPhysicalICC2 --- Add the Synopsys ICC2 Physical Full Design Flow component
++-synopsys_physical_icc2 true
++
++# IntelMCCSpecific --- When true allows some Intel-MCC specific changes to scripts to be built
++-intel_mcc_specific false
++
++# ScanChainsReorder --- Instruct the design flow to automatically reorder the scan chain structures.
++-scan_reorder true
++
++# userFloorplanPath --- Pathname of user floorplan
++-userfloorplan_path ""
++
++# toplevelpinLocationConstraintsFile --- Pathname+filename of the physical pin location constraints file for top-level design
++-toplevel_pin_location_constraints_file ""
++
++# MetalFill --- Metal fill step
++# NONE
++# ICC
++# ICV
++-metal_fill NONE
++
++# CreateGDS --- Enable GDS streamout
++-create_gds false
++
++# AdvancedNode --- Enable Advanced Node routing optimizations
++-advanced_node false
++
++# TwoPassFlow --- Two-pass Flow
++-two_pass_flow false
++
++# Qor --- Qor Flow vs TTR Flow
++-qor true
++
++# OCVMargin --- OCV Margin (as percentage ratio, default 10%)
++-ocv_margin 0.1
++
++
++######## Synopsys Power Analysis --- com.synopsys.PowerAnalysis.1_0 ########
++
++# Create Synopsys Power Analysis
++-create com.synopsys.PowerAnalysis.1_0 "System.Synopsys Power Analysis"
++
++# DcPowerAnalysis --- Command line option to enable power analysis in DC
++-synopsys_power_analysis true
++
++
++######## Synopsys STA Flow --- com.synopsys.SynopsysSTAFlow.1_0 ########
++
++# Create Synopsys STA Flow
++-create com.synopsys.SynopsysSTAFlow.1_0 "System.Synopsys STA Flow"
++
++# SynopsysSTA --- Add the Synopsys Static Timing Analysis Design Flow component
++-synopsys_sta true
++
++# ParasiticFormat --- Parasitics format
++# GPD
++# SDF
++# SPF
++# SPEF
++-parasitic_format GPD
++
++# ECO --- ECO mode
++# none
++# logical
++# physical
++-eco none
++
++
++######## Synopsys StarRC Flow --- com.synopsys.SynopsysStarRCFlow.1_0 ########
++
++# Create Synopsys StarRC Flow
++-create com.synopsys.SynopsysStarRCFlow.1_0 "System.Synopsys StarRC Flow"
++
++# SynopsysStarRC --- Add the Synopsys StarRC Parasitic Extraction Design Flow component
++-synopsys_starrc true
++
++# MetalFill --- Metal fill step
++# NONE
++# FLOATING
++# GROUNDED
++-metal_fill NONE
++
++# OutputFormat --- Parasitics output format
++# GPD
++# SPF
++# SPEF
++-output_format GPD
++
++# AdvancedNode --- Enable higher accuracy for 28nm and smaller
++-advanced_node true
++
++# DoublePatterning --- Enable double patterning
++-double_patterning false
++
++# CoupleToGround --- Transform coupling capacitance to capacitance to ground
++-couple_to_ground false
++
++
++######## Synopsys XG Formal Verification Flow --- com.synopsys.FormalVerification_XG.1_0 ########
++
++# Create Synopsys XG Formal Verification Flow
++-create com.synopsys.FormalVerification_XG.1_0 "System.Synopsys XG Formal Verification Flow"
++
++# SynopsysFormal --- Use this option to generate the scripts necessary to run formal verification in Formality
++-synopsys_xg_formal true
++
++# IntelMCCSpecific --- When true allows some Intel-MCC specific changes to scripts to be built
++-intel_mcc_specific false
++
++
++######## Synopsys XG Synthesis Flow --- com.synopsys.SynthesisFlow_XG.1_0 ########
++
++# Create Synopsys XG Synthesis Flow
++-create com.synopsys.SynthesisFlow_XG.1_0 "System.Synopsys XG Synthesis Flow"
++
++# synopsysSynthesisFlow --- Add the synopsys SynthesisFlow component
++-synopsys_xg_synthesis true
++
++# Retiming --- Instruct the design flow to retime modules as specified in retime_module_list
++-enable_retiming false
++
++# RetimeModuleList --- List of modules to be retimed
++-retime_module_list ""
++
++# InsertScanChains --- Instruct the design flow to automatically add in the scan chain structures.
++-insert_scan_chains true
++
++# ScanChains --- Indicates the number of scan chains to be used when stitching the scan registers;
++# 	This option replaces the obsolete ScanChains option in implementation/System component.
++-scan_chains 4
++
++# InsertLogicBist --- Instruct the design flow to automatically add in the logic BIST structures.
++-insert_logic_bist false
++
++# LogicBistChains --- Indicates the number of logic BIST chains to be used when inserting Logic BIST
++-logic_bist_chains 96
++
++# PatternCounterWidth --- Indicates the width of logic BIST pattern counter
++-pattern_counter_width 16
++
++# InsertTestPoints --- Instruct the design flow to automatically add test points when inserting DfT structures.
++-insert_test_points false
++
++# PowerRampUp --- Specifies whether to run power ramp-up patterns prior to self-test.
++-power_ramp_up false
++
++# TestPointMethod --- Test Point Method
++# DesignCompiler
++# SpyGlassADV
++-test_point_method DesignCompiler
++
++# AutoUngroup --- Instruct the synthesis compile step to enable auto-ungrouping
++-auto_ungroup false
++
++# InsertClockGating --- When set this will cause Clock Gating Logic to be inserted during synthesis.
++-insert_clock_gating true
++
++# UPF --- When set this will cause UPF flow (isolation cell insertion) to be configured during synthesis.
++-upf false
++
++# DcUltra --- Enables Ultra optimization during synthesis.
++-dc_ultra true
++
++# MBFF --- Enables Targeting of multibit flops assuming library has them. Can cause performance drop but may give area/power saving
++-mbff false
++
++# DCTopographicMode --- Use DC Topographic mode for placement aware synthesis.
++-dc_topographic true
++
++# Hierarchical --- Enables hierarchical implementation flow.
++-hierarchical false
++
++
++######## SynopsysEmbeditIntegratorFlow --- com.synopsys.SynopsysEmbeditIntegratorFlow.1_0 ########
++
++# Create SynopsysEmbeditIntegratorFlow
++-create com.synopsys.SynopsysEmbeditIntegratorFlow.1_0 System.SynopsysEmbeditIntegratorFlow
++
++# SynopsysEmbeditIntegratorFlow --- Add the Synopsys Embedit Integrator Flow Component
++-seif true
++
++# OptimizationStrategy --- area : smallest memory instances, performance : fastest instances
++-optimization_strategy performance
++
++# OptimizationStrategyScope --- global: all memories get selected based on criteria specified in Optimization Strategy option, per_memory: criteria is specified per memory
++-optimization_strategy_scope global
++
++# io_i3c0CompilerPath --- Path to the io_i3c0 Memory Compiler (EM, DFSS family
++-io_i3c0_compiler_path ""
++
++# io_i3c0OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c0_optimization_strategy performance
++
++# io_i3c0HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c0_hand_picked_instance ""
++
++# io_i3c1CompilerPath --- Path to the io_i3c1 Memory Compiler (EM, DFSS family
++-io_i3c1_compiler_path ""
++
++# io_i3c1OptimizationStrategy --- area : smallest memory instances, performance : fastest instances : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c1_optimization_strategy performance
++
++# io_i3c1HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c1_hand_picked_instance ""
++
++# io_i3c2CompilerPath --- Path to the io_i3c2 Memory Compiler (EM, DFSS family
++-io_i3c2_compiler_path ""
++
++# io_i3c2OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c2_optimization_strategy performance
++
++# io_i3c2HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c2_hand_picked_instance ""
++
++# io_i3c3CompilerPath --- Path to the io_i3c3 Memory Compiler (EM, DFSS family
++-io_i3c3_compiler_path ""
++
++# io_i3c3OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c3_optimization_strategy performance
++
++# io_i3c3HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-io_i3c3_hand_picked_instance ""
++
++# dss_semc_aicCompilerPath --- Path to the dss_semc_aic (Secure External Memory Controller Authenticated I$ Memory Compiler (EM, DSS family
++-dss_semc_aic_compiler_path ""
++
++# dss_semc_aicOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dss_semc_aic_optimization_strategy performance
++
++# dss_semc_aicHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dss_semc_aic_hand_picked_instance ""
++
++# dss_semc_adcCompilerPath --- Path to the dss_semc_adc (Secure External Memory Controller Authenticated D$ Memory Compiler (EM, DSS family
++-dss_semc_adc_compiler_path ""
++
++# dss_semc_adcOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dss_semc_adc_optimization_strategy performance
++
++# dss_semc_adcHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dss_semc_adc_hand_picked_instance ""
++
++# dss_semc_adc_elp_adc_lseqCompilerPath --- Path to the dss_semc_adc_elp_adc_lseq (Secure External Memory Controller Authenticated D$ Memory Compiler (EM, DSS family
++-dss_semc_adc_elp_adc_lseq_compiler_path ""
++
++# dss_semc_adc_elp_adc_lseqOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dss_semc_adc_elp_adc_lseq_optimization_strategy performance
++
++# dss_semc_adc_elp_adc_lseqHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dss_semc_adc_elp_adc_lseq_hand_picked_instance ""
++
++# ICCMCompilerPath --- Path to the ICCM Memory Compiler (EM, ARC600, ARC700 family
++-iccm_compiler_path ""
++
++# ICCMOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-iccm_optimization_strategy performance
++
++# ICCMHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-iccm_hand_picked_instance ""
++
++# ICCM0CompilerPath --- Path to the ICCM0 Memory Compiler (HS family)
++-iccm0_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# ICCM0OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-iccm0_optimization_strategy performance
++
++# ICCM0HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-iccm0_hand_picked_instance ""
++
++# ICCM1CompilerPath --- Path to the ICCM1 Memory Compiler (EM and HS family)
++-iccm1_compiler_path ""
++
++# ICCM1OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-iccm1_optimization_strategy performance
++
++# ICCM1HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-iccm1_hand_picked_instance ""
++
++# DCCMCompilerPath --- Path to the DCCM Memory Compiler (EM, HS, ARC600, ARC700 family)
++-dccm_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# DCCMOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dccm_optimization_strategy performance
++
++# DCCMHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dccm_hand_picked_instance ""
++
++# XYCCMCompilerPath --- Path to the XYCCM Memory Compiler (EM core family only)
++-xyccm_compiler_path ""
++
++# XYCCMOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-xyccm_optimization_strategy performance
++
++# XYCCMHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-xyccm_hand_picked_instance ""
++
++# ICacheTagCompilerPath --- Path to the ICacheTag Memory Compiler (EM, HS, ARC600, ARC700 family) 
++-icache_tag_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# ICacheTagOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-icache_tag_optimization_strategy performance
++
++# ICacheTagHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-icache_tag_hand_picked_instance ""
++
++# DCacheTagCompilerPath --- Path to the DCacheTag Memory Compiler (EM, HS, ARC600, ARC700 family)
++-dcache_tag_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# DCacheTagOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_tag_optimization_strategy performance
++
++# DCacheTagHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_tag_hand_picked_instance ""
++
++# ICacheDataCompilerPath --- Path to the ICacheData Memory Compiler  (EM, HS, ARC600, ARC700 family)
++-icache_data_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# ICacheDataOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-icache_data_optimization_strategy performance
++
++# ICacheDataHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-icache_data_hand_picked_instance ""
++
++# DCacheDataCompilerPath --- Path to the DCacheData Memory Compiler  (EM, HS, ARC600, ARC700 family)
++-dcache_data_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# DCacheDataOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_data_optimization_strategy performance
++
++# DCacheDataHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_data_hand_picked_instance ""
++
++# DCacheCoherencyCompilerPath --- Path to the DCacheCoherency Memory Compiler(HS family only) 
++-dcache_coherency_compiler_path ""
++
++# DCacheCoherencyOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_coherency_optimization_strategy performance
++
++# DCacheCoherencyHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_coherency_hand_picked_instance ""
++
++# SmartCompilerPath --- Path to the Smart Memory Compiler  (EM, HS, ARC600, ARC700 family)
++-smart_compiler_path ""
++
++# SmartOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-smart_optimization_strategy performance
++
++# SmartHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-smart_hand_picked_instance ""
++
++# VecMemCompilerPath --- Path to the HS  Vector Unit  RAM Memory Compiler(HS family only)
++-vec_mem_compiler_path ""
++
++# VecMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-vec_mem_optimization_strategy performance
++
++# VecMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-vec_mem_hand_picked_instance ""
++
++# CNNDataRamCompilerPath --- Path to the CNN data ram Memory Compiler (CNN only)
++-cnn_data_compiler_path ""
++
++# CNNDataRamOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn_data_optimization_strategy performance
++
++# CNNDataRamHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn_data_hand_picked_instance ""
++
++# CNNProgRamCompilerPath --- Path to the CNN program ram Memory Compiler (CNN only)
++-cnn_prog_compiler_path ""
++
++# CNNProgRamOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn_prog_optimization_strategy performance
++
++# CNNProgRamHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn_prog_hand_picked_instance ""
++
++# CNN2ProgRamCCompilerPath --- Path to the CNN2 program ram (in TNNc) Memory Compiler (CNN2 only)
++-cnn2_prog_c_compiler_path ""
++
++# CNN2ProgRamCOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_prog_c_optimization_strategy performance
++
++# CNN2ProgCRamHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_prog_c_hand_picked_instance ""
++
++# CNN2DataRamCCompilerPath --- Path to the CNN2 data ram (in TNNc)  Memory Compiler (CNN2 only)
++-cnn2_data_c_compiler_path ""
++
++# CNN2DataRamCOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_data_c_optimization_strategy performance
++
++# CNN2DataRamCHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_data_c_hand_picked_instance ""
++
++# CNN2BlkAccCCompilerPath --- Path to the CNN2  Block accumulator memory (in TNNc)  2-port Memory Compiler (CNN2 only)
++-cnn2_blk_acc_c_compiler_path ""
++
++# CNN2BlkAccCOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_blk_acc_c_optimization_strategy performance
++
++# CNN2BlkAccCHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph42p11sadul01ms01_64x128_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_blk_acc_c_hand_picked_instance ""
++
++# CNN2ProgRamVCompilerPath --- Path to the CNN2 program ram (in TNNv) Memory Compiler (CNN2 only)
++-cnn2_prog_v_compiler_path ""
++
++# CNN2ProgRamVOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_prog_v_optimization_strategy performance
++
++# CNN2ProgVRamHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_prog_v_hand_picked_instance ""
++
++# CNN2DataRamVCompilerPath --- Path to the CNN2 data ram (in TNNv)  Memory Compiler (CNN2 only)
++-cnn2_data_v_compiler_path ""
++
++# CNN2DataRamVOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_data_v_optimization_strategy performance
++
++# CNN2DataRamVHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_data_v_hand_picked_instance ""
++
++# CNN2MemArmCompilerPath --- Path to the CNN2  AXI2AXI reordering memory (in TNNv)  2-port Memory Compiler (CNN2 only)
++-cnn2_mem_arm_compiler_path ""
++
++# CNN2MemArmOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_mem_arm_optimization_strategy performance
++
++# CNN2MemArmHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph42p11sadul01ms01_256x256_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_mem_arm_hand_picked_instance ""
++
++# CNN2MemAccVCompilerPath --- Path to the CNN2  accumulator memory (in TNNv)  2-port Memory Compiler (CNN2 only)
++-cnn2_mem_acc_v_compiler_path ""
++
++# CNN2MemAccVOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_mem_acc_v_optimization_strategy performance
++
++# CNN2MemAccVHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph42p11sadul01ms01_256x256_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_mem_acc_v_hand_picked_instance ""
++
++# CNN3VecBankCompilerPath --- Path to the CNN3 Vector Bank  Memory Compiler (CNN3 only)
++-cnn3_vec_bank_compiler_path ""
++
++# CNN3VecBankOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn3_vec_bank_optimization_strategy performance
++
++# CNN3VecBankHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn3_vec_bank_hand_picked_instance ""
++
++# CNN2VecBankCompilerPath --- Path to the CNN2 Vector Bank  Memory Compiler (CNN2 only)
++-cnn2_vec_bank_compiler_path ""
++
++# CNN2VecBankOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_vec_bank_optimization_strategy performance
++
++# CNN2VecBankHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_vec_bank_hand_picked_instance ""
++
++# CNN2WeightBankCompilerPath --- Path to the CNN2 Weight Bank  Memory Compiler (CNN2 only)
++-cnn2_weight_bank_compiler_path ""
++
++# CNN2WeightBankOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_weight_bank_optimization_strategy performance
++
++# CNN2WeightBankHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-cnn2_weight_bank_hand_picked_instance ""
++
++# MCIPMsgCompilerPath --- Path to the ARConnect msg ram Memory Compiler (ARConnect only)
++-mcip_msg_compiler_path ""
++
++# MCIPMsgOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-mcip_msg_optimization_strategy performance
++
++# MCIPMsgHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-mcip_msg_hand_picked_instance ""
++
++# LlmCompilerPath --- Path to the Cluster Shared Memory  Compiler (aka LLM) 
++-llm_compiler_path ""
++
++# LlmOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-llm_optimization_strategy performance
++
++# LlmHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-llm_hand_picked_instance ""
++
++# LlmP0CompilerPath --- Path to the Cluster Shared Memory  Compiler for Partition0 (aka LLM) 
++-llm_partition0_compiler_path ""
++
++# LlmP0OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-llm_partition0_optimization_strategy performance
++
++# LlmP0HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-llm_partition0_hand_picked_instance ""
++
++# LlmP1CompilerPath --- Path to the Cluster Shared Memory  Compiler for Partition1 (aka LLM) 
++-llm_partition1_compiler_path ""
++
++# LlmP1OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-llm_partition1_optimization_strategy performance
++
++# LlmP1HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-llm_partition1_hand_picked_instance ""
++
++# XYMemCompilerPath --- Path to the XY Memory Compiler (ARC600 family only)
++-xymem_compiler_path ""
++
++# XYMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-xymem_optimization_strategy performance
++
++# XYMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-xymem_hand_picked_instance ""
++
++# RegisterFileCompilerPath --- Path to the RegisterFile Compiler (EM, ARC600, ARC700 family)
++-regfile_compiler_path ""
++
++# RegisterFileOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-regfile_optimization_strategy performance
++
++# RegisterFileHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-regfile_hand_picked_instance ""
++
++# MMUCompilerPath --- Path to the MMU Memory Compiler (ARC700 and HS family)
++-mmu_compiler_path ""
++
++# MMUOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-mmu_optimization_strategy performance
++
++# MMUHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-mmu_hand_picked_instance ""
++
++# DCacheDirtyCompilerPath --- Path to the DCacheDirty Memory Compiler (ARC700 family only) 
++-dcache_dirty_compiler_path ""
++
++# DCacheDirtyOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_dirty_optimization_strategy performance
++
++# DCacheDirtyHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dcache_dirty_hand_picked_instance ""
++
++# BPUBTACCompilerPath --- Path to the BPU BTAC Memory Compiler  (ARC700 family only) 
++-bpubtac_compiler_path ""
++
++# BPUBTACOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-bpubtac_optimization_strategy performance
++
++# BPUBTACHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-bpubtac_hand_picked_instance ""
++
++# BranchCacheCompilerPath --- Path to the Branch Cache Memory Compiler  (HS family only) 
++-branch_cache_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# BranchCacheOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-branch_cache_optimization_strategy performance
++
++# BranchCacheHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-branch_cache_hand_picked_instance ""
++
++# PredictionTableCompilerPath --- Path to the Prediction Table Memory Compiler (HS family only)
++-prediction_table_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# PredictionTableOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-prediction_table_optimization_strategy performance
++
++# PredictionTableHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-prediction_table_hand_picked_instance ""
++
++# WriteBufferMemCompilerPath --- Path to the Write Buffer Mem Memory Compiler (HS family only)
++-wb_mem_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# WriteBufferMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-wb_mem_optimization_strategy performance
++
++# WriteBufferMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-wb_mem_hand_picked_instance ""
++
++# CdmaDescriptorCompilerPath --- Path to the Cluster DMA  Descriptor Memory Compiler (HS family only)
++-dma_descr_compiler_path ""
++
++# CdmaDescriptorOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dma_descr_optimization_strategy performance
++
++# CdmaDescriptorHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dma_descr_hand_picked_instance ""
++
++# CdmaBufferCompilerPath --- Path to the Cluster DMA  Data Buffer 2-port Memory Compiler (HS family only)
++-dma_buf_compiler_path ""
++
++# CdmaBufferOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dma_buf_optimization_strategy performance
++
++# CdmaBufferHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-dma_buf_hand_picked_instance ""
++
++# WriteBufferPer0CompilerPath --- Path to the Write Buffer Per0 Memory Compiler (HS family only)
++-wb_per0_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# WriteBufferPer0OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-wb_per0_optimization_strategy performance
++
++# WriteBufferPer0HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-wb_per0_hand_picked_instance ""
++
++# WriteBufferPer1CompilerPath --- Path to the Write Buffer Per1 Memory Compiler (HS family only)
++-wb_per1_compiler_path /technology/N7/ips/mem-comps/synopsys/latest/ts07n0g41p11sadcl02ms+
++
++# WriteBufferPer1OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-wb_per1_optimization_strategy performance
++
++# WriteBufferPer1HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-wb_per1_hand_picked_instance ""
++
++# MEPixelCacheCompilerPath --- Path to the ME Pixel Cache Memory Compiler  (ARC700 family only)
++-mepixelcache_compiler_path ""
++
++# MEPixelCacheOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-mepixelcache_optimization_strategy performance
++
++# MEPixelCacheHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-mepixelcache_hand_picked_instance ""
++
++# SIMDCodeMemCompilerPath --- Path to the SIMD Code Memory Compiler  (ARC700 family only)
++-simdcodemem_compiler_path ""
++
++# SIMDCodeMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-simdcodemem_optimization_strategy performance
++
++# SIMDCodeMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-simdcodemem_hand_picked_instance ""
++
++# SIMDCodeQueueCompilerPath --- Path to the SIMD Code Queue Memory Compiler  (ARC700 family only)
++-simdcodequeue_compiler_path ""
++
++# SIMDCodeQueueOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-simdcodequeue_optimization_strategy performance
++
++# SIMDCodeQueueHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-simdcodequeue_hand_picked_instance ""
++
++# SIMDMemCompilerPath --- Path to the SIMD Memory Compiler  (ARC700 family only)
++-simdmem_compiler_path ""
++
++# SIMDMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-simdmem_optimization_strategy performance
++
++# SIMDMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-simdmem_hand_picked_instance ""
++
++# RTTIntMemCompilerPath --- Path to the RTT intmem Memory Compiler
++-rtt_int_mem_compiler_path ""
++
++# RTTIntMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_int_mem_optimization_strategy performance
++
++# RTTIntMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_int_mem_hand_picked_instance ""
++
++# RTTDSMCompilerPath --- Path to the RTT DSM Source Buffer Memory Compiler
++-rtt_dsm_sbuf_compiler_path ""
++
++# RTTDSMOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dsm_sbuf_optimization_strategy performance
++
++# RTTDSMHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dsm_sbuf_hand_picked_instance ""
++
++# RTTPCMMemCompilerPath --- Path to the RTT PCM Source Buffer Memory Compiler
++-rtt_pcm_sbuf_compiler_path ""
++
++# RTTPCMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pcm_sbuf_optimization_strategy performance
++
++# RTTPCMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pcm_sbuf_hand_picked_instance ""
++
++# RTTPTCMMemCompilerPath --- Path to the RTT PTCM Source Buffer Memory Compiler
++-rtt_ptcm_buf_compiler_path ""
++
++# RTTPTCMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptcm_sbuf_optimization_strategy performance
++
++# RTTPTCMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptcm_sbuf_hand_picked_instance ""
++
++# RTTPTMMemCompilerPath --- Path to the RTT PTM Source Buffer Memory Compiler
++-rtt_ptm_sbuf_compiler_path ""
++
++# RTTPTMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptm_sbuf_optimization_strategy performance
++
++# RTTPTMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptm_sbuf_hand_picked_instance ""
++
++# RTTDTMMemCompilerPath --- Path to the RTT DTM Source Buffer Memory Compiler
++-rtt_dtm_sbuf_compiler_path ""
++
++# RTTDTMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dtm_sbuf_optimization_strategy performance
++
++# RTTDTMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dtm_sbuf_hand_picked_instance ""
++
++# RTTCRMMemCompilerPath --- Path to the RTT CRM Source Buffer Memory Compiler
++-rtt_crm_sbuf_compiler_path ""
++
++# RTTCRMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_crm_sbuf_optimization_strategy performance
++
++# RTTCRMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_crm_sbuf_hand_picked_instance ""
++
++# RTTAUXMMemCompilerPath --- Path to the RTT AUXM Source Buffer Memory Compiler
++-rtt_auxm_sbuf_compiler_path ""
++
++# RTTAUXMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_auxm_sbuf_optimization_strategy performance
++
++# RTTAUXMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_auxm_sbuf_hand_picked_instance ""
++
++# RTTERRMMemCompilerPath --- Path to the RTT ERRM Source Buffer Memory Compiler
++-rtt_errm_sbuf_compiler_path ""
++
++# RTTERRMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_errm_sbuf_optimization_strategy performance
++
++# RTTERRMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_errm_sbuf_hand_picked_instance ""
++
++# RTTOTMMemCompilerPath --- Path to the RTT OTM Source Buffer Memory Compiler
++-rtt_otm_sbuf_compiler_path ""
++
++# RTTOTMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_otm_sbuf_optimization_strategy performance
++
++# RTTOTMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_otm_sbuf_hand_picked_instance ""
++
++# RTTRFMMemCompilerPath --- Path to the RTT RFM Source Buffer Memory Compiler
++-rtt_rfm_sbuf_compiler_path ""
++
++# RTTRFMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_rfm_sbuf_optimization_strategy performance
++
++# RTTRFMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_rfm_sbuf_hand_picked_instance ""
++
++# RTTPBUFMemCompilerPath --- Path to the RTT PBUF Memory Compiler
++-rtt_pbuf_compiler_path ""
++
++# RTTPBUFMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pbuf_optimization_strategy performance
++
++# RTTPBUFMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pbuf_hand_picked_instance ""
++
++# RTTWPMMemCompilerPath --- Path to the RTT WPM Source Buffer Memory Compiler
++-rtt_wpm_sbuf_compiler_path ""
++
++# RTTWPMMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pbuf_sbuf_optimization_strategy performance
++
++# RTTWPMMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_wpm_sbuf_hand_picked_instance ""
++
++# RTTWDATAMemCompilerPath --- Path to the RTT Bus Master Buffer Memory Compiler
++-rtt_bus_master_buf_compiler_path ""
++
++# RTTWDATAMemOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_bus_master_buf_optimization_strategy performance
++
++# RTTWDATAMemHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_bus_master_buf_hand_picked_instance ""
++
++# RTTIntMemCompilerPath_1p --- Path to the RTT intmem 1-port Memory Compiler
++-rtt_int_mem_1p_compiler_path ""
++
++# RTTIntMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_int_mem_1p_optimization_strategy performance
++
++# RTTIntMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_int_mem_1p_hand_picked_instance ""
++
++# RTTDSMCompilerPath_1p --- Path to the RTT DSM Source Buffer  1-port Memory Compiler
++-rtt_dsm_sbuf_1p_compiler_path ""
++
++# RTTDSMOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dsm_sbuf_1p_optimization_strategy performance
++
++# RTTDSMHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dsm_sbuf_1p_hand_picked_instance ""
++
++# RTTPCMMemCompilerPath_1p --- Path to the RTT PCM Source Buffer  1-port Memory Compiler
++-rtt_pcm_sbuf_1p_compiler_path ""
++
++# RTTPCMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pcm_sbuf_1p_optimization_strategy performance
++
++# RTTPCMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pcm_sbuf_1p_hand_picked_instance ""
++
++# RTTPTCMMemCompilerPath_1p --- Path to the RTT PTCM Source Buffer 1-port  Memory Compiler
++-rtt_ptcm_buf_1p_compiler_path ""
++
++# RTTPTCMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptcm_sbuf_1p_optimization_strategy performance
++
++# RTTPTCMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptcm_sbuf_1p_hand_picked_instance ""
++
++# RTTPTMMemCompilerPath_1p --- Path to the RTT PTM Source Buffer  1-port Memory Compiler
++-rtt_ptm_sbuf_1p_compiler_path ""
++
++# RTTPTMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptm_sbuf_1p_optimization_strategy performance
++
++# RTTPTMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_ptm_sbuf_1p_hand_picked_instance ""
++
++# RTTDTMMemCompilerPath_1p --- Path to the RTT DTM Source Buffer  1-port Memory Compiler
++-rtt_dtm_sbuf_1p_compiler_path ""
++
++# RTTDTMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dtm_sbuf_1p_optimization_strategy performance
++
++# RTTDTMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_dtm_sbuf_1p_hand_picked_instance ""
++
++# RTTCRMMemCompilerPath_1p --- Path to the RTT CRM Source 1-port Buffer Memory Compiler
++-rtt_crm_sbuf_1p_compiler_path ""
++
++# RTTCRMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_crm_sbuf_1p_optimization_strategy performance
++
++# RTTCRMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_crm_sbuf_1p_hand_picked_instance ""
++
++# RTTAUXMMemCompilerPath_1p --- Path to the RTT AUXM Source 1-port Buffer Memory Compiler
++-rtt_auxm_sbuf_1p_compiler_path ""
++
++# RTTAUXMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_auxm_sbuf_1p_optimization_strategy performance
++
++# RTTAUXMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_auxm_sbuf_1p_hand_picked_instance ""
++
++# RTTERRMMemCompilerPath_1p --- Path to the RTT ERRM Source Buffer 1-port Memory Compiler
++-rtt_errm_sbuf_1p_compiler_path ""
++
++# RTTERRMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_errm_sbuf_1p_optimization_strategy performance
++
++# RTTERRMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_errm_sbuf_1p_hand_picked_instance ""
++
++# RTTOTMMemCompilerPath_1p --- Path to the RTT OTM Source Buffer 1-port  Memory Compiler
++-rtt_otm_sbuf_1p_compiler_path ""
++
++# RTTOTMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_otm_sbuf_1p_optimization_strategy performance
++
++# RTTOTMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_otm_sbuf_1p_hand_picked_instance ""
++
++# RTTRFMMemCompilerPath_1p --- Path to the RTT RFM Source Buffer 1-port  Memory Compiler
++-rtt_rfm_sbuf_1p_compiler_path ""
++
++# RTTRFMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_rfm_sbuf_1p_optimization_strategy performance
++
++# RTTRFMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_rfm_sbuf_1p_hand_picked_instance ""
++
++# RTTPBUFMemCompilerPath_1p --- Path to the RTT PBUF 1-port  Memory Compiler
++-rtt_pbuf_1p_compiler_path ""
++
++# RTTPBUFMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pbuf_1p_optimization_strategy performance
++
++# RTTPBUFMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_pbuf_1p_hand_picked_instance ""
++
++# RTTWPMMemCompilerPath_1p --- Path to the RTT WPM Source Buffer 1-port  Memory Compiler
++-rtt_wpm_sbuf_1p_compiler_path ""
++
++# RTTWPMMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_wpm_sbuf_1p_optimization_strategy performance
++
++# RTTWPMMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_wpm_sbuf_1p_hand_picked_instance ""
++
++# RTTWDATAMemCompilerPath_1p --- Path to the RTT Bus Master Buffer 1-port Memory Compiler
++-rtt_bus_master_buf_1p_compiler_path ""
++
++# RTTWDATAMemOptimizationStrategy_1p --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_bus_master_buf_1p_optimization_strategy performance
++
++# RTTWDATAMemHandPicked_1p --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-rtt_bus_master_buf_1p_hand_picked_instance ""
++
++# SMDataCompilerPath --- Path to the SLC Shared Data Memory Compiler
++-sm_data_compiler_path ""
++
++# SMDataOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-sm_data_optimization_strategy performance
++
++# SMDataHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-sm_data_hand_picked_instance ""
++
++# SMData1CompilerPath --- Path to the SLC Shared Data1 Memory Compiler
++-sm_data1_compiler_path ""
++
++# SMData1OptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-sm_data1_optimization_strategy performance
++
++# SMData1HandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-sm_data1_hand_picked_instance ""
++
++# SLCDataCompilerPath --- Path to the SLC Data Memory Compiler
++-slc_data_compiler_path ""
++
++# SLCDataOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-slc_data_optimization_strategy performance
++
++# SLCDataHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-slc_data_hand_picked_instance ""
++
++# SLCTagCompilerPath --- Path to the SLC Tag Memory Compiler
++-slc_tag_compiler_path ""
++
++# SLCTagOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-slc_tag_optimization_strategy performance
++
++# SLCTagHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-slc_tag_hand_picked_instance ""
++
++# SLCStatusCompilerPath --- Path to the SLC Status Memory Compiler
++-slc_status_compiler_path ""
++
++# SLCStatusOptimizationStrategy --- area : smallest memory instances, performance : fastest instances, , hand_picked : Via the associated "hand_picked_instance" option, an existing pre-generated SEIF instance from the specified memory compiler can be specified  e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-slc_status_optimization_strategy performance
++
++# SLCStatusHandPicked --- pre-existing instance name (see build/reports/*.tsv from a previous iteration) e.g. mem_ts28nph41p11sad2l02msa02_2048x16_cm8_bk1_cdfalse_bwe1_bno_rno
++-slc_status_hand_picked_instance ""
++
++# memLibPath --- Path to where Memories should be generated
++-mem_lib_path /vlsi/h5/users/rzehorai/repo/h5_fc/work_area/arc/h5_arc_v00/arc_rams
++
++# PruneMemorySet --- Prune all but fasted and smallest instances
++-prune_memory_set true
++
++# MemoryBoost --- Memory Boost by enabling Center Decoder
++-memory_boost false
++
++# ITenabled --- Enable Integrated Test option for Synopsys memory compilers
++-it_enable false
++
++# PowerGateEnabled --- Enable pg_enable option for Synopsys memory compilers where supported. Only enable when power domains are configured in HS or EM
++-pg_enable false
++
++# BtbSlicing --- Specifies amount of slicing of btb ram for performance enhancement (none => 1 instance of 64-bit or 72-bit,  medium => 2 instances of 32-bit or 3 instances of 24-bit, high => 8 or 9 instances of 8-bit
++-btb_slicing none
++
++# MwicNumSlices --- Amount of data width slicing to be applied to instruction cache data ram for faster performance
++-mwic_num_slices 1
++
++# DcDataNumSlices --- Amount of data width slicing to be applied to data cache data ram for faster performance
++-dcdata_num_slices 1
++
++# PatchMemModel --- Default initial content is all zero. Enable this option to have random content intsead. For DCCM with ECC/Parity, use zero initialized memories on post-SEIF RTL simulations of CCT's
++-patch_mem_model false
++
++# GenerateBackendViews --- Generate backend views for Synopsys memory compilers
++-generate_backend_views false
++
++# LSPinTieoff --- Tie off LS pins of memories to 1'b0 in case of timing critical setup of de-asserting edge of ls signal from core to memory clock pins. Option applies to all memories
++-ls_pin_tieoff true
++
++# BackCompat --- Retain the unused rst_a pin on clkgate modules for  backwards compatability with older RTL
++-back_compat false
++
++
++######## Tool Configuration --- cgen.1_0 ########
++
++# Create Tool Configuration
++-create cgen.1_0 "System.Tool Configuration"
++
++# mwdt_version --- Selects the MetaWare version to be used with the TCF file.
++# Change from the default to an older or newer toolset version if you want the TCF file to be used with an older or newer version of the MetaWare tools.
++-mwdt_version O-2018.09
++
++# code_base_addr --- 
++# The base address to assign to the executable code segment in the linker command file when there is no ICCM in the build.  If not set here, the value 0 or the location of the interrupt vectors may be used as a default.  This value is ignored when there is an ICCM.
++# 
++-code_base_addr 0x0
++
++# data_base_addr --- 
++# The base address to assign to the data segment in the linker command file when the data is not being mapped to a DCCM.  This value is ignored when the data segment is mapped to a DCCM, as in that case the base address of the DCCM memory is used.
++# 
++# A value of 0xffffffff means that the data segment will not be mapped to any specific address.
++# 
++-data_base_addr 0xffff_ffff
++
++# underscores_in_numbers --- Use underscores in hex numbers to improve readability.
++-underscores_in_numbers false
++
++# lcf_ccm_fill --- Linker command file fills CCM data memory for use with -Bzerobss
++-lcf_ccm_fill true
++
++# tcf_rebrand_name --- Alternate branding name for TCF (not used)
++-rebrand_name ""
++
++
+diff --git a/scripts/palad/ext_tools/convert_hex.pl b/scripts/palad/ext_tools/convert_hex.pl
+new file mode 100755
+index 0000000..7ca7bf3
+--- /dev/null
++++ b/scripts/palad/ext_tools/convert_hex.pl
+@@ -0,0 +1,35 @@
++#!/usr/intel/bin/perl
++
++# convert 1x byte preboot hex file to 32x byte (8x 4bytes) iccm0/1 ingle hex file
++# usage: convert_preboot.pl in_file (colomn of Byte) out_file1 (8x colomn of 4x bytes)
++
++open(InFile, "$ARGV[0]")  || die "Can't open $Infile";
++open(OutFile1,">$ARGV[1]") || die "Can't open $Outfile";
++# open(OutFile2,">$ARGV[2]") || die "Can't open $Outfile";
++
++
++$address = 0;
++$counter = 0;
++while( $line = <InFile> ) {
++  chomp($line);
++  $array[$address] = $line;
++  $address += 1;
++}
++
++
++for ( $index = 0; $index < $address ; ($index += 32)) {
++#  if ($counter%2 == 0){
++printf OutFile1 (" $array[$index + 0]$array[$index + 1]$array[$index + 2]$array[$index + 3] $array[$index + 4]$array[$index + 5]$array[$index + 6]$array[$index + 7] $array[$index + 8]$array[$index + 9]$array[$index + 10]$array[$index + 11] $array[$index + 12]$array[$index + 13]$array[$index + 14]$array[$index + 15] $array[$index + 16]$array[$index + 17]$array[$index + 18]$array[$index + 19] $array[$index + 20]$array[$index + 21]$array[$index + 22]$array[$index + 23] $array[$index + 24]$array[$index + 25]$array[$index + 26]$array[$index + 27] $array[$index + 28]$array[$index + 29]$array[$index + 30]$array[$index + 31]\n");}
++#  if ($counter%2 == 1){
++#printf OutFile2 ("$array[$index + 4]$array[$index + 5]$array[$index + 6]$array[$index + 7]$array[$index]$array[$index + 1]$array[$index + 2]$array[$index + 3]\n");}
++#   $counter += 1;
++#}
++
++#printf OutFile ("22222222222222222\n");
++#for ( $index = (($address / 2) + 2); $index < $address; ($index += 4)) {
++#printf OutFile ("$array[$index - 1]$array[$index - 2]$array[$index - 3]$array[$index - 4]\n");
++#}
++
++close (InFile);
++close (OutFile1);
++#close (OutFile2);
+diff --git a/scripts/palad/ext_tools/eccgen b/scripts/palad/ext_tools/eccgen
+new file mode 100755
+index 0000000..1fd0f51
+--- /dev/null
++++ b/scripts/palad/ext_tools/eccgen
+Binary files differ
+diff --git a/scripts/palad/ext_tools/eccgen3 b/scripts/palad/ext_tools/eccgen3
+new file mode 100755
+index 0000000..da30540
+--- /dev/null
++++ b/scripts/palad/ext_tools/eccgen3
+Binary files differ

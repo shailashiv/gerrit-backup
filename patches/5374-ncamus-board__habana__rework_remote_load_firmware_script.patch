@@ -1,0 +1,213 @@
+From b0792257a3f9d0dc5b50f6b0ac650f43a0ab9fe3 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 11 Jul 2018 13:18:29 +0300
+Subject: [PATCH] board: habana: rework remote_load_firmware script
+
+Current script brings the whole npu-stack repositories and builds the kmd out of it.
+This is time consuming and prone to repo corruptions.
+
+Rework the remote_load_firmware script to use the prebuilt deb packages which are
+the ones later released to customers.
+Bring a new script (local_install_packages) to the system which is copied to
+the host machine and takes care of the packages installation.
+
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index e9976d8..59d2ea7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -173,5 +173,6 @@
+ .PHONY: dali-asic-tools-install
+ dali-asic-tools-install:
+ 	-cd board/habanalabs/common/ &&					\
+-	sshpass -p123456 scp -r remote_power remote_load_firmware ip_pdu t32 vivado_lab	\
++	sshpass -p123456 scp -r remote_power remote_load_firmware	\
++	local_install_packages ip_pdu t32 vivado_lab			\
+ 	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+diff --git a/board/habanalabs/common/local_install_packages b/board/habanalabs/common/local_install_packages
+new file mode 100755
+index 0000000..325c68e
+--- /dev/null
++++ b/board/habanalabs/common/local_install_packages
+@@ -0,0 +1,66 @@
++#!/bin/bash -l
++
++pkg_dir="$HOME/habana-pkgs"
++dl_host_base="http://jenkins:8080/view/deployment/job"
++dl_suff="lastSuccessfulBuild/artifact/*zip*"	# the '*' are not for expansion
++dl_file="archive.zip"
++pre_pkg_lst="protobuf-compiler libprotoc-dev"
++habana_pkg_lst="habanalabs habanatools libhabana"
++
++function local_msg() {
++	local msg=$1
++	echo -e   "********************************************************"
++	echo -e   "$msg"
++	echo -e   "********************************************************"
++}
++
++function local_prepare_work_dirs() {
++	local_msg "****** Preparing directories for packages download *****"
++	mkdir -p $pkg_dir;
++	sudo umount -lrf $pkg_dir && sleep 1;
++	sudo mount -t tmpfs -o uid=$UID,dirsync,mode=0755 tmpfs $pkg_dir	|| return 1;
++}
++
++function local_dl_prep_packages() {
++	local_msg "********** Downloading and preparing packages **********"
++	cd $pkg_dir
++	wget -N ${dl_host_base}/build-habana-py/${dl_suff}/${dl_file}	|| return 1;
++	unzip -j ${dl_file}						|| return 1;
++	cd -
++	return 0;
++}
++
++function local_remove_packages() {
++	local_msg "************* Removing old habana packages *************"
++	sudo apt-get purge --auto-remove habanalabs habanatools libhabana -y
++	sudo apt-get clean
++}
++
++function local_install_packages() {
++	local_msg "******** Installing habana python prerequisites ********"
++	sudo apt-get install ${pre_pkg_lst} -y	|| return 1;
++	local_msg "************ Installing new habana packages ************"
++	sudo apt update				|| return 1;
++	sudo apt install ${habana_pkg_lst} -y	|| return 1;
++}
++
++local_prepare_work_dirs
++if [ $? -ne 0 ]; then
++	local_msg "********* Failed preparing tmpfs for packages **********"
++	exit 1;
++fi
++
++local_dl_prep_packages
++if [ $? -ne 0 ]; then
++	local_msg "************* Failed downloading packages **************"
++	exit 2;
++fi
++
++local_remove_packages
++local_install_packages
++if [ $? -ne 0 ]; then
++	local_msg "************* Failed installing packages ***************"
++	local_remove_packages
++	exit 3;
++fi
++
+diff --git a/board/habanalabs/common/remote_load_firmware b/board/habanalabs/common/remote_load_firmware
+index 50eea74..93f5611 100755
+--- a/board/habanalabs/common/remote_load_firmware
++++ b/board/habanalabs/common/remote_load_firmware
+@@ -3,58 +3,56 @@
+ host=$1
+ success_str="1000"
+ result=~/remote_load_firmware.result
+-firm_dir=/lib/firmware/habanalabs/dali
+-stack='~/trees/npu-stack'
++fw_dir=/lib/firmware/habanalabs/dali
++local_scr_dir=/var/lib/tftpboot/tests
++scr_name=local_install_packages
++remote_scr_dir="."
+ 
+-function remote_create_repo_sync() {
+-	# prepare the repo
+-	ssh -t $host "mkdir -p $stack; sudo mkdir -p $firm_dir;
+-		sudo umount -lrf $stack; sleep 1;
+-		sudo mount -t tmpfs -o uid=$UID,dirsync,mode=0755 tmpfs $stack;
+-		git config --global user.name Jenkins;
+-		git config --global user.email jenkins@habana.ai;
+-		git config --global pull.rebase true;
+-		cd $stack; pwd;
+-		repo init -u ssh://192.168.0.59:29418/software-repo;
+-		repo sync;" | tee -a $result
++
++function remote_prepare_work_dirs() {
++	ssh -t $host "sudo mkdir -p $fw_dir;" | tee -a $result
+ 
+ 	local pipestat=${PIPESTATUS[0]}
+-	echo ssh repo sync status: $pipestat
+-	if [ $pipestat -ne 0 ]; then
+-		ssh -t 'sudo umount -lrf $stack;'
+-		return $pipestat;
+-	fi
+-
+-	ssh -t $host "cp $stack/automation/habana_scripts/.bashrc ~/ &&
+-		cp $stack/automation/habana_scripts/.bash_aliases ~/;" | tee -a $result
+-	local pipestat=${PIPESTATUS[0]}
+-	echo ssh cp status: $pipestat
+-	if [ $pipestat -ne 0 ]; then
+-		ssh -t "sudo umount -lrf $stack;"
+-	fi
++	echo ssh mkdir $fw_dir status: $pipestat
+ 
+ 	return $pipestat;
+ }
+ 
+-function remote_bi_habanalabs() {
+-	# build and insmod the habanalabs driver
+-	# this depends on successful copy of the .bashrc and .bash_aliases
+-	ssh -t $host 'bash -ic "build_and_insmod_habanalabs -p \"cpu_enable=1 cpu_queues_enable=1\" -d"' | tee -a $result
+-	local success=`grep -cE "^$success_str" $result`
+-	[ $success -ge 1 ] && return 0;
+-
+-	return 1;
+-}
+-
+-function remote_copy_firmware() {
++function remote_copy_fw_scripts() {
+ 	# sync the latest built binaries
+ 	for ((j=0; j<3; j++)); do
+-		sshpass -p123456 scp ${firm_dir}/* root@${host}:${firm_dir}/ || continue;
++		sshpass -p123456 scp ${fw_dir}/* root@${host}:${fw_dir}/	|| break;
++		sshpass -p123456 scp ${local_scr_dir}/${scr_name} ${host}:${remote_scr_dir}/	|| break;
+ 		return 0;
+ 	done
+ 
+-	echo "Failed copying the latest firmware binaries..."
++	echo "Failed copying the latest firmware binaries or remote script..."
+ 	return 1;
++}
++
++function remote_run_script() {
++	ssh -t $host "${remote_scr_dir}/${scr_name};" | tee -a $result
++
++	local pipestat=${PIPESTATUS[0]}
++	case $pipestat in
++	0)
++		;;
++	1)
++		echo "Failed preparing dirs (tmpfs) for packages"
++		;;
++	2)
++		echo "Failed downloading packages"
++		;;
++	3)
++		echo "Failed installing packages"
++		;;
++	*)
++		echo "Unknown error returned from script"
++		;;
++	esac
++
++	echo Installation script status: $pipestat
++	return $pipestat;
+ }
+ 
+ for ((i=100; i>0; i--)); do
+@@ -63,9 +61,9 @@
+ 	ping -c 1 -W 1 $host
+ 	if [ $? -eq 0 ]; then
+ 		rm -f $result
+-		remote_create_repo_sync || continue;
+-		remote_copy_firmware || break;
+-		remote_bi_habanalabs || continue;
++		remote_prepare_work_dirs	|| continue;
++		remote_copy_fw_scripts		|| break;
++		remote_run_script		|| break;
+ 		echo done;
+ 		exit 0;
+ 	fi

@@ -1,0 +1,900 @@
+From 550edea3791f8894c4d1390a3c2d9351416df988 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 19 Apr 2024 16:13:26 +0300
+Subject: [PATCH] sq: elfs
+
+Change-Id: I919425924bce952e3dbd56eccac5a94d05bbd130
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/image-utility.sh b/board/habanalabs/common/image-utility.sh
+index fddba0c..9ebacac 100644
+--- a/board/habanalabs/common/image-utility.sh
++++ b/board/habanalabs/common/image-utility.sh
+@@ -70,7 +70,7 @@
+ 	local SECTIONS=${*:4}
+ 
+ 	${OBJCOPY} -S --gap-fill 0xff --output-target=binary --remove-section=.comment --remove-section=COMMON \
+-	--remove-section=.eh_frame $(echo -n $SECTIONS | sed 's/[^ ]* */ --only-section=&/g') ${BINARIES_DIR}/zephyr_${PREFIX}.elf \
++	--remove-section=.eh_frame $(echo -n $SECTIONS | sed 's/[^ ]* */ --only-section=&/g') ${ELFS_DIR}/zephyr_${PREFIX}.elf \
+ 	--set-section-flags=bss=alloc,load,contents --set-section-flags=noinit=alloc,load,contents \
+ 	${STAGE_DIR}/zephyr-${PREFIX}-${MEM}.bin
+ 
+@@ -82,7 +82,7 @@
+ 	local app=$1
+ 
+ 	echo "name,size,address"
+-	arc-linux-objdump -h ${BINARIES_DIR}/zephyr_${app}.elf | \
++	arc-linux-objdump -h ${ELFS_DIR}/zephyr_${app}.elf | \
+ 		awk '/^[ \t]+[0-9]+ [^.]/ { printf("%s,0x%s,0x%s\n", $2, $3, $4);}'
+ }
+ 
+diff --git a/board/habanalabs/common/post-image-bins.sh b/board/habanalabs/common/post-image-bins.sh
+index cc7e9bd..e75d208 100755
+--- a/board/habanalabs/common/post-image-bins.sh
++++ b/board/habanalabs/common/post-image-bins.sh
+@@ -16,7 +16,7 @@
+ 	local LEFILENAME=${FILENAMEPATH}/${HL_DEV}-${FILENAME}.le
+ 	local BEFILENAME=${FILENAMEPATH}/${HL_DEV}-${FILENAME}.be
+ 
+-	dd status=none conv=sync bs=${BS} if=${FILENAME} of=${LEFILENAME}
++	dd status=none conv=sync bs=${BS} if=${FULLFILENAME} of=${LEFILENAME}
+ 	swap_file ${LEFILENAME} ${BEFILENAME}
+ 	hl_compress_bin ${LEFILENAME}
+ }
+diff --git a/board/habanalabs/common/post-image-exports.sh b/board/habanalabs/common/post-image-exports.sh
+index 8087af2..1c1e0d5 100755
+--- a/board/habanalabs/common/post-image-exports.sh
++++ b/board/habanalabs/common/post-image-exports.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ 
+ # Set U-Boot binary file name for .its
+-HL_UBOOT_BIN_FILE=${HL_DEV}-u-boot.bin.le
++HL_UBOOT_BIN_FILE=${BINS_DIR}/${HL_DEV}-u-boot.bin.le
+ 
+ ITS_SED_PARAMS+="s/@HL_VERSION@/${HL_VERSION}/g;"
+ ITS_SED_PARAMS+="s/@HL_DEV@/${HL_DEV}/g;"
+@@ -14,6 +14,6 @@
+ ITS_SED_PARAMS+="s/@HL_KEY_INDEX@/${HL_SEC_KEY_INDEX}/g;";
+ ITS_SED_PARAMS+="s/@HL_SEC_FW_VERSION@/${HL_SEC_FW_VERSION}/g;";
+ ITS_SED_PARAMS+="s/@SHA_VERSION@/${SHA_VERSION}/g;"
+-ITS_SED_PARAMS+="s/@HL_UBOOT_BIN_FILE@/${HL_UBOOT_BIN_FILE}/g;"
++ITS_SED_PARAMS+="s#@HL_UBOOT_BIN_FILE@#${HL_UBOOT_BIN_FILE}#g;"
+ ITS_SED_PARAMS+="s#@FILES_PATH_1@#${BINS_DIR}#g;"
+ ITS_SED_PARAMS+="s#@FILES_PATH_2@#${BINS_PROD_DIR}#g;"
+diff --git a/board/habanalabs/common/post-image-fit-descriptor.sh b/board/habanalabs/common/post-image-fit-descriptor.sh
+index caaaafb..e5bdfc0 100755
+--- a/board/habanalabs/common/post-image-fit-descriptor.sh
++++ b/board/habanalabs/common/post-image-fit-descriptor.sh
+@@ -31,7 +31,7 @@
+ 
+ pushd ${BIN_IMG_DIR}
+ 	hl_handle_desc
+-	AGENT_FIT_FILES=$(ls ${HL_DEV}-agent-*.itb 2>/dev/null)
++	AGENT_FIT_FILES=$(ls ${ITBS_DIR}/${HL_DEV}-agent-*.itb 2>/dev/null)
+ 
+ 	# For each agent-*.itb files
+ 	for AGENT_FIT in $AGENT_FIT_FILES; do
+diff --git a/board/habanalabs/common/post-image-fit-global.sh b/board/habanalabs/common/post-image-fit-global.sh
+index 17215b3..6730367 100755
+--- a/board/habanalabs/common/post-image-fit-global.sh
++++ b/board/habanalabs/common/post-image-fit-global.sh
+@@ -57,7 +57,7 @@
+ DSV_ITS_TEMPLATE=${COMMON_BASE}/dsv.its
+ DSV_ITB_FILE=${ITBS_DIR}dsv-fit.itb
+ 
+-LINUX_PRODUCTS_DIR=${OUTPUT_DIR}/build/linux-custom/arch/arm64/boot/
++LINUX_PRODUCTS_DIR=${DEV_BASE_DIR}/build/linux-custom/arch/arm64/boot/
+ LINUX_DTB_DIR=${LINUX_PRODUCTS_DIR}/dts/habanalabs/${HL_DEV}/
+ LINUX_ROOTFS_DIR=${IMGS_DIR}
+ 
+@@ -182,9 +182,9 @@
+ 		dd status=none conv=sync bs=4 if=${SPI_ITB_FILE} > ${ITBS_DIR}/${DEV_NAME}-boot-spi-fpga-fit.itb
+ 	fi
+ 
+-	uboot_bin_sz=$(stat -Lc "%s" ${STAGE_DIR}i/${HL_UBOOT_BIN_FILE})
++	uboot_bin_sz=$(stat -Lc "%s" ${HL_UBOOT_BIN_FILE})
+ 	if [ ${uboot_bin_sz} -gt ${UBOOT_BIN_MAX_SZ} ]; then
+-		echo "Error: ${STAGE_DIR}/${HL_UBOOT_BIN_FILE} file is larger (${uboot_bin_sz}) than max (${UBOOT_BIN_MAX_SZ})" 1>&2
++		echo "Error: ${HL_UBOOT_BIN_FILE} file is larger (${uboot_bin_sz}) than max (${UBOOT_BIN_MAX_SZ})" 1>&2
+ 		exit 1
+ 	fi
+ 	sed ${ITS_SED_PARAMS} ${UBOOT_ZEPHYR_ITS_TEMPLATE} > ${UBOOT_ZEPHYR_ITS_FILE}
+diff --git a/board/habanalabs/common/post-image-fit.sh b/board/habanalabs/common/post-image-fit.sh
+index d5e1bf3..b6d27f5 100755
+--- a/board/habanalabs/common/post-image-fit.sh
++++ b/board/habanalabs/common/post-image-fit.sh
+@@ -26,12 +26,12 @@
+ IFS=$'\n'
+ 
+ # Set hl-version = "x.y.z"; inside FIT header to be used for KMD/FW compatability validation
+-HL_VERSION=`cut -d- -f4 ${OUTPUT_DIR}/build/linux-custom/localversion-habanalabs`
++HL_VERSION=`cut -d- -f4 ${DEV_BASE_DIR}/build/linux-custom/localversion-habanalabs`
+ # Set hl-*-version = "hl-<device>-<HL_VERSION>[-rc]-fw-<fw ver>[-<git data>]"; inside FIT header
+-HL_FW_VERSION=`cut -d- -f2- ${OUTPUT_DIR}/build/linux-custom/localversion-habanalabs`
+-HL_UBOOT_VERSION=`cut -d- -f2- ${OUTPUT_DIR}/build/uboot-custom/localversion-habanalabs`
++HL_FW_VERSION=`cut -d- -f2- ${DEV_BASE_DIR}/build/linux-custom/localversion-habanalabs`
++HL_UBOOT_VERSION=`cut -d- -f2- ${DEV_BASE_DIR}/build/uboot-custom/localversion-habanalabs`
+ # Set hl-preboot-version = "hl-<device>-<HL_VERSION>[-rc]-fw-<fw ver>[-<git data>] (<date> - <time>)"
+-HL_PREBOOT_VERSION=`cat ${OUTPUT_DIR}/build/baremetal-custom/buildversion-habanalabs`
++HL_PREBOOT_VERSION=`cat ${DEV_BASE_DIR}/build/baremetal-custom/buildversion-habanalabs`
+ # Set enum number of FIT_LOAD_TYPE_FLASH in FIT
+ FIT_LOAD_TYPE_FLASH=$(grep -E "FIT_LOAD_TYPE_FLASH[^_]" ${SPECS_EMBEDDED_DIR}/fit_load_type.h | sed 's/.* = \(.*\),/\1/')
+ # Set enum number of FIT_LOAD_TYPE_RUN in FIT
+@@ -42,8 +42,8 @@
+ HL_SEC_FW_VERSION=`grep HL_SEC_FW_VERSION $HL_SEC_FILE | awk '{ print $NF }'`
+ 
+ NIC_FW_FILE=${BR2_EXTERNAL_HABANALABS_PATH}/board/habanalabs/${HL_DEV}/fw/condor.fw.bin
+-UBOOT_ITS_FILE=${STAGE_DIR}uboot-${HL_DEV}_${HL_TARGET}.its
+-UBOOT_ITB_FILE=${STAGE_DIR}uboot-fit.itb
++UBOOT_ITS_FILE=${STAGE_DIR}/uboot-${HL_DEV}_${HL_TARGET}.its
++UBOOT_ITB_FILE=${STAGE_DIR}/uboot-fit.itb
+ UBOOT_ITS_TEMPLATE=`sed -e 's/^"//' -e 's/"$//' <<< ${BR2_POST_IMAGE_UBOOT_ITS_TEMPLATE}`
+ SPI_ITS_FILE=${STAGE_DIR}/spi-${HL_DEV}_${HL_TARGET}.its
+ SPI_ITB_FILE=${STAGE_DIR}/spi-fpga-fit.itb
+@@ -58,7 +58,7 @@
+ 	LINUX_ITS_TEMPLATE=${COMMON_BASE}/linux.its
+ fi
+ 
+-LINUX_PRODUCTS_DIR=${OUTPUT_DIR}/build/linux-custom/arch/arm64/boot/
++LINUX_PRODUCTS_DIR=${DEV_BASE_DIR}/build/linux-custom/arch/arm64/boot/
+ LINUX_DTB_DIR=${LINUX_PRODUCTS_DIR}/dts/habanalabs/${HL_DEV}/
+ LINUX_ROOTFS_DIR=${IMGS_DIR}
+ 
+@@ -113,7 +113,7 @@
+ 	fi
+ 	ITS_SED_PARAMS+="s#@NIC_FW@#${NIC_FW_FILE}#g;"
+ 
+-	uboot_bin_sz=$(stat -Lc "%s" ${BINS_DIR}/${HL_UBOOT_BIN_FILE})
++	uboot_bin_sz=$(stat -Lc "%s" ${HL_UBOOT_BIN_FILE})
+ 	if [ ${uboot_bin_sz} -gt ${UBOOT_BIN_MAX_SZ} ]; then
+ 		echo "Error: ${HL_UBOOT_BIN_FILE} file is larger (${uboot_bin_sz}) than max (${UBOOT_BIN_MAX_SZ})" 1>&2
+ 		exit 1
+diff --git a/board/habanalabs/common/post-image-spi-arc_global.sh b/board/habanalabs/common/post-image-spi-arc_global.sh
+index 3c375e7..fc9094d 100755
+--- a/board/habanalabs/common/post-image-spi-arc_global.sh
++++ b/board/habanalabs/common/post-image-spi-arc_global.sh
+@@ -149,7 +149,7 @@
+ 	FILE=$1
+ 	IMAGE_NUM=$2
+ 	hl_get_size ${1} FLASH_BASE_ADDR
+-	dd status=none conv=notrunc seek=${IMAGE_NUM} bs=4 if=${FILE}.size of=${DEV_PREFIX}-spi-flash.bin
++	dd status=none conv=notrunc seek=${IMAGE_NUM} bs=4 if=${FILE}.size of=${BINS_DIR}/${DEV_PREFIX}-spi-flash.bin
+ 	rm -rf ${FILE}.size
+ }
+ 
+@@ -176,7 +176,7 @@
+ 		for i in {0..3}; do
+ 			DWORD=$(echo ${VERSION} | xxd -r -p | xxd -g4 | cut -d' ' -f$(( 5 - ${i} )))
+ 			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 59 + ${i}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.hex
++			echo "force ${FORCE} 'h${DWORD}" >> ${HEXS_DIR}/${HL_TARGET}-force.hex
+ 		done
+ 	fi
+ }
+@@ -196,7 +196,7 @@
+ 			DWORD=$(xxd -e -c32 -g4 ${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
+ 			OFFSET=$(( $(( ${KEY_OFFSET}*8 )) +  ${i} ))
+ 			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 18 + ${OFFSET}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.hex
++			echo "force ${FORCE} 'h${DWORD}" >> ${HEXS_DIR}/${HL_TARGET}-force.hex
+ 		done
+ 	fi
+ }
+@@ -204,9 +204,9 @@
+ function hl_key_revoke {
+ 	REVOKE_STATUS=$1
+ 	if [ $REVOKE_STATUS -eq 1 ]; then
+-		echo -n fe >> revoke_status.hex
++		echo -n fe >> ${STAGE_DIR}/revoke_status.hex
+ 	else
+-		echo -n ff >> revoke_status.hex
++		echo -n ff >> ${STAGE_DIR}/revoke_status.hex
+ 	fi
+ }
+ 
+@@ -235,10 +235,10 @@
+ 	hl_key_revoke ${PROD3_KEY_REVOKE}
+ 	hl_key_revoke ${PROD4_KEY_REVOKE}
+ 
+-	cat revoke_status.hex | xxd -r -p > ${FILE}.tmp
++	cat ${STAGE_DIR}/revoke_status.hex | xxd -r -p > ${FILE}.tmp
+ 	dd status=none conv=notrunc seek=11 bs=16 if=${FILE}.tmp of=${FILE}
+ 
+-	rm -rf revoke_status.hex
++	rm -rf ${STAGE_DIR}/revoke_status.hex
+ }
+ 
+ function hl_update_image_offset {
+@@ -407,9 +407,9 @@
+ 	done
+ }
+ 
+-pushd ${OUTPUT_DIR}
++pushd ${STAGE_DIR}
+ 
+-	hl_copy_binaries ${BINS_DIR}
++	hl_copy_binaries ${STAGE_DIR}
+ 
+ 	for i in $(seq 1 $NUM_PROD_KEYS); do
+ 		CUST=cust${i}
+@@ -417,10 +417,10 @@
+ 	done
+ 
+ 	## create otp spi image
+-	dd status=none conv=sync count=12 bs=16 if=/dev/zero | tr '\000' $'\xFF' > ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin
++	dd status=none conv=sync count=12 bs=16 if=/dev/zero | tr '\000' $'\xFF' > ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin
+ 
+ 	if [ ${CREATE_DUMMY_FLASH} -eq 1 ]; then
+-		dd status=none conv=sync count=${CREATE_DUMMY_FLASH_SIZE_64B_COUNT} bs=64 if=/dev/zero > ${BINS_DIR}${DEV_PREFIX}-dummy.bin
++		dd status=none conv=sync count=${CREATE_DUMMY_FLASH_SIZE_64B_COUNT} bs=64 if=/dev/zero > ${BINS_DIR}/${DEV_PREFIX}-dummy.bin
+ 
+ 		PREBOOT_BINFILE=${DEV_PREFIX}-dummy.bin
+ 		PPBOOT_BINFILE=${DEV_PREFIX}-dummy.bin
+@@ -435,20 +435,20 @@
+ 	generate_public_keys
+ 
+ 	# Create pif arc binaries
+-	prep_image_pcie_pif ${BINS_DIR}${PIF_ARC_ELFFILE}
++	prep_image_pcie_pif ${BINS_DIR}/${PIF_ARC_ELFFILE}
+ 	# Create erom binaries
+-	prep_image_erom ${BINS_DIR}${DEV_PREFIX}-erom.bin.le
++	prep_image_erom ${BINS_DIR}/${DEV_PREFIX}-erom.bin.le
+ 	# Create fake fuse binary
+-	prep_image_fake_fuse ${BINS_DIR}${DEV_PREFIX}-fake-fuse.bin.le
++	prep_image_fake_fuse ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.le
+ 
+ 	# Create sram mbist binary
+ 	prep_image_sram_mbist_data ${BINS_DIR}/sram-mbist-data.bin
+ 
+ 	# Pad preboot binary and then pack
+-	zephyr_preboot_pack ${BINS_DIR}${PREBOOT_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
++	zephyr_preboot_pack ${BINS_DIR}/${PREBOOT_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+ 
+ 	# Pad die1 preboot binary and then pack
+-	zephyr_preboot_d1_pack ${BINS_DIR}${PREBOOT_D1_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
++	zephyr_preboot_d1_pack ${BINS_DIR}/${PREBOOT_D1_BINFILE} ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+ 
+ 	## To be populated into FW SRAM
+ 
+@@ -458,55 +458,55 @@
+ 	PPBOOT_PCIE_PHY_BINFILE=${PPBOOT}-${PCIE_PHY}.bin
+ 
+ 	# concatenate both FW
+-	hl_join_bin ${BINS_DIR}${PPBOOT} ${BINS_DIR}${PCIE_PHY} ${BINS_DIR}${PPBOOT_PCIE_PHY_BINFILE}
++	hl_join_bin ${BINS_DIR}/${PPBOOT} ${BINS_DIR}/${PCIE_PHY} ${BINS_DIR}/${PPBOOT_PCIE_PHY_BINFILE}
+ 
+ 	# pack and sign image
+-	hl_pack_bin ${BINS_DIR}${PPBOOT_PCIE_PHY_BINFILE} 64K ${PRIME_IMAGE_PPBOOT_KEY} ${PRIME_IMAGE_PPBOOT_CRC_ERROR} ${PRIME_IMAGE_PPBOOT_SIGN_ERROR}
++	hl_pack_bin ${BINS_DIR}/${PPBOOT_PCIE_PHY_BINFILE} 64K ${PRIME_IMAGE_PPBOOT_KEY} ${PRIME_IMAGE_PPBOOT_CRC_ERROR} ${PRIME_IMAGE_PPBOOT_SIGN_ERROR}
+ 
+ 	# Create image pointers
+-	prep_image_ptrs ${BINS_DIR}${DEV_PREFIX}-images-pointers.bin.le
++	prep_image_ptrs ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.le
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+ 		hl_efuse_sys_config_generate
+ 	fi
+ 
+-	hl_sec_fw ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin ${SECURITY_FW_VERSION}
++	hl_sec_fw ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin ${SECURITY_FW_VERSION}
+ 
+-	hl_sec_key ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin hl 0
++	hl_sec_key ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin hl 0
+ 
+ 	# generate 4 customer keys and hash them to spi security
+ 	for i in $(seq 1 $NUM_PROD_KEYS); do
+ 		CUST=cust${i}
+-		hl_sec_key ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin ${CUST} ${i}
++		hl_sec_key ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin ${CUST} ${i}
+ 	done
+ 
+ 	# set revoke status as a 40bit (8bit * 5) binary value
+-	hl_set_revoke_status ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin
++	hl_set_revoke_status ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin
+ 
+-	cat ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin	> ${BINS_DIR}${DEV_PREFIX}-security-arc.bin.le
++	cat ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin	> ${BINS_DIR}/${DEV_PREFIX}-security-arc.bin.le
+ 
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-security-arc.bin.le ${BINS_DIR}${DEV_PREFIX}-security-arc.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-erom.bin.le ${BINS_DIR}${DEV_PREFIX}-erom.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-preboot.bin.le ${BINS_DIR}${DEV_PREFIX}-preboot.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.le ${BINS_DIR}${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-images-pointers.bin.le ${BINS_DIR}${DEV_PREFIX}-images-pointers.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-fake-fuse.bin.le ${BINS_DIR}${DEV_PREFIX}-fake-fuse.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-preboot_d1.bin.le ${BINS_DIR}${DEV_PREFIX}-preboot_d1.bin.be
+-	swap_file ${BINS_DIR}${DEV_PREFIX}-sram-mbist-data.bin.le ${BINS_DIR}${DEV_PREFIX}-sram-mbist-data.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-security-arc.bin.le ${BINS_DIR}/${DEV_PREFIX}-security-arc.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-erom.bin.le ${BINS_DIR}/${DEV_PREFIX}-erom.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.le ${BINS_DIR}/${DEV_PREFIX}-preboot.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.le ${BINS_DIR}/${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.le ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.le ${BINS_DIR}/${DEV_PREFIX}-fake-fuse.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-preboot_d1.bin.le ${BINS_DIR}/${DEV_PREFIX}-preboot_d1.bin.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-sram-mbist-data.bin.le ${BINS_DIR}/${DEV_PREFIX}-sram-mbist-data.bin.be
+ 
+ 	calc_image_ptrs_sha384 ${BINS_DIR}/${DEV_PREFIX}-images-pointers.bin.be
+ 
+-	rm -rf ${BINS_DIR}${PPBOOT_PCIE_PHY_BINFILE}
++	rm -rf ${BINS_DIR}/${PPBOOT_PCIE_PHY_BINFILE}
+ 
+ 	## Convert bin file into Palladium hex format ##
+ 	# for otp flash
+-	hl_pldm_flash_hex spi-otp-flash ${BINS_DIR}${DEV_PREFIX}-spi-otp-flash.bin ${HEXS_DIR}
++	hl_pldm_flash_hex spi-otp-flash ${BINS_DIR}/${DEV_PREFIX}-spi-otp-flash.bin ${HEXS_DIR}
+ 
+ 	# for preboot binary
+-	swap_file ${BINS_DIR}${PREBOOT_BINFILE} ${BINS_DIR}${PREBOOT_BINFILE}.orig.be
+-	hl_pldm_hex preboot ${BINS_DIR}${PREBOOT_BINFILE}.orig.be 1 ${HEXS_DIR}
++	swap_file ${BINS_DIR}/${PREBOOT_BINFILE} ${BINS_DIR}/${PREBOOT_BINFILE}.orig.be
++	hl_pldm_hex preboot ${BINS_DIR}/${PREBOOT_BINFILE}.orig.be 1 ${HEXS_DIR}
+ 
+-	PREBOOT_BIN_SZ=$(stat ${BINS_DIR}${PREBOOT_BINFILE}.orig.be --format=%s)
++	PREBOOT_BIN_SZ=$(stat ${BINS_DIR}/${PREBOOT_BINFILE}.orig.be --format=%s)
+ 	PREBOOT_CHUNK_SZ=131072 #128kb
+ 	PREBOOT_CHUNKS=$((PREBOOT_BIN_SZ / PREBOOT_CHUNK_SZ + 1))
+ 	split -b$PREBOOT_CHUNK_SZ -d --additional-suffix=${PREBOOT_BINFILE}.split.be ${BINS_DIR}${PREBOOT_BINFILE}.orig.be
+@@ -520,6 +520,6 @@
+ 
+ 	# for ROM binary
+ 	hl_pad_arcboot_rom
+-	hl_pldm_hex arcboot_rom ${BINS_DIR}${ARCBOOT_BINFILE} 16 ${HEXS_DIR}
++	hl_pldm_hex arcboot_rom ${BINS_DIR}/${ARCBOOT_BINFILE} 16 ${HEXS_DIR}
+ 
+ popd
+diff --git a/board/habanalabs/common/post-image-spi.sh b/board/habanalabs/common/post-image-spi.sh
+index 466c8f2..ffba231 100755
+--- a/board/habanalabs/common/post-image-spi.sh
++++ b/board/habanalabs/common/post-image-spi.sh
+@@ -10,7 +10,7 @@
+ PREBOOT_BINFILE=${PREBOOT_BINFILE:-preboot.bin}
+ UBOOT_CMDFILE=${UBOOT_CMDFILE:-${BOARD_BASE}/uboot-eeprom.cmd}
+ UBOOT_FITFILE=u-boot.itb
+-UBOOT_BINFILE=${UBOOT_BINFILE:-${UBOOT_FITFILE}}
++#UBOOT_BINFILE=${UBOOT_BINFILE:-${UBOOT_FITFILE}}
+ SPEC_BOOT_DESC_FILE=${BR2_EXTERNAL_HABANALABS_PATH}/../specs/${HL_DEV}/${HL_DEV}_boot_info.h
+ 
+ source ${COMMON_BASE}/image-utility.sh
+@@ -78,7 +78,9 @@
+ 	printf "%08x" $img_loadl | rev_bytes_stdin
+ 
+ 	# Prepare checksum
+-	local preboot_file=`echo ${PREBOOT_BINFILE} | cut -f1 -d"."`
++	local preboot_base=$(basename ${STAGE_DIR}/${PREBOOT_BINFILE})
++	local preboot_path=$(dirname ${STAGE_DIR}/${PREBOOT_BINFILE})
++	local preboot_file=${preboot_path}/${preboot_base%.*}
+ 	local preboot_le="${preboot_file}.bin.le"
+ 	local PRE_CKSUM=`${SHA_CHKSUM} ${preboot_le} | cut -d' ' -f1`
+ 	hl_chksum_add ${PRE_CKSUM}
+@@ -118,41 +120,40 @@
+ pushd ${STAGE_DIR}
+ 	${HOST_DIR}/usr/bin/mkimage -C none -A arm64 -T script -d ${UBOOT_CMDFILE} boot.scr
+ 
+-	handle_btl sectors-be.bin ${HL_DEV}-sectors.bin
+-	BTL_BINFILE=${HL_DEV}-sectors.bin
++	handle_btl ${STAGE_DIR}/sectors-be.bin ${BINS_DIR}/${HL_DEV}-sectors.bin ${STAGE_DIR}
++	BTL_BINFILE=${BINS_DIR}/${HL_DEV}-sectors.bin
+ 
+-	dd status=none conv=sync bs=8 if=${PREBOOT_BINFILE}				 > ${HL_DEV}-preboot.bin.le
++	dd status=none conv=sync bs=8 if=${STAGE_DIR}/${PREBOOT_BINFILE} > ${BINS_DIR}/${HL_DEV}-preboot.bin.le
+ 	# Swap Preboot
+-	swap_file ${HL_DEV}-preboot.bin.le ${HL_DEV}-preboot.bin.be
+-	PREBOOT_BINFILE=${HL_DEV}-preboot.bin.be
+-	hl_compress_bin ${HL_DEV}-preboot.bin.le
+-
+-	dd status=none conv=sync bs=8 if=u-boot.bin					 > ${HL_DEV}-u-boot.bin.le
++	swap_file ${BINS_DIR}/${HL_DEV}-preboot.bin.le ${BINS_DIR}/${HL_DEV}-preboot.bin.be
++	PREBOOT_BINFILE=${BINS_DIR}/${HL_DEV}-preboot.bin.be
++	hl_compress_bin ${BINS_DIR}${HL_DEV}-preboot.bin.le
++	dd status=none conv=sync bs=8 if=${IMGS_DIR}/u-boot.bin > ${BINS_DIR}/${HL_DEV}-u-boot.bin.le
+ 	# Swap U-boot
+-	swap_file ${HL_DEV}-u-boot.bin.le ${HL_DEV}-u-boot.bin.be
+-	UBOOT_BINFILE=${HL_DEV}-u-boot.bin.be
++	swap_file ${BINS_DIR}/${HL_DEV}-u-boot.bin.le ${BINS_DIR}/${HL_DEV}-u-boot.bin.be
++	UBOOT_BINFILE=${BINS_DIR}/${HL_DEV}-u-boot.bin.be
+ 
+ 	# Used by TRACE32 (Lauterbach JTAG)
+-	dd status=none conv=sync bs=4 if=u-boot.bin					 > ${HL_DEV}-u-boot.bin
++	dd status=none conv=sync bs=4 if=${IMGS_DIR}/u-boot.bin > ${BINS_DIR}/${HL_DEV}-u-boot.bin
+ 
+ 	# Reserved space filled by 0xFF
+-	dd status=none conv=sync bs=64K count=1 if=/dev/zero |  tr "\000" "\377"	 > 64K-0xff.bin
+-	dd status=none conv=sync bs=128K count=1 if=/dev/zero | tr "\000" "\377"	 > 128K-0xff.bin
++	dd status=none conv=sync bs=64K count=1 if=/dev/zero |  tr "\000" "\377"	 > ${STAGE_DIR}/64K-0xff.bin
++	dd status=none conv=sync bs=128K count=1 if=/dev/zero | tr "\000" "\377"	 > ${STAGE_DIR}/128K-0xff.bin
+ 
+ 	# Metadata: Pointers
+-	prep_image_ptrs ${HL_DEV}-images-pointers.bin.le
+-	swap_file ${HL_DEV}-images-pointers.bin.le ${HL_DEV}-images-pointers.bin.be
+-	dd status=none conv=sync bs=64K count=1 if=64K-0xff.bin				 > ${HL_DEV}-images-pointers.bin.be.spi
+-	dd status=none conv=sync,notrunc bs=4 if=${HL_DEV}-images-pointers.bin.be of=${HL_DEV}-images-pointers.bin.be.spi
++	prep_image_ptrs ${BINS_DIR}$/{HL_DEV}-images-pointers.bin.le
++	swap_file ${BINS_DIR}/${HL_DEV}-images-pointers.bin.le ${BINS_DIR}/${HL_DEV}-images-pointers.bin.be
++	dd status=none conv=sync bs=64K count=1 if=${STAGE_DIR}/64K-0xff.bin > ${STAGE_DIR}/${HL_DEV}-images-pointers.bin.be.spi
++	dd status=none conv=sync,notrunc bs=4 if=${BINS_DIR}/${HL_DEV}-images-pointers.bin.be of=${STAGE_DIR}${HL_DEV}-images-pointers.bin.be.spi
+ 
+-	create_spi_image ${BTL_BINFILE} ${PREBOOT_BINFILE} ${HL_DEV}-images-pointers.bin.be.spi ${HL_DEV}-spi-flash.bin.nocrc
++	create_spi_image ${BTL_BINFILE} ${STAGE_DIR}/${PREBOOT_BINFILE} ${STAGE_DIR}/${HL_DEV}-images-pointers.bin.be.spi ${STAGE_DIR}/${HL_DEV}-spi-flash.bin.nocrc
+ 
+ 	# Prepare checksum
+-	CKSUM=`${SHA_CHKSUM} ${HL_DEV}-spi-flash.bin.nocrc | cut -d' ' -f1`
+-	echo ${CKSUM} | xxd -p -r							 > ${HL_DEV}-spi-flash.crc
+-	dd status=none conv=sync bs=64K		if=${HL_DEV}-spi-flash.bin.nocrc	 > ${HL_DEV}-spi-flash.bin
+-	dd status=none conv=sync bs=32		if=${HL_DEV}-spi-flash.crc		>> ${HL_DEV}-spi-flash.bin
++	CKSUM=`${SHA_CHKSUM} ${STAGE_DIR}/${HL_DEV}-spi-flash.bin.nocrc | cut -d' ' -f1`
++	echo ${CKSUM} | xxd -p -r									> ${STAGE_DIR}/${HL_DEV}-spi-flash.crc
++	dd status=none conv=sync bs=64K		if=${STAGE_DIR}/${HL_DEV}-spi-flash.bin.nocrc		> ${BINS_DIR}/${HL_DEV}-spi-flash.bin
++	dd status=none conv=sync bs=32		if=${STAGE_DIR}/${HL_DEV}-spi-flash.crc			>> ${BINS_DIR}/${HL_DEV}-spi-flash.bin
+ 
+ 	# Convert bin file into Palladium hex format
+-	xxd -p -c1 -g1				${HL_DEV}-spi-flash.bin	 		 > ${STAGE_DIR}/${HL_DEV}-spi-flash.hex
++	xxd -p -c1 -g1				${BINS_DIR}/${HL_DEV}-spi-flash.bin	 		 > ${HEXS_DIR}/${HL_DEV}-spi-flash.hex
+ popd
+diff --git a/board/habanalabs/fs1_arc/fs1-image-utility.sh b/board/habanalabs/fs1_arc/fs1-image-utility.sh
+index a736bb6..d2a4226 100755
+--- a/board/habanalabs/fs1_arc/fs1-image-utility.sh
++++ b/board/habanalabs/fs1_arc/fs1-image-utility.sh
+@@ -86,7 +86,7 @@
+ 	local app=$1
+ 
+ 	echo "name,size,address"
+-	arc-linux-objdump -h ${BINARIES_DIR}/zephyr_${app}.elf | \
++	arc-linux-objdump -h ${ELFS_DIR}/zephyr_${app}.elf | \
+ 		awk '/^[ \t]+[0-9]+ [^.]/ { printf("%s,0x%s,0x%s\n", $2, $3, $4);}'
+ }
+ 
+diff --git a/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh b/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh
+index 01cda26..0379ba0 100755
+--- a/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh
++++ b/board/habanalabs/fs1_arc/fs1-post-image-fit-arc.sh
+@@ -13,7 +13,7 @@
+ HL_VERSION=`cut -d- -f4 ${BR2_EXTERNAL}/output/${HL_DEV}/build/zephyr-custom/localversion-habanalabs`
+ 
+ ZEPHYR_ITS_FILE=zephyr-${DEV_NAME}-${HL_TARGET}.its
+-ZEPHYR_ITB_FILE=zephyr-fit.itb
++ZEPHYR_ITB_FILE=${ITBS_DIR}/zephyr-fit.itb
+ 
+ # Set compression to lzo
+ HL_COMPRESS=lzo
+@@ -61,5 +61,5 @@
+ 	sed ${ITS_SED_PARAMS} ${ZEPHYR_ITS_TEMPLATE} > ${ZEPHYR_ITS_FILE}
+ 	${MKIMAGE} -D "-W no-unit_address_vs_reg" -f ${ZEPHYR_ITS_FILE} -k ${STAGE_DIR} ${ZEPHYR_ITB_FILE}
+ 
+-	dd status=none conv=sync bs=4 if=${ZEPHYR_ITB_FILE} > ${DEV_PREFIX}-boot-fit.itb
++	dd status=none conv=sync bs=4 if=${ZEPHYR_ITB_FILE} > ${ITBS}/${DEV_PREFIX}-boot-fit.itb
+ popd
+diff --git a/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh b/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh
+index 3993f74..b5e93ba 100755
+--- a/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh
++++ b/board/habanalabs/fs1_arc/fs1-post-image-spi-arc_global.sh
+@@ -58,7 +58,6 @@
+ SECURITY_VER_FILE=${SPECS_EMBEDDED_ROOT}/fs/${DEV_PREFIX}/${DEV_PREFIX}_security.h
+ export BOOT_POINTER_HEADER=${SPECS_EMBEDDED_ROOT}/fs/common/hl_boot_desc.h
+ 
+-source ${DEVICE_BASE}/fs1-image-utility.sh
+ source ${DEVICE_BASE}/post-image-spi.sh
+ 
+ SECURITY_FW_VERSION=$(grep -owE "HL_SEC_FW_VERSION[[:space:]]+[0-9]+" $SECURITY_VER_FILE | sed 's/^.*[ \t]\([0-9]\+\)/\1/;')
+@@ -115,16 +114,16 @@
+         KEY_OFFSET=${3}
+         KEY_BASE_NAME_PUB=${KEY_BASE_NAME}.pub
+ 
+-	calculate_hash ${NAME}_${KEY_BASE_NAME_PUB} ${NAME}_${KEY_BASE_NAME_PUB}.hash
+-	cat ${NAME}_${KEY_BASE_NAME_PUB}.hash				> ${FILE}.tmp
++	calculate_hash ${NAME}_${KEY_BASE_NAME_PUB} ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash
++	cat ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash				> ${FILE}.tmp
+ 	dd status=none conv=notrunc seek=$(( ${KEY_OFFSET}*2 + 1 )) bs=16 if=${FILE}.tmp of=${FILE}
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+ 		for i in $(seq 1 $HASH_SZ); do
+-			DWORD=$(xxd -e -c32 -g4 ${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
++			DWORD=$(xxd -e -c32 -g4 ${STAGE_DIR}/${NAME}_${KEY_BASE_NAME_PUB}.hash | cut -d' ' -f$(( ${i} + 2 )))
+ 			OFFSET=$(( $(( ${KEY_OFFSET}*8 )) +  ${i} ))
+ 			FORCE="{h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_$(( 18 + ${OFFSET}))_r.data_in_r[31:0]}"
+-			echo "force ${FORCE} 'h${DWORD}" >> ${HL_TARGET}-force.hex
++			echo "force ${FORCE} 'h${DWORD}" >> ${STAGE_DIR}/${HL_TARGET}-force.hex
+ 		done
+ 	fi
+ }
+@@ -132,9 +131,9 @@
+ function hl_key_revoke {
+ 	REVOKE_STATUS=$1
+ 	if [ $REVOKE_STATUS -eq 1 ]; then
+-		echo -n fe >> revoke_status.hex
++		echo -n fe >> ${STAGE_DIR}/revoke_status.hex
+ 	else
+-		echo -n ff >> revoke_status.hex
++		echo -n ff >> ${STAGE_DIR}/revoke_status.hex
+ 	fi
+ }
+ 
+@@ -152,7 +151,7 @@
+ 	DWORD=$(( DWORD + $((${FW_VERSION_LOCATION}<<13))))
+ 	DWORD=$(( DWORD + $((${SPI_CONTROLLER}<<17))))
+ 	DWORD=$(printf "%08x" ${DWORD})
+-	echo "force {h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_58_r.data_in_r[31:0]} 'h${DWORD}" > ${HL_TARGET}-force.hex
++	echo "force {h5_core.h5_psoc_top.psoc_macro.efuse.efuse_cfg_reg.u_efuse_cfg_reg_fields.u_cfg_reg_base_data_58_r.data_in_r[31:0]} 'h${DWORD}" > ${HEXS_DIR}${HL_TARGET}-force.hex
+ }
+ 
+ pushd ${STAGE_DIR}
+diff --git a/board/habanalabs/fs1_arc/post-image-spi.sh b/board/habanalabs/fs1_arc/post-image-spi.sh
+index 2ad8e99..929b271 100755
+--- a/board/habanalabs/fs1_arc/post-image-spi.sh
++++ b/board/habanalabs/fs1_arc/post-image-spi.sh
+@@ -291,24 +291,24 @@
+ 		KEY_NAME=$(echo -n "cust${KEY_NUM}_${KEY_BASE_NAME}")
+ 	fi
+ 
+-	extract_key_props ${KEY_NAME} r-squared rr.prop
++	extract_key_props ${KEY_NAME} r-squared ${STAGE_DIR}/rr.prop
+ 
+-	extract_key_props ${KEY_NAME} modulus mod.prop
++	extract_key_props ${KEY_NAME} modulus ${STAGE_DIR}/mod.prop
+ 
+-	extract_key_props ${KEY_NAME} exponent exp.prop
++	extract_key_props ${KEY_NAME} exponent ${STAGE_DIR}/exp.prop
+ 
+-	extract_key_props ${KEY_NAME} n0-inverse inv.proptemp
+-	swap_file inv.proptemp inv.prop
++	extract_key_props ${KEY_NAME} n0-inverse ${STAGE_DIR}/inv.proptemp
++	swap_file ${STAGE_DIR}/inv.proptemp ${STAGE_DIR}/inv.prop
+ 
+-	extract_key_props ${KEY_NAME} num-bits nb.proptemp
+-	swap_file nb.proptemp nb.prop
++	extract_key_props ${KEY_NAME} num-bits ${STAGE_DIR}/nb.proptemp
++	swap_file ${STAGE_DIR}/nb.proptemp ${STAGE_DIR}/nb.prop
+ 
+ 	#no separate public key will be part of the image, since these props serve the purpose.
+ 	# Hash will be computed on the Props itself
+-	cat rr.prop mod.prop exp.prop inv.prop nb.prop	> ${KEY_NAME}.pub
+-	cat rr.prop mod.prop exp.prop inv.prop nb.prop	> ${KEY_NAME}-key-props.bin
++	cat ${STAGE_DIR}/rr.prop ${STAGE_DIR}/mod.prop ${STAGE_DIR}/exp.prop ${STAGE_DIR}/inv.prop ${STAGE_DIR}/nb.prop	> ${STAGE_DIR}/${KEY_NAME}.pub
++	cat ${STAGE_DIR}/rr.prop ${STAGE_DIR}/mod.prop ${STAGE_DIR}/exp.prop ${STAGE_DIR}/inv.prop ${STAGE_DIR}/nb.prop	> ${STAGE_DIR}/${KEY_NAME}-key-props.bin
+ 
+-	rm -f *.txt *.proptemp *.prop
++	rm -f ${STAGE_DIR}/*.txt ${STAGE_DIR}/*.proptemp ${STAGE_DIR}/*.prop
+ }
+ 
+ function hl_chksum_padding {
+diff --git a/board/habanalabs/gaudi2_arc/post-image-spi.sh b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+index ba0c56c..ea877f9 100755
+--- a/board/habanalabs/gaudi2_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+@@ -85,7 +85,7 @@
+ 	TMPNAME=${KEY_NAME}-${PROP_NAME}.txt
+ 	fdtget ${KEY_NAME}.dtb /signature/key-${KEY_NAME} rsa,${PROP_NAME} -t bx > ${STAGE_DIR}/${TMPNAME}
+ 	sed 's/\s\+/\n/g' ${STAGE_DIR}/${TMPNAME} > ${STAGE_DIR}/${TMPNAME}.tmp
+-	sed -e 's/\b[0-9]\b/0&/' -e 's/\b[a-f]\b/0&/' ${STAGE_DIR}/${TMPNAME}.tmp  > ${STAGE_DIR}/${TMPNAME}.tmp.le
++	sed -e 's/\b[0-9]\b/0&/' -e 's/\b[a-f]\b/0&/' ${STAGE_DIR}/${TMPNAME}.tmp > ${STAGE_DIR}/${TMPNAME}.tmp.le
+ 	xxd -r -p ${STAGE_DIR}/${TMPNAME}.tmp.le > ${OUT_NAME}
+ 	rm -f ${STAGE_DIR}/${TMPNAME}.*
+ }
+@@ -159,11 +159,11 @@
+ 	VPKFILE=${TEMPNAME}.ver.payload.key
+ 
+ 	#No need to pack Public Key, since Key Props are enough
+-	cat ${TEMPFULLPATH}.ver ${TEMPFULLPATH} ${BINS_DIR}/${KEY_NAME}-key-props.bin > ${STAGE_DIR}/${VPKFILE}
++	cat ${TEMPFULLPATH}.ver ${TEMPFULLPATH} ${STAGE_DIR}/${KEY_NAME}-key-props.bin > ${STAGE_DIR}/${VPKFILE}
+ 
+ 	$OPENSSL dgst -sha384 -binary ${STAGE_DIR}/${VPKFILE} > ${STAGE_DIR}/psk_${VPKFILE}.sha384
+ 
+-	hl_sign_bin ${STAGE_DIR}/${VPKFILE} ${KEY_NAME}
++	hl_sign_bin ${STAGE_DIR}/${VPKFILE} ${STAGE_DIR}/${KEY_NAME}
+ 	if [ ${SIGN_ERROR} -eq 1 ]; then
+ 		dd status=none conv=sync count=24 bs=16 if=/dev/urandom	> ${STAGE_DIR}/${VPKFILE}.sig
+ 	fi
+@@ -387,11 +387,11 @@
+ 	BINFILE=$1
+ 	local BINFILE_BASE=$(basename ${BINFILE})
+ 
+-	cat ${BINFILE}>${STAGE_DIR}/${BINFILE}.tmp.pad
+-	dd status=none conv=sync bs=16 if=${STAGE_DIR}/${BINFILE}.tmp.pad of=${STAGE_DIR}/${BINFILE}.tmp.algn
+-	hl_calc_crc32 ${STAGE_DIR}/${BINFILE}.tmp.algn
+-	cat ${STAGE_DIR}/${BINFILE}.tmp.algn ${STAGE_DIR}/${BINFILE}.tmp.algn.crc32 > ${BINS_DIR}/${DEV_PREFIX}-${BINFILE_BASE}
+-	rm -rf ${STAGE_DIR}/${BINFILE}.tmp*
++	cat ${BINFILE} > ${STAGE_DIR}/${BINFILE_BASE}.tmp.pad
++	dd status=none conv=sync bs=16 if=${STAGE_DIR}/${BINFILE_BASE}.tmp.pad of=${STAGE_DIR}/${BINFILE_BASE}.tmp.algn
++	hl_calc_crc32 ${STAGE_DIR}/${BINFILE_BASE}.tmp.algn
++	cat ${STAGE_DIR}/${BINFILE_BASE}.tmp.algn ${STAGE_DIR}/${BINFILE_BASE}.tmp.algn.crc32 > ${BINS_DIR}/${DEV_PREFIX}-${BINFILE_BASE}
++	rm -rf ${STAGE_DIR}/${BINFILE_BASE}.tmp*
+ }
+ 
+ function prep_erom_fit {
+diff --git a/board/habanalabs/gaudi3/post-image-fit.sh b/board/habanalabs/gaudi3/post-image-fit.sh
+index 7c0eba3..ce122cc 100644
+--- a/board/habanalabs/gaudi3/post-image-fit.sh
++++ b/board/habanalabs/gaudi3/post-image-fit.sh
+@@ -8,7 +8,7 @@
+ 
+ ETH_PHY_FW_HEX_FILE=${DEV_BASE}/eth_phy_fw.hex
+ ETH_PHY_FW_HASH_FILE=${DEV_BASE}/eth_phy_fw.md5
+-ETH_PHY_FW_BIN_FILE=${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_NAME}-eth-phy.bin.le
++ETH_PHY_FW_BIN_FILE=${BINS_DIR}/${DEV_NAME}-eth-phy.bin.le
+ 
+ hl_create_section_variables
+ 
+@@ -52,12 +52,12 @@
+ 	FILEPATH=$1
+ 
+ 	# copy binaries from other HL targets required for boot fit creation
+-	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-pid-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-pid-iccm.bin.le
+-	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-pid-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-pid-dccm.bin.le
+-	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-mgmt-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-mgmt-iccm.bin.le
+-	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-mgmt-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-mgmt-dccm.bin.le
+-	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-event-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-event-iccm.bin.le
+-	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-event-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-event-dccm.bin.le
++	cp ${STAGE_DIR}/${DEV_PREFIX}-zephyr-pid-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-pid-iccm.bin.le
++	cp ${STAGE_DIR}/${DEV_PREFIX}-zephyr-pid-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-pid-dccm.bin.le
++	cp ${STAGE_DIR}/${DEV_PREFIX}-zephyr-mgmt-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-mgmt-iccm.bin.le
++	cp ${STAGE_DIR}/${DEV_PREFIX}-zephyr-mgmt-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-mgmt-dccm.bin.le
++	cp ${STAGE_DIR}/${DEV_PREFIX}-zephyr-event-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-event-iccm.bin.le
++	cp ${STAGE_DIR}/${DEV_PREFIX}-zephyr-event-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-event-dccm.bin.le
+ 
+ 	prep_eth_phy_fw_binary ${ETH_PHY_FW_HEX_FILE} ${ETH_PHY_FW_BIN_FILE}
+ 
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index a344615..4d03076 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -129,8 +129,8 @@
+ 
+ 	#no separate public key will be part of the image, since these props serve the purpose.
+ 	# Hash will be computed on the Props itself
+-	cat ${STAGE_DIR}/rr.prop ${STAGE_DIR}/mod.prop ${STAGE_DIR}/exp.prop ${STAGE_DIR}/inv.prop nb.prop	> ${BINS_DIR}/${KEY_NAME}.pub
+-	cat ${STAGE_DIR}/rr.prop ${STAGE_DIR}/mod.prop ${STAGE_DIR}/exp.prop ${STAGE_DIR}/inv.prop nb.prop	>${BINS_DIR}/${KEY_NAME}-key-props.bin
++	cat ${STAGE_DIR}/rr.prop ${STAGE_DIR}/mod.prop ${STAGE_DIR}/exp.prop ${STAGE_DIR}/inv.prop nb.prop	> ${STAGE_DIR}/${KEY_NAME}.pub
++	cat ${STAGE_DIR}/rr.prop ${STAGE_DIR}/mod.prop ${STAGE_DIR}/exp.prop ${STAGE_DIR}/inv.prop nb.prop	> ${STAGE_DIR}/${KEY_NAME}-key-props.bin
+ 
+ 	rm -f ${STAGE_DIR}/*.txt ${STAGE_DIR}/*.proptemp ${STAGE_DIR}/*.prop
+ }
+@@ -459,8 +459,8 @@
+ 	local EROM_IMG=$2
+ 
+ 	# Prepare the NEXT and MODIFIABLE for backward compatibility
+-	echo "11110000" > ${HL_DEV}-next-image.txt
+-	dd status=none conv=sync bs=8 count=1 if=${HL_DEV}-next-image.txt of=$img_file
++	echo "11110000" > ${STAGE_DIR}/${HL_DEV}-next-image.txt
++	dd status=none conv=sync bs=8 count=1 if=${STAGE_DIR}/${HL_DEV}-next-image.txt of=$img_file
+ 
+ 	# Pointers structure magic "NXT"0x0
+ 	printf "%x%x%x00" "'N" "'X" "'T" | rev_bytes_stdin | xxd -r -p -s +8 - $img_file
+@@ -554,7 +554,7 @@
+ 	PKFILE=${TEMPNAME}.payload.key
+ 	PKFULLFILE=${TEMPFULLNAME}.payload.key
+ 
+-	cat ${TEMPFULLNAME} ${KEY_NAME}-key-props.bin >${PKFULLFILE}
++	cat ${TEMPFULLNAME} ${STAGE_DIR}/${KEY_NAME}-key-props.bin > ${PKFULLFILE}
+ 
+ 	#The size of the complete image(Payload + Key + Signature) needs to be calculated
+ 	#and placed in the manifest even before hashing and signing over it as the size
+@@ -580,11 +580,11 @@
+ 
+ 	$OPENSSL dgst -sha384 -binary ${PKFULLFILE} > ${PKFULLFILE}.sha384
+ 
+-	hl_sign_bin ${PKFULLFILE} ${KEY_NAME}
++	hl_sign_bin ${PKFULLFILE} ${STAGE_DIR}/${KEY_NAME}
+ 
+ 	SIGBINFILE=${PKFILE}.sig.bin
+ 
+-	cat ${PKFULLFILE} ${PKFULLFILE}.sig			>${STAGE_DIR}/${SIGBINFILE}
++	cat ${PKFULLFILE} ${PKFULLFILE}.sig > ${STAGE_DIR}/${SIGBINFILE}
+ 
+ 	prep_img_desc_with_crc ${STAGE_DIR}/${SIGBINFILE}
+ 
+@@ -609,10 +609,10 @@
+ 
+ 	prep_image_ptrs_common_v4 ${STAGE_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.le $IMAGE_TYPE_EROM
+ 
+-	prep_img_desc_with_crc ${BINS_DIR}/${EROM_PCIE_BINFILE}
+-	prep_img_desc_with_crc ${BINS_DIR}/${EROM_RECOVERY_BINFILE}
++	prep_img_desc_with_crc ${STAGE_DIR}/${EROM_PCIE_BINFILE}
++	prep_img_desc_with_crc ${STAGE_DIR}/${EROM_RECOVERY_BINFILE}
+ 
+-	hl_reverse_words ${BINS_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.le \
++	hl_reverse_words ${STAGE_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.le \
+ 	${BINS_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.be 4
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+@@ -648,7 +648,7 @@
+ 	${OBJCOPY} -S --gap-fill 0xff --output-target=binary --remove-section=.comment\
+ 	$(echo -n $SECTIONS | sed 's/[^ ]* */ --only-section=&/g') ${FILEPATH}/${PREFIX}.elf \
+ 	--set-section-flags=bss=alloc,load,contents --set-section-flags=.stack=alloc,load,contents\
+-	${BINARIES_DIR}/${PREFIX}-${MEM}.bin.int
++	${STAGE_DIR}/${PREFIX}-${MEM}.bin.int
+ 
+ 	dd status=none conv=sync bs=${ALIGN} if=${STAGE_DIR}/${PREFIX}-${MEM}.bin.int > \
+ 	${BINS_DIR}/${PREFIX}-${MEM}.bin
+diff --git a/package/zephyr/zephyr.mk b/package/zephyr/zephyr.mk
+index 6e4b7d6..6d63015 100644
+--- a/package/zephyr/zephyr.mk
++++ b/package/zephyr/zephyr.mk
+@@ -103,7 +103,7 @@
+ ZEPHYR_CONF_OPTS += -DPWRBRK_GROUP_ID=$(PWR_BRK_DUP_ID)
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(call CREATE_APP_VERSION,arcpid,$(ZEPHYR_PID_DIR)) $(ZEPHYR_CONF_OPTS_PID) -B $(ZEPHYR_PID_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_PID_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PID_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_pid.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PID_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_pid.elf
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PID_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_pid.stat
+ ZEPHYR_PID_MODULES = mbedtls boot_info eeprom
+ $(foreach module,$(ZEPHYR_PID_MODULES),$(call DEFINE_MODULE_ENVVARS,$(module),$(ZEPHYR_PID_DIR),$(ZEPHYR_PID_NAME)))
+@@ -126,7 +126,7 @@
+ ZEPHYR_CONF_OPTS_MGMT += $(ZEPHYR_MGMT_SRCDIR)
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(call CREATE_APP_VERSION,arcmgmt,$(ZEPHYR_MGMT_DIR)) $(ZEPHYR_CONF_OPTS_MGMT) -B $(ZEPHYR_MGMT_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_MGMT_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_MGMT_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_mgmt.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_MGMT_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_mgmt.elf
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_MGMT_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_mgmt.stat
+ ZEPHYR_MGMT_MODULES = eeprom mbedtls boot_info i2c-indirect soc_init hl_shell mctp pldm
+ $(foreach module,$(ZEPHYR_MGMT_MODULES),$(call DEFINE_MODULE_ENVVARS,$(module),$(ZEPHYR_MGMT_DIR),$(ZEPHYR_MGMT_NAME)))
+@@ -148,7 +148,7 @@
+ ZEPHYR_CONF_OPTS_EVENT += $(ZEPHYR_EVENT_SRCDIR)
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(ZEPHYR_CONF_OPTS_EVENT) -B $(ZEPHYR_EVENT_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_EVENT_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_EVENT_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_event.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_EVENT_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_event.elf
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_EVENT_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_event.stat
+ ZEPHYR_EVENT_MODULES = boot_info mbedtls
+ $(foreach module,$(ZEPHYR_EVENT_MODULES),$(call DEFINE_MODULE_ENVVARS,$(module),$(ZEPHYR_EVENT_DIR),$(ZEPHYR_EVENT_NAME)))
+@@ -176,8 +176,8 @@
+ ZEPHYR_CONF_OPTS_PREBOOT += -DEXTRA_CFLAGS="-include $(SPECS_EMB_PROJ_DIR)/$(DEVICE_NAME)/$(DEVICE_NAME)_boot_info.h $(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)"
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(call CREATE_APP_VERSION,preboot,$(ZEPHYR_PREBOOT_DIR)) $(ZEPHYR_CONF_OPTS_PREBOOT) -B $(ZEPHYR_PREBOOT_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_PREBOOT_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_DIR)/zephyr/zephyr.bin $(BINARIES_DIR)/preboot.bin
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_preboot.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_DIR)/zephyr/zephyr.bin $(STAGE_DIR)/preboot.bin
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_preboot.elf
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_preboot.stat
+ 
+ ZEPHYR_PREBOOT_MODULES = fdt boot_info mbedtls eeprom soc_init hl_shell mctp pldm
+@@ -197,8 +197,8 @@
+ ZEPHYR_CONF_OPTS_PREBOOT_D1 += $(ZEPHYR_PREBOOT_D1_SRCDIR)
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(call CREATE_APP_VERSION,preboot,$(ZEPHYR_PREBOOT_D1_DIR)) $(ZEPHYR_CONF_OPTS_PREBOOT_D1) -B $(ZEPHYR_PREBOOT_D1_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_PREBOOT_D1_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_D1_DIR)/zephyr/zephyr.bin $(BINARIES_DIR)/preboot_d1.bin
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_D1_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_preboot_d1.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_D1_DIR)/zephyr/zephyr.bin $(STAGE_DIR)/preboot_d1.bin
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_D1_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_preboot_d1.elf
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_PREBOOT_D1_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_preboot_d1.stat
+ endif #BR2_PACKAGE_ZEPHYR_ARC_PREBOOT_D1
+ 
+@@ -213,7 +213,7 @@
+ ZEPHYR_CONF_OPTS_DSM += $(ZEPHYR_DSM_SRCDIR)
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(ZEPHYR_CONF_OPTS_DSM) -B $(ZEPHYR_DSM_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_DSM_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_DSM_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_dsm.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_DSM_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_dsm.elf
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_DSM_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_dsm.stat
+ endif
+ 
+@@ -237,7 +237,7 @@
+ ZEPHYR_CONF_OPTS_AGENT_FW_LOADER += -DFAKE_SECURITY=$(FAKE_SECURITY)
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(call CREATE_APP_VERSION,fw-loader,$(ZEPHYR_FW_LOADER_DIR)) $(ZEPHYR_CONF_OPTS_AGENT_FW_LOADER) -B $(ZEPHYR_FW_LOADER_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_FW_LOADER_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_FW_LOADER_DIR)/zephyr/zephyr.bin $(BINARIES_DIR)/zephyr_agent_fw_loader.bin
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_FW_LOADER_DIR)/zephyr/zephyr.bin $(STAGE_DIR)/zephyr_agent_fw_loader.bin
+ # The stat file is used for extracting the binary's load address and start address
+ ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_FW_LOADER_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_agent_fw_loader.stat
+ ZEPHYR_FW_LOADER_MODULES = boot_info eeprom fdt i2c-indirect lz4 mbedtls hl_shell soc_init
+@@ -267,7 +267,7 @@
+ $(eval ZEPHYR_CONF_OPTS_AGENT += $2) \
+ $(eval ZEPHYR_CONFIGURE_CMDS += && $$(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $$(ZEPHYR_CONF_OPTS) $(ZEPHYR_CONF_OPTS_AGENT) -B $(ZEPHYR_AGENT_DIR)) \
+ $(eval ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $$(@D)/$(ZEPHYR_AGENT_DIR)) \
+-$(eval ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $$(@D)/$(ZEPHYR_AGENT_DIR)/zephyr/zephyr.bin $(BINARIES_DIR)/zephyr_agent_$1.bin) \
++$(eval ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $$(@D)/$(ZEPHYR_AGENT_DIR)/zephyr/zephyr.bin $(STAGE_DIR)/zephyr_agent_$1.bin) \
+ $(eval ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $$(@D)/$(ZEPHYR_AGENT_DIR)/zephyr/zephyr.stat $(STATS_DIR)/zephyr_agent_$1.stat) \
+ $(foreach module,$(ZEPHYR_$(AGENT_UPPER_CASE)_MODULES),$(call DEFINE_MODULE_ENVVARS,$(module),$(ZEPHYR_$(AGENT_UPPER_CASE)_DIR), $(ZEPHYR_$(AGENT_UPPER_CASE)_NAME)))
+ endef
+@@ -303,7 +303,7 @@
+ endif
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(call CREATE_APP_VERSION,test,$(ZEPHYR_UTEST_DIR)) $(ZEPHYR_CONF_OPTS_UTEST) -B $(ZEPHYR_UTEST_DIR)
+ ZEPHYR_BUILD_CMDS += && $(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/$(ZEPHYR_UTEST_DIR)
+-ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_UTEST_DIR)/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_utest.elf
++ZEPHYR_INSTALL_TARGET_CMDS += && $(INSTALL) -D -m 0644 $(@D)/$(ZEPHYR_UTEST_DIR)/zephyr/zephyr.elf $(ELFS_DIR)/zephyr_utest.elf
+ endif
+ 
+ # Arguments:
+diff --git a/scripts/make/common/Makefile b/scripts/make/common/Makefile
+index 4993f1f..6171161 100644
+--- a/scripts/make/common/Makefile
++++ b/scripts/make/common/Makefile
+@@ -293,12 +293,12 @@
+ define hl-check-files
+ 	$(if $(1),,$(error Files list parameter must be provided))
+ 	@for fit in $(1); do				\
+-		if [ ! -f $(IMAGES_DIR)/$$fit ]; then					\
+-			echo "File does not exist - $(IMAGES_DIR)/$$fit" ; exit 1 ;	\
++		if [ ! -f $(ITBSS_DIR)/$$fit ]; then					\
++			echo "File does not exist - $(ITBS_DIR)/$$fit" ; exit 1 ;	\
+ 		fi;							\
+-		FSIZE=$$(du -b $(IMAGES_DIR)/$$fit | cut -f 1) ;			\
++		FSIZE=$$(du -b $(ITBS_DIR)/$$fit | cut -f 1) ;			\
+ 		if [ $$FSIZE -eq 0 ]; then				\
+-			echo "Empty file - $(IMAGES_DIR)/$$fit" ; exit 1 ;		\
++			echo "Empty file - $(ITBS_DIR)/$$fit" ; exit 1 ;		\
+ 		fi							\
+ 	done
+ endef
+diff --git a/scripts/make/gaudi2/Makefile b/scripts/make/gaudi2/Makefile
+index a8232de..e0e60d9 100644
+--- a/scripts/make/gaudi2/Makefile
++++ b/scripts/make/gaudi2/Makefile
+@@ -228,11 +228,7 @@
+ 
+ .PHONY: gaudi2-debug-elfs-create
+ gaudi2-debug-elfs-create:
+-	@mkdir -p $(IMAGES_DIR)/elfs
+-	@for elf in $$(ls $(BR2_EXTERNAL)/output/{gaudi2,gaudi2_arc}/build/zephyr-custom/*/zephyr/zephyr.elf); do \
+-		cp $${elf} $(IMAGES_DIR)/elfs/`echo $${elf} | sed "s@.*/\(.*\)/zephyr/zephyr.elf@\1.elf@"`; \
+-	done
+-	@tar czf $(IMAGES_DIR)/${HL_DEV}-elfs.tgz -C $(IMAGES_DIR)/ elfs
++	@tar czf $(IMAGES_DIR)/${HL_DEV}-elfs.tgz -C $(ELFS_DIR)
+ 	@echo
+ 	@echo Created $(IMAGES_DIR)/${HL_DEV}-elfs.tgz
+ 	@echo
+diff --git a/scripts/make/gaudi2_arc/Makefile b/scripts/make/gaudi2_arc/Makefile
+index 5353ae7..4ead17e 100644
+--- a/scripts/make/gaudi2_arc/Makefile
++++ b/scripts/make/gaudi2_arc/Makefile
+@@ -7,11 +7,11 @@
+ 	sshpass -p$(HL_PASSWD) $(SCP) $(ARCBOOT_BASE)/arcboot_rom	root@$(HL_INSTALL_ONIX_LAB_IP):/lib/firmware/habanalabs/$(HL_DEV)/
+ 	sshpass -p$(HL_PASSWD) $(SCP) $(PPBOOT_BASE)/preboot	root@$(HL_INSTALL_ONIX_LAB_IP):/lib/firmware/habanalabs/$(HL_DEV)/
+ 	sshpass -p$(HL_PASSWD) $(SCP) $(PPBOOT_BASE)/ppboot	root@$(HL_INSTALL_ONIX_LAB_IP):/lib/firmware/habanalabs/$(HL_DEV)/
+-	sshpass -p$(HL_PASSWD) $(SCP) $(IMAGES_DIR)/$(HL_DEV)-spi-flash.bin	root@$(HL_INSTALL_ONIX_LAB_IP):/lib/firmware/habanalabs/$(HL_DEV)/
++	sshpass -p$(HL_PASSWD) $(SCP) $(BINS_DIR)/$(HL_DEV)-spi-flash.bin	root@$(HL_INSTALL_ONIX_LAB_IP):/lib/firmware/habanalabs/$(HL_DEV)/
+ 
+ .PHONY: gaudi2_arc-pldm-install
+ gaudi2_arc-pldm-install: gaudi2_arc-pldm-target
+ HL_INSTALL_PALAD ?= vlsi-palad
+ gaudi2_arc-pldm-install:
+-	sshpass -ppalad12345 $(SCP) -r $(IMAGES_DIR)/*.hex	\
++	sshpass -ppalad12345 $(SCP) -r $(HEXS_DIR)/*.hex	\
+ 	palad@$(HL_INSTALL_PALAD):/data_pallad/emulation/palladium/h5/debug/tests/arc/secure_boot/
+diff --git a/scripts/make/gaudi3/Makefile b/scripts/make/gaudi3/Makefile
+index 0b34000..f5b621e 100644
+--- a/scripts/make/gaudi3/Makefile
++++ b/scripts/make/gaudi3/Makefile
+@@ -34,11 +34,7 @@
+ 
+ .PHONY: gaudi3-debug-elfs-create
+ gaudi3-debug-elfs-create:
+-	@mkdir -p $(IMAGES_DIR)/elfs
+-	@for elf in $$(ls $(BR2_EXTERNAL)/output/gaudi3_arc/build/zephyr-custom/*/zephyr/zephyr.elf); do \
+-		cp $${elf} $(IMAGES_DIR)/elfs/`echo $${elf} | sed "s@.*/\(.*\)/zephyr/zephyr.elf@\1.elf@"`; \
+-	done
+-	@tar czf $(IMAGES_DIR)/${HL_DEV}-elfs.tgz -C $(IMAGES_DIR)/ elfs
++	@tar czf $(IMAGES_DIR)/${HL_DEV}-elfs.tgz -C $(ELFS_DIR)/
+ 	@echo
+ 	@echo Created $(IMAGES_DIR)/${HL_DEV}-elfs.tgz
+ 	@echo
+@@ -125,7 +121,7 @@
+ 				gaudi3-rr-dump-create
+ 
+ 	@$(call hl-check-files,$(GAUDI3_INTERNAL_FITS))
+-	@tar czf $(IMAGES_DIR)/${DEV_PREFIX}-int-fit.tgz -C $(IMAGES_DIR)/ $(GAUDI3_INTERNAL_FITS)
++	@tar czf $(IMAGES_DIR)/${DEV_PREFIX}-int-fit.tgz -C $(ITBS_DIR)/ $(GAUDI3_INTERNAL_FITS)
+ 
+ .PHONY: gaudi3-internal-fit-install
+ gaudi3-internal-fit-install:
+@@ -152,7 +148,7 @@
+ 				gaudi3-efuse-read-create gaudi3-nic-sec-create
+ 
+ 	@$(call hl-check-files,$(GAUDI3_SECURITY_FITS))
+-	@tar czf $(IMAGES_DIR)/${DEV_PREFIX}-sec-fit.tgz -C $(IMAGES_DIR)/ $(GAUDI3_SECURITY_FITS)
++	@tar czf $(IMAGES_DIR)/${DEV_PREFIX}-sec-fit.tgz -C $(ITBS_DIR)/ $(GAUDI3_SECURITY_FITS)
+ 
+ .PHONY: gaudi3-security-fit-install
+ gaudi3-security-fit-install:
+diff --git a/scripts/make/hl-common/Makefile b/scripts/make/hl-common/Makefile
+index fe713df..92f1f5a 100644
+--- a/scripts/make/hl-common/Makefile
++++ b/scripts/make/hl-common/Makefile
+@@ -381,7 +381,7 @@
+ 
+ .PHONY: %-bin-create
+ %-bin-create:
+-	BIN_DIR=output/${HL_DEV}/host/bin $(HABANA_SOFTWARE_STACK)/automation/habana_scripts/embedded/scripts/itb2spi.sh -s $(addprefix -i output/${HL_DEV}/images/,$(HL_BIN_FITS)) -o $(FLASH_BIN_FILE) && \
++	BIN_DIR=output/${HL_DEV}/host/bin $(HABANA_SOFTWARE_STACK)/automation/habana_scripts/embedded/scripts/itb2spi.sh -s $(addprefix -i $(BINS_DIR),$(HL_BIN_FITS)) -o $(FLASH_BIN_FILE) && \
+ 	source ${BR2_EXTERNAL}/board/habanalabs/common/image-utility.sh && \
+ 	pushd $(IMAGES_DIR) && \
+ 	swap_file $(FLASH_BIN_FILE) $(FLASH_BIN_FILE).rev && \

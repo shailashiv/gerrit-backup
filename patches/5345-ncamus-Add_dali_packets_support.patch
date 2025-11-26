@@ -1,0 +1,152 @@
+From cb9a909c7a9a85823ffd206fd18d8f85f2451d8e Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sat, 28 Apr 2018 20:58:18 +0300
+Subject: [PATCH] Add dali packets support
+
+For all host requests passed by KMD
+---
+
+diff --git a/board/habanalabs/common/rootfs_overlay/usr/sbin/eeprog b/board/habanalabs/common/rootfs_overlay/usr/sbin/eeprog
+new file mode 100755
+index 0000000..17772bf
+--- /dev/null
++++ b/board/habanalabs/common/rootfs_overlay/usr/sbin/eeprog
+@@ -0,0 +1,50 @@
++#!/bin/sh
++
++DEV=`find /sys -name eeprom`
++if [ ! -e ${DEV} ]; then
++	echo "No eeprom device found"
++	exit 1
++fi
++
++SIZE=256
++PAGESIZE=16
++MAX_PAGE_ID=$((${SIZE}/${PAGESIZE} - 1))
++LAYOUT=/tmp/eeprom-layout
++
++for i in `seq 0 ${MAX_PAGE_ID}`; do
++	dd status=none bs=${PAGESIZE} count=1 seek=$i skip=$i if=${DEV} of=${LAYOUT};
++done
++
++function print_field_num
++{
++	NAME=${1}
++	OFFSET=${2}
++	LEN=${3}
++	FIELD=`xxd -p -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT}`
++	echo "${NAME}: ${FIELD}"
++}
++
++function print_field_str
++{
++	NAME=${1}
++	OFFSET=${2}
++	LEN=${3}
++	FIELD=`xxd -g1 -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT} | tr -s ' ' | cut -d' ' -f$((${LEN}+2))- | cut -d'.' -f1`
++	echo "${NAME}: ${FIELD}"
++}
++
++LAYOUT_VER=`xxd -p -l1 ${LAYOUT}`
++if [ "${LAYOUT_VER}" -eq "0" ]; then
++	print_field_num "Layout Version" 0 1
++	print_field_num "Production Serial Number" 1 5
++	print_field_num "PCB Assembly Version" 6 1
++	print_field_num "DDR Type and Speed" 7 1
++	print_field_num "Fans Vendor" 8 1
++	print_field_num "Mechanics Vendor" 9 1
++	print_field_num "Thermal Solution Vendor" 10 1
++	print_field_num "PCIe Gen3 or Gen4 Enabled" 11 1
++	print_field_num "MAC Address" 12 6
++	print_field_str "Board Configuration" 18 64
++else
++	echo "Unknown eeprom layout"
++fi
+diff --git a/board/habanalabs/common/rootfs_overlay/usr/sbin/flash_burn b/board/habanalabs/common/rootfs_overlay/usr/sbin/flash_burn
+new file mode 100755
+index 0000000..4551870
+--- /dev/null
++++ b/board/habanalabs/common/rootfs_overlay/usr/sbin/flash_burn
+@@ -0,0 +1,82 @@
++#!/bin/sh
++
++if [ $# -eq 0 ]; then
++	echo "Usage: ${0} [-s] [-c <cksum>] <image>"
++	echo "       burn <image> into flash sectors"
++	echo "       -s, skip golden flash sectors"
++	echo "       -c <cksum>, crc32 for <image> validation"
++	exit 0
++else
++	while [ $# -gt 0 ]; do
++		case ${1} in
++			-s)
++				IS_SAFE_BURN="yes"
++				shift
++			;;
++			-c)
++				CKSUM=`printf "%d" ${2}`
++				shift
++				shift
++			;;
++			*)
++				INFILE=${1}
++				shift
++			;;
++		esac
++	done
++fi
++
++
++if [ -z "${INFILE}" ]; then
++	echo "Missing image argument"
++	exit 1
++fi
++
++if [ -n "${CKSUM}" ]; then
++	CRC32=`cksum ${INFILE} | cut -d' ' -f1`
++	if ! [ "${CKSUM}" -eq "${CRC32}" ]; then
++		CKSUM_HEX=`printf "0x%x" ${CKSUM}`
++		CRC32_HEX=`printf "0x%x" ${CRC32}`
++		echo "Mismatch with provided checksum [expected ${CKSUM_HEX} while calculated ${CRC32_HEX}]"
++		exit 2
++	fi
++fi
++
++DEVNUM=`mtdinfo				| grep "Count of MTD devices"	| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
++FULL_DEV_LIST="$(seq 0 $((${DEVNUM}-1)))"
++
++function burn_image {
++	DEV=/dev/mtd${1}
++	NAME=`mtdinfo ${DEV}		| grep "Name" 			| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
++	DEV_IS_SAFE=`mtdinfo ${DEV}	| grep "Name"			| grep " \[safe]"`
++	if [ -n "${IS_SAFE_BURN}" ] && [ -z "${DEV_IS_SAFE}" ]; then
++		return
++	fi
++
++	BLK_SIZE=`mtdinfo ${DEV}	| grep "Eraseblock size"	| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
++	BLK_CNT=`mtdinfo ${DEV}		| grep "Amount of eraseblocks"	| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
++	DEVID=`mtdinfo ${DEV}		| grep "major/minor"		| tr -s ' ' | cut -d: -f2-3	| cut -d' ' -f2`
++	OFFSET=`cat /sys/dev/char/${DEVID}/offset`
++	OFFSET_HEX=`printf "0x%x" ${OFFSET}`
++	SKIP_CNT=$((${OFFSET}/${BLK_SIZE}))
++	IMG=${INFILE}.mtd${1}
++
++	dd status=none conv=sync bs=${BLK_SIZE} skip=${SKIP_CNT} if=${INFILE} of=${IMG} count=${BLK_CNT}
++	echo -n "    ${NAME} @ ${OFFSET_HEX}... "
++	flash_erase -q -u ${DEV} 0 ${BLK_CNT}
++	flashcp ${IMG} ${DEV}
++
++	dd status=none conv=sync bs=${BLK_SIZE} if=${DEV} of=${IMG}.verify count=${BLK_CNT}
++	VERIFY=`diff -q ${IMG} ${IMG}.verify`
++	if [ -n "${VERIFY}" ]; then
++		echo "FAIL"
++		exit 3
++	else
++		echo "OK"
++	fi
++}
++
++echo "Updating MTD Partitions:"
++for i in ${FULL_DEV_LIST}; do
++	burn_image ${i}
++done

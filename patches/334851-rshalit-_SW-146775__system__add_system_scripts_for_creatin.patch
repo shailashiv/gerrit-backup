@@ -1,0 +1,291 @@
+From 72a983653be3b0d15b6fd7f66d0b1264aab103b7 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Mon, 05 Jun 2023 09:18:34 +0300
+Subject: [PATCH] [SW-146775] system: add system scripts for creating cpld and eeprom itbs
+
+Add scripts for generating eeprom.itb and cpld.itb files.
+These files are used for updating eeprom and cpld FW (respectively).
+Today, these scripts are already being used by system, but they were
+out of svn.
+
+This patch adds the scripts into svn.
+A later patch will add in script footer create.
+
+Change-Id: I80c7349a52a954638a95a610654fccef5dc3a97c
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/scripts/system/cpld/cpld.its b/scripts/system/cpld/cpld.its
+new file mode 100644
+index 0000000..0d37ccc
+--- /dev/null
++++ b/scripts/system/cpld/cpld.its
+@@ -0,0 +1,31 @@
++/* CPLD fit for updating CPLD binary */
++/dts-v1/;
++/ {
++	hl-device = "@HL_DEV@";
++	description = "FIT cpld";
++	#address-cells = <2>;
++
++	images {
++		cpldimage {
++			description = "Habana cpld";
++			data = /incbin/("@CPLD_BIN@");
++			compression = "none";
++			offset = <0x0>;
++			hash {
++				algo = "@SHA_VERSION@";
++			};
++		};
++	};
++
++	configurations {
++		default = "fw-loader-conf";
++		fw-loader-conf {
++			load-type = <@FIT_LOAD_TYPE_CPLD@>;
++			target-device = <@TARGET_DEVICE_CPLD@>;
++			load-bootloader;
++			description = "Habanalabs cpld";
++			/* fw-loader expects loadbales for fit verification */
++			loadables = "cpldimage";
++		};
++	};
++};
+diff --git a/scripts/system/cpld/create-cpld-fit.sh b/scripts/system/cpld/create-cpld-fit.sh
+new file mode 100755
+index 0000000..a2b5caf
+--- /dev/null
++++ b/scripts/system/cpld/create-cpld-fit.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++
++set -e          # stop on any error in this script
++set -u          # stop on any reference to undefine variable
++set -o pipefail # stop on any error in pipeline
++
++
++MKIMAGE_FILE=mkimage
++CPLD_ITS_TEMPLATE=cpld.its
++FIT_LOAD_TYPE_CPLD=8
++HL_DEV=${1}
++CPLD_ITS_FILE=${HL_DEV}-cpld.its
++CPLD_ITB_FILE=${HL_DEV}-cpld.itb
++
++function cpld_usage {
++	echo "Usage: $0 <greco/gaudi/gaudi2/gaudi3> [input vme file] [output itb file]"
++	echo "For example:"
++	echo "$0 gaudi ~/input.txt ~/output.itb"
++	echo "  shall create .itb file for gaudi using input ~/input.vme, and output itb will be created in ~/output.itb"
++	echo "This file can then be used with hl-fw-loader to program cpld"
++	echo ""
++	echo ""
++	exit
++}
++
++if [ "$#" -lt 1 ]; then
++	cpld_usage
++fi
++
++if [ "$1" = "gaudi" ]; then
++	echo "Chosen device: gaudi"
++elif [ "$1" = "gaudi2" ]; then
++	echo "Chosen device: gaudi2"
++elif [ "$1" = "gaudi3" ]; then
++	echo "Chosen device: gaudi3"
++elif [ "$1" = "greco" ]; then
++	echo "Chosen device: greco"
++else
++	cpld_usage
++fi
++
++if [ "$#" -gt 1 ] && [ -f $2 ]; then
++	INPUT_FILE=${2}
++else
++	cpld_usage
++fi
++
++if [ "$#" -gt 2 ] && [ -f $2 ]; then
++	OUTPUT_FILE=${3}
++else
++	echo "No output path, so create output in current folder."
++	OUTPUT_FILE=output.itb
++fi
++
++if [ "$HL_DEV" = "gaudi" ]; then
++	FIT_TARGET_DEV=0x1000
++	SHA_VERSION=sha256
++elif [ "$HL_DEV" = "gaudi2" ]; then
++	FIT_TARGET_DEV=0x1020
++	SHA_VERSION=sha384
++elif [ "$HL_DEV" = "gaudi3" ]; then
++	FIT_TARGET_DEV=0x1060
++	SHA_VERSION=sha384
++elif [ "$HL_DEV" = "greco" ]; then
++	FIT_TARGET_DEV=0x0020
++	SHA_VERSION=sha256
++else
++	echo "Wrong input"
++	exit
++fi
++
++ITS_SED_PARAMS+="s|@HL_DEV@|${HL_DEV}|g;"
++ITS_SED_PARAMS+="s/@TARGET_DEVICE_CPLD@/${FIT_TARGET_DEV}/g;"
++ITS_SED_PARAMS+="s|@CPLD_BIN@|${INPUT_FILE}|g;"
++ITS_SED_PARAMS+="s/@SHA_VERSION@/${SHA_VERSION}/g;"
++ITS_SED_PARAMS+="s|@FIT_LOAD_TYPE_CPLD@|${FIT_LOAD_TYPE_CPLD}|g;"
++
++sed ${ITS_SED_PARAMS} ${CPLD_ITS_TEMPLATE} > ${CPLD_ITS_FILE}
++$MKIMAGE_FILE -D "-W no-unit_address_vs_reg" -f ${CPLD_ITS_FILE} ${OUTPUT_FILE}
++
++rm ${CPLD_ITS_FILE}
+diff --git a/scripts/system/eeprom/create-eeprom-fit.sh b/scripts/system/eeprom/create-eeprom-fit.sh
+new file mode 100755
+index 0000000..4251c31
+--- /dev/null
++++ b/scripts/system/eeprom/create-eeprom-fit.sh
+@@ -0,0 +1,100 @@
++#!/usr/bin/env bash
++
++set -e          # stop on any error in this script
++set -u          # stop on any reference to undefine variable
++set -o pipefail # stop on any error in pipeline
++
++function eeprom_usage {
++	echo "Usage: $0 <greco/gaudi/gaudi2/gaudi3> [input text file] [output itb file]"
++	echo "For example:"
++	echo "$0 gaudi ~/input.txt ~/output.itb"
++	echo "  shall create .itb file for gaudi using input ~/input.txt, and output itb will be created in ~/output.itb"
++	echo "This file can then be used with hl-fw-loader to program eeprom"
++	echo ""
++	echo ""
++	exit
++}
++
++if [ "$#" -lt 1 ]; then
++	eeprom_usage
++fi
++
++if [ "$1" = "gaudi" ]; then
++	echo "Chosen device: gaudi"
++elif [ "$1" = "gaudi2" ]; then
++	echo "Chosen device: gaudi2"
++elif [ "$1" = "gaudi3" ]; then
++	echo "Chosen device: gaudi3"
++elif [ "$1" = "greco" ]; then
++	echo "Chosen device: greco"
++else
++	eeprom_usage
++fi
++
++if [ "$#" -gt 1 ] && [ -f $2 ]; then
++	INPUT_FILE=${2}
++else
++	eeprom_usage
++fi
++
++if [ "$#" -gt 2 ] && [ -f $2 ]; then
++	OUTPUT_FILE=${3}
++else
++	echo "No output path, so create output in current folder."
++	OUTPUT_FILE=output.itb
++fi
++
++echo ${INPUT_FILE}
++
++HL_DEV=${1}
++
++FIT_LOAD_TYPE_EEPROM=7
++MKIMAGE_FILE=mkimage
++EEPROM_ITS_TEMPLATE=eeprom.its
++
++if [ "$HL_DEV" = "gaudi" ] || [ "$HL_DEV" = "greco" ]; then
++	SHA_VERSION=sha256
++elif [ "$HL_DEV" = "gaudi2" ] || [ "$HL_DEV" = "gaudi3" ]; then
++	SHA_VERSION=sha384
++else
++	echo "Wrong input"
++	exit
++fi
++
++EEPROM_ITS_FILE=${HL_DEV}-eeprom.its
++EEPROM_ITB_FILE=${OUTPUT_FILE}
++ITS_SED_PARAMS+="s|@HL_DEV@|${HL_DEV}|g;"
++ITS_SED_PARAMS+="s|@FIT_LOAD_TYPE_EEPROM@|${FIT_LOAD_TYPE_EEPROM}|g;"
++ITS_SED_PARAMS+="s|@EEPROM_TXT@|${INPUT_FILE}|g;"
++ITS_SED_PARAMS+="s|@SHA_VERSION@|${SHA_VERSION}|g;"
++
++function eeprom_check_input
++{
++	FILE=$(file -b ${INPUT_FILE})
++	if [[ ${FILE} != "ASCII text" ]];then
++		echo "Error: File encoding not supported.Please use UNIX encoding supported os/editor"
++		exit 1
++	fi
++
++	INV_CHAR=$({ grep -o -P '[^a-z,A-Z,0-9,:,\x5b,\x5d,\x0a,\x3d,\x20]' ${INPUT_FILE} || test $? = 1;} | wc -w)
++	if [ ${INV_CHAR} -gt 0 ];then
++		echo "Error: Invalid characters in the input file"
++		exit 1
++	fi
++}
++
++function align_4B()
++{
++	local TMP_FILE=$(mktemp)
++
++	# LKD like this to be 4B aligned in size
++	dd status=none conv=sync bs=4 if=${1} > ${TMP_FILE}
++	mv ${TMP_FILE} ${1}
++}
++
++eeprom_check_input
++sed  ${ITS_SED_PARAMS} ${EEPROM_ITS_TEMPLATE} > ${EEPROM_ITS_FILE}
++$MKIMAGE_FILE -D "-W no-unit_address_vs_reg" -f ${EEPROM_ITS_FILE} ${EEPROM_ITB_FILE}
++
++align_4B ${EEPROM_ITB_FILE}
++rm ${EEPROM_ITS_FILE}
+diff --git a/scripts/system/eeprom/eeprom.its b/scripts/system/eeprom/eeprom.its
+new file mode 100644
+index 0000000..0841ec2
+--- /dev/null
++++ b/scripts/system/eeprom/eeprom.its
+@@ -0,0 +1,30 @@
++/* EEPROM fit */
++/dts-v1/;
++/ {
++	hl-device = "@HL_DEV@";
++	description = "FIT eeprom";
++	#address-cells = <2>;
++
++	images {
++		eeprom-data {
++			description = "Habana eeprom file";
++			data = /incbin/("@EEPROM_TXT@");
++			compression = "none";
++			offset = <0x00000000>;
++			hash {
++				algo = "@SHA_VERSION@";
++			};
++		};
++	};
++
++	configurations {
++		default = "fw-loader-conf";
++		fw-loader-conf {
++			load-type = <@FIT_LOAD_TYPE_EEPROM@>;
++			load-bootloader;
++			description = "Habanalabs eeprom";
++			/* fw-loader expects loadbales for fit verification */
++			loadables = "eeprom-data";
++		};
++	};
++};
+diff --git a/scripts/system/eeprom/eeprom.txt b/scripts/system/eeprom/eeprom.txt
+new file mode 100644
+index 0000000..eebebfb
+--- /dev/null
++++ b/scripts/system/eeprom/eeprom.txt
+@@ -0,0 +1,2 @@
++DDR Type and Speed=1cfb
++

@@ -1,0 +1,147 @@
+From e3b2ae28895cfe3b1a517c56b0cd37ae11f5c11f Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Sun, 08 Jan 2023 22:08:15 +0200
+Subject: [PATCH] [SW-112281] board: hl: add post-image-fit-script
+
+Currently several memory addresses are defined both in
+post-image-fit.sh (as variables in axi view) and in
+dtsi (in arc view), which creates duplication.
+In order to remove this duplication, this patch adds
+post-image-fit-script in dtsi, which include the
+absolute values in format of string which contains
+"variable=value".
+Therefore, by simply running eval with this string
+as an argument, the variables will also be defined in
+the bash post build script.
+
+Change-Id: Ia1bea185e59f601a9d7e20126e95af190f2d22c3
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/image-utility.sh b/board/habanalabs/common/image-utility.sh
+index 48f5650..a1542d1 100644
+--- a/board/habanalabs/common/image-utility.sh
++++ b/board/habanalabs/common/image-utility.sh
+@@ -181,3 +181,18 @@
+ 	sz=$(hl_get_off_sz_from_dtsi size $1 $2)
+ 	echo $1,${offset},${sz},16 >> $3
+ }
++
++function hl_run_dts_script {
++	for dts_file in *; do
++	echo $dts_file
++		if [[ "${dts_file}" == *"$1"* ]]; then
++			if [ "$(grep -c $2 $dts_file)" -ne 0 ]; then
++				cat $dts_file | grep $2 > script_str_list
++				while read line; do
++					script_str=`echo $line | cut -d '"' -f2`
++					eval $script_str
++				done < script_str_list
++			fi
++		fi
++	done
++}
+\ No newline at end of file
+diff --git a/board/habanalabs/gaudi2/post-image-fit.sh b/board/habanalabs/gaudi2/post-image-fit.sh
+index c83d313..157c8d8 100644
+--- a/board/habanalabs/gaudi2/post-image-fit.sh
++++ b/board/habanalabs/gaudi2/post-image-fit.sh
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env bash
++source ${COMMON_BASE}/image-utility.sh
+ 
+ # DDR/HBM Start address as needed by Linux
+ KERNEL_START_ADDR_LO=0x00000000
+@@ -16,21 +17,7 @@
+ UBOOT_ADDR_HI=0x1000FFFF
+ fi
+ 
+-ARC_MGMT_DCCM_HI=0x1000007F
+-ARC_MGMT_DCCM_LO=0xF7060000
+-ARC_MGMT_ICCM_HI=0x1000007F
+-ARC_MGMT_ICCM_LO=0xF7040000
+-ARC_MGMT_RELOC_HI=0x1000007F
+-ARC_MGMT_RELOC_LO=0xF7012400
+-ARC_PID_DCCM_HI=0x1000007F
+-# Should be aligned with arcpid DCCM_START
+-ARC_PID_DCCM_LO=0xF7020000
+-ARC_PID_ICCM_HI=0x1000007F
+-ARC_PID_ICCM_LO=0xF7000000
+-
+ UBOOT_ZEPHYR_ITS_EXT=_reloc
+-ARC_MGMT_SRAM_HI=0x1000007F
+-ARC_MGMT_SRAM_LO=0xF7FE4800
+ 
+ IMG_PTR_OFFSET=0x00060000
+ PREBOOT_PRI_OFFSET=0x00020000
+@@ -47,6 +34,11 @@
+ # Set the first found public key file name in dtb format inside the its template
+ KEYS_DIR=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}/key/
+ 
++pushd .
++cd ${BR2_EXTERNAL}/../zephyr/dts/arc/
++hl_run_dts_script ${HL_DEV} post-image-fit-script
++popd
++
+ function hl_copy_keys
+ {
+ 	FILEPATH=$1
+diff --git a/board/habanalabs/gaudi3/post-image-fit.sh b/board/habanalabs/gaudi3/post-image-fit.sh
+index 4be2c6a..7049c01 100644
+--- a/board/habanalabs/gaudi3/post-image-fit.sh
++++ b/board/habanalabs/gaudi3/post-image-fit.sh
+@@ -1,16 +1,15 @@
+ #!/usr/bin/env bash
+ 
++source ${COMMON_BASE}/image-utility.sh
++
+ OBJCOPY=arc-linux-objcopy
+ 
+-ARC_PID_DCCM_HI=0x0300007F
+-ARC_PID_DCCM_LO=0xD3020800 # To be aligned with arcpid DCCM_START, 0x800 is reserved for mailbox
+-ARC_PID_ICCM_HI=0x0300007F
+-ARC_PID_ICCM_LO=0xD3000000
+-ARC_MGMT_DCCM_HI=0x0300007F
+-# Should be aligned with arcmgmt DCCM_START
+-ARC_MGMT_DCCM_LO=0xD3080C00
+-ARC_MGMT_ICCM_HI=0x0300007F
+-ARC_MGMT_ICCM_LO=0xD3040000
++MYDEV=`echo $HL_DEV | cut -d '_' -f1`
++
++pushd .
++cd ${BR2_EXTERNAL}/../zephyr/dts/arc/
++hl_run_dts_script ${MYDEV} post-image-fit-script
++popd
+ 
+ COMMON_BASE=${BR2_EXTERNAL_HABANALABS_PATH}/board/habanalabs/common
+ source ${COMMON_BASE}/image-utility.sh
+diff --git a/board/habanalabs/greco/post-image-fit.sh b/board/habanalabs/greco/post-image-fit.sh
+index 34c1e7c..c6a1528 100755
+--- a/board/habanalabs/greco/post-image-fit.sh
++++ b/board/habanalabs/greco/post-image-fit.sh
+@@ -11,10 +11,6 @@
+ # load addresses in ITS file
+ UBOOT_ADDR_LO=0xF0100000
+ UBOOT_ADDR_HI=0x0000007F
+-ARC_MGMT_DCCM_HI=0x0000007F
+-ARC_MGMT_DCCM_LO=0xFB030000
+-ARC_MGMT_ICCM_HI=0x0000007F
+-ARC_MGMT_ICCM_LO=0xFB020000
+ 
+ # For arcmgmt on sram is on 32MB offset
+ if [ -n "$HL_ARCMGMT_SRAM" ]; then
+@@ -33,10 +29,10 @@
+ 	ARC_MGMT_SRAM_LO=0xFBFE4000
+ fi
+ 
+-ARC_PID_DCCM_HI=0x0000007F
+-ARC_PID_DCCM_LO=0xFB010000
+-ARC_PID_ICCM_HI=0x0000007F
+-ARC_PID_ICCM_LO=0xFB000000
++pushd .
++cd ${BR2_EXTERNAL}/../zephyr/dts/arc/
++hl_run_dts_script ${HL_DEV} post-image-fit-script
++popd
+ 
+ IMG_PTR_OFFSET=0x00060000
+ PREBOOT_PRI_OFFSET=0x00020000

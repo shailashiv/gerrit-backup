@@ -1,0 +1,101 @@
+From 4b07335ff4d597984f8a7e0a2abdc3085295dae4 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 10 Jul 2018 10:03:07 +0300
+Subject: [PATCH] board: habana: add remote_cleanup script
+
+The script should be installed on the lab host at:
+/var/lib/tftpboot/tests
+It is used by automatic test frameworks (e.g. tbot, jenkins)
+for connecting to the PCIe host, uninstalling the habanalabs driver
+and cleaning up all the leftovers.
+This is needed for clean habana packages install and for the tbot
+testing framework to not have false positives from starting the Linux
+kernel on target board (Dali) multiple times.
+
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 59d2ea7..5174542 100644
+--- a/Makefile
++++ b/Makefile
+@@ -174,5 +174,5 @@
+ dali-asic-tools-install:
+ 	-cd board/habanalabs/common/ &&					\
+ 	sshpass -p123456 scp -r remote_power remote_load_firmware	\
+-	local_install_packages ip_pdu t32 vivado_lab			\
++	remote_cleanup local_install_packages ip_pdu t32 vivado_lab	\
+ 	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+diff --git a/board/habanalabs/common/remote_cleanup b/board/habanalabs/common/remote_cleanup
+new file mode 100755
+index 0000000..5104b1c
+--- /dev/null
++++ b/board/habanalabs/common/remote_cleanup
+@@ -0,0 +1,67 @@
++#!/bin/bash -l
++
++host=$1
++habana_pkg_lst="habanalabs habanatools libhabana"
++result=~/remote_cleanup.result
++
++# TODO: this script can share code with the other scripts of this family.
++
++function local_msg() {
++	local msg=$1
++	echo -e   "********************************************************"
++	echo -e   "$msg"
++	echo -e   "********************************************************"
++}
++
++function remote_purge_leftovers() {
++	local_msg "****************** Purging leftovers *******************"
++	DKMS_HABANA_DIR=/var/lib/dkms/habanalabs
++	ssh -t $host "HABANA_KO=\"/lib/modules/\`uname -r\`/updates/dkms/habanalabs.ko\"
++			if [ \`lsmod | grep -ci habana\` -ne 0 ]; then
++				echo habanalabs is still inserted...;
++				sudo modprobe -r habanalabs;
++			fi;
++			if [ -e $DKMS_HABANA_DIR ]; then
++				echo $DKMS_HABANA_DIR is still present...;
++				sudo rm -fr $DKMS_HABANA_DIR;
++			fi
++			if [ -e $HABANA_KO ]; then
++				sudo rm -f $HABANA_KO;
++			fi;" | tee -a $result
++
++	local pipestat=${PIPESTATUS[0]}
++	echo ssh purge leftovers status: $pipestat
++	return $pipestat;
++}
++
++function remote_remove_packages() {
++	local_msg "************* Removing old habana packages *************"
++	ssh -t $host "sudo apt-get purge --auto-remove $habana_pkg_lst -y" | tee -a $result
++	local pipestat=${PIPESTATUS[0]}
++	echo ssh apt-get purge status: $pipestat
++	if [ $pipestat -ne 0 ]; then
++		return $pipestat;
++	fi
++
++	ssh -t $host "sudo apt-get clean" | tee -a $result
++	pipestat=${PIPESTATUS[0]}
++	echo ssh apt-get clean status: $pipestat
++	return $pipestat;
++}
++
++for ((i=100; i>0; i--)); do
++	echo $i
++	sleep 1;
++	ping -c 1 -W 1 $host
++	if [ $? -eq 0 ]; then
++		rm -f $result
++		ssh -t $host "echo booted"	|| continue;
++		remote_remove_packages		|| break;
++		remote_purge_leftovers		|| break;
++		echo done;
++		exit 0;
++	fi
++done
++
++echo error
++exit 1;

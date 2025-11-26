@@ -1,0 +1,158 @@
+From 65d82880402c80cc2d83d384fa198fc5eabc79e6 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 28 Jan 2022 14:31:17 +0200
+Subject: [PATCH] [SW-65638] gaudi2: release: wp check
+
+Better to check the Write protection before starting any burning
+activity
+This is a per device check.
+
+Change-Id: I1d63273d749c82efb40ddde4b9fbe3de03364d6a
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+
+[SW-65638] gaudi2: release: wp
+
+Change-Id: Idb1b5834ccff92de54eaa17a4b0e091257e1e561
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/scripts/fwi/fw_installer.sh b/scripts/fwi/fw_installer.sh
+index 8739cae..a739853 100755
+--- a/scripts/fwi/fw_installer.sh
++++ b/scripts/fwi/fw_installer.sh
+@@ -30,6 +30,7 @@
+ sys_pre_recovery \
+ sys_post_recovery \
+ sys_post_reboot \
++sys_wp_check \
+ )
+ 
+ ######################################################
+@@ -614,16 +615,37 @@
+ 	return 0
+ }
+ 
++function if_write_protected()
++{
++	local type result pci_dev
++
++	pci_id=$1
++
++	for type in flash eeprom; do
++		result=$(sys_wp_check ${pci_id} ${type})
++		[ $? -ne 0 ] && return 1
++
++		[[ "${result}" == "1" ]] && {
++			perr "[${pci_id}] Device write protected"
++			return 1
++		}
++	done
++	return 0
++}
++
+ function burn()
+ {
+ 	local err=0
+ 	local pci_dev=$1
++	local result
+ 
++	if_write_protected ${pci_dev}  || return 1
+ 	sys_pre_burn $pci_dev
+ 	[ $? -ne 0 ] && return 1
+ 	burn_device $pci_dev
+ 	[ $? -ne 0 ] && err=1
+ 	sys_post_burn $pci_dev $err
++
+ 	return $err
+ }
+ 
+diff --git a/scripts/fwi/hls_platform.rc b/scripts/fwi/hls_platform.rc
+index 6a8eb29..18272dd 100644
+--- a/scripts/fwi/hls_platform.rc
++++ b/scripts/fwi/hls_platform.rc
+@@ -413,12 +413,34 @@
+ 	esac
+ 
+ 	results=$((0x$(bmc_oams_get_status $which)))
++	[ $? -ne 0 ] && return 1
+ 
+ 	[[ $(( results & (1<< oam) )) -eq 0 ]] && echo 0 || echo 1
+ 
+ 	return 0
+ }
+ 
++function sys_wp_check()
++{
++	local oam_id err
++
++	local oam_id=$(hls2_pci2oam ${1:-99})
++	[ $? -ne 0 ] && return 1
++	oam_wp_check ${oam_id}
++	echo $?
++	return 0
++}
++
++function sys_pci2oam()
++{
++	hls2_pci2oam $1
++}
++
++function sys_oam2pci()
++{
++	hls2_oam2pci $1
++}
++
+ function print_resetN_cause()
+ {
+ 	local val=$1
+diff --git a/scripts/fwi/sa_platform.rc b/scripts/fwi/sa_platform.rc
+index f893639..f5a0bf3 100644
+--- a/scripts/fwi/sa_platform.rc
++++ b/scripts/fwi/sa_platform.rc
+@@ -35,6 +35,26 @@
+ 	echo ${lspci_devs_list[@]}
+ }
+ 
++function sa_pci2oam()
++{
++	pinfo "pci2oam N/A on this platform"
++}
++
++function sa_oam2pci()
++{
++	pinfo "oam2pci N/A on this platform"
++}
++
++function sys_pci2oam()
++{
++	sa_pci2oam $1
++}
++
++function sys_oam2pci()
++{
++	sa_oam2pci $1
++}
++
+ function oam_i2c_scan()
+ {
+ 	local i
+@@ -79,6 +99,19 @@
+ 	pinfo "I2C Res: ${ret[@]}"
+ }
+ 
++function oam_wp_check()
++{
++	pinfo "oam_wp_check N/A on this platform"
++	echo 0
++}
++
++function sys_wp_check()
++{
++	local oam_id=$(sa_pci2oam ${1:-99})
++	[ $? -ne 0 ] && return 1
++	oam_wp_check ${oam_id}
++}
++
+ function recovery_mode_op()
+ {
+ 	case ${recovery_mode:-"NONE"} in

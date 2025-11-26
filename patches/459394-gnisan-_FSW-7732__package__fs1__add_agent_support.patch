@@ -1,0 +1,250 @@
+From e9d08664ae9f2964991e1d77aff5138cb18d450e Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 29 Oct 2024 15:57:43 +0200
+Subject: [PATCH] [FSW-7732] package: fs1: add agent support
+
+Ad FS1 agent support. Unlike Gaudi's agent, FS1 agent does not run on
+SRAM hence the changes that were introduce to extract iccm/dccm and apply
+them properly in itb file.
+
+Change-Id: Ia218e47e8d6181ec4d8d3c26e62be23213b7d568
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/board/habanalabs/fs1/agent-fw_loader.its b/board/habanalabs/fs1/agent-fw_loader.its
+index 9813adf..547c30a 100644
+--- a/board/habanalabs/fs1/agent-fw_loader.its
++++ b/board/habanalabs/fs1/agent-fw_loader.its
+@@ -59,6 +59,33 @@
+ 				algo = "sha384";
+ 			};
+ 		};
++
++		agent-iccm {
++			description = "Zephyr agent ICCM";
++			data = /incbin/("@BINS_DIR_PATH@@DEV_PREFIX@-zephyr-agent_fw_loader-iccm.bin.le");
++			type = "standalone";
++			arch = "arc";
++			core-id = <@FIT_CORE_ID_IO0_MGMT@>;
++			compression = "none";
++			loadaddr = @HL_ICCM_LOAD_ADDR@;
++			startaddr = @HL_START_ADDR@;
++			hash {
++				algo = "@SHA_VERSION@";
++			};
++		};
++
++		agent-dccm {
++			description = "Zephyr agent DCCM";
++			data = /incbin/("@BINS_DIR_PATH@@DEV_PREFIX@-zephyr-agent_fw_loader-dccm.bin.le");
++			type = "standalone";
++			arch = "arc";
++			core-id = <@FIT_CORE_ID_IO0_MGMT@>;
++			compression = "none";
++			loadaddr = @HL_DCCM_LOAD_ADDR@;
++			hash {
++				algo = "@SHA_VERSION@";
++			};
++		};
+ 	};
+ 
+ 	configurations {
+@@ -69,6 +96,12 @@
+ 			loadables = "@FW_LOADER_CONF_LOADABLES@";
+ 			load-type = <@FIT_LOAD_TYPE_FLASH@>;
+ 		};
++
++		preboot-conf {
++			description = "Habanalabs device agent";
++			loadables = "agent-iccm", "agent-dccm";
++			load-type = <0>; /* FIT_LOAD_TYPE_RUN */
++		};
+ 	};
+ };
+ 
+diff --git a/board/habanalabs/fs1/post-image-agents.sh b/board/habanalabs/fs1/post-image-agents.sh
+index c73d36a..b9d1f4a 100755
+--- a/board/habanalabs/fs1/post-image-agents.sh
++++ b/board/habanalabs/fs1/post-image-agents.sh
+@@ -18,9 +18,8 @@
+ }
+ 
+ GCC_ARC=${BR2_EXTERNAL}/output/${DEV_PREFIX}_arc/host/bin/arc-linux-gcc
+-#HL_AGENT_VERSION=`cat ${BASE_DIR}/build/agent-fwl-custom/build/buildversion-habanalabs`
+-#HL_VERSION=$HL_AGENT_VERSION
+-HL_VERSION="NA"
++HL_AGENT_VERSION=`cat ${BASE_DIR}/build/agent-fwl-custom/build/buildversion-habanalabs`
++HL_VERSION=$HL_AGENT_VERSION
+ # Set hl-*-version = "hl-<device>-<HL_VERSION>[-rc]-fw-<fw ver>[-<git data>]"; inside FIT header
+ # Set hl-preboot-version = "hl-<device>-<HL_VERSION>[-rc]-fw-<fw ver>[-<git data>] (<date> - <time>)"
+ if [ -f ${BASE_DIR}/build/baremetal-custom/buildversion-habanalabs ]; then
+@@ -79,39 +78,22 @@
+ 	rm -f ${STAGE_DIR}/${AGENT_ITB_FILE}
+ }
+ 
+-function create_dummy_agent_fw_loader_bin_file {
+-	ZEPHYR_AGENT_FW_LOADER_BIN_FILE=${BR2_EXTERNAL}/output/${DEV_PREFIX}_arc/images/zephyr_agent_fw_loader.bin
+-	touch ${ZEPHYR_AGENT_FW_LOADER_BIN_FILE}
+-	echo "This is a dummy zephyr_agent_fw_loader.bin file" > ${ZEPHYR_AGENT_FW_LOADER_BIN_FILE}
+-}
+-
+-function create_dummy_agent_fw_loader_stat_file {
+-	cp ${BR2_EXTERNAL}/output/${DEV_PREFIX}_arc/images/zephyr_preboot.stat ${BR2_EXTERNAL}/output/${DEV_PREFIX}_arc/images/zephyr_agent_fw_loader.stat
+-}
+-
+ pushd ${STAGE_DIR}
+ 
+-	# The FWL agent image isn't ready yet, so:
+-	# 1. Create a dummy zephyr_agent_fw_loader.bin file.
+-	# 2. Use zephyr_preboot.stat as zephyr_agent_fw_loader.stat.
+-	create_dummy_agent_fw_loader_bin_file
+-	create_dummy_agent_fw_loader_stat_file
+-
+-	AGENT_BIN_FILES=$(ls zephyr_agent_*.bin 2>/dev/null)
++	AGENT_BIN_ICCM_FILES=$(ls zephyr-agent_*-iccm.bin 2>/dev/null)
+ 
+ 	handle_fw_copy
+ 
+ 	handle_preboot_loadaddr
+ 
+ 	# For each zephyr_agent_*.bin files
+-	for AGENT_BIN in $AGENT_BIN_FILES; do
++	for AGENT_BIN_ICCM in $AGENT_BIN_ICCM_FILES; do
+ 		# Extract the agent name (remove prefix and suffix)
+-		AGENT_NAME=$(echo $AGENT_BIN | sed 's/^zephyr_agent_\(.*\).bin/\1/')
++		AGENT_NAME=$(echo $AGENT_BIN_ICCM | sed 's/^zephyr-agent_\(.*\)-iccm.bin/\1/')
++
+ 		echo "Creating the ${AGENT_NAME} agent."
+ 		# Agent stat file, contains the ELF information, omited by Zephyr when the binary got created
+-		AGENT_STAT=$(echo $AGENT_BIN | sed 's/\.bin/.stat/')
+-		# Agent possible FW file
+-		AGENT_FW_NAME=$(echo $AGENT_BIN | sed 's/\_agent_/_agentfw_/')
++		AGENT_STAT=zephyr_agent_${AGENT_NAME}.stat
+ 		HL_AGENT_ADDITIONAL_LOADABLES=', "external_fw"'
+ 
+ 		# Compress binary
+@@ -133,31 +115,25 @@
+ 		AGENT_ITS_FILE=agent-${AGENT_NAME}-${HL_DEV}_${HL_TARGET}.its
+ 		AGENT_ITB_FILE=agent-${AGENT_NAME}-fit.itb
+ 		# Extract the load address and start address from stat file
+-		LOADRADDR=$(grep LOAD $AGENT_STAT | head -1 | awk '{ print $3 }')
+ 		STARTADDR=$(grep "Entry point address" $AGENT_STAT | head -1 | awk -F: '{ print $2 }')
+-		LOADRADDR=$((LOADRADDR | AGENT_BASE_ADDR))
+-		STARTADDR=$((STARTADDR | AGENT_BASE_ADDR))
+ 
+-		# Write the load address within the DTS template
+-		ITS_SED_BIN_PARAMS="s/@HL_LOAD_ADDR@/$(print_fdt64 $LOADRADDR)/g;"
+-		ITS_SED_BIN_PARAMS+="s/@HL_START_ADDR@/$(print_fdt64 $STARTADDR)/g;"
+-		ITS_SED_BIN_PARAMS+="s/@HL_AGENT_BIN@/${AGENT_BIN}/g;"
+-		#ITS_SED_BIN_PARAMS+="s/@HL_AGENT_VERSION@/${HL_AGENT_VERSION}/g;"
++		# Replace ARC core IDs
++		ITS_SED_BIN_PARAMS+="s/@FIT_CORE_ID_IO0_MGMT@/${FIT_CORE_ID_IO0_MGMT}/g;"
+ 
+-		if [ ! -f ${AGENT_FW_NAME} ]; then
+-			echo "No agent FW file"
+-			dd bs=4 count=1 if=/dev/zero of=empty.bin
+-			AGENT_FW_NAME=empty.bin
+-			HL_AGENT_ADDITIONAL_LOADABLES=""
+-		fi
+-		ITS_SED_BIN_PARAMS+="s#@HL_AGENT_FW_BIN@#${AGENT_FW_NAME}#g;"
++		ARC_AGENT_ICCM=$(( (${ARC_AGENT_ICCM_HI} << 32) | ${ARC_AGENT_ICCM_LO} ))
++		ITS_SED_BIN_PARAMS+="s/@HL_ICCM_LOAD_ADDR@/$(print_fdt64 ${ARC_AGENT_ICCM})/g;"
++
++		ARC_AGENT_DCCM=$(( (${ARC_AGENT_DCCM_HI} << 32) | ${ARC_AGENT_DCCM_LO} ))
++		ITS_SED_BIN_PARAMS+="s/@HL_DCCM_LOAD_ADDR@/$(print_fdt64 ${ARC_AGENT_DCCM})/g;"
++
++		ITS_SED_BIN_PARAMS+="s/@HL_START_ADDR@/$(print_fdt64 $(( ${STARTADDR} + ${ARC_AGENT_ICCM} )))/g;"
+ 		ITS_SED_BIN_PARAMS+="s#@HL_AGENT_ADDITIONAL_LOADABLES@#${HL_AGENT_ADDITIONAL_LOADABLES}#g;"
+ 
+ 		AGENTS_ITS_SPEC_TEMPLATE=${BR2_EXTERNAL}/board/habanalabs/${HL_DEV}/agent-${AGENT_NAME}.its
+ 		AGENTS_ITS_SPEC_FILE=agent-${AGENT_NAME}-${HL_DEV}.its
+ 		if [ -f ${AGENTS_ITS_SPEC_TEMPLATE} ]; then
+ 			sed ${ITS_SED_PARAMS}${ITS_SED_BIN_PARAMS} ${AGENTS_ITS_SPEC_TEMPLATE} > ${STAGE_DIR}/${AGENTS_ITS_SPEC_FILE}
+-			#ITS_SED_BIN_PARAMS+="s#@DEV_SPEC_ITS@#${STAGE_DIR}/${AGENTS_ITS_SPEC_FILE}#g;"
++			ITS_SED_BIN_PARAMS+="s#@DEV_SPEC_ITS@#${STAGE_DIR}/${AGENTS_ITS_SPEC_FILE}#g;"
+ 		fi
+ 
+ 		sed ${ITS_SED_PARAMS}${ITS_SED_BIN_PARAMS} ${AGENT_ITS_TEMPLATE} > ${STAGE_DIR}/${AGENT_ITS_FILE}
+diff --git a/board/habanalabs/fs1_arc/fs1-image-utility.sh b/board/habanalabs/fs1_arc/fs1-image-utility.sh
+index 09c8a91..5770b60 100755
+--- a/board/habanalabs/fs1_arc/fs1-image-utility.sh
++++ b/board/habanalabs/fs1_arc/fs1-image-utility.sh
+@@ -95,8 +95,8 @@
+ }
+ 
+ function hl_extract_zephyr_bins_sections {
+-	local bins_file=$1
+-	local app=$(basename ${bins_file} | cut -d. -f1 | cut -d_ -f2)
++	local app=$1
++	local bins_file=$2
+ 	local sections=()
+ 	local bin_start
+ 	local bin_end
+@@ -130,10 +130,42 @@
+ 	done < <(tail -n +2 ${bins_file} | hl_remove_empty_lines)
+ }
+ 
+-#This function should be called after hl_create_zephyr_bins_config
++# Find a bins file which fits the app
++function hl_zephyr_get_bins {
++	local app=$1
++	local bins_file
++	local bins_app
++
++	# Try to find to closest match between an elf and its bins file
++	while [ $(echo ${app} | tr "_" " " | wc -w) -gt 0 ]; do
++		for bins_file in $(ls $BINS_CONFIG_DIR/${HL_TARGET}_*.bins); do
++			bins_app=$(echo ${bins_file} | sed "s/.*\/${HL_TARGET}_\(.*\)\.bins/\1/")
++
++			if [ "${bins_app}" == "${app}" ]; then
++				echo -n ${bins_file}
++				return
++			fi
++		done
++
++		# Remove last word
++		app=$(echo ${app} | awk -F_ 'BEGIN {OFS="_"} {NF-=1} 1')
++	done
++}
++
++# This function should be called after hl_create_zephyr_bins_config
+ function hl_extract_zephyr_elf_sections {
+-	for sec_file in $(ls $BINS_CONFIG_DIR/${HL_TARGET}_*.bins); do
+-		hl_extract_zephyr_bins_sections ${sec_file}
++	local elf_file
++	local bins_file
++	local app
++
++	for elf_file in $(ls ${ELFS_DIR}/zephyr_*.elf); do
++		app=$(echo ${elf_file} | sed "s/.*\/zephyr_\(.*\)\.elf/\1/")
++		bins_file=$(hl_zephyr_get_bins ${app})
++
++		if [ -n "${bins_file}" ]; then
++			hl_extract_zephyr_bins_sections ${app} ${bins_file}
++			continue
++		fi
+ 	done
+ }
+ 
+@@ -150,7 +182,7 @@
+ 		# TEMPORARY:
+ 		# Skip all the modules except "mgmt", because they are not implemented yet.
+ 		# Only a basic implementation of arcmgmt is being implemented for now.
+-		if ! echo "$module" | grep -q -E "mgmt"; then
++		if ! echo "$module" | grep -q -E  -e "mgmt" -e "agent"; then
+ 			continue;
+ 		fi
+ 
+diff --git a/board/habanalabs/fs1_arc/post-image-fit.sh b/board/habanalabs/fs1_arc/post-image-fit.sh
+index 34524d4..9ddc917 100755
+--- a/board/habanalabs/fs1_arc/post-image-fit.sh
++++ b/board/habanalabs/fs1_arc/post-image-fit.sh
+@@ -24,6 +24,8 @@
+ 	#cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-pid-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-pid-dccm.bin.le
+ 	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-mgmt-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-mgmt-iccm.bin.le
+ 	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-mgmt-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-mgmt-dccm.bin.le
++	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-agent_fw_loader-iccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-agent_fw_loader-iccm.bin.le
++	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc/images/${DEV_PREFIX}-zephyr-agent_fw_loader-dccm.bin ${FILEPATH}/${DEV_PREFIX}-zephyr-agent_fw_loader-dccm.bin.le
+ 
+ 	return
+ }

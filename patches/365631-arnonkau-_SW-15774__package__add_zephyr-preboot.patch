@@ -1,0 +1,170 @@
+From 3bf360085a51591875edff1035ff3948a1df8616 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sat, 21 Oct 2023 00:15:28 +0300
+Subject: [PATCH] [SW-15774] package: add zephyr-preboot
+
+Add package to build preboot
+
+Change-Id: I8ab98de0ee9945761be32db742061928320fa397
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index 3f2c226..90f399c 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -23,3 +23,4 @@
+ ZEPHYR_PID_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcpid
+ ZEPHYR_MGMT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcmgmt
+ ZEPHYR_EVENT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcevent
++ZEPHYR_PREBOOT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/preboot
+diff --git a/package/zephyr-preboot/zephyr-preboot.mk b/package/zephyr-preboot/zephyr-preboot.mk
+new file mode 100644
+index 0000000..0309d32
+--- /dev/null
++++ b/package/zephyr-preboot/zephyr-preboot.mk
+@@ -0,0 +1,144 @@
++ZEPHYR_PREBOOT_APP_NAME = preboot
++ZEPHYR_PREBOOT_DEPENDENCIES = host-cmake host-lzop host-lz4
++ZEPHYR_PREBOOT_APP_MODULES = fdt boot_info mbedtls eeprom soc_init hl_shell
++ZEPHYR_PREBOOT_SRC_DIR=$(EMBEDDED_DIR)/zephyr-apps/preboot
++ZEPHYR_PREBOOT_ZEPHYR_SRCDIR=$(EMBEDDED_DIR)/zephyr
++
++ZEPHYR_PREBOOT_CONF_APP_EXTRA_CFLAGS =
++
++ifeq ($(PREBOOT_RUN_FROM_ICCM),true)
++ZEPHYR_PREBOOT_CONF_APP_OPTS += -DCONFIG_PREBOOT_RUN_FROM_ICCM=y
++endif #PREBOOT_RUN_FROM_ICCM
++
++#TODO - TARGET_IS_ASIC: Need to check why on ZEPHYR_CONF_OPTS its not working as expected
++ifeq ($(HL_TARGET),asic)
++ZEPHYR_PREBOOT_CONF_APP_EXTRA_CFLAGS = \
++	-DTARGET_IS_ASIC \
++	-include $(EMBEDDED_ROOT)/specs/$(ZEPHYR_PREBOOT_DEVICE_NAME)/$(ZEPHYR_PREBOOT_DEVICE_NAME)_boot_info.h \
++	$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++	 $(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++endif
++ZEPHYR_PREBOOT_CONF_APP_CFLAGS = \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR) \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/include \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu/$(HL_DEV) \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu/common \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu/$(HL_DEV) \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu/common \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/include/generated \
++		-I$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)/include/generated/syscalls \
++		-I$(EMBEDDED_DIR)/zephyr-modules/fdt/libfdt
++
++###################################################################
++
++ZEPHYR_PREBOOT_APP_PROD_NAME = zephyr_arc_$(ZEPHYR_PREBOOT_APP_NAME)
++ZEPHYR_PREBOOT_DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
++ZEPHYR_PREBOOT_APP_VERSION = $(shell cut -d- -f2- $(@D)/localversion-habanalabs)
++ZEPHYR_PREBOOT_LOCAL_VERSION = $$(sed "s/^.*fw-\\([0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\).*$$/\\1/" $(@D)/localversion-habanalabs)
++
++ZEPHYR_PREBOOT_BUILD_DIR = $(@D)
++#ZEPHYR_PREBOOT_BUILDDIR = $(@D)
++#ZEPHYR_PREBOOT_DIR = $(@D)
++ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR ?= $(@D)/zephyr
++
++ZEPHYR_PREBOOT_CONF_ENV = CROSS_COMPILE=$(TARGET_CROSS)
++ZEPHYR_PREBOOT_CONF_ENV += ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
++ZEPHYR_PREBOOT_CONF_ENV += ZEPHYR_BASE=$(ZEPHYR_PREBOOT_ZEPHYR_BUILD_DIR)
++
++ZEPHYR_PREBOOT_CONF_OPTS = -UCMAKE_TOOLCHAIN_FILE
++ZEPHYR_PREBOOT_CONF_OPTS += -DUSER_CACHE_DIR=$(@D)/.cache
++ZEPHYR_PREBOOT_CONF_OPTS += -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-e__start
++ZEPHYR_PREBOOT_CONF_OPTS += -DTARGET=$(HL_TARGET)
++ZEPHYR_PREBOOT_CONF_OPTS += -DEXTRA_CFLAGS="\
++		-Werror \
++		-Wno-misleading-indentation \
++		$(ZEPHYR_PREBOOT_CONF_APP_EXTRA_CFLAGS)"
++ZEPHYR_PREBOOT_CONF_OPTS += $(ZEPHYR_PREBOOT_CONF_APP_OPTS)
++ZEPHYR_PREBOOT_CONF_OPTS += -DBUILD_VERSION="$(ZEPHYR_PREBOOT_APP_VERSION)"
++ZEPHYR_PREBOOT_CONF_OPTS += -DBUILD_MACHINE="$(shell hostname -s)"
++ZEPHYR_PREBOOT_CONF_OPTS += -DCMAKE_C_FLAGS="\
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(ZEPHYR_PREBOOT_CONF_APP_CFLAGS)"
++
++ZEPHYR_PREBOOT_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMBEDDED_DIR)"
++ZEPHYR_PREBOOT_CONF_OPTS += -DBOARD=hl_$(ZEPHYR_PREBOOT_DEVICE_NAME)_$(ZEPHYR_PREBOOT_APP_NAME)_$(HL_TARGET)
++ZEPHYR_PREBOOT_CONF_OPTS += -DDEVICE=$(ZEPHYR_PREBOOT_DEVICE_NAME)
++ZEPHYR_PREBOOT_CONF_OPTS += -DAPP_NAME=$(ZEPHYR_PREBOOT_APP_PROD_NAME)
++ZEPHYR_PREBOOT_CONF_OPTS += -DAPP_VERSION=$(ZEPHYR_PREBOOT_APP_VERSION)
++
++ZEPHYR_PREBOOT_WEST_SRC_DIR :=
++ZEPHYR_PREBOOT_WEST_DEST_DIR :=
++
++define ZEPHYR_PREBOOT_COPY_ZEPHYR_SRC
++	rsync -au --chmod=u=rwX,go=rX  --exclude .svn --exclude .git --exclude .hg --exclude .bzr --exclude CVS $(ZEPHYR_PREBOOT_ZEPHYR_SRCDIR) $(ZEPHYR_PREBOOT_BUILD_DIR)
++endef
++
++# Arguments:
++# - module name
++# - component dir
++# - component name
++#
++define ZEPHYR_PREBOOT_DEFINE_MODULE_ENVVARS
++	$(eval MODULE_NAME=$(strip $1))
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $(MODULE_NAME) | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(eval $(MODULE_NAME_UPPER_CASE)_SRCDIR=$(EMBEDDED_DIR)/zephyr-modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_DIR=$(@D)/build/modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_NAME=$2_$(MODULE_NAME))
++endef
++
++$(foreach module,$(ZEPHYR_PREBOOT_APP_MODULES),$(call ZEPHYR_PREBOOT_DEFINE_MODULE_ENVVARS,$(module),$(ZEPHYR_PREBOOT_APP_PROD_NAME)))
++
++# Arguments:
++# - module (mbedtls, eeprom, etc.)
++define ZEPHYR_PREBOOT_MODULE_VERSION_HOOK
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $1 | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(call HL_VERSION_GEN, ${${MODULE_NAME_UPPER_CASE}_SRCDIR}, ${${MODULE_NAME_UPPER_CASE}_DIR}, ${${MODULE_NAME_UPPER_CASE}_NAME})
++endef
++
++define ZEPHYR_PREBOOT_APP_VERSION_GEN
++	@$(call HL_VERSION_GEN, ${ZEPHYR_PREBOOT_SRCDIR},.,${ZEPHYR_PREBOOT_APP_PROD_NAME})
++	@$(call HL_VERSION_GEN, ${ZEPHYR_PREBOOT_SRCDIR},build,${ZEPHYR_PREBOOT_APP_PROD_NAME})
++	@$(foreach module,$(ZEPHYR_PREBOOT_APP_MODULES),$(call ZEPHYR_PREBOOT_MODULE_VERSION_HOOK,$(module)))
++endef
++
++define ZEPHYR_PREBOOT_CREATE_HL_VERSION
++	$(call MESSAGE, " [$(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h]")
++
++	@mkdir -p $(ZEPHYR_PREBOOT_BUILD_DIR)/include
++	@echo "#ifndef _HL_VERSION_" >  $(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h
++	@echo "#define _HL_VERSION_" >>  $(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MAJOR $$(echo $(ZEPHYR_PREBOOT_LOCAL_VERSION) | cut -d. -f1)" >> $(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MINOR $$(echo $(ZEPHYR_PREBOOT_LOCAL_VERSION) | cut -d. -f2)" >> $(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_PATCH $$(echo $(ZEPHYR_PREBOOT_LOCAL_VERSION) | cut -d. -f3)" >> $(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h
++	@echo "#endif" >>  $(ZEPHYR_PREBOOT_BUILD_DIR)/include/hl_version.h
++endef
++
++define ZEPHYR_PREBOOT_CONFIGURE_CMDS
++#	$(INSTALL) -D -m 0755 $(ZEPHYR_PREBOOT_WEST_SRC_DIR)/west.config $(ZEPHYR_PREBOOT_WEST_DEST_DIR)/config
++	@$(call ZEPHYR_PREBOOT_CREATE_HL_VERSION)
++	@$(ZEPHYR_PREBOOT_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_PREBOOT_CONF_OPTS) -S $(ZEPHYR_PREBOOT_BUILD_DIR) -B $(ZEPHYR_PREBOOT_BUILD_DIR)/build
++endef
++
++ZEPHYR_PREBOOT_POST_RSYNC_HOOKS += HL_VERSION_GEN
++ZEPHYR_PREBOOT_POST_RSYNC_HOOKS += ZEPHYR_PREBOOT_COPY_ZEPHYR_SRC
++ZEPHYR_PREBOOT_POST_RSYNC_HOOKS += ZEPHYR_PREBOOT_APP_VERSION_GEN
++
++define ZEPHYR_PREBOOT_BUILD_CMDS
++	$(TARGET_MAKE_ENV) $(MAKE) -C $(ZEPHYR_PREBOOT_BUILD_DIR)/build all
++endef
++
++define ZEPHYR_PREBOOT_INSTALL_TARGET_CMDS
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_$(ZEPHYR_PREBOOT_APP_NAME).elf
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.bin $(BINARIES_DIR)/$(ZEPHYR_PREBOOT_APP_NAME).bin
++endef
++
++zephyr-preboot-configure: $(ZEPHYR_PREBOOT_DEPENDENCIES)
++zephyr-preboot-menuconfig zephyr-preboot-guiconfig: | zephyr-preboot-configure
++	$(TARGET_MAKE_ENV) $(MAKE) -C $(ZEPHYR_PREBOOT_BUILD_DIR)/build all
++	rm -f $(ZEPHYR_PREBOOT_BUILD_DIR)/.stamp_{configured,built}
++
++$(eval $(cmake-package))

@@ -1,0 +1,128 @@
+From 4ff4fe447fea139c99e6cdf7bcafe608fb7092f2 Mon Sep 17 00:00:00 2001
+From: Avinash Kumar <avikumar@habana.ai>
+Date: Sun, 20 Jun 2021 21:00:33 +0300
+Subject: [PATCH] [SW-46360] greco: code relocation to sram
+
+ICCM is having 64KB of space and its almost full.
+Any additional function or glabal data can be
+ relocated to SRAM new section, "mysection" using below
+atribute.
+"__attribute__((__section__(".mysection")))".
+
+Change-Id: I66a87c38b3eec7bbce5be2536295d4ccd16e528f
+Signed-off-by: Avinash Kumar <avikumar@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/post-image-fit-global.sh b/board/habanalabs/common/post-image-fit-global.sh
+index bb0e6c9..228b526 100755
+--- a/board/habanalabs/common/post-image-fit-global.sh
++++ b/board/habanalabs/common/post-image-fit-global.sh
+@@ -86,6 +86,8 @@
+ ITS_SED_PARAMS+="s/@ARC_MGMT_DCCM_LO@/${ARC_MGMT_DCCM_LO}/g;"
+ ITS_SED_PARAMS+="s/@ARC_MGMT_ICCM_HI@/${ARC_MGMT_ICCM_HI}/g;"
+ ITS_SED_PARAMS+="s/@ARC_MGMT_ICCM_LO@/${ARC_MGMT_ICCM_LO}/g;"
++ITS_SED_PARAMS+="s/@ARC_MGMT_SRAM_HI@/${ARC_MGMT_SRAM_HI}/g;"
++ITS_SED_PARAMS+="s/@ARC_MGMT_SRAM_LO@/${ARC_MGMT_SRAM_LO}/g;"
+ ITS_SED_PARAMS+="s/@ARC_PID_DCCM_HI@/${ARC_PID_DCCM_HI}/g;"
+ ITS_SED_PARAMS+="s/@ARC_PID_DCCM_LO@/${ARC_PID_DCCM_LO}/g;"
+ ITS_SED_PARAMS+="s/@ARC_PID_ICCM_HI@/${ARC_PID_ICCM_HI}/g;"
+diff --git a/board/habanalabs/common/uboot-zephyr.its b/board/habanalabs/common/uboot-zephyr.its
+index 7b0f36c..1d3980b 100644
+--- a/board/habanalabs/common/uboot-zephyr.its
++++ b/board/habanalabs/common/uboot-zephyr.its
+@@ -164,6 +164,18 @@
+ 				algo = "sha256";
+ 			};
+ 		};
++
++		zephyr-mgmt-sram {
++			description = "Zephyr mgmt SRAM";
++			data = /incbin/("@HL_DEV@-zephyr-mgmt-sram.bin.le");
++			type = "standalone";
++			arch = "arc";
++			compression = "none";
++			loadaddr = <0x0000007F 0xFBFE0000>;
++			hash {
++			algo = "sha256";
++			};
++		};
+ 	};
+ 
+ 	configurations {
+@@ -180,18 +192,19 @@
+ 			description = "Habanalabs device preboot";
+ 			loadables = "uboot", "zephyr-pid-iccm",
+ 				    "zephyr-pid-dccm", "zephyr-mgmt-iccm",
+-				    "zephyr-mgmt-dccm";
++				    "zephyr-mgmt-dccm","zephyr-mgmt-sram";
+ 			uboot = "uboot";
+ 			zephyr-pid-iccm = "zephyr-pid-iccm";
+ 			zephyr-pid-dccm = "zephyr-pid-dccm";
+ 			zephyr-mgmt-iccm = "zephyr-mgmt-iccm";
+ 			zephyr-mgmt-dccm = "zephyr-mgmt-dccm";
++			zephyr-mgmt-sram = "zephyr-mgmt-sram";
+ 			signature {
+ 				algo = "sha256,rsa3072";
+ 				key-name-hint = "hl_rsa3072";
+ 				sign-images = "uboot", "zephyr-pid-iccm",
+ 					"zephyr-pid-dccm", "zephyr-mgmt-iccm",
+-					"zephyr-mgmt-dccm";
++					"zephyr-mgmt-dccm", "zephyr-mgmt-sram";
+ 			};
+ 		};
+ 	};
+diff --git a/board/habanalabs/greco/post-image-fit.sh b/board/habanalabs/greco/post-image-fit.sh
+index a6d1ec3..d3002ec 100755
+--- a/board/habanalabs/greco/post-image-fit.sh
++++ b/board/habanalabs/greco/post-image-fit.sh
+@@ -15,6 +15,8 @@
+ ARC_MGMT_DCCM_LO=0xFB030000
+ ARC_MGMT_ICCM_HI=0x0000007F
+ ARC_MGMT_ICCM_LO=0xFB020000
++ARC_MGMT_SRAM_HI=0x0000007F
++ARC_MGMT_SRAM_LO=0xFBFE0000
+ ARC_PID_DCCM_HI=0x0000007F
+ ARC_PID_DCCM_LO=0xFB010C00
+ ARC_PID_ICCM_HI=0x0000007F
+@@ -40,4 +42,5 @@
+ 	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc_gnu/images/zephyr-pid-dccm.bin ${FILEPATH}/${DEV_NAME}-zephyr-pid-dccm.bin.le
+ 	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc_gnu/images/zephyr-mgmt-iccm.bin ${FILEPATH}/${DEV_NAME}-zephyr-mgmt-iccm.bin.le
+ 	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc_gnu/images/zephyr-mgmt-dccm.bin ${FILEPATH}/${DEV_NAME}-zephyr-mgmt-dccm.bin.le
++	cp ${BR2_EXTERNAL}/output/${DEV_NAME}_arc_gnu/images/zephyr-mgmt-sram.bin ${FILEPATH}/${DEV_NAME}-zephyr-mgmt-sram.bin.le
+ }
+diff --git a/board/habanalabs/greco_arc_gnu/post-image-spi.sh b/board/habanalabs/greco_arc_gnu/post-image-spi.sh
+index f107df8..e91bb6c 100755
+--- a/board/habanalabs/greco_arc_gnu/post-image-spi.sh
++++ b/board/habanalabs/greco_arc_gnu/post-image-spi.sh
+@@ -17,6 +17,11 @@
+ 	--only-section=devices --only-section=_k_mutex_area --set-section-flags=bss=alloc,load,contents \
+ 	--set-section-flags=noinit=alloc,load,contents ${BINARIES_DIR}/zephyr_${PREFIX}.elf \
+ 	${BINARIES_DIR}/zephyr-${PREFIX}-dccm.bin
++
++	# create sram binary
++	${OBJCOPY} -S --gap-fill 0xff --output-target=binary --remove-section=.comment --remove-section=COMMON \
++	--remove-section=.eh_frame --only-section=mysection  ${BINARIES_DIR}/zephyr_${PREFIX}.elf \
++	${BINARIES_DIR}/zephyr-${PREFIX}-sram.bin
+ }
+ 
+ pushd ${BINARIES_DIR}
+diff --git a/package/zephyr/zephyr.mk b/package/zephyr/zephyr.mk
+index 4a1a630..0b03b33 100644
+--- a/package/zephyr/zephyr.mk
++++ b/package/zephyr/zephyr.mk
+@@ -12,6 +12,7 @@
+ ZEPHYR_CONF_OPTS += -DUSER_CACHE_DIR=$(@D)/.cache
+ ZEPHYR_CONF_OPTS += -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-e__start
+ ZEPHYR_CONF_OPTS += -DEXTRA_CFLAGS=-Werror
++ZEPHYR_CONF_OPTS += -DEXTRA_CFLAGS=-mlong-calls
+ ZEPHYR_CONF_OPTS += -DBUILD_VERSION=$(shell cut -d- -f2- $(ZEPHYR_BUILDDIR)/localversion-habanalabs)
+ 
+ DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
+@@ -44,6 +45,7 @@
+ ZEPHYR_MGMT_DIR = build-mgmt
+ ZEPHYR_CONF_DEFAULT ?= $(ZEPHYR_MGMT_DIR)
+ ZEPHYR_CONF_OPTS_MGMT += -DBOARD=hl_$(DEVICE_NAME)_mgmt_$(HL_TARGET)
++#ZEPHYR_CONF_OPTS_MGMT += -DEXTRA_CFLAGS=-mlong-calls
+ ZEPHYR_CONF_OPTS_MGMT += $(dir $(BR2_EXTERNAL_HABANALABS_PATH))/arcmgmt
+ ZEPHYR_CONF_OPTS_MGMT += -DZEPHYR_MODULES=$(dir $(BR2_EXTERNAL_HABANALABS_PATH))/zephyr-modules/eeprom
+ ZEPHYR_CONFIGURE_CMDS += && $(ZEPHYR_CONF_ENV) $(HOST_DIR)/bin/cmake $(ZEPHYR_CONF_OPTS) $(ZEPHYR_CONF_OPTS_MGMT) -B $(ZEPHYR_MGMT_DIR)

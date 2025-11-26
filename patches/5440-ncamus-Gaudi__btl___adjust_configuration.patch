@@ -1,0 +1,102 @@
+From 793e141e81be0bf86be876ef0b7af9e362a951a5 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Tue, 14 Aug 2018 16:20:14 +0300
+Subject: [PATCH] Gaudi [btl]: adjust configuration
+
+Exclude all Dali configuration not needed any more
+---
+
+diff --git a/board/habanalabs/common/btl/Makefile b/board/habanalabs/common/btl/Makefile
+index 45d2f45..175981c 100644
+--- a/board/habanalabs/common/btl/Makefile
++++ b/board/habanalabs/common/btl/Makefile
+@@ -9,6 +9,14 @@
+ COMMON_CPP_FLAGS += -DPREBOOT_ADDR_L=0xF0000000
+ 
+ COMMON_CPP_FLAGS += -I$(dir $(BR2_EXTERNAL))/specs/$(HL_DEV)/asic_reg
++ifeq ($(HL_DEV),dali)
++	COMMON_CPP_FLAGS += -DDEV_IS_DALI
++	FW_SIZE=0x8000
++else
++	COMMON_CPP_FLAGS += -DDEV_IS_GAUDI
++	FW_SIZE=0x3000
++	COMMON_CPP_FLAGS += -DFW_SIZE=$(FW_SIZE)
++endif
+ 
+ ifeq ($(HL_TARGET),pldm)
+ 	COMMON_CPP_FLAGS += -DTARGET_IS_PLDM
+@@ -71,7 +79,7 @@
+ 	@gcc -E -P -nostdinc $(SECONDARY_CPP_FLAGS) -DBTLID=0x32 -o $@ $<
+ 
+ pcie_phy_fw.bin: pcie_phy_fw.i
+-	@cut -d' ' -f3- $< | xxd -r -p | dd status=none bs=16 conv=sync,swab of=$@
++	@cut -d' ' -f3- $< | xxd -r -p | dd status=none bs=16 count=$$(($(FW_SIZE) / 16)) conv=sync,swab of=$@
+ 
+ pcie_phy_fw.i: pcie_phy_fw.s
+ 	@gcc -x c -E -P -nostdinc -o $@ $<
+diff --git a/board/habanalabs/common/btl/pcie_phy.s b/board/habanalabs/common/btl/pcie_phy.s
+index 5e3086e..d916052 100644
+--- a/board/habanalabs/common/btl/pcie_phy.s
++++ b/board/habanalabs/common/btl/pcie_phy.s
+@@ -20,6 +20,8 @@
+ /* Select indirect access to CR PARA I/F instead of PRBI */
+ cfg mmPCIE_PHY_CR_PARA_CFG, 0x00000001
+ 
++#ifdef DEV_IS_DALI
++
+ #ifdef mmPCIE_PHY_MEM_WR_MC
+ /* Dali Errata: disable unused design that cause PCIe phy SRAM DERR */
+ cfg mmPCIE_PHY_MEM_WR_MC, 0x0
+@@ -35,6 +37,7 @@
+ cfg mmPCIE_PHY_PROTOCOL0_EXT_RX_MISC_G3_SLICE0, 0x0000000A
+ cfg mmPCIE_PHY_PROTOCOL0_EXT_RX_MISC_G4_SLICE0, 0x00000009
+ cfg mmPCIE_PHY_PROTOCOL0_EXT_TX_VBOOST_LVL, 0x00000004
++#endif /* DEV_IS_DALI */
+ cfg mmPCIE_PHY_PHY_EXT_CTRL_SEL, 0x00000001
+ 
+ /*
+@@ -49,17 +52,28 @@
+  * use presets 39F instead of 59F (remove 10 add 9)
+  */
+ cfg mmPCIE_DBI_GEN3_EQ_CONTROL_OFF, 0x05039F70
+-#endif
++#endif /* TARGET_IS_PLDM */
+ 
++#ifdef DEV_IS_DALI
+ /* Clear phy_init (removes the workaround provided by SNPS) */
+ cfg mmPCIE_AUX_PHY_INIT, 0x00000000
+ 
+ /* Take PCIe PHY out of reset */
+ cfg mmPCIE_WRAP_PHY_RST_N, 0x00000001
++#endif
+ 
+ /* Enable PCIe FW download FSM */
+ cfg mmPSOC_GLOBAL_CONF_PCI_FW_FSM, 0x00000001
+ 
+ #ifndef TARGET_IS_PLDM
++
++#ifdef DEV_IS_DALI
+ mem 0x07FF9000000, pcie_phy_fw.bin
++#else
++cfg mmPCIE_WRAP_PHY_FW_FSM_SIZE, FW_SIZE
++/* PHY FW FSM EN and Direct FW write mechanism enable */
++cfg mmPCIE_WRAP_PHY_FW_FSM, 0x9
++mem 0x07FFBFF0000, pcie_phy_fw.bin
++#endif
++
+ #endif
+diff --git a/board/habanalabs/common/btl/primary.S b/board/habanalabs/common/btl/primary.S
+index 66d55aa..87b9da0 100644
+--- a/board/habanalabs/common/btl/primary.S
++++ b/board/habanalabs/common/btl/primary.S
+@@ -15,8 +15,10 @@
+ cfg mmPSOC_GLOBAL_CONF_WARM_REBOOT, 0x4
+ #endif
+ 
++#ifdef DEV_IS_DALI
+ /* To avoid false PRSTN configure pad as Schmitt trigger */
+ cfg mmPSOC_GLOBAL_CONF_PAD_3V3_CFG_10, 0x41
++#endif
+ 
+ #ifdef mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG
+ /* Configure PRSTN to reset entire SoC */

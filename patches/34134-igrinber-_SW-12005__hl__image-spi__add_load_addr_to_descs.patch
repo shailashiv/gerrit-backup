@@ -1,0 +1,76 @@
+From 55138b080b46c33113613c926edeec533ab8f999 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 30 Apr 2020 16:06:10 +0300
+Subject: [PATCH] [SW-12005] hl: image-spi: add load addr to descs
+
+The image desriptors did not have the image load address encoded.
+This results in hard coding of the next image load address into the
+previous image - meaning each image must know the next image load
+address during its compilation.
+This situation is not very good and not generic.
+Encode the images load addresses as per latest spec in the end of the
+image descriptor structure.
+
+Change-Id: I4a1348474cc2c275f7a41e1938c1f510d26e2134
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/post-image-spi.sh b/board/habanalabs/common/post-image-spi.sh
+index c173e59..cb9e6a2 100755
+--- a/board/habanalabs/common/post-image-spi.sh
++++ b/board/habanalabs/common/post-image-spi.sh
+@@ -43,12 +43,32 @@
+ 	esac
+ }
+ 
++function get_image_loadaddr {
++	local idx=$1
++	# TODO: rework the below to recieve the addresses from specs instead
++	#	of hard coding them here
++	local PREBOOT_TEXT_BASE=0x7FF0004000
++	local UBOOT_TEXT_BASE=0x7FF0100000
++
++	case $idx in
++	1) # Preboot
++		echo $PREBOOT_TEXT_BASE
++		;;
++	2) # U-Boot
++		echo $UBOOT_TEXT_BASE
++		;;
++	esac
++}
++
+ source ${BOARD_BASE}/post-image-spi.sh
+ 
+ function print_image_desc {
+ 	local img_num=$1
+ 	local img_base=$(get_image_base $img_num)
+ 	local img_size=$(get_image_size $img_num)
++	local img_load=$(get_image_loadaddr $img_num)
++	local img_loadh=$((img_load >> 32))		# take upper bytes
++	local img_loadl=$((img_load & 0xFFFFFFFF))	# take lower bytes
+ 	local s_off=$((0x0 + img_base))
+ 	local m_off=$((0x800000 + img_base))
+ 
+@@ -74,12 +94,20 @@
+ 
+ 	# Prepare Modifiable image size
+ 	printf "%08x" $img_size | rev_bytes_stdin
++
++	# If one of the addresses is empty use 0x0 instead
++	# Prepare Stable and Modifiable image load address high
++	printf "%08x" $img_loadh | rev_bytes_stdin
++	printf "%08x" $img_loadh | rev_bytes_stdin
++	# Prepare Stable and Modifiable image load address low
++	printf "%08x" $img_loadl | rev_bytes_stdin
++	printf "%08x" $img_loadl | rev_bytes_stdin
+ }
+ 
+ function prep_image_ptrs {
+ 	local img_file=$1
+ 	local img_ptrs_sz=16
+-	local img_desc_sz=28
++	local img_desc_sz=44
+ 
+ 	# Prepare the NEXT and MODIFIABLE for backward compatibility
+ 	echo "11110000" > ${HL_DEV}-next-image.txt

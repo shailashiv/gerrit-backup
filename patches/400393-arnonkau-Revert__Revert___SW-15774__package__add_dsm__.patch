@@ -1,0 +1,140 @@
+From 65836bb7a95fb80a866df4d92e5bacbedeb56897 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Mon, 26 Feb 2024 12:30:50 +0200
+Subject: [PATCH] Revert "Revert "[SW-15774] package: add dsm""
+
+This reverts commit bf72cb89a60eb03bea4c033eb8228abfe2270091.
+---
+
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index a5f076b..6239f8c 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -30,3 +30,4 @@
+ AGENT_SERDES_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-plugins
+ PREBOOT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/preboot
+ PREBOOT_D1_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/preboot/app/preboot_d1
++DSM_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/pcie-ss/dsm
+diff --git a/package/dsm/dsm.mk b/package/dsm/dsm.mk
+new file mode 100644
+index 0000000..4c187ca
+--- /dev/null
++++ b/package/dsm/dsm.mk
+@@ -0,0 +1,117 @@
++DSM_APP_NAME = dsm
++DSM_DEPENDENCIES = host-cmake host-lzop host-lz4
++DSM_APP_MODULES = eeprom mbedtls boot_info i2c-indirect soc_init hl_shell mcpt
++DSM_SRCDIR=$(EMBEDDED_DIR)/zephyr-apps/pcie-ss/dsm
++DSM_ZEPHYR_SRCDIR=$(EMBEDDED_DIR)/zephyr
++
++DSM_APP_PROD_NAME = zephyr_arc_$(DSM_APP_NAME)
++DSM_DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
++DSM_APP_VERSION = $(shell cut -d- -f2- $(@D)/localversion-habanalabs)
++DSM_LOCAL_VERSION = $$(sed "s/^.*fw-\\([0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\).*$$/\\1/" $(@D)/localversion-habanalabs)
++
++DSM_BUILD_DIR = $(@D)
++DSM_ZEPHYR_BUILD_DIR ?= $(@D)/zephyr
++
++DSM_CONF_CFLAGS =\
++		$(COMMON_DRV_CONF_CFLAGS) \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++DSM_CONF_EXTRA_CFLAGS =\
++		$(COMMON_CONF_EXTRA_CFLAGS) \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++DSM_CONF_ENV = CROSS_COMPILE=$(TARGET_CROSS)
++DSM_CONF_ENV += ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
++DSM_CONF_ENV += ZEPHYR_BASE=$(DSM_ZEPHYR_BUILD_DIR)
++
++DSM_CONF_OPTS  = $(ZEPHYR_CONF_OPTS)
++DSM_CONF_OPTS += -UCMAKE_TOOLCHAIN_FILE
++DSM_CONF_OPTS += -DUSER_CACHE_DIR=$(@D)/.cache
++DSM_CONF_OPTS += -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-e__start
++DSM_CONF_OPTS += -DEXTRA_CFLAGS="\
++		-Werror \
++		-Wno-misleading-indentation \
++		$(DSM_CONF_EXTRA_CFLAGS)"
++
++DSM_CONF_OPTS += -DBUILD_VERSION="$(DSM_APP_VERSION)"
++DSM_CONF_OPTS += -DBUILD_MACHINE="$(shell hostname -s)"
++DSM_CONF_OPTS += -DCMAKE_C_FLAGS="\
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(DSM_CONF_CFLAGS)"
++
++DSM_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMBEDDED_DIR)"
++DSM_CONF_OPTS += -DBOARD=hl_$(DSM_DEVICE_NAME)_$(DSM_APP_NAME)_$(HL_TARGET)
++DSM_CONF_OPTS += -DDEVICE=$(DSM_DEVICE_NAME)
++DSM_CONF_OPTS += -DAPP_NAME=$(DSM_APP_PROD_NAME)
++DSM_CONF_OPTS += -DAPP_VERSION=$(DSM_APP_VERSION)
++
++DSM_WEST_SRC_DIR :=
++DSM_WEST_DEST_DIR :=
++
++define DSM_COPY_ZEPHYR_SRC
++	rsync -au --chmod=u=rwX,go=rX  --exclude .svn --exclude .git --exclude .hg --exclude .bzr --exclude CVS $(DSM_ZEPHYR_SRCDIR) $(DSM_BUILD_DIR)
++endef
++
++# Arguments:
++# - module name
++# - component dir
++# - component name
++#
++define DSM_DEFINE_MODULE_ENVVARS
++	$(eval MODULE_NAME=$(strip $1)) \
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $(MODULE_NAME) | tr a-z A-Z)) \
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE))) \
++	$(eval $(MODULE_NAME_UPPER_CASE)_SRCDIR=$(EMBEDDED_DIR)/zephyr-modules/$(MODULE_NAME)) \
++	$(eval $(MODULE_NAME_UPPER_CASE)_DIR=$(@D)/build/modules/$(MODULE_NAME)) \
++	$(eval $(MODULE_NAME_UPPER_CASE)_NAME=$2_$(MODULE_NAME))
++endef
++
++$(foreach module,$(DSM_APP_MODULES),$(call DSM_DEFINE_MODULE_ENVVARS,$(module),$(DSM_APP_PROD_NAME)))
++
++# Arguments:
++# - module (mbedtls, eeprom, etc.)
++define DSM_MODULE_VERSION_HOOK
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $1 | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(call HL_VERSION_GEN, ${${MODULE_NAME_UPPER_CASE}_SRCDIR}, ${${MODULE_NAME_UPPER_CASE}_DIR}, ${${MODULE_NAME_UPPER_CASE}_NAME})
++endef
++
++define DSM_APP_VERSION_GEN
++	@$(call HL_VERSION_GEN, ${DSM_SRCDIR},.,${DSM_APP_NAME})
++	@$(call HL_VERSION_GEN, ${DSM_SRCDIR},build,${DSM_APP_NAME})
++	@$(foreach module,$(DSM_APP_MODULES),$(call DSM_MODULE_VERSION_HOOK,$(module)))
++endef
++
++define DSM_CREATE_HL_VERSION
++	@mkdir -p $(DSM_BUILD_DIR)/include
++	@echo "#ifndef _HL_VERSION_" >  $(DSM_BUILD_DIR)/include/hl_version.h
++	@echo "#define _HL_VERSION_" >> $(DSM_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MAJOR $$(echo $(DSM_LOCAL_VERSION) | cut -d. -f1)" >> $(DSM_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MINOR $$(echo $(DSM_LOCAL_VERSION) | cut -d. -f2)" >> $(DSM_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_PATCH $$(echo $(DSM_LOCAL_VERSION) | cut -d. -f3)" >> $(DSM_BUILD_DIR)/include/hl_version.h
++	@echo "#endif" >> $(DSM_BUILD_DIR)/include/hl_version.h
++endef
++
++define DSM_CONFIGURE_CMDS
++	@$(call DSM_CREATE_HL_VERSION)
++	@$(DSM_CONF_ENV) $(HOST_DIR)/bin/cmake $(DSM_CONF_OPTS) -S $(DSM_BUILD_DIR) -B $(DSM_BUILD_DIR)/build
++endef
++
++DSM_POST_RSYNC_HOOKS += HL_VERSION_GEN
++DSM_POST_RSYNC_HOOKS += DSM_COPY_ZEPHYR_SRC
++DSM_POST_RSYNC_HOOKS += DSM_APP_VERSION_GEN
++
++define DSM_BUILD_CMDS
++	@$(TARGET_MAKE_ENV) $(MAKE) -C $(DSM_BUILD_DIR)/build all
++endef
++
++define DSM_INSTALL_TARGET_CMDS
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_$(DSM_APP_NAME).elf
++endef
++
++dsm-configure: $(DSM_DEPENDENCIES)
++dsm-menuconfig dsm-guiconfig: | dsm-configure
++	$(TARGET_MAKE_ENV) $(MAKE) -C $(DSM_BUILD_DIR)/build all
++	rm -f $(DSM_BUILD_DIR)/.stamp_{configured,built}
++
++$(eval $(cmake-package))

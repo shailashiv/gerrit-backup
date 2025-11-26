@@ -1,0 +1,137 @@
+From 2b57ac4a59981157cfeb1d0006bef945e9ba6117 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Fri, 10 Aug 2018 14:54:48 +0300
+Subject: [PATCH] hl: preperation to Gaudi step 1
+
+rename DALI_TARGET_FILE -> HL_VARS_FILE
+
+Inside this file declare:
+1) HL_TARGET instead of DALI_TARGET
+2) HL_DEV <-- possible values dali, gaudi...
+---
+
+diff --git a/Makefile b/Makefile
+index bdfbcea..b7ceffd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+-.DEFAULT_GOAL := dali-help
+-dali-help:
++.DEFAULT_GOAL := hl-help
++hl-help:
+ 	@echo 'Cleaning:'
+ 	@echo '  dali-distclean       - Delete all Dali files created by build'
+ 	@echo
+@@ -40,13 +40,18 @@
+ %:
+ 	@$(MAKE) -C ../buildroot O=$(OUTPUT_DIR) $@
+ 
+-DALI_TARGET_FILE := $(OUTPUT_DIR)/.dali-target.mk
+-ifneq ($(realpath $(DALI_TARGET_FILE)),)
+-include $(DALI_TARGET_FILE)
++HL_VARS_FILE := $(OUTPUT_DIR)/.hl-vars.mk
++ifneq ($(realpath $(HL_VARS_FILE)),)
++include $(HL_VARS_FILE)
+ endif
++
++.PHONY: hl-dali
++hl-dali:
++	@echo "export HL_DEV=$(patsubst hl-%,%,$@)"		 > $(HL_VARS_FILE)
++
+ .PHONY: dali-onix-target dali-pldm-target dali-asic-target
+-dali-onix-target dali-pldm-target dali-asic-target:
+-	@echo "export DALI_TARGET=$(patsubst dali-%-target,%,$@)" > $(DALI_TARGET_FILE)
++dali-onix-target dali-pldm-target dali-asic-target: hl-dali
++	@echo "export HL_TARGET=$(patsubst dali-%-target,%,$@)"	>> $(HL_VARS_FILE)
+ 
+ $(OUTPUT_DIR)/.config: $(BR2_EXTERNAL)/configs/dali_defconfig
+ 	@$(MAKE) $(<F)
+diff --git a/board/habanalabs/dali/btl/Makefile b/board/habanalabs/dali/btl/Makefile
+index 807429b..364ee93 100644
+--- a/board/habanalabs/dali/btl/Makefile
++++ b/board/habanalabs/dali/btl/Makefile
+@@ -10,10 +10,10 @@
+ 
+ COMMON_CPP_FLAGS += -I$(dir $(BR2_EXTERNAL))/specs/dali/asic_reg
+ 
+-ifeq ($(DALI_TARGET),pldm)
++ifeq ($(HL_TARGET),pldm)
+ 	COMMON_CPP_FLAGS += -DTARGET_IS_PLDM
+ endif
+-ifeq ($(DALI_TARGET),asic)
++ifeq ($(HL_TARGET),asic)
+ 	COMMON_CPP_FLAGS += -DTARGET_IS_ASIC
+ endif
+ ifneq ($(TARGET_IS_TESTER),)
+diff --git a/board/habanalabs/dali/post-build.sh b/board/habanalabs/dali/post-build.sh
+index f2ef87c..c7cb9e1 100755
+--- a/board/habanalabs/dali/post-build.sh
++++ b/board/habanalabs/dali/post-build.sh
+@@ -1,16 +1,16 @@
+ #!/usr/bin/env bash
+ 
+ pushd ${TARGET_DIR}/etc/init.d/
+-	if [ "${DALI_TARGET}" == "pldm" ] || [ "${DALI_TARGET}" == "asic" ]; then
++	if [ "${HL_TARGET}" == "pldm" ] || [ "${HL_TARGET}" == "asic" ]; then
+ 		if [ -e S40network ]; then
+ 			mv S40network .S40network
+ 		fi
+-	elif [ "${DALI_TARGET}" == "onix" ]; then
++	elif [ "${HL_TARGET}" == "onix" ]; then
+ 		if [ -e .S40network ]; then
+ 			mv .S40network S40network
+ 		fi
+ 	else
+-		echo "Unknown Dali Target: ${DALI_TARGET}"
++		echo "Unknown ${HL_DEV} target: ${HL_TARGET}"
+ 		exit 1
+ 	fi
+ popd
+diff --git a/board/habanalabs/dali/post-image.sh b/board/habanalabs/dali/post-image.sh
+index 3cb7f88..34a94af 100755
+--- a/board/habanalabs/dali/post-image.sh
++++ b/board/habanalabs/dali/post-image.sh
+@@ -19,9 +19,9 @@
+ }
+ 
+ pushd ${BINARIES_DIR}
+-	cp ${BOARD_BASE}/dali_${DALI_TARGET}.its .
++	cp ${BOARD_BASE}/dali_${HL_TARGET}.its .
+ 	cp ${BASE_DIR}/build/linux-custom/arch/arm64/boot/Image .
+-	${HOST_DIR}/usr/bin/mkimage -D "-W no-unit_address_vs_reg" -f dali_${DALI_TARGET}.its ${LINUX_FITFILE}
++	${HOST_DIR}/usr/bin/mkimage -D "-W no-unit_address_vs_reg" -f dali_${HL_TARGET}.its ${LINUX_FITFILE}
+ 
+ 	cp ${UBOOT_ITSFILE} dali_fit_spl.its
+ 	# In case ITSFILE points to locations under public directory /tools
+diff --git a/configs/dali_defconfig b/configs/dali_defconfig
+index 646fab5..66049d2 100644
+--- a/configs/dali_defconfig
++++ b/configs/dali_defconfig
+@@ -14,11 +14,11 @@
+ BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/post-image.sh"
+ BR2_LINUX_KERNEL=y
+ BR2_LINUX_KERNEL_USE_ARCH_DEFAULT_CONFIG=y
+-BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/linux_$(DALI_TARGET).fragment"
++BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/linux_$(HL_TARGET).fragment"
+ BR2_LINUX_KERNEL_IMAGE_TARGET_CUSTOM=y
+ BR2_LINUX_KERNEL_IMAGE_TARGET_NAME="Image.gz"
+ BR2_LINUX_KERNEL_DTS_SUPPORT=y
+-BR2_LINUX_KERNEL_INTREE_DTS_NAME="habanalabs/dali_$(DALI_TARGET)"
++BR2_LINUX_KERNEL_INTREE_DTS_NAME="habanalabs/dali_$(HL_TARGET)"
+ BR2_PACKAGE_BUSYBOX_CONFIG="package/busybox/busybox-minimal.config"
+ BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/busybox.fragment"
+ BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+@@ -49,11 +49,11 @@
+ BR2_TARGET_UBOOT=y
+ BR2_TARGET_UBOOT_BUILD_SYSTEM_KCONFIG=y
+ BR2_TARGET_UBOOT_BOARD_DEFCONFIG="dali"
+-BR2_TARGET_UBOOT_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/uboot_$(DALI_TARGET).fragment"
++BR2_TARGET_UBOOT_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/uboot_$(HL_TARGET).fragment"
+ BR2_TARGET_UBOOT_NEEDS_DTC=y
+ BR2_TARGET_UBOOT_SPL=y
+ BR2_TARGET_UBOOT_ENVIMAGE=y
+-BR2_TARGET_UBOOT_ENVIMAGE_SOURCE="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/uboot-env-$(DALI_TARGET).txt"
++BR2_TARGET_UBOOT_ENVIMAGE_SOURCE="$(BR2_EXTERNAL_HL_DALI_PATH)/board/habanalabs/dali/uboot-env-$(HL_TARGET).txt"
+ BR2_TARGET_UBOOT_ENVIMAGE_SIZE="0x1000"
+ BR2_TARGET_UBOOT_ENVIMAGE_REDUNDANT=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS=y

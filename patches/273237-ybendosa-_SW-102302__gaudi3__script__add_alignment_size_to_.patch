@@ -1,0 +1,58 @@
+From 563b287849d79076d699451125eeefba0eaf59d7 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 15 Sep 2022 19:48:59 +0300
+Subject: [PATCH] [SW-102302] gaudi3: script: add alignment size to img size
+
+The size of the complete image(Payload + Key + Signature) needs to be calculated
+and placed in the manifest even before hashing and signing over it as the size
+data itself needs to be hashed. Due to this we are required to calculate the
+complete image size to be dmaed by considering payload + key + signature + CRC size.
+
+PL NOTE: We also need to consider the 16 byte alignment in case the resultant
+size of (payload + key + signature) is not 16 byte aligned. This is because
+of dma requirement to place the crc at the end of a 16 byte aligned image.
+Hence the final formula = ALIGN_16(Payload + Key + Signature) + CRC
+
+Currently '(Payload + Key + Signature)' + CRC is calculated.
+The patch fixes the formula to 'ALIGN_16(Payload + Key + Signature) + CRC'
+
+This patch will currently have no functional impact as the image + key
++ signature size is aligned . But the dma crc will fail in case the image is not
+16 byte aligned.
+
+Change-Id: I66a86b4272f5b4c4a0bc2e658c3a878ee7d08c50
+---
+
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index 823d9c7..9178fd0 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -541,9 +541,25 @@
+ 
+ 	cat ${TEMPNAME} ${KEY_NAME}-key-props.bin > ${PKFILE}
+ 
+-	local img_sz=$(stat -Lc "%s" $(eval "echo \${PKFILE}"))
+-	#Add 4 bytes as size for CRC which will be calculated on the final binary
+-	printf "%08x" $((img_sz+sig_size+4)) | rev_bytes_stdin | xxd -r -p -s +0 - ${PKFILE}
++	#The size of the complete image(Payload + Key + Signature) needs to be calculated
++	#and placed in the manifest even before hashing and signing over it as the size
++	#data itself needs to be hashed. Due to this we are required to calculate the
++	#complete image size to be dmaed by considering payload + key + signature + CRC size.
++	#PL NOTE: We also need to consider the 16 byte alignment in case the resultant
++	#size of (payload + key + signature) is not 16 byte aligned. This is because
++	#of dma requirement to place the crc at the end of a 16 byte aligned image.
++	#Hence the final formula = ALIGN_16(Payload + Key + Signature) + CRC
++
++	#payload + key size
++	local pk_sz=$(stat -Lc "%s" $(eval "echo \${PKFILE}"))
++	#size to be aligned to
++	local align_sz=16
++	#payload + key + signature size
++	local pk_sig_sz=$((pk_sz+sig_size))
++	#ALIGN(payload + key + signature size)
++	local pk_sig_align_sz=$(((pk_sig_sz+align_sz-1)/align_sz*align_sz))
++	#ALIGN(payload + key + signature size) + CRC size
++	printf "%08x" $((pk_sig_align_sz+4)) | rev_bytes_stdin | xxd -r -p -s +0 - ${PKFILE}
+ 
+ 	printf "%08x" $img_desc_sz | rev_bytes_stdin | xxd -r -p -s +4 - ${PKFILE}
+ 

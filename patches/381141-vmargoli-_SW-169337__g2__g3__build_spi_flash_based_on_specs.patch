@@ -1,0 +1,318 @@
+From 4082c6582f94979406d28c666ddb716eef73c02f Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Wed, 27 Dec 2023 13:08:43 +0200
+Subject: [PATCH] [SW-169337] g2: g3: build spi flash based on specs
+
+Build spi flash image file  according to
+flash layout data from spec
+
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+Change-Id: I5fc0730088e2e5821bc6490ee04f406a53939e98
+---
+
+diff --git a/board/habanalabs/common/post-image-spi-arc_global.sh b/board/habanalabs/common/post-image-spi-arc_global.sh
+index f7ed3e8..2980431 100755
+--- a/board/habanalabs/common/post-image-spi-arc_global.sh
++++ b/board/habanalabs/common/post-image-spi-arc_global.sh
+@@ -264,16 +264,85 @@
+ 	rm -rf ${FILE}.size
+ }
+ 
++function hl_report_missing_spi_region_offset_and_exit {
++	local red=$(tput setaf 1)
++	local normal=$(tput sgr0)
++
++	printf "$red The offset of SPI flash region %s is not defined $normal \n" $1
++	exit 1
++}
++
++function hl_report_missing_spi_region_size_and_exit {
++	local red=$(tput setaf 1)
++	local normal=$(tput sgr0)
++
++	printf "$red The size of SPI flash region %s is not defined $normal \n" $1
++	exit 1
++}
++
++function hl_validate_spi_flash_layout {
++	local -n spi_region_to_file=$1
++	local -n spi_region_offsets=$2
++	local -n spi_region_sizes=$3
++	local region_name
++
++	for region_name in "${!spi_region_to_file[@]}"; do
++		if [[ -z "${spi_region_offsets[$region_name]+unset}" ]]; then
++			hl_report_missing_spi_region_offset_and_exit $region_name
++		fi
++		if [[ -z "${spi_region_sizes[$region_name]+unset}" ]]; then
++			hl_report_missing_spi_region_size_and_exit $region_name
++		fi
++	done
++}
++
++function hl_parse_spi_flash_regions {
++	local -n spi_region_offsets=$1
++	local -n spi_region_sizes=$2
++	local platform_tokens=(${HL_DEV//_/ })
++	local mem_addr_header_file=${BR2_EXTERNAL_HABANALABS_PATH}/../specs/${platform_tokens[0]}/${platform_tokens[0]}_mem_addr_dt.h
++	local regex_offset="\#define(.*)SPI_FLASH_REGION_([A-Z_0-9]+)_OFFSET(\s+)([0-9A-F]+)"
++	local regex_size="\#define(.*)SPI_FLASH_REGION_([A-Z_0-9]+)_SIZE(\s+)([0-9A-F]+)"
++	local region_name
++	local region_offset
++	local region_size
++	local red=$(tput setaf 1)
++	local normal=$(tput sgr0)
++
++	if [ ! -f $mem_addr_header_file ]; then
++		printf "$red File %s not exists $normal \n" "$mem_addr_header_file"
++		exit 1
++	fi
++	IFS=$'\n'
++	for line in $(cat "$mem_addr_header_file")
++	do
++		if [[ $line =~ $regex_offset ]]; then
++			region_name=${BASH_REMATCH[2]}
++			region_offset=$(echo "ibase=16; ${BASH_REMATCH[4]}"|bc)
++			spi_region_offsets[${region_name}]=$region_offset
++		elif [[ $line =~ $regex_size ]]; then
++			region_name=${BASH_REMATCH[2]}
++			region_size=$(echo "ibase=16; ${BASH_REMATCH[4]}"|bc)
++			spi_region_sizes[${region_name}]=$region_size
++		fi
++	done
++}
++
+ function hl_check_length_of_spi_files {
+-	local -n files=$1
++	local -n region_to_file=$1
++	local -n region_to_size=$2
+ 	local file_name
++	local region_name
+ 	local block_size
+ 	local diff
+ 	local red=$(tput setaf 1)
+ 	local normal=$(tput sgr0)
+ 
+-	for file_name in "${!files[@]}"; do
+-		block_size="${files[${file_name}]}"
++	for region_name in "${!region_to_file[@]}"; do
++		file_name="${region_to_file[${region_name}]}"
++		[[ $file_name == FF ]] && continue
++		[[ $file_name == 00 ]] && continue
++		block_size="${region_to_size[${region_name}]}"
+ 		if [ ! -f $file_name ]; then
+ 			printf "$red File %s not exists $normal \n" "$file_name"
+ 			exit 1
+@@ -292,6 +361,66 @@
+ 	done
+ }
+ 
++function hl_build_spi_flash_file {
++	local -n region_to_file=$1
++	local -n region_to_offset=$2
++	local -n region_to_size=$3
++	local -n out_file=$4
++	local file_length=0
++	local input_file
++	local file_length
++	local offset
++	local size
++	local kb
++	local end_of_region
++	local current_region_offset=0
++	local region_found
++	local red=$(tput setaf 1)
++	local normal=$(tput sgr0)
++
++	for region_name in "${!region_to_offset[@]}"; do
++		offset="${region_to_offset[${region_name}]}"
++		size="${region_to_size[${region_name}]}"
++		end_of_region=$(expr $offset + $size)
++		if [ $end_of_region -gt $file_length ]; then
++			file_length=$end_of_region
++		fi
++	done
++
++	printf "\nLength of flash image file %s: 0x%x bytes \n\n" "$out_file" "$file_length"
++	rm -f "$out_file"
++	touch "$out_file"
++
++	while [ $current_region_offset -lt $file_length ]; do
++		region_found=false
++		for region_name in "${!region_to_offset[@]}"; do
++			offset="${region_to_offset[${region_name}]}"
++			size="${region_to_size[${region_name}]}"
++			kb=$(expr "$size" \/ 1024)
++			if [ $offset -eq $current_region_offset ]; then
++				region_found=true
++				input_file="${region_to_file[${region_name}]}"
++				if [ "$input_file" = "FF" ]; then
++					printf "Writing FF to offset 0x%x  %sK \n" "$offset" "$kb"
++					dd status=none conv=sync bs=${kb}K count=1 if=/dev/zero | tr "\000" "\377" >> ${out_file}
++				elif [ "$input_file" = "00" ]; then
++					printf "Writing 00 to offset 0x%x  %sK \n" "$offset" "$kb"
++					dd status=none conv=sync bs=${kb}K count=1 if=/dev/zero >> ${out_file}
++				else
++					printf "Writing %s from %s to offset 0x%x  %sK \n" "$region_name" "$input_file" "$offset" "$kb"
++					dd status=none conv=sync bs=${kb}K if=${input_file} >> ${out_file}
++				fi
++				current_region_offset=$(expr $offset + $size)
++				break
++			fi
++		done
++		if [ "$region_found" = false ]; then
++			printf "$red SPI flash region with offset 0x%x not defined $normal \n" "$current_region_offset"
++			exit 1
++		fi
++	done
++}
++
+ pushd ${OUTPUT_DIR}
+ 
+ 	hl_copy_binaries ${OUTPUT_DIR}
+diff --git a/board/habanalabs/gaudi2_arc/post-image-spi.sh b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+index 6f9be21..ce367b7 100755
+--- a/board/habanalabs/gaudi2_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+@@ -453,44 +453,22 @@
+ 	local PPBOOT_BIN=$5
+ 	local EROM_BIN=$6
+ 
+-	declare -A SPI_REGIONS
++	declare -rA REGION_TO_FILENAME=(["EROM"]=$EROM_BIN \
++					["SECURITY"]=$SECURITY_BIN \
++					["PPBOOT_1"]=$PPBOOT_BIN \
++					["PPBOOT_2"]=$PPBOOT_BIN \
++					["IMAGE_POINTERS"]=$IMG_PTR_BIN \
++					["PREBOOT_1"]=$PREBOOT_BIN \
++					["PREBOOT_2"]=$PREBOOT_BIN \
++					["RESERVED_1"]="FF" \
++					["RESERVED_UENV"]="FF")
++	declare -A SPI_REGION_OFFSETS
++	declare -A SPI_REGION_SIZES
+ 
+-	SPI_REGIONS[${EROM_BIN}]=$((128 * 1024))
+-	SPI_REGIONS[${SECURITY_BIN}]=$((64 * 1024))
+-	SPI_REGIONS[${PPBOOT_BIN}]=$((64 * 1024))
+-	SPI_REGIONS[${IMG_PTR_BIN}]=$((64 * 1024))
+-	SPI_REGIONS[${PREBOOT_BIN}]=$((320 * 1024))
+-	hl_check_length_of_spi_files  SPI_REGIONS
+-
+-	# Reserved space filled by 0xFF
+-	dd status=none conv=sync bs=64K count=1 if=/dev/zero |  tr "\000" "\377"	 > 64K-0xff.bin
+-
+-	# Create dummy binary for EROM (sector 0 & 1)
+-	dd status=none conv=sync bs=128K if=${EROM_BIN}		> ${OUTF}
+-
+-	# SECURITY (sector 2)
+-	dd status=none conv=sync bs=64K	if=${SECURITY_BIN}	>> ${OUTF}
+-
+-	# Ppboot1 (sector 3)
+-	dd status=none conv=sync bs=64K	if=${PPBOOT_BIN}	>> ${OUTF}
+-
+-	# Unused (sector 4)
+-	dd status=none conv=sync bs=64K count=1 if=64K-0xff.bin	>> ${OUTF}
+-
+-	# Ppboot2 (sector 5)
+-	dd status=none conv=sync bs=64K	if=${PPBOOT_BIN}	>> ${OUTF}
+-
+-	# Image pointers ARC (sector 6)
+-	dd status=none conv=sync bs=64K	if=${IMG_PTR_BIN}	>> ${OUTF}
+-
+-	# U-Boot ENV (for testing purpose, sector 7)
+-	dd status=none conv=sync bs=64K count=1 if=/dev/zero	>> ${OUTF}
+-
+-	# Preboot1 (sector 8-12)
+-	dd status=none conv=sync bs=320K if=${PREBOOT_BIN}	>> ${OUTF}
+-
+-	# Preboot2 (sector 13-17)
+-	dd status=none conv=sync bs=320K if=${PREBOOT_BIN}	>> ${OUTF}
++	hl_parse_spi_flash_regions SPI_REGION_OFFSETS SPI_REGION_SIZES
++	hl_validate_spi_flash_layout REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES
++	hl_check_length_of_spi_files  REGION_TO_FILENAME SPI_REGION_SIZES
++	hl_build_spi_flash_file REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES OUTF
+ }
+ 
+ function append_sha384 {
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index 14e740d..567a8d7 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -249,57 +249,27 @@
+ 	local PREBOOT_D1_BIN=${10}
+ 	local SRAM_MBIST_DATA_BIN=${11}
+ 
+-	declare -A SPI_REGIONS
++	declare -rA REGION_TO_FILENAME=(["EROM"]=$EROM_BIN \
++					["PPBOOT_1"]=$PPBOOT_BIN \
++					["PPBOOT_2"]=$PPBOOT_BIN \
++					["IMAGE_DESCRIPTORS"]=$IMG_PTR_BIN \
++					["PIF_ICCM"]=$PIF_ICCM_BIN \
++					["PIF_DCCM"]=$PIF_DCCM_BIN \
++					["RESERVED_PIF"]="00" \
++					["DIE_0_PREBOOT_1"]=$PREBOOT_BIN \
++					["DIE_0_PREBOOT_2"]=$PREBOOT_BIN \
++					["RESERVED_PREBOOT"]="00" \
++					["DIE_1_PREBOOT_1"]=$PREBOOT_D1_BIN \
++					["RESERVED_1"]="00" \
++					["SRAM_BIST_DATA"]=$SRAM_MBIST_DATA_BIN \
++					["FAKE_FUSE"]=$FAKE_FUSE_BIN)
++	declare -A SPI_REGION_OFFSETS
++	declare -A SPI_REGION_SIZES
+ 
+-	SPI_REGIONS[${EROM_BIN}]=$((128 * 1024))
+-	SPI_REGIONS[${PPBOOT_BIN}]=$((128 * 1024))
+-	SPI_REGIONS[${IMG_PTR_BIN}]=$((64 * 1024))
+-	SPI_REGIONS[${PIF_ICCM_BIN}]=$((5 * 1024))
+-	SPI_REGIONS[${PIF_DCCM_BIN}]=$((5 * 1024))
+-	SPI_REGIONS[${PREBOOT_BIN}]=$(printf "%d" ${PREBOOT2_SIZE_LIMIT})
+-	SPI_REGIONS[${PREBOOT_D1_BIN}]=$((64 * 1024))
+-	SPI_REGIONS[${FAKE_FUSE_BIN}]=$((64 * 1024))
+-	SPI_REGIONS[${SRAM_MBIST_DATA_BIN}]=$(printf "%d" ${SRAM_MBIST_DATA_SIZE_LIMIT})
+-	hl_check_length_of_spi_files  SPI_REGIONS
+-
+-	# Create dummy binary for EROM (sector 0, 1)
+-	dd status=none conv=sync bs=128K if=${EROM_BIN}		> ${OUTF}
+-
+-	# Ppboot1 (sector 2, 3)
+-	dd status=none conv=sync bs=128K	if=${PPBOOT_BIN}	>> ${OUTF}
+-
+-	# Ppboot2 (sector 4, 5)
+-	dd status=none conv=sync bs=128K	if=${PPBOOT_BIN}	>> ${OUTF}
+-
+-	# Image pointers ARC (sector 6)
+-	dd status=none conv=sync bs=64K	if=${IMG_PTR_BIN}	>> ${OUTF}
+-
+-	# Pif Arc images (sector 7)
+-	dd status=none conv=sync bs=8K	if=${PIF_ICCM_BIN}	>> ${OUTF}
+-	dd status=none conv=sync bs=8K	if=${PIF_DCCM_BIN}	>> ${OUTF}
+-	dd status=none conv=sync bs=48K count=1 if=/dev/zero	>> ${OUTF}
+-
+-	# Preboot1 (sector 8, 9, 10, 11, 12)
+-	dd status=none conv=sync bs=320K	if=${PREBOOT_BIN}	>> ${OUTF}
+-
+-	# Preboot2 (sector 13, 14, 15, 16, 17)
+-	dd status=none conv=sync bs=320K	if=${PREBOOT_BIN}	>> ${OUTF}
+-
+-	# empty (sector 18, 19)
+-	dd status=none conv=sync bs=128K count=1 if=/dev/zero	>> ${OUTF}
+-
+-	# Preboot D1 (sector 20) single sector(64K) is enough for preboot D1
+-	dd status=none conv=sync bs=64K	if=${PREBOOT_D1_BIN}	>> ${OUTF}
+-
+-	# empty (sector 21)
+-	dd status=none conv=sync bs=64K count=1 if=/dev/zero	>> ${OUTF}
+-
+-	#SRAM_MBIST_DATA (sector 22)
+-	dd status=none conv=sync bs=64K if=${SRAM_MBIST_DATA_BIN}     >> ${OUTF}
+-
+-	# FAKE_FUSE (sector 23)
+-	dd status=none conv=sync bs=64K	if=${FAKE_FUSE_BIN}	>> ${OUTF}
+-
++	hl_parse_spi_flash_regions SPI_REGION_OFFSETS SPI_REGION_SIZES
++	hl_validate_spi_flash_layout REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES
++	hl_check_length_of_spi_files  REGION_TO_FILENAME SPI_REGION_SIZES
++	hl_build_spi_flash_file REGION_TO_FILENAME SPI_REGION_OFFSETS SPI_REGION_SIZES OUTF
+ }
+ 
+ function hl_chksum_padding {

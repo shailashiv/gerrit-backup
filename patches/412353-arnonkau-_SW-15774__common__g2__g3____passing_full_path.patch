@@ -1,0 +1,613 @@
+From 8516478f6c5b892ecd4ce75fea4a15f0bde267ad Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Tue, 16 Apr 2024 11:27:56 +0300
+Subject: [PATCH] [SW-15774] common: g2: g3: : passing full path
+
+Preparation of function to accept file's full pass as parameter
+
+Change-Id: I9b61cffa35d305513da303b6f1626aba3083c997
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/post-image-bins.sh b/board/habanalabs/common/post-image-bins.sh
+index 66493e6..cc7e9bd 100755
+--- a/board/habanalabs/common/post-image-bins.sh
++++ b/board/habanalabs/common/post-image-bins.sh
+@@ -10,9 +10,11 @@
+ 
+ function image_align_compress_le_be {
+ 	local BS=$(($1))
+-	local FILENAME=$2
+-	local LEFILENAME=${HL_DEV}-${FILENAME}.le
+-	local BEFILENAME=${HL_DEV}-${FILENAME}.be
++	local FULLFILENAME=$2
++	local FILENAME=$(basename ${FULLFILENAME})
++	local FILENAMEPATH=$(dirname ${FULLFILENAME})
++	local LEFILENAME=${FILENAMEPATH}/${HL_DEV}-${FILENAME}.le
++	local BEFILENAME=${FILENAMEPATH}/${HL_DEV}-${FILENAME}.be
+ 
+ 	dd status=none conv=sync bs=${BS} if=${FILENAME} of=${LEFILENAME}
+ 	swap_file ${LEFILENAME} ${BEFILENAME}
+@@ -20,8 +22,8 @@
+ }
+ 
+ function swap_and_compress_bins() {
+-	pushd ${BINARIES_DIR}
+-		handle_btl sectors-be.bin ${HL_DEV}-sectors.bin
+-		image_align_compress_le_be 8 u-boot.bin
++	pushd ${STAGE_DIR}
++		handle_btl ${BINS_DIR}/sectors-be.bin ${BINS_DIR}/${HL_DEV}-sectors.bin ${BINS_DIR}
++		image_align_compress_le_be 8 ${BINS_DIR}u-boot.bin
+ 	popd
+-}
+\ No newline at end of file
++}
+diff --git a/board/habanalabs/gaudi2/post-image-spi.sh b/board/habanalabs/gaudi2/post-image-spi.sh
+index 49a3b7d..16c7ec8 100755
+--- a/board/habanalabs/gaudi2/post-image-spi.sh
++++ b/board/habanalabs/gaudi2/post-image-spi.sh
+@@ -7,12 +7,14 @@
+ function handle_btl {
+ 	local INF=$1
+ 	local OUTF=$2
++	local WRKDIR=$3
+ 
++	pushd ${WRKDIR}
+ 	for s in s?.bin; do
+ 		# Align to 4B
+ 		dd status=none conv=sync bs=4 if=${s} of=${s}.le
+ 	done
+-
++	popd
+ 	# Align to 64KB
+ 	dd status=none conv=sync bs=64K if=${INF} of=${INF}.tmp
+ 	swap_file ${INF}.tmp ${OUTF}
+diff --git a/board/habanalabs/gaudi2_arc/post-image-spi.sh b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+index d548881..b2064cd 100755
+--- a/board/habanalabs/gaudi2_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+@@ -62,8 +62,8 @@
+ 	# hl_copy_binaries function is called from post-image-spi-arc_global.sh
+ 	# common script. All the binaries required for creation of spi
+ 	# are compiled as part of gaudi2_arc HL_TARGET
+-	touch ${DEV_PREFIX}-preboot_d1.bin.le
+-	touch ${DEV_PREFIX}-sram-mbist-data.bin.le
++	touch ${BINS_DIR}/${DEV_PREFIX}-preboot_d1.bin.le
++	touch ${BINS_DIR}/${DEV_PREFIX}-sram-mbist-data.bin.le
+ 	return
+ }
+ 
+@@ -92,11 +92,11 @@
+ 	OUT_NAME=$3
+ 
+ 	TMPNAME=${KEY_NAME}-${PROP_NAME}.txt
+-	fdtget ${KEY_NAME}.dtb /signature/key-${KEY_NAME} rsa,${PROP_NAME} -t bx > ${TMPNAME}
+-	sed 's/\s\+/\n/g' ${TMPNAME} > ${TMPNAME}.tmp
+-	sed -e 's/\b[0-9]\b/0&/' -e 's/\b[a-f]\b/0&/' ${TMPNAME}.tmp  > ${TMPNAME}.tmp.le
+-	xxd -r -p ${TMPNAME}.tmp.le > ${OUT_NAME}
+-	rm -f ${TMPNAME}.*
++	fdtget ${KEY_NAME}.dtb /signature/key-${KEY_NAME} rsa,${PROP_NAME} -t bx > ${STAGE_DIR}/${TMPNAME}
++	sed 's/\s\+/\n/g' ${STAGE_DIR}/${TMPNAME} > ${STAGE_DIR}/${TMPNAME}.tmp
++	sed -e 's/\b[0-9]\b/0&/' -e 's/\b[a-f]\b/0&/' ${STAGE_DIR}/${TMPNAME}.tmp > ${STAGE_DIR}/${TMPNAME}.tmp.le
++	xxd -r -p ${STAGE_DIR}/${TMPNAME}.tmp.le > ${OUT_NAME}
++	rm -f ${STAGE_DIR}/${TMPNAME}.*
+ }
+ 
+ function hl_get_key_props {
+@@ -142,7 +142,10 @@
+ }
+ 
+ function hl_pack_bin {
+-	FILEPATH=$1
++set -x
++	FILEFULLPATH=$1
++	FILENAME=$(basename ${FILEFULLPATH})
++	FILEPATH=$(dirname ${FILEFULLPATH})
+ 	BSIZE=$2
+ 	KEY_NUM=$3
+ 	CRC_ERROR=$4
+@@ -156,32 +159,33 @@
+ 	#Extract Key Properties and store them in a bin file
+ 	hl_get_key_props ${KEY_NUM}
+ 
+-	TEMPNAME=${FUNCNAME}-$(basename ${FILEPATH})
+-	dd status=none conv=sync bs=16 if=${FILEPATH}			> ${TEMPNAME}
++	TEMPNAME=${FUNCNAME}-${FILENAME}
++	TEMPFULLPATH=${STAGE_DIR}/${FUNCNAME}-${FILENAME}
++	dd status=none conv=sync bs=16 if=${FILEFULLPATH} > ${TEMPFULLPATH}
+ 
+-	append_sha384 ${TEMPNAME}
++	append_sha384 ${TEMPFULLPATH}
+ 
+-	hl_get_ver ${TEMPNAME}
++	hl_get_ver ${TEMPFULLPATH}
+ 	VPKFILE=${TEMPNAME}.ver.payload.key
+ 
+ 	#No need to pack Public Key, since Key Props are enough
+-	cat ${TEMPNAME}.ver ${TEMPNAME} ${KEY_NAME}-key-props.bin > ${VPKFILE}
++	cat ${TEMPFULLPATH}.ver ${TEMPFULLPATH} ${STAGE_DIR}/${KEY_NAME}-key-props.bin > ${STAGE_DIR}/${VPKFILE}
+ 
+-	$OPENSSL dgst -sha384 -binary ${VPKFILE} > psk_${VPKFILE}.sha384
++	$OPENSSL dgst -sha384 -binary ${STAGE_DIR}/${VPKFILE} > ${STAGE_DIR}/psk_${VPKFILE}.sha384
+ 
+-	hl_sign_bin ${VPKFILE} ${KEY_NAME}
++	hl_sign_bin ${STAGE_DIR}/${VPKFILE} ${KEY_NAME}
+ 	if [ ${SIGN_ERROR} -eq 1 ]; then
+-		dd status=none conv=sync count=24 bs=16 if=/dev/urandom	> ${VPKFILE}.sig
++		dd status=none conv=sync count=24 bs=16 if=/dev/urandom	> ${STAGE_DIR}/${VPKFILE}.sig
+ 	fi
+ 	SIGBINFILE=${VPKFILE}.sig.bin
+-	cat ${VPKFILE} ${VPKFILE}.sig					> ${SIGBINFILE}
+-	hl_get_size ${SIGBINFILE} 4
++	cat ${STAGE_DIR}/${VPKFILE} ${STAGE_DIR}/${VPKFILE}.sig	> ${STAGE_DIR}/${SIGBINFILE}
++	hl_get_size ${STAGE_DIR}/${SIGBINFILE} 4
+ 	FULLBINFILE=${SIGBINFILE}.full
+-	cat ${SIGBINFILE}.size ${SIGBINFILE}				> ${FULLBINFILE}
++	cat ${STAGE_DIR}/${SIGBINFILE}.size ${STAGE_DIR}/${SIGBINFILE}	> ${STAGE_DIR}/${FULLBINFILE}
+ 	PADFULLBINFILE=${FULLBINFILE}.pad
+-	dd status=none conv=sync bs=16 if=${FULLBINFILE}		> ${PADFULLBINFILE}
++	dd status=none conv=sync bs=16 if=${STAGE_DIR}/${FULLBINFILE}	> ${STAGE_DIR}/${PADFULLBINFILE}
+ 
+-	SIZE_WITHOUT_CRC=$(stat --printf="%s" ${PADFULLBINFILE})
++	SIZE_WITHOUT_CRC=$(stat --printf="%s" ${STAGE_DIR}/${PADFULLBINFILE})
+ 	NUM_SLICES=$((SIZE_WITHOUT_CRC/MAX_SPI_DMA_DATA_TRANSFER))
+ 	MODULO_SLICES=$((SIZE_WITHOUT_CRC%MAX_SPI_DMA_DATA_TRANSFER))
+ 	if [ ${MODULO_SLICES} -ne 0 ]; then
+@@ -190,14 +194,14 @@
+ 
+ 	# add 4 bytes for each CRCs
+ 	SIZE_CRCS=$((NUM_SLICES*4))
+-	hl_get_size ${FULLBINFILE} ${SIZE_CRCS}
+-	dd status=none conv=notrunc seek=0 bs=${SIZE_CRCS} if=${FULLBINFILE}.size of=${PADFULLBINFILE}
++	hl_get_size ${STAGE_DIR}/${FULLBINFILE} ${SIZE_CRCS}
++	dd status=none conv=notrunc seek=0 bs=${SIZE_CRCS} if=${STAGE_DIR}/${FULLBINFILE}.size of=${STAGE_DIR}/${PADFULLBINFILE}
+ 	local leftover=${SIZE_WITHOUT_CRC}
+ 	local skip_offset=0
+ 
+ 	for ((slice_cnt=0; slice_cnt<${NUM_SLICES}; slice_cnt++)); do
+ 		# bin file: (64KB-16) + CRC
+-		local BIN_FILE=${PADFULLBINFILE}.part${slice_cnt}
++		local BIN_FILE=${STAGE_DIR}/${PADFULLBINFILE}.part${slice_cnt}
+ 		if [ $leftover -lt $MAX_SPI_DMA_DATA_TRANSFER ]; then
+ 			size_bytes=$leftover
+ 		else
+@@ -205,19 +209,19 @@
+ 		fi
+ 
+ 		size_words=$((size_bytes/4))
+-		dd status=none skip=${skip_offset} conv=sync bs=4 if=${PADFULLBINFILE} count=${size_words} > ${BIN_FILE}
++		dd status=none skip=${skip_offset} conv=sync bs=4 if=${STAGE_DIR}/${PADFULLBINFILE} count=${size_words} > ${BIN_FILE}
+ 		hl_calc_crc32 ${BIN_FILE}
+ 		if [ ${CRC_ERROR} -eq 0 ]; then
+ 			cat ${BIN_FILE}.crc32 >> ${BIN_FILE}
+ 		fi
+ 		flash_offset=$((SPI_DMA_DEST_64KB_OFFS/4))
+ 		flash_offset=$((flash_offset*slice_cnt))
+-		dd status=none conv=sync if=${BIN_FILE} bs=4 seek=$flash_offset of=${DEV_PREFIX}-${FILEPATH}.le
++		dd status=none conv=sync if=${BIN_FILE} bs=4 seek=$flash_offset of=${BINS_DIR}/${DEV_PREFIX}-${FILENAME}.le
+ 		leftover=$((leftover-size_bytes))
+ 		skip_offset=$((skip_offset+size_words))
+ 	done
+-	hl_pldm_hex $(basename ${FILEPATH}) ${SIGBINFILE}.full 16
+-	rm -f ${FUNCNAME}-*
++	hl_pldm_hex ${FILENAME} ${STAGE_DIR}/${SIGBINFILE}.full 16 ${HEXS_DIR}
++	rm -f ${STAGE_DIR}/${FUNCNAME}-*
+ }
+ 
+ function calculate_hash {
+@@ -259,16 +263,19 @@
+ function print_image_chksum {
+ 	local name=${1^^}
+ 	local BINFILE=$(eval "echo \${${name}_BINFILE}")
++	local BINFILEEXT=${BINFILE##*.}
++	local SRCDIR_VAR_NAME=${BINFILEEXT^^}S_DIR
++	local SRCDIR=${!SRCDIR_VAR_NAME}
+ 
+ 	#align the source binaries to 16 bytes
+-	dd status=none conv=sync bs=16 if=${BINFILE} of=${BINFILE}.tmp.pad
++	dd status=none conv=sync bs=16 if=${SRCDIR}/${BINFILE} of=${STAGE_DIR}/${BINFILE}.tmp.pad
+ 	# Prepare checksum
+ 	# in gaudi2 the struct hl_fw_img_desc is not compatible with the standard.
+ 	# the sha256 chksum feild was removed from struct and the sha384 took its place.
+-	local CKSUM=`sha384sum ${BINFILE}.tmp.pad`
++	local CKSUM=`sha384sum ${STAGE_DIR}/${BINFILE}.tmp.pad`
+ 	echo ${CKSUM}
+ 	echo ${CKSUM}
+-	rm -f ${BINFILE}.tmp.pad
++	rm -f ${STAGE_DIR}/${BINFILE}.tmp.pad
+ }
+ 
+ #*******************************************************************************#
+@@ -388,11 +395,13 @@
+ 
+ function prep_erom_with_crc {
+ 	BINFILE=$1
+-	cat ${BINFILE}>${BINFILE}.tmp.pad
+-	dd status=none conv=sync bs=16 if=${BINFILE}.tmp.pad of=${BINFILE}.tmp.algn
+-	hl_calc_crc32 ${BINFILE}.tmp.algn
+-	cat ${BINFILE}.tmp.algn ${BINFILE}.tmp.algn.crc32 > ${DEV_PREFIX}-${BINFILE}
+-	rm -rf ${BINFILE}.tmp*
++	local BINFILE_BASE=$(basename ${BINFILE})
++
++	cat ${BINFILE}>${STAGE_DIR}/${BINFILE_BASE}.tmp.pad
++	dd status=none conv=sync bs=16 if=${STAGE_DIR}/${BINFILE_BASE}.tmp.pad of=${STAGE_DIR}/${BINFILE_BASE}.tmp.algn
++	hl_calc_crc32 ${STAGE_DIR}/${BINFILE_BASE}.tmp.algn
++	cat ${STAGE_DIR}/${BINFILE_BASE}.tmp.algn ${STAGE_DIR}/${BINFILE_BASE}.tmp.algn.crc32 > ${BINS_DIR}/${DEV_PREFIX}-${BINFILE_BASE}
++	rm -rf ${STAGE_DIR}/${BINFILE_BASE}.tmp*
+ }
+ 
+ function prep_erom_fit {
+@@ -400,20 +409,20 @@
+ 
+ 	ITS_SED_PARAMS+="s/@HL_DEV@/${DEV_PREFIX}/g;"
+ 	ITS_SED_PARAMS+="s|@HL_EROM_VER_FILE@|${EROM_VERSION_FILE}|g;"
+-	sed ${ITS_SED_PARAMS} ${EROM_ITS_TEMPLATE} > ${DEV_PREFIX}-erom.its
+-	$MKIMAGE_FILE -f ${DEV_PREFIX}-erom.its ${ITB_FILE}
++	sed ${ITS_SED_PARAMS} ${EROM_ITS_TEMPLATE} > ${STAGE_DIR}/${DEV_PREFIX}-erom.its
++	$MKIMAGE_FILE -f ${STAGE_DIR}/${DEV_PREFIX}-erom.its ${ITB_FILE}
+ }
+ 
+ function prep_image_erom {
+ 	local OUTF=$1
+ 	local HI_OFFSET=""
+ 
+-	prep_erom_with_crc ${EROM_PCIE_BINFILE}
+-	prep_erom_with_crc ${EROM_RECOVERY_BINFILE}
++	prep_erom_with_crc ${STAGE_DIR}/${EROM_PCIE_BINFILE}
++	prep_erom_with_crc ${STAGE_DIR}/${EROM_RECOVERY_BINFILE}
+ 
+ 	# create fit file with erom additional data
+-	prep_erom_fit ${EROM_FIT_BINFILE}
+-	prep_erom_with_crc ${EROM_FIT_BINFILE}
++	prep_erom_fit ${ITBS_DIR}/${EROM_FIT_BINFILE}
++	prep_erom_with_crc ${ITBS_DIR}/${EROM_FIT_BINFILE}
+ 
+ 	# Create erom image pointers binary
+ 	prep_image_ptrs_erom ${EROM_IMAGES_POINTERS_BINFILE}
+@@ -421,27 +430,27 @@
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+ 		#Create erom hex files for paladium
+-		hl_pldm_flash_hex erom-binary-pcie ${DEV_PREFIX}-${EROM_PCIE_BINFILE}
+-		hl_pldm_flash_hex erom-binary-recovery ${DEV_PREFIX}-${EROM_RECOVERY_BINFILE}
++		hl_pldm_flash_hex erom-binary-pcie ${BINS_DIR}/${DEV_PREFIX}-${EROM_PCIE_BINFILE} ${HEXS_DIR}
++		hl_pldm_flash_hex erom-binary-recovery ${BINS_DIR}/${DEV_PREFIX}-${EROM_RECOVERY_BINFILE} ${HEXS_DIR}
+ 
+ 		#Create erom image pointers hex files for paladium
+-		hl_pldm_flash_hex erom-binary-img-ptr ${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE}
++		hl_pldm_flash_hex erom-binary-img-ptr ${BINS_DIR}/${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE} ${HEXS_DIR}
+ 	fi
+ 
+ 	# create little-endian binaries for ASIC / ONIX
+-	cp -f ${DEV_PREFIX}-${EROM_PCIE_BINFILE} ${DEV_PREFIX}-${EROM_PCIE_BINFILE}.le
+-	cp -f ${DEV_PREFIX}-${EROM_RECOVERY_BINFILE} ${DEV_PREFIX}-${EROM_RECOVERY_BINFILE}.le
+-	cp -f ${DEV_PREFIX}-${EROM_FIT_BINFILE} ${DEV_PREFIX}-${EROM_FIT_BINFILE}.le
+-	cp -f ${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE} ${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE}.le
++	cp -f ${BINS_DIR}/${DEV_PREFIX}-${EROM_PCIE_BINFILE} ${BINS_DIR}/${DEV_PREFIX}-${EROM_PCIE_BINFILE}.le
++	cp -f ${BINS_DIR}/${DEV_PREFIX}-${EROM_RECOVERY_BINFILE} ${BINS_DIR}/${DEV_PREFIX}-${EROM_RECOVERY_BINFILE}.le
++	cp -f ${BINS_DIR}/${DEV_PREFIX}-${EROM_FIT_BINFILE} ${BINS_DIR}/${DEV_PREFIX}-${EROM_FIT_BINFILE}.le
++	cp -f ${BINS_DIR}/${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE} ${BINS_DIR}/${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE}.le
+ 
+ 	# Reserved space (80820 bytes) filled by 0xFF
+ 	HI_OFFSET=$(printf %d ${EROM_TPM_OFFSET})
+ 	dd status=none conv=sync bs=${HI_OFFSET} count=1 if=/dev/zero |  tr "\000" "\377" > ${OUTF}
+ 
+-	dd status=none seek=$(printf %d ${EROM_START_OFFSET})		if=${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE}.le	bs=1 of=${OUTF}
+-	dd status=none seek=$(printf %d ${EROM_PCIE_OFFSET})		if=${DEV_PREFIX}-${EROM_PCIE_BINFILE}.le		bs=1 of=${OUTF}
+-	dd status=none seek=$(printf %d ${EROM_RECOVERY_OFFSET})	if=${DEV_PREFIX}-${EROM_RECOVERY_BINFILE}.le		bs=1 of=${OUTF}
+-	dd status=none seek=$(printf %d ${EROM_FIT_OFFSET})		if=${DEV_PREFIX}-${EROM_FIT_BINFILE}.le			bs=1 of=${OUTF}
++	dd status=none seek=$(printf %d ${EROM_START_OFFSET})		if=${BINS_DIR}/${DEV_PREFIX}-${EROM_IMAGES_POINTERS_BINFILE}.le	bs=1 of=${OUTF}
++	dd status=none seek=$(printf %d ${EROM_PCIE_OFFSET})		if=${BINS_DIR}/${DEV_PREFIX}-${EROM_PCIE_BINFILE}.le		bs=1 of=${OUTF}
++	dd status=none seek=$(printf %d ${EROM_RECOVERY_OFFSET})	if=${BINS_DIR}/${DEV_PREFIX}-${EROM_RECOVERY_BINFILE}.le	bs=1 of=${OUTF}
++	dd status=none seek=$(printf %d ${EROM_FIT_OFFSET})		if=${BINS_DIR}/${DEV_PREFIX}-${EROM_FIT_BINFILE}.le		bs=1 of=${OUTF}
+ 
+ }
+ 
+@@ -472,18 +481,20 @@
+ }
+ 
+ function append_sha384 {
+-	IMG=${1}
+-	SHA384_BINFILE=img-hash-${IMG%.*}.sha384
++	local FILEFULLPATH=${1}
++	local FILENAME=$(basename ${1})
++	local FILEPREFIX=${FILENAME%.*}
++	local SHA384_BINFILE=${STAGE_DIR}/img-hash-${FILEPREFIX}.sha384
+ 
+-	rm -f ${SHA384_BINFILE}.sha384
++	rm -f ${SHA384_BINFILE}
+ 
+-	$OPENSSL dgst -sha384 -binary ${IMG} > ${SHA384_BINFILE}
++	$OPENSSL dgst -sha384 -binary ${FILEFULLPATH} > ${SHA384_BINFILE}
+ 
+ 	# Pad magic to be 16 byte - aligned
+-	dd status=none conv=sync bs=4 if=/dev/zero count=3 >> ${IMG}
++	dd status=none conv=sync bs=4 if=/dev/zero count=3 >> ${FILEFULLPATH}
+ 
+-	echo ${SHA384_MAGIC} | xxd -r -p - >> ${IMG}
+-	dd status=none conv=sync bs=1 if=${SHA384_BINFILE} >> ${IMG}
++	echo ${SHA384_MAGIC} | xxd -r -p - >> ${FILEFULLPATH}
++	dd status=none conv=sync bs=1 if=${SHA384_BINFILE} >> ${FILEFULLPATH}
+ }
+ 
+ # Zephyr code must be aligned to 1K, so it's either at start of SRAM or at the
+@@ -499,15 +510,15 @@
+ 	local PRIME_IMAGE_RAM_CRC_ERROR=$3
+ 	local PRIME_IMAGE_RAM_SIGN_ERROR=$4
+ 
+-	dd if=/dev/zero bs=1 status=none count=1016 	> preboot-pad.bin
+-	cat ${PREBOOT_BINFILE} 				>> preboot-pad.bin
+-	mv ${PREBOOT_BINFILE} preboot-orig.bin
+-	mv preboot-pad.bin ${PREBOOT_BINFILE}
++	dd if=/dev/zero bs=1 status=none count=1016 	> ${STAGE_DIR}/preboot-pad.bin
++	cat ${PREBOOT_BINFILE} 				>> ${STAGE_DIR}/preboot-pad.bin
++	mv ${PREBOOT_BINFILE} ${STAGE_DIR}/preboot-orig.bin
++	mv ${STAGE_DIR}/preboot-pad.bin ${PREBOOT_BINFILE}
+ 
+ 	hl_pack_bin ${PREBOOT_BINFILE} 64K ${PRIME_IMAGE_RAM_KEY} ${PRIME_IMAGE_RAM_CRC_ERROR} ${PRIME_IMAGE_RAM_SIGN_ERROR}
+ 
+ 	rm -rf ${PREBOOT_BINFILE}
+-	mv preboot-orig.bin ${PREBOOT_BINFILE}
++	mv ${STAGE_DIR}/preboot-orig.bin ${PREBOOT_BINFILE}
+ }
+ 
+ function zephyr_preboot_d1_pack {
+diff --git a/board/habanalabs/gaudi3_arc/post-image-spi.sh b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+index fb75ed1..9e63df5 100755
+--- a/board/habanalabs/gaudi3_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi3_arc/post-image-spi.sh
+@@ -138,14 +138,16 @@
+ MAX_SPI_DMA_DATA_TRANSFER=65520
+ SPI_DMA_DEST_64KB_OFFS=65536
+ function hl_pack_bin {
+-	FILEPATH=$1
++	FILEFULLPATH=$1
++	FILENAME=$(basename ${FILEFULLPATH})
++	FILEPATH=$(dirname ${FILEFULLPATH})
+ 	BSIZE=$2
+ 	KEY_NUM=$3
+ 	CRC_ERROR=$4
+ 	SIGN_ERROR=$5
+ 
+-	PADFULLBINFILE=${FILEPATH}.pad
+-	dd status=none conv=sync bs=16 if=${FILEPATH} of=${PADFULLBINFILE}
++	PADFULLBINFILE=${FILEFULLPATH}.pad
++	dd status=none conv=sync bs=16 if=${FILEFULLPATH} of=${PADFULLBINFILE}
+ 
+ 	SIZE_WITHOUT_CRC=$(stat --printf="%s" ${PADFULLBINFILE})
+ 	NUM_SLICES=$((SIZE_WITHOUT_CRC/MAX_SPI_DMA_DATA_TRANSFER))
+@@ -196,13 +198,16 @@
+ 		fi
+ 		flash_offset=$((SPI_DMA_DEST_64KB_OFFS/4))
+ 		flash_offset=$((flash_offset*slice_cnt))
+-		dd status=none conv=sync if=${BIN_FILE} bs=4 seek=$flash_offset of=${DEV_PREFIX}-${FILEPATH}.le.int
++		dd status=none conv=sync if=${BIN_FILE} bs=4 seek=$flash_offset of=${STAGE_DIR}/${DEV_PREFIX}-${FILENAME}.le.int
+ 		leftover=$((leftover-size_bytes))
+ 		skip_offset=$((skip_offset+size_words))
+ 	done
+ 
+-	hl_reverse_words ${DEV_PREFIX}-${FILEPATH}.le.int ${DEV_PREFIX}-${FILEPATH}.le 4
+-	rm -f ${DEV_PREFIX}-${FILEPATH}.le.int
++
++	hl_reverse_words ${STAGE_DIR}/${DEV_PREFIX}-${FILENAME}.le.int ${BINS_DIR}/${DEV_PREFIX}-${FILENAME}.le 4
++	rm -f ${STAGE_DIR}/${DEV_PREFIX}-${FILENAME}.le.int
++	hl_reverse_words ${STAGE_DIR}${DEV_PREFIX}-${FILENAME}.le.int ${FILEPATH}${DEV_PREFIX}-${FILENAME}.le 4
++	rm -f ${STAGE_DIR}${DEV_PREFIX}-${FILENAME}.le.int
+ }
+ 
+ function zephyr_preboot_pack {
+@@ -285,7 +290,7 @@
+ function get_image_size {
+ 	local name=${1^^}
+ 
+-	stat -Lc "%s" $(eval "echo \${${name}_BINFILE}")
++	stat -Lc "%s" $(eval "echo ${BINS_DIR}\${${name}_BINFILE}")
+ }
+ 
+ 
+@@ -300,29 +305,30 @@
+ }
+ 
+ function calc_image_ptrs_sha384 {
+-	input=$1
+-	output=${input}.tmp
+-	hash_output=img-hash-${input}.sha384
++	local input_full_path=$1
++	local input=$(basename $1)
++	output=${input_full_path}.tmp
++	hash_output=${STAGE_DIR}/img-hash-${input}.sha384
+ 
+-	input_size=$(stat -c %s "$input")
++	input_size=$(stat -c %s "$input_full_path")
+ 	local sig_size=384
+ 	#img ptrs size is less than 64kB. setting num_crc=1, crc_bytes=4
+ 	local crc_bytes=4
+ 	#calc hash for image and key only
+ 	truncate_bytes=$((sig_size+crc_bytes))
+ 	count=$(( $input_size - $truncate_bytes ))
+-	dd if="$input" of="$output" bs=1 count=${count}
++	dd if="$input_full_path" of="$output" bs=1 count=${count}
+ 	openssl dgst -sha384 -binary ${output} > ${hash_output}
+ 	rm -rf ${output}
+ }
+ 
+ function prep_img_desc_with_crc {
+ 	BINFILE=$1
+-	OUTFILENAME=$1
++	OUTFILENAME=$(basename $1)
+ 	cat ${BINFILE}>${BINFILE}.tmp.pad
+ 	dd status=none conv=sync bs=16 if=${BINFILE}.tmp.pad of=${BINFILE}.tmp.algn
+ 	hl_calc_crc32 ${BINFILE}.tmp.algn
+-	cat ${BINFILE}.tmp.algn ${BINFILE}.tmp.algn.crc32 > ${DEV_PREFIX}-${OUTFILENAME}
++	cat ${BINFILE}.tmp.algn ${BINFILE}.tmp.algn.crc32 > ${BINS_DIR}${DEV_PREFIX}-${OUTFILENAME}
+ 	rm -rf ${BINFILE}.tmp*
+ }
+ 
+@@ -351,7 +357,7 @@
+ 	local BINFILE=$(eval "echo \${${NAME}_BINFILE}")
+ 
+ 	#align the source binaries to 16 bytes
+-	dd status=none conv=sync bs=16 if=${BINFILE} of=${BINFILE}.tmp.pad
++	dd status=none conv=sync bs=16 if=${BINS_DIR}${BINFILE} of=${STAGE_DIR}/${BINFILE}.tmp.pad
+ 	# Prepare checksum
+ 	local CKSUM=`sha384sum ${BINFILE}.tmp.pad`
+ 	hl_chksum_add ${CKSUM}
+@@ -545,11 +551,13 @@
+ 	hl_get_key_props ${KEY_NUM}
+ 
+ 	TEMPNAME=${FUNCNAME}
+-	dd status=none conv=sync bs=16 if=$img_file			> ${TEMPNAME}
++	TEMPFULLNAME=${STAGE_DIR}/${FUNCNAME}
++	dd status=none conv=sync bs=16 if=$img_file > ${TEMPFULLNAME}
+ 
+ 	PKFILE=${TEMPNAME}.payload.key
++	PKFULLFILE=${TEMPFULLNAME}.payload.key
+ 
+-	cat ${TEMPNAME} ${KEY_NAME}-key-props.bin > ${PKFILE}
++	cat ${TEMPFULLNAME} ${KEY_NAME}-key-props.bin >${PKFULLFILE}
+ 
+ 	#The size of the complete image(Payload + Key + Signature) needs to be calculated
+ 	#and placed in the manifest even before hashing and signing over it as the size
+@@ -561,7 +569,7 @@
+ 	#Hence the final formula = ALIGN_16(Payload + Key + Signature) + CRC
+ 
+ 	#payload + key size
+-	local pk_sz=$(stat -Lc "%s" $(eval "echo \${PKFILE}"))
++	local pk_sz=$(stat -Lc "%s" $(eval "echo \${PKFULLFILE}"))
+ 	#size to be aligned to
+ 	local align_sz=16
+ 	#payload + key + signature size
+@@ -573,17 +581,17 @@
+ 
+ 	printf "%08x" $img_desc_sz | rev_bytes_stdin | xxd -r -p -s +4 - ${PKFILE}
+ 
+-	$OPENSSL dgst -sha384 -binary ${PKFILE} > ${PKFILE}.sha384
++	$OPENSSL dgst -sha384 -binary ${PKFULLFILE} > ${PKFULLFILE}.sha384
+ 
+-	hl_sign_bin ${PKFILE} ${KEY_NAME}
++	hl_sign_bin ${PKFULLFILE} ${KEY_NAME}
+ 
+ 	SIGBINFILE=${PKFILE}.sig.bin
+ 
+-	cat ${PKFILE} ${PKFILE}.sig			>${SIGBINFILE}
++	cat ${PKFULLFILE} ${PKFULLFILE}.sig			>${STAGE_DIR}/${SIGBINFILE}
+ 
+-	prep_img_desc_with_crc ${SIGBINFILE}
++	prep_img_desc_with_crc ${STAGE_DIR}/${SIGBINFILE}
+ 
+-	hl_reverse_words ${DEV_PREFIX}-${SIGBINFILE} $out_file 4
++	hl_reverse_words ${STAGE_DIR}/${DEV_PREFIX}-${SIGBINFILE} $out_file 4
+ }
+ 
+ function prep_image_ptrs {
+@@ -591,31 +599,32 @@
+ }
+ 
+ function prep_pldm_preboot_d1_hex {
+-	swap_file ${PREBOOT_D1_BINFILE} ${PREBOOT_D1_BINFILE}.orig.be
+-	hl_pldm_hex preboot_d1 ${PREBOOT_D1_BINFILE}.orig.be 1
++	swap_file ${BINS_DIR}/${PREBOOT_D1_BINFILE} ${BINS_DIR}/${PREBOOT_D1_BINFILE}.orig.be
++	hl_pldm_hex preboot_d1 ${BINS_DIR}/${PREBOOT_D1_BINFILE}.orig.be 1 ${HEXS_DIR}
+ }
+ 
+ function prep_image_erom {
+-	local OUTF=$1
++	local OUTFULLPATH=$1
++	local OUTF=$(basename $1)
+ 
+-	dd status=none conv=sync bs=16 if=${EROM_PCIE_BINFILE} of=${EROM_PCIE_PADDED_BINFILE}
+-	dd status=none conv=sync bs=16 if=${EROM_RECOVERY_BINFILE} of=${EROM_RECOVERY_PADDED_BINFILE}
++	dd status=none conv=sync bs=16 if=${BINS_DIR}/${EROM_PCIE_BINFILE} of=${BINS_DIR}/${EROM_PCIE_PADDED_BINFILE}
++	dd status=none conv=sync bs=16 if=${BINS_DIR}/${EROM_RECOVERY_BINFILE} of=${BINS_DIR}/${EROM_RECOVERY_PADDED_BINFILE}
+ 
+ 	prep_image_ptrs_common_v4 ${DEV_PREFIX}-erom-images-pointers.bin.le $IMAGE_TYPE_EROM
+ 
+-	prep_img_desc_with_crc ${EROM_PCIE_BINFILE}
+-	prep_img_desc_with_crc ${EROM_RECOVERY_BINFILE}
++	prep_img_desc_with_crc ${BINS_DIR}/${EROM_PCIE_BINFILE}
++	prep_img_desc_with_crc ${BINS_DIR}/${EROM_RECOVERY_BINFILE}
+ 
+-	hl_reverse_words ${DEV_PREFIX}-erom-images-pointers.bin.le \
+-	${DEV_PREFIX}-erom-images-pointers.bin.be 4
++	hl_reverse_words ${BINS_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.le \
++	${BINS_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.be 4
+ 
+ 	if [ ${HL_TARGET} == "pldm" ]; then
+ 	#Create erom hex files for paladium
+-		hl_pldm_flash_hex erom-binary-pcie ${DEV_PREFIX}-${EROM_PCIE_BINFILE}
+-		hl_pldm_flash_hex erom-binary-recovery ${DEV_PREFIX}-${EROM_RECOVERY_BINFILE}
++		hl_pldm_flash_hex erom-binary-pcie ${BINS_DIR}/${DEV_PREFIX}-${EROM_PCIE_BINFILE} ${HEXS_DIR}
++		hl_pldm_flash_hex erom-binary-recovery ${BINS_DIR}/${DEV_PREFIX}-${EROM_RECOVERY_BINFILE} ${HEXS_DIR}
+ 
+ 		#Create erom image pointers hex files for paladium
+-		hl_pldm_flash_hex erom-binary-img-ptr ${DEV_PREFIX}-erom-images-pointers.bin.be
++		hl_pldm_flash_hex erom-binary-img-ptr ${BINS_DIR}/${DEV_PREFIX}-erom-images-pointers.bin.be ${HEXS_DIR}
+ 	fi
+ 
+ 	dd status=none conv=sync if=${DEV_PREFIX}-erom-images-pointers.bin.${ENDIANNESS} \
+@@ -630,42 +639,49 @@
+ }
+ 
+ function hl_objcopy_sections() {
+-	local PREFIX=$1
++	local FILEFULLPATH=$1
++	local FILENAME=$(basename ${FILEFULLPATH})
++	local FILEPATH=$(dirname ${FILEFULLPATH})
++	#local EXT=${FILENAME##*.}
++	local PREFIX=${FILENAME%.*}
+ 	local ALIGN=$2
+ 	local MEM=$3
+ 	local SECTIONS=${*:4}
+ 
+ 	${OBJCOPY} -S --gap-fill 0xff --output-target=binary --remove-section=.comment\
+-	$(echo -n $SECTIONS | sed 's/[^ ]* */ --only-section=&/g') ${BINARIES_DIR}/${PREFIX}.elf \
++	$(echo -n $SECTIONS | sed 's/[^ ]* */ --only-section=&/g') ${FILEPATH}/${PREFIX}.elf \
+ 	--set-section-flags=bss=alloc,load,contents --set-section-flags=.stack=alloc,load,contents\
+ 	${BINARIES_DIR}/${PREFIX}-${MEM}.bin.int
+ 
+-	dd status=none conv=sync bs=${ALIGN} if=${BINARIES_DIR}/${PREFIX}-${MEM}.bin.int > \
+-	${BINARIES_DIR}/${PREFIX}-${MEM}.bin
++	dd status=none conv=sync bs=${ALIGN} if=${STAGE_DIR}/${PREFIX}-${MEM}.bin.int > \
++	${BINS_DIR}/${PREFIX}-${MEM}.bin
+ 
+-	rm -f ${BINARIES_DIR}/${PREFIX}-${MEM}.bin.int
++	rm -f ${STAGE_DIR}/${PREFIX}-${MEM}.bin.int
+ }
+ 
+ function prep_image_pcie_pif {
+-	local PIF_FILENAME=$1
+-	local PREFIX=$(echo "$1" | cut -f 1 -d '.')
++	local FILEFULLPATH=$1
++	local FILENAME=$(basename ${FILEFULLPATH})
++	local FILEPATH=$(dirname ${FILEFULLPATH})
++	local PREFIX=${FILENAME%.*}
++	#local EXT=${FILENAME##*.}
++	local PREFIX=${FILENAME%.*}
+ 	local ICCM_SECTIONS=(.ivt .text)
+ 	local DCCM_SECTIONS=(.data .sdata .bss .stack)
+ 
+ 	# Align ICCM and DCCM binary to 16 bytes to comply with CCM ECC data bank size
+-	hl_objcopy_sections ${PREFIX} 16 "iccm" ${ICCM_SECTIONS[@]}
+-	hl_objcopy_sections ${PREFIX} 16 "dccm" ${DCCM_SECTIONS[@]}
++	hl_objcopy_sections ${FILEFULLPATH} 16 "iccm" ${ICCM_SECTIONS[@]}
++	hl_objcopy_sections ${FILEFULLPATH} 16 "dccm" ${DCCM_SECTIONS[@]}
+ 
+-	hl_pack_bin ${PREFIX}-iccm.bin 4k 0 0 0
+-	hl_pack_bin ${PREFIX}-dccm.bin 4k 0 0 0
+-
+-	swap_file ${DEV_PREFIX}-${PIF_ICCM_BINFILE}.le ${DEV_PREFIX}-${PIF_ICCM_BINFILE}.be
+-	swap_file ${DEV_PREFIX}-${PIF_DCCM_BINFILE}.le ${DEV_PREFIX}-${PIF_DCCM_BINFILE}.be
++	hl_pack_bin ${BINS_DIR}/${PREFIX}-iccm.bin 4k 0 0 0
++	hl_pack_bin ${BINS_DIR}/${PREFIX}-dccm.bin 4k 0 0 0
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-${PIF_ICCM_BINFILE}.le ${BINS_DIR}/${DEV_PREFIX}-${PIF_ICCM_BINFILE}.be
++	swap_file ${BINS_DIR}/${DEV_PREFIX}-${PIF_DCCM_BINFILE}.le ${BINS_DIR}/${DEV_PREFIX}-${PIF_DCCM_BINFILE}.be
+ }
+ 
+ function hl_pad_arcboot_rom {
+-	mv ${ARCBOOT_BINFILE} ${ARCBOOT_BINFILE_ORIG}
++	mv ${BINS_DIR}i/${ARCBOOT_BINFILE} ${BINS_DIR}/${ARCBOOT_BINFILE_ORIG}
+ 
+ 	# pad arcboot rom binary to size of ROM memory
+-	dd status=none conv=sync bs=128K if=${ARCBOOT_BINFILE_ORIG} > ${ARCBOOT_BINFILE}
++	dd status=none conv=sync bs=128K if=${BINS_DIR}/${ARCBOOT_BINFILE_ORIG} > ${BINS_DIR}/${ARCBOOT_BINFILE}
+ }

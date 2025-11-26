@@ -1,0 +1,161 @@
+From 7b1f698410021747baa5f99f5a4cf505930757d8 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 20 Oct 2023 16:33:45 +0300
+Subject: [PATCH] [SW-15774] package: add pid
+
+Add package to build arcpid as a standalone product
+
+Change-Id: I67d881edd6b85840c621e72df0e539a83f175644
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index 05b7462..3fb105f 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -21,3 +21,4 @@
+ HLS3_EVB_BMC_OVERRIDE_SRCDIR = $(TOPDIR)/../openbmc
+ HLB325_BMC_OVERRIDE_SRCDIR = $(TOPDIR)/../openbmc
+ HL_TEST_OVERRIDE_SRCDIR = $(TOPDIR)/../hl-test
++PID_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcpid
+diff --git a/package/pid/pid.mk b/package/pid/pid.mk
+new file mode 100644
+index 0000000..fada14a
+--- /dev/null
++++ b/package/pid/pid.mk
+@@ -0,0 +1,135 @@
++PID_APP_NAME = pid
++PID_DEPENDENCIES = host-cmake host-lzop host-lz4
++PID_APP_MODULES = mbedtls boot_info eeprom
++PID_SRC_DIR=$(EMBEDDED_DIR)/zephyr-apps/arcpid
++PID_ZEPHYR_SRCDIR=$(EMBEDDED_DIR)/zephyr
++
++PID_CONF_APP_OPTS =
++PID_CONF_CFLAGS =
++
++PWR_BRK_GROUP_ID = $(shell grep PWRBRK_GROUP_ID $(EMBEDDED_DIR)/specs/$(DEVICE_NAME)/$(DEVICE_NAME)_mem_addr_dt.h | grep -P -o "\d+"|head -1)
++
++PID_CONF_EXTRA_CFLAGS =\
++		-include $(EMBEDDED_ROOT)/specs/$(PID_DEVICE_NAME)/$(PID_DEVICE_NAME)_boot_info.h \
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++###################################################
++
++PID_APP_PROD_NAME = zephyr_arc_$(PID_APP_NAME)
++PID_DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
++PID_APP_VERSION = $(shell cut -d- -f2- $(@D)/localversion-habanalabs)
++PID_LOCAL_VERSION = $$(sed "s/^.*fw-\\([0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\).*$$/\\1/" $(@D)/localversion-habanalabs)
++
++PID_BUILD_DIR = $(@D)
++#PID_BUILDDIR = $(@D)
++#PID_DIR = $(@D)
++PID_ZEPHYR_BUILD_DIR ?= $(@D)/zephyr
++
++ifeq ($(HL_TARGET),pldm)
++PID_CONF_EXTRA_CFLAGS += -DTARGET_IS_PLDM
++ifeq ($(PLDM_SKIP_UBOOT),1)
++PID_CONF_EXTRA_CFLAGS += -DTARGET_IS_PLDM_REGRESSION
++endif
++endif
++
++ifeq ($(HL_TARGET),onix)
++PID_CONF_EXTRA_CFLAGS += -DTARGET_IS_ONIX
++endif
++
++PID_CONF_ENV = CROSS_COMPILE=$(TARGET_CROSS)
++PID_CONF_ENV += ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
++PID_CONF_ENV += ZEPHYR_BASE=$(PID_ZEPHYR_BUILD_DIR)
++
++PID_CONF_OPTS  = $(ZEPHYR_CONF_OPTS)
++PID_CONF_OPTS += -UCMAKE_TOOLCHAIN_FILE
++PID_CONF_OPTS += -DUSER_CACHE_DIR=$(@D)/.cache
++PID_CONF_OPTS += -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-e__start
++PID_CONF_OPTS += -DPWRBRK_GROUP_ID=$(PWR_BRK_GROUP_ID)
++PID_CONF_OPTS += -DEXTRA_CFLAGS="\
++		-Werror \
++		-Wno-misleading-indentation \
++		$(PID_CONF_EXTRA_CFLAGS)"
++
++PID_CONF_OPTS += $(PID_CONF_APP_OPTS)
++PID_CONF_OPTS += -DBUILD_VERSION="$(PID_APP_VERSION)"
++PID_CONF_OPTS += -DBUILD_MACHINE="$(shell hostname -s)"
++PID_CONF_OPTS += -DCMAKE_C_FLAGS="\
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(PID_CONF_CFLAGS)"
++
++PID_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMBEDDED_DIR)"
++PID_CONF_OPTS += -DBOARD=hl_$(PID_DEVICE_NAME)_$(PID_APP_NAME)_$(HL_TARGET)
++PID_CONF_OPTS += -DDEVICE=$(PID_DEVICE_NAME)
++PID_CONF_OPTS += -DAPP_NAME=$(PID_APP_PROD_NAME)
++PID_CONF_OPTS += -DAPP_VERSION=$(PID_APP_VERSION)
++
++PID_WEST_SRC_DIR :=
++PID_WEST_DEST_DIR :=
++
++define PID_COPY_ZEPHYR_SRC
++	rsync -au --chmod=u=rwX,go=rX  --exclude .svn --exclude .git --exclude .hg --exclude .bzr --exclude CVS $(PID_ZEPHYR_SRCDIR) $(PID_BUILD_DIR)
++endef
++
++# Arguments:
++# - module name
++# - component dir
++# - component name
++#
++define PID_DEFINE_MODULE_ENVVARS
++	$(eval MODULE_NAME=$(strip $1))
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $(MODULE_NAME) | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(eval $(MODULE_NAME_UPPER_CASE)_SRCDIR=$(EMBEDDED_DIR)/zephyr-modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_DIR=$(@D)/build/modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_NAME=$2_$(MODULE_NAME))
++endef
++
++$(foreach module,$(PID_APP_MODULES),$(call PID_DEFINE_MODULE_ENVVARS,$(module),$(PID_APP_PROD_NAME)))
++
++# Arguments:
++# - module (mbedtls, eeprom, etc.)
++define PID_MODULE_VERSION_HOOK
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $1 | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(call HL_VERSION_GEN, ${${MODULE_NAME_UPPER_CASE}_SRCDIR}, ${${MODULE_NAME_UPPER_CASE}_DIR}, ${${MODULE_NAME_UPPER_CASE}_NAME})
++endef
++
++define ZEPHR_PID_APP_VERSION_GEN
++	@$(call HL_VERSION_GEN, ${PID_SRCDIR},.,${PID_APP_NAME})
++	@$(call HL_VERSION_GEN, ${PID_SRCDIR},build,${PID_APP_NAME})
++	@$(foreach module,$(PID_APP_MODULES),$(call PID_MODULE_VERSION_HOOK,$(module)))
++endef
++
++define PID_CREATE_HL_VERSION
++	@echo "#ifndef _HL_VERSION_" >  $(PID_BUILD_DIR)/include/hl_version.h
++	@echo "#define _HL_VERSION_" >>  $(PID_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MAJOR $$(echo $(PID_LOCAL_VERSION) | cut -d. -f1)" >> $(PID_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MINOR $$(echo $(PID_LOCAL_VERSION) | cut -d. -f2)" >> $(PID_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_PATCH $$(echo $(PID_LOCAL_VERSION) | cut -d. -f3)" >> $(PID_BUILD_DIR)/include/hl_version.h
++	@echo "#endif" >>  $(PID_BUILD_DIR)/include/hl_version.h
++endef
++
++define PID_CONFIGURE_CMDS
++	@$(call PID_CREATE_HL_VERSION)
++	@$(PID_CONF_ENV) $(HOST_DIR)/bin/cmake $(PID_CONF_OPTS) -S $(PID_BUILD_DIR) -B $(PID_BUILD_DIR)/build
++endef
++
++PID_POST_RSYNC_HOOKS += HL_VERSION_GEN
++PID_POST_RSYNC_HOOKS += PID_COPY_ZEPHYR_SRC
++PID_POST_RSYNC_HOOKS += ZEPHR_PID_APP_VERSION_GEN
++
++define PID_BUILD_CMDS
++	@$(TARGET_MAKE_ENV) $(MAKE) -C $(PID_BUILD_DIR)/build all
++endef
++
++define PID_INSTALL_TARGET_CMDS
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_$(PID_APP_NAME).elf
++endef
++
++pid-configure: $(PID_APP_DEPENDENCIES)
++pid-menuconfig pid-guiconfig: | pid-configure
++	$(TARGET_MAKE_ENV) $(MAKE) -C $(PID_BUILD_DIR)/build all
++	rm -f $(PID_BUILD_DIR)/.stamp_{configured,built}
++
++$(eval $(cmake-package))

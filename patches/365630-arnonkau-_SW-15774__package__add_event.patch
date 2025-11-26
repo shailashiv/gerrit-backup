@@ -1,0 +1,166 @@
+From f305eca09eae16af8263f36e65eaea02e54fb35e Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Fri, 20 Oct 2023 21:05:23 +0300
+Subject: [PATCH] [SW-15774] package: add event
+
+Add a package arcevent
+
+Change-Id: I1f02c1e2790d31db20c25080266eb05531d5dea4
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index ada50ee..9aa70d6 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -23,3 +23,4 @@
+ HL_TEST_OVERRIDE_SRCDIR = $(TOPDIR)/../hl-test
+ PID_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcpid
+ MGMT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcmgmt
++EVENT_OVERRIDE_SRCDIR = $(TOPDIR)/../zephyr-apps/arcevent
+diff --git a/package/event/event.mk b/package/event/event.mk
+new file mode 100644
+index 0000000..9b502c6
+--- /dev/null
++++ b/package/event/event.mk
+@@ -0,0 +1,140 @@
++EVENT_APP_NAME = event
++EVENT_DEPENDENCIES = host-cmake host-lzop host-lz4
++EVENT_APP_MODULES = boot_info mbedtls
++EVENT_SRC_DIR=$(EMBEDDED_DIR)/zephyr-apps/arcevent
++EVENT_ZEPHYR_SRCDIR=$(EMBEDDED_DIR)/zephyr
++
++EVENT_APP_PROD_NAME = zephyr_arc_$(EVENT_APP_NAME)
++EVENT_DEVICE_NAME = $(firstword $(subst _, ,$(HL_DEV)))
++EVENT_APP_VERSION = $(shell cut -d- -f2- $(@D)/localversion-habanalabs)
++EVENT_LOCAL_VERSION = $$(sed "s/^.*fw-\\([0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\).*$$/\\1/" $(@D)/localversion-habanalabs)
++
++EVENT_BUILD_DIR = $(@D)
++EVENT_BUILDDIR = $(@D)
++EVENT_DIR = $(@D)
++EVENT_ZEPHYR_BUILD_DIR ?= $(@D)/zephyr
++
++EVENT_CONF_CFLAGS =\
++		-I$(EVENT_ZEPHYR_BUILD_DIR) \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/include \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu/$(HL_DEV) \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/include/drivers/misc/hl_npu/common \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu/$(HL_DEV) \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/drivers/misc/hl_npu/common \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/include/generated \
++		-I$(EVENT_ZEPHYR_BUILD_DIR)/include/generated/syscalls \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++EVENT_CONF_EXTRA_CFLAGS = \
++		-include $(EMBEDDED_ROOT)/specs/$(EVENT_DEVICE_NAME)/$(EVENT_DEVICE_NAME)_boot_info.h \
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(ZEPHYR_CONF_DEV_EXTRA_CFLAGS)
++
++ifeq ($(HL_TARGET),pldm)
++EVENT_CONF_EXTRA_CFLAGS += -DTARGET_IS_PLDM
++ifeq ($(PLDM_SKIP_UBOOT),1)
++EVENT_CONF_EXTRA_CFLAGS += -DTARGET_IS_PLDM_REGRESSION
++endif
++endif
++
++ifeq ($(HL_TARGET),onix)
++EVENT_CONF_EXTRA_CFLAGS += -DTARGET_IS_ONIX
++endif
++EVENT_CONF_ENV = CROSS_COMPILE=$(TARGET_CROSS)
++EVENT_CONF_ENV += ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
++EVENT_CONF_ENV += ZEPHYR_BASE=$(EVENT_ZEPHYR_BUILD_DIR)
++
++EVENT_CONF_OPTS  = $(ZEPHYR_CONF_OPTS)
++EVENT_CONF_OPTS += -UCMAKE_TOOLCHAIN_FILE
++EVENT_CONF_OPTS += -DUSER_CACHE_DIR=$(@D)/.cache
++EVENT_CONF_OPTS += -DCMAKE_EXE_LINKER_FLAGS_INIT=-Wl,-e__start
++EVENT_CONF_OPTS += -DEXTRA_CFLAGS="\
++		  -Werror \
++		  -Wno-misleading-indentation \
++		  $(EVENT_CONF_EXTRA_CFLAGS)"
++
++EVENT_CONF_OPTS += -DBUILD_VERSION="$(EVENT_APP_VERSION)"
++EVENT_CONF_OPTS += -DBUILD_MACHINE="$(shell hostname -s)"
++EVENT_CONF_OPTS += -DCMAKE_C_FLAGS="\
++		$($(call UPPERCASE,$(DEV_PREFIX))_CONF_DEV_EXTRA_CFLAGS) \
++		$(EVENT_CONF_CFLAGS)"
++
++EVENT_CONF_OPTS += -DDTS_EXTRA_CPPFLAGS="-I$(SPECS_EMBEDDED_DIR)"
++EVENT_CONF_OPTS += -DBOARD=hl_$(EVENT_DEVICE_NAME)_$(EVENT_APP_NAME)_$(HL_TARGET)
++EVENT_CONF_OPTS += -DDEVICE=$(EVENT_DEVICE_NAME)
++EVENT_CONF_OPTS += -DAPP_NAME=$(EVENT_APP_PROD_NAME)
++EVENT_CONF_OPTS += -DAPP_VERSION=$(EVENT_APP_VERSION)
++
++EVENT_WEST_SRC_DIR :=
++EVENT_WEST_DEST_DIR :=
++
++define EVENT_COPY_ZEPHYR_SRC
++	rsync -au --chmod=u=rwX,go=rX  --exclude .svn --exclude .git --exclude .hg --exclude .bzr --exclude CVS $(EVENT_ZEPHYR_SRCDIR) $(EVENT_BUILD_DIR)
++endef
++
++# Arguments:
++# - module name
++# - component dir
++# - component name
++#
++define EVENT_DEFINE_MODULE_ENVVARS
++	$(eval MODULE_NAME=$(strip $1))
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $(MODULE_NAME) | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(eval $(MODULE_NAME_UPPER_CASE)_SRCDIR=$(EMBEDDED_DIR)/zephyr-modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_DIR=$(@D)/build/modules/$(MODULE_NAME))
++	$(eval $(MODULE_NAME_UPPER_CASE)_NAME=$2_$(MODULE_NAME))
++endef
++
++$(foreach module,$(EVENT_APP_MODULES),$(call EVENT_DEFINE_MODULE_ENVVARS,$(module),$(EVENT_APP_PROD_NAME)))
++
++# Arguments:
++# - module (mbedtls, eeprom, etc.)
++define EVENT_MODULE_VERSION_HOOK
++	$(eval MODULE_NAME_UPPER_CASE=$(shell echo $1 | tr a-z A-Z))
++	$(eval MODULE_NAME_UPPER_CASE=$(strip $(MODULE_NAME_UPPER_CASE)))
++	$(call HL_VERSION_GEN, ${${MODULE_NAME_UPPER_CASE}_SRCDIR}, ${${MODULE_NAME_UPPER_CASE}_DIR}, ${${MODULE_NAME_UPPER_CASE}_NAME})
++endef
++
++define EVENT_APP_VERSION_GEN
++	@$(call HL_VERSION_GEN, ${EVENT_SRCDIR},.,${EVENT_APP_PROD_NAME})
++	@$(call HL_VERSION_GEN, ${EVENT_SRCDIR},build,${EVENT_APP_PROD_NAME})
++	@$(foreach module,$(EVENT_APP_MODULES),$(call EVENT_MODULE_VERSION_HOOK,$(module)))
++endef
++
++define EVENT_CREATE_HL_VERSION
++	@mkdir -p $(EVENT_BUILD_DIR)/include
++	@echo "#ifndef _HL_VERSION_" >  $(EVENT_BUILD_DIR)/include/hl_version.h
++	@echo "#define _HL_VERSION_" >>  $(EVENT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MAJOR $$(echo $(EVENT_LOCAL_VERSION) | cut -d. -f1)" >> $(EVENT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_MINOR $$(echo $(EVENT_LOCAL_VERSION) | cut -d. -f2)" >> $(EVENT_BUILD_DIR)/include/hl_version.h
++	@echo "#define HL_VERSION_PATCH $$(echo $(EVENT_LOCAL_VERSION) | cut -d. -f3)" >> $(EVENT_BUILD_DIR)/include/hl_version.h
++	@echo "#endif" >>  $(EVENT_BUILD_DIR)/include/hl_version.h
++endef
++
++define EVENT_CONFIGURE_CMDS
++#	$(INSTALL) -D -m 0755 $(EVENT_WEST_SRC_DIR)/west.config $(EVENT_WEST_DEST_DIR)/config
++	@$(call EVENT_CREATE_HL_VERSION)
++	@$(EVENT_CONF_ENV) $(HOST_DIR)/bin/cmake $(EVENT_CONF_OPTS) -S $(EVENT_BUILD_DIR) -B $(EVENT_BUILD_DIR)/build
++endef
++
++EVENT_POST_RSYNC_HOOKS += HL_VERSION_GEN
++EVENT_POST_RSYNC_HOOKS += EVENT_COPY_ZEPHYR_SRC
++EVENT_POST_RSYNC_HOOKS += EVENT_APP_VERSION_GEN
++
++define EVENT_BUILD_CMDS
++	@$(TARGET_MAKE_ENV) $(MAKE) -C $(EVENT_BUILD_DIR)/build all
++endef
++
++define EVENT_INSTALL_TARGET_CMDS
++	@$(INSTALL) -D -m 0644 $(@D)/build/zephyr/zephyr.elf $(BINARIES_DIR)/zephyr_$(EVENT_APP_NAME).elf
++endef
++
++event-configure: $(EVENT_DEPENDENCIES)
++event-menuconfig event-guiconfig: | event-configure
++	$(TARGET_MAKE_ENV) $(MAKE) -C $(EVENT_BUILD_DIR)/build all
++	rm -f $(EVENT_BUILD_DIR)/.stamp_{configured,built}
++
++$(eval $(cmake-package))

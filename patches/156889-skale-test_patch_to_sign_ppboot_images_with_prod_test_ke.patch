@@ -1,0 +1,111 @@
+From eefb828183de96134d2b54b8f4e1c15d1fd015a7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 15 Dec 2021 06:23:00 +0200
+Subject: [PATCH] test patch to sign ppboot images with prod test key0
+
+1.update dtb with public key
+2. provide sha to edss server
+3. copy sig from edss server
+4. integrate sig in ppboot and preboot images
+
+Change-Id: I98c8dfa59c111cffe0e9f4aa822a8c1fec858e8d
+---
+
+diff --git a/board/habanalabs/gaudi2_arc/hl_rsa3072.dtb b/board/habanalabs/gaudi2_arc/hl_rsa3072.dtb
+index 9bb736b..e5e7760 100644
+--- a/board/habanalabs/gaudi2_arc/hl_rsa3072.dtb
++++ b/board/habanalabs/gaudi2_arc/hl_rsa3072.dtb
+Binary files differ
+diff --git a/board/habanalabs/gaudi2_arc/post-image-spi.sh b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+index 6049f6d..577fa65 100755
+--- a/board/habanalabs/gaudi2_arc/post-image-spi.sh
++++ b/board/habanalabs/gaudi2_arc/post-image-spi.sh
+@@ -79,10 +79,38 @@
+ 	# Not used
+ }
+ 
++#function hl_sign_bin {
++#	BASENAME=$1
++#	CERT=$2
++#	$OPENSSL dgst -sha384 -sign ${CERT}.key -out ${BASENAME}.sig ${BASENAME}
++#	echo "sig file name: ${BASENAME}.sig"
++#}
++
++EDSS_SIGN_LOCATION_INPUT=/tools/hl_shared_dir/production/embedded/security/edss/toSign
++EDSS_SIGN_LOCATION_OUTPUT=/tools/hl_shared_dir/production/embedded/security/edss/signed
++FOLDER_NAME_S1=gaudi2-key0-test0-manual-copying
++FOLDER_NAME_S2=gaudi2-key0-test0-manual
+ function hl_sign_bin {
+ 	BASENAME=$1
+ 	CERT=$2
+-	$OPENSSL dgst -sha384 -sign ${CERT}.key -out ${BASENAME}.sig ${BASENAME}
++	#$OPENSSL dgst -sha384 -sign ${CERT}.key -out ${BASENAME}.sig ${BASENAME}
++	echo "EDSS_SIGN_LOCATION_OUTPUT:${EDSS_SIGN_LOCATION_OUTPUT}"
++	echo "EDSS_SIGN_LOCATION_INPUT:${EDSS_SIGN_LOCATION_INPUT}"
++	echo "BINARIES_DIR:${BINARIES_DIR}"
++	echo "sig file name: ${BASENAME}.sig"
++	echo "create input directory"
++	sudo mkdir ${EDSS_SIGN_LOCATION_OUTPUT}/${FOLDER_NAME_S1}
++	echo "copy sha384 file in directorty"
++	sudo cp ${BASENAME}.sha384 ${EDSS_SIGN_LOCATION_OUTPUT}/${FOLDER_NAME_S1}
++	echo "rename input directory"
++	sudo mv ${EDSS_SIGN_LOCATION_OUTPUT}/${FOLDER_NAME_S1} ${EDSS_SIGN_LOCATION_OUTPUT}/${FOLDER_NAME_S2}
++	echo "sleep for 30 seconds"
++	sleep 30
++	echo "copy back signature file from output folder"
++	sudo cp ${EDSS_SIGN_LOCATION_OUTPUT}/${FOLDER_NAME_S2}/${BASENAME}.Sig {BINARIES_DIR}/{BASENAME.sig}
++	echo "delete output folder from edss directory"
++	sudo rm -rf ${EDSS_SIGN_LOCATION_OUTPUT}/${FOLDER_NAME_S2}
++	echo "done"
+ }
+ 
+ function copy_all_keys {
+@@ -100,6 +128,16 @@
+ 	dd status=none conv=sync bs=4 if=${INF} > ${OUTF}.tmp
+ 	# Sadly --endian=big is not swapping for -tx1 so I used some gawk magic
+ 	od -Anone -v -tx1 -w4 ${OUTF}.tmp | gawk '{ print $4 $3 $2 $1 }' | xxd -r -p > ${OUTF}
++}
++
++function swap_file16 {
++	local INF=$1
++	local OUTF=$2
++
++	# SWAP needs this to be 4B aligned in size
++	dd status=none conv=sync bs=4 if=${INF} > ${OUTF}.tmp
++	# Sadly --endian=big is not swapping for -tx1 so I used some gawk magic
++	od -Anone -v -tx1 -w2 ${OUTF}.tmp | gawk '{ print $2 $1 }' | xxd -r -p > ${OUTF}
+ }
+ 
+ function extract_key_props {
+@@ -146,7 +184,8 @@
+ 	cat rr.prop mod.prop exp.prop inv.prop nb.prop	> ${KEY_NAME}.pub
+ 	cat rr.prop mod.prop exp.prop inv.prop nb.prop key_header.prop > ${KEY_NAME}-key-props.bin
+ 
+-	rm -f *.txt *.proptemp *.prop
++	#rm -f *.txt *.proptemp *.prop
++	rm -f *.txt *.proptemp
+ }
+ 
+ # Generate the Public Key, whose hash is needed to be stored
+@@ -180,8 +219,9 @@
+ 	#No need to pack Public Key, since Key Props are enough
+ 	cat ${TEMPNAME}.ver ${TEMPNAME} ${KEY_NAME}-key-props.bin > ${VPKFILE}
+ 
+-	$OPENSSL dgst -sha384 -binary ${VPKFILE} > psk_${VPKFILE}.sha384
+-
++	$OPENSSL dgst -sha384 -binary ${VPKFILE} > ${VPKFILE}.sha384
++	#openssl dgst -sha256 -binary $tmp_fit
++	echo "calling hl_sign_bin"
+ 	hl_sign_bin ${VPKFILE} ${KEY_NAME}
+ 	if [ ${SIGN_ERROR} -eq 1 ]; then
+ 		dd status=none conv=sync count=24 bs=16 if=/dev/urandom	> ${VPKFILE}.sig
+@@ -202,7 +242,8 @@
+ 	dd status=none conv=sync if=${PADFULLBINFILE} 			> ${DEV_PREFIX}-${FILEPATH}.le
+ 
+ 	hl_pldm_hex $(basename ${FILEPATH}) ${SIGBINFILE}.full
+-	rm -f ${FUNCNAME}-*
++	echo "FUNCNAME: ${FUNCNAME}"
++	#rm -f ${FUNCNAME}-*
+ }
+ 
+ function calculate_hash {

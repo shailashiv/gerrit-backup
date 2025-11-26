@@ -1,0 +1,120 @@
+From 1f995c378d014c03afa8a9fc6415ea285415268a Mon Sep 17 00:00:00 2001
+From: Yotam Ben Dosa <ybendosa@habana.ai>
+Date: Wed, 18 Sep 2019 21:53:47 +0300
+Subject: [PATCH] [SW-6062] openbmc: add installation script
+
+Implement a script for flashing a BMC image via ssh and add it to the
+output package.
+
+Change-Id: Ie5a727c0546ab663892d34e35d2af7d024e58bc8
+Signed-off-by: Yotam Ben Dosa <ybendosa@habana.ai>
+---
+
+diff --git a/package/openbmc/install-hls.sh b/package/openbmc/install-hls.sh
+new file mode 100755
+index 0000000..d8eeb13
+--- /dev/null
++++ b/package/openbmc/install-hls.sh
+@@ -0,0 +1,68 @@
++#!/bin/bash
++#
++# Copyright (c) 2019, Habana Labs.
++# All rights reserved.
++#
++# This program is free software;  you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 2 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY;  without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
++# the GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program;  if not, write to the Free Software
++# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++#
++
++function usage
++{
++	echo "Usage: $0 [<options>] <BMC IP ADDRESS>"
++	echo "	-f	<image file>	Path to BMC image file"
++	echo "	-p	<password>	Password to root user in BMC"
++	echo "	-h			Print this help message"
++}
++
++while getopts ":f:p:" o; do
++	case "${o}" in
++		f)
++			f=${OPTARG}
++			;;
++		p)
++			p=${OPTARG}
++			;;
++		*)
++			usage
++			exit 1
++			;;
++	esac
++done
++shift $((OPTIND-1))
++
++if [ -z "${f}" ]; then
++	f=${PWD}/flash-hls.tgz
++fi
++
++if [ -z "${p}" ]; then
++	p=root
++fi
++
++if [ ! -f "${f}" ]; then
++	echo missing image file
++	exit 2
++fi
++
++if [ -z "${1}" ]; then
++	echo missing BMC address
++	exit 2
++fi
++
++BMC_IMAGE=${f}
++BMC_ROOT_PASSWORD=${p}
++BMC_ADDRESS=${1}
++
++sshpass -p root scp -o StrictHostKeyChecking="no" $BMC_IMAGE root@$BMC_ADDRESS:
++sshpass -p $BMC_ROOT_PASSWORD ssh root@$BMC_ADDRESS "update_flash.sh && reboot"
+diff --git a/package/openbmc/openbmc.mk b/package/openbmc/openbmc.mk
+index 0929bae..cfa2814 100644
+--- a/package/openbmc/openbmc.mk
++++ b/package/openbmc/openbmc.mk
+@@ -32,7 +32,9 @@
+ OPENBMC_INSTALL_IMAGES = YES
+ 
+ define OPENBMC_INSTALL_IMAGES_CMDS
+-	cp -pf $(@D)/$(OPENBMC_IMAGE) $(BINARIES_DIR)/$(OPENBMC_IMAGE_NAME).bin
++	cp -pf $(@D)/$(OPENBMC_IMAGE) \
++		$(BINARIES_DIR)/$(OPENBMC_IMAGE_NAME).bin; \
++	cp -pf ${BUILDROOT_ROOT}/package/openbmc/install-hls.sh $(BINARIES_DIR)
+ endef
+ 
+ $(eval $(generic-package))
+diff --git a/scripts/make/hls/Makefile b/scripts/make/hls/Makefile
+index d1ca18c..9711068 100644
+--- a/scripts/make/hls/Makefile
++++ b/scripts/make/hls/Makefile
+@@ -35,11 +35,10 @@
+ 
+ .PHONY: hls-archive
+ hls-archive:
+-	@echo $(shell sha256sum						\
+-		$(IMAGES_DIR)/$(OPENBMC_IMAGE_NAME).bin) |		\
+-		cut -f1 -d' ' > $(IMAGES_DIR)/$(OPENBMC_IMAGE_NAME).sha256
+ 	@tar czf $(IMAGES_DIR)/$(OPENBMC_IMAGE_NAME).tgz		\
+-		-C $(IMAGES_DIR) $(OPENBMC_IMAGE_NAME).{bin,sha256}
++		-C $(IMAGES_DIR) $(OPENBMC_IMAGE_NAME).bin
++	@tar czf $(IMAGES_DIR)/$(OPENBMC_IMAGE_NAME)-pkg.tgz		\
++		-C $(IMAGES_DIR) $(OPENBMC_IMAGE_NAME).tgz install-hls.sh
+ 
+ .PHONY: hls-build
+ hls-build: hls-asic-prepare

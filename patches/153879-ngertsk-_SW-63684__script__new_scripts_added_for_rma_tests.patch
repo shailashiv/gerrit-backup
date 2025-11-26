@@ -1,0 +1,227 @@
+From 2c65e60c6bbb7547af60c1135542ddaecf9d58d7 Mon Sep 17 00:00:00 2001
+From: Nina Gertskin <ngertskin@habana.ai>
+Date: Mon, 06 Dec 2021 13:29:38 +0200
+Subject: [PATCH] [SW-63684] script: new scripts added for rma tests
+
+New scripts are needed to inject ECC and test RMA system status
+
+Change-Id: Ifd7d81c66233d0f421711de3988a375e787b4332
+Signed-off-by: Nina Gertskin <ngertskin@habana.ai>
+---
+
+diff --git a/scripts/tests/common_func.py b/scripts/tests/common_func.py
+new file mode 100755
+index 0000000..ff09aeb
+--- /dev/null
++++ b/scripts/tests/common_func.py
+@@ -0,0 +1,47 @@
++# -*- coding: utf-8 -*-
++import os
++import sys
++import time
++import random
++
++
++def print_error():
++    print("----------------------------------------------------------------------------------")
++    print("Failed in opening. Did you insmod habanalabs driver ? (Check for errors in host dmesg)")
++    print("----------------------------------------------------------------------------------")
++
++def prepare_sysfs_nodes(hlnum):
++    global debug_habana_str
++    global f_addr_name
++    global f_data_name
++    global f_clk_gate
++    global f_device_type
++    debug_habana_str = '/sys/kernel/debug/habanalabs/' + hlnum + '/'
++    f_addr_name = debug_habana_str + 'addr'
++    f_data_name = debug_habana_str + 'data32'
++    f_clk_gate  = debug_habana_str + 'clk_gate'
++    f_device_type = '/sys/class/habanalabs/' + hlnum + '/device_type'
++    print("---------done---------")
++
++def get_device_type():
++    with open(f_device_type, 'r') as f_device:
++        return f_device.read().rstrip('\n\x00')
++
++def clk_gate_set(val):
++    with open(f_clk_gate, 'w') as f_cg:
++        f_cg.write(str(val))
++
++def read_reg(addr):
++    with open(f_addr_name, 'w') as f_addr:
++        f_addr.write('%s' % hex(addr))
++        f_data = open(f_data_name, 'r')
++        return f_data.read()
++
++def write_reg(addr, data):
++    with open(f_addr_name, 'w') as f_addr:
++        f_addr.write('%s' % hex(addr))
++        f_data = open(f_data_name, 'w')
++        f_data.write('%s' % hex(data))
++
++def read_int(addr):
++    return int(read_reg(addr).rstrip('\n\x00'), 16)
+diff --git a/scripts/tests/hbm_ecc.py b/scripts/tests/hbm_ecc.py
+new file mode 100755
+index 0000000..7653524
+--- /dev/null
++++ b/scripts/tests/hbm_ecc.py
+@@ -0,0 +1,74 @@
++# -*- coding: utf-8 -*-
++import os
++import sys
++import time
++import common_func
++
++
++def print_usage():
++    print("device name (hl0,..)")
++    print("device (0-3)")
++    print("ch (0-7)")
++    print("pc (0-1) ")
++    print("err (0-par_wd 1-par_rd 2-par_ca 3-serr 4-derr)")
++    print("For example: sudo python3.6 hbm_ecc.py hl0 0 0 0 0")
++
++if len(sys.argv) < 5:
++    print_usage()
++    sys.exit()
++
++hl_num = sys.argv[1]
++dev = int(sys.argv[2])
++ch = int(sys.argv[3])
++pc = int(sys.argv[4])
++err_type = int(sys.argv[5]) #parity wd, rd, ca , serr , derr
++
++if dev > 3 or ch > 7 or pc > 1 or err_type > 4:
++    print_usage()
++    sys.exit()
++
++print("dev (0-3)", dev)
++print("ch (0-7)", ch)
++print("pc (0-1)", pc)
++print("err (0-par_wd 1-par_rd 2-par_ca 3-serr 4-derr)", err_type)
++
++RREG32 = common_func.read_int
++WREG32 = common_func.write_reg
++
++def inject_hbm_ecc():
++	offset = 0x7FFC600000 + dev*0x80000 + ch*0x1000
++	if err_type == 0:
++		err = 0x1
++	elif err_type == 1:
++		err = 0x2
++	elif err_type == 2:
++		err = 0x4
++	elif err_type == 3:
++		err = 0x10
++	elif err_type == 4:
++		err = 0x20
++
++	if pc == 0:
++		WREG32(offset+0x60, err)
++	else:
++		WREG32(offset+0x70, err)
++
++def main():
++    common_func.prepare_sysfs_nodes(hl_num)
++    common_func.clk_gate_set(0)
++    deviceType = common_func.get_device_type()
++
++    if deviceType.lower() == 'gaudi':
++        print('device type: {}.'.format(deviceType.lower()))
++    else:
++        print('Unsupported device type: {}.'.format(deviceType.lower()))
++        exit()
++
++    inject_hbm_ecc()
++
++    common_func.clk_gate_set(1) #Enable clock gating
++
++
++if __name__ == '__main__':
++    main()
++
+diff --git a/scripts/tests/sram_ecc.py b/scripts/tests/sram_ecc.py
+new file mode 100755
+index 0000000..23be0c9
+--- /dev/null
++++ b/scripts/tests/sram_ecc.py
+@@ -0,0 +1,77 @@
++# -*- coding: utf-8 -*-
++import os
++import sys
++import time
++import random
++import common_func
++
++sram_bank_base = 0x7FFC200000
++num_of_mem_blocks = 5120
++
++def print_usage():
++    print("device name (hl0,..)")
++    print("ecc_type (0-serr, 1-derr)")
++    print("sram_block (0-31)")
++    print("sram_block_index (0-1) ")
++    print("sram_addrblock (0-4095)")
++    print("For example: sudo python3.6 sram_ecc.py hl0 0 0 0 0")
++
++if len(sys.argv) < 6:
++    print_usage()
++    sys.exit()
++
++hl_num = sys.argv[1]
++ecc_type = int(sys.argv[2])
++sram_block = int(sys.argv[3])
++sram_block_index = int(sys.argv[4])
++sram_addrblock = int(sys.argv[5]) # 0,0x1000
++
++if ecc_type > 1 or sram_block > 31 or sram_block_index > 1 or sram_addrblock > 4095:
++    print_usage()
++    sys.exit()
++
++print("ecc_type (0-serr, 1-derr)", ecc_type)
++print("sram_block (0-31)", sram_block)
++print("sram_block_index (0-1) ", sram_block_index)
++print("sram_addrblock (0-4095)", hex(sram_addrblock))
++
++sram_bank_block_base = sram_bank_base + sram_block*0x8000
++
++RREG32 = common_func.read_int
++WREG32 = common_func.write_reg
++
++def inject_ecc():
++	if ecc_type == 0:
++		WREG32(sram_bank_block_base + 0xF50, 0x0)
++		WREG32(sram_bank_block_base + 0xF10, sram_block_index)
++	else:
++		# no mask/unmask register for DERR.
++		WREG32(sram_bank_block_base + 0xF14, sram_block_index)
++
++	sram_mem_base = 0x7FF0000000
++
++	for ch in range(num_of_mem_blocks):
++		sram_mem_offset = sram_mem_base + ch*0x1000 + sram_addrblock
++		WREG32(sram_mem_offset, 0xffffffff)
++		RREG32(sram_mem_offset)
++
++
++def main():
++    common_func.prepare_sysfs_nodes(hl_num)
++    common_func.clk_gate_set(0) #Disable clock gating
++    deviceType = common_func.get_device_type()
++
++    if deviceType.lower() == 'gaudi':
++        #inject_ecc()
++        print('device type: {}.'.format(deviceType.lower()))
++    else:
++        print('Unknown device type: {}.'.format(deviceType.lower()))
++
++    inject_ecc()
++
++    common_func.clk_gate_set(1) #Enable clock gating
++
++
++if __name__ == '__main__':
++    main()
++

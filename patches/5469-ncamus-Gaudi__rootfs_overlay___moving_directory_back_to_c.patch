@@ -1,0 +1,761 @@
+From b204d0d66915ffca4c7f8c90b1dd23a71f0df7e5 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Tue, 21 Aug 2018 15:16:12 +0300
+Subject: [PATCH] Gaudi [rootfs_overlay]: moving directory back to common
+
+rootfs_overlay belongs to common (yet).
+Just create ps.sh on the fly at post-build.sh
+---
+
+diff --git a/board/habanalabs/common/post-build.sh b/board/habanalabs/common/post-build.sh
+index 62a64d7..4270fe4 100755
+--- a/board/habanalabs/common/post-build.sh
++++ b/board/habanalabs/common/post-build.sh
+@@ -19,6 +19,8 @@
+ 	fi
+ popd
+ 
++printf "export PS1='%s# '\n" ${HL_DEV^} > ${TARGET_DIR}/etc/profile.d/ps.sh
++
+ cp ${BR2_EXTERNAL}/board/habanalabs/common/inittab ${TARGET_DIR}/etc/inittab
+ # Add armcpd to hl device
+ if [ -e ${TARGET_DIR}/etc/inittab ]; then
+diff --git a/board/habanalabs/common/rootfs_overlay/etc/init.d/S99misc b/board/habanalabs/common/rootfs_overlay/etc/init.d/S99misc
+new file mode 100755
+index 0000000..90b4093
+--- /dev/null
++++ b/board/habanalabs/common/rootfs_overlay/etc/init.d/S99misc
+@@ -0,0 +1,27 @@
++#!/bin/sh
++#
++# Start misc....
++#
++
++case "$1" in
++  start)
++	echo "Starting misc..."
++	echo powr1220 0x25 > /sys/bus/i2c/devices/i2c-0/new_device
++	echo ir35221 0x40 > /sys/bus/i2c/devices/i2c-0/new_device
++	echo 0 > /sys/module/rcupdate/parameters/rcu_cpu_stall_suppress
++	for tz in /sys/class/thermal/thermal_zone*;
++	do
++		echo enabled > ${tz}/mode
++	done
++	mount -t debugfs none /sys/kernel/debug
++	;;
++  stop)
++	;;
++  restart|reload)
++	;;
++  *)
++	echo "Usage: $0 {start|stop|restart}"
++	exit 1
++esac
++
++exit $?
+diff --git a/board/habanalabs/common/rootfs_overlay/etc/profile.d/alias.sh b/board/habanalabs/common/rootfs_overlay/etc/profile.d/alias.sh
+new file mode 100644
+index 0000000..eb4544f
+--- /dev/null
++++ b/board/habanalabs/common/rootfs_overlay/etc/profile.d/alias.sh
+@@ -0,0 +1 @@
++alias ll='ls -alF'
+diff --git a/board/habanalabs/common/rootfs_overlay/usr/sbin/eeprog b/board/habanalabs/common/rootfs_overlay/usr/sbin/eeprog
+new file mode 100755
+index 0000000..35484d8
+--- /dev/null
++++ b/board/habanalabs/common/rootfs_overlay/usr/sbin/eeprog
+@@ -0,0 +1,52 @@
++#!/bin/sh
++
++DEV=`find /sys -name eeprom`
++if [ ! -e ${DEV} ]; then
++	echo "No eeprom device found"
++	exit 1
++fi
++
++SIZE=256
++PAGESIZE=16
++MAX_PAGE_ID=$((${SIZE}/${PAGESIZE} - 1))
++LAYOUT=/tmp/eeprom-layout
++
++for i in `seq 0 ${MAX_PAGE_ID}`; do
++	dd status=none bs=${PAGESIZE} count=1 seek=$i skip=$i if=${DEV} of=${LAYOUT};
++done
++
++function print_field_num
++{
++	NAME=${1}
++	OFFSET=${2}
++	LEN=${3}
++	FIELD=`xxd -p -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT}`
++	echo "${NAME}: ${FIELD}"
++}
++
++function print_field_str
++{
++	NAME=${1}
++	OFFSET=${2}
++	LEN=${3}
++	FIELD=`xxd -g1 -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT} | tr -s ' ' | cut -d' ' -f$((${LEN}+2))- | cut -d'.' -f1`
++	echo "${NAME}: ${FIELD}"
++}
++
++LAYOUT_VER=`xxd -p -l1 ${LAYOUT}`
++if [ "${LAYOUT_VER}" -eq "0" ]; then
++	print_field_num "Layout Version" 0 1
++	print_field_num "Production Serial Number" 1 5
++	print_field_num "PCB Assembly Version" 6 1
++	print_field_num "CPLD FW Version" 7 1
++	print_field_num "Infineon FW Version" 8 1
++	print_field_num "DDR Type and Speed" 9 1
++	print_field_num "Fans Vendor" 10 1
++	print_field_num "Mechanics Vendor" 11 1
++	print_field_num "Thermal Solution Vendor" 12 1
++	print_field_num "PCIe Gen3 or Gen4 Enabled" 13 1
++	print_field_num "MAC Address" 14 6
++	print_field_str "Board Configuration" 20 64
++else
++	echo "Unknown eeprom layout"
++fi
+diff --git a/board/habanalabs/common/rootfs_overlay/usr/sbin/flash_burn b/board/habanalabs/common/rootfs_overlay/usr/sbin/flash_burn
+new file mode 100755
+index 0000000..6a0e782
+--- /dev/null
++++ b/board/habanalabs/common/rootfs_overlay/usr/sbin/flash_burn
+@@ -0,0 +1,129 @@
++#!/bin/sh
++
++if [ $# -eq 0 ]; then
++	echo "Usage: ${0} [-c <cksum>] <image>"
++	echo "Usage: ${0} -s <next_id>"
++	echo "       burn <image> into flash sectors"
++	echo "       -c <cksum>, crc32 for <image> validation"
++	echo "       -s <next_id>, set <next_id> as valid image for next boot"
++	exit 0
++else
++	while [ $# -gt 0 ]; do
++		case ${1} in
++			-c)
++				CKSUM=`printf "%d" ${2}`
++				shift
++				shift
++			;;
++			-s)
++				NEXT_IMAGE=`printf "%d" ${2}`
++				shift
++				shift
++			;;
++			*)
++				INFILE=${1}
++				shift
++			;;
++		esac
++	done
++fi
++
++if [ -n "${NEXT_IMAGE}" ]; then
++	echo "Update next image to fw-$((${NEXT_IMAGE}-1))"
++	IMG=/tmp/next-image.txt
++	if [ ${NEXT_IMAGE} -eq 1 ]; then
++		echo "11110000" > ${IMG}
++	else
++		echo "22220000" > ${IMG}
++	fi
++
++	flashcp ${IMG} /dev/mtd2
++	exit 0
++fi
++
++if [ -z "${INFILE}" ]; then
++	echo "Missing image argument"
++	exit 1
++fi
++
++if [ -n "${CKSUM}" ]; then
++	CRC32=`cksum ${INFILE} | cut -d' ' -f1`
++	if ! [ "${CKSUM}" -eq "${CRC32}" ]; then
++		CKSUM_HEX=`printf "0x%x" ${CKSUM}`
++		CRC32_HEX=`printf "0x%x" ${CRC32}`
++		echo "Mismatch with provided checksum [expected ${CKSUM_HEX} while calculated ${CRC32_HEX}]"
++		exit 2
++	fi
++fi
++
++# MTD Partitions:
++# 0 -- All
++# 1 -- BTL Primary
++# 2 -- Next Image
++# 3 -- Uboot Env
++# 4 -- FW 0
++# 5 -- FW 1
++STABLE_IMAGE_MAGIC=`xxd -p -l4 -c4 /dev/mtd2`
++STABLE_IMAGE_CHAR=${STABLE_IMAGE_MAGIC:0:2}
++# '1' / '2' equal (ascii) 0x31 / 0x32
++if [ "${STABLE_IMAGE_MAGIC}" != "31313131" ] && [ "${STABLE_IMAGE_MAGIC}" != "32323232" ]; then
++	STABLE_IMAGE_UNKNOWN=y
++	STABLE_IMAGE_CHAR=31
++fi
++STABLE_IMAGE_NUM=$((0x${STABLE_IMAGE_CHAR} - 0x31))
++STABLE_MTD_ID=$((4 + ${STABLE_IMAGE_NUM}))
++MODIFIABLE_IMAGE_ID=$((1 - ${STABLE_IMAGE_NUM}))
++MODIFIABLE_MTD_ID=$((4 + ${MODIFIABLE_IMAGE_ID}))
++BTL_IMAGE=${INFILE}.mtd1
++NEXT_IMAGE=${INFILE}.mtd2
++UBOOT_ENV_IMAGE=${INFILE}.mtd3
++FW_IMAGE=${INFILE}.mtd${MODIFIABLE_MTD_ID}
++
++dd status=none conv=sync bs=64K if=${INFILE} of=${BTL_IMAGE} count=1
++if [ ${MODIFIABLE_IMAGE_ID} -eq 0 ]; then
++	echo "22221111" > next-image.txt
++else
++	echo "11112222" > next-image.txt
++fi
++dd status=none conv=sync bs=64K skip=8 count=1 if=${INFILE} of=${UBOOT_ENV_IMAGE}
++dd status=none conv=sync bs=64K if=next-image.txt of=${NEXT_IMAGE}
++dd status=none conv=sync bs=64K skip=10 if=${INFILE} of=${FW_IMAGE}
++
++function burn_image {
++	DEV=/dev/mtd${1}
++	NAME=`mtdinfo ${DEV}		| grep "Name" 			| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
++
++	DEVID=`mtdinfo ${DEV}		| grep "major/minor"		| tr -s ' ' | cut -d: -f2-3	| cut -d' ' -f2`
++	OFFSET=`cat /sys/dev/char/${DEVID}/offset`
++	OFFSET_HEX=`printf "0x%x" ${OFFSET}`
++	IMG=${INFILE}.mtd${1}
++
++	echo -n "    ${NAME} @ ${OFFSET_HEX}... "
++	flashcp ${IMG} ${DEV}
++
++	if [ $? -ne 0 ]; then
++		echo "ERROR: flashcp ${IMG} ${DEV}"
++		exit 3
++	fi
++
++	IMG_SIZE=`ls -l ${IMG}						| tr -s ' ' 			| cut -d' ' -f5`
++	BLK_CNT=$(((${IMG_SIZE} + 0x8000) / 0x10000))
++	dd status=none conv=sync bs=64K if=${DEV} of=${IMG}.verify count=${BLK_CNT}
++	VERIFY=`diff -q ${IMG} ${IMG}.verify`
++	if [ -n "${VERIFY}" ]; then
++		echo "FAIL"
++		exit 3
++	else
++		echo "OK"
++	fi
++}
++
++echo "Updating MTD Partitions:"
++burn_image 1
++burn_image 2
++burn_image 3
++burn_image ${MODIFIABLE_MTD_ID}
++if [ "${STABLE_IMAGE_UNKNOWN}" == "y" ]; then
++	cp ${FW_IMAGE} ${INFILE}.mtd${STABLE_MTD_ID}
++	burn_image ${STABLE_MTD_ID}
++fi
+diff --git a/board/habanalabs/dali/rootfs_overlay/etc/init.d/S99misc b/board/habanalabs/dali/rootfs_overlay/etc/init.d/S99misc
+deleted file mode 100755
+index 90b4093..0000000
+--- a/board/habanalabs/dali/rootfs_overlay/etc/init.d/S99misc
++++ /dev/null
+@@ -1,27 +0,0 @@
+-#!/bin/sh
+-#
+-# Start misc....
+-#
+-
+-case "$1" in
+-  start)
+-	echo "Starting misc..."
+-	echo powr1220 0x25 > /sys/bus/i2c/devices/i2c-0/new_device
+-	echo ir35221 0x40 > /sys/bus/i2c/devices/i2c-0/new_device
+-	echo 0 > /sys/module/rcupdate/parameters/rcu_cpu_stall_suppress
+-	for tz in /sys/class/thermal/thermal_zone*;
+-	do
+-		echo enabled > ${tz}/mode
+-	done
+-	mount -t debugfs none /sys/kernel/debug
+-	;;
+-  stop)
+-	;;
+-  restart|reload)
+-	;;
+-  *)
+-	echo "Usage: $0 {start|stop|restart}"
+-	exit 1
+-esac
+-
+-exit $?
+diff --git a/board/habanalabs/dali/rootfs_overlay/etc/profile.d/alias.sh b/board/habanalabs/dali/rootfs_overlay/etc/profile.d/alias.sh
+deleted file mode 100644
+index eb4544f..0000000
+--- a/board/habanalabs/dali/rootfs_overlay/etc/profile.d/alias.sh
++++ /dev/null
+@@ -1 +0,0 @@
+-alias ll='ls -alF'
+diff --git a/board/habanalabs/dali/rootfs_overlay/etc/profile.d/ps.sh b/board/habanalabs/dali/rootfs_overlay/etc/profile.d/ps.sh
+deleted file mode 100644
+index fbc0c4b..0000000
+--- a/board/habanalabs/dali/rootfs_overlay/etc/profile.d/ps.sh
++++ /dev/null
+@@ -1 +0,0 @@
+-export PS1='Dali# '
+diff --git a/board/habanalabs/dali/rootfs_overlay/usr/sbin/eeprog b/board/habanalabs/dali/rootfs_overlay/usr/sbin/eeprog
+deleted file mode 100755
+index 35484d8..0000000
+--- a/board/habanalabs/dali/rootfs_overlay/usr/sbin/eeprog
++++ /dev/null
+@@ -1,52 +0,0 @@
+-#!/bin/sh
+-
+-DEV=`find /sys -name eeprom`
+-if [ ! -e ${DEV} ]; then
+-	echo "No eeprom device found"
+-	exit 1
+-fi
+-
+-SIZE=256
+-PAGESIZE=16
+-MAX_PAGE_ID=$((${SIZE}/${PAGESIZE} - 1))
+-LAYOUT=/tmp/eeprom-layout
+-
+-for i in `seq 0 ${MAX_PAGE_ID}`; do
+-	dd status=none bs=${PAGESIZE} count=1 seek=$i skip=$i if=${DEV} of=${LAYOUT};
+-done
+-
+-function print_field_num
+-{
+-	NAME=${1}
+-	OFFSET=${2}
+-	LEN=${3}
+-	FIELD=`xxd -p -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT}`
+-	echo "${NAME}: ${FIELD}"
+-}
+-
+-function print_field_str
+-{
+-	NAME=${1}
+-	OFFSET=${2}
+-	LEN=${3}
+-	FIELD=`xxd -g1 -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT} | tr -s ' ' | cut -d' ' -f$((${LEN}+2))- | cut -d'.' -f1`
+-	echo "${NAME}: ${FIELD}"
+-}
+-
+-LAYOUT_VER=`xxd -p -l1 ${LAYOUT}`
+-if [ "${LAYOUT_VER}" -eq "0" ]; then
+-	print_field_num "Layout Version" 0 1
+-	print_field_num "Production Serial Number" 1 5
+-	print_field_num "PCB Assembly Version" 6 1
+-	print_field_num "CPLD FW Version" 7 1
+-	print_field_num "Infineon FW Version" 8 1
+-	print_field_num "DDR Type and Speed" 9 1
+-	print_field_num "Fans Vendor" 10 1
+-	print_field_num "Mechanics Vendor" 11 1
+-	print_field_num "Thermal Solution Vendor" 12 1
+-	print_field_num "PCIe Gen3 or Gen4 Enabled" 13 1
+-	print_field_num "MAC Address" 14 6
+-	print_field_str "Board Configuration" 20 64
+-else
+-	echo "Unknown eeprom layout"
+-fi
+diff --git a/board/habanalabs/dali/rootfs_overlay/usr/sbin/flash_burn b/board/habanalabs/dali/rootfs_overlay/usr/sbin/flash_burn
+deleted file mode 100755
+index 6a0e782..0000000
+--- a/board/habanalabs/dali/rootfs_overlay/usr/sbin/flash_burn
++++ /dev/null
+@@ -1,129 +0,0 @@
+-#!/bin/sh
+-
+-if [ $# -eq 0 ]; then
+-	echo "Usage: ${0} [-c <cksum>] <image>"
+-	echo "Usage: ${0} -s <next_id>"
+-	echo "       burn <image> into flash sectors"
+-	echo "       -c <cksum>, crc32 for <image> validation"
+-	echo "       -s <next_id>, set <next_id> as valid image for next boot"
+-	exit 0
+-else
+-	while [ $# -gt 0 ]; do
+-		case ${1} in
+-			-c)
+-				CKSUM=`printf "%d" ${2}`
+-				shift
+-				shift
+-			;;
+-			-s)
+-				NEXT_IMAGE=`printf "%d" ${2}`
+-				shift
+-				shift
+-			;;
+-			*)
+-				INFILE=${1}
+-				shift
+-			;;
+-		esac
+-	done
+-fi
+-
+-if [ -n "${NEXT_IMAGE}" ]; then
+-	echo "Update next image to fw-$((${NEXT_IMAGE}-1))"
+-	IMG=/tmp/next-image.txt
+-	if [ ${NEXT_IMAGE} -eq 1 ]; then
+-		echo "11110000" > ${IMG}
+-	else
+-		echo "22220000" > ${IMG}
+-	fi
+-
+-	flashcp ${IMG} /dev/mtd2
+-	exit 0
+-fi
+-
+-if [ -z "${INFILE}" ]; then
+-	echo "Missing image argument"
+-	exit 1
+-fi
+-
+-if [ -n "${CKSUM}" ]; then
+-	CRC32=`cksum ${INFILE} | cut -d' ' -f1`
+-	if ! [ "${CKSUM}" -eq "${CRC32}" ]; then
+-		CKSUM_HEX=`printf "0x%x" ${CKSUM}`
+-		CRC32_HEX=`printf "0x%x" ${CRC32}`
+-		echo "Mismatch with provided checksum [expected ${CKSUM_HEX} while calculated ${CRC32_HEX}]"
+-		exit 2
+-	fi
+-fi
+-
+-# MTD Partitions:
+-# 0 -- All
+-# 1 -- BTL Primary
+-# 2 -- Next Image
+-# 3 -- Uboot Env
+-# 4 -- FW 0
+-# 5 -- FW 1
+-STABLE_IMAGE_MAGIC=`xxd -p -l4 -c4 /dev/mtd2`
+-STABLE_IMAGE_CHAR=${STABLE_IMAGE_MAGIC:0:2}
+-# '1' / '2' equal (ascii) 0x31 / 0x32
+-if [ "${STABLE_IMAGE_MAGIC}" != "31313131" ] && [ "${STABLE_IMAGE_MAGIC}" != "32323232" ]; then
+-	STABLE_IMAGE_UNKNOWN=y
+-	STABLE_IMAGE_CHAR=31
+-fi
+-STABLE_IMAGE_NUM=$((0x${STABLE_IMAGE_CHAR} - 0x31))
+-STABLE_MTD_ID=$((4 + ${STABLE_IMAGE_NUM}))
+-MODIFIABLE_IMAGE_ID=$((1 - ${STABLE_IMAGE_NUM}))
+-MODIFIABLE_MTD_ID=$((4 + ${MODIFIABLE_IMAGE_ID}))
+-BTL_IMAGE=${INFILE}.mtd1
+-NEXT_IMAGE=${INFILE}.mtd2
+-UBOOT_ENV_IMAGE=${INFILE}.mtd3
+-FW_IMAGE=${INFILE}.mtd${MODIFIABLE_MTD_ID}
+-
+-dd status=none conv=sync bs=64K if=${INFILE} of=${BTL_IMAGE} count=1
+-if [ ${MODIFIABLE_IMAGE_ID} -eq 0 ]; then
+-	echo "22221111" > next-image.txt
+-else
+-	echo "11112222" > next-image.txt
+-fi
+-dd status=none conv=sync bs=64K skip=8 count=1 if=${INFILE} of=${UBOOT_ENV_IMAGE}
+-dd status=none conv=sync bs=64K if=next-image.txt of=${NEXT_IMAGE}
+-dd status=none conv=sync bs=64K skip=10 if=${INFILE} of=${FW_IMAGE}
+-
+-function burn_image {
+-	DEV=/dev/mtd${1}
+-	NAME=`mtdinfo ${DEV}		| grep "Name" 			| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
+-
+-	DEVID=`mtdinfo ${DEV}		| grep "major/minor"		| tr -s ' ' | cut -d: -f2-3	| cut -d' ' -f2`
+-	OFFSET=`cat /sys/dev/char/${DEVID}/offset`
+-	OFFSET_HEX=`printf "0x%x" ${OFFSET}`
+-	IMG=${INFILE}.mtd${1}
+-
+-	echo -n "    ${NAME} @ ${OFFSET_HEX}... "
+-	flashcp ${IMG} ${DEV}
+-
+-	if [ $? -ne 0 ]; then
+-		echo "ERROR: flashcp ${IMG} ${DEV}"
+-		exit 3
+-	fi
+-
+-	IMG_SIZE=`ls -l ${IMG}						| tr -s ' ' 			| cut -d' ' -f5`
+-	BLK_CNT=$(((${IMG_SIZE} + 0x8000) / 0x10000))
+-	dd status=none conv=sync bs=64K if=${DEV} of=${IMG}.verify count=${BLK_CNT}
+-	VERIFY=`diff -q ${IMG} ${IMG}.verify`
+-	if [ -n "${VERIFY}" ]; then
+-		echo "FAIL"
+-		exit 3
+-	else
+-		echo "OK"
+-	fi
+-}
+-
+-echo "Updating MTD Partitions:"
+-burn_image 1
+-burn_image 2
+-burn_image 3
+-burn_image ${MODIFIABLE_MTD_ID}
+-if [ "${STABLE_IMAGE_UNKNOWN}" == "y" ]; then
+-	cp ${FW_IMAGE} ${INFILE}.mtd${STABLE_MTD_ID}
+-	burn_image ${STABLE_MTD_ID}
+-fi
+diff --git a/board/habanalabs/gaudi/rootfs_overlay/etc/init.d/S99misc b/board/habanalabs/gaudi/rootfs_overlay/etc/init.d/S99misc
+deleted file mode 100755
+index 90b4093..0000000
+--- a/board/habanalabs/gaudi/rootfs_overlay/etc/init.d/S99misc
++++ /dev/null
+@@ -1,27 +0,0 @@
+-#!/bin/sh
+-#
+-# Start misc....
+-#
+-
+-case "$1" in
+-  start)
+-	echo "Starting misc..."
+-	echo powr1220 0x25 > /sys/bus/i2c/devices/i2c-0/new_device
+-	echo ir35221 0x40 > /sys/bus/i2c/devices/i2c-0/new_device
+-	echo 0 > /sys/module/rcupdate/parameters/rcu_cpu_stall_suppress
+-	for tz in /sys/class/thermal/thermal_zone*;
+-	do
+-		echo enabled > ${tz}/mode
+-	done
+-	mount -t debugfs none /sys/kernel/debug
+-	;;
+-  stop)
+-	;;
+-  restart|reload)
+-	;;
+-  *)
+-	echo "Usage: $0 {start|stop|restart}"
+-	exit 1
+-esac
+-
+-exit $?
+diff --git a/board/habanalabs/gaudi/rootfs_overlay/etc/profile.d/alias.sh b/board/habanalabs/gaudi/rootfs_overlay/etc/profile.d/alias.sh
+deleted file mode 100644
+index eb4544f..0000000
+--- a/board/habanalabs/gaudi/rootfs_overlay/etc/profile.d/alias.sh
++++ /dev/null
+@@ -1 +0,0 @@
+-alias ll='ls -alF'
+diff --git a/board/habanalabs/gaudi/rootfs_overlay/etc/profile.d/ps.sh b/board/habanalabs/gaudi/rootfs_overlay/etc/profile.d/ps.sh
+deleted file mode 100644
+index 438e50a..0000000
+--- a/board/habanalabs/gaudi/rootfs_overlay/etc/profile.d/ps.sh
++++ /dev/null
+@@ -1 +0,0 @@
+-export PS1='Gaudi# '
+diff --git a/board/habanalabs/gaudi/rootfs_overlay/usr/sbin/eeprog b/board/habanalabs/gaudi/rootfs_overlay/usr/sbin/eeprog
+deleted file mode 100755
+index 35484d8..0000000
+--- a/board/habanalabs/gaudi/rootfs_overlay/usr/sbin/eeprog
++++ /dev/null
+@@ -1,52 +0,0 @@
+-#!/bin/sh
+-
+-DEV=`find /sys -name eeprom`
+-if [ ! -e ${DEV} ]; then
+-	echo "No eeprom device found"
+-	exit 1
+-fi
+-
+-SIZE=256
+-PAGESIZE=16
+-MAX_PAGE_ID=$((${SIZE}/${PAGESIZE} - 1))
+-LAYOUT=/tmp/eeprom-layout
+-
+-for i in `seq 0 ${MAX_PAGE_ID}`; do
+-	dd status=none bs=${PAGESIZE} count=1 seek=$i skip=$i if=${DEV} of=${LAYOUT};
+-done
+-
+-function print_field_num
+-{
+-	NAME=${1}
+-	OFFSET=${2}
+-	LEN=${3}
+-	FIELD=`xxd -p -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT}`
+-	echo "${NAME}: ${FIELD}"
+-}
+-
+-function print_field_str
+-{
+-	NAME=${1}
+-	OFFSET=${2}
+-	LEN=${3}
+-	FIELD=`xxd -g1 -s${OFFSET} -l${LEN} -c${LEN} ${LAYOUT} | tr -s ' ' | cut -d' ' -f$((${LEN}+2))- | cut -d'.' -f1`
+-	echo "${NAME}: ${FIELD}"
+-}
+-
+-LAYOUT_VER=`xxd -p -l1 ${LAYOUT}`
+-if [ "${LAYOUT_VER}" -eq "0" ]; then
+-	print_field_num "Layout Version" 0 1
+-	print_field_num "Production Serial Number" 1 5
+-	print_field_num "PCB Assembly Version" 6 1
+-	print_field_num "CPLD FW Version" 7 1
+-	print_field_num "Infineon FW Version" 8 1
+-	print_field_num "DDR Type and Speed" 9 1
+-	print_field_num "Fans Vendor" 10 1
+-	print_field_num "Mechanics Vendor" 11 1
+-	print_field_num "Thermal Solution Vendor" 12 1
+-	print_field_num "PCIe Gen3 or Gen4 Enabled" 13 1
+-	print_field_num "MAC Address" 14 6
+-	print_field_str "Board Configuration" 20 64
+-else
+-	echo "Unknown eeprom layout"
+-fi
+diff --git a/board/habanalabs/gaudi/rootfs_overlay/usr/sbin/flash_burn b/board/habanalabs/gaudi/rootfs_overlay/usr/sbin/flash_burn
+deleted file mode 100755
+index 6a0e782..0000000
+--- a/board/habanalabs/gaudi/rootfs_overlay/usr/sbin/flash_burn
++++ /dev/null
+@@ -1,129 +0,0 @@
+-#!/bin/sh
+-
+-if [ $# -eq 0 ]; then
+-	echo "Usage: ${0} [-c <cksum>] <image>"
+-	echo "Usage: ${0} -s <next_id>"
+-	echo "       burn <image> into flash sectors"
+-	echo "       -c <cksum>, crc32 for <image> validation"
+-	echo "       -s <next_id>, set <next_id> as valid image for next boot"
+-	exit 0
+-else
+-	while [ $# -gt 0 ]; do
+-		case ${1} in
+-			-c)
+-				CKSUM=`printf "%d" ${2}`
+-				shift
+-				shift
+-			;;
+-			-s)
+-				NEXT_IMAGE=`printf "%d" ${2}`
+-				shift
+-				shift
+-			;;
+-			*)
+-				INFILE=${1}
+-				shift
+-			;;
+-		esac
+-	done
+-fi
+-
+-if [ -n "${NEXT_IMAGE}" ]; then
+-	echo "Update next image to fw-$((${NEXT_IMAGE}-1))"
+-	IMG=/tmp/next-image.txt
+-	if [ ${NEXT_IMAGE} -eq 1 ]; then
+-		echo "11110000" > ${IMG}
+-	else
+-		echo "22220000" > ${IMG}
+-	fi
+-
+-	flashcp ${IMG} /dev/mtd2
+-	exit 0
+-fi
+-
+-if [ -z "${INFILE}" ]; then
+-	echo "Missing image argument"
+-	exit 1
+-fi
+-
+-if [ -n "${CKSUM}" ]; then
+-	CRC32=`cksum ${INFILE} | cut -d' ' -f1`
+-	if ! [ "${CKSUM}" -eq "${CRC32}" ]; then
+-		CKSUM_HEX=`printf "0x%x" ${CKSUM}`
+-		CRC32_HEX=`printf "0x%x" ${CRC32}`
+-		echo "Mismatch with provided checksum [expected ${CKSUM_HEX} while calculated ${CRC32_HEX}]"
+-		exit 2
+-	fi
+-fi
+-
+-# MTD Partitions:
+-# 0 -- All
+-# 1 -- BTL Primary
+-# 2 -- Next Image
+-# 3 -- Uboot Env
+-# 4 -- FW 0
+-# 5 -- FW 1
+-STABLE_IMAGE_MAGIC=`xxd -p -l4 -c4 /dev/mtd2`
+-STABLE_IMAGE_CHAR=${STABLE_IMAGE_MAGIC:0:2}
+-# '1' / '2' equal (ascii) 0x31 / 0x32
+-if [ "${STABLE_IMAGE_MAGIC}" != "31313131" ] && [ "${STABLE_IMAGE_MAGIC}" != "32323232" ]; then
+-	STABLE_IMAGE_UNKNOWN=y
+-	STABLE_IMAGE_CHAR=31
+-fi
+-STABLE_IMAGE_NUM=$((0x${STABLE_IMAGE_CHAR} - 0x31))
+-STABLE_MTD_ID=$((4 + ${STABLE_IMAGE_NUM}))
+-MODIFIABLE_IMAGE_ID=$((1 - ${STABLE_IMAGE_NUM}))
+-MODIFIABLE_MTD_ID=$((4 + ${MODIFIABLE_IMAGE_ID}))
+-BTL_IMAGE=${INFILE}.mtd1
+-NEXT_IMAGE=${INFILE}.mtd2
+-UBOOT_ENV_IMAGE=${INFILE}.mtd3
+-FW_IMAGE=${INFILE}.mtd${MODIFIABLE_MTD_ID}
+-
+-dd status=none conv=sync bs=64K if=${INFILE} of=${BTL_IMAGE} count=1
+-if [ ${MODIFIABLE_IMAGE_ID} -eq 0 ]; then
+-	echo "22221111" > next-image.txt
+-else
+-	echo "11112222" > next-image.txt
+-fi
+-dd status=none conv=sync bs=64K skip=8 count=1 if=${INFILE} of=${UBOOT_ENV_IMAGE}
+-dd status=none conv=sync bs=64K if=next-image.txt of=${NEXT_IMAGE}
+-dd status=none conv=sync bs=64K skip=10 if=${INFILE} of=${FW_IMAGE}
+-
+-function burn_image {
+-	DEV=/dev/mtd${1}
+-	NAME=`mtdinfo ${DEV}		| grep "Name" 			| tr -s ' ' | cut -d: -f2	| cut -d' ' -f2`
+-
+-	DEVID=`mtdinfo ${DEV}		| grep "major/minor"		| tr -s ' ' | cut -d: -f2-3	| cut -d' ' -f2`
+-	OFFSET=`cat /sys/dev/char/${DEVID}/offset`
+-	OFFSET_HEX=`printf "0x%x" ${OFFSET}`
+-	IMG=${INFILE}.mtd${1}
+-
+-	echo -n "    ${NAME} @ ${OFFSET_HEX}... "
+-	flashcp ${IMG} ${DEV}
+-
+-	if [ $? -ne 0 ]; then
+-		echo "ERROR: flashcp ${IMG} ${DEV}"
+-		exit 3
+-	fi
+-
+-	IMG_SIZE=`ls -l ${IMG}						| tr -s ' ' 			| cut -d' ' -f5`
+-	BLK_CNT=$(((${IMG_SIZE} + 0x8000) / 0x10000))
+-	dd status=none conv=sync bs=64K if=${DEV} of=${IMG}.verify count=${BLK_CNT}
+-	VERIFY=`diff -q ${IMG} ${IMG}.verify`
+-	if [ -n "${VERIFY}" ]; then
+-		echo "FAIL"
+-		exit 3
+-	else
+-		echo "OK"
+-	fi
+-}
+-
+-echo "Updating MTD Partitions:"
+-burn_image 1
+-burn_image 2
+-burn_image 3
+-burn_image ${MODIFIABLE_MTD_ID}
+-if [ "${STABLE_IMAGE_UNKNOWN}" == "y" ]; then
+-	cp ${FW_IMAGE} ${INFILE}.mtd${STABLE_MTD_ID}
+-	burn_image ${STABLE_MTD_ID}
+-fi
+diff --git a/configs/dali_defconfig b/configs/dali_defconfig
+index 7641496..25adc1a 100644
+--- a/configs/dali_defconfig
++++ b/configs/dali_defconfig
+@@ -9,7 +9,7 @@
+ BR2_TARGET_GENERIC_ROOT_PASSWD="root"
+ BR2_SYSTEM_BIN_SH_BASH=y
+ BR2_SYSTEM_DHCP="eth0"
+-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/rootfs_overlay"
++BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/rootfs_overlay"
+ BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-build.sh"
+ BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image.sh"
+ BR2_LINUX_KERNEL=y
+diff --git a/configs/gaudi_defconfig b/configs/gaudi_defconfig
+index 3e3b6a4..831893e 100644
+--- a/configs/gaudi_defconfig
++++ b/configs/gaudi_defconfig
+@@ -9,7 +9,7 @@
+ BR2_TARGET_GENERIC_ROOT_PASSWD="root"
+ BR2_SYSTEM_BIN_SH_BASH=y
+ BR2_SYSTEM_DHCP="eth0"
+-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/rootfs_overlay"
++BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/rootfs_overlay"
+ BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-build.sh"
+ BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image.sh"
+ BR2_LINUX_KERNEL=y

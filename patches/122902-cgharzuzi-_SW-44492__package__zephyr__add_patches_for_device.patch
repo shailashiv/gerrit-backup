@@ -1,0 +1,451 @@
+From f875a462f4fbe98b3af4707fed80b05bca213993 Mon Sep 17 00:00:00 2001
+From: Christine Gharzuzi <cgharzuzi@habana.ai>
+Date: Mon, 16 Aug 2021 21:17:44 +0300
+Subject: [PATCH] [SW-44492] package: zephyr: add patches for devicetree macros
+
+Add patches from zephyr 2.6 version to existing version (2.4)
+
+These patches add the devicetree macro
+'#define DT_FOREACH_PROP_ELEM(node_id,prop,fn) \
+DT_CAT4(node_id, _P_, prop, _FOREACH_PROP_ELEM)(fn)'
+
+which Invokes "fn" for each element in the value of property "prop"
+this adds ability to statically init driver config with
+DT properties that have dynamic size
+
+Change-Id: Ib40115a487a3668464402441c7dac28e06221600
+Signed-off-by: Christine Gharzuzi <cgharzuzi@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/patches/zephyr/0001-devicetree-make-DT_PROP_HAS_IDX-expand-to-0-or-1.patch b/board/habanalabs/common/patches/zephyr/0001-devicetree-make-DT_PROP_HAS_IDX-expand-to-0-or-1.patch
+new file mode 100644
+index 0000000..fcd639e
+--- /dev/null
++++ b/board/habanalabs/common/patches/zephyr/0001-devicetree-make-DT_PROP_HAS_IDX-expand-to-0-or-1.patch
+@@ -0,0 +1,157 @@
++From ffc03124c17e07237941ef68b580b9a3798ef50f Mon Sep 17 00:00:00 2001
++From: =?UTF-8?q?Mart=C3=AD=20Bol=C3=ADvar?= <marti.bolivar@nordicsemi.no>
++Date: Thu, 12 Nov 2020 20:27:20 -0800
++Subject: [PATCH] devicetree: make DT_PROP_HAS_IDX expand to 0 or 1
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++We have a use case for checking the results of a DT_PROP_HAS_IDX()
++call with COND_CODE_1(). That won't work because its expansion is an
++integer comparison; COND_CODE_1() expects a literal 1 or 0.
++
++Adjust the macro implementation so it expands to a literal 1 or 0.
++Make this work even when the index argument needs an expansion while
++we're at it.
++
++Fixes: #29833
++Signed-off-by: Martí Bolívar <marti.bolivar@nordicsemi.no>
++---
++ include/devicetree.h                | 34 ++++++++++++++++++++++++++---
++ scripts/dts/gen_defines.py          |  6 +++++
++ tests/lib/devicetree/api/src/main.c | 14 ++++++++++++
++ 3 files changed, 51 insertions(+), 3 deletions(-)
++
++diff --git a/include/devicetree.h b/include/devicetree.h
++index d5172ac009..4e298fcf62 100644
++--- a/include/devicetree.h
+++++ b/include/devicetree.h
++@@ -55,6 +55,7 @@
++  * _ENUM_IDX: property's value as an index into bindings enum
++  * _EXISTS: property is defined
++  * _IDX_<i>: logical index into property
+++ * _IDX_<i>_EXISTS: logical index into property is defined
++  * _IDX_<i>_PH: phandle array's phandle by index (or phandle, phandles)
++  * _IDX_<i>_VAL_<val>: phandle array's specifier value by index
++  * _IDX_<i>_VAL_<val>_EXISTS: cell value exists, by index
++@@ -442,7 +443,7 @@
++  *         into the given property, and 0 otherwise.
++  */
++ #define DT_PROP_HAS_IDX(node_id, prop, idx) \
++-	((idx) < DT_PROP_LEN(node_id, prop))
+++	IS_ENABLED(DT_CAT6(node_id, _P_, prop, _IDX_, idx, _EXISTS))
++ 
++ /**
++  * @brief Get the value at index "idx" in an array type property
++@@ -1907,8 +1908,35 @@
++ 	UTIL_CAT(DT_ROOT, MACRO_MAP_CAT(DT_S_PREFIX, __VA_ARGS__))
++ /** @internal helper for DT_PATH(): prepends _S_ to a node name */
++ #define DT_S_PREFIX(name) _S_##name
++-/** @internal concatenation helper, sometimes used to force expansion */
++-#define DT_CAT(node_id, prop_suffix) node_id##prop_suffix
+++
+++/**
+++ * @internal concatenation helper, 2 arguments
+++ *
+++ * This and the following macros are used to paste things together
+++ * with "##" *after* forcing expansion on each argument.
+++ *
+++ * We could try to use something like UTIL_CAT(), but the compiler
+++ * error messages from the util macros can be extremely long when they
+++ * are misused. This unfortunately happens often with devicetree.h,
+++ * since its macro-based API is fiddly and can be hard to get right.
+++ *
+++ * Keeping things brutally simple here hopefully makes some errors
+++ * easier to read.
+++ */
+++#define DT_CAT(a1, a2) a1 ## a2
+++/** @internal concatenation helper, 3 arguments */
+++#define DT_CAT3(a1, a2, a3) a1 ## a2 ## a3
+++/** @internal concatenation helper, 4 arguments */
+++#define DT_CAT4(a1, a2, a3, a4) a1 ## a2 ## a3 ## a4
+++/** @internal concatenation helper, 5 arguments */
+++#define DT_CAT5(a1, a2, a3, a4, a5) a1 ## a2 ## a3 ## a4 ## a5
+++/** @internal concatenation helper, 6 arguments */
+++#define DT_CAT6(a1, a2, a3, a4, a5, a6) a1 ## a2 ## a3 ## a4 ## a5 ## a6
+++/*
+++ * If you need to define a bigger DT_CATN(), do so here. Don't leave
+++ * any "holes" of undefined macros, please.
+++ */
+++
++ /** @internal helper for node identifier macros to expand args */
++ #define DT_DASH(...) MACRO_MAP_CAT(DT_DASH_PREFIX, __VA_ARGS__)
++ /** @internal helper for DT_DASH(): prepends _ to a name */
++diff --git a/scripts/dts/gen_defines.py b/scripts/dts/gen_defines.py
++index 3bf91f39dc..bdc3995b60 100755
++--- a/scripts/dts/gen_defines.py
+++++ b/scripts/dts/gen_defines.py
++@@ -439,11 +439,13 @@ def write_vanilla_props(node):
++             macro2val.update(phandle_macros(prop, macro))
++         elif "array" in prop.type:
++             # DT_N_<node-id>_P_<prop-id>_IDX_<i>
+++            # DT_N_<node-id>_P_<prop-id>_IDX_<i>_EXISTS
++             for i, subval in enumerate(prop.val):
++                 if isinstance(subval, str):
++                     macro2val[macro + f"_IDX_{i}"] = quote_str(subval)
++                 else:
++                     macro2val[macro + f"_IDX_{i}"] = subval
+++                macro2val[macro + f"_IDX_{i}_EXISTS"] = 1
++ 
++         plen = prop_len(prop)
++         if plen is not None:
++@@ -528,9 +530,11 @@ def phandle_macros(prop, macro):
++     if prop.type == "phandle":
++         # A phandle is treated as a phandles with fixed length 1.
++         ret[f"{macro}_IDX_0_PH"] = f"DT_{prop.val.z_path_id}"
+++        ret[f"{macro}_IDX_0_EXISTS"] = 1
++     elif prop.type == "phandles":
++         for i, node in enumerate(prop.val):
++             ret[f"{macro}_IDX_{i}_PH"] = f"DT_{node.z_path_id}"
+++            ret[f"{macro}_IDX_{i}_EXISTS"] = 1
++     elif prop.type == "phandle-array":
++         for i, entry in enumerate(prop.val):
++             ret.update(controller_and_data_macros(entry, i, macro))
++@@ -548,6 +552,8 @@ def controller_and_data_macros(entry, i, macro):
++     ret = {}
++     data = entry.data
++ 
+++    # DT_N_<node-id>_P_<prop-id>_IDX_<i>_EXISTS
+++    ret[f"{macro}_IDX_{i}_EXISTS"] = 1
++     # DT_N_<node-id>_P_<prop-id>_IDX_<i>_PH
++     ret[f"{macro}_IDX_{i}_PH"] = f"DT_{entry.controller.z_path_id}"
++     # DT_N_<node-id>_P_<prop-id>_IDX_<i>_VAL_<VAL>
++diff --git a/tests/lib/devicetree/api/src/main.c b/tests/lib/devicetree/api/src/main.c
++index 85a58d8442..2475555e12 100644
++--- a/tests/lib/devicetree/api/src/main.c
+++++ b/tests/lib/devicetree/api/src/main.c
++@@ -1205,6 +1205,8 @@ static char *c[] = DT_PROP(TEST_ARRAYS, c);
++ 
++ static void test_arrays(void)
++ {
+++	int ok;
+++
++ 	zassert_equal(ARRAY_SIZE(a), 3, "a size");
++ 	zassert_equal(ARRAY_SIZE(b), 4, "b size");
++ 	zassert_equal(ARRAY_SIZE(c), 2, "c size");
++@@ -1218,6 +1220,18 @@ static void test_arrays(void)
++ 	zassert_true(DT_PROP_HAS_IDX(TEST_ARRAYS, a, 2), "a idx 2");
++ 	zassert_false(DT_PROP_HAS_IDX(TEST_ARRAYS, a, 3), "!a idx 3");
++ 
+++	/*
+++	 * Verify that DT_PROP_HAS_IDX can be used with COND_CODE_1()
+++	 * and COND_CODE_0(), i.e. its expansion is a literal 1 or 0,
+++	 * not an equivalent expression that evaluates to 1 or 0.
+++	 */
+++	ok = 0;
+++	COND_CODE_1(DT_PROP_HAS_IDX(TEST_ARRAYS, a, 0), (ok = 1;), ());
+++	zassert_equal(ok, 1, "a idx 0 as a literal 1");
+++	ok = 0;
+++	COND_CODE_0(DT_PROP_HAS_IDX(TEST_ARRAYS, a, 3), (ok = 1;), ());
+++	zassert_equal(ok, 1, "a idx 3 as a literal 0");
+++
++ 	zassert_equal(DT_PROP_BY_IDX(TEST_ARRAYS, a, 0), a[0], "a 0");
++ 	zassert_equal(DT_PROP_BY_IDX(TEST_ARRAYS, a, 1), a[1], "a 1");
++ 	zassert_equal(DT_PROP_BY_IDX(TEST_ARRAYS, a, 2), a[2], "a 2");
++-- 
++2.17.1
++
+diff --git a/board/habanalabs/common/patches/zephyr/0002-devicetree-add-DT_FOREACH_PROP_ELEM-node_id-prop-fn.patch b/board/habanalabs/common/patches/zephyr/0002-devicetree-add-DT_FOREACH_PROP_ELEM-node_id-prop-fn.patch
+new file mode 100644
+index 0000000..e22b8fb
+--- /dev/null
++++ b/board/habanalabs/common/patches/zephyr/0002-devicetree-add-DT_FOREACH_PROP_ELEM-node_id-prop-fn.patch
+@@ -0,0 +1,222 @@
++From bea3f73b56f1c2a8a3712855c582cf38949d6b6c Mon Sep 17 00:00:00 2001
++From: =?UTF-8?q?Mart=C3=AD=20Bol=C3=ADvar?= <marti.bolivar@nordicsemi.no>
++Date: Wed, 14 Apr 2021 15:26:42 -0700
++Subject: [PATCH] devicetree: add DT_FOREACH_PROP_ELEM(node_id, prop, fn)
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++It can be convenient to "iterate" over the elements of a property, in
++the same way it is convenient to "iterate" over enabled instances.
++
++Add a new macro for doing this, along with a DT_INST_FOREACH_PROP_ELEM
++variant.
++
++This is likely to be more convenient than UTIL_LISTIFY or FOR_EACH in
++some situations because:
++
++- it handles inputs of any length
++- compiler error messages will be shorter and more self-contained
++- it is easier to use with phandle-array type properties, which
++  require more complicated macro boilerplate when used with
++  util_macro.h APIs
++
++Signed-off-by: Martí Bolívar <marti.bolivar@nordicsemi.no>
++---
++ include/devicetree.h                 | 60 ++++++++++++++++++++++++++++
++ scripts/dts/gen_defines.py           | 15 ++++++-
++ tests/lib/devicetree/api/app.overlay |  5 ++-
++ tests/lib/devicetree/api/src/main.c  | 29 ++++++++++++++
++ 4 files changed, 107 insertions(+), 2 deletions(-)
++
++diff --git a/include/devicetree.h b/include/devicetree.h
++index 4e298fcf62..431a89f1ca 100644
++--- a/include/devicetree.h
+++++ b/include/devicetree.h
++@@ -54,6 +54,7 @@
++  *
++  * _ENUM_IDX: property's value as an index into bindings enum
++  * _EXISTS: property is defined
+++ * _FOREACH_PROP_ELEM: helper for "iterating" over values in the property
++  * _IDX_<i>: logical index into property
++  * _IDX_<i>_EXISTS: logical index into property is defined
++  * _IDX_<i>_PH: phandle array's phandle by index (or phandle, phandles)
++@@ -1166,6 +1167,52 @@
++ #define DT_FOREACH_CHILD(node_id, fn) \
++ 	DT_CAT(node_id, _FOREACH_CHILD)(fn)
++ 
+++/**
+++ * @brief Invokes "fn" for each element in the value of property "prop".
+++ *
+++ * The macro "fn" must take three parameters: fn(node_id, prop, idx).
+++ * "node_id" and "prop" are the same as what is passed to
+++ * DT_FOREACH_PROP_ELEM, and "idx" is the current index into the array.
+++ * The "idx" values are integer literals starting from 0.
+++ *
+++ * Example devicetree fragment:
+++ *
+++ *     n: node {
+++ *             my-ints = <1 2 3>;
+++ *     };
+++ *
+++ * Example usage:
+++ *
+++ *     #define TIMES_TWO(node_id, prop, idx) \
+++ *	       (2 * DT_PROP_BY_IDX(node_id, prop, idx)),
+++ *
+++ *     int array[] = {
+++ *             DT_FOREACH_PROP_ELEM(DT_NODELABEL(n), my_ints, TIMES_TWO)
+++ *     };
+++ *
+++ * This expands to:
+++ *
+++ *     int array[] = {
+++ *             (2 * 1), (2 * 2), (2 * 3),
+++ *     };
+++ *
+++ * In general, this macro expands to:
+++ *
+++ *     fn(node_id, prop, 0) fn(node_id, prop, 1) [...] fn(node_id, prop, n-1)
+++ *
+++ * where "n" is the number of elements in "prop", as it would be
+++ * returned by <tt>DT_PROP_LEN(node_id, prop)</tt>.
+++ *
+++ * The "prop" argument must refer to a property with type string,
+++ * array, uint8-array, string-array, phandles, or phandle-array. It is
+++ * an error to use this macro with properties of other types.
+++ *
+++ * @param node_id node identifier
+++ * @param prop lowercase-and-underscores property name
+++ * @param fn macro to invoke
+++ */
+++#define DT_FOREACH_PROP_ELEM(node_id, prop, fn)		\
+++	DT_CAT4(node_id, _P_, prop, _FOREACH_PROP_ELEM)(fn)
++ 
++ /**
++  * @}
++@@ -1826,6 +1873,19 @@
++ 			      DT_DRV_COMPAT)(fn)),		\
++ 		    ())
++ 
+++/**
+++ * @brief Invokes "fn" for each element of property "prop" for
+++ *        a DT_DRV_COMPAT instance.
+++ *
+++ * Equivalent to DT_FOREACH_PROP_ELEM(DT_DRV_INST(inst), prop, fn).
+++ *
+++ * @param inst instance number
+++ * @param prop lowercase-and-underscores property name
+++ * @param fn macro to invoke
+++ */
+++#define DT_INST_FOREACH_PROP_ELEM(inst, prop, fn) \
+++	DT_FOREACH_PROP_ELEM(DT_DRV_INST(inst), prop, fn)
+++
++ /**
++  * @brief Does a DT_DRV_COMPAT instance have a property?
++  * @param inst instance number
++diff --git a/scripts/dts/gen_defines.py b/scripts/dts/gen_defines.py
++index bdc3995b60..eb589fa874 100755
++--- a/scripts/dts/gen_defines.py
+++++ b/scripts/dts/gen_defines.py
++@@ -28,6 +28,12 @@ import sys
++ 
++ import edtlib
++ 
+++# The set of binding types whose values can be iterated over with
+++# DT_FOREACH_PROP_ELEM(). If you change this, make sure to update the
+++# doxygen string for that macro.
+++FOREACH_PROP_ELEM_TYPES = set(['string', 'array', 'uint8-array', 'string-array',
+++                               'phandles', 'phandle-array'])
+++
++ def main():
++     global header_file
++     global flash_area_num
++@@ -425,7 +431,8 @@ def write_vanilla_props(node):
++ 
++     macro2val = {}
++     for prop_name, prop in node.props.items():
++-        macro = f"{node.z_path_id}_P_{str2ident(prop_name)}"
+++        prop_id = str2ident(prop_name)
+++        macro = f"{node.z_path_id}_P_{prop_id}"
++         val = prop2value(prop)
++         if val is not None:
++             # DT_N_<node-id>_P_<prop-id>
++@@ -447,6 +454,12 @@ def write_vanilla_props(node):
++                     macro2val[macro + f"_IDX_{i}"] = subval
++                 macro2val[macro + f"_IDX_{i}_EXISTS"] = 1
++ 
+++        if prop.type in FOREACH_PROP_ELEM_TYPES:
+++            # DT_N_<node-id>_P_<prop-id>_FOREACH_PROP_ELEM
+++            macro2val[f"{macro}_FOREACH_PROP_ELEM(fn)"] = \
+++                ' \\\n\t'.join(f'fn(DT_{node.z_path_id}, {prop_id}, {i})'
+++                              for i in range(len(prop.val)))
+++
++         plen = prop_len(prop)
++         if plen is not None:
++             # DT_N_<node-id>_P_<prop-id>_LEN
++diff --git a/tests/lib/devicetree/api/app.overlay b/tests/lib/devicetree/api/app.overlay
++index 8662399123..b3f7ee6553 100644
++--- a/tests/lib/devicetree/api/app.overlay
+++++ b/tests/lib/devicetree/api/app.overlay
++@@ -25,7 +25,10 @@
++ 		interrupt-parent = <&test_intc>;
++ 
++ 		test_arrays: array-holder {
++-			/* vnd,undefined-compat is for DT_NODE_HAS_COMPAT_STATUS(..,okay) */
+++			/*
+++			 * vnd,undefined-compat is for DT_NODE_HAS_COMPAT_STATUS(..,okay).
+++			 * There should only be one vnd,array-holder in the entire DTS.
+++			 */
++ 			compatible = "vnd,array-holder", "vnd,undefined-compat";
++ 			a = <1000 2000 3000>;
++ 			b = [aa bb cc dd];
++diff --git a/tests/lib/devicetree/api/src/main.c b/tests/lib/devicetree/api/src/main.c
++index 2475555e12..332b843054 100644
++--- a/tests/lib/devicetree/api/src/main.c
+++++ b/tests/lib/devicetree/api/src/main.c
++@@ -1269,6 +1269,34 @@ static void test_arrays(void)
++ 	zassert_equal(DT_PROP_LEN(TEST_ARRAYS, c), 2, "c len");
++ }
++ 
+++static void test_foreach_prop_elem(void)
+++{
+++#define TIMES_TWO(node_id, prop, idx) \
+++	(2 * DT_PROP_BY_IDX(node_id, prop, idx)),
+++
+++	int array[] = {
+++		DT_FOREACH_PROP_ELEM(TEST_ARRAYS, a, TIMES_TWO)
+++	};
+++
+++	zassert_equal(ARRAY_SIZE(array), 3, "");
+++	zassert_equal(array[0], 2000, "");
+++	zassert_equal(array[1], 4000, "");
+++	zassert_equal(array[2], 6000, "");
+++
+++#undef DT_DRV_COMPAT
+++#define DT_DRV_COMPAT vnd_array_holder
+++
+++	int inst_array[] = {
+++		DT_INST_FOREACH_PROP_ELEM(0, a, TIMES_TWO)
+++	};
+++
+++	zassert_equal(ARRAY_SIZE(inst_array), ARRAY_SIZE(array), "");
+++	zassert_equal(inst_array[0], array[0], "");
+++	zassert_equal(inst_array[1], array[1], "");
+++	zassert_equal(inst_array[2], array[2], "");
+++#undef TIMES_TWO
+++}
+++
++ struct test_gpio_info {
++ 	uint32_t reg_addr;
++ 	uint32_t reg_len;
++@@ -1571,6 +1599,7 @@ void test_main(void)
++ 			 ztest_unit_test(test_pwms),
++ 			 ztest_unit_test(test_macro_names),
++ 			 ztest_unit_test(test_arrays),
+++			 ztest_unit_test(test_foreach_prop_elem),
++ 			 ztest_unit_test(test_devices),
++ 			 ztest_unit_test(test_cs_gpios),
++ 			 ztest_unit_test(test_chosen),
++-- 
++2.17.1
++
+diff --git a/configs/gaudi2_arc_defconfig b/configs/gaudi2_arc_defconfig
+index 35edbe0..0874e79 100644
+--- a/configs/gaudi2_arc_defconfig
++++ b/configs/gaudi2_arc_defconfig
+@@ -3,6 +3,7 @@
+ BR2_archs4x_rel31=y
+ BR2_SVN="svn"
+ BR2_DL_DIR="$(BR2_EXTERNAL_HABANALABS_PATH)/dl"
++BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/patches"
+ BR2_SHARED_STATIC_LIBS=y
+ BR2_PACKAGE_OVERRIDE_FILE="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/local.mk"
+ BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh"
+diff --git a/configs/greco_arc_defconfig b/configs/greco_arc_defconfig
+index 406bedf..1374721 100644
+--- a/configs/greco_arc_defconfig
++++ b/configs/greco_arc_defconfig
+@@ -6,6 +6,7 @@
+ BR2_SHARED_STATIC_LIBS=y
+ BR2_PACKAGE_OVERRIDE_FILE="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/local.mk"
+ BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/$(HL_DEV)/post-image-spi.sh $(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/post-image-spi-arc_global.sh"
++BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_HABANALABS_PATH)/board/habanalabs/common/patches"
+ BR2_TOOLCHAIN_EXTERNAL=y
+ BR2_TARGET_GENERIC_HOSTNAME=""
+ BR2_TARGET_GENERIC_ISSUE=""
+diff --git a/package/zephyr/zephyr.mk b/package/zephyr/zephyr.mk
+index 7128122..9c38ecb 100644
+--- a/package/zephyr/zephyr.mk
++++ b/package/zephyr/zephyr.mk
+@@ -32,6 +32,12 @@
+ ZEPHYR_BUILD_CMDS = true
+ ZEPHYR_INSTALL_TARGET_CMDS = true
+ 
++define ZEPHYR_APPLY_PATCHES
++        $(APPLY_PATCHES) $(@D) $(addsuffix /zephyr/,$(call qstrip,$(BR2_GLOBAL_PATCH_DIR))) \*.patch
++endef
++
++ZEPHYR_POST_RSYNC_HOOKS += ZEPHYR_APPLY_PATCHES
++
+ ifdef BR2_PACKAGE_ZEPHYR_ARC_PID
+ ZEPHYR_PID_DIR = build-pid
+ ZEPHYR_CONF_DEFAULT ?= $(ZEPHYR_PID_DIR)

@@ -1,0 +1,117 @@
+From eaf21d6c418e7449ea4e96aa9d5da868b8a2c9d4 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 05 Aug 2018 02:29:04 +0300
+Subject: [PATCH] Add FW loader support
+
+Add support for the new fw_loader utility.
+The utility is able to update the SPI flash of the dali board from the host PC.
+
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/Config.in b/Config.in
+index d1d7fc8..d3e38b6 100644
+--- a/Config.in
++++ b/Config.in
+@@ -8,4 +8,7 @@
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/thermal/Config.in"
+ source "$BR2_EXTERNAL_HL_DALI_PATH/package/preboot/Config.in"
+ 
++# Source the host tools
++source "$BR2_EXTERNAL_HL_DALI_PATH/Config.in.host"
++
+ # Below can add to make it appear in the top-level configuration menu
+diff --git a/Config.in.host b/Config.in.host
+new file mode 100644
+index 0000000..e3e57bc
+--- /dev/null
++++ b/Config.in.host
+@@ -0,0 +1,3 @@
++menu "External Host utilities"
++	source "$BR2_EXTERNAL_HL_DALI_PATH/package/fw_loader/Config.in.host"
++endmenu
+diff --git a/Makefile b/Makefile
+index 285a709..26e3c01 100644
+--- a/Makefile
++++ b/Makefile
+@@ -99,6 +99,7 @@
+ 	-sshpass -p123456        scp $(IMAGES_DIR)/dali-u-boot-spl.bin	root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
+ 	-sshpass -p123456        scp $(IMAGES_DIR)/dali-fit.itb		root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/
+ 	-sshpass -p123456        scp $(IMAGES_DIR)/boot.scr		root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
++	-sshpass -p123456        scp $(IMAGES_DIR)/fw_loader		root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+ 	-sshpass -p123456        scp $(IMAGES_DIR)/dali-spi-flash.bin	root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
+ 	-sshpass -p123456        scp $(UBOOT_BASE)/u-boot		root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
+ 	-sshpass -p123456        scp $(LINUX_BASE)/vmlinux		root@$(DALI_INSTALL_LAB_IP):/lib/firmware/habanalabs/dali/
+@@ -120,6 +121,7 @@
+ 	-cp $(IMAGES_DIR)/dali-spi-flash.bin $</
+ 	-cp $(IMAGES_DIR)/dali-u-boot.bin $</
+ 	-cp $(IMAGES_DIR)/dali-u-boot-spl.bin $</
++	-cp $(IMAGES_DIR)/fw_loader $</
+ ifneq ($(notdir $(realpath $(ASIC_BIN_DIR))), head)
+ 	ln -nfs $$(basename $(ASIC_BIN_DIR)) $$(dirname $(ASIC_BIN_DIR))/latest
+ endif
+@@ -129,7 +131,7 @@
+ 	@$(MAKE) uboot-dirclean linux-dirclean armcp-dirclean	\
+ 		 spdlog-dirclean specs-dirclean specs_external-dirclean \
+ 		 host-uboot-test-hooks-dirclean host-tbot-dirclean \
+-		 thermal-dirclean preboot-dirclean
++		 thermal-dirclean preboot-dirclean host-fw_loader-dirclean
+ 
+ .PHONY: dali-onix-test dali-pldm-test dali-asic-test
+ dali-onix-test: dali-onix-tools-install
+@@ -175,4 +177,5 @@
+ 	-cd board/habanalabs/common/ &&					\
+ 	sshpass -p123456 scp -r remote_power remote_load_firmware	\
+ 	remote_cleanup local_install_packages ip_pdu t32 vivado_lab	\
++	$(IMAGES_DIR)/fw_loader						\
+ 	root@$(DALI_INSTALL_LAB_IP):/var/lib/tftpboot/tests/
+diff --git a/board/habanalabs/common/local.mk b/board/habanalabs/common/local.mk
+index 5b23a0f..775db55 100644
+--- a/board/habanalabs/common/local.mk
++++ b/board/habanalabs/common/local.mk
+@@ -9,3 +9,4 @@
+ DSV_OVERRIDE_SRCDIR = $(TOPDIR)/../dsv
+ THERMAL_OVERRIDE_SRCDIR = $(TOPDIR)/../thermal
+ PREBOOT_OVERRIDE_SRCDIR = $(TOPDIR)/../preboot
++FW_LOADER_OVERRIDE_SRCDIR = $(TOPDIR)/../fw_loader
+diff --git a/configs/dali_defconfig b/configs/dali_defconfig
+index 33d0314..fa413a8 100644
+--- a/configs/dali_defconfig
++++ b/configs/dali_defconfig
+@@ -64,3 +64,4 @@
+ BR2_PACKAGE_DSV=y
+ BR2_PACKAGE_THERMAL=y
+ BR2_PACKAGE_PREBOOT=y
++BR2_PACKAGE_FW_LOADER=y
+diff --git a/package/fw_loader/Config.in.host b/package/fw_loader/Config.in.host
+new file mode 100644
+index 0000000..03964de
+--- /dev/null
++++ b/package/fw_loader/Config.in.host
+@@ -0,0 +1,7 @@
++config BR2_PACKAGE_FW_LOADER
++	bool "FW Loader"
++	select BR2_PACKAGE_SPECS
++	select BR2_PACKAGE_SPDLOG
++	help
++	  FW loader is an SPI flash burning tool.
++	  Run on the host to update the SPI flash (U-Boot) of the Dali board.
+diff --git a/package/fw_loader/fw_loader.mk b/package/fw_loader/fw_loader.mk
+new file mode 100644
+index 0000000..fb3521b
+--- /dev/null
++++ b/package/fw_loader/fw_loader.mk
+@@ -0,0 +1,13 @@
++FW_LOADER_VERSION = 0.1.0
++FW_LOADER_SITE = fw_loader
++FW_LOADER_LICENSE = unclear
++
++HOST_FW_LOADER_DEPENDENCIES = specs spdlog
++
++HOST_FW_LOADER_CONF_OPTS = -DTESTS_ENABLED=OFF -DCMAKE_EXE_LINKER_FLAGS="-static" -DCMAKE_BUILD_TYPE="Release"
++
++define HOST_FW_LOADER_INSTALL_CMDS
++        $(INSTALL) -s -D -m 0755 $(@D)/bin/fw_loader $(BINARIES_DIR)/
++endef
++
++$(eval $(host-cmake-package))

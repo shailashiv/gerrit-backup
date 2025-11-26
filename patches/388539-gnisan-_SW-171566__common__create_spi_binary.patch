@@ -1,0 +1,147 @@
+From 120c26fa392cd0c3096cf34c810867174f12376b Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 23 Jan 2024 06:36:48 +0200
+Subject: [PATCH] [SW-171566] common: create spi binary
+
+Create SPI binary using generic script along with paladium hex file
+
+Change-Id: Ie01f384f154193a04ecb6084f5b1c9852af34375
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/board/habanalabs/common/image-utility.sh b/board/habanalabs/common/image-utility.sh
+index eb971e9..5a0e1e7 100644
+--- a/board/habanalabs/common/image-utility.sh
++++ b/board/habanalabs/common/image-utility.sh
+@@ -182,3 +182,20 @@
+ 		export $line
+ 	done <<< `grep "define" $mem_sections_hdr_path | sed 's/[[:space:]]\+/ /g' | cut -d ' ' -f2-3 | sed  's/ /=/g'`
+ }
++
++function hl_pldm_hex {
++	NAME=$(echo "$1" | cut -f 1 -d '.')
++	FILE=$2
++	BYTES_PER_LINE=$3
++	# pad file to 128bit (16Byte) as pladium emulates 128bit memory, so xxd wont trunc lines
++	dd status=none conv=sync bs=16 if=${FILE} > ${FILE}.tmp
++	xxd -e -g ${BYTES_PER_LINE} ${FILE}.tmp | xxd -r | xxd -ps -c${BYTES_PER_LINE} > ${DEV_PREFIX}-${HL_TARGET}-${NAME}.hex
++	rm ${FILE}.tmp
++}
++
++function hl_pldm_flash_hex {
++	NAME=$(echo "$1" | cut -f 1 -d '.')
++	FILE=$2
++	# save hex as a 1 byte list of values
++	xxd -e -g 4 ${FILE} | xxd -r | xxd -ps -c1			> ${DEV_PREFIX}-${HL_TARGET}-${NAME}.hex
++}
+diff --git a/board/habanalabs/common/post-image-spi-arc_global.sh b/board/habanalabs/common/post-image-spi-arc_global.sh
+index 569bb32..2825803 100755
+--- a/board/habanalabs/common/post-image-spi-arc_global.sh
++++ b/board/habanalabs/common/post-image-spi-arc_global.sh
+@@ -142,23 +142,6 @@
+ 	echo ${CRC32} | xxd -r -p > ${FILE}.crc32
+ }
+ 
+-function hl_pldm_hex {
+-	NAME=$(echo "$1" | cut -f 1 -d '.')
+-	FILE=$2
+-	BYTES_PER_LINE=$3
+-	# pad file to 128bit (16Byte) as pladium emulates 128bit memory, so xxd wont trunc lines
+-	dd status=none conv=sync bs=16 if=${FILE} > ${FILE}.tmp
+-	xxd -e -g ${BYTES_PER_LINE} ${FILE}.tmp | xxd -r | xxd -ps -c${BYTES_PER_LINE} > ${DEV_PREFIX}-${HL_TARGET}-${NAME}.hex
+-	rm ${FILE}.tmp
+-}
+-
+-function hl_pldm_flash_hex {
+-	NAME=$(echo "$1" | cut -f 1 -d '.')
+-	FILE=$2
+-	# save hex as a 1 byte list of values
+-	xxd -e -g 4 ${FILE} | xxd -r | xxd -ps -c1			> ${DEV_PREFIX}-${HL_TARGET}-${NAME}.hex
+-}
+-
+ function hl_img_offset {
+ 	FILE=$1
+ 	IMAGE_NUM=$2
+@@ -349,27 +332,9 @@
+ 	swap_file ${DEV_PREFIX}-fake-fuse.bin.le ${DEV_PREFIX}-fake-fuse.bin.be
+ 	swap_file ${DEV_PREFIX}-preboot_d1.bin.le ${DEV_PREFIX}-preboot_d1.bin.be
+ 
+-	create_spi_image ${DEV_PREFIX}-spi-flash.bin.nocrc ${DEV_PREFIX}-security-arc.bin.${ENDIANNESS} \
+-			 ${DEV_PREFIX}-images-pointers.bin.${ENDIANNESS} ${DEV_PREFIX}-preboot.bin.${ENDIANNESS} \
+-			 ${DEV_PREFIX}-ppboot-pcie_phy_fw.bin.${ENDIANNESS} ${DEV_PREFIX}-erom.bin.${ENDIANNESS} \
+-			 ${DEV_PREFIX}-fake-fuse.bin.${ENDIANNESS} \
+-			 ${DEV_PREFIX}-${PIF_ICCM_BINFILE}.${ENDIANNESS} ${DEV_PREFIX}-${PIF_DCCM_BINFILE}.${ENDIANNESS} \
+-			 ${DEV_PREFIX}-preboot_d1.bin.${ENDIANNESS}
+-
+-	swap_file ${DEV_PREFIX}-spi-flash.bin.nocrc ${DEV_PREFIX}-spi-flash.bin.nocrc.le
+-
+-	# Prepare checksum
+-	CKSUM=`${SHA256_CHKSUM} ${DEV_PREFIX}-spi-flash.bin.nocrc.le | cut -d' ' -f1`
+-	echo ${CKSUM} | xxd -p -r								> ${DEV_PREFIX}-spi-flash.crc
+-	dd status=none conv=sync bs=64K			if=${DEV_PREFIX}-spi-flash.bin.nocrc.le	> ${DEV_PREFIX}-spi-flash.bin
+-	dd status=none conv=sync bs=$SHA256_SIZE	if=${DEV_PREFIX}-spi-flash.crc		>> ${DEV_PREFIX}-spi-flash.bin
+-
+ 	rm -rf ${PPBOOT_PCIE_PHY_BINFILE}
+ 
+ 	## Convert bin file into Palladium hex format ##
+-	# for SPI flash
+-	hl_pldm_flash_hex spi-flash ${DEV_PREFIX}-spi-flash.bin.nocrc
+-
+ 	# for otp flash
+ 	hl_pldm_flash_hex spi-otp-flash ${DEV_PREFIX}-spi-otp-flash.bin
+ 
+diff --git a/scripts/make/gaudi2/Makefile b/scripts/make/gaudi2/Makefile
+index 4a84180..eaa8420 100644
+--- a/scripts/make/gaudi2/Makefile
++++ b/scripts/make/gaudi2/Makefile
+@@ -18,6 +18,7 @@
+ 	. ./board/habanalabs/common/post-image-fit-global.sh
+ 	. ./board/habanalabs/common/post-image-fit-descriptor.sh
+ 	. ./board/habanalabs/common/gen-pcr-info.sh
++	@$(MAKE) gaudi2-bin-create
+ 
+ .PHONY: gaudi2-cpld-create
+ gaudi2-cpld-create: gaudi2-target
+@@ -191,3 +192,5 @@
+ 	@echo
+ 	@echo Created $(IMAGES_DIR)/${HL_DEV}-elfs.tgz
+ 	@echo
++
++GAUDI2_BIN_FITS = ${DEV_PREFIX}-agent-fw_loader-fit.itb ${DEV_PREFIX}-agent-fw_loader-fit_erom.itb
+diff --git a/scripts/make/gaudi3/Makefile b/scripts/make/gaudi3/Makefile
+index 52fae30..cec9394 100644
+--- a/scripts/make/gaudi3/Makefile
++++ b/scripts/make/gaudi3/Makefile
+@@ -3,6 +3,7 @@
+ .PHONY: gaudi3-post-image
+ gaudi3-post-image:
+ 	. ./board/habanalabs/common/post-image-fit-descriptor.sh
++	@$(MAKE) gaudi3-bin-create
+ 
+ .PHONY: gaudi3-debug-elfs-create
+ gaudi3-debug-elfs-create:
+@@ -140,3 +141,5 @@
+ 	tar czf gaudi3-utils.tgz ${GAUDI3_UTILS} &&	\
+ 	cp gaudi3-utils.tgz $(IMAGES_DIR)/ &&		\
+ 	popd
++
++GAUDI3_BIN_FITS = ${DEV_PREFIX}-agent-fw_loader-fit.itb ${DEV_PREFIX}-fake_fuse.itb ${DEV_PREFIX}-agent-fw_loader-fit_erom.itb
+diff --git a/scripts/make/hl-common/Makefile b/scripts/make/hl-common/Makefile
+index 55268a2..097cbb1 100644
+--- a/scripts/make/hl-common/Makefile
++++ b/scripts/make/hl-common/Makefile
+@@ -359,3 +359,14 @@
+ %-slt-set-create:
+ 	@$(if $(filter $(call hl-device, $@), $(HL_SEC_FIT_CREATE_ARCH)), \
+ 	${BR2_EXTERNAL}/board/habanalabs/common/create-simple.sh slt_set fw-loader-conf no-use-elbi no-use-fwupdate load-bootloader no-load-only)
++
++DEVICE_BIN_FITS_VAR = $(shell echo $(call hl-device, $@) | tr a-z A-Z)_BIN_FITS
++HL_BIN_FITS = $(or $($(DEVICE_BIN_FITS_VAR)),$(call hl-device, $@)-agent-fw_loader-fit.itb)
++FLASH_BIN_FILE=output/${HL_DEV}/images/${DEV_PREFIX}-spi-flash.bin
++
++.PHONY: %-bin-create
++%-bin-create:
++	BIN_DIR=output/${HL_DEV}/host/bin $(HABANA_SOFTWARE_STACK)/automation/habana_scripts/embedded/scripts/itb2spi.sh -s $(addprefix -i output/${HL_DEV}/images/,$(HL_BIN_FITS)) -o $(FLASH_BIN_FILE) && \
++	source ${BR2_EXTERNAL}/board/habanalabs/common/image-utility.sh && \
++	swap_file $(FLASH_BIN_FILE) $(FLASH_BIN_FILE).rev && \
++	hl_pldm_flash_hex spi-flash $(FLASH_BIN_FILE).rev

@@ -1,0 +1,99 @@
+From ee8f5cdbbfbeefe10d1e25b39a5ebbde839e9ce9 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sun, 12 Aug 2018 07:24:58 +0300
+Subject: [PATCH] board: gaudi is a new ARM64 SoC Fixup
+
+1) update makefile to use correct defconfig
+2) remove HL_VARS_FILE at distclean
+3) Since our sed replacment is not good enough start with local inittab
+---
+
+diff --git a/Makefile b/Makefile
+index 4e57043..0681a7d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -59,13 +59,18 @@
+ 
+ $(OUTPUT_DIR)/.config: $(BR2_EXTERNAL)/configs/dali_defconfig
+ 	@$(MAKE) $(<F)
++.PHONY: dali-prepare gaudi-prepare
++gaudi-prepare: $(OUTPUT_DIR)/.config $(BR2_EXTERNAL)/configs/gaudi_defconfig
++dali-prepare: $(OUTPUT_DIR)/.config $(BR2_EXTERNAL)/configs/dali_defconfig
+ 
+ .PHONY: dali-onix-build dali-pldm-build dali-asic-build gaudi-onix-build
+ gaudi-onix-build: gaudi-onix-target
+ dali-onix-build: dali-onix-target
+ dali-pldm-build: dali-pldm-target
+ dali-asic-build: dali-asic-target
+-dali-onix-build dali-pldm-build dali-asic-build gaudi-onix-build: $(OUTPUT_DIR)/.config
++gaudi-onix-build: gaudi-prepare
++dali-onix-build dali-pldm-build dali-asic-build: dali-prepare
++dali-onix-build dali-pldm-build dali-asic-build gaudi-onix-build:
+ 	@$(MAKE) all
+ 
+ .PHONY: dali-rpi-build dali-rpi-armcp dali-rpi-gpio-mdio dali-rpi-regs-cli
+@@ -142,6 +147,7 @@
+ gaudi-distclean: hl-gaudi
+ dali-distclean: hl-dali
+ dali-distclean gaudi-distclean: $(OUTPUT_DIR)/.config
++	@rm -f $(HL_VARS_FILE)
+ 	@$(MAKE) uboot-dirclean linux-dirclean armcp-dirclean	\
+ 		 spdlog-dirclean specs-dirclean specs_external-dirclean \
+ 		 host-uboot-test-hooks-dirclean host-tbot-dirclean \
+diff --git a/board/habanalabs/common/inittab b/board/habanalabs/common/inittab
+new file mode 100644
+index 0000000..a762816
+--- /dev/null
++++ b/board/habanalabs/common/inittab
+@@ -0,0 +1,35 @@
++# /etc/inittab
++#
++# Copyright (C) 2001 Erik Andersen <andersen@codepoet.org>
++#
++# Note: BusyBox init doesn't support runlevels.  The runlevels field is
++# completely ignored by BusyBox init. If you want runlevels, use
++# sysvinit.
++#
++# Format for each entry: <id>:<runlevels>:<action>:<process>
++#
++# id        == tty to run on, or empty for /dev/console
++# runlevels == ignored
++# action    == one of sysinit, respawn, askfirst, wait, and once
++# process   == program to run
++
++# Startup the system
++::sysinit:/bin/mount -t proc proc /proc
++::sysinit:/bin/mount -o remount,rw /
++::sysinit:/bin/mkdir -p /dev/pts
++::sysinit:/bin/mkdir -p /dev/shm
++::sysinit:/bin/mount -a
++::sysinit:/bin/hostname -F /etc/hostname
++# now run any rc scripts
++::sysinit:/etc/init.d/rcS
++
++# Put a getty on the serial port
++console::respawn:/sbin/getty -L  console 0 vt100 # GENERIC_SERIAL
++
++# Stuff to do for the 3-finger salute
++#::ctrlaltdel:/sbin/reboot
++
++# Stuff to do before rebooting
++::shutdown:/etc/init.d/rcK
++::shutdown:/sbin/swapoff -a
++::shutdown:/bin/umount -a -r
+diff --git a/board/habanalabs/common/post-build.sh b/board/habanalabs/common/post-build.sh
+index 493187c..abb367a 100755
+--- a/board/habanalabs/common/post-build.sh
++++ b/board/habanalabs/common/post-build.sh
+@@ -15,9 +15,10 @@
+ 	fi
+ popd
+ 
++cp ${BR2_EXTERNAL}/board/habanalabs/common/inittab ${TARGET_DIR}/etc/inittab
+ # Add armcpd to hl device
+ if [ -e ${TARGET_DIR}/etc/inittab ]; then
+-    grep -qE "^${HL_DEV}::" ${TARGET_DIR}/etc/inittab || \
++	grep -qE "^${HL_DEV}::" ${TARGET_DIR}/etc/inittab || \
+ 	sed -i "/GENERIC_SERIAL/a# Put armcpd on Dali device/\n\
+ ${HL_DEV}::respawn:/usr/bin/armcpd # ARM CP" ${TARGET_DIR}/etc/inittab
+ fi
