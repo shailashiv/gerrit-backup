@@ -1,0 +1,151 @@
+From af217f8f403c9d34cbeb1ff76d5fbf25b2458965 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Sat, 03 Sep 2022 07:02:11 +0300
+Subject: [PATCH] [SW-102303] gaudi3: rr: add hw rr config backup for pcie
+
+In gaudi3, efuse bit 16 in the security dword offset 0x3A, is to be
+used to provide a backup rr config which blocks all the address
+ranges in rom, in case the hw fails to do so.
+
+BIT 16 legend:
+0 : Config rr in ROM.
+1 : HW configures the rr.
+
+The rr apis are renamed for better readability.
+
+Change-Id: I5791b4a7a5213d893ffb8ca58fc1370c383dee6b
+---
+
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index 32d9893..b8ddacf 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -63,12 +63,23 @@
+ 	HL_SEC_HBW_RR_SHORT_7 = 7,
+ };
+ 
++/*
++ * Enum to set the range registers to a predefined constant value.
++ * eg: Open or block the complete lbw or hbw ranges, in this case
++ * the min and max config values are constant (max possible).
++ */
++enum rom_rr_ctx_static_config {
++	RR_OPEN_ALL,
++	RR_CLOSE_ALL,
++	RR_MAX_CTX_TYPES,
++};
++
+ int secureboot_verify_image_signature(const uint8_t *image, uint32_t image_len, uint8_t *key,
+ 				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
+ 				uint8_t sec_ver, uint8_t key_index);
+ 
+ int secureboot_verify_image_hash384(uint8_t *exp_hash, unsigned char *image, uint32_t image_len);
+ void security_rr_recovery_config(void);
+-void security_rr_disable_pcie_config(void);
++void security_rr_open_pcie_config(void);
+ 
+ #endif /* _GAUDI3_DEV_SECURITY_H_ */
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 4fc74ee..dc6b960 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -139,7 +139,7 @@
+ 	if ((arcboot_rom_global.die_id && pcie_ctrl_val) ||
+ 		(!arcboot_rom_global.die_id && !pcie_ctrl_val)) {
+ 		disable_pif_isolation();
+-		security_rr_disable_pcie_config();
++		security_rr_open_pcie_config();
+ 		disable_pcie_error_resp();
+ 		pcie_config();
+ 	}
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index 452ba9e..fbe95be 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -94,20 +94,38 @@
+ 	}
+ };
+ 
+-static struct rom_rr_ctx rr_ctx_lbw = {
++static struct rom_rr_ctx rr_ctx_lbw[RR_MAX_CTX_TYPES] = {
++	[RR_OPEN_ALL] = {
+ 		.rr_idx = HL_SEC_LBW_RR_SHORT_13,
+ 		.data_min = RR_DEFAULT_VAL,
+ 		.data_max = RR_DEFAULT_VAL,
+ 		.en_val = RR_PRIV_RANGE_DIS,
++	},
++	[RR_CLOSE_ALL] = {
++		.rr_idx = HL_SEC_LBW_RR_SHORT_13,
++		.data_min = RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++		.data_max = RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++		.en_val = RR_PRIV_RANGE_EN,
++	},
+ };
+ 
+-static struct rom_rr_ctx rr_ctx_hbw = {
++static struct rom_rr_ctx rr_ctx_hbw[RR_MAX_CTX_TYPES] = {
++	[RR_OPEN_ALL] = {
+ 		.rr_idx = HL_SEC_HBW_RR_SHORT_7,
+ 		.data_min = RR_DEFAULT_VAL,
+ 		.data_min_hi = RR_DEFAULT_VAL,
+ 		.data_max = RR_DEFAULT_VAL,
+ 		.data_max_hi = RR_DEFAULT_VAL,
+ 		.en_val = RR_PRIV_RANGE_DIS,
++	},
++	[RR_CLOSE_ALL] = {
++		.rr_idx = HL_SEC_HBW_RR_SHORT_7,
++		.data_min = RR_HBW_PRIV_RANGE_MIN_LO_VAL,
++		.data_min_hi = RR_HBW_PRIV_RANGE_MIN_HI_VAL,
++		.data_max = RR_HBW_PRIV_RANGE_MAX_LO_VAL,
++		.data_max_hi = RR_HBW_PRIV_RANGE_MAX_HI_VAL,
++		.en_val = RR_PRIV_RANGE_EN,
++	},
+ };
+ 
+ static uint32_t security_rr_calc_rr_dist(struct rom_rr_ctx *rr_ctx)
+@@ -653,12 +671,23 @@
+ 			arcboot_rom_global.config2_fuse;
+ }
+ 
++void security_rr_close_pcie_config(void)
++{
++	security_rr_config_pcie_lbw(&rr_ctx_lbw[RR_CLOSE_ALL]);
++
++	security_rr_config_pcie_hbw(&rr_ctx_lbw[RR_CLOSE_ALL]);
++}
++
+ void arcboot_rom_security_init(void)
+ {
+ 	/* based on efuse, handle jtag enable/disable */
+ 	security_handle_jtag_if();
+ 	/* based on efuse, handle twi enable/disable */
+ 	security_handle_twi();
++
++	/* If HW does not config rr, add a backup rr config in rom */
++	if (!security_efuse_hw_rr_config())
++		security_rr_close_pcie_config();
+ 
+ 	if (arcboot_rom_global.die_id)
+ 		return;
+@@ -739,16 +768,16 @@
+ {
+ 	security_handle_twi();
+ 
+-	security_rr_config_debug_if_lbw(&rr_ctx_lbw);
++	security_rr_config_debug_if_lbw(&rr_ctx_lbw[RR_OPEN_ALL]);
+ 
+-	security_rr_config_debug_if_hbw(&rr_ctx_hbw);
++	security_rr_config_debug_if_hbw(&rr_ctx_hbw[RR_OPEN_ALL]);
+ }
+ 
+-void security_rr_disable_pcie_config(void)
++void security_rr_open_pcie_config(void)
+ {
+-	security_rr_config_pcie_lbw(&rr_ctx_lbw);
++	security_rr_config_pcie_lbw(&rr_ctx_lbw[RR_OPEN_ALL]);
+ 
+-	security_rr_config_pcie_hbw(&rr_ctx_hbw);
++	security_rr_config_pcie_hbw(&rr_ctx_hbw[RR_OPEN_ALL]);
+ }
+ 
+ void check_and_enable_4b_termination(void) {}

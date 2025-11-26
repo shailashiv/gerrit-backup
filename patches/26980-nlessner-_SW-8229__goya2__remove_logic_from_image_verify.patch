@@ -1,0 +1,112 @@
+From 34c914e99c652209ee3b6d313dc0807625641321 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 02 Feb 2020 12:26:29 +0200
+Subject: [PATCH] [SW-8229] goya2: remove logic from image verify
+
+Move logic of image header/footer calculation out of
+image verify routine. Move to arcboot_rom so verify
+function will be more generic
+
+Change-Id: I036260292282e9881f5b3c64888457b67f5265bc
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 07a7dba..6e22cc4 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -114,9 +114,12 @@
+ {
+ 	uint32_t flash_image_offset;
+ 	uint32_t flash_ppboot_pcie_offset;
++	uint32_t ppboot_pcie_offset;
+ 	uint16_t ppboot_pcie_size;
+ 	uint16_t ppboot_size;
+ 	uint16_t pcie_fw_size;
++	uint64_t pcie_fw_offset;
++	uint64_t pcie_fw_dest;
+ 	void (*ppboot)();
+ 
+ 	flash_image_offset = arcboot_flash_image_offset(image_ptr);
+@@ -130,23 +133,30 @@
+ 		/* TODO: update PSOC_SECURITY about CRC error in image */
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
+-	if (secureboot_verify_image(ppboot_pcie_size, HL_FWSRAM_BASE) ==
++	/* remove headers and footers from image, this is the image to verify */
++	ppboot_pcie_size -= SECUREBOOT_IMG_HEAD_FOOTER;
++	/* offset of ppboot+pcie_fw image to verify, start from fw_version */
++	ppboot_pcie_offset = (HL_FWSRAM_BASE + IMG_LEN_SIZE);
++	if (secureboot_verify_image(ppboot_pcie_size, ppboot_pcie_offset) ==
+ 	    SECUREBOOT_VERIFY_FAILED)
+ 		/* TODO: update PSOC_SECURITY about verify fail in image */
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
+ 	ppboot_size = fw_sram_readl(PPBOOT_IMAGE_SIZE_OFFSET);
+ 
+-	/* to find the pcie fw size we take total image size
+-	 * subtract ppboot size, signature, key, image length,
+-	 * fw version, crc32 size
+-	 */
+-	pcie_fw_size = ppboot_pcie_size - ppboot_size - SIG_SIZE - KEY_SIZE -
+-		       IMG_LEN_SIZE - CRC32_SIZE - FW_VERSION_SIZE;
++	/* remove ppboot size from total image size */
++	pcie_fw_size = ppboot_pcie_size - ppboot_size;
++	/* remove public key from image size */
++	pcie_fw_size -= KEY_SIZE;
++	/* remove uint32_t from pcie_fw size so we dont copy fw_version DWORD */
++	pcie_fw_size -= FW_VERSION_SIZE;
++	/* offset of pcie_fw in fw_sram, as source of mem_cpy */
++	pcie_fw_offset = HL_SRAM_BASE + HL_FWSRAM_OFFSET + ppboot_size;
++	/* address of pcie_fw_sram in sram space, as destination of mem_cpy */
++	pcie_fw_dest = HL_SRAM_BASE + HL_PCIE_FWSRAM_OFFSET;
+ 
+ 	/* copy to pcie_fw_sram from fw_sram the pcie_fw */
+-	mem_cpy(pcie_fw_size, HL_SRAM_BASE + HL_FWSRAM_OFFSET + ppboot_size,
+-		HL_SRAM_BASE + HL_PCIE_FWSRAM_OFFSET);
++	mem_cpy(pcie_fw_size, pcie_fw_offset, pcie_fw_dest);
+ 	mem_cpy_wait_finish();
+ 
+ 	/* cast ppboot location as function and execute it */
+@@ -181,7 +191,8 @@
+ 	if (dma_wait_finish() == DMA_CRC_ERROR)
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
+-	if (secureboot_verify_image(arcboot_ram_size, 0) ==
++	arcboot_ram_size -= SECUREBOOT_IMG_HEAD_FOOTER;
++	if (secureboot_verify_image(arcboot_ram_size, IMG_LEN_SIZE) ==
+ 	    SECUREBOOT_VERIFY_FAILED)
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
+diff --git a/common/secureboot.c b/common/secureboot.c
+index 7a83a6b..52b39b1 100644
+--- a/common/secureboot.c
++++ b/common/secureboot.c
+@@ -34,13 +34,11 @@
+ 	int err = 0;
+ 	unsigned char block_buf[SECUREBOOT_HASH_BLOCK_CALC_BUF];
+ 	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
+-	uint16_t test_phase0b_data_len = image_size - SIG_SIZE - IMG_LEN_SIZE -
+-					 CRC32_SIZE;
++	uint16_t test_phase0b_data_len = image_size;
+ 	uint32_t test_phase0b_sig_len = SIG_SIZE;
+ 	uint32_t test_public_key_len = KEY_SIZE;
+ 
+-	unsigned char *test_phase0b_data = (unsigned char *)(IMG_LEN_SIZE +
+-							     image_offset);
++	unsigned char *test_phase0b_data = (unsigned char *)(image_offset);
+ 	unsigned char *test_phase0b_sig = test_phase0b_data +
+ 					  test_phase0b_data_len;
+ 	unsigned char *test_public_key = test_phase0b_sig -
+diff --git a/common/secureboot.h b/common/secureboot.h
+index f50d065..4b8ff43 100644
+--- a/common/secureboot.h
++++ b/common/secureboot.h
+@@ -21,6 +21,7 @@
+ 
+ #define SECUREBOOT_HABANA_KEY		0
+ #define SECUREBOOT_CUSTOMER_KEY		1
++#define SECUREBOOT_IMG_HEAD_FOOTER	(SIG_SIZE + IMG_LEN_SIZE + CRC32_SIZE)
+ 
+ int secureboot_verify_image(uint32_t image_size, uint32_t image_offset);
+ 

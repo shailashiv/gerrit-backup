@@ -1,0 +1,132 @@
+From 9644da9f7c579f341624c59786828dcd10d16e30 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 08 Apr 2022 09:01:00 +0300
+Subject: [PATCH]  [SW-77251] gaudi3: add arc address conversion api
+
+Currently, the macro used for converting 64bit address to
+arc viewpoint assumes the address falls in FW memory
+region. This patch add changes to convert 64 bit
+to arc view point based on address region (SRAM
+or FW MEM).
+
+Change-Id: I93ef44fc5ed81f7710c19af3739ac278da842ade
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index ae970cf..7cb1758 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -26,6 +26,17 @@
+ 
+ void arcboot_rom_bringup_arcboot_ram(void) {}
+ 
++uint32_t arcboot_rom_get_arc_addr(uint64_t addr)
++{
++	if (addr >= HL_SRAM_BASE_FULL && addr <= HL_SRAM_BASE_FULL + HL_SRAM_SIZE)
++		return CONV_64B_TO_ARC_SRAM(addr);
++
++	if (addr >= HL_FW_MEM_BASE_FULL && addr <= HL_FW_MEM_BASE_FULL + HL_FW_MEM_SIZE)
++		return CONV_64B_TO_ARC_FW_MEM(addr);
++
++	return 0;
++}
++
+ int arcboot_rom_mem_init(uint64_t addr, uint32_t size)
+ {
+ 	uint32_t retry = HL_INIT_MEM_RETRIES;
+@@ -516,7 +527,7 @@
+ 	act_img_size = act_img_size - (num_crc * CRC32_SIZE);
+ 
+ 	/* Derive key and signature parameters */
+-	loadaddr_arc = (uint32_t)CONV_64B_TO_ARC(desc->loadaddr);
++	loadaddr_arc = (uint32_t)arcboot_rom_get_arc_addr(desc->loadaddr);
+ 	image = (unsigned char *)(loadaddr_arc);
+ 	image_len = act_img_size;
+ 
+@@ -618,7 +629,7 @@
+ 
+ 	arcboot_rom_status_update(PROGRESS_PPBOOT_START);
+ 	if (start_addr) {
+-		ppboot = (void *)((uint32_t)CONV_64B_TO_ARC(*start_addr));
++		ppboot = (void *)((uint32_t)arcboot_rom_get_arc_addr(*start_addr));
+ 		ppboot();
+ 	}
+ 
+@@ -711,29 +722,20 @@
+ void arcboot_start_image(uint64_t startaddr)
+ {
+ 	void (*image_entry)(void);
+-	uint32_t arc_addr = (uint32_t)(startaddr);
++	uint32_t arc_addr;
+ 
+ 	if (!startaddr)
+ 		wfe();
+ 
+-	/*
+-	 * Jump to __reset of zephyr. After image_entry, control is not
+-	 * expected to return here and continue.
+-	 */
+-	image_entry = (void *)(*(uint32_t *)arc_addr);
++	arc_addr = (uint32_t)arcboot_rom_get_arc_addr(startaddr);
++
++	image_entry = (void *)((uint32_t) arc_addr);
+ 	image_entry();
+ }
+ 
+-#define ARC_ADDR_MASK			0xFFFFFFFull
+ void arcboot_copy_image(uint64_t dst, const void *buf, int len, __unused const char *arch)
+ {
+-	uint32_t arc_dst;
+-
+-	/*
+-	 * ARC_ADDR_MASK trancates the address to the 256MB region accesible by
+-	 * Arc. MSB of 0x2 points to the FW_MEM_REGION.
+-	 */
+-	arc_dst = ((uint32_t)dst & ARC_ADDR_MASK) | BIT(29);
++	uint32_t arc_dst = (uint32_t)arcboot_rom_get_arc_addr(dst);
+ 
+ 	memcpy((void *)arc_dst, buf, len);
+ }
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index 80ebb87..708e5c0 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -9,3 +9,4 @@
+ 
+ void arcboot_rom_notify_slave(void);
+ uint32_t arcboot_rom_get_num_crc(uint32_t size);
++uint32_t arcboot_rom_get_arc_addr(uint64_t addr);
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 037d2f4..3680228 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -102,7 +102,7 @@
+ 		goto run_image;
+ 
+ 	num_crc = arcboot_rom_get_num_crc(desc.img_size);
+-	loadaddr_arc = (uint32_t)CONV_64B_TO_ARC(desc.loadaddr);
++	loadaddr_arc = (uint32_t)arcboot_rom_get_arc_addr(desc.loadaddr);
+ 	image = (unsigned char *)(loadaddr_arc);
+ 
+ 	img_len_nocrc = desc.img_size - (num_crc * CRC32_SIZE);
+@@ -116,7 +116,7 @@
+ 
+ run_image:
+ 	arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_EROM_IMG_START);
+-	erom_func = (void *)((uint32_t)CONV_64B_TO_ARC(desc.start_addr));
++	erom_func = (void *)((uint32_t)arcboot_rom_get_arc_addr(desc.start_addr));
+ 	erom_func();
+ 	arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_EROM_IMG_FINISH);
+ }
+diff --git a/arch/gaudi3/arc/soc.h b/arch/gaudi3/arc/soc.h
+index 9fdcb9e..4fa6a53 100644
+--- a/arch/gaudi3/arc/soc.h
++++ b/arch/gaudi3/arc/soc.h
+@@ -110,5 +110,6 @@
+ #define HL_FW_SRAM_FULL_BASE		(HL_FW_MEM_BASE_FULL + HL_FWSRAM_OFFSET)
+ #define HL_FW_SRAM_SIZE			SZ_128K
+ 
+-#define CONV_64B_TO_ARC(addr)	((addr & 0xFFFFFFF) + HL_FW_MEM_BASE)
++#define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0xFFFFFFF) + HL_FW_MEM_BASE)
++#define CONV_64B_TO_ARC_SRAM(addr)	((addr & 0xFFFFFFF) + HL_SRAM_BASE)
+ #endif /* _SOC_H_ */

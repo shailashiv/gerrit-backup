@@ -1,0 +1,73 @@
+From 531be5aea6e3e493384e63f33bbe3138189bd7b6 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 23 May 2022 14:26:55 +0300
+Subject: [PATCH] [SW-0] rom: recovery mode detection update
+
+GPIO_76 is used by master die to indicate recovery to slave die.
+There is a dedicated "recovery" mode indication bit in
+PSOC_GLOBAL_CONF that can be used for this purpose(as per design
+team's suggestion). This method replaces an inter die read with a
+self die read on slave die, which results in a faster read
+transaction.
+
+Change-Id: I452d6fb8b5a069fa7e93078a964621db6d0bd7af
+---
+
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index 9011723..5f19c32 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -9,43 +9,32 @@
+ #include <pcie.h>
+ #include <dev_common.h>
+ 
+-#define RECOVERY_GPIO			76
+ #define NOTIFY_SLV_DURATION_US		10
+ 
+ void arcboot_rom_notify_slave(void)
+ {
+-	uint32_t idx = RECOVERY_GPIO % GPIOS_PER_BANK;
+-	uint32_t mask = BIT(idx), val;
++	uint32_t val;
+ 
+-	/* set gpio 76 for 10us to notify slave */
+-	val = regmap_readl(mmD0_PSOC_GPIO4_OUTENSET);
+-	regmap_writel((val | mask), mmD0_PSOC_GPIO4_OUTENSET);
+-
+-	val = regmap_readl(mmD0_PSOC_GPIO4_DATAOUT);
+-	regmap_writel((val | mask), mmD0_PSOC_GPIO4_DATAOUT);
+-
++	regmap_writel(D0_PSOC_GLOBAL_CONF_DIE_RECOVERY_IN_IND_M,
++			mmD0_PSOC_GLOBAL_CONF_DIE_RECOVERY_OUT);
++	/* Hold the recovery indication for 10 us */
+ 	udelay(NOTIFY_SLV_DURATION_US);
+-
+-	val &= ~(mask);
+-	regmap_writel(val, mmD0_PSOC_GPIO4_DATAOUT);
+-
+-	/* TODO: Is there need to set gpio to input?? */
++	val = regmap_readl(mmD0_PSOC_GLOBAL_CONF_DIE_RECOVERY_OUT);
++	val &= ~D0_PSOC_GLOBAL_CONF_DIE_RECOVERY_IN_IND_M;
++	regmap_writel(val, mmD0_PSOC_GLOBAL_CONF_DIE_RECOVERY_OUT);
+ }
+ 
+ #define WAIT_SLEEP_DURATION_US		1
+ void arcboot_rom_wait_for_signal(void)
+ {
+-	uint32_t idx, val, mask;
++	uint32_t val;
+ 
+ 	if (!arcboot_rom_global.die_id)
+ 		return;
+ 
+-	idx =  RECOVERY_GPIO % GPIOS_PER_BANK;
+-	mask = BIT(idx);
+-
+ 	while (1) {
+-		val = mirror_readl(mmD0_PSOC_GPIO4_DATAOUT);
+-		if (val & mask)
++		val = regmap_readl(mmD0_PSOC_GLOBAL_CONF_DIE_RECOVERY_IN);
++		if (val & D0_PSOC_GLOBAL_CONF_DIE_RECOVERY_IN_IND_M)
+ 			execute_recovery();
+ 
+ 		udelay(WAIT_SLEEP_DURATION_US);

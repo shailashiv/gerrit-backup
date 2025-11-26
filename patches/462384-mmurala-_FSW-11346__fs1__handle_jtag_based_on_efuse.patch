@@ -1,0 +1,94 @@
+From b7700c463b3bcc10c085c5deef0f9fba899e907c Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 04 Nov 2024 17:54:29 +0200
+Subject: [PATCH] [FSW-11346] fs1: handle jtag based on efuse
+
+Added support to enable or disable jtag interface
+based on efuse bit. Cleared FSM timer bit, it is
+no more valid becasue bootrom is alive.
+Corresponding security changes are taken care
+separately.
+
+Change-Id: I8c2a1a474479338636d1514878572ee9fc5efe0c
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index ffb3eac..fed1f80 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -20,6 +20,8 @@
+ #include <range_reg_lbw_masks.h>
+ #include <axuser_lbw_regs.h>
+ #include <axuser_lbw_masks.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -321,3 +323,38 @@
+ 		/* TODO: Implement if required */
+ 	}
+ }
++
++void security_handle_jtag_if(void)
++{
++	uint32_t val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_JTAG_DISABLE));
++
++	if ((boot_rom_global.config_fuse & EFUSE_SYSCFG_DIS_JTAG) == 0) {
++		/* Enable JTAG */
++		val &= ~(PSOC_BOOT_CONF_JTAG_DISABLE_VAL_M);
++
++		/*
++		 * TODO: RR
++		 * JTAG.MSTR_IF RANGE_EN = 1
++		 * WR_RANGE_SEC & RD_RANGE_SEC = JTAG_SAI
++		 * RANGE_MIN_ADDR & RANGE_MAX_ADDR = 0 to 0xFFFFFFFC
++		 * TODO: PB
++		 * Already all PBs are opened for RW in all pages for all SAI levels.
++		 */
++	} else {
++		val |= PSOC_BOOT_CONF_JTAG_DISABLE_VAL_M;
++
++		/*
++		 * TODO: RR
++		 * JTAG.MSTR_IF RANGE_EN = 0
++		 * WR_RANGE_SEC & RD_RANGE_SEC = 0
++		 * RANGE_MIN_ADDR & RANGE_MAX_ADDR = 0
++		 * TODO: PB
++		 * Blocked from RR level, so no need to change PB.
++		 */
++	}
++
++	/* Clear FSM timer */
++	val &= ~(PSOC_BOOT_CONF_JTAG_DISABLE_COUNTER_EN_M);
++
++	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_JTAG_DISABLE));
++}
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 55ef2ee..7d5c72f 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -108,6 +108,7 @@
+ void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
+ 	const struct security_rr_ctx *rr_ip_ctx);
+ void security_rr_recovery_config(bool enable);
++void security_handle_jtag_if(void);
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+diff --git a/common/security.c b/common/security.c
+index 87d1f8d..656e7bb 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -44,11 +44,6 @@
+ 	return -1;
+ }
+ 
+-static void security_handle_jtag_if(void)
+-{
+-	/* TODO: add jtag enable/disable logic */
+-}
+-
+ static void security_load_sec_efuse_dword(void)
+ {
+ 	boot_rom_global.sec_data.efuse_sys_cfg = boot_rom_global.config_fuse;

@@ -1,0 +1,168 @@
+From 8f7e58acd2b472454ceb7d7cb34cd8aa5cb97ae5 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Thu, 13 Jun 2024 14:13:31 +0300
+Subject: [PATCH] [FSW-418] fs1: bootrom: add tpm bootrom globals
+
+This patch adds variables to bootrom globals and
+support functions.
+
+tpm_exec_stage identifies the TPM execution
+stage and represents the current state of the
+TPM finite state machine.
+
+tpm_extend_done indicates that the TPM extend
+operation was completed in previous resets and
+does not need to be repeated.
+
+tpm_next_pcr_index identifies the next PCR to
+extend in the TPM.This will be used to keep
+track of which PCR extends are already complete
+
+tpm_spi provides info on TPM SPI parameters
+
+Change-Id: Ib454bb5b6686f47ac63b0fe09b02e10ad7a2ff29
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index 81e57b3..3326097 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -19,6 +19,10 @@
+ 	.die_type = INVALID_DIE_TYPE,
+ 	.fake_fuse_en = false,
+ 	.boot_info_set_done = false,
++	.tpm_exec_stage = 0,
++	.tpm_extend_done = 0,
++	.tpm_next_pcr_index = 0,
++	.tpm_spi = NULL,
+ };
+ 
+ struct boot_rom_manifest_s __attribute__((section (".rom_manifest_section")))boot_rom_manifest;
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 0c9fe00..bf35916 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -16,6 +16,7 @@
+ #include <gpio_regs.h>
+ #include <fs1_reg_mask.h>
+ #include <fs1_fw_if.h>
++#include <fs1_security.h>
+ #include <status.h>
+ #include <efuse.h>
+ #include "dev_uart.h"
+@@ -119,6 +120,7 @@
+ 	boot_rom_global.validation_pass = cold_rst_data.validation_flag;
+ 	boot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
+ 	boot_rom_global.boot_info_set_done = cold_rst_data.boot_info_set_done;
++	boot_rom_global.tpm_extend_done = cold_rst_data.tpm_validation_flag;
+ }
+ 
+ /* TODO: Add functionality once mem init feature is added to memcpy block */
+@@ -226,3 +228,38 @@
+ 
+ 	return 0;
+ }
++
++void boot_rom_set_tpm_extend_done(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	boot_rom_global.tpm_extend_done = 1;
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.tpm_validation_flag)
++		return;
++
++	/* tpm pcr extend successful, set cold flops */
++	cold_rst_data.tpm_validation_flag = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++enum boot_rom_tpm_exec_stage boot_rom_get_tpm_exec_stage(void)
++{
++	return boot_rom_global.tpm_exec_stage;
++}
++
++uint8_t boot_rom_get_tpm_next_pcr_index(void)
++{
++	return boot_rom_global.tpm_next_pcr_index;
++}
++
++void boot_rom_set_tpm_next_pcr_index(uint8_t tpm_pcr_index)
++{
++	boot_rom_global.tpm_next_pcr_index = tpm_pcr_index;
++}
++
++void boot_rom_tpm_next_pcr_index_init(void)
++{
++	boot_rom_set_tpm_next_pcr_index(TPM2_SVN_PCR_IDX);
++}
+\ No newline at end of file
+diff --git a/common/common.c b/common/common.c
+index 961d50a..308869f 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -70,6 +70,8 @@
+ 
+ 	if (!boot_desc_init(HL_FW_BOOT_PTR_SPI))
+ 		boot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_FAIL);
++
++	boot_rom_tpm_next_pcr_index_init();
+ }
+ 
+ void boot_rom_fuse(void)
+diff --git a/common/common.h b/common/common.h
+index d861096..4a26e15 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -22,5 +22,10 @@
+ bool boot_rom_secondary_img_disabled(void);
+ void boot_rom_set_validation(bool status);
+ uint32_t boot_rom_get_arc_addr(uint64_t addr);
++void boot_rom_set_tpm_extend_done(void);
++enum boot_rom_tpm_exec_stage boot_rom_get_tpm_exec_stage(void);
++uint8_t boot_rom_get_tpm_next_pcr_index(void);
++void boot_rom_set_tpm_next_pcr_index(uint8_t tpm_pcr_index);
++void boot_rom_tpm_next_pcr_index_init(void);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index b7051a9..d63f31f 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -11,6 +11,7 @@
+ #include <stdbool.h>
+ #include "hl_boot_desc_rom.h"
+ #include <hl_sec_if.h>
++#include "spi.h"
+ 
+ #define wfe()	__asm__ __volatile__("sleep 0x11\n" : : )
+ 
+@@ -84,6 +85,15 @@
+ 
+ #define NUM_OF_MISC_DESCS	(ROM_DESC_NUM_MAX - ROM_DESC_MISC_1)	/* TODO: do we need really MISC desc??*/
+ 
++enum boot_rom_tpm_exec_stage {
++	TPM_EXEC_INIT = 0,
++	TPM_EXEC_STARTUP_SEND = 1,
++	TPM_EXEC_STARTUP_RECV = 2,
++	TPM_EXEC_PCR_EXTEND_SEND = 3,
++	TPM_EXEC_PCR_EXTEND_RECV = 4,
++	TPM_EXEC_DONE = 5,
++};
++
+ struct boot_rom_global_s {
+ 	uint32_t config_fuse;
+ 	uint32_t config2_fuse;
+@@ -99,6 +109,10 @@
+ 	struct hl_fw_boot_ptrs spi_manifest_hdr;
+ 	bool boot_info_set_done;
+ 	struct hl_fw_sec_info sec_data;
++	enum boot_rom_tpm_exec_stage tpm_exec_stage;
++	uint8_t tpm_extend_done;
++	uint8_t tpm_next_pcr_index;
++	struct spi_ctx *tpm_spi;
+ };
+ 
+ struct boot_rom_manifest_s {

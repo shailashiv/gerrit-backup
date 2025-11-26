@@ -1,0 +1,102 @@
+From 73a5bdab090a4efaadd55cd545be1aba660aaadd Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 08 Jul 2024 18:17:56 +0300
+Subject: [PATCH] [FSW-420] fs1: add image validation support
+
+with this patch, added api to validate sha384
+and signature of given image.
+
+Change-Id: I7d2015837cdc702c094e41349590ed2a89c4cfae
+---
+
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 68e7352..7ad211d 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -7,6 +7,23 @@
+ #define _DEV_SECURITY_H_
+ 
+ #define NUM_KEYS_IN_ROM					5
++#define SIG_SIZE					384
++
++/* size of key properties in bytes */
++#define KEY_PROP_RR_SZ					384
++#define KEY_PROP_MOD_SZ					384
++#define KEY_PROP_EXP_SZ					8
++#define KEY_PROP_INV_SZ					4
++#define KEY_PROP_NB_SZ					4
++#define KEY_PROP_HDR_SZ					8
++
++/* 384 + 384 + 8 + 4 + 4 = 784 bytes */
++#define PUB_KEY_SZ		(KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
++				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
++				KEY_PROP_NB_SZ)
++
++/* 784 + 8 = 792 */
++#define TOTAL_PUB_KEY_PROPS_SZ		(PUB_KEY_SZ + KEY_PROP_HDR_SZ)
+ 
+ void security_load_revoke_bits(void);
+ int security_efuse_image_validation_en(void);
+diff --git a/common/secure_boot.c b/common/secure_boot.c
+index f0407d3..a152a48 100644
+--- a/common/secure_boot.c
++++ b/common/secure_boot.c
+@@ -9,6 +9,9 @@
+ #include <string.h>
+ #include <secure_boot.h>
+ #include <security.h>
++#include <boot_rom.h>
++#include <soc.h>
++#include <dev_security.h>
+ 
+ int secure_boot_verify_image_hash384(uint8_t *exp_hash, unsigned char *img, uint32_t img_len)
+ {
+@@ -31,3 +34,35 @@
+ 
+ 	return ret;
+ }
++
++int secure_boot_verify_image_signature(const uint8_t *image, uint32_t image_len, uint8_t *key,
++				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
++				uint8_t sec_ver, uint8_t key_index)
++{
++	int ret;
++
++	if (!security_efuse_image_validation_en())
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	if ((key_len > TOTAL_PUB_KEY_PROPS_SZ) || (sig_len > SIG_SIZE))
++		return SECUREBOOT_VERIFY_FAILED;
++
++	if (security_check_valid_fw_version(sec_ver) != SECURITY_FW_VERSION_SECURE) {
++		return SECUREBOOT_VERIFY_VER_FAILED;
++	}
++
++	ret = security_check_key_revoke_status(key_index);
++	if (ret != 1)
++		return SECUREBOOT_VERIFY_KEY_REVOKED;
++
++	if (secure_boot_verify_key_hash(key_index, key, key_len))
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	ret = rsa_verify(image, image_len, key, key_len, sig, sig_len);
++
++	/* 0 - SUCCESS, but arcboot main code, expects 1 for SUCCESS */
++	if (!ret)
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	return SECUREBOOT_VERIFY_FAILED;
++}
+diff --git a/common/secure_boot.h b/common/secure_boot.h
+index 1505674..479f201 100644
+--- a/common/secure_boot.h
++++ b/common/secure_boot.h
+@@ -13,5 +13,8 @@
+ #define SECUREBOOT_VERIFY_SUCCESS	1
+ 
+ int secure_boot_verify_image_hash384(uint8_t *exp_hash, unsigned char *img, uint32_t img_len);
++int secure_boot_verify_image_signature(const uint8_t *image, uint32_t image_len, uint8_t *key,
++				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
++				uint8_t sec_ver, uint8_t key_index);
+ 
+ #endif /* _SECURE_BOOT_H_ */

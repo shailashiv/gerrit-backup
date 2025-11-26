@@ -1,0 +1,230 @@
+From 8312fe771e9248a5900b4da8330154e194fda49f Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 13 Apr 2022 12:35:58 +0300
+Subject: [PATCH] [SW-81745] boot_desc: update logic for erom desc
+
+Update boot descriptor logic for erom. Erom would support
+erom_tpm, erom_recovery and erom_pcie image.
+
+Update:
+1) Erom image descriptor structure not stored in a rom variable,
+instead referred from iccm, similar to spi fw image descriptor
+processing.
+
+0-128KB is reserved for execution of eROM images (1 of the 3) .
+128KB-192KB is reserved to load the boot info read from SP SRAM .
+Hence 192KB offset is used for eROM image descriptor DMA.
+
+Change-Id: I65668578a74235765b34eef666ebb7259ad7cd06
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 71bc5dd..e538eb9 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -43,6 +43,8 @@
+ 		.max_imgs = HL_FW_MAX_EROM_BOOT_PTRS,
+ 		.start_addr = 0,
+ 		.desc_info = {0},
++		.dest_addr_dma = HL_BOOT_PTR_EROM_DMA_DEST,
++		.dest_addr_arc = HL_BOOT_PTR_EROM_DMA_DEST_ARC,
+ 	},
+ 	.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI] = {
+ 		.boot_desc_flag = 0,
+@@ -50,6 +52,8 @@
+ 		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS,
+ 		.start_addr = 0,
+ 		.desc_info = {0},
++		.dest_addr_dma = HL_BOOT_PTR_SPI_DMA_DEST,
++		.dest_addr_arc = HL_BOOT_PTR_SPI_DMA_DEST_ARC,
+ 	},
+ 	.pci_link_up = false,
+ 	.tpm_validation_pass = false,
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 6a35983..c877966 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -26,8 +26,8 @@
+ #define ALIGN_VAL(val, byte)	ALIGN_SUB(val, (byte - 1))
+ 
+ static struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx;
+-static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_DEST_ARC);
+-static struct hl_fw_img_desc *p_img_desc;
++static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_SPI_DMA_DEST_ARC);
++static uint32_t erom_img_descs_offset = 0;
+ 
+ static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+ {
+@@ -49,8 +49,7 @@
+ 	p_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[img];
+ 
+ 	if (img == HL_FW_BOOT_PTR_EROM) {
+-		p_boot_ptr = &arcboot_rom_global.img_ptrs_erom.boot_ptr;
+-		p_img_desc = arcboot_rom_global.img_ptrs_erom.img_desc;
++		p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_EROM_DMA_DEST_ARC);
+ 	}
+ }
+ 
+@@ -60,7 +59,8 @@
+ 	uint32_t *p_offset = NULL;
+ 	enum arcboot_rom_progress dma_sts_base = PROGRESS_INIT_SPI_BOOT_DESC_DMA_START;
+ 	enum dma_error err;
+-	uint32_t copy_sz, boot_ptr_start_addr = HL_BOOT_PTR_DEST_ARC;
++	uint32_t copy_sz;
++	static struct hl_fw_img_desc *p_img_desc;
+ 
+ 	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
+ 		return 0;
+@@ -84,7 +84,7 @@
+ 
+ 	/* Fetch boot desc using DMA into dest offset */
+ 	err = dma_copy_image_v2(img_ptrs_size, p_img_ptr_ctx->img_ptr_spi_offset,
+-			HL_BOOT_PTR_DMA_DEST, DMA_DEST_HBW, false);
++			p_img_ptr_ctx->dest_addr_dma, DMA_DEST_HBW, false);
+ 	if (err != DMA_SUCCESS) {
+ 		if (err == DMA_INVALID_CRC_ERROR)
+ 			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_CRC_FAILED);
+@@ -107,16 +107,11 @@
+ 	p_img_ptr_ctx->desc_info.desc_size = p_boot_ptr->img_desc_sz;
+ 	p_img_ptr_ctx->desc_info.count = p_boot_ptr->count;
+ 
+-	p_offset = (uint32_t *)(boot_ptr_start_addr + p_boot_ptr->offset2array);
++	p_offset = (uint32_t *)(p_img_ptr_ctx->dest_addr_arc + p_boot_ptr->offset2array);
+ 
+ 	/* Validate all descriptors */
+ 	for (i = 0; i < p_boot_ptr->count; i++) {
+-		if (img == HL_FW_BOOT_PTR_SPI) {
+-			p_img_desc = (struct hl_fw_img_desc *)(boot_ptr_start_addr + p_offset[i]);
+-		} else {
+-			memcpy(p_img_desc,
+-			(uint8_t *)(boot_ptr_start_addr + p_offset[i]), sizeof(struct hl_fw_img_desc));
+-		}
++		p_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc + p_offset[i]);
+ 
+ 		if (!boot_desc_img_desc_is_valid(p_img_desc)) {
+ 			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_BOOT_DESC_VERIFICATION_FAIL);
+@@ -134,7 +129,7 @@
+ 			}
+ 
+ 			if (boot_info_set(HL_BOOT_INFO_IMG_DESC_DATA,
+-			   (uint8_t *)(boot_ptr_start_addr + p_offset[0]),
++			   (uint8_t *)(p_img_ptr_ctx->dest_addr_arc + p_offset[0]),
+ 			   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count)) {
+ 				arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_DATA_SET_FAIL);
+ 				return 0;
+@@ -149,11 +144,14 @@
+ 		}
+ 
+ 		if (boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA,
+-		   (uint8_t *)(boot_ptr_start_addr + BOOT_INFO_IMG_DESC_GET_OFFSET),
++		   (uint8_t *)(p_img_ptr_ctx->dest_addr_arc + BOOT_INFO_IMG_DESC_GET_OFFSET),
+ 		   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count, &copy_sz)) {
+ 			arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_DATA_GET_FAIL);
+ 			return 0;
+ 		}
++	} else {
++		/* Store the erom image descriptor offset to re-use in get api */
++		erom_img_descs_offset = p_offset[0];
+ 	}
+ 
+ 	p_img_ptr_ctx->boot_desc_flag = 1;
+@@ -166,6 +164,7 @@
+ {
+ 	uint32_t i, idx;
+ 	struct hl_fw_img_desc *p_loc_img_desc = NULL;
++	uint32_t boot_desc_offset = 0;
+ 
+ 	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
+ 		return HL_FW_IMG_NOT_FOUND;
+@@ -181,12 +180,14 @@
+ 
+ 	for (i = 0; i < p_img_ptr_ctx->desc_info.count ; i++) {
+ 		if (img == HL_FW_BOOT_PTR_SPI) {
+-			p_loc_img_desc = (struct hl_fw_img_desc *)(HL_BOOT_PTR_DEST_ARC
+-					+ BOOT_INFO_IMG_DESC_GET_OFFSET
+-					+ p_img_ptr_ctx->desc_info.desc_size * i);
++			boot_desc_offset = BOOT_INFO_IMG_DESC_GET_OFFSET;
+ 		} else {
+-			p_loc_img_desc = &p_img_desc[i];
++			boot_desc_offset = erom_img_descs_offset;
+ 		}
++
++		p_loc_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
++						+ boot_desc_offset
++						+ p_img_ptr_ctx->desc_info.desc_size * i);
+ 
+ 		if (p_loc_img_desc->magic.type != type)
+ 			continue;
+@@ -220,5 +221,5 @@
+ 
+ 	memcpy(boot_ptr, p_boot_ptr, sizeof(struct hl_fw_boot_ptrs));
+ 
+-	return HL_BOOT_PTR_DEST_ARC;
++	return HL_BOOT_PTR_SPI_DMA_DEST_ARC;
+ }
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index b951d73..10d0f91 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -12,6 +12,7 @@
+ #include <sha512.h>
+ 
+ #define HL_FW_IMG_NOT_FOUND		((uint32_t) -1)
++#define EROM_IMG_DESC_ICCM_OFFSET	(192 * 1024)
+ /* erom image pointer binary placed in flash at sector 0 */
+ #define HL_EROM_IMG_PTRS_BASE		(0x0)
+ /*
+@@ -20,12 +21,19 @@
+  */
+ #define HL_SPI_IMG_PTRS_BASE		(0x60000)
+ #define HL_CRC32_FOOTER			(sizeof(uint32_t))
+-/* boot descriptors are DMA trans ARC1 ICCM at offset 0 */
+-#define HL_BOOT_DESC_OFFSET		(HL_ICCM_OFFSET)
++/* spi img boot descriptors are DMA trans ARC1 ICCM at offset 0 */
++#define HL_BOOT_DESC_SPI_IMG_OFFSET		(HL_ICCM_OFFSET)
++/* erom boot descriptors are DMA trans ARC1 ICCM at offset 192K */
++#define HL_BOOT_DESC_EROM_OFFSET		(HL_ICCM_OFFSET + EROM_IMG_DESC_ICCM_OFFSET)
+ /* 64Bit address of boot pointer destination, used for DMA */
+-#define HL_BOOT_PTR_DMA_DEST		(HL_GEN_MEM_BASE_FULL + HL_BOOT_DESC_OFFSET)
++#define HL_BOOT_PTR_SPI_DMA_DEST		(HL_GEN_MEM_BASE_FULL + HL_BOOT_DESC_SPI_IMG_OFFSET)
+ /* 32Bit arc viewpoint address of boot pointer stored in ICCM */
+-#define HL_BOOT_PTR_DEST_ARC		(HL_GEN_MEM_BASE + HL_BOOT_DESC_OFFSET)
++#define HL_BOOT_PTR_SPI_DMA_DEST_ARC		(HL_GEN_MEM_BASE + HL_BOOT_DESC_SPI_IMG_OFFSET)
++
++#define HL_BOOT_PTR_EROM_DMA_DEST		(HL_GEN_MEM_BASE_FULL + HL_BOOT_DESC_EROM_OFFSET)
++/* 32Bit arc viewpoint address of boot pointer stored in ICCM */
++#define HL_BOOT_PTR_EROM_DMA_DEST_ARC		(HL_GEN_MEM_BASE + HL_BOOT_DESC_EROM_OFFSET)
++
+ /* SPI boot descriptor stored at 4K Offset */
+ /* TODO: Remove hardcoding of SP SRAM offset for spi boot ptr */
+ #define HL_SPI_BOOT_PTR_SP_SRAM_OFF	(4 * 1024)
+diff --git a/common/hl_boot_desc_rom.h b/common/hl_boot_desc_rom.h
+index 90ec135..155e9f4 100644
+--- a/common/hl_boot_desc_rom.h
++++ b/common/hl_boot_desc_rom.h
+@@ -36,11 +36,8 @@
+ 	uint32_t img_ptr_spi_offset;
+ 	uint64_t start_addr;
+ 	struct hl_fw_desc_info desc_info;
+-};
+-
+-struct hl_img_ptrs_erom {
+-	struct hl_fw_boot_ptrs boot_ptr;
+-	struct hl_fw_img_desc img_desc[HL_FW_MAX_EROM_BOOT_PTRS - 1];
++	uint64_t dest_addr_dma;
++	uint32_t dest_addr_arc;
+ };
+ 
+ #endif /* HL_BOOT_DESC_ROM_H */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 7a79275..3871ab3 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -87,7 +87,6 @@
+ 	uint32_t fuse_spi_offset;
+ 	bool fuse_spi;
+ 	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
+-	struct hl_img_ptrs_erom img_ptrs_erom;
+ 	struct hl_fw_sec_info sec_data;
+ 	bool pci_link_up;
+ 	uint8_t tpm_validation_pass;

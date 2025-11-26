@@ -1,0 +1,77 @@
+From f2e2f0bf3fbfd66b64dc84d51a23125196cd662e Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 26 Sep 2022 17:56:13 +0300
+Subject: [PATCH] [SW-105911] boot_info: use boot info set flag
+
+Currently, validation pass flag is used to determine whether to
+set boot info into scratchpad SRAM or to skip it. Using validation pass
+flag may cause problems in scenario where ppboot image was failed to
+dma, verify and validation pass flag was not set. This will cause ROM
+to set twice even though the data is not changed from previous boot.
+In order to avoid multiple copies, this patch adds separate flag for
+boot info set done indication.
+
+Change-Id: Iaeb7d947b2eb7d34b6c621210c3a81232cbe481f
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 1775c74..55dc085 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -22,6 +22,7 @@
+ 	.recovery_flag = 0,
+ 	.validation_pass = 0,
+ 	.fuse_emulation_done = 0,
++	.boot_info_set_done = 0,
+ 	.efuse_read = 0,
+ 	.curr_img = 0,
+ 	.die_id = 0,
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 920efce..c640601 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -413,6 +413,7 @@
+ 	arcboot_rom_global.validation_pass = cold_rst_data.validation_flag;
+ 	arcboot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
+ 	arcboot_rom_global.fuse_emulation_done = cold_rst_data.fuse_emulation_done;
++	arcboot_rom_global.boot_info_set_done = cold_rst_data.boot_info_set_done;
+ }
+ 
+ static void arcboot_rom_persist_data_non_zero_init(void)
+@@ -1164,11 +1165,12 @@
+ 	struct hl_fw_boot_ptrs_ctx *p_loc_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI];
+ 	struct hl_fw_boot_ptrs *p_loc_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
+ 	uint32_t *p_offset = (uint32_t *)(p_loc_img_ptr_ctx->dest_addr_arc + p_loc_boot_ptr->offset2array);
++	struct gaudi3_cold_rst_data cold_rst_data;
+ 
+ 	if (arcboot_rom_efuse_boot_info_skip())
+ 		return;
+ 
+-	if (!arcboot_rom_global.validation_pass) {
++	if (!arcboot_rom_global.boot_info_set_done) {
+ 		if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &p_loc_img_ptr_ctx->desc_info,
+ 		   sizeof(struct hl_fw_desc_info)))
+ 			return;
+@@ -1183,6 +1185,10 @@
+ 			return;
+ 
+ 		boot_info_finalize_no_merge();
++
++		cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
++		cold_rst_data.boot_info_set_done = 1;
++		regmap_writel(cold_rst_data.data, mmCOLD_RST_FLOPS_2);
+ 	}
+ }
+ 
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 8a8c358..6d29682 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -94,6 +94,7 @@
+ 	uint8_t recovery_flag;
+ 	uint8_t validation_pass;
+ 	uint8_t fuse_emulation_done;
++	uint8_t boot_info_set_done;
+ 	uint8_t efuse_read;
+ 	uint8_t curr_img;
+ 	uint8_t die_id;

@@ -1,0 +1,192 @@
+From 9e5f23d6899cbb09c6beaf797b574358c38068f7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 05 Jun 2022 18:28:51 +0300
+Subject: [PATCH] Revert "[SW-77251] common: add const and bitops header"
+
+Revert rom recovery implementation for secured firmware update via
+inband and OOB.
+
+This reverts commit c705100134cdcaaa5cd38050668a556bba611a6a.
+
+Change-Id: I163c6aa7c645c9ced78ce445e3ea861da3a4d575
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 9d1ed5f..35c4e5e 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -5,7 +5,6 @@
+  */
+ 
+ #include <arcboot.h>
+-#include <bitops.h>
+ #include <string.h>
+ #include <delay.h>
+ #include <gaudi3_fw_if.h>
+diff --git a/include/arcboot.h b/include/arcboot.h
+index a7d952c..6156f9d 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -35,6 +35,8 @@
+ #define ROUND_UP4(n)			(((n) + sizeof(uint32_t) - 1) & ~(sizeof(uint32_t) - 1))
+ #define BIT(nr)					(1 << (nr))
+ #define ARRAY_SIZE(x)				(sizeof(x) / sizeof((x)[0]))
++/* extracts "n" number of bits from position "p" in the given number "v" */
++#define EXTRACT_BITS(v, p, n)	(((v) & (((1 << (n)) - 1) << (p))) >> (p))
+ 
+ #define HL_FLASH_BASE				(HL_GEN_MEM_BASE + \
+ 						 HL_FLASH_OFFSET)
+diff --git a/include/bitops.h b/include/bitops.h
+deleted file mode 100644
+index bbce67d..0000000
+--- a/include/bitops.h
++++ /dev/null
+@@ -1,108 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2022 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _BITOPS_H_
+-#define _BITOPS_H_
+-
+-#include <const.h>
+-
+-#define BITS_PER_LONG_LONG	64
+-
+-#define BITS_PER_LONG		32
+-
+-#define BIT(nr)		(1 << (nr))
+-#define BIT_ULL(nr)	(1ULL << (nr))
+-#define BIT_WORD(nr)	((nr) / BITS_PER_LONG)
+-
+-/* extracts "n" number of bits from position "p" in the given number "v" */
+-#define EXTRACT_BITS(v, p, n) (((v) & (((1 << (n)) - 1) << (p))) >> (p))
+-
+-#define GENMASK(h, l)                      \
+-	(((~UL(0)) - (UL(1) << (l)) + 1) & \
+-	 (~UL(0) >> (BITS_PER_LONG - 1 - (h))))
+-
+-#define GENMASK_ULL(h, l)                    \
+-	(((~ULL(0)) - (ULL(1) << (l)) + 1) & \
+-	 (~ULL(0) >> (BITS_PER_LONG_LONG - 1 - (h))))
+-
+-#ifndef __ASSEMBLY__
+-
+-/**
+- * import test_bit from linux kernel bitops.h
+- * for arc from linux/arch/arc/include/asm/bitops.h
+- * for arm from linux/include/asm-generic/bitops/non-atomic.h
+- *
+- * these function allow to test bit from base long register address.
+- * e.g: bit 250 can be tested relative to a long register address space.
+- */
+-
+-/**
+- * test_bit - Determine whether a bit is set
+- * @nr: bit number to test
+- * @addr: Address to start counting from
+- */
+-static inline int test_bit(unsigned int nr, const unsigned long *addr)
+-{
+-	unsigned long mask;
+-
+-	addr += nr >> 5;
+-
+-	mask = 1UL << (nr & 0x1f);
+-
+-	return ((mask & *addr) != 0);
+-}
+-
+-/**
+- * __ffs - find first bit in word.
+- * @word: The word to search
+- *
+- * Undefined if no bit exists, so code should check against 0 first.
+- */
+-static inline int __ffs32(unsigned int word)
+-{
+-	int num = 0;
+-
+-	if ((word & 0xffff) == 0) {
+-		num += 16;
+-		word >>= 16;
+-	}
+-	if ((word & 0xff) == 0) {
+-		num += 8;
+-		word >>= 8;
+-	}
+-	if ((word & 0xf) == 0) {
+-		num += 4;
+-		word >>= 4;
+-	}
+-	if ((word & 0x3) == 0) {
+-		num += 2;
+-		word >>= 2;
+-	}
+-	if ((word & 0x1) == 0)
+-		num += 1;
+-	return num;
+-}
+-
+-/**
+- * FIELD_PREP() - prepare a bitfield element
+- * @_mask: shifted mask defining the field's length and position
+- * @_val:  value to put in the field
+- *
+- * FIELD_PREP() masks and shifts up the value.  The result should
+- * be combined with other fields of the bitfield using logical OR.
+- */
+-#define FIELD_PREP(_mask, _val)						  \
+-	(								  \
+-	    {								  \
+-		    ((typeof(_mask))(_val) << __ffs32(_mask)) & (_mask);  \
+-	    }								  \
+-	)
+-
+-
+-#endif /* __ASSEMBLY__ */
+-
+-#endif /* _BITOPS_H_ */
+diff --git a/include/const.h b/include/const.h
+deleted file mode 100644
+index 5253d5f..0000000
+--- a/include/const.h
++++ /dev/null
+@@ -1,34 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+-#ifndef _LINUX_CONST_H
+-#define _LINUX_CONST_H
+-
+-/* const.h: Macros for dealing with constants.  */
+-
+-/* Some constant macros are used in both assembler and
+- * C code.  Therefore we cannot annotate them always with
+- * 'UL' and other type specifiers unilaterally.  We
+- * use the following macros to deal with this.
+- *
+- * Similarly, _AT() will cast an expression with a type in C, but
+- * leave it unchanged in asm.
+- */
+-
+-#ifdef __ASSEMBLY__
+-#define _AC(X, Y)	X
+-#define _AT(T, X)	X
+-#else
+-#define __AC(X, Y)	(X##Y)
+-#define _AC(X, Y)	__AC(X, Y)
+-#define _AT(T, X)	((T)(X))
+-#endif
+-
+-#define _UL(x)		(_AC(x, UL))
+-#define _ULL(x)		(_AC(x, ULL))
+-
+-#define _BITUL(x)	(_UL(1) << (x))
+-#define _BITULL(x)	(_ULL(1) << (x))
+-
+-#define UL(x)		(_UL(x))
+-#define ULL(x)		(_ULL(x))
+-
+-#endif /* _LINUX_CONST_H */

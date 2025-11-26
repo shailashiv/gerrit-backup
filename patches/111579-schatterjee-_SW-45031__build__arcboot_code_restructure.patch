@@ -1,0 +1,6205 @@
+From 44732f7572ba350739a5fb507edf1d4df5d6907b Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Thu, 15 Jul 2021 13:02:04 +0300
+Subject: [PATCH] [SW-45031] build: arcboot code restructure
+
+In order to avoid continouing 'xxx_arc_gnu' options
+(e.g. gaudi2_arc_gnu-asic-build), following build commands
+are being changed for GRECO and GAUDI2.
+
+GRECO:
+---------
+greco_arm -> greco_arm (No change)
+greco_arc_gnu -> greco_arc
+greco_arc -> greco_arc_elf32
+greco-asic-build (builds everything) (No change)
+
+GAUDI2:
+-----------
+gaudi2_arm -> gaudi2_arm (No change)
+gaudi2_arc_gnu -> gaudi2_arc
+gaudi2-asic-build (builds everything) (No change)
+
+In this context arcboot arch specific code is aligned accordingly.
+This is in line with preboot new dir structure (see https://gerrit.habana-labs.com/#/c/111013/).
+
+Following is the proposed new dir strcture,
+├── app
+├── arch
+│   ├── gaudi2
+│   │   └── arc
+│   └── greco
+│       └── arc_elf32
+├── common
+│   └── rsa
+├── include
+└── sdk
+    ├── elpsoft
+    │   └── src
+    ├── sbtool
+    └── src
+        └── include
+
+Change-Id: I8e6730ed347d3ed51c391f4dc3cacee3daeae05a
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 83a19e9..a364a24 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,8 @@
+ CC = $(CROSS_COMPILE)gcc
+ AR = $(CROSS_COMPILE)ar
+ RANLIB = $(CROSS_COMPILE)ranlib
++HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
++HL_DEV_ARCH := arch/$(shell echo $(HL_DEV) | cut -d'_' -f1)/$(HL_DEV_SUBTYPE)
+ ifneq ($(CROSS_COMPILE),)
+ 	export LTO_PLUGIN := --plugin $(shell find $(abspath ../../) -name liblto_plugin.so)
+ 	RANLIB += $(LTO_PLUGIN)
+@@ -16,7 +18,7 @@
+ ARCBOOT_CFLAGS += -Iinclude
+ ARCBOOT_CFLAGS += -Icommon
+ ARCBOOT_CFLAGS += -Icommon/rsa
+-ARCBOOT_CFLAGS += -I$(HL_DEV)
++ARCBOOT_CFLAGS += -I$(HL_DEV_ARCH)
+ ARCBOOT_CFLAGS += -Isdk/src
+ ARCBOOT_CFLAGS += -Isdk/src/include
+ ARCBOOT_CFLAGS += -Isdk/elpsoft/src/headers
+@@ -34,8 +36,8 @@
+ 
+ ifneq ($(CROSS_COMPILE),)
+ LDFLAGS = -flto
+-LDFLAGS += -L $(LIBDIR) -lsb -lellipsys -L $(HL_DEV)
+-LDFLAGS += -T $(HL_DEV)/$(HL_TARGET)_$@.lds
++LDFLAGS += -L $(LIBDIR) -lsb -lellipsys -L $(HL_DEV_ARCH)
++LDFLAGS += -T $(HL_DEV_ARCH)/$(HL_TARGET)_$@.lds
+ LDFLAGS += -nostartfiles
+ LDFLAGS += -Wl,-e__start
+ 
+@@ -44,12 +46,12 @@
+ CFLAGS = -DELP_ARCV2
+ export CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+-include $(HL_DEV)/Makefile
++include $(HL_DEV_ARCH)/Makefile
+ 
+-ARCBOOT_COMMON_SRCS_C := $(shell ls common/*.c common/rsa/*.c $(HL_DEV)/$(HL_TARGET).c)
+-ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV)/security.c)
+-ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+-ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV)/secureboot.c)
++ARCBOOT_COMMON_SRCS_C := $(shell ls common/*.c common/rsa/*.c $(HL_DEV_ARCH)/$(HL_TARGET).c)
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/secureboot.c)
+ 
+ 
+ ARCBOOT_RAM_SRCS_C := app/arcboot_ram.c
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+new file mode 100644
+index 0000000..1c6d192
+--- /dev/null
++++ b/arch/gaudi2/arc/Makefile
+@@ -0,0 +1 @@
++LDFLAGS += -static
+diff --git a/arch/gaudi2/arc/arcboot_ram.lds b/arch/gaudi2/arc/arcboot_ram.lds
+new file mode 100644
+index 0000000..056dca1
+--- /dev/null
++++ b/arch/gaudi2/arc/arcboot_ram.lds
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 128K
++	SRAM	: ORIGIN = 0x11000000, LENGTH = 48M
++	STM	: ORIGIN = 0x24000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x26000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x27FC0000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x27FD0000, LENGTH = 64K
++	CS	: ORIGIN = 0x2C000000, LENGTH = 32M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 32K
++}
++
++REGION_ALIAS("REGION_TEXT",	ICCM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	.text : {
++		app/crt0_ram.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+diff --git a/arch/gaudi2/arc/arcboot_rom.lds b/arch/gaudi2/arc/arcboot_rom.lds
+new file mode 100644
+index 0000000..55904dd
+--- /dev/null
++++ b/arch/gaudi2/arc/arcboot_rom.lds
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 128K
++	SRAM	: ORIGIN = 0x11000000, LENGTH = 48M
++	STM	: ORIGIN = 0x24000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x26000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x27FC0000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x27FD0000, LENGTH = 64K
++	CS	: ORIGIN = 0x2C000000, LENGTH = 32M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 32K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		app/crt0_rom.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 5k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 8k)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+new file mode 100644
+index 0000000..7b6e440
+--- /dev/null
++++ b/arch/gaudi2/arc/asic.c
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
+diff --git a/arch/gaudi2/arc/asic_arcboot_ram.lds b/arch/gaudi2/arc/asic_arcboot_ram.lds
+new file mode 100644
+index 0000000..827fe1f
+--- /dev/null
++++ b/arch/gaudi2/arc/asic_arcboot_ram.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_ram.lds
+diff --git a/arch/gaudi2/arc/asic_arcboot_rom.lds b/arch/gaudi2/arc/asic_arcboot_rom.lds
+new file mode 100644
+index 0000000..9e1e858
+--- /dev/null
++++ b/arch/gaudi2/arc/asic_arcboot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_rom.lds
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+new file mode 100644
+index 0000000..6a6e784
+--- /dev/null
++++ b/arch/gaudi2/arc/common.c
+@@ -0,0 +1,504 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <unistd.h>
++#include <efuse.h>
++#include <pcie.h>
++#include <arcboot.h>
++#include <psoc_efuse_regs.h>
++#include <psoc_global_conf_masks.h>
++#include <psoc_reset_conf_masks.h>
++#include <psoc_reset_conf_regs.h>
++#include <sha512.h>
++#include <string.h>
++#include "dma.h"
++#include "spi_flash.h"
++#include "boot_desc.h"
++
++#define ARCBOOT_STATUS_REG_SZ_BITS	32
++#define LOW_DWORD(x)			(x & 0xFFFFFFFF)
++#define ICCM_OFFS_MASK			0x1FFFF
++#define SP_SRAM_OFFS_MASK		0xFFFF
++#define SRAM_PHYS_OFFS_MASK		0x2FFFFFF
++
++#define IATU_REGION_CTRL_1_OFF_INBOUND_OFF	0x100
++#define IATU_REGION_CTRL_2_OFF_INBOUND_OFF	0x104
++#define IATU_LWR_TARGET_ADDR_OFF_INBOUND_OFF	0x114
++#define IATU_UPPER_TARGET_ADDR_OFF_INBOUND_OFF	0x118
++
++#define IATU_LOWER_TARGET_ADDR			0xF0000000
++#define IATU_HIGHER_TARGET_ADDR			0x1000007F
++#define IATU_INBOUND_LOW_OFFSET_ADDR		0x0
++#define IATU_INBOUND_HI_OFFSET_ADDR		0xC0080000
++#define DBI_ENABLE				0x300000
++
++void arcboot_rom_status_update(enum arcboot_rom_progress progress)
++{
++	uint32_t reg, offset;
++
++	offset = progress / ARCBOOT_STATUS_REG_SZ_BITS;
++	progress = progress % ARCBOOT_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl((mmPSOC_SECURITY_SW_STATUS_0 + offset * 4));
++	reg |= BIT(progress);
++	regmap_writel(reg, (mmPSOC_SECURITY_SW_STATUS_0 + offset  * 4));
++}
++
++uint32_t get_efuse_read_reg(void)
++{
++	return mmPSOC_EFUSE_READ_CTRL;
++}
++
++uint32_t get_mem_cfg_mask(void)
++{
++	return PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK;
++}
++
++uint32_t get_fld_size_shift(void)
++{
++	return PSOC_GLOBAL_CONF_SPI_DMA_CTRL_MEM_SIZE_SHIFT;
++}
++
++void update_warm_reset_config(void)
++{
++	regmap_writel(PSOC_RESET_CONF_PSOC_PRSTN_RST_CFG_EN_MASK,
++			mmPSOC_RESET_CONF_PSOC_PRSTN_RST_CFG);
++	regmap_writel(PSOC_RESET_CONF_ARC_PRSTN_RST_CFG_EN_MASK,
++			mmPSOC_RESET_CONF_ARC_PRSTN_RST_CFG);
++}
++
++uint8_t get_sris_mode_from_strap()
++{
++	uint32_t boot_strap;
++
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H);
++
++	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H_SRIS_MODE_MASK);
++}
++
++void enable_flr_handling_fsm(void)
++{
++	/* No HW FSM bits in Gaudi2, No need to set anything */
++}
++
++static int verify_sha(uint32_t data_size, unsigned char *ptr_to_data,
++		      unsigned char *ptr_to_sha)
++{
++	unsigned char actual_hash[SHA384_SUM_LEN];
++
++	sha384_csum(ptr_to_data, data_size, actual_hash, 0);
++
++	return memcmp(ptr_to_sha, actual_hash, SHA384_SUM_LEN);
++}
++
++static int check_boundary(uint64_t addr, uint32_t size, uint64_t endaddr)
++{
++	return ((addr + size) <= endaddr) ? 0 : 1;
++}
++
++/*
++ * check_load_addr_valid updates 'addr' with the 32bit ARC
++ * view point address used to jump to the code and execute.
++ * If address is valid and within bounds 0 is returned,
++ * else returns 1.
++ */
++static int check_load_addr_valid(struct boot_desc *p_desc, uint32_t *addr)
++{
++	uint32_t addr_low = LOW_DWORD(p_desc->loadaddr);
++	int ret;
++
++	switch (p_desc->loadaddr) {
++	case HL_ICCM_BASE ... HL_ICCM_END:
++		ret = check_boundary(p_desc->loadaddr, p_desc->img_size,
++				HL_ICCM_END);
++		*addr = addr_low & ICCM_OFFS_MASK;
++		break;
++	case HL_SP_SRAM_BASE ... HL_SP_SRAM_END:
++		ret = check_boundary(p_desc->loadaddr, p_desc->img_size,
++				HL_SP_SRAM_END);
++		*addr = HL_SCRATCHPAD_SRAM_BASE +
++			(addr_low & SP_SRAM_OFFS_MASK);
++		/*
++		 * Note that the offset of SP SRAM to be provided to perform
++		 * DMA must be in granuality of 4B. ie.
++		 * (right shift offset 0x1000 by 2).
++		 */
++		p_desc->loadaddr = (HL_SP_SRAM_BASE +
++				((addr_low & SP_SRAM_OFFS_MASK) >> 2));
++		break;
++	case HL_SRAM_PHY_BASE ... HL_SRAM_PHY_END:
++		ret = check_boundary(p_desc->loadaddr, p_desc->img_size,
++				HL_SRAM_PHY_END);
++		*addr = HL_SRAM_LOG_BASE +
++			(addr_low & SRAM_PHYS_OFFS_MASK);
++		break;
++	default:
++		ret = 1;
++		break;
++	}
++	return ret;
++}
++
++static int img_desc_precheck(struct boot_desc *p_desc, uint32_t *addr)
++{
++	if (p_desc->img_size == 0)
++		goto img_desc_invalid;
++
++	/*
++	 * prevent rogue accesses by checking for-
++	 * 1. flash offset should be <= Max possible offset
++	 * 2. requested size is also less than Max allowed size
++	 */
++	if ((p_desc->spi_offset >=
++		(FLASH_VALID_OFFSET + FLASH_VALID_MAX_SIZE)) ||
++		(p_desc->img_size >= FLASH_VALID_MAX_SIZE))
++		goto img_desc_invalid;
++
++	if (p_desc->spi_offset + p_desc->img_size >=
++			(FLASH_VALID_OFFSET + FLASH_VALID_MAX_SIZE))
++		goto img_desc_invalid;
++
++	if (check_load_addr_valid(p_desc, addr))
++		goto img_desc_invalid;
++
++	return 0;
++
++img_desc_invalid:
++	return 1;
++}
++
++static void ext_rom_load_erom_pcie(void)
++{
++	int err;
++	uint32_t idx;
++	struct boot_desc desc;
++	uint32_t load_addr_logical; /* 32 bit ARC view point address */
++	void (*erom_pcie_func)();
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE);
++
++	idx = boot_desc_get_img_desc(HL_FW_EROM_PCIE, &desc);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return;
++
++	err = img_desc_precheck(&desc, &load_addr_logical);
++	if (err)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_DMA_START);
++
++	dma_copy_image(desc.img_size, desc.spi_offset,
++		       desc.loadaddr, SPI_DMA_DST_HBW);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH);
++
++	/* Verify SHA excluding the CRC byte */
++	err = verify_sha(desc.img_size - HL_CRC32_FOOTER,
++			(unsigned char *)(load_addr_logical),
++			desc.chksum);
++
++	if (!err) {
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_START);
++		erom_pcie_func = (void *)(load_addr_logical);
++		erom_pcie_func();
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_FINISH);
++	}
++}
++
++static void ext_rom_load_erom_recovery(void)
++{
++	int err;
++	uint32_t idx;
++	struct boot_desc desc;
++	uint32_t load_addr_logical; /* 32 bit ARC view point address */
++	void (*erom_recov_func)();
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY);
++
++	idx = boot_desc_get_img_desc(HL_FW_EROM_RECOVERY, &desc);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return;
++
++	err = img_desc_precheck(&desc, &load_addr_logical);
++	if (err)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START);
++
++	dma_copy_image(desc.img_size, desc.spi_offset,
++		       desc.loadaddr, SPI_DMA_DST_HBW);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH);
++
++	/* Verify SHA excluding the CRC byte */
++	err = verify_sha(desc.img_size - HL_CRC32_FOOTER,
++			(unsigned char *)(load_addr_logical),
++			desc.chksum);
++
++	if (!err) {
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY_START);
++		erom_recov_func = (void *)(load_addr_logical);
++		erom_recov_func();
++		arcboot_rom_status_update(
++				PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH);
++	}
++}
++
++static void ext_rom_load_erom_tpm(void)
++{
++	int err = 0;
++	uint32_t idx = 0;
++	struct boot_desc desc;
++	uint32_t load_addr_logical; /* 32 bit ARC view point address */
++	void (*erom_tpm_func)();
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM);
++
++	idx = boot_desc_get_img_desc(HL_FW_EROM_TPM, &desc);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return;
++
++	err = img_desc_precheck(&desc, &load_addr_logical);
++	if (err)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_DMA_START);
++
++	dma_copy_image(desc.img_size, desc.spi_offset,
++		       desc.loadaddr, SPI_DMA_DST_HBW);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH);
++
++	/* Verify SHA excluding the CRC byte */
++	err = verify_sha(desc.img_size - HL_CRC32_FOOTER,
++			(unsigned char *)(load_addr_logical),
++			desc.chksum);
++
++	if (!err) {
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_START);
++		erom_tpm_func = (void *)(load_addr_logical);
++		erom_tpm_func();
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_FINISH);
++	}
++}
++
++void execute_pcie_recovery(void)
++{
++	/*
++	 * efuse[14:13]:
++	 * 00: ROM
++	 * 01: eROM
++	 * 10: Reserved
++	 * 11: ROM
++	 */
++	uint8_t pcie_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_RECOVERY_CODE_LOCATION) &
++			EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_MASK);
++
++	if (pcie_location != EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_EROM) {
++		/* In all other scenarios, execute from ROM (most secure) */
++		pcie_recovery();
++		return;
++	}
++
++	if (!arcboot_rom_global.erom_boot_desc_flag)
++		if (!boot_desc_init()) {
++			arcboot_rom_status_update(
++					PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR);
++			return;
++		}
++
++	/* else load PCIE binary from eROM to establish the link */
++	ext_rom_load_erom_pcie();
++
++	/* Further, load the recovery bin from eROM */
++	ext_rom_load_erom_recovery();
++
++	/*
++	 * if we reach here, because of SHA/CRC error in execution of
++	 * eROM recovery, stay here, and don't return
++	 */
++	while (1)
++		;
++}
++
++void arcboot_rom_handle_tpm(void)
++{
++	/* check fuse bit to call the erom function*/
++	if ((arcboot_rom_global.config_fuse &
++	   EFUSE_SYSCFG_ENABLE_TPM_MASK) != 0) {
++		if (!arcboot_rom_global.erom_boot_desc_flag)
++			if (!boot_desc_init()) {
++				arcboot_rom_status_update(
++					PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR);
++				return;
++			}
++
++		ext_rom_load_erom_tpm();
++	}
++}
++
++void arcboot_rom_set_spi_write_limit(void)
++{
++	/* limit flash write to just 2MB */
++	regmap_writel(write_en_2MB, mmPSOC_SECURITY_SPI_WRITE_LIMIT);
++}
++
++void pcie_config_iatu(void)
++{
++	uint32_t pci_dbi_base = (mmPCIE_DBI_BASE & 0x7FFFFFF);
++
++	regmap_writel(DBI_ENABLE, mmPCIE_AUX_DBI);
++	regmap_writel(IATU_LOWER_TARGET_ADDR,
++		(pci_dbi_base + IATU_LWR_TARGET_ADDR_OFF_INBOUND_OFF));
++	regmap_writel(IATU_HIGHER_TARGET_ADDR,
++		(pci_dbi_base + IATU_UPPER_TARGET_ADDR_OFF_INBOUND_OFF));
++	regmap_writel(IATU_INBOUND_LOW_OFFSET_ADDR,
++		(pci_dbi_base + IATU_REGION_CTRL_1_OFF_INBOUND_OFF));
++	regmap_writel(IATU_INBOUND_HI_OFFSET_ADDR,
++		(pci_dbi_base + IATU_REGION_CTRL_2_OFF_INBOUND_OFF));
++}
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
++}
++
++void pcie_wait_for_sram_init_done(void)
++{
++	uint8_t sram_init_done = 0;
++
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3);
++	} while (sram_init_done != 1);
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmPCIE_PHY_PHY_SRAM_EXT_LD_DONE);
++}
++
++void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
++
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLB_SSC_EN_3, 0x1);
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLA_SSC_EN_3, 0x1);
++}
++
++void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
++{
++	uint32_t reg;
++
++	if (separate_reference) {
++		reg = 0xA0;
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = 0x50;
++		regmap_writel(0x00530053,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x01C301C3,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++}
++
++void pcie_phy_set_ext_tx_rx_ctrl(void) {}
++void pcie_phy_set_protocol0_ext_tx_rx(void) {}
++
++#define DUMP_SEL_SRNS_MASK	0x1
++#define DUMP_SEL_SSC_MASK	0x2
++
++uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
++{
++	uint32_t dump_sel = (boot_strap &
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
++
++	/* dumpsel[0] is SRNS */
++	return (dump_sel & DUMP_SEL_SRNS_MASK);
++}
++
++uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
++{
++	uint32_t dump_sel = (boot_strap &
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
++
++	/* dumpsel[1] is SSC EN */
++	return !!(dump_sel & DUMP_SEL_SSC_MASK);
++}
++
++/*
++ * Request CPLD to start the watchdog, by asserting
++ * a GPIO.
++ */
++#define GAUDI2_CPLD_WDOG_GPIO_INDEX	62
++void arcboot_rom_request_cpld_wdog(void)
++{
++	uint32_t index = GAUDI2_CPLD_WDOG_GPIO_INDEX % 16;
++	uint32_t val, mask = BIT(index);
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(mmPSOC_GPIO3_OUTENSET);
++	val = val | mask;
++	regmap_writel(val, mmPSOC_GPIO3_OUTENSET);
++
++	/* gpio is active low */
++	val = regmap_readl(mmPSOC_GPIO3_DATAOUT);
++	val &= ~mask;
++	regmap_writel(val, mmPSOC_GPIO3_DATAOUT);
++}
++
++void arcboot_rom_clear_sw_status(void)
++{
++	/* As per Architecture recommendation, clear status reg */
++	regmap_writel(0, mmPSOC_SECURITY_STATUS);
++
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_0);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_1);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_2);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_3);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_4);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_5);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_6);
++	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_7);
++}
+diff --git a/arch/gaudi2/arc/dev_efuse.h b/arch/gaudi2/arc/dev_efuse.h
+new file mode 100644
+index 0000000..57550a9
+--- /dev/null
++++ b/arch/gaudi2/arc/dev_efuse.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#define EFUSE_KEY_HASH_OFFSET				0x14
++
++/*
++ * 00: ROM, 01: EROM, 10: RSVD, 11:ROM
++ */
++#define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION		13
++#define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_MASK	0x3
++#define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_EROM	0x1
++
++#define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(11)
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION		7
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK		0x3
++#define EFUSE_SYSCFG_KEY_LOCATION			5
++#define EFUSE_SYSCFG_KEY_LOCATION_MASK			0x3
++#define EFUSE_SYSCFG_REVOKATION_LOCATION		7
++#define EFUSE_SYSCFG_REVOKATION_LOCATION_MASK		0x3
++
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI		BIT(8)
++#define EFUSE_SYSCFG_REVOKATION_LOCATION_SPI		BIT(8)
++
++/*
++ * As per recommendation from Security Architect, if FUSE is not available,
++ * card should not continue in the secure boot mode. Hence the default
++ * can be 0 (with no enabling of the Signature of Validation also.
++ */
++#define EFUSE_SYSCFG_DEFAULT				0
+diff --git a/arch/gaudi2/arc/dev_security.h b/arch/gaudi2/arc/dev_security.h
+new file mode 100644
+index 0000000..9247604
+--- /dev/null
++++ b/arch/gaudi2/arc/dev_security.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _GAUDI2_DEV_SECURITY_H_
++#define _GAUDI2_DEV_SECURITY_H_
++
++#include <sha512.h>
++
++#define NUM_KEYS_IN_ROM					5
++#define NUM_KEYS_IN_EFUSE				3
++#define SECURITY_DWORD_PER_KEY				12
++#define SECURITY_KEY_HASH_COUNT				3
++#define NUM_DWORDS_AVLBL_IN_PSOC_SEC			8
++
++enum security_key_location {
++	KEY_LOCATION_ROM,
++	KEY_LOCATION_EFUSE
++};
++
++/* size of key properties in bytes */
++#define KEY_PROP_RR_SZ  				384
++#define KEY_PROP_MOD_SZ					384
++#define KEY_PROP_EXP_SZ					8
++#define KEY_PROP_INV_SZ					4
++#define KEY_PROP_NB_SZ					4
++#define KEY_PROP_HDR_SZ					8
++
++/* 384 + 384 + 8 + 4 + 4 = 784 bytes */
++#define PUB_KEY_SZ		(KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
++				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
++				KEY_PROP_NB_SZ)
++
++/* 784 + 8 = 792 */
++#define TOTAL_PUB_KEY_PROPS_SZ  (PUB_KEY_SZ + KEY_PROP_HDR_SZ)
++
++extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
++
++#endif /* _GAUDI2_DEV_SECURITY_H_ */
+diff --git a/arch/gaudi2/arc/onix.c b/arch/gaudi2/arc/onix.c
+new file mode 100644
+index 0000000..1d90e3c
+--- /dev/null
++++ b/arch/gaudi2/arc/onix.c
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <unistd.h>
++#include "arcboot.h"
++#include "efuse.h"
++#include <common.h>
++#include <psoc_global_conf_masks.h>
++
++#define EFUSE_SYSCFG_ONIX_DEFAULT \
++				(EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
++				 EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL)
++
++int fuse_read(uint32_t word, uint32_t *val)
++{
++	int ret = -1;
++
++	if (word == EFUSE_SYSCFG_OFFSET) {
++		*val = EFUSE_SYSCFG_ONIX_DEFAULT;
++		ret = 0;
++	}
++
++	return ret;
++}
+diff --git a/arch/gaudi2/arc/onix_arcboot_ram.lds b/arch/gaudi2/arc/onix_arcboot_ram.lds
+new file mode 100644
+index 0000000..827fe1f
+--- /dev/null
++++ b/arch/gaudi2/arc/onix_arcboot_ram.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_ram.lds
+diff --git a/arch/gaudi2/arc/onix_arcboot_rom.lds b/arch/gaudi2/arc/onix_arcboot_rom.lds
+new file mode 100644
+index 0000000..1a9a352
+--- /dev/null
++++ b/arch/gaudi2/arc/onix_arcboot_rom.lds
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++INCLUDE arcboot_rom.lds
++
++/* This is SRAM address, used for Onix targets */
++MEMORY
++{
++	SBROM	: ORIGIN = 0x11000000, LENGTH = 64K
++}
+diff --git a/arch/gaudi2/arc/pldm.c b/arch/gaudi2/arc/pldm.c
+new file mode 100644
+index 0000000..7b6e440
+--- /dev/null
++++ b/arch/gaudi2/arc/pldm.c
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
+diff --git a/arch/gaudi2/arc/pldm_arcboot_ram.lds b/arch/gaudi2/arc/pldm_arcboot_ram.lds
+new file mode 100644
+index 0000000..827fe1f
+--- /dev/null
++++ b/arch/gaudi2/arc/pldm_arcboot_ram.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_ram.lds
+diff --git a/arch/gaudi2/arc/pldm_arcboot_rom.lds b/arch/gaudi2/arc/pldm_arcboot_rom.lds
+new file mode 100644
+index 0000000..9e1e858
+--- /dev/null
++++ b/arch/gaudi2/arc/pldm_arcboot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_rom.lds
+diff --git a/arch/gaudi2/arc/secureboot.c b/arch/gaudi2/arc/secureboot.c
+new file mode 100644
+index 0000000..009c1cb
+--- /dev/null
++++ b/arch/gaudi2/arc/secureboot.c
+@@ -0,0 +1,227 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <string.h>
++#include <arcboot.h>
++#include <efuse.h>
++#include <secureboot.h>
++#include <security.h>
++#include <dev_security.h>
++#include <rsa.h>
++#include <sha512.h>
++
++/*
++ * This key hash is calculated on the Public Key Properties -
++ *   -----------------------------------------------
++ * | R ^ 2 | modulus | exponent | inverse | num bits |
++ *   -----------------------------------------------
++ * Since the key props are directly given to the ROM, there is
++ * no need to explicitly include the Public key, which is
++ * usually the modulus.
++ */
++const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN] = {
++	/* Habana Public Key */
++	{
++		0x08, 0x51, 0xe7, 0x07, 0xc1, 0x0a, 0xc8, 0x45,
++		0x51, 0x61, 0xb4, 0xdf, 0xb6, 0xd6, 0x89, 0xbc,
++		0x57, 0xbb, 0xf9, 0xe2, 0x50, 0x4f, 0x44, 0x1f,
++		0x12, 0x4a, 0x73, 0x3d, 0xbb, 0xda, 0x63, 0xf2,
++		0x76, 0x53, 0x6c, 0x12, 0xa1, 0x13, 0x37, 0x30,
++		0x03, 0xee, 0x79, 0xce, 0x20, 0xa3, 0x32, 0x33
++	},
++	/* Additional Keys*/
++	/* Production Key 1 */
++	{
++		0x47, 0x9b, 0x51, 0x5d, 0xf9, 0x8b, 0xfd, 0x3d,
++		0x38, 0x3f, 0x19, 0x51, 0x40, 0x62, 0xcb, 0x15,
++		0x2d, 0xae, 0x11, 0xe8, 0x1a, 0x91, 0x3e, 0x02,
++		0xa0, 0x80, 0x08, 0x9a, 0x62, 0x93, 0xb7, 0x65,
++		0x73, 0xe1, 0x6f, 0x86, 0x32, 0x16, 0xea, 0x37,
++		0x48, 0x19, 0xb8, 0xe0, 0xc3, 0x3b, 0x5a, 0xcf
++	},
++	/* Production Key 2 */
++	{
++		0x48, 0x3c, 0x50, 0xfc, 0xf1, 0x3a, 0x56, 0x7a,
++		0x7b, 0x7c, 0xcc, 0x77, 0x66, 0xb3, 0x85, 0x1b,
++		0x6f, 0x43, 0x60, 0xce, 0x16, 0x9a, 0xc4, 0x14,
++		0xd5, 0xcb, 0x11, 0x09, 0x66, 0xc0, 0xfe, 0x42,
++		0xfe, 0x78, 0x79, 0x57, 0xdb, 0x06, 0x5c, 0x37,
++		0x2f, 0xe2, 0x81, 0xb0, 0x00, 0x11, 0x9f, 0x8e,
++	},
++	/* Production Key 3 */
++	{
++		0x5c, 0xc8, 0xd6, 0xf3, 0x42, 0xdc, 0xa3, 0xdf,
++		0xb0, 0xa3, 0xa8, 0x73, 0x68, 0x54, 0x78, 0x5e,
++		0x8c, 0xaf, 0x09, 0x0b, 0x0d, 0x41, 0xa8, 0xa1,
++		0xd9, 0xf8, 0x31, 0xdc, 0x95, 0x0f, 0x84, 0x02,
++		0xb3, 0x2a, 0x61, 0xe4, 0x10, 0xd8, 0x39, 0xdf,
++		0x80, 0x27, 0xc1, 0x2e, 0xd5, 0xd2, 0xb2, 0xcd,
++	},
++	/* Production Key 4 */
++	{
++		0xdb, 0x8c, 0x8c, 0xe7, 0x08, 0x19, 0x6b, 0x04,
++		0x76, 0x43, 0xa7, 0xe4, 0x34, 0x2d, 0x2e, 0x8f,
++		0xf5, 0xdd, 0x20, 0xc9, 0xc7, 0x48, 0x0c, 0x4d,
++		0x80, 0x35, 0x18, 0x10, 0x8b, 0xb2, 0x04, 0xd2,
++		0x79, 0xc1, 0x6b, 0x33, 0x07, 0x99, 0x21, 0x3a,
++		0xbf, 0x77, 0xfa, 0x6b, 0x53, 0xf4, 0x27, 0x25,
++	}
++};
++
++static int security_check_key_revoke_status(uint32_t key_index)
++{
++	uint8_t max_key_index = NUM_KEYS_IN_ROM, key_revoke;
++	enum security_key_location key_location;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++	/*
++	 * Key index ranges from:
++	 * 0 - 4: if key location == ROM (0, 2, 3)
++	 * 0 - 2: if key location == eFUSE (1)
++	 * Except a value of 1 for EFUSE, rest all are
++	 * routed into ROM, since thats the secure way.
++	 */
++	/* check efuse for key location */
++	if (key_location == KEY_LOCATION_EFUSE)
++		max_key_index = NUM_KEYS_IN_EFUSE;
++
++	if (key_index >= max_key_index)
++		return -1;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++
++	/* if the key is not revoked, return 1 */
++	if ((key_revoke & BIT(key_index)) == 0)
++		return 1;
++
++	/* no valid key found */
++	return -1;
++}
++
++int security_get_key_hash(uint32_t *hash, uint8_t key_index)
++{
++	uint32_t valid_key_base, max_key_index;
++	int i;
++	enum security_key_location key_location;
++	uint32_t *ptr;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++
++	/* check efuse for key location */
++	if (key_location == KEY_LOCATION_EFUSE) {
++		max_key_index = NUM_KEYS_IN_EFUSE;
++
++		if (key_index >= max_key_index)
++			return -1;
++
++		/* read from efuse/SP SRAM */
++		valid_key_base = (key_index * SECURITY_BYTE_PER_DWORD *
++			SECURITY_DWORD_PER_KEY) + SECURITY_EFUSE_KEYS_OFFSET;
++
++		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
++			*(hash + i) = sp_sram_readl(valid_key_base + (i *
++					SECURITY_BYTE_PER_DWORD));
++	} else {
++		/*
++		 * All other cases are routed into ROM, since it is
++		 * the more secure way
++		 */
++		max_key_index = NUM_KEYS_IN_ROM;
++
++		if (key_index >= max_key_index)
++			return -1;
++
++		/* read from ROM itself */
++		ptr = (uint32_t *)rom_key_hashes[key_index];
++		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
++			*(hash + i) = ptr[i];
++	}
++
++	return 1;
++}
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++int secureboot_verify_image(uint32_t image_size,
++				uint32_t image_offset)
++{
++	int verify = 0, ret, key_index;
++	unsigned char expected_hash[SHA384_SUM_LEN];
++	unsigned char actual_hash[SHA384_SUM_LEN];
++	uint32_t config_fuse;
++	/* Public key is the total size of Public Key Props */
++	uint32_t test_public_key_len = PUB_KEY_SZ;
++	uint32_t test_sig_len = SIG_SIZE;
++	uint32_t test_data_len = image_size;
++	unsigned char *test_data = (unsigned char *)(image_offset);
++	unsigned char *test_sig = test_data + test_data_len;
++	unsigned char *ptr_key_index, *ptr_key_prop, *test_public_key;
++
++	/* check if the image size has minimum sized contents */
++	if (test_data_len <= TOTAL_PUB_KEY_PROPS_SZ)
++		return SECUREBOOT_VERIFY_VER_FAILED;
++
++	/* Key header is located as the last 2 DWORDS of the image */
++	ptr_key_index = test_sig - KEY_PROP_HDR_SZ;
++	ptr_key_prop = test_sig - TOTAL_PUB_KEY_PROPS_SZ;
++	test_public_key =  ptr_key_prop;
++
++	uint32_t fw_version = base_readl((uint32_t)test_data);
++
++	/* check efuse for security validation enable */
++	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++
++	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	/* check minimal valid security FW version */
++	if (security_check_valid_fw_version(fw_version) !=
++					SECURITY_FW_VERSION_SECURE)
++		return SECUREBOOT_VERIFY_VER_FAILED;
++
++	key_index = *(uint32_t *)ptr_key_index;
++
++	ret = security_check_key_revoke_status(key_index);
++	if (ret != 1)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	ret = security_get_key_hash((uint32_t *)expected_hash, key_index);
++	if (ret != 1)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	/* check pub key hash versus efuse */
++        sha384_csum(test_public_key, test_public_key_len, actual_hash, 0);
++
++        verify = memcmp(actual_hash, expected_hash, SHA384_SUM_LEN);
++	if (verify)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	ret = rsa_verify(test_data, test_data_len, test_public_key,
++			test_public_key_len, test_sig, test_sig_len);
++
++	/* 0 - SUCCESS, but arcboot main code, expects 1 for SUCCESS */
++	if (!ret)
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	return SECUREBOOT_VERIFY_FAILED;
++}
+diff --git a/arch/gaudi2/arc/security.c b/arch/gaudi2/arc/security.c
+new file mode 100644
+index 0000000..86584bd
+--- /dev/null
++++ b/arch/gaudi2/arc/security.c
+@@ -0,0 +1,581 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include "arcboot.h"
++#include "security.h"
++#include "efuse.h"
++#include "security.h"
++#include "spi_flash.h"
++
++#define GAUDI2_SECURITY_END_HBW_LSB		0xFFFFFFFF
++#define GAUDI2_SECURITY_END_HBW_MSB		0xFFFFF
++#define GAUDI2_SECURITY_START_HBW_LSB		0x0
++#define GAUDI2_SECURITY_START_HBW_MSB		0x0
++#define GAUDI2_DISABLE_PCIE_TRAFFIC		0x0
++#define GAUDI2_ENABLE_PCIE_TRAFFIC		0x3
++#define GAUDI2_SECURITY_LBW_MASK		0x7FFFFFF
++#define GAUDI2_SECURITY_PSOC_START_LBW		0x0
++#define GAUDI2_SECURITY_PSOC_END_LBW		0x7FFFFFF
++#define GAUDI2_SECURITY_FLASH_START_HBW		0x1000007FF6000000ULL
++#define GAUDI2_SECURITY_FLASH_END_HBW		0x1000007FF6200000ULL
++#define GAUDI2_PSOC_START_LBW			0x0
++#define GAUDI2_PSOC_END_LBW			0x7FFFFFF
++
++static void security_disable_i2c_s_mstr_if(void)
++{
++	/* override AXI prot bit by master IF to secure, unprivileged access */
++	/* ovrd_en = 1, and overd_value of 0 */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++			mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* disable pcie traffic by writing 0 */
++	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* Block Everything:
++	 * Set MIN = 0x0
++	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
++	 */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++static void security_enable_i2c_s_mstr_if(void)
++{
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0,
++		mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable pcie traffic by writing 1 */
++	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* enable access to all:
++	 * MIN = 0xFFFFFFFFFFFFF
++	 * MAX = 0
++	 */
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++static void security_enable_smi_mstr_if(void)
++{
++	/* 0: Disable access, 1: Enable Access */
++	regmap_writel(1,
++		mmPSOC_GLOBAL_CONF_SMI_ACCESS_EN);
++
++	/* enable pcie traffic by writing 1 */
++	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0,
++		mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable access to all:
++	 * MIN = 0xFFFFFFFFFFFFF
++	 * MAX = 0
++	 */
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++static void security_disable_smi_mstr_if(void)
++{
++	/* 0: Disable access, 1: Enable Access */
++	regmap_writel(0,
++		mmPSOC_GLOBAL_CONF_SMI_ACCESS_EN);
++
++	/* override AXI prot bit by master IF to secure, unprivileged access */
++	/* ovrd_en = 1, and overd_value of 0 */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* disable pcie traffic by writing 0 */
++	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* Block Everything:
++	 * Set MIN = 0x0
++	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
++	 */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++void security_disable_jtag_mstr_if(void)
++{
++
++	/* override AXI prot bit by master IF to secure, unprivileged access */
++	/* ovrd_en = 1, and overd_value of 0 */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* disable pcie traffic by writing 0 */
++	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* Block Everything:
++	 * Set MIN = 0x0
++	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
++	 */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++void security_enable_jtag_mstr_if(void)
++{
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable pcie traffic by writing 1 */
++	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* enable access to all */
++	/* MIN = 0xFFFFFFFFFFFFF
++	 * MAX = 0
++	 */
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	/* LBW is not implemented for JT, so nothing to be done there */
++}
++
++void security_disable_twi_if(void)
++{
++	security_disable_i2c_s_mstr_if();
++	security_disable_smi_mstr_if();
++}
++
++void security_enable_twi_if(void)
++{
++	security_enable_i2c_s_mstr_if();
++	security_enable_smi_mstr_if();
++}
++
++void security_jtag_dap(uint8_t status)
++{
++	regmap_writel(status, mmPSOC_CS_TRACE_SECURITY_CTRL);
++}
++
++void security_debug_if_shared(void)
++{
++	/* There is no concept of shared engine in Gaudi2 */
++}
++
++static void security_pcie_mstr_rr_hbw_config(uint8_t spi_controller_en)
++{
++	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
++	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
++
++
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		/*
++		 * No need to open any region. All access would be done
++		 * through LBW
++		 */
++	} else {
++		regmap_writel((flash_start & 0xFFFFFFFF),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((flash_start >> 32),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((flash_end & 0xFFFFFFFF),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((flash_end >> 32),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++		regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++		regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++static void security_pcie_mstr_rr_lbw_config(uint8_t spi_controller_en)
++{
++	/* get lower [26:0] to program into LBW space */
++	uint32_t psoc_security_start_lbw = (mmPSOC_SECURITY_BASE & 0x7FFFFFF);
++	uint32_t psoc_security_end_lbw =
++				(mmJT_MSTR_IF_RR_SHRD_HBW_BASE & 0x7FFFFFF);
++	uint32_t psoc_qspi_base_start_lbw = (mmPSOC_QSPI_BASE & 0x7FFFFFF);
++	uint32_t psoc_qspi_base_end_lbw = (mmPSOC_UART_0_BASE & 0x7FFFFFF);
++
++	regmap_writel(SECURITY_PSOC_START_LBW,
++		mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++
++	if (spi_controller_en) {
++		regmap_writel(psoc_qspi_base_start_lbw,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(psoc_qspi_base_end_lbw,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(psoc_security_start_lbw,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++		regmap_writel(psoc_security_end_lbw,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
++	} else {
++		regmap_writel(psoc_security_start_lbw,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(psoc_security_end_lbw,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++	}
++}
++
++void security_i2c_s_rr_hbw_config(uint8_t spi_controller_en)
++{
++	/* This can be done by eROM, since this is called,
++	 * after the Image verification is failed for PRI/SEC
++	 */
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++	uint64_t psoc_qspi_base_start = mmPSOC_QSPI_BASE >> 12;
++	uint64_t psoc_qspi_base_end = mmPSOC_UART_0_BASE >> 12;
++	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
++	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
++
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel((psoc_qspi_base_start & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((psoc_qspi_base_start >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((psoc_qspi_base_end & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((psoc_qspi_base_end >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel((flash_start & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((flash_start >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((flash_end & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((flash_end >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel((security_addr_start >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel((security_addr_end >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++void security_smi_rr_hbw_config(uint8_t spi_controller_en)
++{
++	/* This can be done by eROM, since this is called,
++	 * after the Image verification is failed for PRI/SEC
++	 */
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++	uint64_t psoc_qspi_base_start = mmPSOC_QSPI_BASE >> 12;
++	uint64_t psoc_qspi_base_end = mmPSOC_UART_0_BASE >> 12;
++	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
++	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
++
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel((psoc_qspi_base_start & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((psoc_qspi_base_start >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((psoc_qspi_base_end & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((psoc_qspi_base_end >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel((flash_start & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((flash_start >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((flash_end & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((flash_end >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel((security_addr_start >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel((security_addr_end >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++void security_jtag_rr_hbw_config(uint8_t spi_controller_en)
++{
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++	uint64_t psoc_qspi_base_start = mmPSOC_QSPI_BASE >> 12;
++	uint64_t psoc_qspi_base_end = mmPSOC_UART_0_BASE >> 12;
++	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
++	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
++
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel((psoc_qspi_base_start & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((psoc_qspi_base_start >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((psoc_qspi_base_end & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((psoc_qspi_base_end >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel((flash_start & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel((flash_start >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++		regmap_writel((flash_end & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel((flash_end >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel((security_addr_start >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel((security_addr_end >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++static void security_elbi_rr_lbw_config(uint8_t spi_controller_en)
++{
++	/* get lower [26:0] to program into LBW space */
++	uint32_t psoc_security_start_lbw = (mmPSOC_SECURITY_BASE & 0x7FFFFFF);
++	uint32_t psoc_security_end_lbw =
++				(mmJT_MSTR_IF_RR_SHRD_HBW_BASE & 0x7FFFFFF);
++	uint32_t psoc_qspi_base_start_lbw = (mmPSOC_QSPI_BASE & 0x7FFFFFF);
++	uint32_t psoc_qspi_base_end_lbw = (mmPSOC_UART_0_BASE & 0x7FFFFFF);
++
++	regmap_writel(SECURITY_PSOC_START_LBW,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++
++	if (spi_controller_en) {
++		regmap_writel(psoc_qspi_base_start_lbw,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(psoc_qspi_base_end_lbw,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(psoc_security_start_lbw,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++		regmap_writel(psoc_security_end_lbw,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
++	} else {
++		regmap_writel(psoc_security_start_lbw,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(psoc_security_end_lbw,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++	}
++}
++
++void security_pcie_rr_config(uint8_t spi_en)
++{
++	regmap_writel(PCIE_WRAP_PCIE_PROT_OVR_WR_EN_MASK |
++		      PCIE_WRAP_PCIE_PROT_OVR_RD_EN_MASK,
++		      mmPCIE_WRAP_PCIE_PROT_OVR);
++
++	/* NO Shared Initiator bits for Gaudi2, hence no need to set the mask */
++
++	security_elbi_rr_lbw_config(spi_en);
++	security_pcie_mstr_rr_hbw_config(spi_en);
++	security_pcie_mstr_rr_lbw_config(spi_en);
++}
++
++void rom_get_hash(uint32_t *key_hash)
++{
++	uint32_t *ptr = (uint32_t *)rom_key_hashes;
++	int size = NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY;
++
++	for (int i = 0; i < size; i++)
++		*(key_hash + i) = *(ptr + i);
++}
++
++static void security_store_keys_in_psoc(uint8_t max_keys, uint32_t *hash)
++{
++	/*
++	 * Just store the top 256 bits of each hash, due to the
++	 * limited space available in PSOC Security
++	 */
++	uint8_t max_dwords_stored = NUM_DWORDS_AVLBL_IN_PSOC_SEC, i, j;
++	uint32_t key_soc_location_base;
++	uint32_t key_address[] = {
++		mmPSOC_SECURITY_HABANA_KEY_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_3_0
++	};
++
++	for (i = 0; i < max_keys; i++) {
++		key_soc_location_base = key_address[i];
++		for (j = 0; j < max_dwords_stored; j++) {
++			regmap_writel(hash[(i * SECURITY_DWORD_PER_KEY) + j],
++					key_soc_location_base);
++			key_soc_location_base += sizeof(uint32_t);
++		}
++	}
++}
++
++void security_load_keys(void)
++{
++	uint8_t hash_key_index, num_dwords, max_keys = NUM_KEYS_IN_ROM;
++	uint32_t key_hash[NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY];
++	enum security_key_location key_location;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++
++	arcboot_rom_status_update(PROGRESS_KEY_LOC);
++	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
++
++	switch (key_location) {
++	case KEY_LOCATION_EFUSE:
++		max_keys = NUM_KEYS_IN_EFUSE;
++		efuse_get_hash(key_hash);
++		break;
++	case KEY_LOCATION_ROM:
++	default:
++		rom_get_hash(key_hash);
++		break;
++	}
++
++	/* store hashes in the limited space available in PSOC_SECURITY */
++	security_store_keys_in_psoc(max_keys, key_hash);
++
++	/* ROM Keys are already in ROM, no need to store them explicitly */
++	if (key_location == KEY_LOCATION_EFUSE) {
++		/* Store the efuse keys in SPSRAM */
++		num_dwords = NUM_KEYS_IN_EFUSE * SECURITY_DWORD_PER_KEY;
++		for (hash_key_index = 0; hash_key_index < num_dwords;
++						hash_key_index++)
++			sp_sram_writel(key_hash[hash_key_index],
++			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
++			       SECURITY_BYTE_PER_DWORD));
++	}
++}
++
++void check_and_enable_4b_termination(void)
++{
++	/* Not needed for Gaudi2 */
++}
++
++void security_disable_interfaces(void)
++{
++	/* by default disable jtag I/F as soon as possible */
++	security_disable_jtag_if();
++
++	/* by default disable TWI I/F as soon as possible */
++	security_disable_twi_if();
++}
++
++void security_handle_twi(void)
++{
++	if ((arcboot_rom_global.config_fuse &
++			EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0)
++		security_enable_twi_if();
++}
++
++void security_disable_jtag_if(void)
++{
++	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
++	security_disable_jtag_mstr_if();
++}
++
++void security_enable_jtag_if(void)
++{
++	security_jtag_dap(SECURITY_JTAG_DAP_ENABLE);
++	security_enable_jtag_mstr_if();
++}
+diff --git a/arch/gaudi2/arc/soc.h b/arch/gaudi2/arc/soc.h
+new file mode 100644
+index 0000000..04a8713
+--- /dev/null
++++ b/arch/gaudi2/arc/soc.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#ifndef _SOC_H_
++#define _SOC_H_
++#include <gaudi2_regs.h>
++
++#define CPU_FREQ			500000000
++#define CPU_FREQ_US			500	/* CPU_FREQ / 1000000 */
++
++#define FW_SIZE				65535
++#define SIG_SIZE			384
++#define KEY_SIZE			784
++#define BLOB_START			4
++
++#define SPI_FLASH_BLOCK_SIZE		1024
++
++/* 2MB for Gaudi2 */
++#define FLASH_VALID_MASK		0x1FFFFF
++#define FLASH_VALID_OFFSET		0
++#define FLASH_VALID_MAX_SIZE		0x200000
++
++#define HL_SRAM_BASE			0x1000007FF0000000ULL
++#define HL_SP_SRAM_BASE			0x1000007FF7FE0000ULL
++#define HL_SRAM_PHY_BASE		0x1000FFFFFD000000ULL
++
++/*
++ * This is not SDRAM Base, but the base address of General region
++ * into which the rest of the components are mapped
++ */
++#define HL_SDRAM_BASE			0x20000000
++#define HL_SRAM_LOG_BASE		0x11000000
++
++#define HL_FLASH_OFFSET			0x6000000
++#define HL_ICCM_OFFSET			0x7040000
++#define HL_SBROM_OFFSET			0x7FC0000
++#define HL_FWSRAM_OFFSET		0x7FD0000
++#define HL_SCRATCHPAD_SRAM_OFFSET	0x7FE0000
++#define HL_PCIE_FWSRAM_OFFSET		0x7FF0000
++#define HL_CFG_BASE			0xF8000000
++#define HL_ICCM_BASE			(HL_SRAM_BASE + HL_ICCM_OFFSET)
++
++#define HL_ICCM_SIZE			0x20000
++#define HL_SP_SRAM_SIZE			0x10000
++#define HL_SRAM_PHY_SIZE		0x2FFFFF
++
++#define HL_ICCM_END			(HL_ICCM_BASE + HL_ICCM_SIZE - 1)
++#define HL_SP_SRAM_END			(HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE - 1)
++#define HL_SRAM_PHY_END			(HL_SRAM_PHY_BASE +\
++					HL_SRAM_PHY_SIZE - 1)
++
++#endif /* _SOC_H_ */
+diff --git a/arch/greco/arc_elf32/Makefile b/arch/greco/arc_elf32/Makefile
+new file mode 100644
+index 0000000..e69de29
+--- /dev/null
++++ b/arch/greco/arc_elf32/Makefile
+diff --git a/arch/greco/arc_elf32/arcboot_ram.lds b/arch/greco/arc_elf32/arcboot_ram.lds
+new file mode 100644
+index 0000000..3630a3f
+--- /dev/null
++++ b/arch/greco/arc_elf32/arcboot_ram.lds
+@@ -0,0 +1,90 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
++	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
++	STM	: ORIGIN = 0x18000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
++	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
++}
++
++REGION_ALIAS("REGION_TEXT",	ICCM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	.text : {
++		app/crt0_ram.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/arcboot_rom.lds b/arch/greco/arc_elf32/arcboot_rom.lds
+new file mode 100644
+index 0000000..cce0716
+--- /dev/null
++++ b/arch/greco/arc_elf32/arcboot_rom.lds
+@@ -0,0 +1,98 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
++	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
++	STM	: ORIGIN = 0x18000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
++	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		app/crt0_rom.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 5k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 2k)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/asic.c b/arch/greco/arc_elf32/asic.c
+new file mode 100644
+index 0000000..3f6ceaa
+--- /dev/null
++++ b/arch/greco/arc_elf32/asic.c
+@@ -0,0 +1,6 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
+diff --git a/arch/greco/arc_elf32/asic_arcboot_ram.lds b/arch/greco/arc_elf32/asic_arcboot_ram.lds
+new file mode 100644
+index 0000000..c960869
+--- /dev/null
++++ b/arch/greco/arc_elf32/asic_arcboot_ram.lds
+@@ -0,0 +1,8 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++ INCLUDE arcboot_ram.lds
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/asic_arcboot_rom.lds b/arch/greco/arc_elf32/asic_arcboot_rom.lds
+new file mode 100644
+index 0000000..d49acc6
+--- /dev/null
++++ b/arch/greco/arc_elf32/asic_arcboot_rom.lds
+@@ -0,0 +1,8 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++ INCLUDE arcboot_rom.lds
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+new file mode 100644
+index 0000000..b409f6b
+--- /dev/null
++++ b/arch/greco/arc_elf32/common.c
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <unistd.h>
++#include <efuse.h>
++#include <pcie.h>
++#include <psoc_efuse_regs.h>
++#include <psoc_global_conf_masks.h>
++#include <arcboot.h>
++
++#define IATU_BASE				(mmPCIE_DBI_BASE & 0xFFFFFF)
++#define IATU_REGION_CTRL_1_OFF_INBOUND		(IATU_BASE + 0x100)
++#define IATU_REGION_CTRL_2_OFF_INBOUND		(IATU_BASE + 0x104)
++#define IATU_LWR_TARGET_ADDR_OFF_INBOUND	(IATU_BASE + 0x114)
++#define IATU_UPPER_TARGET_ADDR_OFF_INBOUND	(IATU_BASE + 0x118)
++
++uint32_t get_efuse_read_reg(void)
++{
++	return mmPSOC_EFUSE_READ;
++}
++
++uint32_t get_mem_cfg_mask(void)
++{
++	return PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK;
++}
++
++uint32_t get_fld_size_shift(void)
++{
++	return PSOC_GLOBAL_CONF_SPI_DMA_CTRL_FLD_SIZE_SHIFT;
++}
++
++void update_warm_reset_config(void)
++{
++	uint32_t reg;
++	reg = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
++	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_ARC_MASK;
++	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_PSOC_MASK;
++	regmap_writel(reg, mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
++}
++
++uint8_t get_sris_mode_from_strap(void)
++{
++	uint32_t boot_strap;
++
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK);
++}
++
++void enable_flr_handling_fsm(void)
++{
++	uint32_t flr_ctrl = regmap_readl(mmPCIE_AUX_FLR_CTRL);
++
++	flr_ctrl |= (1 << PCIE_AUX_FLR_CTRL_FSM_EN_SHIFT);
++	regmap_writel(flr_ctrl, mmPCIE_AUX_FLR_CTRL);
++}
++
++void pcie_config_iatu(void)
++{
++	regmap_writel(0x300000, mmPCIE_AUX_DBI);
++	regmap_writel(0xF0000000, IATU_LWR_TARGET_ADDR_OFF_INBOUND);
++	regmap_writel(0x7F, IATU_UPPER_TARGET_ADDR_OFF_INBOUND);
++	regmap_writel(0, IATU_REGION_CTRL_1_OFF_INBOUND);
++	regmap_writel(0xC0080000, IATU_REGION_CTRL_2_OFF_INBOUND);
++}
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++}
++
++void pcie_wait_for_sram_init_done(void)
++{
++	uint8_t sram_init_done = 0;
++
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++	} while (sram_init_done != 1);
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
++}
++
++void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
++
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
++}
++
++void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
++{
++	uint32_t reg;
++
++	if (separate_reference) {
++		reg = 0xA0;
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = 0x50;
++		regmap_writel(0x01C301C3,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++}
++
++void pcie_phy_set_ext_tx_rx_ctrl(void)
++{
++	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
++			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
++
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++}
++
++void pcie_phy_set_protocol0_ext_tx_rx(void)
++{
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
++		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
++
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
++}
++uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
++{
++	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK);
++}
++
++uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
++{
++	return (!!(boot_strap &
++			PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK));
++}
++
++void arcboot_rom_request_cpld_wdog(void)
++{
++	/* Do this after boot rom code, since it is beyond TO */
++}
++
++void arcboot_rom_clear_sw_status(void)
++{
++	/* Do this after boot rom code, since it is beyond TO */
++}
+diff --git a/arch/greco/arc_elf32/dev_efuse.h b/arch/greco/arc_elf32/dev_efuse.h
+new file mode 100644
+index 0000000..11a630a
+--- /dev/null
++++ b/arch/greco/arc_elf32/dev_efuse.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#define EFUSE_KEY_HASH_OFFSET			0x12
++#define EFUSE_SYSCFG_ENABLE_4B_TERMINATION	BIT(25)
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION	13
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK	0x3
++#define EFUSE_SYSCFG_KEY_LOCATION		7
++#define EFUSE_SYSCFG_KEY_LOCATION_MASK		0x3
++#define EFUSE_SYSCFG_REVOKATION_LOCATION	5
++#define EFUSE_SYSCFG_REVOKATION_LOCATION_MASK	0x3
++
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI	BIT(14)
++#define EFUSE_SYSCFG_KEY_LOCATION_SPI		BIT(8)
++#define EFUSE_SYSCFG_REVOKATION_LOCATION_SPI	BIT(6)
++
++#define EFUSE_SYSCFG_DEFAULT	(EFUSE_SYSCFG_SPI_CONTROLLER | \
++				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
++				 EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
++				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_ENABLE_4B_TERMINATION)
+diff --git a/arch/greco/arc_elf32/dev_security.h b/arch/greco/arc_elf32/dev_security.h
+new file mode 100644
+index 0000000..c5f4711
+--- /dev/null
++++ b/arch/greco/arc_elf32/dev_security.h
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _GRECO_DEV_SECURITY_H_
++#define _GRECO_DEV_SECURITY_H_
++
++#define SECURITY_DWORD_PER_KEY				8
++#define SECURITY_KEY_HASH_COUNT				5
++
++#endif /* _GRECO_DEV_SECURITY_H_ */
+diff --git a/arch/greco/arc_elf32/onix.c b/arch/greco/arc_elf32/onix.c
+new file mode 100644
+index 0000000..50aaae6
+--- /dev/null
++++ b/arch/greco/arc_elf32/onix.c
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <unistd.h>
++#include "arcboot.h"
++#include "efuse.h"
++
++#define EFUSE_SYSCFG_ONIX_DEFAULT \
++				(EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
++				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
++				 EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL)
++
++int fuse_read(uint32_t word, uint32_t *val)
++{
++	int ret = -1;
++
++	if (word == EFUSE_SYSCFG_OFFSET) {
++		*val = EFUSE_SYSCFG_ONIX_DEFAULT;
++		ret = 0;
++	}
++
++	return ret;
++}
+diff --git a/arch/greco/arc_elf32/onix_arcboot_ram.lds b/arch/greco/arc_elf32/onix_arcboot_ram.lds
+new file mode 100644
+index 0000000..c960869
+--- /dev/null
++++ b/arch/greco/arc_elf32/onix_arcboot_ram.lds
+@@ -0,0 +1,8 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++ INCLUDE arcboot_ram.lds
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/onix_arcboot_rom.lds b/arch/greco/arc_elf32/onix_arcboot_rom.lds
+new file mode 100644
+index 0000000..fdb13f0
+--- /dev/null
++++ b/arch/greco/arc_elf32/onix_arcboot_rom.lds
+@@ -0,0 +1,13 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++INCLUDE arcboot_rom.lds
++
++MEMORY
++{
++	SBROM	: ORIGIN = 0x10000000, LENGTH = 64K
++}
+diff --git a/arch/greco/arc_elf32/pldm.c b/arch/greco/arc_elf32/pldm.c
+new file mode 100644
+index 0000000..3f6ceaa
+--- /dev/null
++++ b/arch/greco/arc_elf32/pldm.c
+@@ -0,0 +1,6 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
+diff --git a/arch/greco/arc_elf32/pldm_arcboot_ram.lds b/arch/greco/arc_elf32/pldm_arcboot_ram.lds
+new file mode 100644
+index 0000000..c960869
+--- /dev/null
++++ b/arch/greco/arc_elf32/pldm_arcboot_ram.lds
+@@ -0,0 +1,8 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++ INCLUDE arcboot_ram.lds
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/pldm_arcboot_rom.lds b/arch/greco/arc_elf32/pldm_arcboot_rom.lds
+new file mode 100644
+index 0000000..d49acc6
+--- /dev/null
++++ b/arch/greco/arc_elf32/pldm_arcboot_rom.lds
+@@ -0,0 +1,8 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++ INCLUDE arcboot_rom.lds
+\ No newline at end of file
+diff --git a/arch/greco/arc_elf32/secureboot.c b/arch/greco/arc_elf32/secureboot.c
+new file mode 100644
+index 0000000..dc7bbf8
+--- /dev/null
++++ b/arch/greco/arc_elf32/secureboot.c
+@@ -0,0 +1,94 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdio.h>
++#include "sb.h"
++#include "arcboot.h"
++#include "efuse.h"
++#include "secureboot.h"
++#include "security.h"
++
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++int secureboot_verify_image(uint32_t image_size, uint32_t image_offset)
++{
++	int verify = 0;
++	int err = 0;
++	int key_scan;
++	unsigned char block_buf[SECUREBOOT_HASH_BLOCK_CALC_BUF];
++	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
++	uint32_t config_fuse;
++	uint16_t test_phase0b_data_len = image_size;
++	uint32_t test_phase0b_sig_len = SIG_SIZE;
++	uint32_t test_public_key_len = KEY_SIZE;
++
++	unsigned char *test_phase0b_data = (unsigned char *)(image_offset);
++	unsigned char *test_phase0b_sig = test_phase0b_data +
++					  test_phase0b_data_len;
++	unsigned char *test_public_key = test_phase0b_sig -
++					 test_public_key_len;
++	uint32_t fw_version = base_readl((uint32_t)test_phase0b_data);
++
++	/* check efuse for security validation enable */
++	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	/* check minimal valid security FW version */
++	if (security_check_valid_fw_version(fw_version) !=
++	    SECURITY_FW_VERSION_SECURE)
++		return SECUREBOOT_VERIFY_VER_FAILED;
++
++	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
++	     SECUREBOOT_HABANA_KEY; key_scan--) {
++		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
++					  key_scan)) {
++			/* check pub key hash versus efuse */
++			err = elp_secureboot_phase0a(sb_proxy_read,
++						     test_public_key,
++						     test_public_key_len,
++						     test_phase0a_hash,
++						     &verify, block_buf,
++						     sizeof(block_buf));
++		}
++		/* if key is verified we can exit the loop */
++		if (verify)
++			break;
++	}
++	/* if for loop doesn't find a valid key hash in fuse, return error */
++	if (!verify)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	/* Phase0b uses the public key (test_public_key) to validate signature
++	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
++	 */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data,
++				     test_phase0b_data_len, test_public_key,
++				     test_public_key_len, test_phase0b_sig,
++				     test_phase0b_sig_len, &verify,
++				     block_buf, sizeof(block_buf));
++
++	if (err || !verify)
++		return SECUREBOOT_VERIFY_FAILED;
++
++	return verify;
++}
+diff --git a/arch/greco/arc_elf32/security.c b/arch/greco/arc_elf32/security.c
+new file mode 100644
+index 0000000..1ac70fe
+--- /dev/null
++++ b/arch/greco/arc_elf32/security.c
+@@ -0,0 +1,496 @@
++/*
++ * Copyright 2016-2019 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ *
++ * SPDX-License-Identifier:	GPL-2.0+
++ */
++
++#include "arcboot.h"
++#include "security.h"
++#include "efuse.h"
++#include "security.h"
++#include "spi_flash.h"
++
++static void security_disable_i2c_s_mstr_if(void)
++{
++	/* set AXUSER to shared */
++	regmap_writel(I2C_S_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++	      mmI2C_S_MSTR_IF_AXUSER_CORE);
++	/* override AXI prot bit by master IF to secure, unprivlaged access */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		      mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++static void security_disable_smi_mstr_if(void)
++{
++	regmap_writel(SMI_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++	      mmSMI_MSTR_IF_AXUSER_CORE);
++	/* override AXI prot bit by master IF to secure, unprivlaged access */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		      mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++void security_disable_jtag_mstr_if(void)
++{
++	regmap_writel(JT_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++		      mmJT_MSTR_IF_AXUSER_CORE);
++
++	/* override AXI prot bit by master IF to secure, unprivlaged access */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		      mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++void security_enable_jtag_mstr_if(void)
++{
++	regmap_writel(0, mmJT_MSTR_IF_AXUSER_CORE);
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable access to all */
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++void security_disable_twi_if(void)
++{
++	security_disable_i2c_s_mstr_if();
++	security_disable_smi_mstr_if();
++}
++
++void security_jtag_dap(uint8_t status)
++{
++	/* close dap WA jira: H5-1803 */
++	regmap_writel(status, mmPSOC_CS_TRACE_SPECIAL_GLBL_SPARE_0);
++}
++
++void security_debug_if_shared(void)
++{
++	/* Configure SMI,I2C and JTAG to be "shared" engine */
++	regmap_writel(I2C_S_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++		      mmI2C_S_MSTR_IF_AXUSER_CORE);
++	regmap_writel(SMI_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++		      mmSMI_MSTR_IF_AXUSER_CORE);
++	regmap_writel(JT_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++		      mmJT_MSTR_IF_AXUSER_CORE);
++	regmap_writel(MSTR_IF_AXUSER_CORE_SHARED,
++		      mmPSOC_MSTR_IF_AXUSER_CORE);
++}
++
++static void security_dcon_rr_lbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_LBW,
++		mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(SECURITY_QSPI_END_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
++	} else {
++		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++	}
++}
++
++static void security_dcon_if0_rr_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_HBW,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_QSPI_END_HBW,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(SECURITY_FLASH_START_HBW,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_FLASH_END_HBW,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++static void security_dcon_if1_rr_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_HBW,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_QSPI_END_HBW,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(SECURITY_FLASH_START_HBW,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_FLASH_END_HBW,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++void security_i2c_s_rr_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_HBW,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_QSPI_END_HBW,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(SECURITY_FLASH_START_HBW,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_FLASH_END_HBW,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++static void security_elbi_rr_lbw_config(
++				uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_LBW,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(SECURITY_QSPI_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
++	} else {
++		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++	}
++}
++
++void security_smi_rr_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_HBW,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_QSPI_END_HBW,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(SECURITY_FLASH_START_HBW,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_FLASH_END_HBW,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++void security_jtag_rr_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_HBW,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_QSPI_END_HBW,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(SECURITY_FLASH_START_HBW,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(SECURITY_FLASH_END_HBW,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(SECURITY_HBW_MSB_ZERO,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel(SECURITY_HBW_MSB_ZERO,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++void security_pcie_rr_config(uint8_t spi_en)
++{
++	regmap_writel(PCIE_WRAP_PCIE_PROT_OVR_WR_EN_MASK |
++		      PCIE_WRAP_PCIE_PROT_OVR_RD_EN_MASK,
++		      mmPCIE_WRAP_PCIE_PROT_OVR);
++	regmap_writel(PCIE_MSTR_RR_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++		      mmPCIE_MSTR_RR_MSTR_IF_AXUSER_CORE);
++	security_elbi_rr_lbw_config(spi_en);
++	security_dcon_rr_lbw_config(spi_en);
++	security_dcon_if0_rr_hbw_config(spi_en);
++	security_dcon_if1_rr_hbw_config(spi_en);
++}
++
++uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
++{
++	uint32_t ret;
++	uint8_t key_soc_base_index;
++	uint8_t key_soc_location_index;
++	uint32_t key_soc_location[] = {
++		mmPSOC_SECURITY_HABANA_KEY_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_3_0
++	};
++
++	/* select which index to choose (haban, customer 0-4) */
++	key_soc_base_index = hash_key_index / SECURITY_DWORD_PER_KEY;
++	/* key is 256bit, 32bit * 8... which of the 8 location is requested */
++	key_soc_location_index = hash_key_index % SECURITY_DWORD_PER_KEY;
++
++	/* get base address of selected key index */
++	ret = key_soc_location[key_soc_base_index];
++	/* add to base address of key the spicifice location of currect DWORD */
++	ret += (key_soc_location_index * sizeof(uint32_t));
++	return ret;
++}
++
++void security_load_keys(void)
++{
++	uint8_t hash_key_index;
++	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
++	enum security_location key_location;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++
++	arcboot_rom_status_update(PROGRESS_KEY_LOC);
++	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
++
++	switch (key_location) {
++	case SPI_FLASH:
++		spi_flash_get_hash(key_hash);
++		break;
++	case SPI_OTP:
++		spi_flash_otp_access(FLASH_OTP_ENABLE);
++		spi_flash_otp_get_hash(key_hash);
++		spi_flash_otp_access(FLASH_OTP_DISABLE);
++		break;
++	case ASIC_EFUSE:
++	default:
++		efuse_get_hash(key_hash);
++		break;
++	}
++
++	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
++	     hash_key_index++) {
++		/* store habana key hash in PSOC_SECURITY */
++		regmap_writel(key_hash[hash_key_index],
++			      security_key_soc_location_offset(hash_key_index));
++		/* store key hashes in Scratch PAD Sram */
++		sp_sram_writel(key_hash[hash_key_index],
++			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
++			       SECURITY_BYTE_PER_DWORD));
++	}
++}
++
++void check_and_enable_4b_termination(void)
++{
++	uint32_t spare0;
++	/*
++	 * check and enable 4B termination
++	 * set bit[1] of mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0 register
++	 * to enable LBW 4B termination.
++	 */
++	if (arcboot_rom_global.config_fuse &
++				EFUSE_SYSCFG_ENABLE_4B_TERMINATION) {
++
++		spare0 = regmap_readl(mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
++		spare0 |= BIT(1);
++		regmap_writel(spare0, mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
++	}
++}
++
++void security_handle_twi(void)
++{
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_TWI_IF_MASK)
++		security_disable_twi_if();
++}
++
++void security_disable_jtag_if(void)
++{
++	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
++	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
++	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
++	security_disable_jtag_mstr_if();
++}
++
++void security_enable_jtag_if(void)
++{
++	regmap_writel(0xFFFFFFFF, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
++	regmap_writel(0xFFFFFFFF, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
++	security_jtag_dap(SECURITY_JTAG_DAP_ENABLE);
++	security_enable_jtag_mstr_if();
++}
+diff --git a/arch/greco/arc_elf32/soc.h b/arch/greco/arc_elf32/soc.h
+new file mode 100644
+index 0000000..8ef900d
+--- /dev/null
++++ b/arch/greco/arc_elf32/soc.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _SOC_H_
++#define _SOC_H_
++#include <goya2_regs.h>
++
++#define CPU_FREQ	500000000
++#define CPU_FREQ_US	500	/* CPU_FREQ / 1000000 */
++#define PREBOOT_ADDR_H	0x7F
++#define PREBOOT_ADDR_L	0xF0000000
++
++#define FW_SIZE					65535
++#define SIG_SIZE				384
++#define KEY_SIZE				392
++#define BLOB_START				4
++
++#define SPI_FLASH_BLOCK_SIZE			1024
++
++/* 16MB for Greco */
++#define FLASH_VALID_MASK			0xFFFFFF
++#define FLASH_VALID_OFFSET			0
++#define FLASH_VALID_MAX_SIZE			0x1000000
++
++#define HL_SRAM_BASE				0x7FF0000000ULL
++#define HL_SP_SRAM_BASE            		0x7FFBFE0000ULL
++#define HL_SDRAM_BASE				0x10000000
++#define HL_FLASH_OFFSET				0xA000000
++#define HL_ICCM_OFFSET				0xB020000
++#define HL_SBROM_OFFSET				0xB040000
++#define HL_FWSRAM_OFFSET			0xB050000
++#define HL_SCRATCHPAD_SRAM_OFFSET		0xBFE0000
++#define HL_PCIE_FWSRAM_OFFSET			0xBFF0000
++
++#define HL_CFG_BASE				0xFC000000
++
++#endif /* _SOC_H_ */
+diff --git a/gaudi2_arc_gnu/Makefile b/gaudi2_arc_gnu/Makefile
+deleted file mode 100644
+index 1c6d192..0000000
+--- a/gaudi2_arc_gnu/Makefile
++++ /dev/null
+@@ -1 +0,0 @@
+-LDFLAGS += -static
+diff --git a/gaudi2_arc_gnu/arcboot_ram.lds b/gaudi2_arc_gnu/arcboot_ram.lds
+deleted file mode 100644
+index 056dca1..0000000
+--- a/gaudi2_arc_gnu/arcboot_ram.lds
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 128K
+-	SRAM	: ORIGIN = 0x11000000, LENGTH = 48M
+-	STM	: ORIGIN = 0x24000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x26000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x27FC0000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x27FD0000, LENGTH = 64K
+-	CS	: ORIGIN = 0x2C000000, LENGTH = 32M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 32K
+-}
+-
+-REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	.text : {
+-		app/crt0_ram.o (.text*)
+-		*(.text .text.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data = .;
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+diff --git a/gaudi2_arc_gnu/arcboot_rom.lds b/gaudi2_arc_gnu/arcboot_rom.lds
+deleted file mode 100644
+index 55904dd..0000000
+--- a/gaudi2_arc_gnu/arcboot_rom.lds
++++ /dev/null
+@@ -1,96 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 128K
+-	SRAM	: ORIGIN = 0x11000000, LENGTH = 48M
+-	STM	: ORIGIN = 0x24000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x26000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x27FC0000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x27FD0000, LENGTH = 64K
+-	CS	: ORIGIN = 0x2C000000, LENGTH = 32M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 32K
+-}
+-
+-REGION_ALIAS("REGION_IVT",	SBROM)
+-REGION_ALIAS("REGION_TEXT",	SBROM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	_dccm_begin = ORIGIN(DCCM);
+-	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+-
+-	.ivt : {
+-		KEEP (*(.ivt));
+-	} > REGION_IVT
+-
+-	.text : {
+-		app/crt0_rom.o (.text*)
+-		*(.text .text.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data = .;
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 5k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 8k)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+diff --git a/gaudi2_arc_gnu/asic.c b/gaudi2_arc_gnu/asic.c
+deleted file mode 100644
+index 7b6e440..0000000
+--- a/gaudi2_arc_gnu/asic.c
++++ /dev/null
+@@ -1,4 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+diff --git a/gaudi2_arc_gnu/asic_arcboot_ram.lds b/gaudi2_arc_gnu/asic_arcboot_ram.lds
+deleted file mode 100644
+index 827fe1f..0000000
+--- a/gaudi2_arc_gnu/asic_arcboot_ram.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_ram.lds
+diff --git a/gaudi2_arc_gnu/asic_arcboot_rom.lds b/gaudi2_arc_gnu/asic_arcboot_rom.lds
+deleted file mode 100644
+index 9e1e858..0000000
+--- a/gaudi2_arc_gnu/asic_arcboot_rom.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_rom.lds
+diff --git a/gaudi2_arc_gnu/common.c b/gaudi2_arc_gnu/common.c
+deleted file mode 100644
+index 6a6e784..0000000
+--- a/gaudi2_arc_gnu/common.c
++++ /dev/null
+@@ -1,504 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <unistd.h>
+-#include <efuse.h>
+-#include <pcie.h>
+-#include <arcboot.h>
+-#include <psoc_efuse_regs.h>
+-#include <psoc_global_conf_masks.h>
+-#include <psoc_reset_conf_masks.h>
+-#include <psoc_reset_conf_regs.h>
+-#include <sha512.h>
+-#include <string.h>
+-#include "dma.h"
+-#include "spi_flash.h"
+-#include "boot_desc.h"
+-
+-#define ARCBOOT_STATUS_REG_SZ_BITS	32
+-#define LOW_DWORD(x)			(x & 0xFFFFFFFF)
+-#define ICCM_OFFS_MASK			0x1FFFF
+-#define SP_SRAM_OFFS_MASK		0xFFFF
+-#define SRAM_PHYS_OFFS_MASK		0x2FFFFFF
+-
+-#define IATU_REGION_CTRL_1_OFF_INBOUND_OFF	0x100
+-#define IATU_REGION_CTRL_2_OFF_INBOUND_OFF	0x104
+-#define IATU_LWR_TARGET_ADDR_OFF_INBOUND_OFF	0x114
+-#define IATU_UPPER_TARGET_ADDR_OFF_INBOUND_OFF	0x118
+-
+-#define IATU_LOWER_TARGET_ADDR			0xF0000000
+-#define IATU_HIGHER_TARGET_ADDR			0x1000007F
+-#define IATU_INBOUND_LOW_OFFSET_ADDR		0x0
+-#define IATU_INBOUND_HI_OFFSET_ADDR		0xC0080000
+-#define DBI_ENABLE				0x300000
+-
+-void arcboot_rom_status_update(enum arcboot_rom_progress progress)
+-{
+-	uint32_t reg, offset;
+-
+-	offset = progress / ARCBOOT_STATUS_REG_SZ_BITS;
+-	progress = progress % ARCBOOT_STATUS_REG_SZ_BITS;
+-
+-	reg = regmap_readl((mmPSOC_SECURITY_SW_STATUS_0 + offset * 4));
+-	reg |= BIT(progress);
+-	regmap_writel(reg, (mmPSOC_SECURITY_SW_STATUS_0 + offset  * 4));
+-}
+-
+-uint32_t get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ_CTRL;
+-}
+-
+-uint32_t get_mem_cfg_mask(void)
+-{
+-	return PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK;
+-}
+-
+-uint32_t get_fld_size_shift(void)
+-{
+-	return PSOC_GLOBAL_CONF_SPI_DMA_CTRL_MEM_SIZE_SHIFT;
+-}
+-
+-void update_warm_reset_config(void)
+-{
+-	regmap_writel(PSOC_RESET_CONF_PSOC_PRSTN_RST_CFG_EN_MASK,
+-			mmPSOC_RESET_CONF_PSOC_PRSTN_RST_CFG);
+-	regmap_writel(PSOC_RESET_CONF_ARC_PRSTN_RST_CFG_EN_MASK,
+-			mmPSOC_RESET_CONF_ARC_PRSTN_RST_CFG);
+-}
+-
+-uint8_t get_sris_mode_from_strap()
+-{
+-	uint32_t boot_strap;
+-
+-	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H);
+-
+-	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H_SRIS_MODE_MASK);
+-}
+-
+-void enable_flr_handling_fsm(void)
+-{
+-	/* No HW FSM bits in Gaudi2, No need to set anything */
+-}
+-
+-static int verify_sha(uint32_t data_size, unsigned char *ptr_to_data,
+-		      unsigned char *ptr_to_sha)
+-{
+-	unsigned char actual_hash[SHA384_SUM_LEN];
+-
+-	sha384_csum(ptr_to_data, data_size, actual_hash, 0);
+-
+-	return memcmp(ptr_to_sha, actual_hash, SHA384_SUM_LEN);
+-}
+-
+-static int check_boundary(uint64_t addr, uint32_t size, uint64_t endaddr)
+-{
+-	return ((addr + size) <= endaddr) ? 0 : 1;
+-}
+-
+-/*
+- * check_load_addr_valid updates 'addr' with the 32bit ARC
+- * view point address used to jump to the code and execute.
+- * If address is valid and within bounds 0 is returned,
+- * else returns 1.
+- */
+-static int check_load_addr_valid(struct boot_desc *p_desc, uint32_t *addr)
+-{
+-	uint32_t addr_low = LOW_DWORD(p_desc->loadaddr);
+-	int ret;
+-
+-	switch (p_desc->loadaddr) {
+-	case HL_ICCM_BASE ... HL_ICCM_END:
+-		ret = check_boundary(p_desc->loadaddr, p_desc->img_size,
+-				HL_ICCM_END);
+-		*addr = addr_low & ICCM_OFFS_MASK;
+-		break;
+-	case HL_SP_SRAM_BASE ... HL_SP_SRAM_END:
+-		ret = check_boundary(p_desc->loadaddr, p_desc->img_size,
+-				HL_SP_SRAM_END);
+-		*addr = HL_SCRATCHPAD_SRAM_BASE +
+-			(addr_low & SP_SRAM_OFFS_MASK);
+-		/*
+-		 * Note that the offset of SP SRAM to be provided to perform
+-		 * DMA must be in granuality of 4B. ie.
+-		 * (right shift offset 0x1000 by 2).
+-		 */
+-		p_desc->loadaddr = (HL_SP_SRAM_BASE +
+-				((addr_low & SP_SRAM_OFFS_MASK) >> 2));
+-		break;
+-	case HL_SRAM_PHY_BASE ... HL_SRAM_PHY_END:
+-		ret = check_boundary(p_desc->loadaddr, p_desc->img_size,
+-				HL_SRAM_PHY_END);
+-		*addr = HL_SRAM_LOG_BASE +
+-			(addr_low & SRAM_PHYS_OFFS_MASK);
+-		break;
+-	default:
+-		ret = 1;
+-		break;
+-	}
+-	return ret;
+-}
+-
+-static int img_desc_precheck(struct boot_desc *p_desc, uint32_t *addr)
+-{
+-	if (p_desc->img_size == 0)
+-		goto img_desc_invalid;
+-
+-	/*
+-	 * prevent rogue accesses by checking for-
+-	 * 1. flash offset should be <= Max possible offset
+-	 * 2. requested size is also less than Max allowed size
+-	 */
+-	if ((p_desc->spi_offset >=
+-		(FLASH_VALID_OFFSET + FLASH_VALID_MAX_SIZE)) ||
+-		(p_desc->img_size >= FLASH_VALID_MAX_SIZE))
+-		goto img_desc_invalid;
+-
+-	if (p_desc->spi_offset + p_desc->img_size >=
+-			(FLASH_VALID_OFFSET + FLASH_VALID_MAX_SIZE))
+-		goto img_desc_invalid;
+-
+-	if (check_load_addr_valid(p_desc, addr))
+-		goto img_desc_invalid;
+-
+-	return 0;
+-
+-img_desc_invalid:
+-	return 1;
+-}
+-
+-static void ext_rom_load_erom_pcie(void)
+-{
+-	int err;
+-	uint32_t idx;
+-	struct boot_desc desc;
+-	uint32_t load_addr_logical; /* 32 bit ARC view point address */
+-	void (*erom_pcie_func)();
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE);
+-
+-	idx = boot_desc_get_img_desc(HL_FW_EROM_PCIE, &desc);
+-	if (idx == HL_FW_IMG_NOT_FOUND)
+-		return;
+-
+-	err = img_desc_precheck(&desc, &load_addr_logical);
+-	if (err)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_DMA_START);
+-
+-	dma_copy_image(desc.img_size, desc.spi_offset,
+-		       desc.loadaddr, SPI_DMA_DST_HBW);
+-	if (dma_wait_finish() == DMA_CRC_ERROR)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH);
+-
+-	/* Verify SHA excluding the CRC byte */
+-	err = verify_sha(desc.img_size - HL_CRC32_FOOTER,
+-			(unsigned char *)(load_addr_logical),
+-			desc.chksum);
+-
+-	if (!err) {
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_START);
+-		erom_pcie_func = (void *)(load_addr_logical);
+-		erom_pcie_func();
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_PCIE_FINISH);
+-	}
+-}
+-
+-static void ext_rom_load_erom_recovery(void)
+-{
+-	int err;
+-	uint32_t idx;
+-	struct boot_desc desc;
+-	uint32_t load_addr_logical; /* 32 bit ARC view point address */
+-	void (*erom_recov_func)();
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY);
+-
+-	idx = boot_desc_get_img_desc(HL_FW_EROM_RECOVERY, &desc);
+-	if (idx == HL_FW_IMG_NOT_FOUND)
+-		return;
+-
+-	err = img_desc_precheck(&desc, &load_addr_logical);
+-	if (err)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START);
+-
+-	dma_copy_image(desc.img_size, desc.spi_offset,
+-		       desc.loadaddr, SPI_DMA_DST_HBW);
+-	if (dma_wait_finish() == DMA_CRC_ERROR)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH);
+-
+-	/* Verify SHA excluding the CRC byte */
+-	err = verify_sha(desc.img_size - HL_CRC32_FOOTER,
+-			(unsigned char *)(load_addr_logical),
+-			desc.chksum);
+-
+-	if (!err) {
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_RECOVERY_START);
+-		erom_recov_func = (void *)(load_addr_logical);
+-		erom_recov_func();
+-		arcboot_rom_status_update(
+-				PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH);
+-	}
+-}
+-
+-static void ext_rom_load_erom_tpm(void)
+-{
+-	int err = 0;
+-	uint32_t idx = 0;
+-	struct boot_desc desc;
+-	uint32_t load_addr_logical; /* 32 bit ARC view point address */
+-	void (*erom_tpm_func)();
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM);
+-
+-	idx = boot_desc_get_img_desc(HL_FW_EROM_TPM, &desc);
+-	if (idx == HL_FW_IMG_NOT_FOUND)
+-		return;
+-
+-	err = img_desc_precheck(&desc, &load_addr_logical);
+-	if (err)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_DMA_START);
+-
+-	dma_copy_image(desc.img_size, desc.spi_offset,
+-		       desc.loadaddr, SPI_DMA_DST_HBW);
+-	if (dma_wait_finish() == DMA_CRC_ERROR)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH);
+-
+-	/* Verify SHA excluding the CRC byte */
+-	err = verify_sha(desc.img_size - HL_CRC32_FOOTER,
+-			(unsigned char *)(load_addr_logical),
+-			desc.chksum);
+-
+-	if (!err) {
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_START);
+-		erom_tpm_func = (void *)(load_addr_logical);
+-		erom_tpm_func();
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_TPM_FINISH);
+-	}
+-}
+-
+-void execute_pcie_recovery(void)
+-{
+-	/*
+-	 * efuse[14:13]:
+-	 * 00: ROM
+-	 * 01: eROM
+-	 * 10: Reserved
+-	 * 11: ROM
+-	 */
+-	uint8_t pcie_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_RECOVERY_CODE_LOCATION) &
+-			EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_MASK);
+-
+-	if (pcie_location != EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_EROM) {
+-		/* In all other scenarios, execute from ROM (most secure) */
+-		pcie_recovery();
+-		return;
+-	}
+-
+-	if (!arcboot_rom_global.erom_boot_desc_flag)
+-		if (!boot_desc_init()) {
+-			arcboot_rom_status_update(
+-					PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR);
+-			return;
+-		}
+-
+-	/* else load PCIE binary from eROM to establish the link */
+-	ext_rom_load_erom_pcie();
+-
+-	/* Further, load the recovery bin from eROM */
+-	ext_rom_load_erom_recovery();
+-
+-	/*
+-	 * if we reach here, because of SHA/CRC error in execution of
+-	 * eROM recovery, stay here, and don't return
+-	 */
+-	while (1)
+-		;
+-}
+-
+-void arcboot_rom_handle_tpm(void)
+-{
+-	/* check fuse bit to call the erom function*/
+-	if ((arcboot_rom_global.config_fuse &
+-	   EFUSE_SYSCFG_ENABLE_TPM_MASK) != 0) {
+-		if (!arcboot_rom_global.erom_boot_desc_flag)
+-			if (!boot_desc_init()) {
+-				arcboot_rom_status_update(
+-					PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR);
+-				return;
+-			}
+-
+-		ext_rom_load_erom_tpm();
+-	}
+-}
+-
+-void arcboot_rom_set_spi_write_limit(void)
+-{
+-	/* limit flash write to just 2MB */
+-	regmap_writel(write_en_2MB, mmPSOC_SECURITY_SPI_WRITE_LIMIT);
+-}
+-
+-void pcie_config_iatu(void)
+-{
+-	uint32_t pci_dbi_base = (mmPCIE_DBI_BASE & 0x7FFFFFF);
+-
+-	regmap_writel(DBI_ENABLE, mmPCIE_AUX_DBI);
+-	regmap_writel(IATU_LOWER_TARGET_ADDR,
+-		(pci_dbi_base + IATU_LWR_TARGET_ADDR_OFF_INBOUND_OFF));
+-	regmap_writel(IATU_HIGHER_TARGET_ADDR,
+-		(pci_dbi_base + IATU_UPPER_TARGET_ADDR_OFF_INBOUND_OFF));
+-	regmap_writel(IATU_INBOUND_LOW_OFFSET_ADDR,
+-		(pci_dbi_base + IATU_REGION_CTRL_1_OFF_INBOUND_OFF));
+-	regmap_writel(IATU_INBOUND_HI_OFFSET_ADDR,
+-		(pci_dbi_base + IATU_REGION_CTRL_2_OFF_INBOUND_OFF));
+-}
+-
+-void pcie_phy_para_sel_set(void)
+-{
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
+-}
+-
+-void pcie_wait_for_sram_init_done(void)
+-{
+-	uint8_t sram_init_done = 0;
+-
+-	do {
+-		sram_init_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
+-	} while (sram_init_done != 1);
+-
+-	sram_init_done = 0;
+-	do {
+-		sram_init_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
+-	} while (sram_init_done != 1);
+-
+-	sram_init_done = 0;
+-	do {
+-		sram_init_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2);
+-	} while (sram_init_done != 1);
+-
+-	sram_init_done = 0;
+-	do {
+-		sram_init_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3);
+-	} while (sram_init_done != 1);
+-}
+-
+-void pcie_phy_set_sram_ext_ld_done(void)
+-{
+-	regmap_writel(1, mmPCIE_PHY_PHY_SRAM_EXT_LD_DONE);
+-}
+-
+-void pcie_phy_set_mpll_a_b_ssc_enable(void)
+-{
+-
+-	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
+-			mmPCIE_PHY_PHYX_MPLLB_SSC_EN_3, 0x1);
+-	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
+-			mmPCIE_PHY_PHYX_MPLLA_SSC_EN_3, 0x1);
+-}
+-
+-void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
+-{
+-	uint32_t reg;
+-
+-	if (separate_reference) {
+-		reg = 0xA0;
+-		regmap_writel(0x00250025,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
+-		regmap_writel(0x00250025,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-	} else {
+-		reg = 0x50;
+-		regmap_writel(0x00530053,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
+-		regmap_writel(0x01C301C3,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-	}
+-
+-	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
+-	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
+-}
+-
+-void pcie_phy_set_ext_tx_rx_ctrl(void) {}
+-void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+-
+-#define DUMP_SEL_SRNS_MASK	0x1
+-#define DUMP_SEL_SSC_MASK	0x2
+-
+-uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
+-{
+-	uint32_t dump_sel = (boot_strap &
+-		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
+-		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
+-
+-	/* dumpsel[0] is SRNS */
+-	return (dump_sel & DUMP_SEL_SRNS_MASK);
+-}
+-
+-uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
+-{
+-	uint32_t dump_sel = (boot_strap &
+-		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
+-		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
+-
+-	/* dumpsel[1] is SSC EN */
+-	return !!(dump_sel & DUMP_SEL_SSC_MASK);
+-}
+-
+-/*
+- * Request CPLD to start the watchdog, by asserting
+- * a GPIO.
+- */
+-#define GAUDI2_CPLD_WDOG_GPIO_INDEX	62
+-void arcboot_rom_request_cpld_wdog(void)
+-{
+-	uint32_t index = GAUDI2_CPLD_WDOG_GPIO_INDEX % 16;
+-	uint32_t val, mask = BIT(index);
+-
+-	/* configure GPIO in output mode */
+-	val = regmap_readl(mmPSOC_GPIO3_OUTENSET);
+-	val = val | mask;
+-	regmap_writel(val, mmPSOC_GPIO3_OUTENSET);
+-
+-	/* gpio is active low */
+-	val = regmap_readl(mmPSOC_GPIO3_DATAOUT);
+-	val &= ~mask;
+-	regmap_writel(val, mmPSOC_GPIO3_DATAOUT);
+-}
+-
+-void arcboot_rom_clear_sw_status(void)
+-{
+-	/* As per Architecture recommendation, clear status reg */
+-	regmap_writel(0, mmPSOC_SECURITY_STATUS);
+-
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_0);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_1);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_2);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_3);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_4);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_5);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_6);
+-	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_7);
+-}
+diff --git a/gaudi2_arc_gnu/dev_efuse.h b/gaudi2_arc_gnu/dev_efuse.h
+deleted file mode 100644
+index 57550a9..0000000
+--- a/gaudi2_arc_gnu/dev_efuse.h
++++ /dev/null
+@@ -1,31 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#define EFUSE_KEY_HASH_OFFSET				0x14
+-
+-/*
+- * 00: ROM, 01: EROM, 10: RSVD, 11:ROM
+- */
+-#define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION		13
+-#define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_MASK	0x3
+-#define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_EROM	0x1
+-
+-#define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(11)
+-#define EFUSE_SYSCFG_FW_VERSION_LOCATION		7
+-#define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK		0x3
+-#define EFUSE_SYSCFG_KEY_LOCATION			5
+-#define EFUSE_SYSCFG_KEY_LOCATION_MASK			0x3
+-#define EFUSE_SYSCFG_REVOKATION_LOCATION		7
+-#define EFUSE_SYSCFG_REVOKATION_LOCATION_MASK		0x3
+-
+-#define EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI		BIT(8)
+-#define EFUSE_SYSCFG_REVOKATION_LOCATION_SPI		BIT(8)
+-
+-/*
+- * As per recommendation from Security Architect, if FUSE is not available,
+- * card should not continue in the secure boot mode. Hence the default
+- * can be 0 (with no enabling of the Signature of Validation also.
+- */
+-#define EFUSE_SYSCFG_DEFAULT				0
+diff --git a/gaudi2_arc_gnu/dev_security.h b/gaudi2_arc_gnu/dev_security.h
+deleted file mode 100644
+index 9247604..0000000
+--- a/gaudi2_arc_gnu/dev_security.h
++++ /dev/null
+@@ -1,42 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _GAUDI2_DEV_SECURITY_H_
+-#define _GAUDI2_DEV_SECURITY_H_
+-
+-#include <sha512.h>
+-
+-#define NUM_KEYS_IN_ROM					5
+-#define NUM_KEYS_IN_EFUSE				3
+-#define SECURITY_DWORD_PER_KEY				12
+-#define SECURITY_KEY_HASH_COUNT				3
+-#define NUM_DWORDS_AVLBL_IN_PSOC_SEC			8
+-
+-enum security_key_location {
+-	KEY_LOCATION_ROM,
+-	KEY_LOCATION_EFUSE
+-};
+-
+-/* size of key properties in bytes */
+-#define KEY_PROP_RR_SZ  				384
+-#define KEY_PROP_MOD_SZ					384
+-#define KEY_PROP_EXP_SZ					8
+-#define KEY_PROP_INV_SZ					4
+-#define KEY_PROP_NB_SZ					4
+-#define KEY_PROP_HDR_SZ					8
+-
+-/* 384 + 384 + 8 + 4 + 4 = 784 bytes */
+-#define PUB_KEY_SZ		(KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
+-				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
+-				KEY_PROP_NB_SZ)
+-
+-/* 784 + 8 = 792 */
+-#define TOTAL_PUB_KEY_PROPS_SZ  (PUB_KEY_SZ + KEY_PROP_HDR_SZ)
+-
+-extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+-
+-#endif /* _GAUDI2_DEV_SECURITY_H_ */
+diff --git a/gaudi2_arc_gnu/onix.c b/gaudi2_arc_gnu/onix.c
+deleted file mode 100644
+index 1d90e3c..0000000
+--- a/gaudi2_arc_gnu/onix.c
++++ /dev/null
+@@ -1,28 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#include <unistd.h>
+-#include "arcboot.h"
+-#include "efuse.h"
+-#include <common.h>
+-#include <psoc_global_conf_masks.h>
+-
+-#define EFUSE_SYSCFG_ONIX_DEFAULT \
+-				(EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
+-				 EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL)
+-
+-int fuse_read(uint32_t word, uint32_t *val)
+-{
+-	int ret = -1;
+-
+-	if (word == EFUSE_SYSCFG_OFFSET) {
+-		*val = EFUSE_SYSCFG_ONIX_DEFAULT;
+-		ret = 0;
+-	}
+-
+-	return ret;
+-}
+diff --git a/gaudi2_arc_gnu/onix_arcboot_ram.lds b/gaudi2_arc_gnu/onix_arcboot_ram.lds
+deleted file mode 100644
+index 827fe1f..0000000
+--- a/gaudi2_arc_gnu/onix_arcboot_ram.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_ram.lds
+diff --git a/gaudi2_arc_gnu/onix_arcboot_rom.lds b/gaudi2_arc_gnu/onix_arcboot_rom.lds
+deleted file mode 100644
+index 1a9a352..0000000
+--- a/gaudi2_arc_gnu/onix_arcboot_rom.lds
++++ /dev/null
+@@ -1,12 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-INCLUDE arcboot_rom.lds
+-
+-/* This is SRAM address, used for Onix targets */
+-MEMORY
+-{
+-	SBROM	: ORIGIN = 0x11000000, LENGTH = 64K
+-}
+diff --git a/gaudi2_arc_gnu/pldm.c b/gaudi2_arc_gnu/pldm.c
+deleted file mode 100644
+index 7b6e440..0000000
+--- a/gaudi2_arc_gnu/pldm.c
++++ /dev/null
+@@ -1,4 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+diff --git a/gaudi2_arc_gnu/pldm_arcboot_ram.lds b/gaudi2_arc_gnu/pldm_arcboot_ram.lds
+deleted file mode 100644
+index 827fe1f..0000000
+--- a/gaudi2_arc_gnu/pldm_arcboot_ram.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_ram.lds
+diff --git a/gaudi2_arc_gnu/pldm_arcboot_rom.lds b/gaudi2_arc_gnu/pldm_arcboot_rom.lds
+deleted file mode 100644
+index 9e1e858..0000000
+--- a/gaudi2_arc_gnu/pldm_arcboot_rom.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_rom.lds
+diff --git a/gaudi2_arc_gnu/secureboot.c b/gaudi2_arc_gnu/secureboot.c
+deleted file mode 100644
+index 009c1cb..0000000
+--- a/gaudi2_arc_gnu/secureboot.c
++++ /dev/null
+@@ -1,227 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#include <string.h>
+-#include <arcboot.h>
+-#include <efuse.h>
+-#include <secureboot.h>
+-#include <security.h>
+-#include <dev_security.h>
+-#include <rsa.h>
+-#include <sha512.h>
+-
+-/*
+- * This key hash is calculated on the Public Key Properties -
+- *   -----------------------------------------------
+- * | R ^ 2 | modulus | exponent | inverse | num bits |
+- *   -----------------------------------------------
+- * Since the key props are directly given to the ROM, there is
+- * no need to explicitly include the Public key, which is
+- * usually the modulus.
+- */
+-const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN] = {
+-	/* Habana Public Key */
+-	{
+-		0x08, 0x51, 0xe7, 0x07, 0xc1, 0x0a, 0xc8, 0x45,
+-		0x51, 0x61, 0xb4, 0xdf, 0xb6, 0xd6, 0x89, 0xbc,
+-		0x57, 0xbb, 0xf9, 0xe2, 0x50, 0x4f, 0x44, 0x1f,
+-		0x12, 0x4a, 0x73, 0x3d, 0xbb, 0xda, 0x63, 0xf2,
+-		0x76, 0x53, 0x6c, 0x12, 0xa1, 0x13, 0x37, 0x30,
+-		0x03, 0xee, 0x79, 0xce, 0x20, 0xa3, 0x32, 0x33
+-	},
+-	/* Additional Keys*/
+-	/* Production Key 1 */
+-	{
+-		0x47, 0x9b, 0x51, 0x5d, 0xf9, 0x8b, 0xfd, 0x3d,
+-		0x38, 0x3f, 0x19, 0x51, 0x40, 0x62, 0xcb, 0x15,
+-		0x2d, 0xae, 0x11, 0xe8, 0x1a, 0x91, 0x3e, 0x02,
+-		0xa0, 0x80, 0x08, 0x9a, 0x62, 0x93, 0xb7, 0x65,
+-		0x73, 0xe1, 0x6f, 0x86, 0x32, 0x16, 0xea, 0x37,
+-		0x48, 0x19, 0xb8, 0xe0, 0xc3, 0x3b, 0x5a, 0xcf
+-	},
+-	/* Production Key 2 */
+-	{
+-		0x48, 0x3c, 0x50, 0xfc, 0xf1, 0x3a, 0x56, 0x7a,
+-		0x7b, 0x7c, 0xcc, 0x77, 0x66, 0xb3, 0x85, 0x1b,
+-		0x6f, 0x43, 0x60, 0xce, 0x16, 0x9a, 0xc4, 0x14,
+-		0xd5, 0xcb, 0x11, 0x09, 0x66, 0xc0, 0xfe, 0x42,
+-		0xfe, 0x78, 0x79, 0x57, 0xdb, 0x06, 0x5c, 0x37,
+-		0x2f, 0xe2, 0x81, 0xb0, 0x00, 0x11, 0x9f, 0x8e,
+-	},
+-	/* Production Key 3 */
+-	{
+-		0x5c, 0xc8, 0xd6, 0xf3, 0x42, 0xdc, 0xa3, 0xdf,
+-		0xb0, 0xa3, 0xa8, 0x73, 0x68, 0x54, 0x78, 0x5e,
+-		0x8c, 0xaf, 0x09, 0x0b, 0x0d, 0x41, 0xa8, 0xa1,
+-		0xd9, 0xf8, 0x31, 0xdc, 0x95, 0x0f, 0x84, 0x02,
+-		0xb3, 0x2a, 0x61, 0xe4, 0x10, 0xd8, 0x39, 0xdf,
+-		0x80, 0x27, 0xc1, 0x2e, 0xd5, 0xd2, 0xb2, 0xcd,
+-	},
+-	/* Production Key 4 */
+-	{
+-		0xdb, 0x8c, 0x8c, 0xe7, 0x08, 0x19, 0x6b, 0x04,
+-		0x76, 0x43, 0xa7, 0xe4, 0x34, 0x2d, 0x2e, 0x8f,
+-		0xf5, 0xdd, 0x20, 0xc9, 0xc7, 0x48, 0x0c, 0x4d,
+-		0x80, 0x35, 0x18, 0x10, 0x8b, 0xb2, 0x04, 0xd2,
+-		0x79, 0xc1, 0x6b, 0x33, 0x07, 0x99, 0x21, 0x3a,
+-		0xbf, 0x77, 0xfa, 0x6b, 0x53, 0xf4, 0x27, 0x25,
+-	}
+-};
+-
+-static int security_check_key_revoke_status(uint32_t key_index)
+-{
+-	uint8_t max_key_index = NUM_KEYS_IN_ROM, key_revoke;
+-	enum security_key_location key_location;
+-
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-	/*
+-	 * Key index ranges from:
+-	 * 0 - 4: if key location == ROM (0, 2, 3)
+-	 * 0 - 2: if key location == eFUSE (1)
+-	 * Except a value of 1 for EFUSE, rest all are
+-	 * routed into ROM, since thats the secure way.
+-	 */
+-	/* check efuse for key location */
+-	if (key_location == KEY_LOCATION_EFUSE)
+-		max_key_index = NUM_KEYS_IN_EFUSE;
+-
+-	if (key_index >= max_key_index)
+-		return -1;
+-
+-	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+-
+-	/* if the key is not revoked, return 1 */
+-	if ((key_revoke & BIT(key_index)) == 0)
+-		return 1;
+-
+-	/* no valid key found */
+-	return -1;
+-}
+-
+-int security_get_key_hash(uint32_t *hash, uint8_t key_index)
+-{
+-	uint32_t valid_key_base, max_key_index;
+-	int i;
+-	enum security_key_location key_location;
+-	uint32_t *ptr;
+-
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-
+-	/* check efuse for key location */
+-	if (key_location == KEY_LOCATION_EFUSE) {
+-		max_key_index = NUM_KEYS_IN_EFUSE;
+-
+-		if (key_index >= max_key_index)
+-			return -1;
+-
+-		/* read from efuse/SP SRAM */
+-		valid_key_base = (key_index * SECURITY_BYTE_PER_DWORD *
+-			SECURITY_DWORD_PER_KEY) + SECURITY_EFUSE_KEYS_OFFSET;
+-
+-		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
+-			*(hash + i) = sp_sram_readl(valid_key_base + (i *
+-					SECURITY_BYTE_PER_DWORD));
+-	} else {
+-		/*
+-		 * All other cases are routed into ROM, since it is
+-		 * the more secure way
+-		 */
+-		max_key_index = NUM_KEYS_IN_ROM;
+-
+-		if (key_index >= max_key_index)
+-			return -1;
+-
+-		/* read from ROM itself */
+-		ptr = (uint32_t *)rom_key_hashes[key_index];
+-		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
+-			*(hash + i) = ptr[i];
+-	}
+-
+-	return 1;
+-}
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+-int secureboot_verify_image(uint32_t image_size,
+-				uint32_t image_offset)
+-{
+-	int verify = 0, ret, key_index;
+-	unsigned char expected_hash[SHA384_SUM_LEN];
+-	unsigned char actual_hash[SHA384_SUM_LEN];
+-	uint32_t config_fuse;
+-	/* Public key is the total size of Public Key Props */
+-	uint32_t test_public_key_len = PUB_KEY_SZ;
+-	uint32_t test_sig_len = SIG_SIZE;
+-	uint32_t test_data_len = image_size;
+-	unsigned char *test_data = (unsigned char *)(image_offset);
+-	unsigned char *test_sig = test_data + test_data_len;
+-	unsigned char *ptr_key_index, *ptr_key_prop, *test_public_key;
+-
+-	/* check if the image size has minimum sized contents */
+-	if (test_data_len <= TOTAL_PUB_KEY_PROPS_SZ)
+-		return SECUREBOOT_VERIFY_VER_FAILED;
+-
+-	/* Key header is located as the last 2 DWORDS of the image */
+-	ptr_key_index = test_sig - KEY_PROP_HDR_SZ;
+-	ptr_key_prop = test_sig - TOTAL_PUB_KEY_PROPS_SZ;
+-	test_public_key =  ptr_key_prop;
+-
+-	uint32_t fw_version = base_readl((uint32_t)test_data);
+-
+-	/* check efuse for security validation enable */
+-	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
+-
+-	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
+-		return SECUREBOOT_VERIFY_SUCCESS;
+-
+-	/* check minimal valid security FW version */
+-	if (security_check_valid_fw_version(fw_version) !=
+-					SECURITY_FW_VERSION_SECURE)
+-		return SECUREBOOT_VERIFY_VER_FAILED;
+-
+-	key_index = *(uint32_t *)ptr_key_index;
+-
+-	ret = security_check_key_revoke_status(key_index);
+-	if (ret != 1)
+-		return SECUREBOOT_VERIFY_KEY_FAILED;
+-
+-	ret = security_get_key_hash((uint32_t *)expected_hash, key_index);
+-	if (ret != 1)
+-		return SECUREBOOT_VERIFY_KEY_FAILED;
+-
+-	/* check pub key hash versus efuse */
+-        sha384_csum(test_public_key, test_public_key_len, actual_hash, 0);
+-
+-        verify = memcmp(actual_hash, expected_hash, SHA384_SUM_LEN);
+-	if (verify)
+-		return SECUREBOOT_VERIFY_KEY_FAILED;
+-
+-	ret = rsa_verify(test_data, test_data_len, test_public_key,
+-			test_public_key_len, test_sig, test_sig_len);
+-
+-	/* 0 - SUCCESS, but arcboot main code, expects 1 for SUCCESS */
+-	if (!ret)
+-		return SECUREBOOT_VERIFY_SUCCESS;
+-
+-	return SECUREBOOT_VERIFY_FAILED;
+-}
+diff --git a/gaudi2_arc_gnu/security.c b/gaudi2_arc_gnu/security.c
+deleted file mode 100644
+index 86584bd..0000000
+--- a/gaudi2_arc_gnu/security.c
++++ /dev/null
+@@ -1,581 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#include "arcboot.h"
+-#include "security.h"
+-#include "efuse.h"
+-#include "security.h"
+-#include "spi_flash.h"
+-
+-#define GAUDI2_SECURITY_END_HBW_LSB		0xFFFFFFFF
+-#define GAUDI2_SECURITY_END_HBW_MSB		0xFFFFF
+-#define GAUDI2_SECURITY_START_HBW_LSB		0x0
+-#define GAUDI2_SECURITY_START_HBW_MSB		0x0
+-#define GAUDI2_DISABLE_PCIE_TRAFFIC		0x0
+-#define GAUDI2_ENABLE_PCIE_TRAFFIC		0x3
+-#define GAUDI2_SECURITY_LBW_MASK		0x7FFFFFF
+-#define GAUDI2_SECURITY_PSOC_START_LBW		0x0
+-#define GAUDI2_SECURITY_PSOC_END_LBW		0x7FFFFFF
+-#define GAUDI2_SECURITY_FLASH_START_HBW		0x1000007FF6000000ULL
+-#define GAUDI2_SECURITY_FLASH_END_HBW		0x1000007FF6200000ULL
+-#define GAUDI2_PSOC_START_LBW			0x0
+-#define GAUDI2_PSOC_END_LBW			0x7FFFFFF
+-
+-static void security_disable_i2c_s_mstr_if(void)
+-{
+-	/* override AXI prot bit by master IF to secure, unprivileged access */
+-	/* ovrd_en = 1, and overd_value of 0 */
+-	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
+-			mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* disable pcie traffic by writing 0 */
+-	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
+-
+-	/* Block Everything:
+-	 * Set MIN = 0x0
+-	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
+-	 */
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-}
+-
+-static void security_enable_i2c_s_mstr_if(void)
+-{
+-	/* don't override AXI prot bit by master IF */
+-	regmap_writel(0,
+-		mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* enable pcie traffic by writing 1 */
+-	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
+-
+-	/* enable access to all:
+-	 * MIN = 0xFFFFFFFFFFFFF
+-	 * MAX = 0
+-	 */
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-}
+-
+-static void security_enable_smi_mstr_if(void)
+-{
+-	/* 0: Disable access, 1: Enable Access */
+-	regmap_writel(1,
+-		mmPSOC_GLOBAL_CONF_SMI_ACCESS_EN);
+-
+-	/* enable pcie traffic by writing 1 */
+-	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
+-
+-	/* don't override AXI prot bit by master IF */
+-	regmap_writel(0,
+-		mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* enable access to all:
+-	 * MIN = 0xFFFFFFFFFFFFF
+-	 * MAX = 0
+-	 */
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-}
+-
+-static void security_disable_smi_mstr_if(void)
+-{
+-	/* 0: Disable access, 1: Enable Access */
+-	regmap_writel(0,
+-		mmPSOC_GLOBAL_CONF_SMI_ACCESS_EN);
+-
+-	/* override AXI prot bit by master IF to secure, unprivileged access */
+-	/* ovrd_en = 1, and overd_value of 0 */
+-	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
+-		mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* disable pcie traffic by writing 0 */
+-	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
+-
+-	/* Block Everything:
+-	 * Set MIN = 0x0
+-	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
+-	 */
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-}
+-
+-void security_disable_jtag_mstr_if(void)
+-{
+-
+-	/* override AXI prot bit by master IF to secure, unprivileged access */
+-	/* ovrd_en = 1, and overd_value of 0 */
+-	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
+-		mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* disable pcie traffic by writing 0 */
+-	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
+-
+-	/* Block Everything:
+-	 * Set MIN = 0x0
+-	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
+-	 */
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-}
+-
+-void security_enable_jtag_mstr_if(void)
+-{
+-	/* don't override AXI prot bit by master IF */
+-	regmap_writel(0, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* enable pcie traffic by writing 1 */
+-	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
+-
+-	/* enable access to all */
+-	/* MIN = 0xFFFFFFFFFFFFF
+-	 * MAX = 0
+-	 */
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-	/* LBW is not implemented for JT, so nothing to be done there */
+-}
+-
+-void security_disable_twi_if(void)
+-{
+-	security_disable_i2c_s_mstr_if();
+-	security_disable_smi_mstr_if();
+-}
+-
+-void security_enable_twi_if(void)
+-{
+-	security_enable_i2c_s_mstr_if();
+-	security_enable_smi_mstr_if();
+-}
+-
+-void security_jtag_dap(uint8_t status)
+-{
+-	regmap_writel(status, mmPSOC_CS_TRACE_SECURITY_CTRL);
+-}
+-
+-void security_debug_if_shared(void)
+-{
+-	/* There is no concept of shared engine in Gaudi2 */
+-}
+-
+-static void security_pcie_mstr_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
+-	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
+-
+-
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		/*
+-		 * No need to open any region. All access would be done
+-		 * through LBW
+-		 */
+-	} else {
+-		regmap_writel((flash_start & 0xFFFFFFFF),
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((flash_start >> 32),
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((flash_end & 0xFFFFFFFF),
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((flash_end >> 32),
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-		regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-		regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-}
+-
+-static void security_pcie_mstr_rr_lbw_config(uint8_t spi_controller_en)
+-{
+-	/* get lower [26:0] to program into LBW space */
+-	uint32_t psoc_security_start_lbw = (mmPSOC_SECURITY_BASE & 0x7FFFFFF);
+-	uint32_t psoc_security_end_lbw =
+-				(mmJT_MSTR_IF_RR_SHRD_HBW_BASE & 0x7FFFFFF);
+-	uint32_t psoc_qspi_base_start_lbw = (mmPSOC_QSPI_BASE & 0x7FFFFFF);
+-	uint32_t psoc_qspi_base_end_lbw = (mmPSOC_UART_0_BASE & 0x7FFFFFF);
+-
+-	regmap_writel(SECURITY_PSOC_START_LBW,
+-		mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(psoc_qspi_base_start_lbw,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(psoc_qspi_base_end_lbw,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(psoc_security_start_lbw,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-		regmap_writel(psoc_security_end_lbw,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
+-	} else {
+-		regmap_writel(psoc_security_start_lbw,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(psoc_security_end_lbw,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-	}
+-}
+-
+-void security_i2c_s_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	/* This can be done by eROM, since this is called,
+-	 * after the Image verification is failed for PRI/SEC
+-	 */
+-	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
+-	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
+-	uint64_t psoc_qspi_base_start = mmPSOC_QSPI_BASE >> 12;
+-	uint64_t psoc_qspi_base_end = mmPSOC_UART_0_BASE >> 12;
+-	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
+-	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
+-
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel((psoc_qspi_base_start & 0xFFFFFFFF),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((psoc_qspi_base_start >> 32),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((psoc_qspi_base_end & 0xFFFFFFFF),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((psoc_qspi_base_end >> 32),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel((flash_start & 0xFFFFFFFF),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((flash_start >> 32),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((flash_end & 0xFFFFFFFF),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((flash_end >> 32),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel((security_addr_start & 0xFFFFFFFF),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel((security_addr_start >> 32),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-
+-	regmap_writel((security_addr_end & 0xFFFFFFFF),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
+-	regmap_writel((security_addr_end >> 32),
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+-}
+-
+-void security_smi_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	/* This can be done by eROM, since this is called,
+-	 * after the Image verification is failed for PRI/SEC
+-	 */
+-	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
+-	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
+-	uint64_t psoc_qspi_base_start = mmPSOC_QSPI_BASE >> 12;
+-	uint64_t psoc_qspi_base_end = mmPSOC_UART_0_BASE >> 12;
+-	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
+-	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
+-
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel((psoc_qspi_base_start & 0xFFFFFFFF),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((psoc_qspi_base_start >> 32),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((psoc_qspi_base_end & 0xFFFFFFFF),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((psoc_qspi_base_end >> 32),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel((flash_start & 0xFFFFFFFF),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((flash_start >> 32),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((flash_end & 0xFFFFFFFF),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((flash_end >> 32),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel((security_addr_start & 0xFFFFFFFF),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel((security_addr_start >> 32),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-
+-	regmap_writel((security_addr_end & 0xFFFFFFFF),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
+-	regmap_writel((security_addr_end >> 32),
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+-}
+-
+-void security_jtag_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
+-	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
+-	uint64_t psoc_qspi_base_start = mmPSOC_QSPI_BASE >> 12;
+-	uint64_t psoc_qspi_base_end = mmPSOC_UART_0_BASE >> 12;
+-	uint64_t flash_start = GAUDI2_SECURITY_FLASH_START_HBW >> 12;
+-	uint64_t flash_end = GAUDI2_SECURITY_FLASH_END_HBW >> 12;
+-
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel((psoc_qspi_base_start & 0xFFFFFFFF),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((psoc_qspi_base_start >> 32),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((psoc_qspi_base_end & 0xFFFFFFFF),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((psoc_qspi_base_end >> 32),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel((flash_start & 0xFFFFFFFF),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel((flash_start >> 32),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-		regmap_writel((flash_end & 0xFFFFFFFF),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel((flash_end >> 32),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel((security_addr_start & 0xFFFFFFFF),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel((security_addr_start >> 32),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-
+-	regmap_writel((security_addr_end & 0xFFFFFFFF),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
+-	regmap_writel((security_addr_end >> 32),
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
+-	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+-}
+-
+-static void security_elbi_rr_lbw_config(uint8_t spi_controller_en)
+-{
+-	/* get lower [26:0] to program into LBW space */
+-	uint32_t psoc_security_start_lbw = (mmPSOC_SECURITY_BASE & 0x7FFFFFF);
+-	uint32_t psoc_security_end_lbw =
+-				(mmJT_MSTR_IF_RR_SHRD_HBW_BASE & 0x7FFFFFF);
+-	uint32_t psoc_qspi_base_start_lbw = (mmPSOC_QSPI_BASE & 0x7FFFFFF);
+-	uint32_t psoc_qspi_base_end_lbw = (mmPSOC_UART_0_BASE & 0x7FFFFFF);
+-
+-	regmap_writel(SECURITY_PSOC_START_LBW,
+-		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(psoc_qspi_base_start_lbw,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(psoc_qspi_base_end_lbw,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(psoc_security_start_lbw,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-		regmap_writel(psoc_security_end_lbw,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
+-	} else {
+-		regmap_writel(psoc_security_start_lbw,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(psoc_security_end_lbw,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-	}
+-}
+-
+-void security_pcie_rr_config(uint8_t spi_en)
+-{
+-	regmap_writel(PCIE_WRAP_PCIE_PROT_OVR_WR_EN_MASK |
+-		      PCIE_WRAP_PCIE_PROT_OVR_RD_EN_MASK,
+-		      mmPCIE_WRAP_PCIE_PROT_OVR);
+-
+-	/* NO Shared Initiator bits for Gaudi2, hence no need to set the mask */
+-
+-	security_elbi_rr_lbw_config(spi_en);
+-	security_pcie_mstr_rr_hbw_config(spi_en);
+-	security_pcie_mstr_rr_lbw_config(spi_en);
+-}
+-
+-void rom_get_hash(uint32_t *key_hash)
+-{
+-	uint32_t *ptr = (uint32_t *)rom_key_hashes;
+-	int size = NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY;
+-
+-	for (int i = 0; i < size; i++)
+-		*(key_hash + i) = *(ptr + i);
+-}
+-
+-static void security_store_keys_in_psoc(uint8_t max_keys, uint32_t *hash)
+-{
+-	/*
+-	 * Just store the top 256 bits of each hash, due to the
+-	 * limited space available in PSOC Security
+-	 */
+-	uint8_t max_dwords_stored = NUM_DWORDS_AVLBL_IN_PSOC_SEC, i, j;
+-	uint32_t key_soc_location_base;
+-	uint32_t key_address[] = {
+-		mmPSOC_SECURITY_HABANA_KEY_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_3_0
+-	};
+-
+-	for (i = 0; i < max_keys; i++) {
+-		key_soc_location_base = key_address[i];
+-		for (j = 0; j < max_dwords_stored; j++) {
+-			regmap_writel(hash[(i * SECURITY_DWORD_PER_KEY) + j],
+-					key_soc_location_base);
+-			key_soc_location_base += sizeof(uint32_t);
+-		}
+-	}
+-}
+-
+-void security_load_keys(void)
+-{
+-	uint8_t hash_key_index, num_dwords, max_keys = NUM_KEYS_IN_ROM;
+-	uint32_t key_hash[NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY];
+-	enum security_key_location key_location;
+-
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-
+-	arcboot_rom_status_update(PROGRESS_KEY_LOC);
+-	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
+-
+-	switch (key_location) {
+-	case KEY_LOCATION_EFUSE:
+-		max_keys = NUM_KEYS_IN_EFUSE;
+-		efuse_get_hash(key_hash);
+-		break;
+-	case KEY_LOCATION_ROM:
+-	default:
+-		rom_get_hash(key_hash);
+-		break;
+-	}
+-
+-	/* store hashes in the limited space available in PSOC_SECURITY */
+-	security_store_keys_in_psoc(max_keys, key_hash);
+-
+-	/* ROM Keys are already in ROM, no need to store them explicitly */
+-	if (key_location == KEY_LOCATION_EFUSE) {
+-		/* Store the efuse keys in SPSRAM */
+-		num_dwords = NUM_KEYS_IN_EFUSE * SECURITY_DWORD_PER_KEY;
+-		for (hash_key_index = 0; hash_key_index < num_dwords;
+-						hash_key_index++)
+-			sp_sram_writel(key_hash[hash_key_index],
+-			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
+-			       SECURITY_BYTE_PER_DWORD));
+-	}
+-}
+-
+-void check_and_enable_4b_termination(void)
+-{
+-	/* Not needed for Gaudi2 */
+-}
+-
+-void security_disable_interfaces(void)
+-{
+-	/* by default disable jtag I/F as soon as possible */
+-	security_disable_jtag_if();
+-
+-	/* by default disable TWI I/F as soon as possible */
+-	security_disable_twi_if();
+-}
+-
+-void security_handle_twi(void)
+-{
+-	if ((arcboot_rom_global.config_fuse &
+-			EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0)
+-		security_enable_twi_if();
+-}
+-
+-void security_disable_jtag_if(void)
+-{
+-	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
+-	security_disable_jtag_mstr_if();
+-}
+-
+-void security_enable_jtag_if(void)
+-{
+-	security_jtag_dap(SECURITY_JTAG_DAP_ENABLE);
+-	security_enable_jtag_mstr_if();
+-}
+diff --git a/gaudi2_arc_gnu/soc.h b/gaudi2_arc_gnu/soc.h
+deleted file mode 100644
+index 04a8713..0000000
+--- a/gaudi2_arc_gnu/soc.h
++++ /dev/null
+@@ -1,54 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#ifndef _SOC_H_
+-#define _SOC_H_
+-#include <gaudi2_regs.h>
+-
+-#define CPU_FREQ			500000000
+-#define CPU_FREQ_US			500	/* CPU_FREQ / 1000000 */
+-
+-#define FW_SIZE				65535
+-#define SIG_SIZE			384
+-#define KEY_SIZE			784
+-#define BLOB_START			4
+-
+-#define SPI_FLASH_BLOCK_SIZE		1024
+-
+-/* 2MB for Gaudi2 */
+-#define FLASH_VALID_MASK		0x1FFFFF
+-#define FLASH_VALID_OFFSET		0
+-#define FLASH_VALID_MAX_SIZE		0x200000
+-
+-#define HL_SRAM_BASE			0x1000007FF0000000ULL
+-#define HL_SP_SRAM_BASE			0x1000007FF7FE0000ULL
+-#define HL_SRAM_PHY_BASE		0x1000FFFFFD000000ULL
+-
+-/*
+- * This is not SDRAM Base, but the base address of General region
+- * into which the rest of the components are mapped
+- */
+-#define HL_SDRAM_BASE			0x20000000
+-#define HL_SRAM_LOG_BASE		0x11000000
+-
+-#define HL_FLASH_OFFSET			0x6000000
+-#define HL_ICCM_OFFSET			0x7040000
+-#define HL_SBROM_OFFSET			0x7FC0000
+-#define HL_FWSRAM_OFFSET		0x7FD0000
+-#define HL_SCRATCHPAD_SRAM_OFFSET	0x7FE0000
+-#define HL_PCIE_FWSRAM_OFFSET		0x7FF0000
+-#define HL_CFG_BASE			0xF8000000
+-#define HL_ICCM_BASE			(HL_SRAM_BASE + HL_ICCM_OFFSET)
+-
+-#define HL_ICCM_SIZE			0x20000
+-#define HL_SP_SRAM_SIZE			0x10000
+-#define HL_SRAM_PHY_SIZE		0x2FFFFF
+-
+-#define HL_ICCM_END			(HL_ICCM_BASE + HL_ICCM_SIZE - 1)
+-#define HL_SP_SRAM_END			(HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE - 1)
+-#define HL_SRAM_PHY_END			(HL_SRAM_PHY_BASE +\
+-					HL_SRAM_PHY_SIZE - 1)
+-
+-#endif /* _SOC_H_ */
+diff --git a/greco_arc/Makefile b/greco_arc/Makefile
+deleted file mode 100644
+index e69de29..0000000
+--- a/greco_arc/Makefile
++++ /dev/null
+diff --git a/greco_arc/arcboot_ram.lds b/greco_arc/arcboot_ram.lds
+deleted file mode 100644
+index 3630a3f..0000000
+--- a/greco_arc/arcboot_ram.lds
++++ /dev/null
+@@ -1,90 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
+-	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
+-	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+-	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+-}
+-
+-REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	.text : {
+-		app/crt0_ram.o (.text*)
+-		*(.text .text.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data = .;
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+\ No newline at end of file
+diff --git a/greco_arc/arcboot_rom.lds b/greco_arc/arcboot_rom.lds
+deleted file mode 100644
+index cce0716..0000000
+--- a/greco_arc/arcboot_rom.lds
++++ /dev/null
+@@ -1,98 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
+-	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
+-	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+-	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+-}
+-
+-REGION_ALIAS("REGION_IVT",	SBROM)
+-REGION_ALIAS("REGION_TEXT",	SBROM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	_dccm_begin = ORIGIN(DCCM);
+-	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+-
+-	.ivt : {
+-		KEEP (*(.ivt));
+-	} > REGION_IVT
+-
+-	.text : {
+-		app/crt0_rom.o (.text*)
+-		*(.text .text.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data = .;
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 5k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 2k)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+\ No newline at end of file
+diff --git a/greco_arc/asic.c b/greco_arc/asic.c
+deleted file mode 100644
+index 3f6ceaa..0000000
+--- a/greco_arc/asic.c
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+diff --git a/greco_arc/asic_arcboot_ram.lds b/greco_arc/asic_arcboot_ram.lds
+deleted file mode 100644
+index c960869..0000000
+--- a/greco_arc/asic_arcboot_ram.lds
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+- INCLUDE arcboot_ram.lds
+\ No newline at end of file
+diff --git a/greco_arc/asic_arcboot_rom.lds b/greco_arc/asic_arcboot_rom.lds
+deleted file mode 100644
+index d49acc6..0000000
+--- a/greco_arc/asic_arcboot_rom.lds
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+- INCLUDE arcboot_rom.lds
+\ No newline at end of file
+diff --git a/greco_arc/common.c b/greco_arc/common.c
+deleted file mode 100644
+index b409f6b..0000000
+--- a/greco_arc/common.c
++++ /dev/null
+@@ -1,179 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <unistd.h>
+-#include <efuse.h>
+-#include <pcie.h>
+-#include <psoc_efuse_regs.h>
+-#include <psoc_global_conf_masks.h>
+-#include <arcboot.h>
+-
+-#define IATU_BASE				(mmPCIE_DBI_BASE & 0xFFFFFF)
+-#define IATU_REGION_CTRL_1_OFF_INBOUND		(IATU_BASE + 0x100)
+-#define IATU_REGION_CTRL_2_OFF_INBOUND		(IATU_BASE + 0x104)
+-#define IATU_LWR_TARGET_ADDR_OFF_INBOUND	(IATU_BASE + 0x114)
+-#define IATU_UPPER_TARGET_ADDR_OFF_INBOUND	(IATU_BASE + 0x118)
+-
+-uint32_t get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+-}
+-
+-uint32_t get_mem_cfg_mask(void)
+-{
+-	return PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK;
+-}
+-
+-uint32_t get_fld_size_shift(void)
+-{
+-	return PSOC_GLOBAL_CONF_SPI_DMA_CTRL_FLD_SIZE_SHIFT;
+-}
+-
+-void update_warm_reset_config(void)
+-{
+-	uint32_t reg;
+-	reg = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+-	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_ARC_MASK;
+-	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_PSOC_MASK;
+-	regmap_writel(reg, mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+-}
+-
+-uint8_t get_sris_mode_from_strap(void)
+-{
+-	uint32_t boot_strap;
+-
+-	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+-
+-	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK);
+-}
+-
+-void enable_flr_handling_fsm(void)
+-{
+-	uint32_t flr_ctrl = regmap_readl(mmPCIE_AUX_FLR_CTRL);
+-
+-	flr_ctrl |= (1 << PCIE_AUX_FLR_CTRL_FSM_EN_SHIFT);
+-	regmap_writel(flr_ctrl, mmPCIE_AUX_FLR_CTRL);
+-}
+-
+-void pcie_config_iatu(void)
+-{
+-	regmap_writel(0x300000, mmPCIE_AUX_DBI);
+-	regmap_writel(0xF0000000, IATU_LWR_TARGET_ADDR_OFF_INBOUND);
+-	regmap_writel(0x7F, IATU_UPPER_TARGET_ADDR_OFF_INBOUND);
+-	regmap_writel(0, IATU_REGION_CTRL_1_OFF_INBOUND);
+-	regmap_writel(0xC0080000, IATU_REGION_CTRL_2_OFF_INBOUND);
+-}
+-
+-void pcie_phy_para_sel_set(void)
+-{
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+-}
+-
+-void pcie_wait_for_sram_init_done(void)
+-{
+-	uint8_t sram_init_done = 0;
+-
+-	do {
+-		sram_init_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
+-	} while (sram_init_done != 1);
+-
+-	sram_init_done = 0;
+-	do {
+-		sram_init_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
+-	} while (sram_init_done != 1);
+-}
+-
+-void pcie_phy_set_sram_ext_ld_done(void)
+-{
+-	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
+-	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
+-}
+-
+-void pcie_phy_set_mpll_a_b_ssc_enable(void)
+-{
+-
+-	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
+-			mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
+-	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
+-			mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
+-}
+-
+-void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
+-{
+-	uint32_t reg;
+-
+-	if (separate_reference) {
+-		reg = 0xA0;
+-		regmap_writel(0x00250025,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
+-		regmap_writel(0x00250025,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-	} else {
+-		reg = 0x50;
+-		regmap_writel(0x01C301C3,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-	}
+-
+-	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
+-	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
+-}
+-
+-void pcie_phy_set_ext_tx_rx_ctrl(void)
+-{
+-	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
+-			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
+-
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
+-}
+-
+-void pcie_phy_set_protocol0_ext_tx_rx(void)
+-{
+-	regmap_writel(0x30,
+-		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
+-	regmap_writel(0x30,
+-		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
+-	regmap_writel(0x30,
+-		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
+-	regmap_writel(0x30,
+-		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
+-		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
+-
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
+-}
+-uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
+-{
+-	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK);
+-}
+-
+-uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
+-{
+-	return (!!(boot_strap &
+-			PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK));
+-}
+-
+-void arcboot_rom_request_cpld_wdog(void)
+-{
+-	/* Do this after boot rom code, since it is beyond TO */
+-}
+-
+-void arcboot_rom_clear_sw_status(void)
+-{
+-	/* Do this after boot rom code, since it is beyond TO */
+-}
+diff --git a/greco_arc/dev_efuse.h b/greco_arc/dev_efuse.h
+deleted file mode 100644
+index 11a630a..0000000
+--- a/greco_arc/dev_efuse.h
++++ /dev/null
+@@ -1,24 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#define EFUSE_KEY_HASH_OFFSET			0x12
+-#define EFUSE_SYSCFG_ENABLE_4B_TERMINATION	BIT(25)
+-#define EFUSE_SYSCFG_FW_VERSION_LOCATION	13
+-#define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK	0x3
+-#define EFUSE_SYSCFG_KEY_LOCATION		7
+-#define EFUSE_SYSCFG_KEY_LOCATION_MASK		0x3
+-#define EFUSE_SYSCFG_REVOKATION_LOCATION	5
+-#define EFUSE_SYSCFG_REVOKATION_LOCATION_MASK	0x3
+-
+-#define EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI	BIT(14)
+-#define EFUSE_SYSCFG_KEY_LOCATION_SPI		BIT(8)
+-#define EFUSE_SYSCFG_REVOKATION_LOCATION_SPI	BIT(6)
+-
+-#define EFUSE_SYSCFG_DEFAULT	(EFUSE_SYSCFG_SPI_CONTROLLER | \
+-				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
+-				 EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_ENABLE_4B_TERMINATION)
+diff --git a/greco_arc/dev_security.h b/greco_arc/dev_security.h
+deleted file mode 100644
+index c5f4711..0000000
+--- a/greco_arc/dev_security.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _GRECO_DEV_SECURITY_H_
+-#define _GRECO_DEV_SECURITY_H_
+-
+-#define SECURITY_DWORD_PER_KEY				8
+-#define SECURITY_KEY_HASH_COUNT				5
+-
+-#endif /* _GRECO_DEV_SECURITY_H_ */
+diff --git a/greco_arc/onix.c b/greco_arc/onix.c
+deleted file mode 100644
+index 50aaae6..0000000
+--- a/greco_arc/onix.c
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include <unistd.h>
+-#include "arcboot.h"
+-#include "efuse.h"
+-
+-#define EFUSE_SYSCFG_ONIX_DEFAULT \
+-				(EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
+-				 EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL)
+-
+-int fuse_read(uint32_t word, uint32_t *val)
+-{
+-	int ret = -1;
+-
+-	if (word == EFUSE_SYSCFG_OFFSET) {
+-		*val = EFUSE_SYSCFG_ONIX_DEFAULT;
+-		ret = 0;
+-	}
+-
+-	return ret;
+-}
+diff --git a/greco_arc/onix_arcboot_ram.lds b/greco_arc/onix_arcboot_ram.lds
+deleted file mode 100644
+index c960869..0000000
+--- a/greco_arc/onix_arcboot_ram.lds
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+- INCLUDE arcboot_ram.lds
+\ No newline at end of file
+diff --git a/greco_arc/onix_arcboot_rom.lds b/greco_arc/onix_arcboot_rom.lds
+deleted file mode 100644
+index fdb13f0..0000000
+--- a/greco_arc/onix_arcboot_rom.lds
++++ /dev/null
+@@ -1,13 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-INCLUDE arcboot_rom.lds
+-
+-MEMORY
+-{
+-	SBROM	: ORIGIN = 0x10000000, LENGTH = 64K
+-}
+diff --git a/greco_arc/pldm.c b/greco_arc/pldm.c
+deleted file mode 100644
+index 3f6ceaa..0000000
+--- a/greco_arc/pldm.c
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+diff --git a/greco_arc/pldm_arcboot_ram.lds b/greco_arc/pldm_arcboot_ram.lds
+deleted file mode 100644
+index c960869..0000000
+--- a/greco_arc/pldm_arcboot_ram.lds
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+- INCLUDE arcboot_ram.lds
+\ No newline at end of file
+diff --git a/greco_arc/pldm_arcboot_rom.lds b/greco_arc/pldm_arcboot_rom.lds
+deleted file mode 100644
+index d49acc6..0000000
+--- a/greco_arc/pldm_arcboot_rom.lds
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+- INCLUDE arcboot_rom.lds
+\ No newline at end of file
+diff --git a/greco_arc/secureboot.c b/greco_arc/secureboot.c
+deleted file mode 100644
+index dc7bbf8..0000000
+--- a/greco_arc/secureboot.c
++++ /dev/null
+@@ -1,94 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include <stdio.h>
+-#include "sb.h"
+-#include "arcboot.h"
+-#include "efuse.h"
+-#include "secureboot.h"
+-#include "security.h"
+-
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+-int secureboot_verify_image(uint32_t image_size, uint32_t image_offset)
+-{
+-	int verify = 0;
+-	int err = 0;
+-	int key_scan;
+-	unsigned char block_buf[SECUREBOOT_HASH_BLOCK_CALC_BUF];
+-	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
+-	uint32_t config_fuse;
+-	uint16_t test_phase0b_data_len = image_size;
+-	uint32_t test_phase0b_sig_len = SIG_SIZE;
+-	uint32_t test_public_key_len = KEY_SIZE;
+-
+-	unsigned char *test_phase0b_data = (unsigned char *)(image_offset);
+-	unsigned char *test_phase0b_sig = test_phase0b_data +
+-					  test_phase0b_data_len;
+-	unsigned char *test_public_key = test_phase0b_sig -
+-					 test_public_key_len;
+-	uint32_t fw_version = base_readl((uint32_t)test_phase0b_data);
+-
+-	/* check efuse for security validation enable */
+-	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
+-	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
+-		return SECUREBOOT_VERIFY_SUCCESS;
+-
+-	/* check minimal valid security FW version */
+-	if (security_check_valid_fw_version(fw_version) !=
+-	    SECURITY_FW_VERSION_SECURE)
+-		return SECUREBOOT_VERIFY_VER_FAILED;
+-
+-	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
+-	     SECUREBOOT_HABANA_KEY; key_scan--) {
+-		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
+-					  key_scan)) {
+-			/* check pub key hash versus efuse */
+-			err = elp_secureboot_phase0a(sb_proxy_read,
+-						     test_public_key,
+-						     test_public_key_len,
+-						     test_phase0a_hash,
+-						     &verify, block_buf,
+-						     sizeof(block_buf));
+-		}
+-		/* if key is verified we can exit the loop */
+-		if (verify)
+-			break;
+-	}
+-	/* if for loop doesn't find a valid key hash in fuse, return error */
+-	if (!verify)
+-		return SECUREBOOT_VERIFY_KEY_FAILED;
+-
+-	/* Phase0b uses the public key (test_public_key) to validate signature
+-	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
+-	 */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data,
+-				     test_phase0b_data_len, test_public_key,
+-				     test_public_key_len, test_phase0b_sig,
+-				     test_phase0b_sig_len, &verify,
+-				     block_buf, sizeof(block_buf));
+-
+-	if (err || !verify)
+-		return SECUREBOOT_VERIFY_FAILED;
+-
+-	return verify;
+-}
+diff --git a/greco_arc/security.c b/greco_arc/security.c
+deleted file mode 100644
+index 1ac70fe..0000000
+--- a/greco_arc/security.c
++++ /dev/null
+@@ -1,496 +0,0 @@
+-/*
+- * Copyright 2016-2019 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- *
+- * SPDX-License-Identifier:	GPL-2.0+
+- */
+-
+-#include "arcboot.h"
+-#include "security.h"
+-#include "efuse.h"
+-#include "security.h"
+-#include "spi_flash.h"
+-
+-static void security_disable_i2c_s_mstr_if(void)
+-{
+-	/* set AXUSER to shared */
+-	regmap_writel(I2C_S_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-	      mmI2C_S_MSTR_IF_AXUSER_CORE);
+-	/* override AXI prot bit by master IF to secure, unprivlaged access */
+-	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
+-		      mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-	/* enable access to PSOC_SECURITY only */
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-}
+-
+-static void security_disable_smi_mstr_if(void)
+-{
+-	regmap_writel(SMI_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-	      mmSMI_MSTR_IF_AXUSER_CORE);
+-	/* override AXI prot bit by master IF to secure, unprivlaged access */
+-	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
+-		      mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-	/* enable access to PSOC_SECURITY only */
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-}
+-
+-void security_disable_jtag_mstr_if(void)
+-{
+-	regmap_writel(JT_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-		      mmJT_MSTR_IF_AXUSER_CORE);
+-
+-	/* override AXI prot bit by master IF to secure, unprivlaged access */
+-	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
+-		      mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-	/* enable access to PSOC_SECURITY only */
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-
+-	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-}
+-
+-void security_enable_jtag_mstr_if(void)
+-{
+-	regmap_writel(0, mmJT_MSTR_IF_AXUSER_CORE);
+-	/* don't override AXI prot bit by master IF */
+-	regmap_writel(0, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-
+-	/* enable access to all */
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-}
+-
+-void security_disable_twi_if(void)
+-{
+-	security_disable_i2c_s_mstr_if();
+-	security_disable_smi_mstr_if();
+-}
+-
+-void security_jtag_dap(uint8_t status)
+-{
+-	/* close dap WA jira: H5-1803 */
+-	regmap_writel(status, mmPSOC_CS_TRACE_SPECIAL_GLBL_SPARE_0);
+-}
+-
+-void security_debug_if_shared(void)
+-{
+-	/* Configure SMI,I2C and JTAG to be "shared" engine */
+-	regmap_writel(I2C_S_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-		      mmI2C_S_MSTR_IF_AXUSER_CORE);
+-	regmap_writel(SMI_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-		      mmSMI_MSTR_IF_AXUSER_CORE);
+-	regmap_writel(JT_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-		      mmJT_MSTR_IF_AXUSER_CORE);
+-	regmap_writel(MSTR_IF_AXUSER_CORE_SHARED,
+-		      mmPSOC_MSTR_IF_AXUSER_CORE);
+-}
+-
+-static void security_dcon_rr_lbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_LBW,
+-		mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(SECURITY_QSPI_END_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
+-	} else {
+-		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-		       mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-	}
+-}
+-
+-static void security_dcon_if0_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_HBW,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_QSPI_END_HBW,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel(SECURITY_FLASH_START_HBW,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_FLASH_END_HBW,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-}
+-
+-static void security_dcon_if1_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_HBW,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_QSPI_END_HBW,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel(SECURITY_FLASH_START_HBW,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_FLASH_END_HBW,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		   mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-}
+-
+-void security_i2c_s_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_HBW,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_QSPI_END_HBW,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel(SECURITY_FLASH_START_HBW,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_FLASH_END_HBW,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+-}
+-
+-static void security_elbi_rr_lbw_config(
+-				uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_LBW,
+-		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(SECURITY_QSPI_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
+-	} else {
+-		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-	}
+-}
+-
+-void security_smi_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_HBW,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_QSPI_END_HBW,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel(SECURITY_FLASH_START_HBW,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_FLASH_END_HBW,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+-}
+-
+-void security_jtag_rr_hbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+-	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_HBW,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_QSPI_END_HBW,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	} else {
+-		regmap_writel(SECURITY_FLASH_START_HBW,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+-		regmap_writel(SECURITY_FLASH_END_HBW,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
+-		regmap_writel(SECURITY_HBW_MSB_ZERO,
+-			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
+-	}
+-
+-	regmap_writel(SECURITY_PSOC_SECURITY_START_HBW,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+-	regmap_writel(SECURITY_PSOC_SECURITY_END_HBW,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
+-	regmap_writel(SECURITY_HBW_MSB_ZERO,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
+-	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
+-	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
+-		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+-}
+-
+-void security_pcie_rr_config(uint8_t spi_en)
+-{
+-	regmap_writel(PCIE_WRAP_PCIE_PROT_OVR_WR_EN_MASK |
+-		      PCIE_WRAP_PCIE_PROT_OVR_RD_EN_MASK,
+-		      mmPCIE_WRAP_PCIE_PROT_OVR);
+-	regmap_writel(PCIE_MSTR_RR_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-		      mmPCIE_MSTR_RR_MSTR_IF_AXUSER_CORE);
+-	security_elbi_rr_lbw_config(spi_en);
+-	security_dcon_rr_lbw_config(spi_en);
+-	security_dcon_if0_rr_hbw_config(spi_en);
+-	security_dcon_if1_rr_hbw_config(spi_en);
+-}
+-
+-uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
+-{
+-	uint32_t ret;
+-	uint8_t key_soc_base_index;
+-	uint8_t key_soc_location_index;
+-	uint32_t key_soc_location[] = {
+-		mmPSOC_SECURITY_HABANA_KEY_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_3_0
+-	};
+-
+-	/* select which index to choose (haban, customer 0-4) */
+-	key_soc_base_index = hash_key_index / SECURITY_DWORD_PER_KEY;
+-	/* key is 256bit, 32bit * 8... which of the 8 location is requested */
+-	key_soc_location_index = hash_key_index % SECURITY_DWORD_PER_KEY;
+-
+-	/* get base address of selected key index */
+-	ret = key_soc_location[key_soc_base_index];
+-	/* add to base address of key the spicifice location of currect DWORD */
+-	ret += (key_soc_location_index * sizeof(uint32_t));
+-	return ret;
+-}
+-
+-void security_load_keys(void)
+-{
+-	uint8_t hash_key_index;
+-	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
+-	enum security_location key_location;
+-
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-
+-	arcboot_rom_status_update(PROGRESS_KEY_LOC);
+-	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
+-
+-	switch (key_location) {
+-	case SPI_FLASH:
+-		spi_flash_get_hash(key_hash);
+-		break;
+-	case SPI_OTP:
+-		spi_flash_otp_access(FLASH_OTP_ENABLE);
+-		spi_flash_otp_get_hash(key_hash);
+-		spi_flash_otp_access(FLASH_OTP_DISABLE);
+-		break;
+-	case ASIC_EFUSE:
+-	default:
+-		efuse_get_hash(key_hash);
+-		break;
+-	}
+-
+-	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
+-	     hash_key_index++) {
+-		/* store habana key hash in PSOC_SECURITY */
+-		regmap_writel(key_hash[hash_key_index],
+-			      security_key_soc_location_offset(hash_key_index));
+-		/* store key hashes in Scratch PAD Sram */
+-		sp_sram_writel(key_hash[hash_key_index],
+-			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
+-			       SECURITY_BYTE_PER_DWORD));
+-	}
+-}
+-
+-void check_and_enable_4b_termination(void)
+-{
+-	uint32_t spare0;
+-	/*
+-	 * check and enable 4B termination
+-	 * set bit[1] of mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0 register
+-	 * to enable LBW 4B termination.
+-	 */
+-	if (arcboot_rom_global.config_fuse &
+-				EFUSE_SYSCFG_ENABLE_4B_TERMINATION) {
+-
+-		spare0 = regmap_readl(mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
+-		spare0 |= BIT(1);
+-		regmap_writel(spare0, mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
+-	}
+-}
+-
+-void security_handle_twi(void)
+-{
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_TWI_IF_MASK)
+-		security_disable_twi_if();
+-}
+-
+-void security_disable_jtag_if(void)
+-{
+-	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
+-	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
+-	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
+-	security_disable_jtag_mstr_if();
+-}
+-
+-void security_enable_jtag_if(void)
+-{
+-	regmap_writel(0xFFFFFFFF, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
+-	regmap_writel(0xFFFFFFFF, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
+-	security_jtag_dap(SECURITY_JTAG_DAP_ENABLE);
+-	security_enable_jtag_mstr_if();
+-}
+diff --git a/greco_arc/soc.h b/greco_arc/soc.h
+deleted file mode 100644
+index 8ef900d..0000000
+--- a/greco_arc/soc.h
++++ /dev/null
+@@ -1,41 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#ifndef _SOC_H_
+-#define _SOC_H_
+-#include <goya2_regs.h>
+-
+-#define CPU_FREQ	500000000
+-#define CPU_FREQ_US	500	/* CPU_FREQ / 1000000 */
+-#define PREBOOT_ADDR_H	0x7F
+-#define PREBOOT_ADDR_L	0xF0000000
+-
+-#define FW_SIZE					65535
+-#define SIG_SIZE				384
+-#define KEY_SIZE				392
+-#define BLOB_START				4
+-
+-#define SPI_FLASH_BLOCK_SIZE			1024
+-
+-/* 16MB for Greco */
+-#define FLASH_VALID_MASK			0xFFFFFF
+-#define FLASH_VALID_OFFSET			0
+-#define FLASH_VALID_MAX_SIZE			0x1000000
+-
+-#define HL_SRAM_BASE				0x7FF0000000ULL
+-#define HL_SP_SRAM_BASE            		0x7FFBFE0000ULL
+-#define HL_SDRAM_BASE				0x10000000
+-#define HL_FLASH_OFFSET				0xA000000
+-#define HL_ICCM_OFFSET				0xB020000
+-#define HL_SBROM_OFFSET				0xB040000
+-#define HL_FWSRAM_OFFSET			0xB050000
+-#define HL_SCRATCHPAD_SRAM_OFFSET		0xBFE0000
+-#define HL_PCIE_FWSRAM_OFFSET			0xBFF0000
+-
+-#define HL_CFG_BASE				0xFC000000
+-
+-#endif /* _SOC_H_ */

@@ -1,0 +1,88 @@
+From df9d5b02864829050ba8d645d90c381781f69b07 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 18 Sep 2024 15:51:12 +0300
+Subject: [PATCH] [FSW-9220] boot_desc: use spi offsets array
+
+Since the SPI offset of the primary image and the secondary image are
+different, but the pri and sec manifests are identical, both offsets
+are stored in each manifest.
+
+Change-Id: I2e05824a956f6785b93257b7e11b9e20a7d16214
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index a9b02d9..2f3d1cc 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -197,7 +197,8 @@
+ static uint32_t boot_desc_copy_desc(struct boot_desc *desc,
+ 				    struct hl_fw_img_desc *local_img_desc)
+ {
+-	desc->spi_offset = local_img_desc->offset;
++	desc->spi_offset[0] = local_img_desc->spi_offset[0];
++	desc->spi_offset[1] = local_img_desc->spi_offset[1];
+ 	desc->img_size = local_img_desc->size;
+ 	desc->loadaddr = ((uint64_t) local_img_desc->load_high << 32) |
+ 		local_img_desc->load_low;
+@@ -394,12 +395,14 @@
+ 				(fake_fuse_img_desc->magic.type > MAX_DIE_COUNT))
+ 				return BOOT_ROM_FAIL;
+ 
+-			fake_fuse_offset_array[index] = fake_fuse_base + fake_fuse_img_desc->offset;
++			fake_fuse_offset_array[index] = fake_fuse_base +
++				fake_fuse_img_desc->spi_offset[manifest_idx];
+ 		}
+ 	} else {
+ 		fake_fuse_img_desc = (struct hl_fw_img_desc *)(spi_manifest_consts.dest_addr_arc +
+ 			offset_array_base[die_id_index]);
+-		fake_fuse_offset_array[die_id_index] = fake_fuse_base + fake_fuse_img_desc->offset;
++		fake_fuse_offset_array[die_id_index] = fake_fuse_base +
++			fake_fuse_img_desc->spi_offset[manifest_idx];
+ 	}
+ 
+ 	return BOOT_ROM_SUCCESS;
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 5f81cff..8f0913f 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -19,7 +19,7 @@
+ 
+ struct boot_desc {
+ 	uint32_t desc_ver;
+-	uint32_t spi_offset;
++	uint32_t spi_offset[2];
+ 	uint32_t img_size;
+ 	uint64_t loadaddr;
+ 	uint8_t chksum[SHA384_SUM_LEN];
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 2033f56..c272687 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -48,7 +48,7 @@
+ 	    != BOOT_ROM_SUCCESS)
+ 		return BOOT_ROM_FAIL;
+ 
+-	err = boot_rom_spi_dma(desc->img_size, desc->spi_offset, desc->loadaddr,
++	err = boot_rom_spi_dma(desc->img_size, desc->spi_offset[manifest_idx], desc->loadaddr,
+ 			       false, false, 0);
+ 	if (boot_rom_process_dma_err(err, img_sts_base))
+ 		return BOOT_ROM_FAIL;
+@@ -279,7 +279,7 @@
+ 		!= BOOT_ROM_SUCCESS)
+ 			return BOOT_ROM_FAIL;
+ 
+-		err = boot_rom_spi_dma(desc.img_size, desc.spi_offset, desc.loadaddr,
++		err = boot_rom_spi_dma(desc.img_size, desc.spi_offset[manifest_idx], desc.loadaddr,
+ 				false, false, 0);
+ 		if (boot_rom_process_dma_err(err, img_sts_base))
+ 			return BOOT_ROM_FAIL;
+@@ -305,7 +305,7 @@
+ 	if (boot_desc_get_img_desc(manifest_idx, HL_FW_IMG_FAKE_EFUSE, &desc, 0) == BOOT_ROM_FAIL)
+ 		return 0;
+ 
+-	return desc.spi_offset;
++	return desc.spi_offset[manifest_idx];
+ }
+ 
+ enum boot_rom_status boot_flow_spi_efuse_manifest_init()

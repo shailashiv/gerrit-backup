@@ -1,0 +1,146 @@
+From fb4cd781e8ff6b23802e7026bb837a05dbdb3e03 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 14 Jun 2022 05:04:01 +0300
+Subject: [PATCH] [SW-89971] rom: update recovery rr config
+
+As per the updated security specification document, secured firmware
+update is not supported in rom recovery flow. For debug purpose, the
+rr config is updated to open the config space access when security
+is disabled.
+
+Change-Id: I60e323e7fa36a5c802c3a64fcc5d47ace37ab069
+---
+
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index fc5cecb..dc82639 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -164,7 +164,7 @@
+ 	int sec_en = security_efuse_security_en();
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_ROM_RECOVERY);
+ 
+-	if (!arcboot_rom_global.die_id)
++	if ((!sec_en) && (!arcboot_rom_global.die_id))
+ 		security_rr_recovery_config();
+ 
+ 	if (!sec_en)
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index c306c04..9ac7779 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -728,56 +728,6 @@
+ 		security_rr_twi_lbw_config(rr_ctx);
+ }
+ 
+-static void security_rr_recovery_lbw_config(void)
+-{
+-	/*
+-	 * PSOC_BTL to PSOC_SECURITY start
+-	 * 0300007FFC48C000 - 0300007FFC494000
+-	 */
+-	struct rom_rr_ctx rr_ctx = {
+-			.rr_idx = HL_SEC_LBW_RR_SHORT_1,
+-			.data_min = (uint32_t)mmD0_PSOC_BTL_BASE,
+-			.data_max = (uint32_t)mmD0_PSOC_SECURITY_BASE,
+-			.en_val = RR_PRIV_RANGE_EN,
+-	};
+-
+-	security_rr_config_lbw_if_common(&rr_ctx);
+-
+-	/*
+-	 * JT_MSTR_IF start to mmD0_PARC_ARC1_CFG_KMD_HW_DIRTY_STATUS
+-	 * 0300007FFC495000 - 0x0300007FFC4E3200
+-	 */
+-	rr_ctx.rr_idx = HL_SEC_LBW_RR_FULL_0;
+-	rr_ctx.data_min = (uint32_t)mmD0_JT_MSTR_IF_RR_HBW_BASE;
+-	rr_ctx.data_max = HL_CFG_BASE + mmD0_PARC_ARC1_CFG_KMD_HW_DIRTY_STATUS;
+-	security_rr_config_lbw_if_common(&rr_ctx);
+-
+-	/*
+-	 * ARC1_CFG_PF_PQ_PI base to CFG_END
+-	 * 0x0300007FFC4E3204 - 0x300007FFFFFF000
+-	 */
+-	rr_ctx.rr_idx = HL_SEC_LBW_RR_FULL_1;
+-	rr_ctx.data_min = HL_CFG_BASE + mmD0_PARC_ARC1_CFG_PF_PQ_PI;
+-	rr_ctx.data_max = RR_LBW_PRIV_RANGE_MAX_FULL_VAL;
+-	security_rr_config_lbw_if_common(&rr_ctx);
+-
+-	/*
+-	 * CFG_SPACE base to PSOC_GLOBAL_CONF base
+-	 * 0x0300007FE0000000 - 0x0300007FFC48B000
+-	 */
+-	rr_ctx.rr_idx = HL_SEC_LBW_RR_SHORT_0;
+-	rr_ctx.data_min = RR_LBW_PRIV_RANGE_MIN_SHORT_VAL;
+-	rr_ctx.data_max = (uint32_t)mmD0_PSOC_GLOBAL_CONF_BASE;
+-	security_rr_config_lbw_if_common(&rr_ctx);
+-
+-	/* RR config by HW is neutralized */
+-	rr_ctx.rr_idx = HL_SEC_LBW_RR_SHORT_13;
+-	rr_ctx.data_min = RR_DEFAULT_VAL;
+-	rr_ctx.data_max = RR_DEFAULT_VAL;
+-	rr_ctx.en_val = RR_PRIV_RANGE_DIS;
+-	security_rr_config_lbw_if_common(&rr_ctx);
+-}
+-
+ static void security_rr_config_hbw_if_common(struct rom_rr_ctx *rr_ctx)
+ {
+ 	security_rr_pcie_hbw_config(rr_ctx);
+@@ -791,40 +741,7 @@
+ 		security_rr_twi_hbw_config(rr_ctx);
+ }
+ 
+-#define BITS_PER_DWORD			32
+-static void security_rr_recovery_hbw_config(void)
+-{
+-	/* SRAM_END to HBW_MAX_VAL */
+-	struct rom_rr_ctx rr_ctx = {
+-		.rr_idx = HL_SEC_HBW_RR_SHORT_1,
+-		.data_min = (uint32_t)(SRAM_BASE_ADDR + SRAM_SIZE),
+-		.data_min_hi = (uint32_t)((SRAM_BASE_ADDR + SRAM_SIZE) >> BITS_PER_DWORD),
+-		.data_max = RR_HBW_PRIV_RANGE_MAX_LO_VAL,
+-		.data_max_hi = RR_HBW_PRIV_RANGE_MAX_HI_VAL,
+-		.en_val = RR_PRIV_RANGE_EN,
+-	};
+-
+-	security_rr_config_hbw_if_common(&rr_ctx);
+-
+-	/* HBW_MIN_VAL to SRAM_BEGIN */
+-	rr_ctx.rr_idx = HL_SEC_HBW_RR_SHORT_0;
+-	rr_ctx.data_min = RR_DEFAULT_VAL;
+-	rr_ctx.data_min_hi = RR_DEFAULT_VAL;
+-	rr_ctx.data_max = (uint32_t)SRAM_BASE_ADDR;
+-	rr_ctx.data_max_hi = (uint32_t)(SRAM_BASE_ADDR >> BITS_PER_DWORD);
+-	security_rr_config_hbw_if_common(&rr_ctx);
+-
+-	/* RR config by HW is neutralized */
+-	rr_ctx.rr_idx = HL_SEC_HBW_RR_SHORT_7;
+-	rr_ctx.data_min = RR_DEFAULT_VAL;
+-	rr_ctx.data_min_hi = RR_DEFAULT_VAL;
+-	rr_ctx.data_max = RR_DEFAULT_VAL;
+-	rr_ctx.data_max_hi = RR_DEFAULT_VAL;
+-	rr_ctx.en_val = RR_PRIV_RANGE_DIS;
+-	security_rr_config_hbw_if_common(&rr_ctx);
+-}
+-
+-static void security_rr_recovery_unsecured_config(void)
++void security_rr_recovery_config(void)
+ {
+ 	rr_ctx_lbw[RR_OPEN_ALL].rr_idx = HL_SEC_LBW_RR_SHORT_0;
+ 	security_rr_config_lbw_if_common(&rr_ctx_lbw[RR_OPEN_ALL]);
+@@ -837,16 +754,6 @@
+ 
+ 	rr_ctx_hbw[RR_OPEN_ALL].rr_idx = HL_SEC_HBW_RR_SHORT_7;
+ 	security_rr_config_hbw_if_common(&rr_ctx_hbw[RR_OPEN_ALL]);
+-}
+-
+-void security_rr_recovery_config(void)
+-{
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SECURITY_ENABLE_MASK) {
+-		security_rr_recovery_lbw_config();
+-		security_rr_recovery_hbw_config();
+-	} else {
+-		security_rr_recovery_unsecured_config();
+-	}
+ }
+ 
+ void check_and_enable_4b_termination(void) {}

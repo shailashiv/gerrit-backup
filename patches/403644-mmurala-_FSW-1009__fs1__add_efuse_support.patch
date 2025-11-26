@@ -1,0 +1,382 @@
+From 93c76e75c9fb45e48a5e233e5fbd74dead6ff6b9 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 14 Mar 2024 18:00:24 +0200
+Subject: [PATCH] [FSW-1009] fs1: add efuse support
+
+This patch added efuse support, bootrom will
+trigger fsm to start efuse data of size 256dwords
+(bank0 and bank1) copy from efuse device to psoc
+config space efuse data registers. if any failure
+in efuse read, system will goto halt.
+
+Change-Id: Ia9766ea1b24726a0b6d8cc9f194bfe1539a1f772
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index a4f4eaa..31e6add 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -16,6 +16,7 @@
+ 	.curr_img = 0,
+ 	.die_id = 0,
+ 	.die_type = INVALID_DIE_TYPE,
++	.fake_fuse_en = false,
+ };
+ 
+ struct boot_rom_manifest_s __attribute__((section (".rom_manifest_section")))boot_rom_manifest;
+@@ -24,6 +25,8 @@
+ {
+ 	boot_rom_init();
+ 
++	boot_rom_fuse();
++
+ 	boot_rom_security_init();
+ 
+ 	return 0;
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index b3e84cc..14b4125 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -6,4 +6,4 @@
+ 
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
+-
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index a65fc4d..91af5c7 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -16,6 +16,7 @@
+ #include <fs1_reg_mask.h>
+ #include <fs1_fw_if.h>
+ #include <status.h>
++#include <efuse.h>
+ 
+ uint8_t boot_rom_get_die_id(void)
+ {
+@@ -136,3 +137,44 @@
+ 	cold_rst_data.arc1_iccm_init_done = 1;
+ 	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ }
++
++void boot_rom_halt(void)
++{
++	while (1) {
++		/* TODO: uart print character 'h' */
++		wfe();
++	}
++}
++
++static void boot_rom_set_efuse_read(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	if (cold_rst_data.efuse_read_flag)
++		return;
++
++	/* efuse init successful, set cold flops */
++	cold_rst_data.efuse_read_flag = 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++void boot_rom_fuse(void)
++{
++	if (boot_rom_fuse_init() == BOOT_ROM_SUCCESS) {
++		boot_rom_set_efuse_read();
++	} else {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_INIT_FAIL);
++		boot_rom_halt();
++	}
++
++	if (boot_rom_fuse_read(IO_EFUSE_SYSCFG_OFFSET, &boot_rom_global.config_fuse) != BOOT_ROM_SUCCESS)
++		boot_rom_halt();
++
++	if(boot_rom_fuse_read(IO_EFUSE_SYSCFG2_OFFSET, &boot_rom_global.config2_fuse) != BOOT_ROM_SUCCESS)
++		boot_rom_halt();
++
++	/* TODO: FS1 SKU decession pending */
++
++	/* TODO: Enable FAKE FUSE & RMA support */
++}
+diff --git a/arch/fs1/arc/dev_efuse.c b/arch/fs1/arc/dev_efuse.c
+new file mode 100644
+index 0000000..4d6cbff
+--- /dev/null
++++ b/arch/fs1/arc/dev_efuse.c
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include "boot_rom.h"
++#include "mem_io.h"
++#include <fs1_blocks_linux_driver.h>
++#include <efuse_masks.h>
++#include <fs1_reg_map.h>
++#include <efuse_regs.h>
++#include <dev_efuse.h>
++#include "delay.h"
++
++void fuse_prog_range_config(void)
++{
++	regmap_writel(EFUSE_PROG_ADDRESS_LAST_M, IO0_H0_PSOC_EFUSE(mmEFUSE_PROG_ADDRESS));
++}
++
++void fuse_prog_read_address(void)
++{
++	regmap_writel(EFUSE_READ_ADDRESS_LAST_M, IO0_H0_PSOC_EFUSE(mmEFUSE_READ_ADDRESS));
++}
++
++uint32_t fuse_read_data(uint32_t offset)
++{
++	return regmap_readl(IO0_H0_PSOC_EFUSE(mmEFUSE_DATA_0) + offset);
++}
++
++uint32_t fuse_get_read_ctrl_reg_val(void)
++{
++	return regmap_readl(IO0_H0_PSOC_EFUSE(mmEFUSE_RD));
++}
++
++void fuse_set_read_ctrl_reg_val(uint32_t fsm_trigger)
++{
++	regmap_writel(fsm_trigger, IO0_H0_PSOC_EFUSE(mmEFUSE_RD));
++}
+diff --git a/arch/fs1/arc/dev_efuse.h b/arch/fs1/arc/dev_efuse.h
+new file mode 100644
+index 0000000..eae068b
+--- /dev/null
++++ b/arch/fs1/arc/dev_efuse.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_EFUSE_H_
++#define _DEV_EFUSE_H_
++
++#define FLASH_VALID_MASK			0x1FFFFF
++
++#define FUSE_READ_FSM_TRIGGER		0x1
++#define FUSE_DELAY_US				5
++#define FUSE_TIMEOUT_US				500
++#define FUSE_RETRIES				(FUSE_TIMEOUT_US / FUSE_DELAY_US)
++
++void fuse_prog_range_config(void);
++void fuse_prog_read_address(void);
++uint32_t fuse_get_read_ctrl_reg_val(void);
++void fuse_set_read_ctrl_reg_val(uint32_t fsm_trigger);
++uint32_t fuse_read_data(uint32_t offset);
++
++#endif /* _DEV_EFUSE_H_ */
+diff --git a/arch/fs1/arc/dev_spi_flash.c b/arch/fs1/arc/dev_spi_flash.c
+index f56be1e..efb317a 100644
+--- a/arch/fs1/arc/dev_spi_flash.c
++++ b/arch/fs1/arc/dev_spi_flash.c
+@@ -40,3 +40,12 @@
+ {
+ 	regmap_writel(write_limit, IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_WRITE_LIMIT));
+ }
++
++uint32_t spi_flash_readl(uint32_t offset)
++{
++	/* mask offset to valid range of flash */
++	offset &= FLASH_VALID_MASK;
++	uint32_t val = base_readl(HL_FLASH_BASE + offset);
++
++	return val;
++}
+diff --git a/arch/fs1/arc/dev_spi_flash.h b/arch/fs1/arc/dev_spi_flash.h
+new file mode 100644
+index 0000000..0ba4d90
+--- /dev/null
++++ b/arch/fs1/arc/dev_spi_flash.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_SPI_FLASH_H_
++#define _DEV_SPI_FLASH_H_
++
++void spi_flash_set_byte_swap(uint8_t enable);
++void spi_flash_set_baud_rate(uint8_t baud_rate);
++void spi_flash_set_write_limit(enum flash_write_limit write_limit);
++uint32_t spi_flash_readl(uint32_t offset);
++
++#endif /* _DEV_SPI_FLASH_H_ */
+diff --git a/common/efuse.c b/common/efuse.c
+new file mode 100644
+index 0000000..bdb18b1
+--- /dev/null
++++ b/common/efuse.c
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include "boot_rom.h"
++#include "efuse.h"
++#include "delay.h"
++
++uint32_t boot_rom_fuse_read(uint32_t word, uint32_t *val)
++{
++	uint32_t offset;
++
++	if (word > EFUSE_WORDS_PER_BANK)
++		return BOOT_ROM_CFG_ERROR;
++
++	if (boot_rom_global.efuse_read == 0)
++		return BOOT_ROM_CFG_ERROR;
++
++	if (boot_rom_global.fake_fuse_en)
++		return spi_flash_fuse_read(word, val);
++
++	/* read value from bank0 */
++	offset = (word * sizeof(uint32_t));
++	*val = fuse_read_data(offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((EFUSE_WORDS_PER_BANK + word) * sizeof(uint32_t));
++	*val |= fuse_read_data(offset);
++
++	return BOOT_ROM_SUCCESS;
++}
++
++uint32_t boot_rom_fuse_init(void)
++{
++	uint32_t i;
++
++	fuse_prog_read_address();
++	fuse_prog_range_config();
++
++	if (boot_rom_global.efuse_read == 1)
++		return BOOT_ROM_SUCCESS;
++
++	fuse_set_read_ctrl_reg_val(FUSE_READ_FSM_TRIGGER);
++
++	for (i = 0; i < FUSE_RETRIES; i++)
++		if (fuse_get_read_ctrl_reg_val())
++			udelay(FUSE_DELAY_US);
++		else
++			break;
++
++	if (i == FUSE_RETRIES)
++		return BOOT_ROM_TIMEOUT;
++
++	boot_rom_global.efuse_read = 1;
++
++	return BOOT_ROM_SUCCESS;
++}
+diff --git a/common/efuse.h b/common/efuse.h
+new file mode 100644
+index 0000000..f3bbe77
+--- /dev/null
++++ b/common/efuse.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _EFUSE_H_
++#define _EFUSE_H_
++
++#include <stdint.h>
++#include <dev_efuse.h>
++#include <spi_flash.h>
++#include <fs1_efuse.h>
++
++uint32_t boot_rom_fuse_read(uint32_t word, uint32_t *val);
++uint32_t boot_rom_fuse_init(void);
++
++#endif /* _EFUSE_H_ */
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index 37c4b6b..9d6e0d3 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -4,8 +4,10 @@
+  * All Rights Reserved.
+  */
+ 
++#include <fs1_efuse.h>
+ #include <boot_rom.h>
+ #include <spi_flash.h>
++#include "dev_spi_flash.h"
+ 
+ void spi_flash_init(void)
+ {
+@@ -17,3 +19,17 @@
+ 	spi_flash_set_write_limit(write_en_2MB);
+ }
+ 
++uint32_t spi_flash_fuse_read(uint32_t word, uint32_t *val)
++{
++	uint32_t offset;
++
++	/* read value from bank0 */
++	offset = (word * sizeof(uint32_t));
++	*val = spi_flash_readl(boot_rom_global.fake_fuse_spi_offset + offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((EFUSE_WORDS_PER_BANK + word) * sizeof(uint32_t));
++	*val |= spi_flash_readl(boot_rom_global.fake_fuse_spi_offset + offset);
++
++	return BOOT_ROM_SUCCESS;
++}
+diff --git a/common/spi_flash.h b/common/spi_flash.h
+index 83a06fe..e3688b0 100644
+--- a/common/spi_flash.h
++++ b/common/spi_flash.h
+@@ -23,9 +23,7 @@
+ 
+ #define SPI_FLASH_BAUDR_DIVISOR		2
+ 
+-void spi_flash_set_byte_swap(uint8_t enable);
+-void spi_flash_set_baud_rate(uint8_t baud_rate);
+-void spi_flash_set_write_limit(enum flash_write_limit write_limit);
+ void spi_flash_init(void);
++uint32_t spi_flash_fuse_read(uint32_t word, uint32_t *val);
+ 
+ #endif /* _SPI_FLASH_H_ */
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index 6c63f8d..13dc3ed 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -29,6 +29,13 @@
+ /* extracts "n" number of bits from position "p" in the given number "v" */
+ #define EXTRACT_BITS(v, p, n)	(((v) & (((1 << (n)) - 1) << (p))) >> (p))
+ 
++enum boot_rom_status {
++	BOOT_ROM_SUCCESS,
++	BOOT_ROM_FAIL,
++	BOOT_ROM_TIMEOUT,
++	BOOT_ROM_CFG_ERROR,
++};
++
+ enum boot_rom_sku_type {
+ 	MULTI_DIE_SKU = 0,
+ 	SINGLE_DIE_SKU = 1,
+@@ -76,6 +83,8 @@
+ 	uint8_t die_id;
+ 	enum boot_rom_die_type die_type;
+ 	uint64_t ppboot_start_addr;
++	bool fake_fuse_en;
++	uint32_t fake_fuse_spi_offset;
+ };
+ 
+ struct boot_rom_manifest_s {
+@@ -91,5 +100,6 @@
+ uint8_t boot_rom_get_die_id(void);
+ enum boot_rom_die_type boot_rom_get_die_type(void);
+ void boot_rom_init(void);
++void boot_rom_fuse(void);
+ 
+ #endif /* _BOOT_ROM_H_ */

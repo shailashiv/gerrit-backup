@@ -1,0 +1,216 @@
+From 7050fcc70eb892854bfdaa0712927a4880f71efd Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 21 Mar 2024 08:56:00 +0200
+Subject: [PATCH] [FSW-4076] fs1: enable uart in bootrom
+
+With this patch, uart is enabled from bootrom.
+and also api added to push a single character
+where ever required for debug.
+
+Change-Id: I30176765a3a20fae63f2fb7ce27212329cb74353
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 3eaae99..66e011c 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -9,4 +9,5 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_pcie.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_uart.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_recovery.c)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 3f77631..1eb0ba8 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -17,6 +17,7 @@
+ #include <fs1_fw_if.h>
+ #include <status.h>
+ #include <efuse.h>
++#include "dev_uart.h"
+ 
+ uint8_t boot_rom_get_die_id(void)
+ {
+@@ -141,7 +142,7 @@
+ void boot_rom_halt(void)
+ {
+ 	while (1) {
+-		/* TODO: uart print character 'h' */
++		boot_rom_putc('h');
+ 		wfe();
+ 	}
+ }
+@@ -169,4 +170,3 @@
+ 	cold_rst_data.efuse_read_flag = 1;
+ 	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ }
+-
+diff --git a/arch/fs1/arc/dev_uart.c b/arch/fs1/arc/dev_uart.c
+new file mode 100644
+index 0000000..8c31aef
+--- /dev/null
++++ b/arch/fs1/arc/dev_uart.c
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <fs1_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <psoc_pad_conf_regs.h>
++#include <uart_regs.h>
++#include "dev_uart.h"
++#include <delay.h>
++
++__weak uint32_t boot_rom_get_baudrate() { return 0; }
++__weak uint32_t boot_rom_pll_get_freq(__unused enum boot_rom_pll_div div) { return 0; }
++
++void boot_rom_uart_dev_init(unsigned int val)
++{
++	regmap_writel(0x0, IO0_H0_PSOC_CFG_UART(mmUART_CTRL));
++	regmap_writel(val, IO0_H0_PSOC_CFG_UART(mmUART_BAUDDIV));
++	regmap_writel(UART_TX_ENABLE | UART_RX_ENABLE, IO0_H0_PSOC_CFG_UART(mmUART_CTRL));
++}
++
++void boot_rom_config_uart_gpio()
++{
++	/* TODO: Confirm with system team and remove rx config */
++	/* UART0 RXD */
++	regmap_writel(GPIO_FUNC_1, IO0_H0_PSOC_CFG_PAD_CONF_PAD_SEL(mmPSOC_PAD_CONF_PAD_SEL_49));
++
++	/* UART0 TXD */
++	regmap_writel(GPIO_FUNC_1, IO0_H0_PSOC_CFG_PAD_CONF_PAD_SEL(mmPSOC_PAD_CONF_PAD_SEL_50));
++}
++
++void boot_rom_putc(const char ch)
++{
++	uint8_t loop;
++
++	/*
++	 * TODO: DIE_CHECK
++	 * Confirm with system team, uart required for slave's or not
++	 */
++
++	for (loop = 0; loop < UART_TX_FULL_RETRY_COUNT; loop++) {
++		if ((regmap_readl(IO0_H0_PSOC_CFG_UART(mmUART_STATE)) & UART_SR_TXFULL) == 0) {
++			regmap_writel(ch, IO0_H0_PSOC_CFG_UART(mmUART_DATA));
++			break;
++		}
++	}
++}
+diff --git a/arch/fs1/arc/dev_uart.h b/arch/fs1/arc/dev_uart.h
+new file mode 100644
+index 0000000..0b4a6e0
+--- /dev/null
++++ b/arch/fs1/arc/dev_uart.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_UART_
++#define _DEV_UART_
++
++#define UART_TX_FULL_RETRY_COUNT	10
++
++/* UART state bits */
++#define UART_SR_TXFULL			(1 << 0) /* TX Buffer Full */
++#define UART_SR_RXFULL			(1 << 1) /* RX Buffer Full */
++
++/* UART control bits */
++#define UART_TX_ENABLE		BIT(0)
++#define UART_RX_ENABLE		BIT(1)
++
++enum boot_rom_pll_div {
++	PLL_DIV0,
++	PLL_DIV1,
++	PLL_DIV2,
++	PLL_DIV3,
++	PLL_DIV_SIZE,
++};
++
++enum boot_rom_pll_bypass {
++	PLL_REF_CLK,
++	PLL_PLL_CLK,
++	PLL_DIV_REF,
++	PLL_DIV_PLL
++};
++
++void boot_rom_config_uart_gpio(void);
++void boot_rom_uart_dev_init(unsigned int val);
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div);
++uint32_t boot_rom_get_baudrate();
++
++/*
++ * System status over UART
++ * h - System in halt state
++ */
++void boot_rom_putc(const char ch);
++
++#endif /* _DEV_UART_ */
+\ No newline at end of file
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index aec43f4..1dfa68e 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -25,6 +25,13 @@
+ 	REGION_LBW_CFG_IDX = 15,
+ };
+ 
++enum gpio_func {
++	GPIO_FUNC_0,
++	GPIO_FUNC_1,
++	GPIO_FUNC_2,
++	GPIO_FUNC_3,
++};
++
+ #define REGION_BASE_ADDR(REG_IDX)	(REG_IDX << 28)
+ #define SZ_32K				0x00008000
+ #define SZ_64K				0x00010000
+diff --git a/common/common.c b/common/common.c
+index d9e652c..bf2816a 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -12,6 +12,26 @@
+ #include <efuse.h>
+ #include <dev_efuse.h>
+ #include <recovery.h>
++#include <hl_fw_upd_if.h>
++#include "dev_uart.h"
++
++void boot_rom_uart_init(void)
++{
++	uint32_t uart_clk_freq;
++	uint32_t uart_baud;
++
++	/*
++	 * TODO: DIE_CHECK
++	 * Confirm with system team, uart required for slave's or not
++	 */
++
++	boot_rom_config_uart_gpio();
++
++	uart_clk_freq = boot_rom_pll_get_freq(PLL_DIV3);
++	uart_baud = boot_rom_get_baudrate();
++
++	boot_rom_uart_dev_init(uart_clk_freq / uart_baud);
++}
+ 
+ void boot_rom_init(void)
+ {
+@@ -30,6 +50,8 @@
+ 
+ 	boot_rom_init_ts();
+ 
++	boot_rom_uart_init();
++
+ 	boot_rom_read_cold_flops();
+ 
+ 	/* Early EFUSE read trigger */

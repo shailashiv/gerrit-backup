@@ -1,0 +1,75 @@
+From d9e9b6d770e806cf08364ad501fc91808df849f7 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Mon, 10 Feb 2020 00:16:11 +0200
+Subject: [PATCH] [SW-8229] goya2: fix key hash copying to scratchpad
+
+Error in copying key hash from spi security location to
+scratchpad sram. Fixed wrong indexing and addressing.
+
+Change-Id: Ib70d99845facdf9c3fa73c7faf7a396bfabf0931
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/security.c b/common/security.c
+index ec02f2e..f30bd66 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -473,14 +473,18 @@
+ 
+ int security_get_key_hash(uint32_t *hash, uint8_t customer)
+ {
++	uint32_t valid_key_base;
++	int i;
+ 	int valid_key_offset = security_get_first_valid_key(customer);
+ 
+ 	if (valid_key_offset < 0)
+ 		return valid_key_offset;
+ 
+-	for (int i = 0; i < SECURITY_KEY_HASH_COUNT; i++)
+-		*hash = sp_sram_readl((SECURITY_EFUSE_KEYS_OFFSET + i) *
+-				      SECURITY_BYTE_PER_DWORD);
++	valid_key_base = (valid_key_offset * SECURITY_BYTE_PER_DWORD *
++			  SECURITY_DWORD_PER_KEY) + SECURITY_EFUSE_KEYS_OFFSET;
++	for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
++		*(hash + i) = sp_sram_readl(valid_key_base + (i *
++					    SECURITY_BYTE_PER_DWORD));
+ 
+ 	return 1;
+ }
+@@ -601,6 +605,7 @@
+ 			      security_key_soc_location_offset(hash_key_index));
+ 		/* store key hashes in Scratch PAD Sram */
+ 		sp_sram_writel(key_hash[hash_key_index],
+-			       SECURITY_EFUSE_KEYS_OFFSET + hash_key_index);
++			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
++			       SECURITY_BYTE_PER_DWORD));
+ 	}
+ }
+diff --git a/common/security.h b/common/security.h
+index 4083cf0..bad7f60 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -17,8 +17,7 @@
+ #define SECURITY_DWORD_PER_KEY				8
+ #define SECURITY_DWORD_BIT_SIZE				(sizeof(uint32_t) * \
+ 							 CHAR_BIT)
+-#define SECURITY_BYTE_PER_DWORD				(sizeof(uint32_t) / \
+-							 CHAR_BIT)
++#define SECURITY_BYTE_PER_DWORD				(sizeof(uint32_t))
+ 
+ #define SECURITY_KEY_REVOKE_MAP				0x1F
+ 
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index c703498..e0b39fb 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -76,7 +76,8 @@
+ 	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
+ 						FLASH_EFUSE_KEYS_OFFSET;
+ 	for (i = 0; i < SECURITY_KEY_HASH_ARRAY_SIZE; i++)
+-		*(key_hash + i) = spi_flash_readl(flash_efuse_offset + i);
++		*(key_hash + i) = spi_flash_readl(flash_efuse_offset + (i *
++						  SECURITY_BYTE_PER_DWORD));
+ }
+ 
+ uint8_t spi_flash_get_fw_version_security(void)

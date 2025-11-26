@@ -1,0 +1,141 @@
+From b49ffd9d26338676db21555eaaacb424cb635c35 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 16 May 2022 20:45:55 +0300
+Subject: [PATCH] [SW-86866] gaudi3: update get ts frequency routine
+
+Currently, the frequency required for psoc timestamp is hardcoded
+to 35M to onix and 50M to pldm and asic. Since the timestamp block
+will be used for udelay implementation, this patch add changes to
+get timestamp freq by reading pll registers. psoc ts block is driven
+by DIV3 of PCIE PLL clock.
+
+Change-Id: Ic9800324101f380db58ba761066340e9b16a8404
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index af0ac9e..6f478f0 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -10,3 +10,8 @@
+ {
+ 	disable_spi_gw();
+ }
++
++uint64_t arcboot_rom_get_timestamp_freq(void)
++{
++	return get_pcie_pll_freq(PLL_DIV3);
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c142c17..de72709 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <arcboot.h>
++#include <bitops.h>
+ #include <string.h>
+ #include <delay.h>
+ #include <gaudi3_fw_if.h>
+@@ -1041,3 +1042,34 @@
+ 	val = (D0_PARC_ARC0_CFG_ARC_RST_PRESETDBGN_M | 0x0);
+ 	regmap_writel(val, arc_rst);
+ }
++
++uint64_t get_pcie_pll_freq(enum pll_div_out div)
++{
++	uint32_t div_sel, factor, offset;
++	uint32_t reg, fbdiv, refdiv, postdiv1, postdiv2;
++	uint64_t out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(uint32_t);
++	div_sel = regmap_readl(mmD0_G4_PCI_PLL_CTRL_DIV_SEL_0 + offset);
++
++	if (div_sel == PLL_PLL_CLK || div_sel == PLL_DIV_PLL) {
++		reg = regmap_readl(mmD0_G4_PCI_PLL_CTRL_CFG_DIV);
++		/* fbdiv : bits 0-11 */
++		fbdiv = EXTRACT_BITS(reg, 0, 12);
++		/* postdiv1 : bits 16-18 */
++		postdiv1 = EXTRACT_BITS(reg, 16, 3);
++		/* postdiv2 : bits 20-22 */
++		postdiv2 = EXTRACT_BITS(reg, 20, 3);
++		/* refdiv : bits 24-29 */
++		refdiv  = EXTRACT_BITS(reg, 24, 6);
++		out_freq = SYS_REF_CLOCK * fbdiv;
++		out_freq /= refdiv * (postdiv1 + 1) * (postdiv2 + 1);
++	}
++
++	if (div_sel == PLL_DIV_REF || div_sel == PLL_DIV_PLL) {
++		factor = regmap_readl(mmD0_G4_PCI_PLL_CTRL_DIV_FACTOR_0 + offset);
++		out_freq /= factor + 1;
++	}
++
++	return out_freq;
++}
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index 17009e3..650d4dc 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -8,9 +8,25 @@
+ #define GPIOS_PER_BANK			16
+ #define TPM_CS_GPIO_PIN			18
+ 
++enum pll_div_out {
++	PLL_DIV0,
++	PLL_DIV1,
++	PLL_DIV2,
++	PLL_DIV3,
++	PLL_DIV_MAX,
++};
++
++enum pll_bypass_val {
++	PLL_REF_CLK,
++	PLL_PLL_CLK,
++	PLL_DIV_REF,
++	PLL_DIV_PLL,
++};
++
+ void arcboot_rom_notify_slave(void);
+ uint32_t arcboot_rom_get_num_crc(uint32_t size);
+ void arcboot_rom_wait_for_fuse_data(void);
+ int arcboot_rom_fuse_single_die_config(void);
+ void ext_rom_load_erom_image(enum hl_fw_img_type_erom img_type);
+ void disable_spi_gw(void);
++uint64_t get_pcie_pll_freq(enum pll_div_out div);
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index af0ac9e..6f478f0 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -10,3 +10,8 @@
+ {
+ 	disable_spi_gw();
+ }
++
++uint64_t arcboot_rom_get_timestamp_freq(void)
++{
++	return get_pcie_pll_freq(PLL_DIV3);
++}
+diff --git a/common/delay.c b/common/delay.c
+index f9d9cbc..934049b 100644
+--- a/common/delay.c
++++ b/common/delay.c
+@@ -7,7 +7,6 @@
+ 
+ #include <arcboot.h>
+ 
+-#define SYS_REF_CLOCK		50000000ULL
+ #define USEC_PER_SEC		1000000
+ #define BYPASS_CYCLES_PER_USEC	(SYS_REF_CLOCK / USEC_PER_SEC)
+ 
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 054afae..0d18030 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -79,6 +79,7 @@
+ #define HL_INIT_MEM_UDELAY			10
+ #define SP_SRAM_SIZE_16B_GRANULARITY		0x1000
+ #define CRC32_SIZE		4
++#define SYS_REF_CLOCK				50000000ULL
+ 
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;

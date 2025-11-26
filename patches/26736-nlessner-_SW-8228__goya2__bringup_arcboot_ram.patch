@@ -1,0 +1,58 @@
+From 0d2f6205b9e4b28c0f9f6cff8e15bc2c71f9a7ec Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Wed, 29 Jan 2020 01:22:46 +0200
+Subject: [PATCH] [SW-8228] goya2: bringup arcboot ram
+
+Load from spi flash to ICCM arcboot_ram, verify it and run.
+do not expect to return from arcboot_ram
+
+Change-Id: I32248e7e2bf689369668728c3b007a1b69a64bcc
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index ff1e647..e94a8d0 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -158,7 +158,41 @@
+ 	}
+ }
+ 
+-static void arcboot_rom_bringup_arcboot_ram(void) {}
++static int arcboot_rom_bringup_ram_images(uint8_t image_ptr)
++{
++	uint32_t flash_arcboot_ram_offset;
++	uint16_t arcboot_ram_size;
++
++	flash_arcboot_ram_offset = arcboot_flash_image_offset(image_ptr);
++	arcboot_ram_size = (uint16_t)spi_flash_readl(flash_arcboot_ram_offset);
++
++	dma_copy_image(arcboot_ram_size, flash_arcboot_ram_offset,
++		       HL_SRAM_BASE + HL_ICCM_OFFSET, SPI_DMA_DST_HBW);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	if (secureboot_verify_image(arcboot_ram_size, 0) ==
++	    SECUREBOOT_VERIFY_FAILED)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	return ARCBOOT_BRINGUP_OK;
++}
++
++static void arcboot_rom_bringup_arcboot_ram(void)
++{
++	if (arcboot_rom_bringup_ram_images(ARCBOOT_PRIMARY) !=
++	    ARCBOOT_BRINGUP_OK) {
++		if (arcboot_rom_bringup_ram_images(ARCBOOT_SECONDARY) !=
++		    ARCBOOT_BRINGUP_OK) {
++			/* TODO:					*
++			 * if (!EFUSE_SYSTEM_CONFIG_DISABLE_DEBUG_IF)	*
++			 * then enable i2c_s				*
++			 */
++		}
++	}
++	/* jump to iccm start location */
++	goto *(void *)(0);
++}
+ 
+ int arcboot_rom_main(void)
+ {

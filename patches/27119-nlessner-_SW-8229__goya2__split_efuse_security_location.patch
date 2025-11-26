@@ -1,0 +1,202 @@
+From a62365f61a4dce693e559e7a16ffa3c0a4eaf11a Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Mon, 03 Feb 2020 17:24:01 +0200
+Subject: [PATCH] [SW-8229] goya2: split efuse security location
+
+Use differant efuse for key,revoke and fw_version location
+as defined in the efuse map.
+
+Change-Id: I12187452038a8d76c843d2350b9d4b7b3ccca09c
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 6e22cc4..0503e85 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -29,56 +29,14 @@
+ 
+ static void arcboot_rom_fuse(void)
+ {
+-	uint8_t hash_key_index;
+-	uint8_t fw_version_sec = 0;
+-	uint32_t key_revoke = 0;
+-	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
+-	enum security_location current_security_location;
+-
+ 	fuse_read(EFUSE_SYSCFG_OFFSET, &arcboot_rom_global.config_fuse);
+ 	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK)
+ 		security_disable_debug_if();
+ 
+-	/* read security location from efuse */
+-	current_security_location =
+-		((arcboot_rom_global.config_fuse >>
+-		  EFUSE_SYSCFG_SECURITY_LOCATION) &
+-		  EFUSE_SYSCFG_SECURITY_LOCATION_MASK);
++	security_load_revoke_bits();
++	security_load_fw_version();
++	security_load_keys();
+ 
+-	switch (current_security_location) {
+-	case SPI_FLASH:
+-		spi_flash_get_revoke(&key_revoke);
+-		spi_flash_get_hash(key_hash);
+-		fw_version_sec = spi_flash_get_fw_version_security();
+-		break;
+-	case SPI_OTP:
+-		spi_flash_otp_access(FLASH_OTP_ENABLE);
+-		spi_flash_otp_get_revoke(&key_revoke);
+-		spi_flash_otp_get_hash(key_hash);
+-		fw_version_sec =
+-			spi_flash_otp_get_fw_version_security();
+-		spi_flash_otp_access(FLASH_OTP_DISABLE);
+-		break;
+-	case ASIC_EFUSE:
+-		key_revoke = (arcboot_rom_global.config_fuse &
+-			      EFUSE_SYSCFG_REVOKE_KEY_MASK);
+-		fw_version_sec = efuse_otp_get_fw_version_security();
+-		efuse_get_hash(key_hash);
+-		break;
+-	}
+-
+-	/* store key_revoke map in PSOC */
+-	regmap_writel(key_revoke, mmPSOC_SECURITY_KEY_REVOKE);
+-
+-	/* store minimum allowed security version in PSOC */
+-	regmap_writel(SECURITY_FW_VERSION_FROM_SECURITY_BYTE(fw_version_sec),
+-		      mmPSOC_SECURITY_MIN_FW_VERSION);
+-
+-	/* store habana key hash in PSOC */
+-	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
+-	     hash_key_index++)
+-		regmap_writel(key_hash[hash_key_index],
+-			      security_key_soc_location_offset(hash_key_index));
+ }
+ 
+ static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
+diff --git a/common/efuse.h b/common/efuse.h
+index abdf77b..589d4bc 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -18,8 +18,12 @@
+ 
+ #define EFUSE_SYSCFG_SPI_CONTROLLER		BIT(20)
+ #define EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK	BIT(12)
+-#define EFUSE_SYSCFG_SECURITY_LOCATION		7
+-#define EFUSE_SYSCFG_SECURITY_LOCATION_MASK	0x3
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION	13
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK	0x3
++#define EFUSE_SYSCFG_KEY_LOCATION		7
++#define EFUSE_SYSCFG_KEY_LOCATION_MASK		0x3
++#define EFUSE_SYSCFG_REVOKATION_LOCATION	5
++#define EFUSE_SYSCFG_REVOKATION_LOCATION_MASK	0x3
+ #define EFUSE_SYSCFG_REVOKE_KEY_LOCATION	0
+ #define EFUSE_SYSCFG_REVOKE_KEY_MASK		0x1F
+ 
+diff --git a/common/security.c b/common/security.c
+index 081bfaa..fba177a 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -507,3 +507,89 @@
+ 
+ 	return SECURITY_FW_VERSION_NOT_SECURE;
+ }
++
++void security_load_revoke_bits(void)
++{
++	uint32_t key_revoke = 0;
++	enum security_location revoke_location;
++
++	revoke_location = ((arcboot_rom_global.config_fuse >>
++			   EFUSE_SYSCFG_REVOKATION_LOCATION) &
++			   EFUSE_SYSCFG_REVOKATION_LOCATION_MASK);
++
++	switch (revoke_location) {
++	case SPI_FLASH:
++		spi_flash_get_revoke(&key_revoke);
++		break;
++	case SPI_OTP:
++		spi_flash_otp_access(FLASH_OTP_ENABLE);
++		spi_flash_otp_get_revoke(&key_revoke);
++		spi_flash_otp_access(FLASH_OTP_DISABLE);
++		break;
++	case ASIC_EFUSE:
++		key_revoke = (arcboot_rom_global.config_fuse &
++			      EFUSE_SYSCFG_REVOKE_KEY_MASK);
++		break;
++	}
++	/* store key_revoke map in PSOC */
++	regmap_writel(key_revoke, mmPSOC_SECURITY_KEY_REVOKE);
++}
++
++void security_load_fw_version(void)
++{
++	uint8_t fw_version_sec = 0;
++	enum security_location fw_version_location;
++
++	fw_version_location = ((arcboot_rom_global.config_fuse >>
++			       EFUSE_SYSCFG_FW_VERSION_LOCATION) &
++			       EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK);
++
++	switch (fw_version_location) {
++	case SPI_FLASH:
++		fw_version_sec = spi_flash_get_fw_version_security();
++		break;
++	case SPI_OTP:
++		spi_flash_otp_access(FLASH_OTP_ENABLE);
++		fw_version_sec =
++			spi_flash_otp_get_fw_version_security();
++		spi_flash_otp_access(FLASH_OTP_DISABLE);
++		break;
++	case ASIC_EFUSE:
++		fw_version_sec = efuse_otp_get_fw_version_security();
++		break;
++	}
++	/* store minimum allowed security version in PSOC */
++	regmap_writel(SECURITY_FW_VERSION_FROM_SECURITY_BYTE(fw_version_sec),
++		      mmPSOC_SECURITY_MIN_FW_VERSION);
++}
++
++void security_load_keys(void)
++{
++	uint8_t hash_key_index;
++	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
++	enum security_location key_location;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++
++	switch (key_location) {
++	case SPI_FLASH:
++		spi_flash_get_hash(key_hash);
++		break;
++	case SPI_OTP:
++		spi_flash_otp_access(FLASH_OTP_ENABLE);
++		spi_flash_otp_get_hash(key_hash);
++		spi_flash_otp_access(FLASH_OTP_DISABLE);
++		break;
++	case ASIC_EFUSE:
++		efuse_get_hash(key_hash);
++		break;
++	}
++
++	/* store habana key hash in PSOC */
++	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
++	     hash_key_index++)
++		regmap_writel(key_hash[hash_key_index],
++			      security_key_soc_location_offset(hash_key_index));
++}
+diff --git a/common/security.h b/common/security.h
+index 863968e..56bc54c 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -90,5 +90,8 @@
+ uint8_t security_find_min_fw_version(uint32_t *fw_version);
+ int security_get_key_hash(uint32_t *hash, uint8_t customer);
+ int security_check_valid_fw_version(uint32_t fw_version);
++void security_load_revoke_bits(void);
++void security_load_fw_version(void);
++void security_load_keys(void);
+ 
+ #endif /* _SECURITY_H_ */

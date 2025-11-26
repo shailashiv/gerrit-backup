@@ -1,0 +1,211 @@
+From 9a367b516723ebb7a0b652024cb9f533503af258 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Wed, 29 Jan 2020 01:00:46 +0200
+Subject: [PATCH] [SW-8228] goya2: flash_otp: read security
+
+Add support to read the key hash, revoked keys and fw security version
+from spi flash otp location
+
+Change-Id: I1c5840f96c70c935065f4e39d73f9d19d7172d6f
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 0dfdf54..e2f8215 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -46,6 +46,12 @@
+ 		fw_version_sec = spi_flash_get_fw_version_security();
+ 		break;
+ 	case SPI_OTP:
++		spi_flash_otp_access(FLASH_OTP_ENABLE);
++		spi_flash_otp_get_revoke(&key_revoke);
++		spi_flash_otp_get_hash(key_hash);
++		fw_version_sec =
++			spi_flash_otp_get_fw_version_security();
++		spi_flash_otp_access(FLASH_OTP_DISABLE);
+ 		break;
+ 	case ASIC_EFUSE:
+ 		/* TODO: finish efuse hash get and fw_ver_sec */
+diff --git a/common/security.h b/common/security.h
+index 6a4f0db..6408462 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -7,10 +7,21 @@
+ 
+ #ifndef _SECURITY_H_
+ #define _SECURITY_H_
++#include <limits.h>
+ 
+ #define SECURITY_FW_VERSION_FROM_SECURITY_BYTE(x)	((x & 0xFF) << 24)
+ #define SECURITY_KEY_HASH_COUNT				5
+ #define SECURITY_DWORD_PER_KEY				8
++#define SECURITY_DWORD_BIT_SIZE				(sizeof(uint32_t) * \
++							 CHAR_BIT)
++
++#define SECURITY_KEY_REVOKE_MAP				0x1F
++
++#define SECURITY_MAX_FW_SEC_VERSION			128
++#define SECURITY_FW_VER_LAST_DWORD			3
++#define SECURITY_FW_VER_LAST_BYTE			31
++#define SECURITY_DWORD_PER_FW_SEC_VERSION	(SECURITY_MAX_FW_SEC_VERSION / \
++						 SECURITY_DWORD_BIT_SIZE)
+ 
+ #define SECURITY_KEY_HASH_ARRAY_SIZE		(SECURITY_DWORD_PER_KEY * \
+ 						SECURITY_KEY_HASH_COUNT)
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index dbbb9b0..adb15fc 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -5,7 +5,9 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <limits.h>
+ #include "arcboot.h"
++#include "security.h"
+ #include "spi_flash.h"
+ 
+ static void spi_flash_set_byte_swap(uint8_t enable)
+@@ -49,17 +51,17 @@
+ 	revoke_status =  spi_flash_readl(flash_efuse_offset +
+ 					 FLASH_EFUSE_KEYS_REVOKE_OFFSET);
+ 	/* check for revoke habana key bit and customer bit 0 - 3 */
+-	for (i = 0; i < 4; i++) {
+-		if ((revoke_status >> i) & 1)
++	for (i = 0; i < FLASH_REVOKE_BITS_PER_DWORD; i++) {
++		if (revoke_status & 1)
+ 			*key_revoke |= BIT(i);
+-		revoke_status = revoke_status >> 4;
++		revoke_status = revoke_status >> CHAR_BIT;
+ 	}
+ 
+-	flash_efuse_offset += 4;
++	flash_efuse_offset += FLASH_REVOKE_BITS_PER_DWORD;
+ 	revoke_status =  spi_flash_readl(flash_efuse_offset +
+ 					 FLASH_EFUSE_KEYS_REVOKE_OFFSET);
+ 	/* check for revoke bit of customer key 4 */
+-	if ((revoke_status & 1) == 1)
++	if (revoke_status & 1)
+ 		*key_revoke |= BIT(4);
+ }
+ 
+@@ -68,7 +70,7 @@
+ 	uint8_t i;
+ 	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
+ 						FLASH_EFUSE_KEYS_OFFSET;
+-	for (i = 0; i < 40; i++)
++	for (i = 0; i < SECURITY_KEY_HASH_ARRAY_SIZE; i++)
+ 		*(key_hash + i) = spi_flash_readl(flash_efuse_offset + i);
+ }
+ 
+@@ -76,24 +78,22 @@
+  * we scan from end to beginning of map looking for the first set bit. once
+  * it's found this indicated the minimal version allowed to run on the system
+  */
+-uint8_t spi_flash_get_fw_version_security(void)
++static uint8_t spi_flash_find_fw_version_security(uint32_t flash_fuse_offset)
+ {
+ 	uint8_t i, row, colume;
+-	uint32_t fw_version[4];
++	uint32_t fw_version[SECURITY_DWORD_PER_FW_SEC_VERSION];
+ 	uint8_t fw_version_sec;
+-	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
+-						FLASH_EFUSE_FW_VERSION_OFFSET;
+ 
+ 	/* read min security version bit map from flash */
+-	for (i = 0; i < 4; i++)
+-		fw_version[i] = spi_flash_readl(flash_efuse_offset + i);
++	for (i = 0; i < SECURITY_DWORD_PER_FW_SEC_VERSION; i++)
++		fw_version[i] = spi_flash_readl(flash_fuse_offset + i);
+ 
+ 	/* init max version */
+-	fw_version_sec = 128;
++	fw_version_sec = SECURITY_MAX_FW_SEC_VERSION;
+ 
+ 	/* iterate back from 127 -> 0 till a set bit found */
+-	for (row = 3; row > 0; row--) {
+-		for (colume = 31; colume > 0; colume--) {
++	for (row = SECURITY_FW_VER_LAST_DWORD; row > 0; row--) {
++		for (colume = SECURITY_FW_VER_LAST_BYTE; colume > 0; colume--) {
+ 			/* find highest bit set in valid FW */
+ 			fw_version_sec--;
+ 			if (fw_version[row] & BIT(colume))
+@@ -102,3 +102,45 @@
+ 	}
+ 	return fw_version_sec;
+ }
++
++uint8_t spi_flash_get_fw_version_security(void)
++{
++	uint8_t fw_version_sec;
++	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
++						FLASH_EFUSE_FW_VERSION_OFFSET;
++	fw_version_sec = spi_flash_find_fw_version_security(flash_efuse_offset);
++	return fw_version_sec;
++}
++
++void spi_flash_otp_access(uint8_t enable)
++{
++	if (enable)
++		regmap_writel(FLASH_OTP_CMD_ENTER, mmPSOC_QSPI_DR0);
++	else
++		regmap_writel(FLASH_OTP_CMD_EXIT, mmPSOC_QSPI_DR0);
++
++	regmap_writel(FLASH_OTP_START_TRANSFER, mmPSOC_QSPI_SER);
++}
++
++void spi_flash_otp_get_revoke(uint32_t *key_revoke)
++{
++	*key_revoke = spi_flash_readl(FLASH_EFUSE_KEYS_REVOKE_OFFSET) &
++			SECURITY_KEY_REVOKE_MAP;
++}
++
++void spi_flash_otp_get_hash(uint32_t *key_hash)
++{
++	uint32_t flash_otp_offset = FLASH_OTP_KEYS_OFFSET;
++
++	for (int i = 0; i < SECURITY_KEY_HASH_ARRAY_SIZE; i++)
++		*(key_hash + i) = spi_flash_readl(flash_otp_offset + i);
++}
++
++uint8_t spi_flash_otp_get_fw_version_security(void)
++{
++	uint8_t fw_version_sec;
++	uint32_t flash_otp_offset = FLASH_OTP_FW_VERSION_OFFSET;
++
++	fw_version_sec = spi_flash_find_fw_version_security(flash_otp_offset);
++	return fw_version_sec;
++}
+diff --git a/common/spi_flash.h b/common/spi_flash.h
+index 894f58c..5f85477 100644
+--- a/common/spi_flash.h
++++ b/common/spi_flash.h
+@@ -24,6 +24,18 @@
+ #define DISABLE_BYTE_SWAP		0
+ 
+ #define SPI_FLASH_BAUDR_DIVISOR		2
++#define FLASH_OTP_OFFSET		0
++#define FLASH_OTP_DISABLE		0
++#define FLASH_OTP_ENABLE		1
++
++#define FLASH_OTP_CMD_ENTER		0xB1
++#define FLASH_OTP_CMD_EXIT		0xC1
++#define FLASH_OTP_START_TRANSFER	0x1
++
++#define FLASH_OTP_KEYS_OFFSET		0
++#define FLASH_OTP_KEYS_REVOKE_OFFSET	156
++#define FLASH_OTP_FW_VERSION_OFFSET	160
++#define FLASH_REVOKE_BITS_PER_DWORD	4
+ 
+ #define FLASH_PRIMARY_OFFSET		0
+ #define FLASH_SECONDARY_OFFSET		4
+@@ -39,5 +51,9 @@
+ void spi_flash_get_revoke(uint32_t *key_revoke);
+ void spi_flash_get_hash(uint32_t *key_hash);
+ uint8_t spi_flash_get_fw_version_security(void);
++void spi_flash_otp_access(uint8_t enable);
++void spi_flash_otp_get_revoke(uint32_t *key_revoke);
++void spi_flash_otp_get_hash(uint32_t *key_hash);
++uint8_t spi_flash_otp_get_fw_version_security(void);
+ 
+ #endif /* _SPI_FLASH_H_ */

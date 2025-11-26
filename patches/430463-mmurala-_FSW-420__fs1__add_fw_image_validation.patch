@@ -1,0 +1,51 @@
+From 1c6a93e4248ab924d9db484ddfb6ba93205dc4fb Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 01 Jul 2024 09:16:59 +0300
+Subject: [PATCH] [FSW-420] fs1: add fw image validation
+
+with this patch, added support to validate
+firmware image checksum, by comparing sha384 from
+fw image descriptor with calculated sha384 just
+before image bringup.
+
+Change-Id: Ia8e609c2a0c47cb52ee92bcca67cff1583bed975
+---
+
+diff --git a/common/common.c b/common/common.c
+index 07fbb7a..af8da36 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -154,6 +154,9 @@
+ static int boot_rom_bringup_img_sub(int img, struct boot_desc *desc,
+ 	enum fw_post_reset_cmd upd_status, uint8_t cur_img)
+ {
++	uint32_t act_img_size, loadaddr_arc;
++	int ret;
++	unsigned char *image;
+ 	enum dma_error err = DMA_SUCCESS;
+ 	enum boot_rom_progress img_sts_base = PROGRESS_BRINGUP_PCI_PRI;
+ 	boot_rom_global.curr_img = cur_img;
+@@ -208,7 +211,22 @@
+ 
+ 	boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_DMA);
+ 
+-	/* TODO: security_impl */
++	if (!security_efuse_image_validation_en())
++		return BOOT_ROM_SUCCESS;
++
++	act_img_size = desc->img_size;
++	act_img_size = act_img_size - CRC32_SIZE;
++
++	/* Derive key and signature parameters */
++	loadaddr_arc = (uint32_t)boot_rom_get_arc_addr(desc->loadaddr);
++	image = (unsigned char *)(loadaddr_arc);
++
++	ret = secure_boot_verify_image_hash384(desc->chksum, image, act_img_size);
++	if (ret) {
++		return 	BOOT_ROM_FAIL;
++	}
++
++	boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_SECURITY);
+ 
+ 	return BOOT_ROM_SUCCESS;
+ }

@@ -1,0 +1,1371 @@
+From 7ceac47ef7656072555f463e912ba962509ee137 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 31 Mar 2022 20:39:06 +0300
+Subject: [PATCH] [SW-77251] fit: add fit operations
+
+This patch add all fit related function which will be used
+in firmware update module. This subsequent patches will make
+use of fit functions.
+
+Change-Id: Iaca29f76d7bc1775c003808b293b381cc1b62052
+---
+
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+index ae139ef..c9217ac 100644
+--- a/arch/gaudi2/arc/Makefile
++++ b/arch/gaudi2/arc/Makefile
+@@ -1,3 +1,5 @@
+ LDFLAGS += -static
+ 
+ BINARIES = arcboot_rom.bin arcboot_ram.bin
++
++ARCBOOT_COMMON_SRCS_C := $(filter-out common/fit_regions.c common/fit.c common/memory.c, $(ARCBOOT_COMMON_SRCS_C))
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 798c409..3d0fcd0 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -1,4 +1,5 @@
+ LDFLAGS += -static
++LDFLAGS += -lfdt
+ 
+ BINARIES = arcboot_rom.bin
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/spi_flash.c)
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index e068a7e..72403c5 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -42,5 +42,6 @@
+ 				uint8_t sec_ver, uint8_t key_index);
+ 
+ int secureboot_verify_image_hash384(uint8_t *exp_hash, unsigned char *image, uint32_t image_len);
++int secureboot_verify_key_hash(int key_index, uint8_t *key, uint32_t key_len);
+ 
+ #endif /* _GAUDI3_DEV_SECURITY_H_ */
+diff --git a/arch/gaudi3/arc/secureboot.c b/arch/gaudi3/arc/secureboot.c
+index 2a791d0..ded1a63 100644
+--- a/arch/gaudi3/arc/secureboot.c
++++ b/arch/gaudi3/arc/secureboot.c
+@@ -13,6 +13,17 @@
+ #include <rsa.h>
+ #include <sha512.h>
+ 
++bool arcboot_rom_is_image_sig_supported(void)
++{
++	return true;
++}
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
++	sha384_csum(input, ilen, output, 0);
++}
++
+ int secureboot_verify_key_hash(int key_index, uint8_t *key, uint32_t key_len)
+ {
+ 	uint8_t expected_hash[SHA384_SUM_LEN];
+diff --git a/arch/gaudi3/arc/sha.h b/arch/gaudi3/arc/sha.h
+new file mode 100644
+index 0000000..8c2f34d
+--- /dev/null
++++ b/arch/gaudi3/arc/sha.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <sha512.h>
++#include <fit_rsa.h>
++
++#define SHA_SUM_LEN			SHA384_SUM_LEN
++#define SHA_DER_LEN			SHA384_DER_LEN
++#define SHA_DER_PRE			sha384_der_prefix
++#define FIT_SHA				"sha384"
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha384,rsa3072"
++
++void sha_csum(const unsigned char *input, unsigned int ilen, unsigned char *output);
++
++void sha_csum_regions(const struct image_region region[], int region_count, uint8_t *output);
+diff --git a/arch/greco/arc_elf32/Makefile b/arch/greco/arc_elf32/Makefile
+index 668dfae..4d3384c 100644
+--- a/arch/greco/arc_elf32/Makefile
++++ b/arch/greco/arc_elf32/Makefile
+@@ -1 +1,3 @@
+ BINARIES = arcboot_rom.bin arcboot_ram.bin
++
++ARCBOOT_COMMON_SRCS_C := $(filter-out common/fit_regions.c common/fit.c common/memory.c, $(ARCBOOT_COMMON_SRCS_C))
+diff --git a/common/fit.c b/common/fit.c
+new file mode 100644
+index 0000000..08c69f9
+--- /dev/null
++++ b/common/fit.c
+@@ -0,0 +1,913 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <libfdt.h>
++#include <string.h>
++#include <bitops.h>
++#include <security.h>
++#include <dev_security.h>
++#include <hl_boot_if.h>
++#include <arcboot.h>
++#include <hl_boot_desc.h>
++#include <fit_load_type.h>
++#include <boot_info.h>
++#include <hl_fw_if.h>
++#include "fit.h"
++#include "fit_rsa.h"
++#include "fit_regions.h"
++#include "cmd_module.h"
++#include <sha.h>
++
++#define FIT_IMAGES_PATH			"/images"
++#define FIT_CONFS_PATH			"/configurations"
++
++#define FIT_CONF_NAME			"preboot-conf"
++#define FIT_DESC_PROP			"description"
++#define FIT_LOADABLE_PROP		"loadables"
++#define FIT_HASHED_NODES_PROP		"hashed-nodes"
++#define FIT_DATA_PROP			"data"
++#define FIT_HASH_PROP			"hash"
++#define FIT_LOADADDR_PROP		"loadaddr"
++#define FIT_STARTADDR_PROP		"startaddr"
++#define FIT_ARCH_PROP			"arch"
++#define FIT_COMPRESSION_PROP		"compression"
++
++#define FIT_SEC_VERSION			"hl-sec-version"
++#define FIT_SEC_KEY_IDX			"hl-sec-key-idx"
++#define FIT_SIG_NODENAME		"signature"
++#define FIT_VALUE_PROP			"value"
++#define FIT_ALGO_PROP			"algo"
++#define FIT_KEY_NAME_HINT		"key-name-hint"
++#define FIT_PUB_KEY_PROP		"pub-key"
++#define FIT_PUB_KEY_EXT_PROP		"pub-key-ext"
++#define FIT_LOAD_TYPE_PROP		"load-type"
++#define FIT_PUB_KEY_HASH_PROP		"hash"
++
++#define FIT_MAX_PATH			200
++#define MAX_FDT_REGIONS			20
++#define IMAGE_MAX_HASHED_NODES		20
++
++#define FIT_MAX_IMAGES			8
++
++#define FDT_MIN_SUPPORTED_VERSION	0x11
++#define FIT_MAX_KEY_NAME		64
++#define PREFIX_KEY			"key-"
++
++struct fit_image {
++	uint64_t loadaddr;
++	uint64_t startaddr;
++	const char *arch;
++};
++
++struct fit_image images[FIT_MAX_IMAGES];
++struct fdt_region fdt_regions[MAX_FDT_REGIONS];
++struct image_region region[MAX_FDT_REGIONS];
++static int arcboot_key_idx;
++
++__weak void arcboot_copy_image(uint64_t dst, const void *buf, int len,
++			       __unused const char *arch)
++{
++	memcpy((void *)(uintptr_t)dst, buf, len);
++}
++
++static const char *fit_loadables_name(const void *fit, int noffset, int id)
++{
++	return fdt_stringlist_get(fit, noffset, FIT_LOADABLE_PROP, id, NULL);
++}
++
++static int fit_find_config_node(const void *fit)
++{
++	int conf, node;
++	int dflt_conf_node = -1;
++
++	conf = fdt_path_offset(fit, FIT_CONFS_PATH);
++	if (conf < 0)
++		return -1;
++
++	for (node = fdt_first_subnode(fit, conf); node >= 0; node = fdt_next_subnode(fit, node)) {
++		const char *node_name = fdt_get_name(fit, node, NULL);
++
++		if (strcmp(FIT_CONF_NAME, node_name) == 0) {
++			dflt_conf_node = node;
++			break;
++		}
++	}
++
++	return dflt_conf_node;
++}
++
++static int fit_loadables_node_get(const void *fit, int id)
++{
++	int images, conf = fit_find_config_node(fit);
++	const char *uname = fit_loadables_name(fit, conf, id);
++
++	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	return fdt_subnode_offset(fit, images, uname);
++}
++
++int fit_check_format(const void *fit)
++{
++	if (fdt_check_header(fit))
++		return FIT_FORMAT_HEADER_CHECK_FAILED;
++
++	/* mandatory / node 'description' property */
++	if (fdt_getprop(fit, 0, FIT_DESC_PROP, NULL) == NULL)
++		return FIT_FORMAT_NO_DESCRIPTION;
++
++	/* mandatory subimages parent '/images' node */
++	if (fdt_path_offset(fit, FIT_IMAGES_PATH) < 0)
++		return FIT_FORMAT_NO_IMAGES_PARENT_NODE;
++
++	return FIT_FORMAT_SUCCESS;
++}
++
++static int fit_get_int(const void *fit, int node, const char *prop_name,
++		       int default_val)
++{
++	const int *cell;
++	int len;
++
++	cell = fdt_getprop(fit, node, prop_name, &len);
++	if (cell && len >= (int) sizeof(int))
++		return fdt32_to_cpu(cell[0]);
++
++	return default_val;
++}
++
++static int get_algo_prop(const void *fit, int noffset, const uint8_t **algo_prop)
++{
++	int algo_prop_len;
++
++	*algo_prop = fdt_getprop(fit, noffset, FIT_ALGO_PROP, &algo_prop_len);
++	if (!(*algo_prop))
++		return 1;
++
++	if (algo_prop_len != sizeof(FIT_ALGO_PROP_EXPECTED_VALUE))
++		return 1;
++
++	if (memcmp((char *)*algo_prop, FIT_ALGO_PROP_EXPECTED_VALUE,
++			sizeof(FIT_ALGO_PROP_EXPECTED_VALUE)))
++		return 1;
++
++	return 0;
++}
++
++static int get_sig_hash(const void *fit, int noffset, const uint8_t **hash_value,
++			int *hash_value_len)
++{
++	*hash_value = fdt_getprop(fit, noffset, FIT_VALUE_PROP, hash_value_len);
++	if (!(*hash_value))
++		return 1;
++
++	return 0;
++}
++
++static int get_key_name(const void *fit, int noffset, const char **key_name)
++{
++	int key_name_len;
++
++	*key_name = fdt_getprop(fit, noffset, FIT_KEY_NAME_HINT, &key_name_len);
++	if (!(*key_name))
++		return 1;
++
++	return 0;
++}
++
++static int get_pub_key_node(const void *pub_key_fit, const char *key_name)
++{
++	int sig_node;
++	char key_node_name[FIT_MAX_KEY_NAME] = PREFIX_KEY;
++	size_t key_node_name_len = sizeof(PREFIX_KEY) - 1;
++
++	key_node_name[FIT_MAX_KEY_NAME - 1] = '\0';
++
++	strncpy(key_node_name + key_node_name_len,
++			key_name, (FIT_MAX_KEY_NAME - key_node_name_len - 1));
++	/*
++	 * To avoid stack based buffer overflow
++	 * make sure your key string length does not exceed buffer size.
++	 */
++	if (key_node_name[FIT_MAX_KEY_NAME - 1] != '\0')
++		return -1;
++
++	sig_node = fdt_subnode_offset(pub_key_fit, 0, FIT_SIG_NODENAME);
++
++	return fdt_subnode_offset(pub_key_fit, sig_node, key_node_name);
++}
++
++static int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++			    struct key_prop *prop)
++{
++	int pub_key_node = 0;
++	int length;
++
++	if (fdt_check_header(pub_key_fit))
++		return 1;
++
++	pub_key_node = get_pub_key_node(pub_key_fit, key_name);
++	if (pub_key_node < 0)
++		return 1;
++
++	prop->num_bits =
++		fit_get_int(pub_key_fit, pub_key_node, "rsa,num-bits", 0);
++	prop->n0inv =
++		fit_get_int(pub_key_fit, pub_key_node, "rsa,n0-inverse", 0);
++	prop->public_exponent =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,exponent", &length);
++	if (!prop->public_exponent || length < (int) sizeof(uint64_t))
++		prop->public_exponent = NULL;
++	prop->modulus =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,modulus", NULL);
++	prop->rr =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,r-squared", NULL);
++
++	if (!prop->num_bits || !prop->modulus)
++		return 1;
++
++	return 0;
++}
++
++static int fit_config_check_sig(const void *fit, int noffset,
++				const struct image_region region[],
++				int region_count, const void *pub_key_fit)
++{
++	const uint8_t *algo_prop = NULL;
++	const uint8_t *hash_value = NULL;
++	const char *key_name = NULL;
++	int hash_len = 0;
++	struct key_prop prop;
++
++	if (get_algo_prop(fit, noffset, &algo_prop))
++		return 1;
++
++	if (get_sig_hash(fit, noffset, &hash_value, &hash_len))
++		return 1;
++
++	if (get_key_name(fit, noffset, &key_name))
++		return 1;
++
++	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
++		return 1;
++
++	return rsa_verify_regions(region, region_count, hash_value, hash_len,
++				  &prop);
++}
++
++static const char *fit_get_hashed_nodes(const void *fit, int noffset,
++					int *hashed_node_count, char **node_inc)
++{
++	const char *prop, *end, *name;
++	int prop_len;
++	int count;
++	int i;
++
++	/* Count the number of strings in the property */
++	count = fdt_stringlist_count(fit, noffset, FIT_HASHED_NODES_PROP);
++	if ((count == 0) || (count > IMAGE_MAX_HASHED_NODES))
++		return NULL;
++
++	prop = fdt_getprop(fit, noffset, FIT_HASHED_NODES_PROP, &prop_len);
++	end = prop ? prop + prop_len : prop;
++	*hashed_node_count = count;
++	for (name = prop, i = 0; name < end; name += strlen(name) + 1, i++)
++		node_inc[i] = (char *)name;
++
++	return prop;
++}
++
++static int fit_pub_key_node_get(const void *fit, __unused int conf)
++{
++	int images;
++
++	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	return fdt_subnode_offset(fit, images, FIT_PUB_KEY_PROP);
++}
++
++static int fit_get_pub_key(const void *fit, int noffset, int sig_sub_node,
++			   const void **pub_key_fit, enum fit_sec_failure *res)
++{
++	int node, key_len, pub_key_node;
++	const void *key_data;
++	const char *key_name;
++
++	node = fit_pub_key_node_get(fit, noffset);
++	if (node < 0)
++		return 1;
++
++	key_data = fdt_getprop(fit, node, FIT_DATA_PROP, &key_len);
++	if (!key_data)
++		return 1;
++
++	arcboot_key_idx = fit_get_int(fit, 0, FIT_SEC_KEY_IDX, -1);
++	if (arcboot_key_idx < 0)
++		return 1;
++
++	*pub_key_fit = key_data;
++
++	/* Get modulus from public key */
++	if (fdt_check_header(*pub_key_fit))
++		return 1;
++
++	if (get_key_name(fit, sig_sub_node, &key_name))
++		return 1;
++
++	pub_key_node = get_pub_key_node(*pub_key_fit, key_name);
++	if (pub_key_node < 0)
++		return 1;
++
++	/* Update key data and key length with 384 bytes modulus */
++	key_data = fdt_getprop(*pub_key_fit, pub_key_node,
++			"rsa,modulus", &key_len);
++
++	if (security_check_key_revoke_status(arcboot_key_idx) != 1) {
++		*res = FIT_SEC_KEY_REVOKED;
++		return 1;
++	}
++
++	if (secureboot_verify_key_hash(arcboot_key_idx, (uint8_t *)key_data, key_len)) {
++		*res = FIT_SEC_SIGN_FAILED;
++		return 1;
++	}
++
++	return 0;
++}
++
++static bool fit_svn_is_valid(const void *fit)
++{
++	int sec_ver;
++
++	sec_ver = fit_get_int(fit, 0, FIT_SEC_VERSION, -1);
++	if (sec_ver < 0)
++		return false;
++
++	if (security_check_valid_fw_version(sec_ver) !=
++					SECURITY_FW_VERSION_SECURE)
++		return false;
++
++	return true;
++}
++
++static int fit_verify_config_regions(const void *fit,
++				     struct fdt_region *fdt_regions,
++				     int count, int sig_sub_node,
++				     const void *pub_key_fit)
++{
++	fit_region_make_list(fit, fdt_regions, count, region);
++
++	return fit_config_check_sig(fit, sig_sub_node, region, count,
++				    pub_key_fit);
++}
++
++/* Checks the signed FIT and validate it againts the public key */
++static int fit_verify_config(const void *fit, int noffset,
++			     enum fit_sec_failure *res)
++{
++	int sig_sub_node;
++	const char *hashed_node_prop;
++	int count, err;
++	char *node_inc[IMAGE_MAX_HASHED_NODES];
++	char * const exc_prop[] = { FIT_DATA_PROP };
++	char path[FIT_MAX_PATH];
++	const uint32_t *strings;
++	const void *pub_key_fit;
++
++	sig_sub_node = fdt_subnode_offset(fit, noffset, FIT_SIG_NODENAME);
++	if (sig_sub_node < 0)
++		return 1;
++
++	if (fit_get_pub_key(fit, noffset, sig_sub_node, &pub_key_fit, res))
++		return 1;
++
++	hashed_node_prop = fit_get_hashed_nodes(fit, sig_sub_node, &count,
++						node_inc);
++	if (!hashed_node_prop)
++		return 1;
++
++	/* Get a list of regions to hash */
++	count = fdt_find_regions(fit, node_inc, count, exc_prop,
++				 ARRAY_SIZE(exc_prop), fdt_regions,
++				 MAX_FDT_REGIONS - 1, path, sizeof(path), 0);
++
++	if ((count <= 0) || (count >= MAX_FDT_REGIONS - 1))
++		return 1;
++
++	/* Add the strings */
++	strings = fdt_getprop(fit, sig_sub_node, "hashed-strings", NULL);
++	if (strings) {
++		fdt_regions[count].offset = fdt_off_dt_strings(fit);
++		fdt_regions[count].size = fdt32_to_cpu(strings[1]);
++		count++;
++	}
++
++	err = fit_verify_config_regions(fit, fdt_regions, count, sig_sub_node,
++					pub_key_fit);
++	if (err) {
++		*res = FIT_SEC_SIGN_FAILED;
++		return err;
++	}
++
++	return 0;
++}
++
++static int fit_verify_security(const void *fit, int noffset,
++			       enum fit_sec_failure *res)
++{
++	if (!security_efuse_image_validation_en())
++		return 0;
++
++	if (!fit_svn_is_valid(fit)) {
++		*res = FIT_SEC_SVN_INVALID;
++		return 1;
++	}
++
++	/*
++	 * Security in enabled and SVN is valid all thats left is to check the
++	 * signature on the FIT.
++	 */
++	return fit_verify_config(fit, noffset, res);
++}
++
++static int fit_getprop_u64(const void *fit, int node, const char *name,
++			   uint64_t *val64)
++{
++	const uint32_t *val32;
++	int len;
++
++	val32 = fdt_getprop(fit, node, name, &len);
++	if (!val32 || len != sizeof(uint64_t))
++		return 1;
++
++	*val64 = ((uint64_t)fdt32_to_cpu(val32[0])) << 32;
++	*val64 |= fdt32_to_cpu(val32[1]);
++	return 0;
++}
++
++int fit_init_resp(void *fit, size_t sz)
++{
++	int err;
++
++	err = fdt_create(fit, sz);
++	if (err)
++		return err;
++
++	err = fdt_finish_reservemap(fit);
++	if (err)
++		return err;
++
++	err = fdt_begin_node(fit, "");
++	if (err)
++		return err;
++
++	return 0;
++}
++
++int fit_fin_resp(void *fit, unsigned int *res_size)
++{
++	int err;
++
++	if (!fdt_size_dt_strings(fit)) {
++		*res_size = 0;
++		return 0; /* Empty response */
++	}
++
++	err = fdt_end_node(fit);
++	if (err)
++		return err;
++
++	err = fdt_finish(fit);
++	if (err)
++		return err;
++
++	*res_size = fdt_totalsize(fit);
++
++	return err;
++}
++
++static int fit_copy_image(uint64_t dst, const void *buf, int len, const char *arch,
++			  const char *cmpr)
++{
++	if (!strcmp(cmpr, "none")) {
++		arcboot_copy_image(dst, buf, len, arch);
++		return 0;
++	}
++
++	return 1;
++}
++
++static bool fit_load_is_runnable(const void *fit, int conf)
++{
++	const uint32_t *cell;
++	uint32_t type;
++	int len;
++
++	cell = fdt_getprop(fit, conf, FIT_LOAD_TYPE_PROP, &len);
++
++	/* If load type does not exists, assume it's u-boot */
++	if (!cell)
++		return true;
++
++	if (len != sizeof(*cell))
++		return false;
++
++	type = fdt32_to_cpu(*cell);
++	if (type >= FIT_LOAD_TYPE_COUNT)
++		return false;
++
++	return type == FIT_LOAD_TYPE_RUN;
++}
++
++static const uint8_t *fit_node_get_hash(const void *fit, int node)
++{
++	int hash;
++	const char *prop;
++
++	hash = fdt_subnode_offset(fit, node, FIT_HASH_PROP);
++	prop = (const char *)fdt_getprop(fit, hash, FIT_ALGO_PROP, NULL);
++	if (strcmp(prop, FIT_SHA))
++		return NULL;
++
++	return (const uint8_t *)fdt_getprop(fit, hash, FIT_VALUE_PROP, NULL);
++}
++
++__weak void sha_csum(__unused const unsigned char *input, __unused unsigned int ilen,
++		__unused unsigned char *output)
++{
++}
++
++static int fit_node_check_hash(const void *fit, int node, const uint8_t *buf,
++			       int len)
++{
++	const uint8_t *node_hash = fit_node_get_hash(fit, node);
++	uint8_t calc_hash[SHA_SUM_LEN];
++
++	if (!node_hash)
++		return 1;
++
++	sha_csum(buf, len, calc_hash);
++	if (memcmp(node_hash, calc_hash, SHA_SUM_LEN))
++		return 1;
++
++	return 0;
++}
++
++__weak bool arcboot_rom_is_image_sig_supported(void) { return true; }
++
++__weak int arcboot_verify_img_sig(__unused const void *fit, __unused size_t img_size,
++				  __unused enum fit_sec_failure *res, __unused int *key_idx)
++{
++	return 1;
++}
++
++static int fit_verify_image(const void *fit, size_t fit_size, int conf,
++			    enum fit_sec_failure *res)
++{
++	/*
++	 * for platforms with image security descriptor support, the signature
++	 * of the descriptor is validated. otherwise the fit internal signature
++	 * is validated.
++	 */
++	if (!arcboot_rom_is_image_sig_supported())
++		return fit_verify_security(fit, conf, res);
++
++	return arcboot_verify_img_sig(fit, fit_size, res, &arcboot_key_idx);
++}
++
++static enum fit_load_result fit_copy_images(const void *fit,
++					    enum fit_sec_failure *res)
++{
++	int node, len;
++	int conf, num_images, i;
++	const uint8_t *buf;
++	uint64_t load, start;
++	const char *cmpr;
++	size_t fit_size = fdt_totalsize(fit);
++
++	/* Check if image supports a minimum FDT version or newer */
++	if (fdt_version(fit) < FDT_MIN_SUPPORTED_VERSION)
++		return FIT_LOAD_SEC_FAILED;
++
++	/* check that the calculated memory range are legal */
++	if (!arcboot_is_valid_address_range((uintptr_t)fit, fit_size))
++		return FIT_LOAD_SEC_FAILED;
++
++	/* Get number of images in preboot configuration */
++	conf = fit_find_config_node(fit);
++	if (conf < 0)
++		return FIT_LOAD_CORRUPTED;
++
++	if (!fit_load_is_runnable(fit, conf))
++		return FIT_LOAD_CORRUPTED;
++
++	if (fit_verify_image(fit, fit_size, conf, res))
++		return FIT_LOAD_SEC_FAILED;
++
++	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
++	if (num_images > FIT_MAX_IMAGES)
++		return FIT_LOAD_CORRUPTED;
++	else if (num_images < 0)
++		return FIT_LOAD_CORRUPTED;
++
++	for (i = 0; i < num_images; i++) {
++		node = fit_loadables_node_get(fit, i);
++		if (node < 0)
++			return FIT_LOAD_NOT_RUNNABLE;
++
++		if (fit_getprop_u64(fit, node, FIT_LOADADDR_PROP, &load))
++			return FIT_LOAD_BAD_LOAD_ADDR;
++
++		if (fit_getprop_u64(fit, node, FIT_STARTADDR_PROP, &start))
++			start = load;
++
++		buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
++		if (!buf)
++			return FIT_LOAD_CORRUPTED;
++
++		if (fit_node_check_hash(fit, node, buf, len))
++			return FIT_LOAD_CORRUPTED;
++
++		cmpr = (const char *)fdt_getprop(fit, node,
++						 FIT_COMPRESSION_PROP,
++						 NULL);
++		if (!cmpr) {
++			/*
++			 * mkimage is adding compression, if it's missing then
++			 * something is wrong.
++			 */
++			return FIT_LOAD_CORRUPTED;
++		}
++
++		if (!arcboot_is_valid_address_range(load, len))
++			return FIT_LOAD_BAD_LOAD_ADDR;
++
++		images[i].arch = (const char *)fdt_getprop(fit, node,
++							FIT_ARCH_PROP, NULL);
++		if (!images[i].arch)
++			return FIT_LOAD_CORRUPTED;
++
++		images[i].loadaddr = load;
++		images[i].startaddr = start;
++
++		if (fit_copy_image(load, buf, len, images[i].arch, cmpr))
++			return FIT_LOAD_CORRUPTED;
++	}
++
++	return FIT_LOAD_SUCCESS;
++}
++
++void fit_load_update_status(enum fit_load_result errtype)
++{
++	switch (errtype) {
++	case FIT_LOAD_BAD_LOAD_ADDR:
++	case FIT_LOAD_NOT_RUNNABLE:
++	case FIT_LOAD_CORRUPTED:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_LOAD_FAILED);
++		break;
++	case FIT_LOAD_SEC_FAILED:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_LOAD_SEC_FAILED);
++		break;
++	default:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_LOAD_UNKNOWN_ERROR);
++		break;
++	}
++}
++
++void fit_format_update_status(enum fit_format_result errtype)
++{
++	switch (errtype) {
++	case FIT_FORMAT_HEADER_CHECK_FAILED:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_FORMAT_HEADER_CHECK_FAILED);
++		break;
++	case FIT_FORMAT_NO_DESCRIPTION:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_DESCRIPTION);
++		break;
++	case FIT_FORMAT_NO_IMAGES_PARENT_NODE:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_IMAGES_PARENT_NODE);
++		break;
++	case FIT_FORMAT_CURRUPTED_LOAD_TYPE:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_FORMAT_CORRUPTED_LOAD_TYPE);
++		break;
++	case FIT_FORMAT_UNSUPPORTED_LOAD_TYPE:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNSUPPORTED_LOAD_TYPE);
++		break;
++	default:
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNKNOWN_ERROR);
++		break;
++	}
++}
++
++static int fwupd_sec_convert_min_error(enum fit_sec_failure err)
++{
++	int serr;
++
++	switch (err) {
++	case FIT_SEC_KEY_REVOKED:
++		serr = HL_SEC_ERR_KEY_REVOKED;
++		break;
++	case FIT_SEC_SVN_INVALID:
++		serr = HL_SEC_ERR_SVN_INVALID;
++		break;
++	case FIT_SEC_SIGN_FAILED:
++		serr = HL_SEC_ERR_SIGN_FAILED;
++		break;
++	default:
++		serr = FIT_SEC_NONE;
++		break;
++	};
++
++	return serr;
++}
++
++int fit_load_images(void *fit)
++{
++	enum fit_sec_failure sec_res = FIT_SEC_NONE;
++	enum fit_load_result fit_load_error;
++	enum fit_format_result fit_format_error;
++
++	memset(&images, 0x0, sizeof(images));
++
++	fit_format_error = fit_check_format(fit);
++	if (fit_format_error) {
++		fit_format_update_status(fit_format_error);
++		fit_load_error = FIT_LOAD_CORRUPTED;
++	} else {
++		fit_load_error = fit_copy_images(fit, &sec_res);
++	}
++
++	switch (fit_load_error) {
++	case FIT_LOAD_SUCCESS:
++		return FIT_LOAD_SUCCESS;
++	case FIT_LOAD_SEC_FAILED:
++		arcboot_error_inform(HL_FW_ERR_SECURITY,
++				     fwupd_sec_convert_min_error(sec_res));
++		break;
++	default:
++		arcboot_error_inform(HL_FW_ERR_FIT, fit_load_error);
++		break;
++	}
++
++	fit_load_update_status(fit_load_error);
++	return fit_load_error;
++}
++
++void fit_run_image(void)
++{
++	uint64_t startaddr = 0;
++	uint32_t i;
++
++	for (i = 0; i < FIT_MAX_IMAGES; i++) {
++
++		if (strcmp(images[i].arch, "arc"))
++			continue;
++		/*
++		 * Since we only perform agent fit download as part
++		 * of ROM recovery, assumption is made here that
++		 * number of fit images will be 1 and agent will
++		 * run only on ARC.
++		 */
++		startaddr = images[i].startaddr;
++		break;
++	}
++
++	arcboot_start_image(startaddr);
++}
++
++__weak size_t arcboot_get_img_sec_desc_size(void)
++{
++	return 0;
++}
++
++int fit_validate_size(const void *fit, int len)
++{
++	size_t img_size = ROUND_UP4(fdt_totalsize(fit));
++
++	if (fdt_check_header(fit))
++		return 1;
++
++	/* taking the security footer into account */
++	img_size += arcboot_get_img_sec_desc_size();
++
++	return img_size != (size_t) len;
++}
++
++int fit_get_load_type(const void *fit, uint32_t *load_type)
++{
++	const uint32_t *cell;
++	uint32_t type = FIT_LOAD_TYPE_RUN;
++	int ret, len, conf;
++
++	ret = fit_check_format(fit);
++	if (ret)
++		return ret;
++
++	conf = fit_find_config_node(fit);
++	if (conf >= 0) {
++		cell = fdt_getprop(fit, conf, FIT_LOAD_TYPE_PROP, &len);
++		if (!cell) {
++			*load_type = type;
++			return FIT_FORMAT_SUCCESS;
++		}
++		if (len != sizeof(*cell))
++			return FIT_FORMAT_CURRUPTED_LOAD_TYPE;
++
++		type = fdt32_to_cpu(*cell);
++		if (type >= FIT_LOAD_TYPE_COUNT)
++			return FIT_FORMAT_UNSUPPORTED_LOAD_TYPE;
++	}
++
++	*load_type = type;
++
++	return ret;
++}
++
++static int fit_image_get_data(const void *fit, int noffset,
++		       const void **data, size_t *size)
++{
++	int len;
++
++	*data = fdt_getprop(fit, noffset, FIT_DATA_PROP, &len);
++	if (*data == NULL) {
++		*size = 0;
++		return -1;
++	}
++
++	*size = len;
++	return 0;
++}
++
++static int fit_image_get_node(const void *fit, const char *image_uname)
++{
++	int images_noffset;
++
++	images_noffset = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	if (images_noffset < 0)
++		return images_noffset;
++
++	return fdt_subnode_offset(fit, images_noffset, image_uname);
++}
++
++static int fit_conf_get_prop_node_index(const void *fit, int noffset,
++				 const char *prop_name, int index)
++{
++	const char *uname;
++	int len;
++
++	/* get image unit name from configuration property */
++	uname = fdt_stringlist_get(fit, noffset, prop_name, index, &len);
++	if (uname == NULL)
++		return len;
++
++	return fit_image_get_node(fit, uname);
++}
++
++int fit_image_get_loadable_data(const void *fit, const void **data,
++				size_t size)
++{
++	size_t actual_size;
++	int err, node, conf;
++
++	conf = fit_find_config_node(fit);
++	if (conf < 0)
++		return 1;
++
++	node = fit_conf_get_prop_node_index(fit, conf, FIT_LOADABLE_PROP, 0);
++	if (node < 0)
++		return 1;
++
++	err = fit_image_get_data(fit, node, data, &actual_size);
++	if (err)
++		return err;
++
++	if (actual_size != size)
++		return 1;
++
++	return 0;
++}
++
++#define HL_SEC_REGIONS_CNT	2
++#define HL_SEC_KEY_NAME		"hl_rsa3072"
++
++int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
++		       size_t sec_desc_size, const void *pub_key_fit,
++		       const uint8_t *sig, size_t sig_len)
++{
++	const char *key_name = HL_SEC_KEY_NAME;
++	struct key_prop prop;
++	struct image_region region[HL_SEC_REGIONS_CNT];
++
++	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
++		return 1;
++
++	/*
++	 * region 0 holds the fit image as a whole,
++	 * region 1 holds the hl security descriptor
++	 */
++	region[0].data = img;
++	region[0].size = img_size;
++	region[1].data = sec_desc;
++	region[1].size = sec_desc_size;
++
++	return rsa_verify_regions(region, HL_SEC_REGIONS_CNT, sig, sig_len,
++				  &prop);
++}
+diff --git a/common/fit.h b/common/fit.h
+new file mode 100644
+index 0000000..c08bf28
+--- /dev/null
++++ b/common/fit.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#ifndef _HL_FIT_H_
++#define _HL_FIT_H_
++
++enum fit_load_result {
++	FIT_LOAD_SUCCESS = 0,
++	FIT_LOAD_CORRUPTED,
++	FIT_LOAD_BAD_LOAD_ADDR,
++	FIT_LOAD_NOT_RUNNABLE,
++	FIT_LOAD_SEC_FAILED,
++};
++
++enum fit_format_result {
++	FIT_FORMAT_SUCCESS = 0,
++	FIT_FORMAT_HEADER_CHECK_FAILED,
++	FIT_FORMAT_NO_DESCRIPTION,
++	FIT_FORMAT_NO_IMAGES_PARENT_NODE,
++	FIT_FORMAT_CURRUPTED_LOAD_TYPE,
++	FIT_FORMAT_UNSUPPORTED_LOAD_TYPE,
++};
++
++void fit_load_update_status(enum fit_load_result errtype);
++void fit_format_update_status(enum fit_format_result errtype);
++int fit_load_images(void *fit);
++void fit_run_image(void);
++int fit_validate_size(const void *fit, int len);
++int fit_get_load_type(const void *fit, uint32_t *load_type);
++int fit_image_get_loadable_data(const void *fit, const void **data,
++				size_t size);
++int fit_init_resp(void *fit, size_t sz);
++int fit_fin_resp(void *fit, unsigned int *res_size);
++int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
++		       size_t sec_desc_size, const void *pub_key_fit,
++		       const uint8_t *sig, size_t sig_len);
++
++#endif /* _HL_FIT_H_ */
+diff --git a/common/fit_regions.c b/common/fit_regions.c
+new file mode 100644
+index 0000000..f4a19f5
+--- /dev/null
++++ b/common/fit_regions.c
+@@ -0,0 +1,167 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <libfdt.h>
++#include "common.h"
++#include "fit_rsa.h"
++#include "fit_regions.h"
++
++#define FDT_MAX_DEPTH	8
++
++/*
++ * from u-boot/common/image-sig.c
++ */
++struct image_region *fit_region_make_list(const void *fit,
++					  struct fdt_region *fdt_regions,
++					  int count,
++					  struct image_region *region)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		region[i].data = fit + fdt_regions[i].offset;
++		region[i].size = fdt_regions[i].size;
++	}
++
++	return region;
++}
++
++static int str_in_list(const char *str, char * const list[], int count)
++{
++	int i;
++
++	for (i = 0; i < count; i++)
++		if (!strcmp(list[i], str))
++			return 1;
++
++	return 0;
++}
++
++/*
++ * from u-boot/lib/libfdt/fdt_region.c
++ */
++int fdt_find_regions(const void *fdt, char * const inc[], int inc_count,
++		     char * const exc_prop[], int exc_prop_count,
++		     struct fdt_region region[], int max_regions,
++		     char *path, int path_len, int add_string_tab)
++{
++	int stack[FDT_MAX_DEPTH] = { 0 };
++	char *end;
++	int nextoffset = 0;
++	uint32_t tag;
++	int count = 0;
++	int start = -1;
++	int depth = -1;
++	int want = 0;
++	int base = fdt_off_dt_struct(fdt);
++
++	end = path;
++	*end = '\0';
++	do {
++		const struct fdt_property *prop;
++		const char *name;
++		const char *str;
++		int include = 0;
++		int stop_at = 0;
++		int offset;
++		int len;
++
++		offset = nextoffset;
++		tag = fdt_next_tag(fdt, offset, &nextoffset);
++		stop_at = nextoffset;
++
++		switch (tag) {
++		case FDT_PROP:
++			include = want >= 2;
++			stop_at = offset;
++			prop = fdt_get_property_by_offset(fdt, offset, NULL);
++			str = fdt_string(fdt, fdt32_to_cpu(prop->nameoff));
++			if (str_in_list(str, exc_prop, exc_prop_count))
++				include = 0;
++			break;
++
++		case FDT_NOP:
++			include = want >= 2;
++			stop_at = offset;
++			break;
++
++		case FDT_BEGIN_NODE:
++			depth++;
++			if (depth == FDT_MAX_DEPTH)
++				return -FDT_ERR_BADSTRUCTURE;
++			name = fdt_get_name(fdt, offset, &len);
++			if (end - path + 2 + len >= path_len)
++				return -FDT_ERR_NOSPACE;
++			if (end != path + 1)
++				*end++ = '/';
++			memcpy(end, name, len+1);
++			end += len;
++			stack[depth] = want;
++			if (want == 1)
++				stop_at = offset;
++			if (str_in_list(path, inc, inc_count))
++				want = 2;
++			else if (want)
++				want--;
++			else
++				stop_at = offset;
++			include = want;
++			break;
++
++		case FDT_END_NODE:
++			/* Depth must never go below -1 */
++			if (depth < 0)
++				return -FDT_ERR_BADSTRUCTURE;
++			include = want;
++			want = stack[depth--];
++			while (end > path && *--end != '/')
++				;
++			*end = '\0';
++			break;
++
++		case FDT_END:
++			include = 1;
++			break;
++		}
++
++		if (include && start == -1) {
++			/* Should we merge with previous? */
++			if (count && count <= max_regions &&
++			    offset == region[count - 1].offset +
++					region[count - 1].size - base)
++				start = region[--count].offset - base;
++			else
++				start = offset;
++		}
++
++		if (!include && start != -1) {
++			if (count < max_regions) {
++				region[count].offset = base + start;
++				region[count].size = stop_at - start;
++			}
++			count++;
++			start = -1;
++		}
++	} while (tag != FDT_END);
++
++	if (nextoffset != (int) fdt_size_dt_struct(fdt))
++		return -FDT_ERR_BADLAYOUT;
++
++	/* Add a region for the END tag and the string table */
++	if (count < max_regions) {
++		region[count].offset = base + start;
++		region[count].size = nextoffset - start;
++		if (add_string_tab)
++			region[count].size += fdt_size_dt_strings(fdt);
++	}
++	count++;
++
++	return count;
++}
++
++__weak void sha_csum_regions(__unused const struct image_region region[],
++				__unused int region_count, __unused uint8_t *output)
++{
++}
+diff --git a/common/fit_regions.h b/common/fit_regions.h
+new file mode 100644
+index 0000000..94d8cd6
+--- /dev/null
++++ b/common/fit_regions.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_FIT_REGIONS_H_
++#define COMMON_FIT_REGIONS_H_
++
++struct fdt_region {
++	int offset;
++	int size;
++};
++
++struct image_region *fit_region_make_list(const void *fit,
++					  struct fdt_region *fdt_regions,
++					  int count,
++					  struct image_region *region);
++
++int fdt_find_regions(const void *fdt, char * const inc[], int inc_count,
++		     char * const exc_prop[], int exc_prop_count,
++		     struct fdt_region region[], int max_regions,
++		     char *path, int path_len, int add_string_tab);
++
++#endif /* COMMON_FIT_REGIONS_H_ */
+diff --git a/common/fit_rsa.h b/common/fit_rsa.h
+new file mode 100644
+index 0000000..6bae701
+--- /dev/null
++++ b/common/fit_rsa.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_FIT_RSA_H_
++#define COMMON_FIT_RSA_H_
++
++#include <arcboot.h>
++#include <rsa-mod-exp.h>
++
++struct image_region {
++	const void *data;
++	int size;
++};
++
++int rsa_verify_regions(const struct image_region region[], int region_count,
++		       const uint8_t *sig, uint32_t sig_len, struct key_prop *prop);
++
++#endif /* COMMON_FIT_RSA_H_ */
+diff --git a/common/rsa/rsa-verify.c b/common/rsa/rsa-verify.c
+index 0ad3468..7f18dde 100644
+--- a/common/rsa/rsa-verify.c
++++ b/common/rsa/rsa-verify.c
+@@ -8,6 +8,7 @@
+ #include <sha512.h>
+ #include <string.h>
+ #include <arcboot.h>
++#include <fit_rsa.h>
+ 
+ /*
+  * This array is declared as global, to minimise
+@@ -228,3 +229,34 @@
+ 
+ 	return rsa_verify_hash(key, key_len, hash, sig, sig_len);
+ }
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			 uint8_t *output)
++{
++	sha512_context ctx;
++	int i;
++
++	sha384_starts(&ctx);
++	for (i = 0; i < region_count; i++)
++		sha384_update(&ctx, region[i].data, region[i].size);
++	sha384_finish(&ctx, output);
++}
++
++/* based on int rsa_verify(struct image_sign_info *info,
++ *		const struct image_region region[], int region_count,
++ *		uint8_t *sig, uint sig_len)
++ * from: u-boot/lib/rsa/rsa-verify.c
++ */
++int rsa_verify_regions(const struct image_region region[], int region_count,
++		       const uint8_t *sig, uint32_t sig_len, struct key_prop *prop)
++{
++	uint8_t hash[SHA384_SUM_LEN];
++	int ret;
++
++	if (sig_len != (uint32_t) (prop->num_bits >> 3))
++		return 1;
++
++	sha_csum_regions(region, region_count, (uint8_t *)hash);
++	ret = rsa_verify_key(prop, sig, sig_len, (uint8_t *)hash, RSA3072_BYTES);
++	return ret;
++}
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 8eabe5f..ec6045b 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -202,6 +202,15 @@
+ 	PROGRESS_ARCBOOT_EROM_TPM_START = 84,
+ 	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 85,
+ 	PROGRESS_ARCBOOT_ROM_PCIE_LINK_UP = 86,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_HEADER_CHECK_FAILED = 87,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_DESCRIPTION = 88,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_IMAGES_PARENT_NODE = 89,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_CORRUPTED_LOAD_TYPE = 90,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNSUPPORTED_LOAD_TYPE = 91,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNKNOWN_ERROR = 92,
++	PROGRESS_ARCBOOT_ROM_FIT_LOAD_FAILED = 93,
++	PROGRESS_ARCBOOT_ROM_FIT_LOAD_SEC_FAILED = 94,
++	PROGRESS_ARCBOOT_ROM_FIT_LOAD_UNKNOWN_ERROR = 95,
+ };
+ 
+ enum security_location {
+@@ -210,6 +219,13 @@
+ 	SPI_FLASH
+ };
+ 
++enum fit_sec_failure {
++	FIT_SEC_NONE = 0,
++	FIT_SEC_SVN_INVALID,
++	FIT_SEC_KEY_REVOKED,
++	FIT_SEC_SIGN_FAILED,
++};
++
+ extern struct arcboot_global_s arcboot_rom_global;
+ void arcboot_rom_status_update(enum arcboot_rom_progress progress);
+ void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,

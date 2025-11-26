@@ -1,0 +1,79 @@
+From 325ba92bca8f58b57972e4b4b575b7c1924dcc43 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 16 Oct 2020 09:43:06 +0300
+Subject: [PATCH] [SW-22029] initialize dccm regions used by arcboot
+
+Currently on goya2 ASIC, it is observed that ARC throws DCCM memory
+exception (Internal Memory Error on Data Access) while attempt is made
+to read un-initialized DCCM memory in stack section of arcboot which is
+mapped on DCCM.
+
+This issue is seen in synopsys key validation api's which make use of
+prefetch instruction causing un-initialized read on stack. Also the
+fake ECC can also be generated if attempt is made to perform byte
+write on DCCM memory which in-turn gets converted to
+read-modify-write causing ECC error.
+
+The recommendation from synopsys to avoid above ECC error is to
+initialize DCCM memory before start of arcboot code. This patch add
+changes to initialize DCCM memory to zeros which is used by arcboot for
+its operations which includes stack and heap areas. bss and data
+sections mapped on DCCM are already initialized as part of arcboot init
+code.
+
+Change-Id: I5fcd76cd1addc330445bf350a854ad8fd5dd17fe
+---
+
+diff --git a/app/crt0_rom.S b/app/crt0_rom.S
+index d4680ee..dd8b3c8 100644
+--- a/app/crt0_rom.S
++++ b/app/crt0_rom.S
+@@ -84,20 +84,45 @@
+ 	CPU_EARLY_SETUP
+ 	mov gp, @__SDATA_BEGIN__
+ 
++	mov sp, @__stack_top	; initialize stack pointer
++
+ 	mov_s r2, @__sbss_start	; r2 = start of the bss section
+ 	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+ 	; set up the loop counter register to the size (in words) of the bss section
+ 	asr_s r13, r3
+ 	asr.f lp_count, r13
+ 
+-	mov sp, @__stack_top	; initialize stack pointer
+-	mov_s r3, 0
++	mov r4, 0
+ 	; loop to zero out the bss.  Enter loop only if lp_count != 0
+ 	lpnz @.Lend_zbss
+-	st.ab r3, [r2, 4]	; zero out the word
++	st.ab r4, [r2, 4]	; zero out the word
+ 	nop
+ .Lend_zbss:
+ 
++	mov_s r2, @__start_heap	; r2 = start of the heap section
++	sub r3, @__end_heap, r2	; r3 = size of the heap section in bytes
++	; set up the loop counter register to the size (in words) of the heap section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to zero out the heap.  Enter loop only if lp_count != 0
++	lpnz @.Lend_heap
++	st.ab r4, [r2, 4]	; zero out the word
++	nop
++.Lend_heap:
++
++	mov_s r2, @__stack		; r2 = start of the stack section
++	sub r3, @__stack_top, r2	; r3 = size of the stack section in bytes
++	; set up the loop counter register to the size (in words) of the stack section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to zero out the stack.  Enter loop only if lp_count != 0
++	lpnz @.Lend_stack
++	st.ab r4, [r2, 4]	; zero out the word
++	nop
++.Lend_stack:
++
+ 	mov_s r1, @_etext	; r1 = end of the text section
+ 	mov_s r2, @_data	; r1 = end of the data section
+ 

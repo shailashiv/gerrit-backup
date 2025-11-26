@@ -1,0 +1,128 @@
+From b1b86fa158a8ceec93d1591b79da1b984b03a8ad Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 06 May 2024 12:59:04 +0300
+Subject: [PATCH] [FSW-402] fs1: init: add cfg base to cfg reg
+
+with this patch, added support to add cfg base
+to global regmap read/write api, and added
+correction in die id read. removed die id replace
+logic in regmap read/write, because of
+cfg_addr_mnpl register is enabled by default.
+irrespective of any die id in register offset
+request will reach to same die by default.
+
+Change-Id: I556e2dad1bff8a516311c300085f6bed2c641125
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 1eb0ba8..9c98bcd 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -21,7 +21,7 @@
+ 
+ uint8_t boot_rom_get_die_id(void)
+ {
+-	uint32_t die_cpu_id = base_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_DIE_CPU_ID));
++	uint32_t die_cpu_id = regmap_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_DIE_CPU_ID));
+ 
+ 	return ((die_cpu_id & ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_M)
+ 		>> ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_S);
+@@ -51,13 +51,8 @@
+ 	uint32_t dccm_dwords = HL_ARC1_DCCM_PERSIST_SECTION_SIZE >> 2;
+ 	struct fs1_cold_rst_data cold_rst_data;
+ 	uint32_t i;
+-	uint32_t die_cold_rst_flop_2 = HL_CFG_BASE +
+-				       IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2);
+ 
+-	/* Replace correct die id in register offset*/
+-	die_cold_rst_flop_2 = (die_cold_rst_flop_2 & ~(HL_ARC_ADDR_DIE_ID_MASK)) |
+-			      (die_id << HL_ARC_ADDR_DIE_ID_SHIFT);
+-	cold_rst_data.data = base_readl(die_cold_rst_flop_2);
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ 
+ 	if (cold_rst_data.arc1_persist_dccm_init_done)
+ 		goto non_zero_init;
+@@ -66,7 +61,7 @@
+ 		*dccm_addr++ = 0;
+ 
+ 	cold_rst_data.arc1_persist_dccm_init_done = 1;
+-	base_writel(cold_rst_data.data, die_cold_rst_flop_2);
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ 
+ non_zero_init:
+ 	/* Non zero initializers only required for master(die 0) */
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index b03ef80..2993037 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -97,9 +97,9 @@
+ 		if(boot_rom_global.die_type != COMPUTE_DIE) {
+ 			io_half1_off = boot_rom_global.die_id + 1;
+ 
+-			base_writel(PLL_LOCK_TIMER_VAL, IO_HALF1((ctrl0 + phy_off), io_half1_off));
+-			base_writel(OFFSET_CALLOCK_TIMER, IO_HALF1((ctrl1 + phy_off), io_half1_off));
+-			base_writel(TIMER_1US, IO_HALF1((ctrl3 + phy_off), io_half1_off));
++			regmap_writel(PLL_LOCK_TIMER_VAL, IO_HALF1((ctrl0 + phy_off), io_half1_off));
++			regmap_writel(OFFSET_CALLOCK_TIMER, IO_HALF1((ctrl1 + phy_off), io_half1_off));
++			regmap_writel(TIMER_1US, IO_HALF1((ctrl3 + phy_off), io_half1_off));
+ 		}
+ 	}
+ }
+@@ -132,9 +132,9 @@
+ 		if(boot_rom_global.die_type != COMPUTE_DIE) {
+ 			h1_reg_addr = IO_HALF1((reg_addr + phy_off), (boot_rom_global.die_id + 1));
+ 
+-			val = base_readl(h1_reg_addr);
++			val = regmap_readl(h1_reg_addr);
+ 			val |= (BITSYNC_TRKWIN_VAL << IPT_D2D_PHYCTRLREG_RXBITSYNCTMR_BITSYNC_TRKWIN_S);
+-			base_writel(val, h1_reg_addr);
++			regmap_writel(val, h1_reg_addr);
+ 		}
+ 	}
+ }
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index 1dfa68e..687a381 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -43,6 +43,7 @@
+ 
+ #define FLASH_VALID_MASK		0x1FFFFF
+ 
++#define ARC_REG_BASE_MASK	REGION_BASE_ADDR(0xF)
+ #define HL_CFG_BASE			REGION_BASE_ADDR(REGION_LBW_CFG_IDX)
+ #define HL_CFG_SIZE			SZ_256MB   /* 256MB */
+ 
+diff --git a/include/mem_io.h b/include/mem_io.h
+index e0ef2f0..6c1201d 100644
+--- a/include/mem_io.h
++++ b/include/mem_io.h
+@@ -18,8 +18,9 @@
+ #define HL_ARC_ADDR_DIE_ID_SHIFT		25
+ #define HL_ARC_ADDR_DIE_ID_MASK			(0x7 << HL_ARC_ADDR_DIE_ID_SHIFT)
+ 
++#define ARC_REG_UPD(OFFSET, ARC_REG_BASE)	((OFFSET & ~(ARC_REG_BASE_MASK)) | ARC_REG_BASE)
++
+ #define BIT(nr)					(1 << (nr))
+-extern struct boot_rom_global_s boot_rom_global;
+ 
+ static inline void base_writel(uint32_t val, uint32_t offset)
+ {
+@@ -35,16 +36,14 @@
+ 
+ static inline uint32_t regmap_readl(uint32_t offset)
+ {
+-	uint32_t reg = base_readl((offset & ~(HL_ARC_ADDR_DIE_ID_MASK)) |
+-				(boot_rom_global.die_id << HL_ARC_ADDR_DIE_ID_SHIFT));
++	uint32_t reg = base_readl(ARC_REG_UPD(offset, HL_CFG_BASE));
+ 
+ 	return reg;
+ }
+ 
+ static inline void regmap_writel(uint32_t val, uint32_t offset)
+ {
+-	base_writel(val, (offset & ~(HL_ARC_ADDR_DIE_ID_MASK)) |
+-				(boot_rom_global.die_id << HL_ARC_ADDR_DIE_ID_SHIFT));
++	base_writel(val, (ARC_REG_UPD(offset, HL_CFG_BASE)));
+ }
+ 
+ static inline uint32_t sp_sram_readl(uint32_t offset)

@@ -1,0 +1,90 @@
+From ccccddc3fad1158ee2e5345eaffc75e235c904ff Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 16 May 2022 16:11:26 +0300
+Subject: [PATCH] [SW-0] rom: update rma mode logic
+
+As per the updated gaudi3 security specification, in case of
+rma mode, fake fuse from flash is required to be used instead of
+actual fuse. This is to provide complete flexibility to the system
+team to debug the rma occurrence .
+
+It is agreed with security architect that the fake fuse contents
+in spi need not be validated.
+
+Change-Id: I25feadffa8bb2925aeda6e572ebce1b46fc67349
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 928768d..1f384d1 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -370,15 +370,11 @@
+ 
+ #define BOOT_STRAP_RMA_MODE_MASK			0x3
+ #define GAUDI_MANF_MODE_GPIO				22
+-
+-void arcboot_rom_fuse_override(void)
++static bool arcboot_rom_rma_mode_en(void)
+ {
+ 	uint32_t rma_mode_status, rma_mode_gpio;
+ 	uint32_t index = GAUDI_MANF_MODE_GPIO % GPIOS_PER_BANK;
+ 	uint32_t strap_h = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H);
+-
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_EOM_MASK)
+-		arcboot_rom_global.config_fuse |= EFUSE_SYSCFG_PRE_PRODUCTION_BITS;
+ 
+ 	rma_mode_status = (strap_h & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_MODULE_ID_M)
+ 			>> D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_MODULE_ID_S;
+@@ -387,10 +383,28 @@
+ 	rma_mode_gpio = regmap_readl(mmD0_PSOC_GPIO1_DATA) & BIT(index);
+ 
+ 	if (((rma_mode_status & BOOT_STRAP_RMA_MODE_MASK) == BOOT_STRAP_RMA_MODE_MASK) &&
+-		(rma_mode_gpio == 0)) {
+-		/* Reset the efuse pre-production bits to 0(pre-production value) */
+-		arcboot_rom_global.config_fuse &= ~EFUSE_SYSCFG_PRE_PRODUCTION_BITS;
+-	}
++		(rma_mode_gpio == 0))
++		return true;
++
++	return false;
++}
++
++static bool arcboot_rom_fake_fuse_en(void)
++{
++	uint32_t strap_l = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L);
++
++	if (!(arcboot_rom_global.config_fuse & EFUSE_SYSCFG_EFUSE_LOCATION_MASK) &&
++		(strap_l & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L_EFUSE_OVERRIDE_M))
++		return true;
++
++	return false;
++}
++
++void arcboot_rom_fuse_override(void)
++{
++
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_EOM_MASK)
++		arcboot_rom_global.config_fuse |= EFUSE_SYSCFG_PRE_PRODUCTION_BITS;
+ 
+ 	/* KEY index 4 must not be revoked */
+ 	arcboot_rom_global.config_fuse &= ~EFUSE_SYSCFG_REVOKE_KEY_4;
+@@ -403,7 +417,7 @@
+ 
+ void arcboot_rom_fuse(void)
+ {
+-	uint32_t val, strap_l;
++	uint32_t val;
+ 
+ 	if (fuse_init() == 0)
+ 		arcboot_rom_set_efuse_read();
+@@ -420,9 +434,7 @@
+ 	/* Override the fuse values as per requirement */
+ 	arcboot_rom_fuse_override();
+ 
+-	strap_l = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L);
+-	if (!(val & EFUSE_SYSCFG_EFUSE_LOCATION_MASK) &&
+-		(strap_l & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L_EFUSE_OVERRIDE_M)) {
++	if (arcboot_rom_fake_fuse_en() || arcboot_rom_rma_mode_en()) {
+ 		spi_flash_fuse_init();
+ 		/*
+ 		 * Re-configure sku value based on new config_fuse,

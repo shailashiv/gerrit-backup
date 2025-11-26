@@ -1,0 +1,96 @@
+From 2a9e6400c8dda503a3f3bef1341091e57214e97d Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Tue, 06 Aug 2024 15:41:27 +0300
+Subject: [PATCH] [FSW-7765] fs1: enhance memcopy for constants
+
+this patch, enhances functionality of mem copy
+api to copy constant data to destination.
+user can send constant data in source argument
+to write into entire memory of size in arguments
+
+Change-Id: I876aa17eb76942fa7971a3f655324c07bb4d7944
+---
+
+diff --git a/arch/fs1/arc/dev_mem_copy.c b/arch/fs1/arc/dev_mem_copy.c
+index 8015e70..adfb40b 100644
+--- a/arch/fs1/arc/dev_mem_copy.c
++++ b/arch/fs1/arc/dev_mem_copy.c
+@@ -49,14 +49,15 @@
+ 	regmap_writel(val, addr);
+ }
+ 
+-int boot_rom_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool hbw)
++/* if flag.copy_type is MEM_COPY_TYPE_CONSTANT, src should provide data. */
++int boot_rom_mem_copy(struct mem_copy_flag flag, uint64_t src, uint64_t dst, uint32_t size)
+ {
+ 	uint64_t start = boot_rom_get_ts_us();
+ 	uint32_t cpy_sts, copy_sz;
+ 	uint32_t cp_err, wr_err, rd_err;
+ 	uint32_t sz_limit, sz_shift, sz_mask;
+ 
+-	if (hbw) {
++	if (flag.mem_type == MEM_COPY_MEM_TYPE_HBW) {
+ 		sz_limit = MEM_CPY_HBW_SIZE_LIMIT;
+ 		sz_shift = MEM_CPY_HBW_SIZE_SHIFT;
+ 		sz_mask = MEM_CPY_HBW_SIZE_SHIFT_MASK;
+@@ -70,9 +71,20 @@
+ 		return -1;
+ 	}
+ 
+-	regmap_writel((uint32_t)src & MEM_COPY_SRC_ADDR_LSB_BITS_31_4_M,
+-			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_LSB));
+-	regmap_writel((uint32_t)(src >> 32), IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_MSB));
++	if (flag.copy_type == MEM_COPY_TYPE_CONSTANT) {
++		/* Make sure valid 32 bit data only received over source arg */
++		if ((src >> 32) != 0) {
++			return -1;
++		}
++
++		regmap_writel(src, IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_CONST_VAL_WR_DATA));
++		regmap_writel(MEM_COPY_CONST_VAL_WR_MODE_VAL_M,
++			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_CONST_VAL_WR_MODE));
++	} else {
++		regmap_writel((uint32_t)src & MEM_COPY_SRC_ADDR_LSB_BITS_31_4_M,
++				IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_LSB));
++		regmap_writel((uint32_t)(src >> 32), IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_MSB));
++	}
+ 
+ 	regmap_writel((uint32_t)dst & MEM_COPY_DEST_ADDR_LSB_BITS_31_4_M,
+ 			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_DEST_ADDR_LSB));
+@@ -114,5 +126,8 @@
+ 	wr_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_WR_ERR_STS));
+ 	rd_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_RD_ERR_STS));
+ 
+-	return (cp_err || wr_err || rd_err);
++	if (cp_err || wr_err || rd_err)
++		return BOOT_ROM_FAIL;
++	else
++		return BOOT_ROM_SUCCESS;
+ }
+diff --git a/arch/fs1/arc/dev_mem_copy.h b/arch/fs1/arc/dev_mem_copy.h
+index e98fc94..463eb04 100644
+--- a/arch/fs1/arc/dev_mem_copy.h
++++ b/arch/fs1/arc/dev_mem_copy.h
+@@ -17,6 +17,21 @@
+ #define HL_MEM_CPY_TIMEOUT_US		10000
+ #define HL_W_BARRIER_TIMEOUT_US		100000
+ 
+-int boot_rom_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool hbw);
++/* Data copy from source or constant data to be copied */
++#define MEM_COPY_TYPE_CONSTANT		0
++#define MEM_COPY_TYPE_DATA		1
++
++#define MEM_COPY_CONSTANT_CLEAR		0
++
++/* Memory type selection for mem copy */
++#define MEM_COPY_MEM_TYPE_LBW		0
++#define MEM_COPY_MEM_TYPE_HBW		1
++
++struct mem_copy_flag {
++	uint8_t copy_type;
++	uint8_t mem_type;
++};
++
++int boot_rom_mem_copy(struct mem_copy_flag flag, uint64_t src, uint64_t dst, uint32_t size);
+ 
+ #endif /* _DEV_MEM_COPY_H_ */

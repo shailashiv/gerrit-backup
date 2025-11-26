@@ -1,0 +1,295 @@
+From 1a0f479538f942cb729ae5f820e4c69f3072003c Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Thu, 13 Feb 2020 01:46:39 +0200
+Subject: [PATCH] [SW-8229] goya2: add security status report
+
+Report to PSOC_SECURITY the state of the security.
+
+Change-Id: I5c6eb3c25949c36260392c956cc1f166435f5b74
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 727fdc9..9a56685 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -17,7 +17,8 @@
+ struct arcboot_global_s arcboot_rom_global = {
+ 	.config_fuse = 0,
+ 	.recovery_flag = 0,
+-	.validation_pass = 0
++	.validation_pass = 0,
++	.curr_img = 0
+ };
+ 
+ #define ARCBOOT_BRINGUP_ERROR		-1
+@@ -151,6 +152,9 @@
+ 			image_ptr = ARCBOOT_PRIMARY;
+ 	}
+ 
++	/* store current selected img for status */
++	arcboot_rom_global.curr_img = image_ptr;
++
+ 	if (image_ptr == ARCBOOT_SECONDARY) {
+ 		flash_image_offset =
+ 			spi_flash_readl(FLASH_SECONDARY_OFFSET);
+@@ -164,6 +168,7 @@
+ static int arcboot_rom_bringup_pcie_images(uint8_t image_ptr)
+ {
+ 	uint32_t flash_image_offset;
++	uint32_t flash_image_fw_ver;
+ 	uint32_t flash_ppboot_pcie_offset;
+ 	uint32_t ppboot_pcie_offset;
+ 	uint16_t ppboot_pcie_size;
+@@ -171,6 +176,8 @@
+ 	uint16_t pcie_fw_size;
+ 	uint64_t pcie_fw_offset;
+ 	uint64_t pcie_fw_dest;
++	enum security_img_status img_status;
++	int8_t  ret;
+ 
+ 	arcboot_rom_status_update_clear(CLEAR_DMA_SECURITY_PROGRESS,
+ 					PROGRESS_BRINGUP_PCI_DMA);
+@@ -179,11 +186,18 @@
+ 					      flash_image_offset);
+ 	ppboot_pcie_size = (uint16_t)spi_flash_readl(flash_ppboot_pcie_offset);
+ 
++	/* update in PSOC_SECURITY the current img fw_version */
++	flash_image_fw_ver = spi_flash_readl(flash_image_offset +
++					     FW_VERSION_SIZE);
++	security_report_img_fw(arcboot_rom_global.curr_img, flash_image_fw_ver);
++
+ 	dma_copy_image(ppboot_pcie_size, flash_ppboot_pcie_offset, 0,
+ 		       SPI_DMA_DST_FW_SRAM);
+-	if (dma_wait_finish() == DMA_CRC_ERROR)
+-		/* TODO: update PSOC_SECURITY about CRC error in image */
++	if (dma_wait_finish() == DMA_CRC_ERROR) {
++		security_report_img_status(arcboot_rom_global.curr_img,
++					   IMG_STATUS_CRC_FAIL);
+ 		return ARCBOOT_BRINGUP_ERROR;
++	}
+ 
+ 	arcboot_rom_status_update(PROGRESS_BRINGUP_PCI_DMA);
+ 
+@@ -191,10 +205,16 @@
+ 	ppboot_pcie_size -= SECUREBOOT_IMG_HEAD_FOOTER;
+ 	/* offset of ppboot+pcie_fw image to verify, start from fw_version */
+ 	ppboot_pcie_offset = (HL_FWSRAM_BASE + IMG_LEN_SIZE);
+-	if (secureboot_verify_image(ppboot_pcie_size, ppboot_pcie_offset) ==
+-	    SECUREBOOT_VERIFY_FAILED)
+-		/* TODO: update PSOC_SECURITY about verify fail in image */
++	ret = secureboot_verify_image(ppboot_pcie_size, ppboot_pcie_offset);
++	if (ret != SECUREBOOT_VERIFY_SUCCESS) {
++		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
++			img_status = IMG_STATUS_FW_VERSION_LOW;
++		if (ret == SECUREBOOT_VERIFY_FAILED)
++			img_status = IMG_STATUS_SIG_AUTH_FAIL;
++		security_report_img_status(arcboot_rom_global.curr_img,
++					   img_status);
+ 		return ARCBOOT_BRINGUP_ERROR;
++	}
+ 
+ 	arcboot_rom_status_update(PROGRESS_BRINGUP_PCI_SECURITY);
+ 
+@@ -274,6 +294,8 @@
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 	arcboot_rom_status_update(PROGRESS_BRINGUP_RAM_SECURITY);
+ 
++	security_report_status(0, STATUS_IMG_VALID);
++
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+ 
+@@ -286,6 +308,7 @@
+ 		arcboot_rom_status_update(PROGRESS_BRINGUP_RAM_SEC);
+ 		if (arcboot_rom_bringup_ram_images(ARCBOOT_SECONDARY) !=
+ 		    ARCBOOT_BRINGUP_OK) {
++			security_report_status(0, STATUS_FW_AUTH_FAIL);
+ 			/* if debug I/F is enabled then fall back on I2C_S */
+ 			if ((arcboot_rom_global.config_fuse &
+ 			     EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK) == 0)
+diff --git a/common/secureboot.c b/common/secureboot.c
+index 0f3c3ae..d0e596b 100644
+--- a/common/secureboot.c
++++ b/common/secureboot.c
+@@ -55,7 +55,7 @@
+ 	/* check minimal valid security FW version */
+ 	if (security_check_valid_fw_version(fw_version) !=
+ 	    SECURITY_FW_VERSION_SECURE)
+-		return SECUREBOOT_VERIFY_FAILED;
++		return SECUREBOOT_VERIFY_VER_FAILED;
+ 
+ 	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
+ 	     SECUREBOOT_HABANA_KEY; key_scan--) {
+@@ -74,12 +74,8 @@
+ 			break;
+ 	}
+ 	/* if for loop doesn't find a valid key hash in fuse, return error */
+-	if (!verify) {
+-		regmap_writel(err, mmPSOC_SECURITY_SW_STATUS_0);
+-		regmap_writel(verify, mmPSOC_SECURITY_SW_STATUS_1);
+-		return SECUREBOOT_VERIFY_FAILED;
+-	}
+-
++	if (!verify)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
+ 
+ 	/* Phase0b uses the public key (test_public_key) to validate signature
+ 	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
+@@ -90,11 +86,8 @@
+ 				     test_phase0b_sig_len, &verify,
+ 				     block_buf, sizeof(block_buf));
+ 
+-	if (err || !verify) {
+-		/* TODO: status of verify fail */
+-		regmap_writel(err, mmPSOC_SECURITY_SW_STATUS_0);
+-		regmap_writel(verify, mmPSOC_SECURITY_SW_STATUS_1);
+-	}
++	if (err || !verify)
++		return SECUREBOOT_VERIFY_FAILED;
+ 
+ 	return verify;
+-}
+\ No newline at end of file
++}
+diff --git a/common/secureboot.h b/common/secureboot.h
+index 4b8ff43..f3fc9e9 100644
+--- a/common/secureboot.h
++++ b/common/secureboot.h
+@@ -16,6 +16,8 @@
+ 
+ #define SECUREBOOT_HASH_BLOCK_CALC_BUF	512
+ 
++#define SECUREBOOT_VERIFY_KEY_FAILED	-2
++#define SECUREBOOT_VERIFY_VER_FAILED	-1
+ #define SECUREBOOT_VERIFY_FAILED	0
+ #define SECUREBOOT_VERIFY_SUCCESS	1
+ 
+diff --git a/common/security.c b/common/security.c
+index 8eef54f..208ae5a 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -620,3 +620,83 @@
+ 			       SECURITY_BYTE_PER_DWORD));
+ 	}
+ }
++
++void security_report_img_fw(uint8_t index, uint32_t fw_ver)
++{
++	uint32_t offset;
++
++	if (index == ARCBOOT_SECONDARY)
++		offset = mmPSOC_SECURITY_SEC_IMG_FW_VER;
++	else
++		offset = mmPSOC_SECURITY_PRI_IMG_FW_VER;
++
++	regmap_writel(fw_ver, offset);
++}
++
++void security_report_img_status(uint8_t index,
++				enum security_img_status img_stat)
++{
++	uint32_t reg, offset;
++
++	if (index == ARCBOOT_SECONDARY)
++		offset = mmPSOC_SECURITY_SEC_IMG_STATUS;
++	else
++		offset = mmPSOC_SECURITY_PRI_IMG_STATUS;
++
++	reg = regmap_readl(offset);
++	switch (img_stat) {
++	case IMG_STATUS_FW_VERSION_LOW:
++		reg |= 1 << PSOC_SECURITY_PRI_IMG_STATUS_FW_VER_LOWER_SHIFT;
++		break;
++	case IMG_STATUS_SIG_AUTH_FAIL:
++		reg |= 1 <<
++		       PSOC_SECURITY_PRI_IMG_STATUS_AUTHENTICATE_FAIL_SHIFT;
++		break;
++	case IMG_STATUS_CRC_FAIL:
++		reg |= 1 << PSOC_SECURITY_PRI_IMG_STATUS_CRC_FAIL_SHIFT;
++		break;
++	default:
++		reg = 0;
++	}
++	regmap_writel(reg, offset);
++
++}
++
++
++void security_report_status(uint8_t index, enum security_status sec_stat)
++{
++	uint32_t reg;
++
++	reg = regmap_readl(mmPSOC_SECURITY_STATUS);
++	switch (sec_stat) {
++	case STATUS_IMG_VALID:
++		reg |= 1 << PSOC_SECURITY_STATUS_IMG_VALIDATED_SHIFT;
++		break;
++	case STATUS_FW_UPGRADE:
++		reg |= 1 << PSOC_SECURITY_STATUS_FW_UPGRADE_SHIFT;
++		break;
++	case STATUS_KEY_REVOKED:
++		reg |= 1 << PSOC_SECURITY_STATUS_KEY_REVOKED_SHIFT;
++		break;
++	case STATUS_KEY_REVOKED_INDX:
++		reg |= 1 << PSOC_SECURITY_STATUS_KEY_REVOKED_IND_SHIFT;
++		break;
++	case STATUS_MIN_FW_MODIFIED:
++		reg |= 1 << PSOC_SECURITY_STATUS_MIN_FW_MODIFIED_SHIFT;
++		break;
++	case STATUS_FW_VER_INC:
++		reg |= 1 << PSOC_SECURITY_STATUS_FW_VER_INC_SHIFT;
++		break;
++	case STATUS_SPI_IMG_MODIFIES:
++		reg |= index << PSOC_SECURITY_STATUS_SPI_IMG_MODIFIES_SHIFT;
++		break;
++	case STATUS_FW_AUTH_FAIL:
++		reg |= 1 << PSOC_SECURITY_STATUS_FW_AUTHENTICAION_FAIL_SHIFT;
++		break;
++	default:
++		reg = 0;
++	}
++
++	regmap_writel(reg, mmPSOC_SECURITY_STATUS);
++
++}
+diff --git a/common/security.h b/common/security.h
+index a7e3e91..2c21236 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -9,6 +9,25 @@
+ #define _SECURITY_H_
+ #include <limits.h>
+ 
++enum security_img_status {
++	IMG_STATUS_FW_VERSION_LOW,
++	IMG_STATUS_SIG_AUTH_FAIL,
++	IMG_STATUS_CRC_FAIL,
++	IMG_STATUS_CLEAR
++};
++
++enum security_status {
++	STATUS_IMG_VALID,
++	STATUS_FW_UPGRADE,
++	STATUS_KEY_REVOKED,
++	STATUS_KEY_REVOKED_INDX,
++	STATUS_MIN_FW_MODIFIED,
++	STATUS_FW_VER_INC,
++	STATUS_SPI_IMG_MODIFIES,
++	STATUS_FW_AUTH_FAIL,
++	STATUS_CLEAR
++};
++
+ #define SECURITY_FW_VERSION_TO_SECURITY_BYTE(x)		((x >> 24) & 0xFF)
+ #define SECURITY_FW_VERSION_FROM_SECURITY_BYTE(x)	((x & 0xFF) << 24)
+ 
+@@ -96,5 +115,9 @@
+ void security_load_revoke_bits(void);
+ void security_load_fw_version(void);
+ void security_load_keys(void);
++void security_report_img_fw(uint8_t index, uint32_t fw_ver);
++void security_report_img_status(uint8_t index,
++				enum security_img_status img_stat);
++void security_report_status(uint8_t index, enum security_status sec_stat);
+ 
+ #endif /* _SECURITY_H_ */

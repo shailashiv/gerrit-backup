@@ -1,0 +1,98 @@
+From 8cc3a9ae20fdf6e61165334141374f8b5150e85f Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 14 Mar 2022 17:48:11 +0200
+Subject: [PATCH] [SW-57547] rom: add validation pass flag check
+
+As per the new design, signature validation is done on image
+descriptor manifest and sha validation is done on ppboot/preboot
+images. Hence the validation pass check needs to be done at
+both places.
+
+This would skip re-processing of an already verified image.
+
+This patch consists of validation pass based logic update.
+
+Change-Id: Iac6812698d96a72bbe863d198caebd70c56269c2
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 4d4dd05..6b01743 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -384,13 +384,29 @@
+ 	uint64_t *start_addr =
+ 			&arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].start_addr;
+ 	int ret;
++	uint32_t idx;
++	struct boot_desc desc;
+ 
+ 	if (!arcboot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI)) {
+ 		goto skip_bringup;
+ 	}
+ 
+-	if (arcboot_rom_global.validation_pass)
++	if (arcboot_rom_global.validation_pass) {
++		idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI,
++				HL_FW_IMG_PPBOOT, &desc, FLOPS_UPD_NOOP);
++
++		/* Toggle the index in case primary index failed */
++		if (idx == HL_FW_IMG_NOT_FOUND)
++			idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI,
++				HL_FW_IMG_PPBOOT, &desc, FLOPS_UPD_PENDING);
++
++		/* Both index failed. Go to recovery */
++		if ((idx == HL_FW_IMG_NOT_FOUND) || (!desc.start_addr))
++			goto skip_bringup;
++
++		*start_addr = desc.start_addr;
+ 		goto skip_rom_validation;
++	}
+ 
+ 	/* Check for prim/sec failure */
+ 	ret = arcboot_rom_bringup_img(HL_FW_IMG_PPBOOT, start_addr);
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index a7e6305..8bfdc0b 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -73,12 +73,15 @@
+ 	if (p_img_ptr_ctx->boot_desc_flag)
+ 		return p_boot_ptr->count;
+ 
+-	img_ptrs_size = spi_flash_readl(p_img_ptr_ctx->img_ptr_spi_offset);
+-
+ 	if (img == HL_FW_BOOT_PTR_EROM) {
+ 		dma_sts_start = PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START;
+ 		dma_sts_end = PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH;
++	} else {
++		if (arcboot_rom_global.validation_pass)
++			goto skip_boot_desc_process;
+ 	}
++
++	img_ptrs_size = spi_flash_readl(p_img_ptr_ctx->img_ptr_spi_offset);
+ 
+ 	arcboot_rom_status_update(dma_sts_start);
+ 
+@@ -117,14 +120,16 @@
+ 			return 0;
+ 	}
+ 
+-
++skip_boot_desc_process:
+ 	if (img == HL_FW_BOOT_PTR_SPI) {
+-		desc_info.count = p_boot_ptr->count;
+-		desc_info.desc_size = p_boot_ptr->img_desc_sz;
+-		boot_info_set(HL_BOOT_INFO_IMG_DESC_INFO, &desc_info, sizeof(desc_info));
+-		boot_info_set(HL_BOOT_INFO_IMG_DESC_DATA, (uint8_t *)(boot_ptr_start_addr + p_offset[0]),
+-				p_boot_ptr->img_desc_sz * p_boot_ptr->count);
+-		boot_info_finalize();
++		if (!arcboot_rom_global.validation_pass) {
++			desc_info.count = p_boot_ptr->count;
++			desc_info.desc_size = p_boot_ptr->img_desc_sz;
++			boot_info_set(HL_BOOT_INFO_IMG_DESC_INFO, &desc_info, sizeof(desc_info));
++			boot_info_set(HL_BOOT_INFO_IMG_DESC_DATA, (uint8_t *)(boot_ptr_start_addr + p_offset[0]),
++					p_boot_ptr->img_desc_sz * p_boot_ptr->count);
++			boot_info_finalize();
++		}
+ 		boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA,
+ 				(uint8_t *)(boot_ptr_start_addr + BOOT_INFO_IMG_DESC_GET_OFFSET),
+ 				p_boot_ptr->img_desc_sz * p_boot_ptr->count, &copy_sz);

@@ -1,0 +1,210 @@
+From a93474c6eaee1f6dd7ceb47e0188b4206113a751 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Wed, 29 Jan 2020 00:38:49 +0200
+Subject: [PATCH] [SW-8228] goya2: add reading of fuses
+
+Add functions to support reading of security fuses on start.
+
+Change-Id: I7c939409c74d8a18a6a90eefae3df1789e917255
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 1234a1f..e7ed554 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -9,28 +9,64 @@
+ #include "efuse.h"
+ #include "security.h"
+ 
+-void arcboot_rom_init()
++struct arcboot_global_s arcboot_rom_global = {
++	.config_fuse = 0,
++};
++
++static void arcboot_rom_init(void) {}
++
++static void arcboot_rom_fuse(void)
+ {
+-	u32 config_fuse = 0;
+-	fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
+-	if (config_fuse & EFUSE_DISABLE_DEBUG_IF_MASK)
++	uint8_t hash_key_index;
++	uint8_t fw_version_sec = 0;
++	uint32_t key_revoke = 0;
++	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
++	enum security_location current_security_location;
++
++	fuse_read(EFUSE_SYSCFG_OFFSET, &arcboot_rom_global.config_fuse);
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK)
+ 		security_disable_debug_if();
+ 
++	/* read security location from efuse */
++	current_security_location =
++		((arcboot_rom_global.config_fuse >>
++		  EFUSE_SYSCFG_SECURITY_LOCATION) &
++		  EFUSE_SYSCFG_SECURITY_LOCATION_MASK);
++
++	switch (current_security_location) {
++	case SPI_FLASH:
++		break;
++	case SPI_OTP:
++		break;
++	case ASIC_EFUSE:
++		/* TODO: finish efuse hash get and fw_ver_sec */
++		key_revoke = arcboot_rom_global.config_fuse &
++			     EFUSE_SYSCFG_REVOKE_KEY_MASK;
++		break;
++	}
++
++	/* store key_revoke map in PSOC */
++	regmap_writel(key_revoke, mmPSOC_SECURITY_KEY_REVOKE);
++
++	/* store minimum allowed security version in PSOC */
++	regmap_writel(SECURITY_FW_VERSION_FROM_SECURITY_BYTE(fw_version_sec),
++		      mmPSOC_SECURITY_MIN_FW_VERSION);
++
++	/* store habana key hash in PSOC */
++	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
++	     hash_key_index++)
++		regmap_writel(key_hash[hash_key_index],
++			      security_key_soc_location_offset(hash_key_index));
+ }
+ 
+-void arcboot_rom_bringup_pcie()
+-{
++static void arcboot_rom_bringup_pcie(void) {}
+ 
+-}
+-
+-void arcboot_rom_bringup_arcboot_ram()
+-{
+-
+-}
++static void arcboot_rom_bringup_arcboot_ram(void) {}
+ 
+ int arcboot_rom_main(void)
+ {
+ 	arcboot_rom_init();
++	arcboot_rom_fuse();
+ 	arcboot_rom_bringup_pcie();
+ 	arcboot_rom_bringup_arcboot_ram();
+ 
+diff --git a/common/efuse.h b/common/efuse.h
+index 7d177f0..d72a485 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -7,10 +7,15 @@
+ 
+ #ifndef _EFUSE_H_
+ #define _EFUSE_H_
+-#define EFUSE_SYSCFG_OFFSET		0x3A
+ 
+-#define EFUSE_DISABLE_DEBUG_IF_MASK	BIT(12)
++#define EFUSE_SYSCFG_OFFSET			0x3A
++
++#define EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK	BIT(12)
++#define EFUSE_SYSCFG_SECURITY_LOCATION		7
++#define EFUSE_SYSCFG_SECURITY_LOCATION_MASK	0x3
++#define EFUSE_SYSCFG_REVOKE_KEY_LOCATION	0
++#define EFUSE_SYSCFG_REVOKE_KEY_MASK		0x1F
+ 
+ int fuse_read(u32 word, u32 *val);
+ 
+-#endif /* _EFUSE_H_ */
+\ No newline at end of file
++#endif /* _EFUSE_H_ */
+diff --git a/common/security.c b/common/security.c
+index a5381d9..759781c 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "arcboot.h"
++#include "security.h"
+ 
+ static void security_disable_i2c_s_mstr_if(void)
+ {
+@@ -50,6 +51,31 @@
+ 	security_disable_jtag_mstr_if();
+ }
+ 
++uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
++{
++	uint32_t ret;
++	uint8_t key_soc_base_index;
++	uint8_t key_soc_location_index;
++	uint32_t key_soc_location[] = {
++		mmPSOC_SECURITY_HABANA_KEY_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_3_0
++	};
++
++	/* select which index to choose (haban, customer 0-4) */
++	key_soc_base_index = hash_key_index / SECURITY_DWORD_PER_KEY;
++	/* key is 256bit, 32bit * 8... which of the 8 location is requested */
++	key_soc_location_index = hash_key_index % SECURITY_DWORD_PER_KEY;
++
++	/* get base address of selected key index */
++	ret = key_soc_location[key_soc_base_index];
++	/* add to base address of key the spicifice location of currect DWORD */
++	ret += (key_soc_location_index * sizeof(uint32_t));
++	return ret;
++}
++
+ void security_enable_spi_dma()
+ {
+ 	regmap_writel(mmPSOC_GLOBAL_CONF_SPI_DMA_AWUSER,0x400);
+@@ -58,4 +84,4 @@
+ void security_enable_mem_cpy()
+ {
+ 	regmap_writel(mmPSOC_GLOBAL_CONF_MEM_CPY_AXUSER,0x400);
+-}
+\ No newline at end of file
++}
+diff --git a/common/security.h b/common/security.h
+index 7ee84bf..6a4f0db 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -8,6 +8,14 @@
+ #ifndef _SECURITY_H_
+ #define _SECURITY_H_
+ 
++#define SECURITY_FW_VERSION_FROM_SECURITY_BYTE(x)	((x & 0xFF) << 24)
++#define SECURITY_KEY_HASH_COUNT				5
++#define SECURITY_DWORD_PER_KEY				8
++
++#define SECURITY_KEY_HASH_ARRAY_SIZE		(SECURITY_DWORD_PER_KEY * \
++						SECURITY_KEY_HASH_COUNT)
++
+ void security_disable_debug_if(void);
++uint32_t security_key_soc_location_offset(uint32_t hash_key_index);
+ 
+ #endif /* _SECURITY_H_ */
+\ No newline at end of file
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 364c1bc..20fe53b 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -39,9 +39,18 @@
+ #define FLASH_IMAGE_PREBOOT_OFFSET		0x10000
+ #define FLASH_IMAGE_PCIE_FW_OFFSET		0x18000
+ 
++struct arcboot_global_s {
++	uint32_t config_fuse;
++};
++
++enum security_location {
++	SPI_FLASH,
++	SPI_OTP,
++	ASIC_EFUSE
++};
+ 
+ typedef unsigned char u8;
+-typedef unsigned int u32;
++typedef unsigned long int u32;
+ typedef unsigned long long u64;
+ 
+ static inline void base_writel(u32 val, u32 offset)

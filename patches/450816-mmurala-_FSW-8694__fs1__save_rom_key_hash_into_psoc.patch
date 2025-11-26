@@ -1,0 +1,93 @@
+From 364d40074d998d2b1360c2cdd796674e30f0ebfd Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 19 Sep 2024 12:53:27 +0300
+Subject: [PATCH] [FSW-8694] fs1: save rom key hash into psoc
+
+Added support to write psoc pub key registers
+with array of 5 security key hash elements
+which are present in rom memory.
+
+Change-Id: I6c67fc5244c70c99a95d64f9d58932f7f4a9da8e
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 3044b71..f9b56e1 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -103,6 +103,35 @@
+ 	boot_rom_global.sec_data.sec_ver = fw_version_sec;
+ }
+ 
++void security_load_rom_key_hash()
++{
++	uint8_t key_idx, dword;
++	uint32_t key_reg;
++	uint32_t *hash = (uint32_t *)rom_key_hashes;
++	uint32_t key_reg_base_array[] = {
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_0_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_1_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_2_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_3_0),
++		IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PUBLIC_KEY_4_0)
++	};
++
++	/* KEY LOCATION: ROM */
++	boot_rom_status_update(PROGRESS_KEY_LOC_ROM);
++
++	/* TODO: Store keys in boot_info if required */
++
++	for (key_idx = 0; key_idx < NUM_KEYS_IN_ROM; key_idx++) {
++		key_reg = key_reg_base_array[key_idx];
++		for (dword = 0; dword < SECURITY_DWORD_PER_KEY; dword++) {
++			regmap_writel(hash[(key_idx * SECURITY_DWORD_PER_KEY) + dword],
++					key_reg);
++
++			key_reg += sizeof(uint32_t);
++		}
++	}
++}
++
+ int security_efuse_image_validation_en(void)
+ {
+ 	/* check efuse for security validation enable */
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index c9067f6..0c4a18c 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -29,6 +29,7 @@
+ int security_efuse_image_validation_en(void);
+ void boot_rom_eom_overrides(void);
+ void security_load_fw_version(void);
++void security_load_rom_key_hash(void);
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index ed09bcb..2e8c194 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -55,9 +55,9 @@
+ 	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 45,
+ 	PROGRESS_REVOKE_LOC_ASIC_EFUSE = 46,
+ 	PROGRESS_REVOKE_LOC_FAKE_FUSE = 47,
+-	PROGRESS_KEY_LOC = 48,
+-	PROGRESS_KEY_LOC_0 = 49,
+-	PROGRESS_KEY_LOC_1 = 50,
++	PROGRESS_KEY_LOC = 48, /* TODO: Remove & rearrange */
++	PROGRESS_KEY_LOC_ROM = 49,
++	PROGRESS_KEY_LOC_1 = 50, /* TODO: Remove & rearrange */
+ 	PROGRESS_VER_LOC = 51, /* TODO: Remove & rearrange */
+ 	PROGRESS_VER_LOC_ASIC_EFUSE = 52,
+ 	PROGRESS_VER_LOC_FAKE_FUSE = 53,
+diff --git a/common/security.c b/common/security.c
+index 4baa2f5..87d1f8d 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -66,6 +66,7 @@
+ 	security_load_sec_efuse_dword();
+ 	security_load_revoke_bits();
+ 	security_load_fw_version();
++	security_load_rom_key_hash();
+ }
+ 
+ int security_rom_get_key_hash_by_idx(uint32_t *hash, uint8_t key_index)

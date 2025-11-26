@@ -1,0 +1,106 @@
+From 6e6a6f3178ff3d2dd400dfd7f975fef7508f2ba7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 13 Apr 2022 20:29:29 +0300
+Subject: [PATCH] [SW-82714] gaudi3: block config range on startup
+
+In gaudi3, HW FSM will block entire config space. However if there
+is bug in HW in blocking entire config space, backup needs to be kept
+inside ROM to block entire config space. This patch implements
+blocking entire config space based on RR efuse bit.
+RR bit 0: skip RR configuration
+RR bit 1: perform RR configuration
+
+Change-Id: I1401084548014f672586980d4a31813893b441e7
+---
+
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index 5d7e4ca..7b3be07 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -19,6 +19,7 @@
+ #define EFUSE_SYSCFG_DISABLE_TWI_IF_MASK		BIT(11)
+ #define EFUSE_SYSCFG_EFUSE_LOCATION_MASK		BIT(13)
+ #define EFUSE_SYSCFG_SECURITY_ENABLE_MASK		BIT(15)
++#define EFUSE_SYSCFG_RR_MASK				BIT(16)
+ #define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(17)
+ #define EFUSE_SYSCFG_BACKUP_DISABLE			BIT(22)
+ #define EFUSE_SYSCFG_SKU_MASK				BIT(26)
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index 49df10d..e60d7f8 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -11,6 +11,7 @@
+ #include "spi_flash.h"
+ #include <string.h>
+ #include <boot_info.h>
++#include <dev_efuse.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -213,12 +214,66 @@
+ 			arcboot_rom_global.config_fuse;
+ }
+ 
++#define RR_LBW_PRIV_RANGE_MIN_SHORT_VAL		0x0
++#define RR_LBW_PRIV_RANGE_MAX_SHORT_VAL		0x1FFFF000
++#define RR_LBW_PRIV_RANGE_EN_SHORT_VAL		0x11
++static void security_rr_config(void)
++{
++	if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_RR_MASK) == 0)
++		return;
++
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_PCIE_LBW_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_PCIE_LBW_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++			mmD0_PCIE_LBW_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++}
++
+ void arcboot_rom_security_init(void)
+ {
+ 	/* based on efuse, handle jtag enable/disable */
+ 	security_handle_jtag_if();
+ 	/* based on efuse, handle twi enable/disable */
+ 	security_handle_twi();
++
++	security_rr_config();
++
+ 	/* store security relevant data in Scratch PAD Sram */
+ 	security_load_sec_efuse_dword();
+ 	security_load_revoke_bits();

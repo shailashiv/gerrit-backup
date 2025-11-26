@@ -1,0 +1,142 @@
+From d4dd71b0175c6e38e57f8dc9d83e80dce2c34349 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 23 Aug 2024 15:47:46 +0300
+Subject: [PATCH] [FSW-8694] fs1: retrieve spi efuse bin offsets
+
+SPI Efuse has separate manifest, but instead of
+locating it from constant SPI offset a separate
+img descriptor is used inside main manifest.
+Once fake fuse image descriptor is located from
+main manifest, desc offset used for spi dma copy
+spi efuse manifest to iccm.
+Each img desc inside spi efuse manifest used to
+locate spi efuse binaries.
+
+Change-Id: I005215db624a3575c930d09f395dc49daeb05c7c
+---
+
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index ef10861..1d58c25 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -46,6 +46,11 @@
+ 	PROGRESS_INIT_SPI_VALID_MANIFEST_INDEX_FAIL = 36,
+ 	PROGRESS_INIT_EFUSE_INIT_FAIL = 37,
+ 	PROGRESS_INIT_EFUSE_SPI = 38,
++	PROGRESS_INIT_EFUSE_SPI_IMG_DESC_FAIL, /* TODO */
++	PROGRESS_INIT_EFUSE_SPI_EXCEEDS_MAX_SIZE, /* TODO */
++	PROGRESS_INIT_EFUSE_SPI_DMA_COPY_FAIL, /* TODO */
++	PROGRESS_INIT_EFUSE_SPI_MAGIC_FAIL, /* TODO */
++	PROGRESS_INIT_EFUSE_SPI_DESC_COUNT_FAIL, /* TODO */
+ 	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 39,
+ 	PROGRESS_REVOKE_LOC_ASIC_EFUSE = 40,
+ 	PROGRESS_REVOKE_LOC_FAKE_FUSE = 41, /* TODO */
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 4dbc517..7f2e564 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -16,6 +16,9 @@
+ #include <dev_spi_flash.h>
+ #include <dma.h>
+ #include <common.h>
++#include <boot_flow.h>
++
++uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
+ 
+ static struct hl_fw_manifest_ctx *p_manifest_ctx;
+ static struct hl_fw_boot_ptrs *p_boot_ptr;
+@@ -328,3 +331,73 @@
+ 
+ 	return rec_img_count;
+ }
++
++uint8_t boot_desc_spi_efuse_init(uint8_t die_id_index, enum hl_fw_manifest_type manifest_idx)
++{
++	uint32_t ret, index;
++	uint32_t fake_fuse_base, fake_fuse_boot_ptr_size;
++	struct hl_fw_img_desc *fake_fuse_img_desc;
++	struct hl_fw_manifest_constants spi_manifest_consts;
++	struct hl_fw_boot_ptrs fake_fuse_boot_ptr;
++	uint32_t *offset_array_base = NULL;
++
++	spi_manifest_consts.dest_addr_dma = SPI_MANIFEST_IMG_2_DMA_DEST;
++	spi_manifest_consts.dest_addr_arc = SPI_MANIFEST_IMG_2_DMA_DEST_ARC;
++
++	fake_fuse_base = boot_flow_get_spi_efuse_manifest_offset(manifest_idx);
++	if (fake_fuse_base == 0) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_IMG_DESC_FAIL);
++		return BOOT_ROM_FAIL;
++	}
++
++	fake_fuse_boot_ptr_size = spi_flash_readl(fake_fuse_base);
++	if (fake_fuse_boot_ptr_size > HL_IMG_PTRS_MAX_SIZE) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_EXCEEDS_MAX_SIZE);
++		return BOOT_ROM_FAIL;
++	}
++
++	/* Fetch boot desc using DMA into dest offset */
++	ret = boot_rom_spi_dma(fake_fuse_boot_ptr_size, fake_fuse_base,
++		spi_manifest_consts.dest_addr_dma, false, false, 0);
++
++	if (ret != DMA_SUCCESS) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DMA_COPY_FAIL);
++		return BOOT_ROM_FAIL;
++	}
++
++	memcpy(&fake_fuse_boot_ptr, (uint32_t *)(spi_manifest_consts.dest_addr_arc),
++		sizeof(struct hl_fw_boot_ptrs));
++
++	if (fake_fuse_boot_ptr.magic.val != (FAKE_FUSE_BOOT_PTR_MAGIC_NAME | FW_SPI_BOOT_PTR_SUB)) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_MAGIC_FAIL);
++		return BOOT_ROM_FAIL;
++	}
++
++	offset_array_base = (uint32_t *)(spi_manifest_consts.dest_addr_arc +
++		fake_fuse_boot_ptr.offset2array);
++
++	if ((offset_array_base == NULL) || (fake_fuse_boot_ptr.count == 0)) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DESC_COUNT_FAIL);
++		return BOOT_ROM_FAIL;
++	}
++
++	if (die_id_index == MAX_DIE_COUNT) {
++		for(index = 0; index < fake_fuse_boot_ptr.count; index++) {
++			fake_fuse_img_desc = (struct hl_fw_img_desc *)(spi_manifest_consts.dest_addr_arc +
++				offset_array_base[index]);
++
++			/* Fake fuse bin order controlled by enum fake_fuse_bin_index */
++			if (((fake_fuse_img_desc->magic.type - 1) != (uint8_t)index) ||
++				(fake_fuse_img_desc->magic.type > MAX_DIE_COUNT))
++				return BOOT_ROM_FAIL;
++
++			fake_fuse_offset_array[index] = fake_fuse_base + fake_fuse_img_desc->offset;
++		}
++	} else {
++		fake_fuse_img_desc = (struct hl_fw_img_desc *)(spi_manifest_consts.dest_addr_arc +
++			offset_array_base[die_id_index]);
++		fake_fuse_offset_array[die_id_index] = fake_fuse_base + fake_fuse_img_desc->offset;
++	}
++
++	return BOOT_ROM_SUCCESS;
++}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 1bc5f13..5f81cff 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -15,6 +15,8 @@
+ #define INV_VER2		((uint32_t) -1)
+ #define INVALID_DESC_ID		2
+ 
++#define MAX_DIE_COUNT		(FS1_NUM_IO_DIES + FS1_NUM_COMPUTE_DIES)
++
+ struct boot_desc {
+ 	uint32_t desc_ver;
+ 	uint32_t spi_offset;
+@@ -38,6 +40,7 @@
+ 						enum hl_fw_img_type img);
+ uint32_t boot_desc_get_recovery_img_count(enum hl_fw_manifest_type manifest_idx);
+ uint32_t boot_desc_get_boot_pointer(enum hl_fw_manifest_type manifest_type);
++uint8_t boot_desc_spi_efuse_init(uint8_t die_id_index, enum hl_fw_manifest_type manifest_idx);
+ 
+ #endif /* _BOOT_DESC_H_ */
+ 

@@ -1,0 +1,502 @@
+From e5ec84d7709b4e9b2b02c9d4cf2a6406d17a1856 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 09 Apr 2025 19:05:54 +0300
+Subject: [PATCH] [FSW-14708] fs1: move arch specific code out
+
+Removed arch specific header from common header.
+Moved all arch specific code from common files
+to arch specific.
+
+Change-Id: Ib701c8d7255b5836945114932dcd3d8c96ccdd8f
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 70076c1..5f1c68a 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -16,3 +16,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_dma.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_security.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_mem_copy.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/fake_fuse_flow.c)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index adf24b6..d8dae88 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -34,61 +34,6 @@
+ #include <dev_boot_info.h>
+ 
+ extern const int fs1_die_type;
+-extern uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
+-
+-void boot_rom_init_slave_spi_efuse()
+-{
+-	/* Align with enum fake_fuse_bin_index */
+-	uint8_t die_id_arary[MAX_DIE_COUNT] = {FS1_IO_DIE_0, FS1_IO_DIE_1,
+-		FS1_COMPUTE_DIE_0, FS1_COMPUTE_DIE_1, FS1_COMPUTE_DIE_2, FS1_COMPUTE_DIE_3};
+-	uint32_t bank_offset, spi_offset, syscfg1_data, syscfg2_data;
+-	uint8_t die_id_index;
+-
+-	/* Note: Index 0 master, no need to export. */
+-	for(die_id_index = 1 ; die_id_index < MAX_DIE_COUNT; die_id_index++) {
+-
+-		spi_offset = fake_fuse_offset_array[die_id_index];
+-
+-		if (spi_offset == 0)
+-			continue;
+-
+-		/* read value from bank0 */
+-		bank_offset = (IO_EFUSE_SYSCFG_OFFSET * sizeof(uint32_t));
+-		syscfg1_data = spi_flash_readl(spi_offset + bank_offset);
+-
+-		/* read value from bank1 and OR with value from bank0 */
+-		bank_offset = ((EFUSE_WORDS_PER_BANK + IO_EFUSE_SYSCFG_OFFSET) * sizeof(uint32_t));
+-		syscfg1_data |= spi_flash_readl(spi_offset + bank_offset);
+-
+-		/* read value from bank0 */
+-		bank_offset = (IO_EFUSE_SYSCFG2_OFFSET * sizeof(uint32_t));
+-		syscfg2_data = spi_flash_readl(spi_offset + bank_offset);
+-
+-		/* read value from bank1 and OR with value from bank0 */
+-		bank_offset = ((EFUSE_WORDS_PER_BANK + IO_EFUSE_SYSCFG2_OFFSET) * sizeof(uint32_t));
+-		syscfg2_data |= spi_flash_readl(spi_offset + bank_offset);
+-
+-		/* Notify slave config fuse value in slave scratchpad 0/1 register */
+-		regmap_writel_inter_die(
+-			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
+-			syscfg1_data,
+-			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_0)),
+-				die_id_arary[die_id_index]));
+-
+-		regmap_writel_inter_die(
+-			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
+-			syscfg2_data,
+-			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_1)),
+-				die_id_arary[die_id_index]));
+-
+-		/* Indicate slave die about fuse value is available */
+-		regmap_writel_inter_die(
+-			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
+-			FFUSE_WRITE_IND_MAGIC,
+-			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2)),
+-				die_id_arary[die_id_index]));
+-	}
+-}
+ 
+ uint8_t boot_rom_get_die_id(void)
+ {
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index d607a10..a9a3d43 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -16,6 +16,7 @@
+ #include <gpio_regs.h>
+ #include <fs1_efuse.h>
+ #include <mem_io.h>
++#include <fs1_fw_if.h>
+ 
+ /* TODO: we need to verify flow and params on test chip to finalize D2D link init */
+ 
+diff --git a/arch/fs1/arc/fake_fuse_flow.c b/arch/fs1/arc/fake_fuse_flow.c
+new file mode 100644
+index 0000000..455695f
+--- /dev/null
++++ b/arch/fs1/arc/fake_fuse_flow.c
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2025 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <fs1_blocks_linux_driver.h>
++#include <arc_local_conf_regs.h>
++#include <global_conf_regs.h>
++#include <boot_rom.h>
++#include <hl_boot_desc.h>
++#include <fs1_fw_if.h>
++#include <boot_desc.h>
++#include <status.h>
++#include <progress_bits.h>
++#include <common.h>
++#include <boot_flow.h>
++#include <fs1_efuse.h>
++#include <spi_flash.h>
++#include <dev_spi_flash.h>
++#include <fs1_reg_map.h>
++
++static uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
++
++void boot_rom_init_slave_spi_efuse(void)
++{
++	/* Align with enum fake_fuse_bin_index */
++	uint8_t die_id_arary[MAX_DIE_COUNT] = {FS1_IO_DIE_0, FS1_IO_DIE_1,
++		FS1_COMPUTE_DIE_0, FS1_COMPUTE_DIE_1, FS1_COMPUTE_DIE_2, FS1_COMPUTE_DIE_3};
++	uint32_t bank_offset, spi_offset, syscfg1_data, syscfg2_data;
++	uint8_t die_id_index;
++
++	for(die_id_index = 0 ; die_id_index < MAX_DIE_COUNT; die_id_index++) {
++
++		/* Note: master die, no need to export. */
++		if (die_id_index == FAKE_FUSE_IO_D0)
++			continue;
++
++		spi_offset = fake_fuse_offset_array[die_id_index];
++
++		if (spi_offset == 0)
++			continue;
++
++		/* read value from bank0 */
++		bank_offset = (IO_EFUSE_SYSCFG_OFFSET * sizeof(uint32_t));
++		syscfg1_data = spi_flash_readl(spi_offset + bank_offset);
++
++		/* read value from bank1 and OR with value from bank0 */
++		bank_offset = ((EFUSE_WORDS_PER_BANK + IO_EFUSE_SYSCFG_OFFSET) * sizeof(uint32_t));
++		syscfg1_data |= spi_flash_readl(spi_offset + bank_offset);
++
++		/* read value from bank0 */
++		bank_offset = (IO_EFUSE_SYSCFG2_OFFSET * sizeof(uint32_t));
++		syscfg2_data = spi_flash_readl(spi_offset + bank_offset);
++
++		/* read value from bank1 and OR with value from bank0 */
++		bank_offset = ((EFUSE_WORDS_PER_BANK + IO_EFUSE_SYSCFG2_OFFSET) * sizeof(uint32_t));
++		syscfg2_data |= spi_flash_readl(spi_offset + bank_offset);
++
++		/* Notify slave config fuse value in slave scratchpad 0/1 register */
++		regmap_writel_inter_die(
++			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
++			syscfg1_data,
++			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_0)),
++				die_id_arary[die_id_index]));
++
++		regmap_writel_inter_die(
++			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
++			syscfg2_data,
++			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_1)),
++				die_id_arary[die_id_index]));
++
++		/* Indicate slave die about fuse value is available */
++		regmap_writel_inter_die(
++			IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_CFG_ADDR_MNPL_CTRL),
++			FFUSE_WRITE_IND_MAGIC,
++			DIE_BASED_ADDRESS((IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2)),
++				die_id_arary[die_id_index]));
++	}
++}
++
++uint8_t boot_desc_spi_efuse_init(enum hl_fw_manifest_type curr_manifest_idx, uint8_t *slv_en)
++{
++	uint8_t val = 0;
++
++	/* return 1 for all die fake fuse enabled, 2 for No need of slave fake fuse values */
++    val = boot_desc_spi_efuse_offset_init(MAX_DIE_COUNT, curr_manifest_idx, fake_fuse_offset_array);
++
++	if (val == 0)
++        return BOOT_ROM_FAIL;
++
++	if(val == 1)
++		(*slv_en) = 1;
++	else if(val == 2)
++		(*slv_en) = 0;
++
++    return BOOT_ROM_SUCCESS;
++}
++
++void boot_rom_fake_fuse(void)
++{
++	uint8_t slave_en = 0;
++
++	if (!boot_rom_spi_efuse_enabled())
++		return;
++
++	if (!boot_rom_in_master_die()) {
++		boot_rom_wait_for_spi_fuse_data();
++		return;
++	}
++
++	if (boot_rom_global.fuse_emulation_init_done)
++		return;
++
++	boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);
++
++	if (boot_flow_spi_efuse_manifest_init(&slave_en) == BOOT_ROM_FAIL) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DECODE_FAIL);
++		return;
++	}
++
++	boot_rom_global.fake_fuse_spi_offset = fake_fuse_offset_array[FAKE_FUSE_IO_D0];
++	boot_rom_global.fake_fuse_en = true;
++	if (boot_rom_read_config_fuse() != BOOT_ROM_SUCCESS) {
++		boot_rom_global.fake_fuse_en = false;
++		return;
++	}
++
++	boot_rom_init_sku();
++
++	if ((boot_rom_global.sku == FS1_FULL_PACKAGE)
++		&& boot_rom_in_master_die() && (slave_en == 1))
++		boot_rom_init_slave_spi_efuse();
++
++	boot_rom_set_spi_efuse_read();
++}
+diff --git a/arch/fs1/arc/slave.c b/arch/fs1/arc/slave.c
+index 1d82582..f819c35 100644
+--- a/arch/fs1/arc/slave.c
++++ b/arch/fs1/arc/slave.c
+@@ -17,6 +17,7 @@
+ #include <fs1_reg_map.h>
+ #include <dev_uart.h>
+ #include <spi_flash.h>
++#include <fs1_fw_if.h>
+ 
+ #define SPI_FUSE_EMULATION_DATA_UDELAY	5000 /* 5ms */
+ 
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 701f542..1e9ce57 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -20,8 +20,6 @@
+ #include <dev_boot_info.h>
+ #include <lfs_wrapper.h>
+ 
+-uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
+-
+ static struct hl_fw_manifest_ctx *p_manifest_ctx;
+ static struct hl_fw_boot_ptrs *p_boot_ptr;
+ static struct hl_fw_manifest_constants *p_spi_manifest_const;
+@@ -351,7 +349,13 @@
+ 	return rec_img_count;
+ }
+ 
+-uint8_t boot_desc_spi_efuse_init(uint8_t die_id_index, enum hl_fw_manifest_type manifest_idx)
++/*
++ * return values:
++ * 0: fail
++ * 1: pass - all die's enabled
++ * 2: pass - No need slave fuse
++ */
++uint8_t boot_desc_spi_efuse_offset_init(uint8_t max_die_cnt, enum hl_fw_manifest_type manifest_idx, uint32_t *off_arr)
+ {
+ 	uint32_t ret, index;
+ 	uint32_t fake_fuse_base, fake_fuse_boot_ptr_size;
+@@ -366,13 +370,13 @@
+ 	fake_fuse_base = boot_flow_get_spi_efuse_manifest_offset(manifest_idx);
+ 	if (fake_fuse_base == 0) {
+ 		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_IMG_DESC_FAIL);
+-		return BOOT_ROM_FAIL;
++		return 0;
+ 	}
+ 
+ 	fake_fuse_boot_ptr_size = spi_flash_readl(fake_fuse_base);
+ 	if (fake_fuse_boot_ptr_size > HL_IMG_PTRS_MAX_SIZE) {
+ 		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_EXCEEDS_MAX_SIZE);
+-		return BOOT_ROM_FAIL;
++		return 0;
+ 	}
+ 
+ 	/* Fetch boot desc using DMA into dest offset */
+@@ -381,52 +385,43 @@
+ 
+ 	if (ret != DMA_SUCCESS) {
+ 		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DMA_COPY_FAIL);
+-		return BOOT_ROM_FAIL;
++		return 0;
+ 	}
+ 
+ 	fake_fuse_boot_ptr = (struct hl_fw_boot_ptrs *)(spi_manifest_consts.dest_addr_arc);
+ 
+ 	if (fake_fuse_boot_ptr->magic.val != (FAKE_FUSE_BOOT_PTR_MAGIC_NAME | FW_SPI_BOOT_PTR_SUB)) {
+ 		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_MAGIC_FAIL);
+-		return BOOT_ROM_FAIL;
++		return 0;
+ 	}
+ 
+ 	offset_array_base = (uint32_t *)(spi_manifest_consts.dest_addr_arc +
+ 		fake_fuse_boot_ptr->offset2array);
+ 
+-	if ((offset_array_base == NULL) || (fake_fuse_boot_ptr->count == 0)) {
++	if ((offset_array_base == NULL) || (fake_fuse_boot_ptr->count == 0) ||
++		(fake_fuse_boot_ptr->count != max_die_cnt)) {
+ 		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DESC_COUNT_FAIL);
+-		return BOOT_ROM_FAIL;
++		return 0;
+ 	}
+ 
+-	if (die_id_index == MAX_DIE_COUNT) {
+-		if (fake_fuse_boot_ptr->key_idx == DISABLE_SLAVE_FAKE_FUSE) {
+-			fake_fuse_img_desc = (struct hl_fw_img_desc *)(spi_manifest_consts.dest_addr_arc +
+-				offset_array_base[FAKE_FUSE_IO_D0]);
+-			fake_fuse_offset_array[FAKE_FUSE_IO_D0] = fake_fuse_base +
+-				fake_fuse_img_desc->spi_offset[manifest_idx];
+-		} else {
+-			for(index = 0; index < fake_fuse_boot_ptr->count; index++) {
+-				fake_fuse_img_desc = (struct hl_fw_img_desc *)(spi_manifest_consts.dest_addr_arc +
+-					offset_array_base[index]);
+-
+-				/* Fake fuse bin order controlled by enum fake_fuse_bin_index */
+-				if (((fake_fuse_img_desc->magic.type - 1) != (uint8_t)index) ||
+-					(fake_fuse_img_desc->magic.type > MAX_DIE_COUNT))
+-					return BOOT_ROM_FAIL;
+-
+-				fake_fuse_offset_array[index] = fake_fuse_base +
+-					fake_fuse_img_desc->spi_offset[manifest_idx];
+-			}
+-		}
+-	} else {
++	for(index = 0; index < fake_fuse_boot_ptr->count; index++) {
+ 		fake_fuse_img_desc = (struct hl_fw_img_desc *)(spi_manifest_consts.dest_addr_arc +
+-			offset_array_base[die_id_index]);
+-		fake_fuse_offset_array[die_id_index] = fake_fuse_base +
+-			fake_fuse_img_desc->spi_offset[manifest_idx];
++			offset_array_base[index]);
++
++		/* Fake fuse bin order controlled by enum fake_fuse_bin_index */
++		if (((fake_fuse_img_desc->magic.type - 1) != (uint8_t)index) ||
++			(fake_fuse_img_desc->magic.type > max_die_cnt))
++			return 0;
++
++			off_arr[index] = fake_fuse_base +
++				fake_fuse_img_desc->spi_offset[manifest_idx];
+ 	}
+ 
+-	return BOOT_ROM_SUCCESS;
++	/* Slave fake fuse values are disabled */
++	if (fake_fuse_boot_ptr->key_idx == DISABLE_SLAVE_FAKE_FUSE)
++		return 2;
++
++	return 1;
+ }
+ 
+ void boot_desc_save_manifest_boot_info_data(void)
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 0d3cfae..da7fb1f 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -40,7 +40,8 @@
+ 						enum hl_fw_img_type img);
+ uint32_t boot_desc_get_recovery_img_count(enum hl_fw_manifest_type manifest_idx);
+ uint32_t boot_desc_get_boot_pointer(enum hl_fw_manifest_type manifest_type);
+-uint8_t boot_desc_spi_efuse_init(uint8_t die_id_index, enum hl_fw_manifest_type manifest_idx);
++uint8_t boot_desc_spi_efuse_init(enum hl_fw_manifest_type manifest_idx, uint8_t *slv_en);
++uint8_t boot_desc_spi_efuse_offset_init(uint8_t max_die_cnt, enum hl_fw_manifest_type manifest_idx, uint32_t *off_arr);
+ void boot_rom_handle_manifest_data(enum hl_fw_manifest_type manifest_type, bool write);
+ void boot_desc_save_manifest_boot_info_data(void);
+ void boot_desc_get_manifest_boot_info_data(void);
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index c441acd..0e7e1c9 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -318,7 +318,7 @@
+ 	return desc.spi_offset[manifest_idx];
+ }
+ 
+-enum boot_rom_status boot_flow_spi_efuse_manifest_init()
++enum boot_rom_status boot_flow_spi_efuse_manifest_init(uint8_t *slv_en)
+ {
+ 	enum hl_fw_manifest_type curr_manifest_idx;
+ 
+@@ -327,11 +327,11 @@
+ 		primary_manifest_idx = HL_FW_SPI_MANIFEST_1;
+ 
+ 	curr_manifest_idx = primary_manifest_idx;
+-	if (boot_desc_spi_efuse_init(MAX_DIE_COUNT, curr_manifest_idx) == BOOT_ROM_SUCCESS)
++	if (boot_desc_spi_efuse_init(curr_manifest_idx, slv_en) == BOOT_ROM_SUCCESS)
+ 		return BOOT_ROM_SUCCESS;
+ 
+ 	curr_manifest_idx = (primary_manifest_idx + 1) % HL_FW_SPI_MANIFEST_MAX_NUM;
+-	if (boot_desc_spi_efuse_init(MAX_DIE_COUNT, curr_manifest_idx) == BOOT_ROM_SUCCESS)
++	if (boot_desc_spi_efuse_init(curr_manifest_idx, slv_en) == BOOT_ROM_SUCCESS)
+ 		return BOOT_ROM_SUCCESS;
+ 
+ 	return BOOT_ROM_FAIL;
+diff --git a/common/boot_flow.h b/common/boot_flow.h
+index f8dc562..da1114b 100644
+--- a/common/boot_flow.h
++++ b/common/boot_flow.h
+@@ -21,6 +21,6 @@
+ 						  uint32_t img_count,
+ 						  enum boot_rom_progress img_sts_base);
+ uint32_t boot_flow_get_spi_efuse_manifest_offset(enum hl_fw_manifest_type manifest_idx);
+-enum boot_rom_status boot_flow_spi_efuse_manifest_init();
++enum boot_rom_status boot_flow_spi_efuse_manifest_init(uint8_t *slv_en);
+ 
+ #endif /* _BOOT_FLOW_H_ */
+diff --git a/common/common.c b/common/common.c
+index f5642ac..233ced6 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -20,8 +20,6 @@
+ #include <boot_desc.h>
+ #include <boot_flow.h>
+ 
+-extern uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
+-
+ void boot_rom_uart_init(void)
+ {
+ 	uint32_t uart_clk_freq;
+@@ -117,41 +115,6 @@
+ efuse_fail_halt:
+ 	boot_rom_status_update(PROGRESS_INIT_EFUSE_INIT_FAIL);
+ 	boot_rom_halt();
+-}
+-
+-void boot_rom_fake_fuse(void)
+-{
+-	if (!boot_rom_spi_efuse_enabled())
+-		return;
+-
+-	if (!boot_rom_in_master_die()) {
+-		boot_rom_wait_for_spi_fuse_data();
+-		return;
+-	}
+-
+-	if (boot_rom_global.fuse_emulation_init_done)
+-		return;
+-
+-	boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);
+-
+-	if (boot_flow_spi_efuse_manifest_init() == BOOT_ROM_FAIL) {
+-		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DECODE_FAIL);
+-		return;
+-	}
+-
+-	boot_rom_global.fake_fuse_spi_offset = fake_fuse_offset_array[FAKE_FUSE_IO_D0];
+-	boot_rom_global.fake_fuse_en = true;
+-	if (boot_rom_read_config_fuse() != BOOT_ROM_SUCCESS) {
+-		boot_rom_global.fake_fuse_en = false;
+-		return;
+-	}
+-
+-	boot_rom_init_sku();
+-
+-	if ((boot_rom_global.sku == FS1_FULL_PACKAGE) && boot_rom_in_master_die())
+-		boot_rom_init_slave_spi_efuse();
+-
+-	boot_rom_set_spi_efuse_read();
+ }
+ 
+ void boot_rom_check_recovery(void)
+diff --git a/common/common.h b/common/common.h
+index 8b34630..2939e04 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -38,7 +38,6 @@
+ void boot_rom_start_cpld_wdtimer(void);
+ bool boot_rom_spi_efuse_enabled(void);
+ void boot_rom_config_arc_regions(void);
+-void boot_rom_init_slave_spi_efuse(void);
+ void boot_rom_wait_for_spi_fuse_data(void);
+ bool boot_rom_second_image_enabled(void);
+ 
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index e992548..3dbf4f3 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -12,7 +12,6 @@
+ #include "hl_boot_desc_rom.h"
+ #include <hl_sec_if.h>
+ #include "spi.h"
+-#include <fs1_fw_if.h>
+ 
+ #define wfe()	__asm__ __volatile__("sleep 0x11\n" : : )
+ 

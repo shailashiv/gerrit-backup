@@ -1,0 +1,418 @@
+From 5615a40c3bb8088e4d912dbce99fdc467723764d Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Sat, 15 Jun 2024 14:55:09 +0300
+Subject: [PATCH] [FSW-418] fs1: bootrom: paralellize tpm operations
+
+This patch adds a finite state machine (FSM) to
+interleave TPM operations with other functionalities.
+Instead of waiting idly for TPM responses, the boot
+ROM proceeds with other tasks and periodically keeps
+checking for TPM responses. Each state has short
+timeouts. If the FSM doesn't complete by the end of
+boot ROM execution, a final long timeout-waited
+TPM operation is performed.
+
+This patch also adds a new bit to the progress_bit.h
+to indicate that the FSM is out of sync.
+
+Change-Id: Iac1c74bff10976f8b6b8434c8ae554d1e51b9672
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index f29a8f8..18f5c7c 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -20,6 +20,7 @@
+ #include <status.h>
+ #include <efuse.h>
+ #include "dev_uart.h"
++#include "progress_bits.h"
+ 
+ uint8_t boot_rom_get_die_id(void)
+ {
+@@ -264,6 +265,11 @@
+ 	boot_rom_set_tpm_next_pcr_index(TPM2_SVN_PCR_IDX);
+ }
+ 
++bool boot_rom_is_manifest_valid(void)
++{
++	return (bool)boot_rom_global.validation_pass;
++}
++
+ static bool boot_rom_get_svn(__unused uint8_t *hash)
+ {
+ 	/*
+@@ -302,3 +308,10 @@
+ 
+ 	return is_valid;
+ }
++
++enum boot_rom_progress boot_rom_get_tpm_extend_fail_prog_bit(uint8_t tpm_pcr_index)
++{
++	return (tpm_pcr_index == TPM2_SVN_PCR_IDX) ?
++		PROGRESS_BOOT_ROM_SVN_TPM_PCR_EXTEND_FAIL :
++		PROGRESS_BOOT_ROM_MANIFEST_TPM_PCR_EXTEND_FAIL;
++}
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index e41f964..2ea9671 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -75,63 +75,65 @@
+ 	PROGRESS_BOOT_ROM_TPM = 65,
+ 	PROGRESS_BOOT_ROM_TPM_INIT_FAIL = 66,
+ 	PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL = 67,
+-	PROGRESS_BOOT_ROM_TPM_PCR_EXTEND_FAIL = 68,
+-	PROGRESS_BOOT_ROM_TPM_FINISH = 69,
+-	PROGRESS_PPBOOT_START = 70,
+-	PROGRESS_PPBOOT_FINISH = 71,
+-	PROGRESS_BOOT_ROM_IN_RECOVERY = 72,
+-	PROGRESS_BOOT_ROM_IN_ROM_RECOVERY = 73,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_START = 74,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_INIT = 75,
+-	PROGRESS_BOOT_ROM_PCIE_PHY_SRAM_INIT_TIMEDOUT = 76,
+-	PROGRESS_BOOT_ROM_PCIE_PHY_PARA_STS_CLR_TIMEDOUT = 77,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_LIMIT_GEN1 = 78,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_IATU_CONFIG = 79,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_FINISH = 80,
+-	PROGRESS_BOOT_ROM_D2D_LINK_START = 81,
+-	PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY = 82,
+-	PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC = 83,
+-	PROGRESS_BOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 84,
+-	PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS = 85,
+-	PROGRESS_BOOT_ROM_RECOVERY_END = 86,
+-	PROGRESS_BOOT_ROM_IN_RECOVERY_IMG = 87,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_EXCEEDS_MAX_SIZE = 88,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_START = 89,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_CRC_FAIL = 90,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_DEST = 91,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_SIZE = 92,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_IMG_SIZE = 93,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_FLASH_OFFSET = 94,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_ERROR = 95,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_FINISH = 96,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_HDR_MAGIC_FAIL = 97,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_OFFSET = 98,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_VERIFICATION_FAIL = 99,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_FAIL = 100,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_START = 101,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_VERSION_FAIL = 102,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_REVOKED = 103,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 104,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_AUTH_FAIL = 105,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_SUCCESS = 106,
+-	PROGRESS_RECOVERY_IMG_IMG0 = 107,
+-	PROGRESS_RECOVERY_IMG_IMG0_LOADADDR_INVALID = 108,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_STARTADDR_INVALID = 109,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_START = 110,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_CRC_FAILED = 111,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_DEST = 112,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_IMG_SIZE = 113,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_IMG_SIZE = 114,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_FLASH_OFFSET = 115,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_ERROR = 116,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_FINISH = 117,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_VERIFICATION_FAIL = 118,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_START = 119,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_FINISH = 120,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START = 121,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 122,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 123,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 124,
++	PROGRESS_BOOT_ROM_SVN_TPM_PCR_EXTEND_FAIL = 68,
++	PROGRESS_BOOT_ROM_MANIFEST_TPM_PCR_EXTEND_FAIL = 69,
++	PROGRESS_BOOT_ROM_TPM_FSM_OUT_OF_SYNC = 70,
++	PROGRESS_BOOT_ROM_TPM_FINISH = 71,
++	PROGRESS_PPBOOT_START = 72,
++	PROGRESS_PPBOOT_FINISH = 73,
++	PROGRESS_BOOT_ROM_IN_RECOVERY = 74,
++	PROGRESS_BOOT_ROM_IN_ROM_RECOVERY = 75,
++	PROGRESS_BOOT_ROM_PCIE_LINK_START = 76,
++	PROGRESS_BOOT_ROM_PCIE_LINK_INIT = 77,
++	PROGRESS_BOOT_ROM_PCIE_PHY_SRAM_INIT_TIMEDOUT = 78,
++	PROGRESS_BOOT_ROM_PCIE_PHY_PARA_STS_CLR_TIMEDOUT = 79,
++	PROGRESS_BOOT_ROM_PCIE_LINK_LIMIT_GEN1 = 80,
++	PROGRESS_BOOT_ROM_PCIE_LINK_IATU_CONFIG = 81,
++	PROGRESS_BOOT_ROM_PCIE_LINK_FINISH = 82,
++	PROGRESS_BOOT_ROM_D2D_LINK_START = 83,
++	PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY = 84,
++	PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC = 85,
++	PROGRESS_BOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 86,
++	PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS = 87,
++	PROGRESS_BOOT_ROM_RECOVERY_END = 88,
++	PROGRESS_BOOT_ROM_IN_RECOVERY_IMG = 89,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_EXCEEDS_MAX_SIZE = 90,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_START = 91,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_CRC_FAIL = 92,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_DEST = 93,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_SIZE = 94,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_IMG_SIZE = 95,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_FLASH_OFFSET = 96,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_ERROR = 97,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_FINISH = 98,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_HDR_MAGIC_FAIL = 99,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_OFFSET = 100,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_VERIFICATION_FAIL = 101,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_FAIL = 102,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_START = 103,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_VERSION_FAIL = 104,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_REVOKED = 105,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 106,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_AUTH_FAIL = 107,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_SUCCESS = 108,
++	PROGRESS_RECOVERY_IMG_IMG0 = 109,
++	PROGRESS_RECOVERY_IMG_IMG0_LOADADDR_INVALID = 110,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_STARTADDR_INVALID = 111,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_START = 112,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_CRC_FAILED = 113,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_DEST = 114,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_IMG_SIZE = 115,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_IMG_SIZE = 116,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_FLASH_OFFSET = 117,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_ERROR = 118,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_FINISH = 119,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_VERIFICATION_FAIL = 120,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_START = 121,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_FINISH = 122,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START = 123,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 124,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 125,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 126,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/common/common.h b/common/common.h
+index c75082b..aa2515c 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -28,6 +28,8 @@
+ void boot_rom_set_tpm_next_pcr_index(uint8_t tpm_pcr_index);
+ void boot_rom_tpm_next_pcr_index_init(void);
+ uint32_t boot_rom_tpm_spi_baudr_get(void);
++bool boot_rom_is_manifest_valid(void);
+ bool boot_rom_get_hash_for_tpm_pcr(uint8_t tpm_pcr_index, uint8_t *hash);
++enum boot_rom_progress boot_rom_get_tpm_extend_fail_prog_bit(uint8_t tpm_pcr_index);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/common/tpm.c b/common/tpm.c
+new file mode 100644
+index 0000000..060909e
+--- /dev/null
++++ b/common/tpm.c
+@@ -0,0 +1,196 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <hl_tpm2.h>
++#include "common.h"
++#include "tpm.h"
++#include "tpm2.h"
++#include "delay.h"
++#include "status.h"
++#include "progress_bits.h"
++
++static void boot_rom_tpm_init(bool long_timeout_en)
++{
++	int ret = 0;
++
++	/*
++	 * tpm init is attempted with a short timeout repeatedly until it succeeds.
++	 * If all attempts with the short timeout fail, one final attempt with a long
++	 * timeout is performed. If this too fails, abort the TPM init operations
++	 */
++	ret = tpm2_init(long_timeout_en);
++	if (ret != BOOT_ROM_SUCCESS) {
++		if (long_timeout_en) {
++			boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_INIT_FAIL);
++			boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++		}
++	} else {
++		boot_rom_global.tpm_exec_stage = TPM_EXEC_STARTUP_SEND;
++	}
++}
++
++static void boot_rom_send_tpm_startup_cmd(void)
++{
++	int ret = 0;
++
++	ret = tpm2_startup_send_cmd(TPM2_SU_CLEAR);
++	if (ret != BOOT_ROM_SUCCESS) {
++		boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL);
++		boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++	} else {
++		boot_rom_global.tpm_exec_stage = TPM_EXEC_STARTUP_RECV;
++	}
++}
++
++static void boot_rom_recv_tpm_startup_cmd(bool long_timeout_en)
++{
++	int ret = 0;
++
++	if (tpm2_resp_avail(long_timeout_en)) {
++		ret = tpm2_startup_recv_resp();
++		if (ret != BOOT_ROM_SUCCESS) {
++			boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL);
++			boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++		} else
++			boot_rom_global.tpm_exec_stage = TPM_EXEC_PCR_EXTEND_SEND;
++	}
++}
++
++static void boot_rom_send_tpm_pcr_extend_cmd(void)
++{
++	int ret = 0;
++	bool is_valid;
++	uint8_t hash[SHA384_SUM_LEN] = {0};
++	enum boot_rom_progress tpm_pcr_extend_fail_prog_bit;
++
++	/* Wait for manifest validation to complete before extending svn & manifest hash*/
++	if (!boot_rom_is_manifest_valid())
++		return;
++
++	is_valid = boot_rom_get_hash_for_tpm_pcr(boot_rom_global.tpm_next_pcr_index, hash);
++	if (!is_valid) {
++		tpm_pcr_extend_fail_prog_bit = boot_rom_get_tpm_extend_fail_prog_bit(
++			boot_rom_global.tpm_next_pcr_index);
++		boot_rom_status_update(tpm_pcr_extend_fail_prog_bit);
++		boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++	}
++
++	ret = tpm2_pcr_extend_send_cmd(boot_rom_global.tpm_next_pcr_index,
++		TPM2_ALG_SHA384, hash, SHA384_SUM_LEN);
++	if (ret != BOOT_ROM_SUCCESS) {
++		tpm_pcr_extend_fail_prog_bit = boot_rom_get_tpm_extend_fail_prog_bit(
++			boot_rom_global.tpm_next_pcr_index);
++		boot_rom_status_update(tpm_pcr_extend_fail_prog_bit);
++		boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++	} else
++		boot_rom_global.tpm_exec_stage = TPM_EXEC_PCR_EXTEND_RECV;
++}
++
++
++static void boot_rom_recv_tpm_pcr_extend_cmd(bool long_timeout_en)
++{
++	int ret = 0;
++	enum boot_rom_progress tpm_pcr_extend_fail_prog_bit;
++
++	if (tpm2_resp_avail(long_timeout_en)) {
++		ret = tpm2_pcr_extend_recv_resp();
++		if (ret != BOOT_ROM_SUCCESS) {
++			tpm_pcr_extend_fail_prog_bit = boot_rom_get_tpm_extend_fail_prog_bit(
++				boot_rom_global.tpm_next_pcr_index);
++			boot_rom_status_update(tpm_pcr_extend_fail_prog_bit);
++			boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++			return;
++		}
++
++		boot_rom_global.tpm_next_pcr_index++;
++
++		if (boot_rom_global.tpm_next_pcr_index == NUM_PCR_TO_EXTEND_IN_BOOTROM) {
++			boot_rom_set_tpm_extend_done();
++			boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_FINISH);
++			boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++		} else {
++			/* Extend remaining PCRs */
++			boot_rom_global.tpm_exec_stage = TPM_EXEC_PCR_EXTEND_SEND;
++		}
++	}
++}
++
++static inline void boot_rom_set_fsm_out_of_sync_err(void)
++{
++	boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_FSM_OUT_OF_SYNC);
++	boot_rom_global.tpm_exec_stage = TPM_EXEC_DONE;
++}
++
++void boot_rom_tpm_ops(bool long_timeout_en)
++{
++
++	if (boot_rom_global.tpm_extend_done)
++		return;
++
++	switch (boot_rom_global.tpm_exec_stage) {
++	case TPM_EXEC_INIT:
++		boot_rom_tpm_init(long_timeout_en);
++		break;
++	case TPM_EXEC_STARTUP_SEND:
++		boot_rom_send_tpm_startup_cmd();
++		break;
++	case TPM_EXEC_STARTUP_RECV:
++		boot_rom_recv_tpm_startup_cmd(long_timeout_en);
++		break;
++	case TPM_EXEC_PCR_EXTEND_SEND:
++		boot_rom_send_tpm_pcr_extend_cmd();
++		break;
++	case TPM_EXEC_PCR_EXTEND_RECV:
++		boot_rom_recv_tpm_pcr_extend_cmd(long_timeout_en);
++		break;
++	case TPM_EXEC_DONE:
++		break;
++	default:
++		boot_rom_set_fsm_out_of_sync_err();
++		break;
++	}
++}
++
++static void boot_rom_set_tpm_ops_final_error(void)
++{
++	enum boot_rom_progress tpm_pcr_extend_fail_prog_bit;
++
++	switch (boot_rom_global.tpm_exec_stage) {
++	case TPM_EXEC_INIT:
++		boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_INIT_FAIL);
++		break;
++	case TPM_EXEC_STARTUP_SEND:
++	case TPM_EXEC_STARTUP_RECV:
++		boot_rom_status_update(PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL);
++		break;
++	case TPM_EXEC_PCR_EXTEND_SEND:
++	case TPM_EXEC_PCR_EXTEND_RECV:
++		tpm_pcr_extend_fail_prog_bit = boot_rom_get_tpm_extend_fail_prog_bit(
++			boot_rom_global.tpm_next_pcr_index);
++		boot_rom_status_update(tpm_pcr_extend_fail_prog_bit);
++		break;
++	default:
++		break;
++	}
++}
++
++void boot_rom_tpm_ops_final(void)
++{
++	uint64_t start;
++
++	start = boot_rom_get_ts_us();
++	do {
++		boot_rom_tpm_ops(true);
++
++		if (boot_rom_global.tpm_exec_stage == TPM_EXEC_DONE)
++			return;
++
++	} while (!boot_rom_timeout_expired(start, MS_TO_US(TPM_LONG_TIMEOUT_MS)));
++
++	boot_rom_set_tpm_ops_final_error();
++}
+diff --git a/common/tpm.h b/common/tpm.h
+new file mode 100644
+index 0000000..127349d
+--- /dev/null
++++ b/common/tpm.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _TPM_H_
++#define _TPM_H_
++
++#define NUM_PCR_TO_EXTEND_IN_BOOTROM	(2)
++
++void boot_rom_tpm_ops(bool long_timeout_en);
++void boot_rom_tpm_ops_final(void);
++
++#endif /* _TPM_H_ */

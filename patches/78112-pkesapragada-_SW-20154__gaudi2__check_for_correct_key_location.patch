@@ -1,0 +1,103 @@
+From 4f013c8586d32dbec45874a6f866e73f76bb6478 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Tue, 23 Feb 2021 07:16:35 +0200
+Subject: [PATCH] [SW-20154] gaudi2: check for correct key location
+
+Key location has 2 bits and hence needs to check
+for correct location before using them.
+
+Change-Id: Iaa2d5669aae7ca0d2ca15258e2ae6aed6cfeb725
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/gaudi2_arc_gnu/secureboot.c b/gaudi2_arc_gnu/secureboot.c
+index ea11bc4..bd80ad1 100644
+--- a/gaudi2_arc_gnu/secureboot.c
++++ b/gaudi2_arc_gnu/secureboot.c
+@@ -72,17 +72,22 @@
+ 
+ static int security_check_key_revoke_status(uint32_t key_index)
+ {
+-	uint8_t max_key_index = NUM_KEYS_IN_EFUSE, key_revoke;
++	uint8_t max_key_index = NUM_KEYS_IN_ROM, key_revoke;
++	enum security_key_location key_location;
+ 
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+ 	/*
+ 	 * Key index ranges from:
+-	 * 0 - 4: if key location == ROM (1)
+-	 * 0 - 2: if key location == eFUSE (0)
++	 * 0 - 4: if key location == ROM (0, 2, 3)
++	 * 0 - 2: if key location == eFUSE (1)
++	 * Except a value of 1 for EFUSE, rest all are
++	 * routed into ROM, since thats the secure way.
+ 	 */
+ 	/* check efuse for key location */
+-	if ((arcboot_rom_global.config_fuse >> EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK)
+-		max_key_index = NUM_KEYS_IN_ROM;
++	if (key_location == KEY_LOCATION_EFUSE)
++		max_key_index = NUM_KEYS_IN_EFUSE;
+ 
+ 	if (key_index >= max_key_index)
+ 		return -1;
+@@ -99,14 +104,34 @@
+ 
+ int security_get_key_hash(uint32_t *hash, uint8_t key_index)
+ {
+-	uint32_t valid_key_base, max_key_index = NUM_KEYS_IN_EFUSE;
++	uint32_t valid_key_base, max_key_index;
+ 	int i;
++	enum security_key_location key_location;
++	uint32_t *ptr;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+ 
+ 	/* check efuse for key location */
+-	if ((arcboot_rom_global.config_fuse >> EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK) {
++	if (key_location == KEY_LOCATION_EFUSE) {
++		max_key_index = NUM_KEYS_IN_EFUSE;
+ 
+-		uint32_t *ptr;
++		if (key_index >= max_key_index)
++			return -1;
++
++		/* read from efuse/SP SRAM */
++		valid_key_base = (key_index * SECURITY_BYTE_PER_DWORD *
++			SECURITY_DWORD_PER_KEY) + SECURITY_EFUSE_KEYS_OFFSET;
++
++		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
++			*(hash + i) = sp_sram_readl(valid_key_base + (i *
++					SECURITY_BYTE_PER_DWORD));
++	} else {
++		/*
++		 * All other cases are routed into ROM, since it is
++		 * the more secure way
++		 */
+ 		max_key_index = NUM_KEYS_IN_ROM;
+ 
+ 		if (key_index >= max_key_index)
+@@ -116,18 +141,6 @@
+ 		ptr = (uint32_t *)rom_key_hashes[key_index];
+ 		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
+ 			*(hash + i) = ptr[i];
+-	} else {
+-
+-		if (key_index >= max_key_index)
+-			return -1;
+-
+-		/* read from efuse/SP SRAM */
+-		valid_key_base = (key_index * SECURITY_BYTE_PER_DWORD *
+-			  SECURITY_DWORD_PER_KEY) + SECURITY_EFUSE_KEYS_OFFSET;
+-
+-		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
+-			*(hash + i) = sp_sram_readl(valid_key_base + (i *
+-					    SECURITY_BYTE_PER_DWORD));
+ 	}
+ 
+ 	return 1;

@@ -1,0 +1,277 @@
+From 6b972866d65c024991f89f8a8743aff99ca90e0c Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Tue, 30 Apr 2024 10:18:25 +0300
+Subject: [PATCH] [FSW-1172] fs1: pcie: add pcie init code for gen1
+
+This patch adds pcie gen1 init code to bootrom
+recovery flow.
+
+Change-Id: I55e8b271d7e556e3e1f01ea575262cc6ac409f24
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 4224427..3eaae99 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -7,5 +7,6 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_pcie.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_recovery.c)
+diff --git a/arch/fs1/arc/dev_pcie.c b/arch/fs1/arc/dev_pcie.c
+new file mode 100644
+index 0000000..a3ec5d5
+--- /dev/null
++++ b/arch/fs1/arc/dev_pcie.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++#include <fs1_efuse.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_dbi_masks.h>
++#include <pcie_aux_masks.h>
++
++bool boot_rom_pcie_gen_limit_enabled(void)
++{
++	if ((boot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0)
++		return true;
++
++	return false;
++}
++
++void boot_rom_dbi_ro_write_en(bool enable)
++{
++	uint32_t val;
++
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++
++	if (enable)
++		val |= PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++	else
++		val &= ~PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++}
++
++void boot_rom_shadow_reg_access_en(bool enable)
++{
++	uint32_t val = 0;
++
++	if (enable)
++		val = PCIE_AUX_DBI_CS2_M;
++
++	regmap_writel(val, IO0_H0_PCIE_AUX(mmPCIE_AUX_DBI));
++}
++
++#define BAR_SIZE_1GB			(SZ_1G - 1)
++void boot_rom_set_pf_cfg_bar(void)
++{
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR1_REG));
++}
++
++void boot_rom_set_vf_cfg_bar(void)
++{
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR1_REG));
++}
++
++void boot_rom_disable_alt_protocol(void)
++{
++	uint32_t val;
++
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++	val &= ~PCIE_DBI_PL32G_CAPABILITY_REG_MOD_TS_ALT_PROTOCOL_SUPPORT_M;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++}
++
++#define SRIOV_MAX_NUM_VFS		0x4
++#define SRIOV_DEFAULT_NUM_VFS		0x1
++void boot_rom_set_number_of_vfs(uint32_t num_vfs)
++{
++	uint32_t val;
++
++	if (num_vfs > SRIOV_MAX_NUM_VFS)
++		num_vfs = SRIOV_DEFAULT_NUM_VFS;
++
++	val = num_vfs << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_INITIAL_VFS_S |
++		num_vfs << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_TOTAL_VFS_S;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG));
++}
++
++void boot_rom_skip_ats_capability(void)
++{
++	uint32_t val;
++
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++	val &= ~PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_M;
++	val |= mmPCIE_DBI_PRS_EXT_CAP_HDR_REG <<
++		PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_S;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++}
++
++#define LTTSM_EN_MASK		(PCIE_AUX_LTSSM_EN_IND_M | PCIE_AUX_LTSSM_EN_MASK_M)
++void boot_rom_pcie_set_ltssm_en(void)
++{
++	regmap_writel(LTTSM_EN_MASK, IO0_H0_PCIE_AUX(mmPCIE_AUX_LTSSM_EN));
++}
+diff --git a/arch/fs1/arc/dev_pcie.h b/arch/fs1/arc/dev_pcie.h
+new file mode 100644
+index 0000000..b5414d6
+--- /dev/null
++++ b/arch/fs1/arc/dev_pcie.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_PCIE_H_
++#define _DEV_PCIE_H_
++
++void boot_rom_dbi_ro_write_en(bool enable);
++void boot_rom_shadow_reg_access_en(bool enable);
++void boot_rom_set_pf_cfg_bar(void);
++void boot_rom_set_vf_cfg_bar(void);
++void boot_rom_disable_alt_protocol(void);
++void boot_rom_set_number_of_vfs(uint32_t num_vfs);
++void boot_rom_skip_ats_capability(void);
++void boot_rom_pcie_set_ltssm_en(void);
++bool boot_rom_pcie_gen_limit_enabled(void);
++
++#endif /* _DEV_PCIE_H_ */
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index 352ba9d..aec43f4 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -32,6 +32,7 @@
+ #define SZ_256K				0x00040000
+ #define SZ_4MB				0x00400000
+ #define SZ_256MB			0x10000000
++#define SZ_1G				0x40000000
+ 
+ #define FLASH_VALID_MASK		0x1FFFFF
+ 
+diff --git a/common/pcie.c b/common/pcie.c
+new file mode 100644
+index 0000000..e50d57c
+--- /dev/null
++++ b/common/pcie.c
+@@ -0,0 +1,63 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <efuse.h>
++#include <delay.h>
++#include <pcie.h>
++#include <status.h>
++
++#define NUM_VFS			1
++
++static void boot_rom_pcie_bar_config(void)
++{
++	boot_rom_shadow_reg_access_en(true);
++
++	boot_rom_set_pf_cfg_bar();
++
++	boot_rom_set_vf_cfg_bar();
++
++	boot_rom_shadow_reg_access_en(false);
++}
++
++static void boot_rom_pcie_mode_config(void)
++{
++	boot_rom_disable_alt_protocol();
++
++	/* TODO: Confirm how many VFs should be enabled in recovery */
++	boot_rom_set_number_of_vfs(NUM_VFS);
++
++	boot_rom_skip_ats_capability();
++
++	/* TODO: Set Gen 1 limit config */
++	if (boot_rom_pcie_gen_limit_enabled())
++		boot_rom_status_update(PROGRESS_BOOT_ROM_PCIE_LINK_LIMIT_GEN1);
++}
++
++void boot_rom_pcie_link_init(void)
++{
++	boot_rom_status_update(PROGRESS_BOOT_ROM_PCIE_LINK_START);
++
++	/* TODO: Check if PRSTN de-assert loop is required */
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_PCIE_LINK_INIT);
++
++	/* TODO: Add PCIe Phy fw init code*/
++
++	boot_rom_dbi_ro_write_en(true);
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_PCIE_LINK_IATU_CONFIG);
++
++	boot_rom_pcie_bar_config();
++
++	boot_rom_pcie_mode_config();
++
++	boot_rom_dbi_ro_write_en(false);
++
++	boot_rom_pcie_set_ltssm_en();
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_PCIE_LINK_FINISH);
++}
+diff --git a/common/pcie.h b/common/pcie.h
+new file mode 100644
+index 0000000..06d2a3f
+--- /dev/null
++++ b/common/pcie.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _PCIE_H_
++#define _PCIE_H_
++
++#include <stdint.h>
++#include <dev_pcie.h>
++
++void boot_rom_pcie_link_init(void);
++
++#endif /* _PCIE_H_ */
+diff --git a/common/recovery.c b/common/recovery.c
+index d12ae4f..cdf877f 100644
+--- a/common/recovery.c
++++ b/common/recovery.c
+@@ -10,11 +10,17 @@
+ #include <fs1_blocks_linux_driver.h>
+ #include <global_conf_masks.h>
+ #include <global_conf_regs.h>
++#include <pcie.h>
+ 
+ static void execute_rom_recovery(void)
+ {
+ 	boot_rom_status_update(PROGRESS_BOOT_ROM_IN_ROM_RECOVERY);
+ 
++	/* TODO: Should add fuse cfg to skip pcie init? */
++
++	if (boot_rom_global.die_type == IO_DIE_MASTER)
++		boot_rom_pcie_link_init();
++
+ 	boot_rom_d2d_link_init();
+ 
+ 	boot_rom_status_update(PROGRESS_BOOT_ROM_RECOVERY_END);

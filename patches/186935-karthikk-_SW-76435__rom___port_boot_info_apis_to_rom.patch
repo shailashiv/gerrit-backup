@@ -1,0 +1,325 @@
+From ed152e34628b5caa6d760da113a4f6189251ebb3 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 09 Mar 2022 04:09:19 +0200
+Subject: [PATCH] [SW-76435] rom : port boot info apis to rom
+
+Ported boot info apis from preboot to rom. Boot info in rom is used
+to store image descriptor and security data on sp sram which can be
+reused by other components in the future.
+
+Change-Id: I2efc6cc59eafb901c46907f53a6a36cd0a03ae03
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 86c9d9a..f4687ca 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -18,6 +18,8 @@
+ #include "dma.h"
+ #include "spi_flash.h"
+ #include "boot_desc.h"
++#include <gaudi2_boot_info.h>
++#include <boot_info.h>
+ 
+ #define LOW_DWORD(x)			(x & 0xFFFFFFFF)
+ #define ICCM_OFFS_MASK			0x1FFFF
+@@ -476,3 +478,8 @@
+ 	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_6);
+ 	regmap_writel(0, mmPSOC_SECURITY_SW_STATUS_7);
+ }
++
++uint16_t hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index e55c062..c23749c 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -17,6 +17,8 @@
+ #include <soc.h>
+ #include <pcie.h>
+ #include <dev_dma.h>
++#include <gaudi3_boot_info.h>
++#include <boot_info.h>
+ 
+ #include <d0_psoc_global_conf_masks.h>
+ 
+@@ -419,3 +421,8 @@
+ 	execute_pcie_recovery();
+ 	return;
+ }
++
++uint16_t hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index 2eb1a20..f15aef0 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -12,6 +12,8 @@
+ #include <psoc_global_conf_masks.h>
+ #include <arcboot.h>
+ #include <spi_flash.h>
++#include <greco_boot_info.h>
++#include <boot_info.h>
+ 
+ #define IATU_BASE				(mmPCIE_DBI_BASE & 0xFFFFFF)
+ #define IATU_REGION_CTRL_1_OFF_INBOUND		(IATU_BASE + 0x100)
+@@ -182,3 +184,8 @@
+ 	reg |= BIT(progress);
+ 	regmap_writel(reg, mmSW_STATUS_0);
+ }
++
++uint16_t hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
+diff --git a/common/boot_info.c b/common/boot_info.c
+new file mode 100644
+index 0000000..309af4b
+--- /dev/null
++++ b/common/boot_info.c
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <string.h>
++#include <stdbool.h>
++#include <arcboot.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++#include <crc32.h>
++
++#include "boot_info.h"
++
++#define BOOT_INFO_BASE		(HL_GEN_MEM_BASE + HL_SCRATCHPAD_SRAM_OFFSET)
++#define ROUND_UP4(n)		(((n) + sizeof(uint32_t) - 1) & ~(sizeof(uint32_t) - 1))
++
++static struct boot_info boot_info = { .ptrs = { .count = 0 } };
++
++/* API to export for ppboot/preboot to read boot info base address */
++uint32_t boot_info_get_base_addr(void)
++{
++	return BOOT_INFO_BASE;
++}
++
++static inline void *offset2ptr(uint32_t offset, uintptr_t base)
++{
++	return (void *)(base + offset);
++}
++
++static inline uint32_t ptr2offset(const void *ptr, uintptr_t base)
++{
++	return (uint32_t)((uintptr_t)ptr) - base;
++}
++
++static struct hl_boot_info_desc *boot_info_get_desc(uint32_t type)
++{
++	uint32_t i;
++
++	for (i = 0; i < boot_info.ptrs.count; i++)
++		if (boot_info.descs[i].type == type)
++			return &boot_info.descs[i];
++
++	return NULL;
++}
++
++static void create_crc32_csum(const unsigned char *input, unsigned int ilen,
++			    struct hl_boot_info_desc *desc)
++{
++	uint32_t crc32_res;
++
++	crc32_res = crc32(0, input, ilen);
++	memcpy(&desc->crc32, &crc32_res, sizeof(crc32_res));
++}
++
++static int validate_crc32_csum(const unsigned char *input,
++			     unsigned int ilen,
++			     struct hl_boot_info_desc *desc)
++{
++	uint32_t crc32_res;
++
++	crc32_res = crc32(0, input, ilen);
++	return memcmp(&crc32_res, &desc->crc32, CRC32_NUM_BYTES);
++}
++
++void boot_info_finalize(void)
++{
++	struct hl_boot_info_desc *desc;
++	uint32_t offsets[MAX_INFO_DESCS];
++	uint32_t offset, copy_sz;
++	const uint32_t *src;
++	uint32_t *dst;
++	uint32_t i, j;
++	struct hl_boot_info_desc descs[MAX_INFO_DESCS];
++
++	if (!boot_info.ptrs.count)
++		return;
++
++	boot_info.ptrs.magic = HL_BOOT_INFO_MAGIC;
++	boot_info.ptrs.desc_ver = hl_get_boot_info_ver();
++	boot_info.ptrs.desc_sz = sizeof(struct hl_boot_info_desc);
++
++	/* Data offset */
++	offset = sizeof(struct hl_boot_info_ptrs) +
++		(sizeof(struct hl_boot_info_desc) + sizeof(uint32_t)) *
++		boot_info.ptrs.count;
++
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++
++	memcpy(descs, boot_info.descs, sizeof(descs));
++	/* Store data */
++	for (i = 0; i < boot_info.ptrs.count; i++) {
++		desc = &descs[i];
++		src = offset2ptr(desc->offset, 0);
++		create_crc32_csum((uint8_t *)src, desc->size, desc);
++		copy_sz = ROUND_UP4(desc->size);
++
++		for (j = 0; j < copy_sz / sizeof(uint32_t); j++)
++			dst[j] = src[j];
++
++		desc->offset = ptr2offset(dst, BOOT_INFO_BASE);
++		dst += j;
++	}
++
++	/* Store descriptors */
++	offset = sizeof(struct hl_boot_info_ptrs) +
++		(sizeof(uint32_t)) * boot_info.ptrs.count;
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++	for (i = 0; i < boot_info.ptrs.count; i++) {
++		src = (uint32_t *)&descs[i];
++		copy_sz = ROUND_UP4(sizeof(struct hl_boot_info_desc));
++
++		for (j = 0; j < copy_sz / sizeof(uint32_t); j++)
++			dst[j] = src[j];
++
++		offsets[i] = ptr2offset(dst, BOOT_INFO_BASE);
++		dst += j;
++	}
++
++	/* Store offsets array */
++	offset = sizeof(struct hl_boot_info_ptrs);
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++	for (i = 0; i < boot_info.ptrs.count; i++)
++		dst[i] = offsets[i];
++
++	/* Store the ptr */
++	dst = offset2ptr(0, BOOT_INFO_BASE);
++	for (i = 0; i < sizeof(boot_info.ptrs) / sizeof(uint32_t); i++)
++		dst[i] = boot_info.data[i];
++}
++
++int boot_info_set(uint32_t type, const void *data, uint32_t size)
++{
++	struct hl_boot_info_desc *desc;
++
++	desc = boot_info_get_desc(type);
++	if (!desc) {
++		if (boot_info.ptrs.count >= MAX_INFO_DESCS) {
++			return 1;
++		}
++
++		desc = &boot_info.descs[boot_info.ptrs.count];
++		boot_info.ptrs.count++;
++	}
++
++	desc->type = type;
++	desc->size = size;
++	desc->magic = HL_BOOT_INFO_DESC_MAGIC | type;
++	desc->offset = ptr2offset(data, 0);
++
++	return 0;
++}
++
++/*
++ * Apply memory copy with 32bit access limitation from src, make sure any
++ * reminder is also read using 32bit access.
++ * Both src and dst must be 32bit aligned addresses.
++ */
++static void boot_info_memcpy32(void *dst, void *src, uint32_t size)
++{
++	uint32_t *d, *s, rem;
++	uint32_t i, rem_sz;
++
++	d = dst;
++	s = src;
++
++	for (i = 0; i < size / sizeof(uint32_t); i++)
++		d[i] = s[i];
++
++	rem_sz = size % sizeof(uint32_t);
++	if (!rem_sz)
++		return;
++
++	rem = s[i];
++	memcpy(&d[i], &rem, rem_sz);
++}
++
++int boot_info_get(uint32_t type, void *data, uint32_t max_size, uint32_t *copy_size)
++{
++	struct hl_boot_info_ptrs ptrs;
++	struct hl_boot_info_desc desc;
++	uint32_t *offsets, i, cpy_sz;
++	void *src;
++	int ret;
++
++	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
++	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
++		return 1;
++
++	offsets = (uint32_t *)offset2ptr(sizeof(struct hl_boot_info_ptrs),
++				    BOOT_INFO_BASE);
++
++	for (i = 0; i < ptrs.count; i++) {
++		desc = *(struct hl_boot_info_desc *)offset2ptr(offsets[i],
++							       BOOT_INFO_BASE);
++		if (type != desc.type)
++			continue;
++
++		if (desc.magic != (HL_BOOT_INFO_DESC_MAGIC | type))
++			return 1;
++
++		cpy_sz = (max_size > desc.size) ? desc.size : max_size;
++		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
++		boot_info_memcpy32(data, src, cpy_sz);
++
++		ret = validate_crc32_csum((uint8_t *)data, desc.size,
++					&desc);
++		if (ret)
++			return 1;
++
++		*copy_size = cpy_sz;
++
++		return 0;
++	}
++
++	return 1;
++}
+diff --git a/common/boot_info.h b/common/boot_info.h
+new file mode 100644
+index 0000000..c95bda3
+--- /dev/null
++++ b/common/boot_info.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#ifndef _BOOT_INFO_H_
++#define _BOOT_INFO_H_
++
++#include <arcboot.h>
++
++void boot_info_finalize(void);
++int boot_info_set(uint32_t type, const void *data, uint32_t size);
++int boot_info_get(uint32_t type, void *data, uint32_t max_size, uint32_t *copy_size);
++uint16_t hl_get_boot_info_ver(void);
++
++#endif /* _BOOT_INFO_H_ */

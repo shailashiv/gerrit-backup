@@ -1,0 +1,103 @@
+From 24178e96ea407afc3a21c4113382ed1ce62df6ec Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 26 Jun 2024 06:14:42 +0300
+Subject: [PATCH] [FSW-6580] fs1: report failures in lfs wrapper
+
+With this patch, added support to report failures
+using software status bits. Especially this
+failure bits added for present bootrom using
+api's, those are lfs disk mount, open file
+config, file read and write.
+Failure report hierarchy is as follows, lfs
+disk mount, open file config, partial set or
+copy.
+
+Change-Id: I5494e06b45551e2d90a4666ee254369b8d952fd4
+---
+
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index 2ea9671..db5c648 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -134,6 +134,10 @@
+ 	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 124,
+ 	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 125,
+ 	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 126,
++	PROGRESS_BOOT_INFO_LFS_DISK_MOUNT_FAIL = 127,
++	PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL = 128,
++	PROGRESS_BOOT_INFO_LFS_FILE_COPY_PART_FAIL = 129,
++	PROGRESS_BOOT_INFO_LFS_FILE_SET_FAIL = 130,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/common/littlefs/lfs_wrapper.c b/common/littlefs/lfs_wrapper.c
+index 7658c52..3366ee5 100644
+--- a/common/littlefs/lfs_wrapper.c
++++ b/common/littlefs/lfs_wrapper.c
+@@ -12,6 +12,7 @@
+ #include "util.h"
+ #include <lfs_wrapper.h>
+ #include <dev_boot_info.h>
++#include <status.h>
+ 
+ #define DST_SAFE	true
+ #define DST_UNSAFE	false
+@@ -188,7 +189,7 @@
+ 	if (!err) {
+ 		lfs_init_done = true;
+ 	} else {
+-		/* TODO: Handle error scenerio */
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_DISK_MOUNT_FAIL);
+ 	}
+ 
+ 	return err;
+@@ -231,14 +232,21 @@
+ 		return ret;
+ 
+ 	ret = lfs_file_opencfg(&lfs, &file, type2file(type), LFS_O_RDWR | LFS_O_CREAT | (is_truncate ? LFS_O_TRUNC : 0), &defaults);
+-	if (ret < 0)
++	if (ret < 0) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL);
+ 		return ret;
++	}
+ 
+ 	ret = lfs_file_write(&lfs, &file, data, size);
+ 
+ 	lfs_file_close(&lfs, &file);
+ 
+-	return ret >= 0 ? 0 : ret;
++	if (ret >= 0)
++		return 0;
++	else {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_SET_FAIL);
++		return ret;
++	}
+ }
+ 
+ /* boot_info_set() must use globally allocated 'data' or finalize */
+@@ -261,8 +269,10 @@
+ 		return ret;
+ 
+ 	ret = lfs_file_opencfg(&lfs, &file, type2file(type), LFS_O_RDONLY, &defaults);
+-	if (ret < 0)
++	if (ret < 0) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL);
+ 		return ret;
++	}
+ 
+ 	memset(data, 0, size);
+ 
+@@ -285,7 +295,12 @@
+ 
+ 	lfs_file_close(&lfs, &file);
+ 
+-	return ret >= 0 ? 0 : ret;
++	if (ret >= 0)
++		return 0;
++	else {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_COPY_PART_FAIL);
++		return ret;
++	}
+ }
+ 
+ int boot_info_copy(enum hl_boot_info_type type, void *desc_data, uint32_t size)

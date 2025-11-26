@@ -1,0 +1,57 @@
+From afae3505dae2d14c1877c03398daf115b3882d9a Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 17 Apr 2022 20:40:40 +0300
+Subject: [PATCH] [SW-78052] gaudi3: update pcie control check in rom recovery
+
+In gaudi3, pcie control bit in efuse has different meaning for
+Master and Slave die.
+
+On Die 0 (Master Die):
+•	Value of ‘0’ – PCIe is Enabled
+•	Value of ‘1’ – PCIe is Disabled
+On Die 1 (Slave Die):
+•	Value of ‘0’ – PCIe is Disabled
+•	Value of ‘1’ – PCIe is Enabled
+
+This patch modifies pcie control check based on die id.
+
+Change-Id: Id1889c97786091177695a658a423b0963c1fe2b2
+---
+
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index 12229b6..1379e44 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -23,6 +23,7 @@
+ #define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(17)
+ #define EFUSE_SYSCFG_BACKUP_DISABLE			BIT(22)
+ #define EFUSE_SYSCFG_SKU_MASK				BIT(26)
++#define EFUSE_SYSCFG_PCIE_CONTROL_MASK			BIT(29)
+ #define EFUSE_SYSCFG2_D2D_DIS_MASK			BIT(31)
+ 
+ /* Following bitmaps are used in common code, hence maintained for compilation */
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index ca56aa5..2eb9234 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -167,12 +167,18 @@
+ 
+ static void rom_pcie_recovery(void)
+ {
++	uint32_t pcie_ctrl_val = arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_CONTROL_MASK;
++
+ 	/* Disable PCIe error responses (both HBW and LBW) */
+ 	regmap_writel(0x1, mmPCIE_RSP_OK);
+ 	regmap_writel(0x1, mmD0_PCIE_WRAP_PCIE_RSP_OK_1);
+ 
+-	if ((arcboot_rom_global.config_fuse &
+-	     EFUSE_SYSCFG_DISABLE_ROM_PCIE_RECOVERY) == 0)
++	/*
++	 * Master die (die_id=0): pcie_ctrl 0: PCIe enable 1: PCIe disable
++	 * Slave die (die_id=1): pcie_ctrl 0: PCIe disable 1: PCIe enable
++	 */
++	if ((arcboot_rom_global.die_id && pcie_ctrl_val) ||
++		(!arcboot_rom_global.die_id && !pcie_ctrl_val))
+ 		pcie_config();
+ }
+ 

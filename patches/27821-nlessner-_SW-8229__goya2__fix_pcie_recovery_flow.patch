@@ -1,0 +1,102 @@
+From 655398d7fd4bdcd70e70ed9634e2393e4616c185 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Thu, 13 Feb 2020 01:55:36 +0200
+Subject: [PATCH] [SW-8229] goya2: fix pcie_recovery flow
+
+Some minor bug and issues where fixed in flow.
+link not up yet but pcie_recovery is running better.
+
+Change-Id: I2baa82c5ec515de7b36822502a632873be7007db
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/pcie.c b/common/pcie.c
+index 3be10ef..2ef5750 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -12,14 +12,6 @@
+ #include "pcie.h"
+ #include "delay.h"
+ 
+-static uint8_t pcie_ltssm_en(void)
+-{
+-	uint8_t ltssm_en;
+-
+-	ltssm_en = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+-	return (ltssm_en & 0x1);
+-}
+-
+ static void pcie_loop_while_prstn(uint8_t assert)
+ {
+ 	uint8_t pcie_prstn;
+@@ -34,13 +26,18 @@
+ {
+ 	uint8_t sram_init_done;
+ 	uint32_t boot_strap;
++	uint8_t ltssm_en;
+ 
+-	if (pcie_ltssm_en()) {
+-		pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
++	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
++	ltssm_en = regmap_readl(mmPCIE_AUX_LTSSM_EN) &
++				PCIE_AUX_LTSSM_EN_IND_MASK;
++
++	if (!ltssm_en) {
+ 		regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ 		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+ 		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+ 
++		/* gpio bootstrap pin gpio17 = 0 */
+ 		boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+ 
+ 		if (boot_strap &
+@@ -48,11 +45,14 @@
+ 			regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
+ 
+ 		regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++		sram_init_done = 0;
+ 		do {
+ 			sram_init_done =
+ 				regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
+ 		} while (sram_init_done != 1);
+ 
++		sram_init_done = 0;
+ 		do {
+ 			sram_init_done =
+ 				regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
+@@ -62,12 +62,11 @@
+ 		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
+ 
+ 		/* Configure IATU */
+-		/* TODO: check the values of register are correct */
+ 		regmap_writel(0x300000, mmPCIE_AUX_DBI);
+-		regmap_writel(0xF0000000, mmPCIE_DBI_CORR_ERR_MASK_OFF);
+-		regmap_writel(0x7F, mmPCIE_DBI_ADV_ERR_CAP_CTRL_OFF);
+-		regmap_writel(0, mmPCIE_DBI_AER_EXT_CAP_HDR_OFF);
+-		regmap_writel(0xC0080000, mmPCIE_DBI_UNCORR_ERR_STATUS_OFF);
++		regmap_writel(0xF0000000, IATU_LWR_TARGET_ADDR_OFF_INBOUND);
++		regmap_writel(0x7F, IATU_UPPER_TARGET_ADDR_OFF_INBOUND);
++		regmap_writel(0, IATU_REGION_CTRL_1_OFF_INBOUND);
++		regmap_writel(0xC0080000, IATU_REGION_CTRL_2_OFF_INBOUND);
+ 		regmap_writel(0x3, mmPCIE_AUX_LTSSM_EN);
+ 	}
+ 
+diff --git a/common/pcie.h b/common/pcie.h
+index bb21ba1..b1a6c33 100644
+--- a/common/pcie.h
++++ b/common/pcie.h
+@@ -12,6 +12,13 @@
+ #define PCIE_PRSTN_ASSERT			0
+ #define PCIE_PRSTN_DEASSERT			1
+ 
++#define IATU_BASE				(mmPCIE_DBI_BASE & 0xFFFFFF)
++#define IATU_REGION_CTRL_1_OFF_INBOUND		(IATU_BASE + 0x100)
++#define IATU_REGION_CTRL_2_OFF_INBOUND		(IATU_BASE + 0x104)
++#define IATU_LWR_TARGET_ADDR_OFF_INBOUND	(IATU_BASE + 0x114)
++#define IATU_UPPER_TARGET_ADDR_OFF_INBOUND	(IATU_BASE + 0x118)
++
++
+ void pcie_recovery(void);
+ 
+ #endif /* _PCIE_H_ */

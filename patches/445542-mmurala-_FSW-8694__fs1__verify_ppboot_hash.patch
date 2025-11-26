@@ -1,0 +1,62 @@
+From f68f52aabf4d39c5204576eeaaa9f6af7333423e Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 28 Aug 2024 13:24:31 +0300
+Subject: [PATCH] [FSW-8694] fs1: verify ppboot hash
+
+Support added to verify hash of ppboot image
+by using generic key hash API. Boot desc lib
+is used to extract ppboot firmware img desc
+and which has embedded checksum required to
+compare against calculated checksum.
+
+Change-Id: Ic0ba447b65a525bee5af36fae7c40367e5bd841f
+---
+
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 0d415d6..2033f56 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -14,6 +14,8 @@
+ #include <boot_flow.h>
+ #include <dev_uart.h>
+ #include <dev_boot_info.h>
++#include <dev_security.h>
++#include <secure_boot.h>
+ 
+ /* These fields will be added to proper structure later */
+ static enum hl_fw_manifest_type primary_manifest_idx = HL_FW_SPI_MANIFEST_0;
+@@ -211,10 +213,31 @@
+ 
+ }
+ 
+-bool boot_rom_boot_flow_is_ppboot_valid(__unused enum boot_rom_manifests rom_manifest_type)
++bool boot_rom_boot_flow_is_ppboot_valid(enum boot_rom_manifests rom_manifest_type)
+ {
+-	/* Validate ppboot sha */
+-	return true;
++	enum boot_rom_progress status_base = PROGRESS_BRINGUP_PCI_PRI;
++	enum hl_fw_manifest_type man_idx = primary_manifest_idx;
++
++	if (!boot_rom_boot_flow_is_manifest_valid(rom_manifest_type))
++		return false;
++
++	if (!security_efuse_image_validation_en())
++		return true;
++
++	if (rom_manifest_type == BOOT_ROM_SECONDARY)
++		man_idx = (primary_manifest_idx + 1) % HL_FW_SPI_MANIFEST_MAX_NUM;
++
++	if (man_idx == HL_FW_SPI_MANIFEST_1)
++		status_base = PROGRESS_BRINGUP_PCI_SEC;
++
++	if (boot_rom_verify_fw_image_hash384(man_idx, HL_FW_IMG_PPBOOT)) {
++		boot_rom_status_update_bringup(status_base, PROGRESS_BRINGUP_VERIFY_SUCCESS);
++		return true;
++	}
++
++	boot_rom_status_update_bringup(status_base, PROGRESS_BRINGUP_KEY_AUTH_FAIL);
++
++	return false;
+ }
+ 
+ uint32_t boot_rom_boot_flow_get_recovery_img_count(enum boot_rom_manifests recovery_manifest)

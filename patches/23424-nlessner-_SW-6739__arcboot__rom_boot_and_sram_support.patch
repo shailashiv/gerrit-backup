@@ -1,0 +1,161 @@
+From b7a37844d4d9034d23308b92117bd8bf7ca824f8 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 17 Dec 2019 09:40:11 +0200
+Subject: [PATCH] [SW-6739] arcboot: rom boot and sram support
+
+because data is saved in DCCM it has to be placed in rom and linked to
+DCCM with linker script. added support at startup to copy data
+from ROM to DCCM.
+
+Change-Id: If6a1e1f2e101526033c0ef95544992ad1819fa77
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 9d870ce..0657dbf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -46,7 +46,7 @@
+ sbtool:
+ 	@$(MAKE) -C sdk $@
+ %.bin: %
+-	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .*data -R .test* $< $@
++	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .test* $< $@
+ 
+ arcboot: $(ARCBOOT_OBJECTS)
+ 	$(CC) $^ $(LDFLAGS) -o $@
+diff --git a/common/crt0.S b/common/crt0.S
+index 34f5c36..63f3ae6 100644
+--- a/common/crt0.S
++++ b/common/crt0.S
+@@ -43,6 +43,21 @@
+ 	nop
+ .Lend_zbss:
+ 
++	mov_s r1, @_etext	; r1 = end of the text section
++	mov_s r2, @_data	; r1 = end of the data section
++
++	sub r3, @_edata, r2	; r3 = size of the data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
+ 	;; branch to main
+ 	bl.d @main
+ 	mov fp, 0		; initialize frame pointer
+diff --git a/common/crt0_rom.S b/common/crt0_rom.S
+index 0d9fc77..e431ed8 100644
+--- a/common/crt0_rom.S
++++ b/common/crt0_rom.S
+@@ -80,6 +80,21 @@
+ 	nop
+ .Lend_zbss:
+ 
++	mov_s r1, @_etext	; r1 = end of the text section
++	mov_s r2, @_data	; r1 = end of the data section
++
++	sub r3, @_edata, r2	; r3 = size of the data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
+ 	;; branch to main
+ 	bl.d @main
+ 	mov fp, 0		; initialize frame pointer
+diff --git a/goya2_arc/arcboot.lds b/goya2_arc/arcboot.lds
+index ce4ef86..aa0d58e 100644
+--- a/goya2_arc/arcboot.lds
++++ b/goya2_arc/arcboot.lds
+@@ -15,13 +15,12 @@
+ 	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+ 	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+ 	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+ 	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+ 	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+ }
+ 
+ REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_DATA",	FWSRAM)
++REGION_ALIAS("REGION_DATA",	DCCM)
+ REGION_ALIAS("REGION_SDATA",	DCCM)
+ REGION_ALIAS("REGION_SBSS",	DCCM)
+ REGION_ALIAS("REGION_BSS",	DCCM)
+@@ -33,15 +32,17 @@
+ SECTIONS
+ {
+ 	.text : {
+-		crt0.o (.text*)
+-		*(.text)
++		common/crt0.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
+ 	} > REGION_TEXT
+ 
+-	.data : {
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
+ 		*(.data)
+ 	} > REGION_DATA
+ 
+-	.sdata : {
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+ 		__SDATA_BEGIN__ = .;
+ 		*(.sdata .sdata.* .gnu.linkonce.s.*)
+ 		_edata = .;
+diff --git a/goya2_arc/arcboot_rom.lds b/goya2_arc/arcboot_rom.lds
+index 2019e3d..db67460 100644
+--- a/goya2_arc/arcboot_rom.lds
++++ b/goya2_arc/arcboot_rom.lds
+@@ -15,14 +15,13 @@
+ 	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+ 	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+ 	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+ 	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+ 	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+ }
+ 
+-REGION_ALIAS("REGION_IVT",	ICCM)
+-REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_DATA",	FWSRAM)
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
+ REGION_ALIAS("REGION_SDATA",	DCCM)
+ REGION_ALIAS("REGION_SBSS",	DCCM)
+ REGION_ALIAS("REGION_BSS",	DCCM)
+@@ -39,14 +38,16 @@
+ 
+ 	.text : {
+ 		common/crt0_rom.o (.text*)
+-		*(.text)
++		*(.text .text.*)
++		_etext = . ;
+ 	} > REGION_TEXT
+ 
+-	.data : {
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
+ 		*(.data)
+ 	} > REGION_DATA
+ 
+-	.sdata : {
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+ 		__SDATA_BEGIN__ = .;
+ 		*(.sdata .sdata.* .gnu.linkonce.s.*)
+ 		_edata = .;

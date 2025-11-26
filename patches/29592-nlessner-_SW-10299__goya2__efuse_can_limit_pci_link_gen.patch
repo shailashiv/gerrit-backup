@@ -1,0 +1,58 @@
+From 4332faf94771ca904f4471edc8ad19cfdd00b436 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 10 Mar 2020 18:26:08 +0200
+Subject: [PATCH] [SW-10299] goya2: efuse can limit pci link gen
+
+Efuse bit 18 can controll the gen used when in PCI recovery.
+when 0 this will limit the link to gen 1, if efuse is set then we allow
+unlimited gen.
+
+Change-Id: I79813ae96aadd7d53d68c457f4266e7ad35168cb
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/efuse.h b/common/efuse.h
+index 267b700..a1b8e06 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -17,6 +17,7 @@
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ #define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 
++#define EFUSE_SYSCFG_PCIE_GEN_LIMIT		BIT(18)
+ #define EFUSE_SYSCFG_SPI_CONTROLLER		BIT(17)
+ #define EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK	BIT(12)
+ #define EFUSE_SYSCFG_FW_VERSION_LOCATION	13
+diff --git a/common/pcie.c b/common/pcie.c
+index 25a32e7..11d8a2e 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -25,7 +25,7 @@
+ static void pcie_config(void)
+ {
+ 	uint8_t sram_init_done;
+-	uint32_t boot_strap, flr_ctrl;
++	uint32_t boot_strap, flr_ctrl, link_ctrl;
+ 	uint8_t ltssm_en;
+ 
+ 	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
+@@ -61,6 +61,19 @@
+ 		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
+ 		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
+ 
++		if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0) {
++			/* limit PCIe link gen to 1 */
++			link_ctrl = regmap_readl(mmPCIE_DBI_LINK_CAPABILITIES_REG);
++			link_ctrl &= ~PCIE_DBI_LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_MASK;
++			link_ctrl |= (1 << PCIE_DBI_LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_SHIFT);
++			regmap_writel(link_ctrl, mmPCIE_DBI_LINK_CAPABILITIES_REG);
++
++			link_ctrl = regmap_readl(mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG);
++			link_ctrl &= ~PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_MASK;
++			link_ctrl |= (1 << PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_SHIFT);
++			regmap_writel(link_ctrl, mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG);
++		}
++
+ 		/* Configure IATU */
+ 		regmap_writel(0x300000, mmPCIE_AUX_DBI);
+ 		regmap_writel(0xF0000000, IATU_LWR_TARGET_ADDR_OFF_INBOUND);

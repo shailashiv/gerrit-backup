@@ -1,0 +1,118 @@
+From e49cf2371e3d3bde7f20866926956857001d319b Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 15 Mar 2022 05:10:59 +0200
+Subject: [PATCH] [SW-56706] rom: make dma v2 api generic
+
+Upgrading dma api to v2 in boot desc requires dma v2 to be
+available in generic code. Hence making the function weak
+such that logic is redirected to legacy api for existing
+projects.
+
+Change-Id: I6a30703ea09fc6f4679fb94d340704ead471109d
+---
+
+diff --git a/arch/gaudi3/arc/dev_dma.h b/arch/gaudi3/arc/dev_dma.h
+index fb5dcc5..147c7e6 100644
+--- a/arch/gaudi3/arc/dev_dma.h
++++ b/arch/gaudi3/arc/dev_dma.h
+@@ -4,37 +4,10 @@
+  */
+ 
+ #include <secureboot.h>
++#include <dma.h>
+ 
+ #define MAX_DMA_SIZE		0xFFF0
+ #define MAX_DMA_SIZE_CRC	(MAX_DMA_SIZE + CRC32_SIZE)
+ #define OFFSET_64KB		0x10000
+ #define ADDR_SIZE_ALIGNMENT	16	/* 16 bytes */
+ 
+-enum dma_error {
+-	DMA_SUCCESS = 0,
+-	DMA_INVALID_CRC_ERROR,
+-	DMA_INVALID_DEST_TYPE,
+-	DMA_UNALIGNED_IMG_SIZE,
+-	DMA_UNALIGNED_DEST_ADDR,
+-	DMA_ERROR_MAX
+-};
+-
+-enum dma_dest_type {
+-	DMA_DEST_HBW = 0,
+-	DMA_DEST_SRAM,
+-	DMA_DEST_MAX
+-};
+-
+-/*
+- * dma_copy_image_v2 - dma copy using spi dma above 64KB size
+- * @image_size: Total image size including CRCs (in bytes)
+- * @flash_offset: SPI flash offset
+- * @dest_addr: Full 64 bit destination address
+- * @dest_type: Destination HBW: 0 SRAM: 1
+- * @skip_crc_check: whether to skip CRC check
+- *
+- * Return: enum dma_error
+- */
+-enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
+-				 uint64_t dest_addr, enum dma_dest_type dest_type,
+-				 bool skip_crc_check);
+diff --git a/common/dma.c b/common/dma.c
+index db690f2..9019ae8 100644
+--- a/common/dma.c
++++ b/common/dma.c
+@@ -63,3 +63,15 @@
+ 
+ 	return crc_error;
+ }
++
++__weak enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
++		 uint64_t dest_addr, enum dma_dest_type dest_type,
++		 bool skip_crc_check)
++{
++	dma_copy_image(image_size, flash_offset, dest_addr, dest_type);
++
++	if ((!skip_crc_check) && (dma_wait_finish() == DMA_CRC_ERROR))
++		return DMA_INVALID_CRC_ERROR;
++
++	return DMA_SUCCESS;
++}
+diff --git a/common/dma.h b/common/dma.h
+index ef92a5f..6fd1c72 100644
+--- a/common/dma.h
++++ b/common/dma.h
+@@ -19,7 +19,35 @@
+ #define DMA_ADDRESS_LOW(x)	((x) & 0xFFFFFFFF)
+ #define DMA_ADDRESS_HIGH(x)	(((x) >> 32) & 0xFFFFFFFF)
+ 
++enum dma_error {
++	DMA_SUCCESS = 0,
++	DMA_INVALID_CRC_ERROR,
++	DMA_INVALID_DEST_TYPE,
++	DMA_UNALIGNED_IMG_SIZE,
++	DMA_UNALIGNED_DEST_ADDR,
++	DMA_ERROR_MAX
++};
++
++enum dma_dest_type {
++	DMA_DEST_HBW = 0,
++	DMA_DEST_SRAM,
++	DMA_DEST_MAX
++};
++
+ void dma_copy_image(uint16_t image_size, uint32_t flash_offset,
+ 		    uint64_t dest_offset, uint8_t fw_sram_dst);
+ int dma_wait_finish(void);
+-#endif /* _DMA_H_ */
+\ No newline at end of file
++/*
++ * dma_copy_image_v2 - dma copy using spi dma above 64KB size
++ * @image_size: Total image size including CRCs (in bytes)
++ * @flash_offset: SPI flash offset
++ * @dest_addr: Full 64 bit destination address
++ * @dest_type: Destination HBW: 0 SRAM: 1
++ * @skip_crc_check: whether to skip CRC check
++ *
++ * Return: enum dma_error
++ */
++enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
++				 uint64_t dest_addr, enum dma_dest_type dest_type,
++				 bool skip_crc_check);
++#endif /* _DMA_H_ */

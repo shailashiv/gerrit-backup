@@ -1,0 +1,129 @@
+From 484d3ffd1590f5d2bfca0b11c1809edd58ebcdac Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sat, 08 Feb 2020 21:03:18 +0200
+Subject: [PATCH] [SW-8229] goya2: split efuse function to simplify
+
+Split efuse to init and read function. Init will trigger a
+read of the analog front end of the efuses to data memory range.
+Read function will retrieve the corresponding efuse requested.
+Make sure that init will read all fuse reange, from 0x0 till 0x7F.
+
+Change-Id: I8407d2951f988dda7db6e1a849d62d438d8599a1
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index e377936..313c566 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -48,6 +48,7 @@
+ 
+ 	regmap_writel(SPI_FLASH_BAUDR_DIVISOR, mmPSOC_QSPI_BAUDR);
+ 	regmap_writel(write_en_16MB, mmPSOC_SECURITY_SPI_WRITE_LIMIT);
++	fuse_init();
+ }
+ 
+ static void arcboot_rom_in_recovery(void)
+@@ -96,7 +97,9 @@
+ 
+ static void arcboot_rom_fuse(void)
+ {
+-	fuse_read(EFUSE_SYSCFG_OFFSET, &arcboot_rom_global.config_fuse);
++	if (fuse_read(EFUSE_SYSCFG_OFFSET, &arcboot_rom_global.config_fuse) ==
++	    -1)
++		arcboot_rom_global.config_fuse = EFUSE_SYSCFG_DEFAULT;
+ 	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK)
+ 		security_disable_debug_if();
+ 
+diff --git a/common/efuse.c b/common/efuse.c
+index 87dc1aa..737c33f 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -17,32 +17,43 @@
+ #define FUSE_RETRIES		(FUSE_TIMEOUT_US / FUSE_DELAY_US)
+ #define FUSE_WORDS_PER_BANK	64
+ 
++static uint8_t fuse_init_fail = 1;
++
+ /*
+  * fuse box is devided into half for redundancy
+  * each half is bank of FUSE_WORDS_PER_BANK words
+  * NOTE: bank1 is a complete duplication of bank0
+  */
++
++void fuse_init(void)
++{
++	int i;
++
++	regmap_writel(EFUSE_READ_RANGE_ALL,
++		      mmPSOC_DFT_EFUSE_READ_ADDRESS);
++
++	regmap_writel(1, mmPSOC_EFUSE_READ);
++
++	for (i = 0; i < FUSE_RETRIES; i++)
++		if (regmap_readl(mmPSOC_EFUSE_READ))
++			udelay(FUSE_DELAY_US);
++		else
++			break;
++
++	if (i == FUSE_RETRIES)
++		fuse_init_fail = 0;
++}
++
+ int fuse_read(uint32_t word, uint32_t *val)
+ {
+ 	int offset;
+-	static uint16_t i = EFUSE_NOT_READ;
+ 
+ 	if (word > 64) {
+ 		return -1;
+ 	}
+ 
+-	if (i <= EFUSE_NOT_READ)	{
+-		regmap_writel(1, mmPSOC_EFUSE_READ);
+-
+-		for (i = 0; i < FUSE_RETRIES; i++)
+-			if (regmap_readl(mmPSOC_EFUSE_READ))
+-				udelay(FUSE_DELAY_US);
+-			else
+-				break;
+-
+-	}
+-	if (i == FUSE_RETRIES)
+-		return -2;
++	if (!fuse_init_fail)
++		return -1;
+ 
+ 	/* read value from bank0 */
+ 	offset = (word * sizeof(uint32_t));
+diff --git a/common/efuse.h b/common/efuse.h
+index 0a7b77e..8c9595a 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -11,6 +11,7 @@
+ #define EFUSE_READ_DONE				0x2
+ #define EFUSE_NOT_READ				0x1
+ 
++#define EFUSE_READ_RANGE_ALL			0x3F80
+ 
+ #define EFUSE_KEY_HASH_OFFSET			0x12
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+@@ -28,6 +29,18 @@
+ #define EFUSE_SYSCFG_REVOKE_KEY_LOCATION	0
+ #define EFUSE_SYSCFG_REVOKE_KEY_MASK		0x1F
+ 
++#define EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI	BIT(14)
++#define EFUSE_SYSCFG_KEY_LOCATION_SPI		BIT(8)
++#define EFUSE_SYSCFG_REVOKATION_LOCATION_SPI	BIT(6)
++
++#define EFUSE_SYSCFG_DEFAULT	(EFUSE_SYSCFG_SPI_CONTROLLER | \
++				 EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK | \
++				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
++				 EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
++				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI)
++
++void fuse_init(void);
+ int fuse_read(uint32_t word, uint32_t *val);
+ uint8_t efuse_otp_get_fw_version_security(void);
+ void efuse_get_hash(uint32_t *key_hash);

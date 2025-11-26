@@ -1,0 +1,374 @@
+From 0386456bd431f3ae7a9ee37361ba3c2a375be58c Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 03 Feb 2022 08:09:28 +0200
+Subject: [PATCH] [SW-68803] arcboot: bringup logic for gaudi3
+
+The pcie bringup images logic is added for gaudi3. Major changes
+compared to gaudi2:
+
+1) Use image pointer framework to read and process the ppboot image
+parameters.
+
+2) Adapt individual sub-routines to increase re-usability in ppboot.
+
+Change-Id: Ic33b88cfbf381ce58deb3b4142ce3f7fdb1b075a
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 878e4cf..99da273 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -29,12 +29,14 @@
+ 	.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM] = {
+ 		.boot_desc_flag = 0,
+ 		.img_ptr_spi_offset = HL_EROM_IMG_PTRS_BASE,
+-		.max_imgs = HL_FW_MAX_EROM_BOOT_PTRS
++		.max_imgs = HL_FW_MAX_EROM_BOOT_PTRS,
++		.load_addr = 0,
+ 	},
+ 	.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI] = {
+ 		.boot_desc_flag = 0,
+ 		.img_ptr_spi_offset = HL_SPI_IMG_PTRS_BASE,
+-		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS
++		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS,
++		.load_addr = 0,
+ 	},
+ };
+ 
+@@ -51,7 +53,7 @@
+ 	regmap_writel(reg, (mmSW_STATUS_0 + offset * 4));
+ }
+ 
+-static void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,
++void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,
+ 					      enum arcboot_rom_bringup_proggress position)
+ {
+ 	uint32_t reg;
+@@ -195,7 +197,7 @@
+ 	return (!arcboot_rom_global.validation_pass);
+ }
+ 
+-static void arcboot_rom_validation_fail(void)
++void arcboot_rom_validation_fail(void)
+ {
+ 	uint32_t reg;
+ 
+@@ -206,7 +208,7 @@
+ 	regmap_writel(reg, mmCOLD_RST_FLOPS_2);
+ }
+ 
+-static void arcboot_rom_clear_recovery_flag(void)
++void arcboot_rom_clear_recovery_flag(void)
+ {
+ 	uint32_t reg;
+ 
+@@ -266,7 +268,7 @@
+ 	return flash_image_offset;
+ }
+ 
+-static void arcboot_rom_load_recovery(void)
++void arcboot_rom_load_recovery(void)
+ {
+ 	uint32_t recovery_img_size = 0;
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 9d6f5bc..4f8289d 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -10,6 +10,13 @@
+ #include <efuse.h>
+ #include <dev_spi_flash.h>
+ #include <dev_common.h>
++#include <boot_desc.h>
++#include <efuse.h>
++#include <secureboot.h>
++#include <security.h>
++#include <soc.h>
++#include <pcie.h>
++#include <dev_dma.h>
+ 
+ #include <d0_psoc_global_conf_masks.h>
+ 
+@@ -213,3 +220,139 @@
+ 	val &= ~mask;
+ 	regmap_writel(val, mmD0_PSOC_GPIO4_OUTENSET);
+ }
++
++static void arcboot_get_boot_desc(int img, struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
++{
++	boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, img, desc, upd_status);
++}
++
++static void arcboot_rom_validation_pass(void)
++{
++	/* TODO: add vaildation pass logic */
++}
++
++static int arcboot_rom_bringup_img_sub(int img, struct boot_desc *desc, enum fw_post_reset_cmd upd_status,
++		uint8_t cur_img)
++{
++	uint32_t act_img_size, image_len, loadaddr_arc;
++	unsigned char *image, *signature, *pub_key;
++	enum arcboot_rom_progress img_sts_base = PROGRESS_BRINGUP_PCI_PRI;
++	int ret;
++
++	arcboot_rom_global.curr_img = cur_img;
++
++	if (cur_img == ARCBOOT_SECONDARY)
++		img_sts_base = PROGRESS_BRINGUP_PCI_SEC;
++
++	arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_START);
++
++	arcboot_get_boot_desc(img, desc, upd_status);
++
++	security_report_img_fw(arcboot_rom_global.curr_img, desc->sec_ver);
++
++	act_img_size = desc->img_size - desc->pub_key_size - desc->sig_size - CRC32_SIZE;
++
++	arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_DMA);
++	/* TODO: Add DMA LOGIC */
++
++	if (!security_efuse_image_validation_en())
++		return ARCBOOT_BRINGUP_OK;
++
++	/* Derive key and signature parameters */
++	loadaddr_arc = (uint32_t)CONV_64B_TO_ARC(desc->loadaddr);
++	image = (unsigned char *)(loadaddr_arc);
++	image_len = act_img_size + desc->pub_key_size; /* img + public key*/
++	pub_key = (unsigned char *)(loadaddr_arc + act_img_size);
++	signature = (unsigned char *)(loadaddr_arc + image_len);
++
++	ret = secureboot_verify_image_v2(image, image_len,
++			pub_key, desc->pub_key_size, signature, desc->sig_size, desc->sec_ver);
++	if (ret != SECUREBOOT_VERIFY_SUCCESS) {
++		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
++			security_report_img_status(IMG_STATUS_FW_VERSION_LOW, cur_img);
++		else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
++			arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_KEY_REVOKED);
++		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
++			arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_KEY_AUTH_FAIL);
++		else
++			security_report_img_status(IMG_STATUS_SIG_AUTH_FAIL, cur_img);
++		return ARCBOOT_BRINGUP_ERROR;
++	}
++
++	arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_SECURITY);
++
++	return ARCBOOT_BRINGUP_OK;
++}
++
++static int arcboot_rom_bringup_img(int img, uint64_t *load_addr)
++{
++	enum fw_post_reset_cmd fw_upd_status = regmap_readl(mmD0_PSOC_GLOBAL_CONF_COLD_RST_FLOPS_3);
++	int ret;
++	struct boot_desc desc;
++
++	ret = arcboot_rom_bringup_img_sub(img, &desc, fw_upd_status, ARCBOOT_PRIMARY);
++	if (ret == ARCBOOT_BRINGUP_OK)
++		goto image_bringup_success;
++
++	if (arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_SECONDARY_IMG)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	/* Try the secondary image by toggling upd_status variable */
++	fw_upd_status = (fw_upd_status == FLOPS_UPD_PENDING) ? FLOPS_UPD_NOOP :
++			 FLOPS_UPD_PENDING;
++
++	ret = arcboot_rom_bringup_img_sub(img, &desc, fw_upd_status, ARCBOOT_SECONDARY);
++	if (ret == ARCBOOT_BRINGUP_OK)
++		goto image_bringup_success;
++
++	return ARCBOOT_BRINGUP_ERROR;
++
++image_bringup_success:
++	*load_addr = desc.loadaddr;
++	return ARCBOOT_BRINGUP_OK;
++
++}
++
++void arcboot_rom_handle_tpm(void)
++{
++	/* TODO: Add tpm relavent code */
++}
++
++void arcboot_rom_bringup_pcie(void)
++{
++	void (*ppboot)();
++	uint64_t *loadaddr =
++			&arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].load_addr;
++	int ret;
++
++	if (!boot_desc_init(HL_FW_BOOT_PTR_SPI)) {
++		arcboot_rom_status_update(PROGRESS_BRINGUP_PCI_BOOT_DESC_FAIL);
++		goto skip_bringup;
++	}
++
++	if (arcboot_rom_global.validation_pass)
++		goto skip_rom_validation;
++
++	/* Check for prim/sec failure */
++	ret = arcboot_rom_bringup_img(HL_FW_IMG_PPBOOT, loadaddr);
++	if (ret == ARCBOOT_BRINGUP_OK) {
++		arcboot_rom_validation_pass();
++	} else {
++		arcboot_rom_validation_fail();
++		goto skip_bringup;
++	}
++
++skip_rom_validation:
++	arcboot_rom_handle_tpm();
++
++	arcboot_rom_status_update(PROGRESS_PPBOOT_START);
++	if (loadaddr) {
++		ppboot = (void *)((uint32_t)CONV_64B_TO_ARC(*loadaddr));
++		ppboot();
++	}
++
++skip_bringup:
++	execute_pcie_recovery();
++	return;
++}
+diff --git a/arch/gaudi3/arc/soc.h b/arch/gaudi3/arc/soc.h
+index 0148a8a..f5071d8 100644
+--- a/arch/gaudi3/arc/soc.h
++++ b/arch/gaudi3/arc/soc.h
+@@ -90,4 +90,5 @@
+ #define HL_SP_SRAM_SIZE			0x10000
+ #define HL_MIRROR_CFG_BASE		HL_D2D_LBW_BASE
+ 
++#define CONV_64B_TO_ARC(addr)	((addr & 0xFFFFFFF) + HL_FW_MEM_BASE)
+ #endif /* _SOC_H_ */
+diff --git a/common/hl_boot_desc_rom.h b/common/hl_boot_desc_rom.h
+index 6cb04ab..417e089 100644
+--- a/common/hl_boot_desc_rom.h
++++ b/common/hl_boot_desc_rom.h
+@@ -34,6 +34,7 @@
+ 	uint8_t boot_desc_flag;
+ 	uint8_t max_imgs;
+ 	uint32_t img_ptr_spi_offset;
++	uint64_t load_addr;
+ };
+ 
+ struct hl_img_ptrs_erom {
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 789de6a..2543435 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -79,9 +79,11 @@
+ 
+ enum arcboot_rom_bringup_proggress {
+ 	PROGRESS_BRINGUP_START,
+-	PROGRESS_BRINGUP_DMA,
+-	PROGRESS_BRINGUP_SECURITY,
+ 	PROGRESS_BRINGUP_TOO_BIG,
++	PROGRESS_BRINGUP_DMA,
++	PROGRESS_BRINGUP_KEY_REVOKED,
++	PROGRESS_BRINGUP_KEY_AUTH_FAIL,
++	PROGRESS_BRINGUP_SECURITY,
+ };
+ 
+ enum arcboot_rom_progress {
+@@ -99,44 +101,49 @@
+ 	PROGRESS_VER_LOC = 11,
+ 	PROGRESS_VER_LOC_0 = 12,
+ 	PROGRESS_VER_LOC_1 = 13,
+-	PROGRESS_BRINGUP_PCI_PRI = 14,
+-	PROGRESS_BRINGUP_PCI_PRI_DMA = 15,
+-	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 16,
+-	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 17,
+-	PROGRESS_BRINGUP_PCI_SEC = 18,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA = 19,
+-	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 20,
+-	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 21,
+-	PROGRESS_PCIE_IN_RECOVERY = 22,
+-	PROGRESS_PPBOOT_START = 23,
+-	PROGRESS_PPBOOT_FINISH = 24,
+-	PROGRESS_BRINGUP_RAM_PRI = 25,
+-	PROGRESS_BRINGUP_RAM_PRI_DMA = 26,
+-	PROGRESS_BRINGUP_RAM_PRI_SECURITY = 27,
+-	PROGRESS_BRINGUP_RAM_SEC = 28,
+-	PROGRESS_BRINGUP_RAM_SEC_DMA = 29,
+-	PROGRESS_BRINGUP_RAM_SEC_SECURITY = 30,
+-	PROGRESS_ARCBOOT_RAM_START = 31,
+-	PROGRESS_ARCBOOT_RECOVERY = 32,
+-	PROGRESS_ARCBOOT_RECOVERY_DMA = 33,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR = 34,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START = 35,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH = 36,
+-	PROGRESS_ARCBOOT_EROM_PCIE = 37,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START = 38,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH = 39,
+-	PROGRESS_ARCBOOT_EROM_PCIE_START = 40,
+-	PROGRESS_ARCBOOT_EROM_PCIE_FINISH = 41,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY = 42,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START = 43,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH = 44,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_START = 45,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH = 46,
+-	PROGRESS_ARCBOOT_EROM_TPM = 47,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_START = 48,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH = 49,
+-	PROGRESS_ARCBOOT_EROM_TPM_START = 50,
+-	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 51,
++	PROGRESS_BRINGUP_PCI_BOOT_DESC_FAIL = 14,
++	PROGRESS_BRINGUP_PCI_PRI = 15,
++	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 16,
++	PROGRESS_BRINGUP_PCI_PRI_DMA = 17,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 18,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 19,
++	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 20,
++	PROGRESS_BRINGUP_PCI_SEC = 21,
++	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 22,
++	PROGRESS_BRINGUP_PCI_SEC_DMA = 23,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 24,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 25,
++	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 26,
++	PROGRESS_PCIE_IN_RECOVERY = 27,
++	PROGRESS_PPBOOT_START = 28,
++	PROGRESS_PPBOOT_FINISH = 29,
++	PROGRESS_BRINGUP_RAM_PRI = 30,
++	PROGRESS_BRINGUP_RAM_PRI_DMA = 31,
++	PROGRESS_BRINGUP_RAM_PRI_SECURITY = 32,
++	PROGRESS_BRINGUP_RAM_SEC = 33,
++	PROGRESS_BRINGUP_RAM_SEC_DMA = 34,
++	PROGRESS_BRINGUP_RAM_SEC_SECURITY = 35,
++	PROGRESS_ARCBOOT_RAM_START = 36,
++	PROGRESS_ARCBOOT_RECOVERY = 37,
++	PROGRESS_ARCBOOT_RECOVERY_DMA = 38,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR = 39,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START = 40,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH = 41,
++	PROGRESS_ARCBOOT_EROM_PCIE = 42,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START = 43,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH = 44,
++	PROGRESS_ARCBOOT_EROM_PCIE_START = 45,
++	PROGRESS_ARCBOOT_EROM_PCIE_FINISH = 46,
++	PROGRESS_ARCBOOT_EROM_RECOVERY = 47,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START = 48,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH = 49,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_START = 50,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH = 51,
++	PROGRESS_ARCBOOT_EROM_TPM = 52,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_START = 53,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH = 54,
++	PROGRESS_ARCBOOT_EROM_TPM_START = 55,
++	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 56,
+ };
+ 
+ enum security_location {
+@@ -147,8 +154,14 @@
+ 
+ extern struct arcboot_global_s arcboot_rom_global;
+ void arcboot_rom_status_update(enum arcboot_rom_progress progress);
++void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,
++					enum arcboot_rom_bringup_proggress position);
+ void arcboot_rom_status_update_location(uint8_t progress,
+ 					enum security_location loc);
++void arcboot_rom_bringup_pcie(void);
++void arcboot_rom_validation_fail(void);
++void arcboot_rom_clear_recovery_flag(void);
++void arcboot_rom_load_recovery(void);
+ 
+ #define CLEAR_DMA_SECURITY_PROGRESS 0x3
+ 

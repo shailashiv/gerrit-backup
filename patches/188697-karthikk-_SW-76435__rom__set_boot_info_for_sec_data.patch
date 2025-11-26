@@ -1,0 +1,140 @@
+From 5299dd3b8f62575db3ef73ba944c0f86bdd198f5 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 09 Mar 2022 12:32:06 +0200
+Subject: [PATCH] [SW-76435] rom: set boot info for sec data
+
+As boot info framework is used to store data onto spsram in gaudi3,
+the same is used to store security data structure (efuse offset 0x3A)
+
+This patch implements the boot_info_set.
+
+Change-Id: I4a64bd81c45f2df2756b2fb9e0f8c86de86c501f
+---
+
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index 582edbf..5fb4213 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -10,6 +10,7 @@
+ #include "security.h"
+ #include "spi_flash.h"
+ #include <string.h>
++#include <boot_info.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -86,7 +87,7 @@
+ 			return 1;
+ 
+ 		/* read from efuse/SP SRAM */
+-		ptr = arcboot_rom_global.sp_sram->sec_data.keys[key_index];
++		ptr = arcboot_rom_global.sec_data.keys[key_index];
+ 	} else {
+ 		/*
+ 		 * All other cases are routed into ROM, since it is
+@@ -129,7 +130,7 @@
+ 	if (key_index >= max_key_index)
+ 		return -1;
+ 
+-	key_revoke = arcboot_rom_global.sp_sram->sec_data.key_revoke;
++	key_revoke = arcboot_rom_global.sec_data.key_revoke;
+ 
+ 	/* if the key is not revoked, return 1 */
+ 	if ((key_revoke & BIT(key_index)) == 0)
+@@ -232,8 +233,7 @@
+ 	/* store hashes in the limited space available in PSOC_SECURITY */
+ 	security_store_keys_in_psoc(max_keys, key_hash);
+ 
+-	/* Store key hashes in sp sram */
+-	memcpy(arcboot_rom_global.sp_sram->sec_data.keys,
++	memcpy(arcboot_rom_global.sec_data.keys,
+ 			key_hash, max_keys * SECURITY_KEY_HASH_LEN);
+ }
+ 
+@@ -264,7 +264,7 @@
+ 	/* store key_revoke map in PSOC */
+ 	regmap_writel(key_revoke, mmSECURITY_KEY_REVOKE);
+ 
+-	arcboot_rom_global.sp_sram->sec_data.key_revoke = key_revoke;
++	arcboot_rom_global.sec_data.key_revoke = key_revoke;
+ }
+ 
+ void security_load_fw_version(void)
+@@ -295,12 +295,12 @@
+ 		      mmSECURITY_MIN_FW_VERSION);
+ 
+ 	/* store minimum allowed security version in Scratch PAD Sram */
+-	arcboot_rom_global.sp_sram->sec_data.sec_ver = fw_version_sec;
++	arcboot_rom_global.sec_data.sec_ver = fw_version_sec;
+ }
+ 
+ void security_load_sec_efuse_dword(void)
+ {
+-	arcboot_rom_global.sp_sram->sec_data.efuse_sys_cfg =
++	arcboot_rom_global.sec_data.efuse_sys_cfg =
+ 			arcboot_rom_global.config_fuse;
+ }
+ 
+@@ -315,16 +315,28 @@
+ 	security_load_revoke_bits();
+ 	security_load_fw_version();
+ 	security_load_keys();
++
++	boot_info_set(HL_BOOT_INFO_ROM_SECURITY_DATA, &arcboot_rom_global.sec_data,
++			sizeof(arcboot_rom_global.sec_data));
++	boot_info_finalize();
+ }
+ 
+ int security_efuse_image_validation_en(void)
+ {
+ 	/* check efuse for security validation enable */
+-	uint32_t config_fuse = arcboot_rom_global.sp_sram->sec_data.efuse_sys_cfg;
++	uint32_t config_fuse = arcboot_rom_global.sec_data.efuse_sys_cfg;
+ 
+ 	return !!(config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+ 
++int security_check_valid_fw_version(uint32_t fw_version)
++{
++	if (fw_version >= arcboot_rom_global.sec_data.sec_ver)
++		return SECURITY_FW_VERSION_SECURE;
++
++	return SECURITY_FW_VERSION_NOT_SECURE;
++}
++
+ void check_and_enable_4b_termination(void) {}
+ void security_debug_if_shared(void) {}
+ void security_pcie_rr_config(__unused uint8_t spi_en) {}
+diff --git a/common/security.c b/common/security.c
+index 3048006..a05018b 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -135,7 +135,7 @@
+ }
+ 
+ 
+-int security_check_valid_fw_version(uint32_t fw_version)
++__weak int security_check_valid_fw_version(uint32_t fw_version)
+ {
+ 	uint32_t valid_fw_version;
+ 	uint8_t fw_version_sec, valid_fw_version_sec;
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 1df7892..4cbe82a 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -15,6 +15,7 @@
+ #include "regmap.h"
+ #include "regmask.h"
+ #include "hl_boot_desc_rom.h"
++#include "hl_sec_if.h"
+ 
+ #ifndef __weak
+ #define __weak		__attribute__((weak))
+@@ -77,6 +78,7 @@
+ 	bool fuse_spi;
+ 	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
+ 	struct hl_img_ptrs_erom img_ptrs_erom;
++	struct hl_fw_sec_info sec_data;
+ };
+ 
+ enum arcboot_rom_bringup_proggress {

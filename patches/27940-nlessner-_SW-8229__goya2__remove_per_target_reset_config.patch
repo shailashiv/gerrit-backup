@@ -1,0 +1,132 @@
+From 2ed599b639ebad65877124982a8b3d501efc5473 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 16 Feb 2020 08:03:58 +0200
+Subject: [PATCH] [SW-8229] goya2: remove per target reset config
+
+Becuse the FPGA is working now with perstn reset config
+and not cause the FPGAs ARC to reset when its configured.
+We can unify again all target implimentations
+
+Change-Id: I2af8bdcd462b3cd51ea8be80f8ee25dea9d1dc91
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 7bb2bf5..abd4c21 100644
+--- a/Makefile
++++ b/Makefile
+@@ -45,12 +45,10 @@
+ ARCBOOT_COMMON_SRCS_C := $(shell ls common/*.c)
+ 
+ ARCBOOT_RAM_SRCS_C := app/arcboot_ram.c
+-ARCBOOT_RAM_SRCS_C += $(HL_DEV)/$(HL_TARGET).c
+ ARCBOOT_RAM_SRCS_S := app/crt0_ram.S
+ ARCBOOT_RAM_OBJECTS := $(ARCBOOT_COMMON_SRCS_C:.c=.o) $(ARCBOOT_RAM_SRCS_C:.c=.o) $(ARCBOOT_RAM_SRCS_S:.S=.o)
+ 
+ ARCBOOT_ROM_SRCS_C := app/arcboot_rom.c
+-ARCBOOT_ROM_SRCS_C += $(HL_DEV)/$(HL_TARGET).c
+ ARCBOOT_ROM_SRCS_S := app/crt0_rom.S
+ ARCBOOT_ROM_OBJECTS := $(ARCBOOT_COMMON_SRCS_C:.c=.o) $(ARCBOOT_ROM_SRCS_C:.c=.o) $(ARCBOOT_ROM_SRCS_S:.S=.o)
+ 
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index e4409b8..217575c 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -73,8 +73,14 @@
+ 	/* make sure spi controller doesn't swap bytes */
+ 	spi_flash_set_byte_swap(DISABLE_BYTE_SWAP);
+ 
+-	/* TODO: ask raviv why in fpga we get a reset on start */
+-	hl_arcboot_rom_prstn_reset_config();
++	/* disable global masking of prstn reset */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_PRSTN_MASK);
++
++	/* on warm reset change default to reset ARC and PSOC */
++	reg = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
++	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_ARC_MASK;
++	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_PSOC_MASK;
++	regmap_writel(reg, mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+ 
+ 	/* read from cold reset flops the recovery and validation flag */
+ 	reg = regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
+diff --git a/goya2_arc/asic.c b/goya2_arc/asic.c
+deleted file mode 100644
+index ff82160..0000000
+--- a/goya2_arc/asic.c
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/*
+- * (C) Copyright 2019 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include "arcboot.h"
+-
+-void hl_arcboot_rom_prstn_reset_config(void)
+-{
+-	uint32_t reg;
+-
+-	/* on warm reset change default to reset ARC and PSOC */
+-	reg = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+-	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_ARC_MASK;
+-	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_PSOC_MASK;
+-	regmap_writel(reg, mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+-}
+diff --git a/goya2_arc/onix.c b/goya2_arc/onix.c
+deleted file mode 100644
+index ecbdd2d..0000000
+--- a/goya2_arc/onix.c
++++ /dev/null
+@@ -1,10 +0,0 @@
+-/*
+- * (C) Copyright 2019 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include "arcboot.h"
+-
+-void hl_arcboot_rom_prstn_reset_config(void) {}
+diff --git a/goya2_arc/pldm.c b/goya2_arc/pldm.c
+deleted file mode 100644
+index f8063d0..0000000
+--- a/goya2_arc/pldm.c
++++ /dev/null
+@@ -1,22 +0,0 @@
+-/*
+- * (C) Copyright 2019 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include "arcboot.h"
+-
+-void hl_arcboot_rom_prstn_reset_config(void)
+-{
+-	uint32_t reg;
+-
+-	/* disable global masking of prstn reset */
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_PRSTN_MASK);
+-
+-	/* on warm reset change default to reset ARC and PSOC */
+-	reg = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+-	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_ARC_MASK;
+-	reg |= PSOC_GLOBAL_CONF_PRSTN_RST_CFG_L_PSOC_MASK;
+-	regmap_writel(reg, mmPSOC_GLOBAL_CONF_PRSTN_RST_CFG_L);
+-}
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 4608496..e6049d3 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -97,7 +97,6 @@
+ };
+ 
+ extern struct arcboot_global_s arcboot_rom_global;
+-void hl_arcboot_rom_prstn_reset_config(void);
+ void arcboot_rom_status_update(enum arcboot_rom_progress progress);
+ void arcboot_rom_status_update_location(uint8_t progress,
+ 					enum security_location loc);

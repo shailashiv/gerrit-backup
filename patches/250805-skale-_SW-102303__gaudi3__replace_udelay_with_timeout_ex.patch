@@ -1,0 +1,87 @@
+From 99d07cbc6016bffe6dcac64cb451100290d3afc0 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 02 Sep 2022 13:17:36 +0300
+Subject: [PATCH] [SW-102303] gaudi3: replace udelay with timeout expire api
+
+This patch replace retry + udelay mechanism with timeout expire
+api in arcboot_rom_wait_for_fuse_data and rom_d2d_link_init function.
+
+Change-Id: I6d5b94ade32e86e19f6f2809e0b8cd2433623129
+---
+
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index ae296e3..fea0132 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -149,11 +149,10 @@
+ 	}
+ }
+ 
+-#define D2D_LINK_STATUS_RETRIES		100
+-#define D2D_LINK_STATUS_UDELAY		100
++#define D2D_LINK_STATUS_UDELAY		10000 /* 10 ms */
+ static void rom_d2d_link_init(void)
+ {
+-	uint32_t retry = D2D_LINK_STATUS_RETRIES;
++	uint64_t start;
+ 	uint32_t val;
+ 
+ 	/* D2D link init will be performed by both die's */
+@@ -179,18 +178,16 @@
+ 	 * Poll 10ms for BUSY bit to be 0 indicating link initialization
+ 	 * is completed successfully.
+ 	 */
++	start = arcboot_rom_get_ts_us();
+ 	while (1) {
+ 		val = regmap_readl(mmD0_PSOC_GLOBAL_CONF_DPHY_FSM_STS);
+ 		if (!(val & D0_PSOC_GLOBAL_CONF_DPHY_FSM_STS_BUSY_M))
+ 			break;
+ 
+-		retry--;
+-		if (!retry) {
++		if (arcboot_rom_timeout_expired(start, D2D_LINK_STATUS_UDELAY)) {
+ 			arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT);
+ 			return;
+ 		}
+-
+-		udelay(D2D_LINK_STATUS_UDELAY);
+ 	}
+ 
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS);
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index 79f2eab..cdfa446 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -38,28 +38,25 @@
+ 	}
+ }
+ 
+-#define FUSE_EMULATION_DATA_RETRIES	50
+-#define FUSE_EMULATION_DATA_UDELAY	100
++#define FUSE_EMULATION_DATA_UDELAY	5000 /* 5ms */
+ void arcboot_rom_wait_for_fuse_data(void)
+ {
+-	uint32_t retry = FUSE_EMULATION_DATA_RETRIES;
++	uint64_t start;
+ 	uint32_t val;
+ 
+ 	/* Clear indication before polling */
+ 	regmap_writel(0x0, mmFFUSE_WRITE_IND);
+ 
++	start = arcboot_rom_get_ts_us();
+ 	while (1) {
+ 		val = regmap_readl(mmFFUSE_WRITE_IND);
+ 		if (val == FFUSE_WRITE_IND_MAGIC)
+ 			break;
+ 
+-		retry--;
+-		if (!retry) {
++		if (arcboot_rom_timeout_expired(start, FUSE_EMULATION_DATA_UDELAY)) {
+ 			arcboot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT);
+ 			return;
+ 		}
+-
+-		udelay(FUSE_EMULATION_DATA_UDELAY);
+ 	}
+ 
+ 	arcboot_rom_global.config_fuse = regmap_readl(mmSYSCFG1_EFUSE_DATA);

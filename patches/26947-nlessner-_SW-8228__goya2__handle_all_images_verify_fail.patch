@@ -1,0 +1,549 @@
+From 06f41892e9be0eab798be3db8d9d08107954b953 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 02 Feb 2020 01:53:55 +0200
+Subject: [PATCH] [SW-8228] goya2: handle all images verify fail
+
+If we fail to verify primary and secondary image
+deal with fallback.
+Recover PCIe if ppboot/pcie_fw is bad.
+Enable I2C slave if arcboot_ram is bad.
+
+Change-Id: I46e0c7de4bb982d42ad62c1b9ab7dcff8e049409
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index e94a8d0..718142e 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -12,6 +12,7 @@
+ #include "security.h"
+ #include "secureboot.h"
+ #include "spi_flash.h"
++#include "pcie.h"
+ 
+ struct arcboot_global_s arcboot_rom_global = {
+ 	.config_fuse = 0,
+@@ -19,12 +20,6 @@
+ 
+ #define ARCBOOT_BRINGUP_ERROR		-1
+ #define ARCBOOT_BRINGUP_OK		1
+-
+-static void arcboot_rom_recovery(void)
+-{
+-	/* TODO: add "all debug components should bypass the MMU" */
+-}
+-
+ 
+ static void arcboot_rom_init(void)
+ {
+@@ -88,6 +83,7 @@
+ 
+ static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
+ {
++	/* TODO: switch prim/secondary relative to flag in flash */
+ 	uint32_t flash_image_offset;
+ 
+ 	if (image_ptr == ARCBOOT_SECONDARY) {
+@@ -148,12 +144,12 @@
+ 
+ static void arcboot_rom_bringup_pcie(void)
+ {
+-	/* TODO: add FLASH_IMAGE_PTR decides which image first */
+ 	if (arcboot_rom_bringup_pcie_images(ARCBOOT_PRIMARY) !=
+ 	    ARCBOOT_BRINGUP_OK) {
+ 		if (arcboot_rom_bringup_pcie_images(ARCBOOT_SECONDARY) !=
+ 		    ARCBOOT_BRINGUP_OK) {
+-			arcboot_rom_recovery();
++			pcie_recovery();
++			/* TODO: deal with PCI */
+ 		}
+ 	}
+ }
+@@ -184,12 +180,13 @@
+ 	    ARCBOOT_BRINGUP_OK) {
+ 		if (arcboot_rom_bringup_ram_images(ARCBOOT_SECONDARY) !=
+ 		    ARCBOOT_BRINGUP_OK) {
+-			/* TODO:					*
+-			 * if (!EFUSE_SYSTEM_CONFIG_DISABLE_DEBUG_IF)	*
+-			 * then enable i2c_s				*
+-			 */
++			/* if debug I/F is enabled then fall back on I2C_S */
++			if ((arcboot_rom_global.config_fuse &
++			     EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK) == 0)
++				secuirty_i2c_s_enable();
+ 		}
+ 	}
++
+ 	/* jump to iccm start location */
+ 	goto *(void *)(0);
+ }
+diff --git a/common/efuse.h b/common/efuse.h
+index d72a485..2be7a5a 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -10,6 +10,7 @@
+ 
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ 
++#define EFUSE_SYSCFG_SPI_CONTROLLER		BIT(20)
+ #define EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK	BIT(12)
+ #define EFUSE_SYSCFG_SECURITY_LOCATION		7
+ #define EFUSE_SYSCFG_SECURITY_LOCATION_MASK	0x3
+diff --git a/common/pcie.c b/common/pcie.c
+new file mode 100644
+index 0000000..50a07c5
+--- /dev/null
++++ b/common/pcie.c
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2016-2019 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ *
++ * SPDX-License-Identifier:	GPL-2.0+
++ */
++
++#include <unistd.h>
++#include "arcboot.h"
++#include "security.h"
++#include "efuse.h"
++#include "pcie.h"
++#include "delay.h"
++
++static uint8_t pcie_ltssm_en(void)
++{
++	uint8_t ltssm_en;
++
++	ltssm_en = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++	return (ltssm_en & 0x1);
++}
++
++static void pcie_config(void)
++{
++	uint8_t pcie_prstn, sram_init_done;
++	uint32_t boot_strap;
++
++	if (pcie_ltssm_en()) {
++		do {
++			pcie_prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		} while (pcie_prstn != 1);
++
++		regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++
++		boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++		if (boot_strap &
++		    PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
++			regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++
++		regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++		do {
++			sram_init_done =
++				regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++		} while (sram_init_done != 1);
++
++		do {
++			sram_init_done =
++				regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++		} while (sram_init_done != 1);
++
++		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
++		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
++
++		/* Configure IATU */
++		regmap_writel(0x300000, mmPCIE_AUX_DBI);
++		regmap_writel(0xF0000000, mmPCIE_DBI_CORR_ERR_MASK_OFF);
++		regmap_writel(0x7F, mmPCIE_DBI_ADV_ERR_CAP_CTRL_OFF);
++		regmap_writel(0, mmPCIE_DBI_AER_EXT_CAP_HDR_OFF);
++		regmap_writel(0xC0080000, mmPCIE_DBI_UNCORR_ERR_STATUS_OFF);
++		regmap_writel(0x3, mmPCIE_AUX_LTSSM_EN);
++	}
++
++}
++
++void pcie_recovery(void)
++{
++	security_debug_if_secure();
++	security_debug_if_shared();
++
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK)
++		secuirty_debug_if_hbw_config();
++	else
++		secuirty_i2c_s_enable();
++
++	security_spi_dma_mmu_bypass();
++	security_mem_cpy_mmu_bypass();
++	security_pcie_config();
++	pcie_config();
++}
++
++/*
++ * Wait for Boot Manager to complete PCIe image execution
++ * and return to idle state, so it won't initiate UART access anymore
++ */
++static void pcie_sync_btl(void)
++{
++	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM))
++		;
++}
++
++void pcie_warm_reset_handle(void)
++{
++	uint8_t pcie_prstn;
++	/* TODO: move to function*/
++	do {
++		pcie_prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++	} while (pcie_prstn);
++
++	/* TODO: add 1uS delay */
++	udelay(BOOTMNG_STARTUP_DELAY_AFTER_PERSTN);
++	pcie_sync_btl();
++	pcie_recovery();
++}
++
++/* TODO: move to correct file */
++void fw_reset_handle(void)
++{
++
++}
+diff --git a/common/pcie.h b/common/pcie.h
+new file mode 100644
+index 0000000..c6a8b27
+--- /dev/null
++++ b/common/pcie.h
+@@ -0,0 +1,15 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _PCIE_H_
++#define _PCIE_H_
++
++#define BOOTMNG_STARTUP_DELAY_AFTER_PERSTN	1
++
++void pcie_recovery(void);
++
++#endif /* _PCIE_H_ */
+diff --git a/common/security.c b/common/security.c
+index 738a672..3af4d0d 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -63,6 +63,23 @@
+ 	security_disable_jtag_mstr_if();
+ }
+ 
++void security_debug_if_secure(void)
++{
++	/* Configure SMI,I2C and JTAG to be "secure" */
++	regmap_writel(0x1, mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++	regmap_writel(0x1, mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++	regmap_writel(0x1, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++}
++
++void security_debug_if_shared(void)
++{
++	/* Configure SMI,I2C and JTAG to be "shared" engine */
++	regmap_writel(0x400, mmI2C_S_MSTR_IF_AXUSER_HB_SEC);
++	regmap_writel(0x400, mmSMI_MSTR_IF_AXUSER_HB_SEC);
++	regmap_writel(0x400, mmJT_MSTR_IF_AXUSER_HB_SEC);
++	regmap_writel(0x1, mmPSOC_MSTR_IF_AXUSER_CORE);
++}
++
+ uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
+ {
+ 	uint32_t ret;
+@@ -88,16 +105,250 @@
+ 	return ret;
+ }
+ 
+-void security_enable_spi_dma()
++void security_spi_dma_mmu_bypass(void)
+ {
+ 	regmap_writel(mmPSOC_GLOBAL_CONF_SPI_DMA_AWUSER,0x400);
+ }
+ 
+-void security_enable_mem_cpy()
++void security_mem_cpy_mmu_bypass(void)
+ {
+ 	regmap_writel(mmPSOC_GLOBAL_CONF_MEM_CPY_AXUSER,0x400);
+ }
+ 
++static void secuirty_elbi_lbw_config(void)
++{
++	regmap_writel(0x0,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(0x0460000,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	regmap_writel(0x0461000,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++	regmap_writel(0x3ffffff,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++}
++
++static void secuirty_dcon_lbw_config(void)
++{
++	regmap_writel(0x0,
++		mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(0x0460000,
++		mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	regmap_writel(0x0461000,
++		mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++	regmap_writel(0x3ffffff,
++		mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++}
++
++static void secuirty_dcon_if0_hbw_config(void)
++{
++	/* RR for pcie dcon hbw 0x0 - 0x00_07FF_A000 */
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(0x7FFA000,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	/* RR for pcie dcon hbw 0x00_7FF_B000 -  0x3F_FFFFF_FFFF */
++	regmap_writel(0x7FFB000,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(0xFFFFFFFF,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(0x3F,
++		mmDCON0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++static void secuirty_dcon_if1_hbw_config(void)
++{
++	/* RR for pcie dcon hbw 0x0 - 0x00_07FF_A000 */
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(0x7FFA000,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	/* RR for pcie dcon hbw 0x00_7FF_B000 -  0x3F_FFFFF_FFFF */
++	regmap_writel(0x7FFB000,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel(0x0,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(0xFFFFFFFF,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(0x3F,
++		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++static void secuirty_i2c_s_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(0,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(0x7FFC444,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(0,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(0x7FFC445,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(0,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(0x7FFA000,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(0,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(0x7FFB000,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(0,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(0x7FFC460,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(0,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++	regmap_writel(0x7FFC461,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel(0,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(0xFFFFFFFF,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(0x3F,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++static void secuirty_smi_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(0,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(0x7FFC444,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(0,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(0x7FFC445,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(0,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(0x7FFA000,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(0,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(0x7FFB000,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(0,
++			mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(0x7FFC460,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(0,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++	regmap_writel(0x7FFC461,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel(0,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(0xFFFFFFFF,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(0x3F,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++static void secuirty_jtag_hbw_config(uint8_t spi_controller_en)
++{
++	regmap_writel(0,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++
++	if (spi_controller_en) {
++		regmap_writel(0x7FFC444,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(0,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(0x7FFC445,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(0,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	} else {
++		regmap_writel(0x7FFA000,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++		regmap_writel(0,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++		regmap_writel(0x7FFB000,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++		regmap_writel(0,
++			mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	}
++
++	regmap_writel(0x7FFC460,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(0,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++	regmap_writel(0x7FFC461,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_2);
++	regmap_writel(0,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_2);
++	regmap_writel(0xFFFFFFFF,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_2);
++	regmap_writel(0x3F,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
++}
++
++void security_pcie_config(void)
++{
++	regmap_writel(PCIE_WRAP_PCIE_PROT_OVR_WR_EN_MASK |
++		      PCIE_WRAP_PCIE_PROT_OVR_RD_EN_MASK,
++		      mmPCIE_WRAP_PCIE_PROT_OVR);
++	regmap_writel(PCIE_MSTR_RR_MSTR_IF_AXUSER_CORE_SHARED_MASK,
++		      mmPCIE_MSTR_RR_MSTR_IF_AXUSER_CORE);
++	secuirty_elbi_lbw_config();
++	secuirty_dcon_lbw_config();
++	secuirty_dcon_if0_hbw_config();
++	secuirty_dcon_if1_hbw_config();
++}
++
++/* If DBG I/F were not disabled, program the RR to allow access
++ * only to SPI flash and PSOC_SECURITY
++ */
++void secuirty_debug_if_hbw_config(void)
++{
++	uint8_t spi_en = arcboot_rom_global.config_fuse &
++				EFUSE_SYSCFG_SPI_CONTROLLER;
++	secuirty_i2c_s_hbw_config(spi_en);
++	secuirty_smi_hbw_config(spi_en);
++	secuirty_jtag_hbw_config(spi_en);
++}
++
++void secuirty_i2c_s_enable(void)
++{
++	/* Slave address */
++	regmap_writel(0x55, mmPSOC_I2C_S_IC_SAR);
++	/* IC_RESTART_EN and speed: standard mode - 100 kbit/s */
++	regmap_writel(0x22, mmPSOC_I2C_S_IC_CON);
++	/* Enable all interrupt via mask */
++	regmap_writel(0x7FFF, mmPSOC_I2C_S_IC_INTR_MASK);
++	/* I2C Receive FIFO Threshold to 0 */
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_RX_TL);
++	/* I2C Transmit FIFO Threshold to 7 */
++	regmap_writel(0x7, mmPSOC_I2C_S_IC_TX_TL);
++	/* Enable I2C slave controller */
++	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
++}
++
+ static int security_get_first_valid_key(uint8_t customer)
+ {
+ 	uint8_t end_index, key_revoke;
+diff --git a/common/security.h b/common/security.h
+index 102ef38..c2cde11 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -40,7 +40,14 @@
+ 						sizeof(uint32_t))
+ 
+ void security_disable_debug_if(void);
++void security_debug_if_secure(void);
++void security_debug_if_shared(void);
+ uint32_t security_key_soc_location_offset(uint32_t hash_key_index);
++void security_spi_dma_mmu_bypass(void);
++void security_mem_cpy_mmu_bypass(void);
++void security_pcie_config(void);
++void secuirty_debug_if_hbw_config(void);
++void secuirty_i2c_s_enable(void);
+ int security_get_key_hash(uint32_t *hash, uint8_t customer);
+ int security_check_valid_fw_version(uint32_t fw_version);
+ 
+diff --git a/include/arcboot.h b/include/arcboot.h
+index d5e42a2..03c9df6 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -45,11 +45,12 @@
+ #define PPBOOT_IMAGE_CODE_ALIGN			4
+ #define PPBOOT_IMAGE_CODE_OFFSET		(PPBOOT_IMAGE_OFFSET + \
+ 						 PPBOOT_IMAGE_CODE_ALIGN)
+-
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;
+ };
+ 
++extern struct arcboot_global_s arcboot_rom_global;
++
+ enum security_location {
+ 	SPI_FLASH,
+ 	SPI_OTP,

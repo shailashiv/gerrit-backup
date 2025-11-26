@@ -1,0 +1,78 @@
+From dcfe6d5573a4d7d96cb6b8dd20e80034a70638c4 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Fri, 08 Apr 2022 11:47:15 +0300
+Subject: [PATCH] [SW-79695] gaudi3: force pre production fuse bits
+
+Efuse bits that are classified as pre-production bits in the security
+specification needs to be forced to a fixed value in rom in
+production. Hence all the pre-production fuse bits are tied to the
+EOM bit.
+
+This is to make sure that no pre-production features are enabled/used
+in post-production systems.
+
+Preproduction bits and settings:
+1) Key 0(pre-production key) is always revoked.
+2) Key 4(last valid key index) is always valid.
+3) Signature validation is enabled.
+4) JTAG Interface is disabled.
+5) TWI Interface is disabled.
+6) Fuse location is efuse.
+7) Security is enabled.
+
+Change-Id: I55408a4a6f698529d44a9cc6f97480cce2c0586a
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 7cb1758..571a4b8 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -371,6 +371,12 @@
+ 		arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_FAIL);
+ }
+ 
++void arcboot_rom_fuse_override(void)
++{
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_EOM_MASK)
++		arcboot_rom_global.config_fuse |= EFUSE_SYSCFG_PRE_PRODUCTION_BITS;
++}
++
+ void arcboot_rom_fuse(void)
+ {
+ 	uint32_t val, strap_l;
+@@ -383,6 +389,9 @@
+ 
+ 	arcboot_rom_global.config_fuse = val;
+ 
++	/* Override the fuse values as per requirement */
++	arcboot_rom_fuse_override();
++
+ 	strap_l = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L);
+ 	if (!(val & EFUSE_SYSCFG_EFUSE_LOCATION_MASK) &&
+ 		(strap_l & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L_EFUSE_OVERRIDE_M)) {
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index 51f63ac..9edb8a1 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -9,6 +9,8 @@
+ /* Unused for gaudi3. Maintained for common code compilation */
+ #define EFUSE_KEY_HASH_OFFSET				0x0
+ 
++#define EFUSE_SYSCFG_REVOKE_KEY_0			BIT(0)
++#define EFUSE_SYSCFG_PERMIT_KEY_4			~BIT(4)
+ #define EFUSE_SYSCFG_EOM_MASK				BIT(5)
+ #define EFUSE_SYSCFG_TPM_CODE_LOCATION_MASK		BIT(6)
+ #define EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_MASK	BIT(7)
+@@ -35,4 +37,12 @@
+ #define EFUSE_READ_RANGE_ALL				0xFF00
+ #define FUSE_WORDS_PER_BANK				128
+ 
++#define EFUSE_SYSCFG_PRE_PRODUCTION_BITS 		((EFUSE_SYSCFG_EFUSE_LOCATION_MASK\
++							| EFUSE_SYSCFG_DISABLE_TWI_IF_MASK \
++							| EFUSE_SYSCFG_ENABLE_VALIDATION_MASK \
++							| EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK \
++							| EFUSE_SYSCFG_REVOKE_KEY_0 \
++							| EFUSE_SYSCFG_SECURITY_ENABLE_MASK) \
++							& EFUSE_SYSCFG_PERMIT_KEY_4)
++
+ #endif /* _GAUDI3_DEV_EFUSE_H_ */

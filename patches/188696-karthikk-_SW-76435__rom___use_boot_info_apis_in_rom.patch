@@ -1,0 +1,170 @@
+From 96c8a5506112a3474ecda22624333567ad0a18f7 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 14 Mar 2022 03:10:20 +0200
+Subject: [PATCH] [SW-76435] rom : use boot info apis in rom
+
+Boot info set and get is used to store and retrieve the image
+descriptor data on sp sram. This is done during boot desc's
+initialization. This data should be used to get the image
+descriptor data in rom and in the future by ppboot/preboot.
+
+Change-Id: I8e12b16e84db632b33370d41a55dde030fdcf208
+---
+
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 2d7450e..dae4056 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -14,6 +14,7 @@
+ #include "boot_desc.h"
+ #include "dma.h"
+ #include "spi_flash.h"
++#include "boot_info.h"
+ 
+ #define BOOT_PTRS_SZ		sizeof(struct hl_fw_boot_ptrs)
+ #define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
+@@ -25,9 +26,9 @@
+ #define ALIGN_VAL(val, byte)	ALIGN_SUB(val, (byte - 1))
+ 
+ static struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx;
+-static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_SPI_BOOT_PTR_SP_SRAM_ADDR);
+-static struct hl_fw_img_desc *p_img_desc = (struct hl_fw_img_desc *)(HL_SPI_BOOT_PTR_SP_SRAM_ADDR +\
+-					BOOT_PTRS_SZ);
++static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_DEST_ARC);
++static struct hl_fw_img_desc *p_img_desc;
++struct hl_fw_desc_info desc_info;
+ 
+ static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+ {
+@@ -61,6 +62,7 @@
+ 	enum arcboot_rom_progress dma_sts_start = PROGRESS_INIT_SPI_BOOT_DESC_DMA_START;
+ 	enum arcboot_rom_progress dma_sts_end = PROGRESS_INIT_SPI_BOOT_DESC_DMA_FINISH;
+ 	enum dma_error err;
++	uint32_t copy_sz, boot_ptr_start_addr = HL_BOOT_PTR_DEST_ARC;
+ 
+ 	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
+ 		return 0;
+@@ -97,22 +99,37 @@
+ 
+ 	arcboot_rom_status_update(dma_sts_end);
+ 
+-	memcpy(p_boot_ptr,
+-		(uint8_t *)(HL_BOOT_PTR_DEST_ARC), BOOT_PTRS_SZ);
+-
+ 	if (p_boot_ptr->magic.val != HL_FW_BOOT_MAGIC)
+ 		return 0;
+ 
+-	p_offset = (uint32_t *)(HL_BOOT_PTR_DEST_ARC + p_boot_ptr->offset2array);
++	p_offset = (uint32_t *)(boot_ptr_start_addr + p_boot_ptr->offset2array);
+ 
+-	/* Read all descriptors */
++	/* Validate all descriptors */
+ 	for (i = 0; i < p_boot_ptr->count; i++) {
+-		memcpy(&p_img_desc[i],
+-			(uint8_t *)(HL_BOOT_PTR_DEST_ARC + p_offset[i]), IMG_DESC_SZ);
++		if (img == HL_FW_BOOT_PTR_SPI) {
++			p_img_desc = (struct hl_fw_img_desc *)(boot_ptr_start_addr + p_offset[i]);
++		} else {
++			memcpy(p_img_desc,
++			(uint8_t *)(boot_ptr_start_addr + p_offset[i]), sizeof(struct hl_fw_img_desc));
++		}
+ 
+-		if (!boot_desc_img_desc_is_valid(&p_img_desc[i]))
++		if (!boot_desc_img_desc_is_valid(p_img_desc))
+ 			return 0;
+ 	}
++
++
++	if (img == HL_FW_BOOT_PTR_SPI) {
++		desc_info.count = p_boot_ptr->count;
++		desc_info.desc_size = p_boot_ptr->img_desc_sz;
++		boot_info_set(HL_BOOT_INFO_IMG_DESC_INFO, &desc_info, sizeof(desc_info));
++		boot_info_set(HL_BOOT_INFO_IMG_DESC_DATA, (uint8_t *)(boot_ptr_start_addr + p_offset[0]),
++				p_boot_ptr->img_desc_sz * p_boot_ptr->count);
++		boot_info_finalize();
++		boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA,
++				(uint8_t *)(boot_ptr_start_addr + BOOT_INFO_IMG_DESC_GET_OFFSET),
++				p_boot_ptr->img_desc_sz * p_boot_ptr->count, &copy_sz);
++	}
++
+ 	p_img_ptr_ctx->boot_desc_flag = 1;
+ 
+ 	return p_boot_ptr->count;
+@@ -122,9 +139,12 @@
+ 				struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
+ {
+ 	uint32_t i, idx;
++	struct hl_fw_img_desc *p_loc_img_desc = NULL;
+ 
+ 	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
+ 		return HL_FW_IMG_NOT_FOUND;
++
++	boot_desc_update_ptrs(img);
+ 
+ 	/* Image descriptor pointers validity check */
+ 	if (!p_img_ptr_ctx || !p_boot_ptr || !p_img_desc)
+@@ -134,24 +154,32 @@
+ 		return HL_FW_IMG_NOT_FOUND;
+ 
+ 	for (i = 0; i < p_boot_ptr->count; i++) {
+-		if (p_img_desc[i].magic.type != type)
++		if (img == HL_FW_BOOT_PTR_SPI) {
++			p_loc_img_desc = (struct hl_fw_img_desc *)(HL_BOOT_PTR_DEST_ARC
++					+ BOOT_INFO_IMG_DESC_GET_OFFSET
++					+ p_boot_ptr->img_desc_sz * i);
++		} else {
++			p_loc_img_desc = &p_img_desc[i];
++		}
++
++		if (p_loc_img_desc->magic.type != type)
+ 			continue;
+ 
+-		idx = p_img_desc[i].idx;
++		idx = p_loc_img_desc->idx;
+ 		if (upd_status == FLOPS_UPD_PENDING)
+ 			idx = (idx + 1) % 2;
+ 
+-		desc->spi_offset = p_img_desc[i].offset[idx];
+-		desc->img_size = p_img_desc[i].size[idx];
++		desc->spi_offset = p_loc_img_desc->offset[idx];
++		desc->img_size = p_loc_img_desc->size[idx];
+ 		desc->loadaddr = ((uint64_t)
+-			p_img_desc[i].load_high[idx] << 32) |
+-			p_img_desc[i].load_low[idx];
+-		desc->desc_ver = p_img_desc[i].desc_ver;
++			p_loc_img_desc->load_high[idx] << 32) |
++			p_loc_img_desc->load_low[idx];
++		desc->desc_ver = p_loc_img_desc->desc_ver;
+ 		desc->start_addr = ((uint64_t)
+-			p_img_desc[i].start_high[idx] << 32) |
+-			p_img_desc[i].start_low[idx];
++			p_loc_img_desc->start_high[idx] << 32) |
++			p_loc_img_desc->start_low[idx];
+ 
+-		memcpy(desc->chksum, p_img_desc[i].chksum2[idx],
++		memcpy(desc->chksum, p_loc_img_desc->chksum2[idx],
+ 			   ARRAY_SIZE(desc->chksum));
+ 
+ 		return idx;
+diff --git a/common/boot_info.h b/common/boot_info.h
+index c95bda3..0eef30b 100644
+--- a/common/boot_info.h
++++ b/common/boot_info.h
+@@ -9,6 +9,17 @@
+ 
+ #include <arcboot.h>
+ 
++/*
++ * This offset is to store the boot info that we get from sp sram .
++ * The data dmaed is stored at 0th offset, which needs to be intact
++ * till the boot desc is verified at a later stage (post the fake fuse
++ * read to determine image validation en bit). Hence an offset 128K is
++ * chosen . This memory is unused for execution during rom flow, hence
++ * the offset 128K allows for a forward compatibility in case image
++ * descriptor data even exceeds 64K (2 sector support).
++ */
++#define BOOT_INFO_IMG_DESC_GET_OFFSET	(128 * 1024) // 128KB offset
++
+ void boot_info_finalize(void);
+ int boot_info_set(uint32_t type, const void *data, uint32_t size);
+ int boot_info_get(uint32_t type, void *data, uint32_t max_size, uint32_t *copy_size);

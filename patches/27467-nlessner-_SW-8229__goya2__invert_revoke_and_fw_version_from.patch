@@ -1,0 +1,148 @@
+From d39b74e7ba06d3a3a1f10b4880587b35949efef4 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 09 Feb 2020 09:43:39 +0200
+Subject: [PATCH] [SW-8229] goya2: invert revoke and fw version from flash
+
+When reading revoke bit or fw_version from security flash sector
+we invert the bits so we can erase the sector and clear bits, just
+like logic of burning fuses. Then these bit can only be set again
+if we erase whole sector.
+
+Change-Id: I33e24d019c508727acd73c5ec7db9211b3945a1f
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/security.c b/common/security.c
+index 17d0fae..9391bad 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -420,6 +420,10 @@
+ 	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+ }
+ 
++/* minimal allowed security version is defined by a 128bit map, to find this
++ * we scan from end to beginning of map looking for the first set bit. once
++ * it's found this indicated the minimal version allowed to run on the system
++ */
+ uint8_t security_find_min_fw_version(uint32_t *fw_version)
+ {
+ 	uint8_t row, colume;
+@@ -528,10 +532,11 @@
+ 		break;
+ 	case ASIC_EFUSE:
+ 	default:
+-		key_revoke = (arcboot_rom_global.config_fuse &
+-			      EFUSE_SYSCFG_REVOKE_KEY_MASK);
++		key_revoke = arcboot_rom_global.config_fuse;
+ 		break;
+ 	}
++	key_revoke &= EFUSE_SYSCFG_REVOKE_KEY_MASK;
++
+ 	/* store key_revoke map in PSOC */
+ 	regmap_writel(key_revoke, mmPSOC_SECURITY_KEY_REVOKE);
+ }
+@@ -547,12 +552,11 @@
+ 
+ 	switch (fw_version_location) {
+ 	case SPI_FLASH:
+-			/* TODO: need to inverse bits */
+ 		fw_version_sec = spi_flash_get_fw_version_security();
+ 		break;
+ 	case SPI_OTP:
+ 		spi_flash_otp_access(FLASH_OTP_ENABLE);
+-			/* TODO: do we need to inverse bits? */
++		/* TODO: do we need to inverse bits? */
+ 		fw_version_sec =
+ 			spi_flash_otp_get_fw_version_security();
+ 		spi_flash_otp_access(FLASH_OTP_DISABLE);
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index 1176947..c703498 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -40,9 +40,9 @@
+ 	base_writel(val, HL_FLASH_BASE + offset);
+ }
+ 
+-static void spi_flash_invert_revoke(uint32_t *key_revoke)
++static void spi_flash_invert_dword(uint32_t *dword)
+ {
+-	*key_revoke = ((~(*key_revoke)) & SECURITY_KEY_REVOKE_MAP);
++	*dword = (~(*dword));
+ }
+ 
+ void spi_flash_get_revoke(uint32_t *key_revoke)
+@@ -67,7 +67,7 @@
+ 	if (revoke_status & 1)
+ 		*key_revoke |= BIT(4);
+ 
+-	spi_flash_invert_revoke(key_revoke);
++	spi_flash_invert_dword(key_revoke);
+ }
+ 
+ void spi_flash_get_hash(uint32_t *key_hash)
+@@ -79,30 +79,21 @@
+ 		*(key_hash + i) = spi_flash_readl(flash_efuse_offset + i);
+ }
+ 
+-/* minimal allowed security version is defined by a 128bit map, to find this
+- * we scan from end to beginning of map looking for the first set bit. once
+- * it's found this indicated the minimal version allowed to run on the system
+- */
+-static uint8_t spi_flash_find_fw_version_security(uint32_t flash_fuse_offset)
++uint8_t spi_flash_get_fw_version_security(void)
+ {
+ 	uint8_t i;
+ 	uint32_t fw_version[SECURITY_DWORD_PER_FW_SEC_VERSION];
+ 	uint8_t fw_version_sec;
+-
+-	/* read min security version bit map from flash */
+-	for (i = 0; i < SECURITY_DWORD_PER_FW_SEC_VERSION; i++)
+-		fw_version[i] = spi_flash_readl(flash_fuse_offset + i);
+-
+-	fw_version_sec = security_find_min_fw_version(fw_version);
+-	return fw_version_sec;
+-}
+-
+-uint8_t spi_flash_get_fw_version_security(void)
+-{
+-	uint8_t fw_version_sec;
+ 	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
+ 						FLASH_EFUSE_FW_VERSION_OFFSET;
+-	fw_version_sec = spi_flash_find_fw_version_security(flash_efuse_offset);
++
++	/* read min security version bit map from flash */
++	for (i = 0; i < SECURITY_DWORD_PER_FW_SEC_VERSION; i++) {
++		fw_version[i] = spi_flash_readl(flash_efuse_offset + i);
++		spi_flash_invert_dword(&fw_version[i]);
++	}
++
++	fw_version_sec = security_find_min_fw_version(fw_version);
+ 	return fw_version_sec;
+ }
+ 
+@@ -120,7 +111,6 @@
+ {
+ 	*key_revoke = spi_flash_readl(FLASH_EFUSE_KEYS_REVOKE_OFFSET) &
+ 			SECURITY_KEY_REVOKE_MAP;
+-	spi_flash_invert_revoke(key_revoke);
+ }
+ 
+ void spi_flash_otp_get_hash(uint32_t *key_hash)
+@@ -133,9 +123,15 @@
+ 
+ uint8_t spi_flash_otp_get_fw_version_security(void)
+ {
++	uint8_t i;
++	uint32_t fw_version[SECURITY_DWORD_PER_FW_SEC_VERSION];
+ 	uint8_t fw_version_sec;
+-	uint32_t flash_otp_offset = FLASH_OTP_FW_VERSION_OFFSET;
++	uint32_t flash_efuse_offset = FLASH_OTP_FW_VERSION_OFFSET;
+ 
+-	fw_version_sec = spi_flash_find_fw_version_security(flash_otp_offset);
++	/* read min security version bit map from flash */
++	for (i = 0; i < SECURITY_DWORD_PER_FW_SEC_VERSION; i++)
++		fw_version[i] = spi_flash_readl(flash_efuse_offset + i);
++
++	fw_version_sec = security_find_min_fw_version(fw_version);
+ 	return fw_version_sec;
+ }

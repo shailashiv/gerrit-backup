@@ -1,0 +1,70 @@
+From 73b0d1b5799c123817f545e6229ad244a4f66317 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 03 Oct 2022 20:28:08 +0300
+Subject: [PATCH] [SW-106502] gaudi3: perform mmu bypass configuration
+
+nRTR DTLB for PSOC+PCIe assumes AxUSER[0] MMU_BP configured to be
+0x1, however the default configuration of MMU_BP in PSOC and PCIe
+is set to 0x0. This patch adds configuration of MMU_BP for PSOC and
+PCIe master interface as part of ROM init sequence. This is required
+for any HBW access via nRTR from PCIe to PSOC/SRAM or PSOC to
+PCIe/SRAM.
+
+Details are available in H9-5284 HW Jira.
+
+Change-Id: I1bc1b9575de06019edd5e51c2e71163c64983f69
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 86f82b7..0b38d86 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -453,11 +453,13 @@
+ }
+ 
+ __weak void arcboot_rom_init_boot_info(void) {}
++__weak void arcboot_rom_set_mmu_bp(void) {}
+ 
+ int arcboot_rom_main(void)
+ {
+ 	arcboot_rom_init();
+ 	arcboot_rom_fuse();
++	arcboot_rom_set_mmu_bp();
+ 	arcboot_rom_security_init();
+ 	arcboot_rom_disable_spi_gw();
+ 	arcboot_rom_wait_for_signal();
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 591e509..4af10d2 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -474,6 +474,30 @@
+ 		arcboot_rom_persist_data_non_zero_init();
+ }
+ 
++void arcboot_rom_set_mmu_bp(void)
++{
++	uint32_t pcie_ctrl_val = arcboot_rom_fuse_pcie_ctrl_config();
++
++	regmap_writel((D0_PARC_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_WR_M |
++		D0_PARC_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_RD_M),
++		mmD0_PARC_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS);
++
++	regmap_writel((D0_PARC_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_OVRD_WR_M |
++		D0_PARC_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_OVRD_RD_M),
++		mmD0_PARC_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_OVRD);
++
++	if (arcboot_rom_global.die_id && !pcie_ctrl_val)
++		return;
++
++	regmap_writel((D0_PCIE_MSTR_RR_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_WR_M |
++		D0_PCIE_MSTR_RR_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_RD_M),
++		mmD0_PCIE_MSTR_RR_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS);
++
++	regmap_writel((D0_PCIE_MSTR_RR_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_OVRD_WR_M |
++		D0_PCIE_MSTR_RR_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_OVRD_RD_M),
++		mmD0_PCIE_MSTR_RR_MSTR_IF_AXUSER_HBW_HB_MMU_BYPASS_OVRD);
++}
++
+ void arcboot_rom_init(void)
+ {
+ 	arcboot_rom_persistent_dccm_init();

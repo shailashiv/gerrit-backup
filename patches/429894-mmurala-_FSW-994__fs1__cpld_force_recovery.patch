@@ -1,0 +1,70 @@
+From a0ccab16b2b11b6621055b6badf4fe073f316675 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 03 Jul 2024 14:37:24 +0300
+Subject: [PATCH] [FSW-994] fs1: cpld force recovery
+
+with this patch, added support to check gpio01
+to check and enter recovery mode. when force
+recovery efuse bit set, force recovery completely
+disabled.
+
+Change-Id: I9e545337313417f22458674a862081566f56ea39
+---
+
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index f2b1d02..ea11365 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -20,6 +20,7 @@
+ /* TODO: we need to verify flow and params on test chip to finalize D2D link init */
+ 
+ #define D2D_LINK_STATUS_UDELAY	10000 /* 10 ms */
++#define FORCE_REC_GPIO_MASK		BIT(1)
+ 
+ #define FS1_REC_STS_GPIO		77
+ #define GPIOS_PER_BANK			16
+@@ -128,3 +129,13 @@
+ 	 * If no ack back, initiator has to blindly proceed that all Die's init success.
+ 	*/
+ }
++
++bool boot_rom_efuse_force_recovery_en(void)
++{
++	return ((boot_rom_global.config_fuse & EFUSE_SYSCFG_GPIO01_RECOVERY_CONTROL) == 0);
++}
++
++bool boot_rom_read_force_recovery_gpio(void)
++{
++	return ((regmap_readl(I0_H0_PSOC_GPIO0(mmGPIO_DATA)) & FORCE_REC_GPIO_MASK) > 0);
++}
+diff --git a/common/common.c b/common/common.c
+index af8da36..961d50a 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -104,7 +104,12 @@
+ 
+ void boot_rom_check_n_enter_recovery(void)
+ {
+-	if(!boot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI))
++	bool override = true;
++
++	if (boot_rom_efuse_force_recovery_en())
++		override = boot_rom_read_force_recovery_gpio();
++
++	if ((!boot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI)) || (!override))
+ 		execute_recovery();
+ }
+ 
+diff --git a/common/recovery.h b/common/recovery.h
+index 67e439e..fed5d75 100644
+--- a/common/recovery.h
++++ b/common/recovery.h
+@@ -14,6 +14,8 @@
+ void boot_rom_wait_for_recovery_in(void);
+ void boot_rom_d2d_link_init(void);
+ void boot_rom_set_recovery_status(void);
++bool boot_rom_efuse_force_recovery_en(void);
++bool boot_rom_read_force_recovery_gpio(void);
+ 
+ #define RECOVERY_PULSE_DURATION	10 /* 10us */
+ 

@@ -1,0 +1,245 @@
+From a22d4b3143262cf24f95eb6215511636448627e0 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Wed, 17 Feb 2021 20:46:12 +0200
+Subject: [PATCH] [SW-20154] change the key storage function in psoc_security
+
+PSOC SECURITY has specific entries to store the key
+hashes, for user debugging. In gaudi2, it has been
+decided to store just the 256 bits of the key (despite
+the hash being 384 bits). This is as per recommendation
+from Security architecture.
+
+Change-Id: I27e081f58e531b1302dc22eadd481befe43725a3
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/common/security.c b/common/security.c
+index b033760..7da328c 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -241,46 +241,6 @@
+ 		      SECURITY_EFUSE_FW_VERSION_OFFSET);
+ }
+ 
+-__attribute__((weak)) void security_load_keys(void)
+-{
+-	uint8_t hash_key_index;
+-	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
+-	enum security_location key_location;
+-
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-
+-	arcboot_rom_status_update(PROGRESS_KEY_LOC);
+-	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
+-
+-	switch (key_location) {
+-	case SPI_FLASH:
+-		spi_flash_get_hash(key_hash);
+-		break;
+-	case SPI_OTP:
+-		spi_flash_otp_access(FLASH_OTP_ENABLE);
+-		spi_flash_otp_get_hash(key_hash);
+-		spi_flash_otp_access(FLASH_OTP_DISABLE);
+-		break;
+-	case ASIC_EFUSE:
+-	default:
+-		efuse_get_hash(key_hash);
+-		break;
+-	}
+-
+-	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
+-	     hash_key_index++) {
+-		/* store habana key hash in PSOC_SECURITY */
+-		regmap_writel(key_hash[hash_key_index],
+-			      security_key_soc_location_offset(hash_key_index));
+-		/* store key hashes in Scratch PAD Sram */
+-		sp_sram_writel(key_hash[hash_key_index],
+-			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
+-			       SECURITY_BYTE_PER_DWORD));
+-	}
+-}
+-
+ void security_report_img_fw(uint8_t index, uint32_t fw_ver)
+ {
+ 	uint32_t offset;
+diff --git a/gaudi2_arc_gnu/dev_security.h b/gaudi2_arc_gnu/dev_security.h
+index cbae31c..64bc68b 100644
+--- a/gaudi2_arc_gnu/dev_security.h
++++ b/gaudi2_arc_gnu/dev_security.h
+@@ -14,6 +14,7 @@
+ #define NUM_KEYS_IN_EFUSE				3
+ #define SECURITY_DWORD_PER_KEY				12
+ #define SECURITY_KEY_HASH_COUNT				3
++#define NUM_DWORDS_AVLBL_IN_PSOC_SEC			8
+ 
+ enum security_key_location {
+ 	KEY_LOCATION_EFUSE,
+diff --git a/gaudi2_arc_gnu/security.c b/gaudi2_arc_gnu/security.c
+index 1c0988d..aa32271 100644
+--- a/gaudi2_arc_gnu/security.c
++++ b/gaudi2_arc_gnu/security.c
+@@ -473,42 +473,45 @@
+ 	security_pcie_mstr_rr_lbw_config(spi_en);
+ }
+ 
+-uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
+-{
+-	uint32_t ret;
+-	uint8_t key_soc_base_index;
+-	uint8_t key_soc_location_index;
+-	uint32_t key_soc_location[] = {
+-		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
+-		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
+-	};
+-
+-	/* select which index to choose */
+-	key_soc_base_index = hash_key_index / SECURITY_DWORD_PER_KEY;
+-	/* key is 384bit, 32bit * 12... which of the 12 location is requested */
+-	key_soc_location_index = hash_key_index % SECURITY_DWORD_PER_KEY;
+-
+-	/* get base address of selected key index */
+-	ret = key_soc_location[key_soc_base_index];
+-	/* add to base address of key the spicifice location of currect DWORD */
+-	ret += (key_soc_location_index * sizeof(uint32_t));
+-
+-	return ret;
+-}
+-
+ void rom_get_hash(uint32_t *key_hash)
+ {
+ 	uint32_t *ptr = (uint32_t *)rom_key_hashes;
++	int size = NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY;
+ 
+-	for (int i = 0; i < SECURITY_KEY_HASH_ARRAY_SIZE; i++)
++	for (int i = 0; i < size; i++)
+ 		*(key_hash + i) = *(ptr + i);
++}
++
++static void security_store_keys_in_psoc(uint8_t max_keys, uint32_t *hash)
++{
++	/*
++	 * Just store the top 256 bits of each hash, due to the
++	 * limited space available in PSOC Security
++	 */
++	uint8_t max_dwords_stored = NUM_DWORDS_AVLBL_IN_PSOC_SEC, i, j;
++	uint32_t key_soc_location_base;
++	uint32_t key_address[] = {
++		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_0_8,
++		mmPSOC_SECURITY_PUBLIC_KEY_1_4,
++		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_2_8
++	};
++
++	for (i = 0; i < max_keys; i++) {
++		key_soc_location_base = key_address[i];
++		for (j = 0; j < max_dwords_stored; j++) {
++			regmap_writel(hash[(i * SECURITY_DWORD_PER_KEY) + j],
++					key_soc_location_base);
++			key_soc_location_base += sizeof(uint32_t);
++		}
++	}
+ }
+ 
+ void security_load_keys(void)
+ {
+-	uint8_t hash_key_index, num_dwords;
+-	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
++	uint8_t hash_key_index, num_dwords, max_keys = NUM_KEYS_IN_ROM;
++	uint32_t key_hash[NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY];
+ 	enum security_key_location key_location;
+ 
+ 	key_location = ((arcboot_rom_global.config_fuse >>
+@@ -520,6 +523,7 @@
+ 
+ 	switch (key_location) {
+ 	case KEY_LOCATION_EFUSE:
++		max_keys = NUM_KEYS_IN_EFUSE;
+ 		efuse_get_hash(key_hash);
+ 		break;
+ 	case KEY_LOCATION_ROM:
+@@ -528,20 +532,19 @@
+ 		break;
+ 	}
+ 
+-	/* Store 3 key hashes in PSOC SECURITY, due to limited space */
+-	num_dwords = NUM_KEYS_IN_EFUSE * SECURITY_DWORD_PER_KEY;
+-	for (hash_key_index = 0; hash_key_index < num_dwords;
+-	     hash_key_index++)
+-		/* store habana key hash in PSOC_SECURITY */
+-		regmap_writel(key_hash[hash_key_index],
+-			      security_key_soc_location_offset(hash_key_index));
++	/* store hashes in the limited space available in PSOC_SECURITY */
++	security_store_keys_in_psoc(max_keys, key_hash);
+ 
+-	/* Store the 3 keys in SPSRAM */
+-	for (hash_key_index = 0; hash_key_index < num_dwords;
+-		hash_key_index++)
+-		sp_sram_writel(key_hash[hash_key_index],
++	/* ROM Keys are already in ROM, no need to store them explicitly */
++	if (key_location == KEY_LOCATION_EFUSE) {
++		/* Store the efuse keys in SPSRAM */
++		num_dwords = NUM_KEYS_IN_EFUSE * SECURITY_DWORD_PER_KEY;
++		for (hash_key_index = 0; hash_key_index < num_dwords;
++						hash_key_index++)
++			sp_sram_writel(key_hash[hash_key_index],
+ 			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
+ 			       SECURITY_BYTE_PER_DWORD));
++	}
+ }
+ 
+ void check_and_enable_4b_termination(void)
+diff --git a/goya2_arc/security.c b/goya2_arc/security.c
+index 079906d..85acee3 100644
+--- a/goya2_arc/security.c
++++ b/goya2_arc/security.c
+@@ -416,6 +416,46 @@
+ 	return ret;
+ }
+ 
++void security_load_keys(void)
++{
++	uint8_t hash_key_index;
++	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
++	enum security_location key_location;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++
++	arcboot_rom_status_update(PROGRESS_KEY_LOC);
++	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
++
++	switch (key_location) {
++	case SPI_FLASH:
++		spi_flash_get_hash(key_hash);
++		break;
++	case SPI_OTP:
++		spi_flash_otp_access(FLASH_OTP_ENABLE);
++		spi_flash_otp_get_hash(key_hash);
++		spi_flash_otp_access(FLASH_OTP_DISABLE);
++		break;
++	case ASIC_EFUSE:
++	default:
++		efuse_get_hash(key_hash);
++		break;
++	}
++
++	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
++	     hash_key_index++) {
++		/* store habana key hash in PSOC_SECURITY */
++		regmap_writel(key_hash[hash_key_index],
++			      security_key_soc_location_offset(hash_key_index));
++		/* store key hashes in Scratch PAD Sram */
++		sp_sram_writel(key_hash[hash_key_index],
++			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
++			       SECURITY_BYTE_PER_DWORD));
++	}
++}
++
+ void check_and_enable_4b_termination(void)
+ {
+ 	uint32_t spare0;

@@ -1,0 +1,153 @@
+From 254f29b57657b76f23c0d36ed4783539007a07ad Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 22 Mar 2022 19:32:21 +0200
+Subject: [PATCH] [SW-76678] common: change function arguments
+
+In order to reuse pcie config flow for gaudi3, this is
+preparatory patch which alters function arguments as
+part of pcie config flow.
+
+Change-Id: I2a7f4e388a0d97b2e14b9f61be59591d8aab0cb7
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 30691e2..81b35ec 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -423,8 +423,10 @@
+ #define DUMP_SEL_SRNS_MASK	0x1
+ #define DUMP_SEL_SSC_MASK	0x2
+ 
+-uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
++uint8_t get_srns_mode_from_strap(void)
+ {
++	uint32_t boot_strap = regmap_readl(mmBOOT_STRAP_PINS_L);
++
+ 	uint32_t dump_sel = (boot_strap &
+ 		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
+ 		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
+@@ -433,8 +435,10 @@
+ 	return (dump_sel & DUMP_SEL_SRNS_MASK);
+ }
+ 
+-uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
++uint8_t get_ssc_en_from_strap(void)
+ {
++	uint32_t boot_strap = regmap_readl(mmBOOT_STRAP_PINS_L);
++
+ 	uint32_t dump_sel = (boot_strap &
+ 		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
+ 		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 1ce6d7d..bca7fb8 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -129,12 +129,12 @@
+ 	return 0;
+ }
+ 
+-uint8_t get_ssc_en_from_strap(__unused uint32_t boot_strap)
++uint8_t get_ssc_en_from_strap(void)
+ {
+ 	return 0;
+ }
+ 
+-uint8_t get_srns_mode_from_strap(__unused uint32_t boot_strap)
++uint8_t get_srns_mode_from_strap(void)
+ {
+ 	return 0;
+ }
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index f15aef0..1c7f165 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -150,13 +150,17 @@
+ 	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
+ 			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
+ }
+-uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
++uint8_t get_srns_mode_from_strap(void)
+ {
++	uint32_t boot_strap = regmap_readl(mmBOOT_STRAP_PINS_L);
++
+ 	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK);
+ }
+ 
+-uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
++uint8_t get_ssc_en_from_strap(void)
+ {
++	uint32_t boot_strap = regmap_readl(mmBOOT_STRAP_PINS_L);
++
+ 	return (!!(boot_strap &
+ 			PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK));
+ }
+diff --git a/common/pcie.c b/common/pcie.c
+index 45ae6d1..4adf7cc 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -30,7 +30,7 @@
+ 		regmap_writel(value, addr);
+ }
+ 
+-static void pcie_wa_snps_case_01038891(uint32_t boot_strap)
++static void pcie_wa_snps_case_01038891(void)
+ {
+ 	uint8_t separate_reference = 0;
+ 	uint8_t ssc_en = 0, srns = 0;
+@@ -38,13 +38,13 @@
+ 	separate_reference = get_sris_mode_from_strap();
+ 
+ 	/* SRNS mode enable */
+-	srns = get_srns_mode_from_strap(boot_strap);
++	srns = get_srns_mode_from_strap();
+ 
+ 	if (!srns)
+ 		separate_reference = 1;
+ 
+ 	/* spread spectum clock enable */
+-	ssc_en = get_ssc_en_from_strap(boot_strap);
++	ssc_en = get_ssc_en_from_strap();
+ 
+ 	if ((arcboot_rom_global.config_fuse &
+ 	     EFUSE_SYSCFG_WA_SNPS_CASE_01038891) == 0) {
+@@ -72,7 +72,7 @@
+ 
+ static void pcie_config(void)
+ {
+-	uint32_t boot_strap, link_ctrl;
++	uint32_t link_ctrl;
+ 	uint8_t ltssm_en;
+ 
+ 	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
+@@ -84,15 +84,13 @@
+ 
+ 		pcie_phy_para_sel_set();
+ 
+-		/* gpio bootstrap pin gpio17 = 0 */
+-		boot_strap = regmap_readl(mmBOOT_STRAP_PINS_L);
+-
+ 		if (get_sris_mode_from_strap()) {
+ 			regmap_writel(1, mmPIPE_RX_SRIS_MODE_EN);
+ 			regmap_writel(1, mmAPP_SRIS_MODE);
+ 		}
+ 
+-		pcie_wa_snps_case_01038891(boot_strap);
++		pcie_wa_snps_case_01038891();
++
+ 		regmap_writel(1, mmPCIE_PHY_RST_N);
+ 
+ 		pcie_wait_for_sram_init_done();
+diff --git a/common/pcie.h b/common/pcie.h
+index 089c9ad..33abdb3 100644
+--- a/common/pcie.h
++++ b/common/pcie.h
+@@ -26,7 +26,7 @@
+ void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference);
+ void pcie_phy_set_ext_tx_rx_ctrl(void);
+ void pcie_phy_set_protocol0_ext_tx_rx(void);
+-uint8_t get_ssc_en_from_strap(uint32_t boot_strap);
+-uint8_t get_srns_mode_from_strap(uint32_t boot_strap);
++uint8_t get_ssc_en_from_strap(void);
++uint8_t get_srns_mode_from_strap(void);
+ 
+ #endif /* _PCIE_H_ */

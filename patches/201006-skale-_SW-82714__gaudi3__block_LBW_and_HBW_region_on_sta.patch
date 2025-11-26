@@ -1,0 +1,250 @@
+From 4d891775c068b7af8109a0950d915d0e0cb06e56 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 19 Apr 2022 09:03:41 +0300
+Subject: [PATCH] [SW-82714] gaudi3: block LBW and HBW region on startup
+
+In gaudi3, HW FSM will block entire LBW and HBW region using RR. However if
+there is bug in HW in blocking entire config space, backup needs to be kept
+inside ROM to block entire config space. This patch modifies current
+implementation to block HBW interface and block/unblock JTAG/TWI LBW/HBW
+region based on efuse bits.
+
+Change-Id: I9ce8ff30798e9a834e5d68d4f7e8d63970f8d095
+---
+
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index e60d7f8..92f60ec 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -13,6 +13,15 @@
+ #include <boot_info.h>
+ #include <dev_efuse.h>
+ 
++#define RR_LBW_PRIV_RANGE_MIN_SHORT_VAL		0x0
++#define RR_LBW_PRIV_RANGE_MAX_SHORT_VAL		0x1FFFF000
++#define RR_HBW_PRIV_RANGE_MIN_LO_VAL		0x0
++#define RR_HBW_PRIV_RANGE_MIN_HI_VAL		0x0
++#define RR_HBW_PRIV_RANGE_MAX_LO_VAL		0xFFFFC000
++#define RR_HBW_PRIV_RANGE_MAX_HI_VAL		0xFFFFFFFF
++#define RR_PRIV_RANGE_EN			0x11
++#define RR_PRIV_RANGE_DIS			0x0
++
+ /*
+  * This key hash is calculated on the Public Key Properties -
+  *   -----------------------------------------------
+@@ -108,7 +117,88 @@
+ void security_i2c_s_rr_hbw_config(__unused uint8_t spi_controller_en) {}
+ void security_smi_rr_hbw_config(__unused uint8_t spi_controller_en) {}
+ void security_jtag_rr_hbw_config(__unused uint8_t spi_controller_en) {}
+-void security_handle_twi(void) {}
++
++static void security_disable_i2c_s_if(void)
++{
++	/* Disable LBW */
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	/* Disable HBW */
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_LO_VAL, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_HI_VAL, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_LO_VAL, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_HI_VAL, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
++}
++
++static void security_enable_i2c_s_if(void)
++{
++	/*
++	 * RR0 is configured by FW and RR7/13 is configured by HW.
++	 * Disable both RR's.
++	 */
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_13);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_EN_7);
++}
++
++static void security_disable_smi_if(void)
++{
++	/* Disable LBW */
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	/* Disable HBW */
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_LO_VAL, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_HI_VAL, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_LO_VAL, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_HI_VAL, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
++}
++
++static void security_enable_smi_if(void)
++{
++	/*
++	 * RR0 is configured by FW and RR7/13 is configured by HW.
++	 * Disable both RR's.
++	 */
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_13);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_EN_7);
++}
++
++void security_enable_twi_if(void)
++{
++	security_enable_i2c_s_if();
++	security_enable_smi_if();
++}
++
++void security_disable_twi_if(void)
++{
++	if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_RR_MASK) == 0)
++		return;
++
++	security_disable_i2c_s_if();
++	security_disable_smi_if();
++}
++
++void security_handle_twi(void)
++{
++	if ((arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0)
++		security_enable_twi_if();
++	else
++		security_disable_twi_if();
++}
+ 
+ void security_jtag_dap(uint8_t status)
+ {
+@@ -118,13 +208,37 @@
+ void security_disable_jtag_if(void)
+ {
+ 	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
+-	/* TODO: Add additional RR config to lock jtag */
++
++	if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_RR_MASK) == 0)
++		return;
++
++	/* Disable LBW */
++	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
++	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++
++	/* Disable HBW */
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_LO_VAL, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_HI_VAL, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_LO_VAL, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_HI_VAL, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
+ }
+ 
+ void security_enable_jtag_if(void)
+ {
+ 	security_jtag_dap(SECURITY_JTAG_DAP_ENABLE);
+-	/* TODO: Add additional RR config to lock jtag */
++
++	/*
++	 * RR0 is configured by FW and RR7/13 is configured by HW.
++	 * Disable both RR's.
++	 */
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_13);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
++	regmap_writel(RR_PRIV_RANGE_DIS, mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_EN_7);
+ }
+ 
+ void security_handle_jtag_if(void)
+@@ -134,7 +248,6 @@
+ 		security_enable_jtag_if();
+ 	else
+ 		security_disable_jtag_if();
+-	/* TODO: Add additional RR config to lock jtag */
+ }
+ 
+ /* TODO: get newly added key addresses from global specs once it is updated */
+@@ -214,55 +327,43 @@
+ 			arcboot_rom_global.config_fuse;
+ }
+ 
+-#define RR_LBW_PRIV_RANGE_MIN_SHORT_VAL		0x0
+-#define RR_LBW_PRIV_RANGE_MAX_SHORT_VAL		0x1FFFF000
+-#define RR_LBW_PRIV_RANGE_EN_SHORT_VAL		0x11
+-static void security_rr_config(void)
++static void security_rr_lbw_config(void)
+ {
+-	if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_RR_MASK) == 0)
+-		return;
+-
+ 	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
+ 			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
+ 	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
+ 			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++	regmap_writel(RR_PRIV_RANGE_EN,
+ 			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
+ 
+ 	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
+ 			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
+ 	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
+ 			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
++	regmap_writel(RR_PRIV_RANGE_EN,
+ 			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++}
+ 
+-	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
+-			mmD0_PCIE_LBW_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
+-			mmD0_PCIE_LBW_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
+-			mmD0_PCIE_LBW_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++static void security_rr_hbw_config(void)
++{
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_LO_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MIN_HI_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_LO_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(RR_HBW_PRIV_RANGE_MAX_HI_VAL,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0);
++	regmap_writel(RR_PRIV_RANGE_EN, mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0);
++}
+ 
+-	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++static void security_rr_config(void)
++{
++	if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_RR_MASK) == 0)
++		return;
+ 
+-	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
+-
+-	regmap_writel(RR_LBW_PRIV_RANGE_MIN_SHORT_VAL,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_MAX_SHORT_VAL,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0);
+-	regmap_writel(RR_LBW_PRIV_RANGE_EN_SHORT_VAL,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0);
++	security_rr_lbw_config();
++	security_rr_hbw_config();
+ }
+ 
+ void arcboot_rom_security_init(void)

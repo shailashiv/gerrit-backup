@@ -1,0 +1,167 @@
+From 0e5710b8e76831cf0f01ba1d7c2cbfc38d2ee61f Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 01 Mar 2020 08:36:09 +0200
+Subject: [PATCH] [SW-8229] goya2: improve progress report
+
+Split the progress report for each phase so it clear on what phase we
+fail pass.
+
+Change-Id: I4c557f0785a8bddc332d69218e4c2b5c2fd3e843
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 11b92d5..f789488 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -34,13 +34,13 @@
+ 	regmap_writel(reg, mmPSOC_SECURITY_SW_STATUS_0);
+ }
+ 
+-static void arcboot_rom_status_update_clear(uint8_t mask,
+-				     uint8_t position)
++static void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,
++					      enum arcboot_rom_bringup_proggress position)
+ {
+ 	uint32_t reg;
+ 
+ 	reg = regmap_readl(mmPSOC_SECURITY_SW_STATUS_0);
+-	reg &= ~(mask << position);
++	reg |= BIT(progress + position);
+ 	regmap_writel(reg, mmPSOC_SECURITY_SW_STATUS_0);
+ }
+ 
+@@ -205,10 +205,15 @@
+ 	uint64_t pcie_fw_offset;
+ 	uint64_t pcie_fw_dest;
+ 	enum security_img_status img_status;
++	enum  arcboot_rom_progress image_progress;
+ 	int8_t  ret;
+ 
+-	arcboot_rom_status_update_clear(CLEAR_DMA_SECURITY_PROGRESS,
+-					PROGRESS_BRINGUP_PCI_DMA);
++	if (image_ptr == ARCBOOT_PRIMARY)
++		image_progress = PROGRESS_BRINGUP_PCI_PRI;
++	else
++		image_progress = PROGRESS_BRINGUP_PCI_SEC;
++
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_START);
+ 	flash_image_offset = arcboot_flash_image_offset(image_ptr);
+ 	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
+ 					      flash_image_offset);
+@@ -227,7 +232,7 @@
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 	}
+ 
+-	arcboot_rom_status_update(PROGRESS_BRINGUP_PCI_DMA);
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_DMA);
+ 
+ 	/* remove headers and footers from image, this is the image to verify */
+ 	ppboot_pcie_size -= SECUREBOOT_IMG_HEAD_FOOTER;
+@@ -244,7 +249,7 @@
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 	}
+ 
+-	arcboot_rom_status_update(PROGRESS_BRINGUP_PCI_SECURITY);
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_SECURITY);
+ 
+ 	ppboot_size = fw_sram_readl(PPBOOT_IMAGE_SIZE_OFFSET);
+ 
+@@ -259,7 +264,7 @@
+ 	/* address of pcie_fw_sram in sram space, as destination of mem_cpy */
+ 	pcie_fw_dest = HL_SRAM_BASE + HL_PCIE_FWSRAM_OFFSET;
+ 
+-	arcboot_rom_status_update(PROGRESS_BRINGUP_PCI_MEM_CPY);
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_MEM_CPY);
+ 
+ 	/* copy to pcie_fw_sram from fw_sram the pcie_fw */
+ 	mem_cpy(pcie_fw_size, pcie_fw_offset, pcie_fw_dest);
+@@ -304,9 +309,14 @@
+ {
+ 	uint32_t flash_arcboot_ram_offset;
+ 	uint16_t arcboot_ram_size;
++	enum  arcboot_rom_progress image_progress;
+ 
+-	arcboot_rom_status_update_clear(CLEAR_DMA_SECURITY_PROGRESS,
+-					PROGRESS_BRINGUP_RAM_DMA);
++	if (image_ptr == ARCBOOT_PRIMARY)
++		image_progress = PROGRESS_BRINGUP_RAM_PRI;
++	else
++		image_progress = PROGRESS_BRINGUP_RAM_SEC;
++
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_START);
+ 	flash_arcboot_ram_offset = arcboot_flash_image_offset(image_ptr);
+ 	arcboot_ram_size = (uint16_t)spi_flash_readl(flash_arcboot_ram_offset);
+ 
+@@ -314,13 +324,13 @@
+ 		       HL_SRAM_BASE + HL_ICCM_OFFSET, SPI_DMA_DST_HBW);
+ 	if (dma_wait_finish() == DMA_CRC_ERROR)
+ 		return ARCBOOT_BRINGUP_ERROR;
+-	arcboot_rom_status_update(PROGRESS_BRINGUP_RAM_DMA);
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_DMA);
+ 
+ 	arcboot_ram_size -= SECUREBOOT_IMG_HEAD_FOOTER;
+ 	if (secureboot_verify_image(arcboot_ram_size, IMG_LEN_SIZE) ==
+ 	    SECUREBOOT_VERIFY_FAILED)
+ 		return ARCBOOT_BRINGUP_ERROR;
+-	arcboot_rom_status_update(PROGRESS_BRINGUP_RAM_SECURITY);
++	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_SECURITY);
+ 
+ 	security_report_status(0, STATUS_IMG_VALID);
+ 
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 962d3f4..db9b7bd 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -70,29 +70,41 @@
+ 	uint8_t curr_img;
+ };
+ 
++enum arcboot_rom_bringup_proggress {
++	PROGRESS_BRINGUP_START,
++	PROGRESS_BRINGUP_DMA,
++	PROGRESS_BRINGUP_SECURITY,
++	PROGRESS_BRINGUP_MEM_CPY
++};
++
+ enum arcboot_rom_progress {
+ 	PROGRESS_INIT,
+ 	PROGRESS_REVOKE_LOC,
+ 	PROGRESS_REVOKE_LOC_0,
+ 	PROGRESS_REVOKE_LOC_1,
+ 	PROGRESS_KEY_LOC,
+-	PROGRESS_KEY_LOC_0,
++	PROGRESS_KEY_LOC_0,			/* 5 */
+ 	PROGRESS_KEY_LOC_1,
+ 	PROGRESS_VER_LOC,
+ 	PROGRESS_VER_LOC_0,
+-	PROGRESS_VER_LOC_1,		/* 10 */
+-	PROGRESS_BRINGUP_PCI_PRI,
++	PROGRESS_VER_LOC_1,
++	PROGRESS_BRINGUP_PCI_PRI,		/* 10 */
++	PROGRESS_BRINGUP_PCI_PRI_DMA,
++	PROGRESS_BRINGUP_PCI_PRI_SECURITY,
++	PROGRESS_BRINGUP_PCI_PRI_MEM_CPY,
+ 	PROGRESS_BRINGUP_PCI_SEC,
+-	PROGRESS_BRINGUP_PCI_DMA,
+-	PROGRESS_BRINGUP_PCI_SECURITY,
+-	PROGRESS_BRINGUP_PCI_MEM_CPY,
++	PROGRESS_BRINGUP_PCI_SEC_DMA,		/* 15 */
++	PROGRESS_BRINGUP_PCI_SEC_SECURITY,
++	PROGRESS_BRINGUP_PCI_SEC_MEM_CPY,
+ 	PROGRESS_PCIE_IN_RECOVERY,
+ 	PROGRESS_PPBOOT_START,
+-	PROGRESS_PPBOOT_FINISH,
++	PROGRESS_PPBOOT_FINISH,			/* 20 */
+ 	PROGRESS_BRINGUP_RAM_PRI,
+-	PROGRESS_BRINGUP_RAM_SEC,	/* 20 */
+-	PROGRESS_BRINGUP_RAM_DMA,
+-	PROGRESS_BRINGUP_RAM_SECURITY,
++	PROGRESS_BRINGUP_RAM_PRI_DMA,
++	PROGRESS_BRINGUP_RAM_PRI_SECURITY,
++	PROGRESS_BRINGUP_RAM_SEC,
++	PROGRESS_BRINGUP_RAM_SEC_DMA,		/* 25 */
++	PROGRESS_BRINGUP_RAM_SEC_SECURITY,
+ 	PROGRESS_ARCBOOT_RAM_START
+ };
+ 

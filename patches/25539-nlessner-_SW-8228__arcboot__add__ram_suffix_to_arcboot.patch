@@ -1,0 +1,449 @@
+From 8d84286edd9a7b291bbdade54daa1a6ed2b65426 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 14 Jan 2020 15:34:57 +0200
+Subject: [PATCH] [SW-8228] arcboot: add _ram suffix to arcboot
+
+to better differentiate between arcboot running in
+rom and ram i've added _ram suffix to all arcboot sections
+running in ram, like we have _rom suffix to all arcboot running
+in rom
+
+Change-Id: Ic8164026c6c3997410f67f7903d80486f6924219
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 9f2401b..f4361df 100644
+--- a/Makefile
++++ b/Makefile
+@@ -32,9 +32,9 @@
+ CFLAGS = -DELP_ARCV2
+ export CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+-ARCBOOT_SRCS_C := common/arcboot.c
+-ARCBOOT_SRCS_S := common/crt0.S
+-ARCBOOT_OBJECTS := $(ARCBOOT_SRCS_C:.c=.o) $(ARCBOOT_SRCS_S:.S=.o)
++ARCBOOT_RAM_SRCS_C := common/arcboot_ram.c
++ARCBOOT_RAM_SRCS_S := common/crt0_ram.S
++ARCBOOT_RAM_OBJECTS := $(ARCBOOT_RAM_SRCS_C:.c=.o) $(ARCBOOT_RAM_SRCS_S:.S=.o)
+ 
+ ARCBOOT_ROM_SRCS_C := common/arcboot_rom.c
+ ARCBOOT_ROM_SRCS_S := common/crt0_rom.S
+@@ -42,7 +42,7 @@
+ 
+ .PHONY: all libsb libellipsys sbtool
+ all: libsb libellipsys
+-	@$(MAKE) arcboot.bin arcboot_rom.bin
++	@$(MAKE) arcboot_ram.bin arcboot_rom.bin
+ 
+ libsb libellipsys:
+ 	@+$(MAKE) -C sdk $@ SB_SIGN_MODE=rsa_fixed > /dev/null
+@@ -51,7 +51,7 @@
+ %.bin: %
+ 	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .fw_sram -R .test* $< $@
+ 
+-arcboot: $(ARCBOOT_OBJECTS)
++arcboot_ram: $(ARCBOOT_RAM_OBJECTS)
+ 	@$(CC) $^ $(LDFLAGS) -o $@
+ arcboot_rom: $(ARCBOOT_ROM_OBJECTS)
+ 	@$(CC) $^ $(LDFLAGS) -o $@
+diff --git a/common/arcboot.c b/common/arcboot.c
+deleted file mode 100644
+index 0a2d43d..0000000
+--- a/common/arcboot.c
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#include <stdio.h>
+-#include "soc.h"
+-#include "arcboot.h"
+-
+-int arcboot_main(void)
+-{
+-	return 0;
+-}
+diff --git a/common/arcboot_ram.c b/common/arcboot_ram.c
+new file mode 100644
+index 0000000..27f0711
+--- /dev/null
++++ b/common/arcboot_ram.c
+@@ -0,0 +1,8 @@
++#include <stdio.h>
++#include "soc.h"
++#include "arcboot.h"
++
++int arcboot_ram_main(void)
++{
++	return 0;
++}
+diff --git a/common/crt0.S b/common/crt0.S
+deleted file mode 100644
+index 31fa6b6..0000000
+--- a/common/crt0.S
++++ /dev/null
+@@ -1,77 +0,0 @@
+-;; *******************************************************************************************************************
+-;; -----------------
+-;; ARC start up file
+-;; -----------------
+-;; The startup code for the ARC family of processors does the following
+-;; before transferring control to user defined main label :
+-;;	1. Set sp to __stack_top (link time variable)
+-;;	2. Set fp to zero
+-;;	3. Zero out the bss section (for uninitialized globals)
+-;; After returning from main, the processor is halted and the pipeline is flushed out
+-;;
+-;; *******************************************************************************************************************
+-.file "crt0.S"
+-
+-.extern main
+-
+-.section .text.__startup, "ax", @progbits
+-
+-.global __start
+-.type __start, @function
+-.align 4
+-
+-; Startup code for the ARC600, ARC700 and ARCv2 processors
+-; NOTE:  The following restrictions apply on zero overhead loops (other
+-; restrictions are not pertinent to this code)
+-; - loop end should be 4 instruction words away from the lp_count setting
+-;   instruction
+-; - loop body should have at least two instruction words
+-__start:
+-	mov gp, @__SDATA_BEGIN__
+-
+-	mov_s r2, @__sbss_start	; r2 = start of the bss section
+-	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+-	; set up the loop counter register to the size (in words) of the bss section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	mov sp, @__stack_top	; initialize stack pointer
+-	mov_s r3, 0
+-	; loop to zero out the bss.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_zbss
+-	st.ab r3, [r2, 4]	; zero out the word
+-	nop
+-.Lend_zbss:
+-
+-	mov_s r1, @_etext	; r1 = end of the text section
+-	mov_s r2, @_data	; r1 = end of the data section
+-
+-	sub r3, @_edata, r2	; r3 = size of the data section in bytes
+-
+-	; set up the loop counter register to the size (in words) of the data section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_cdata
+-	ld.ab	r5,[r1,4]
+-	st.ab	r5,[r2,4]
+-.Lend_cdata:
+-
+-	;; branch to main
+-	bl.d @arcboot_main
+-	mov fp, 0		; initialize frame pointer
+-				; r0 contains exit code
+-	j @_exit_halt
+-
+-.global _exit_halt
+-.type _exit_halt, @function
+-.align 4
+-_exit_halt:
+-				; r0 contains exit code
+-	flag 0x01
+-	nop
+-	nop
+-	nop
+-	j @_exit_halt
+-	nop
+diff --git a/common/crt0_ram.S b/common/crt0_ram.S
+new file mode 100644
+index 0000000..cc2c4c3
+--- /dev/null
++++ b/common/crt0_ram.S
+@@ -0,0 +1,77 @@
++;; *******************************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; *******************************************************************************************************************
++.file "crt0_ram.S"
++
++.extern main
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	mov gp, @__SDATA_BEGIN__
++
++	mov_s r2, @__sbss_start	; r2 = start of the bss section
++	sub r3, @_end, r2	; r3 = size of the bss section in bytes
++	; set up the loop counter register to the size (in words) of the bss section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov sp, @__stack_top	; initialize stack pointer
++	mov_s r3, 0
++	; loop to zero out the bss.  Enter loop only if lp_count != 0
++	lpnz @.Lend_zbss
++	st.ab r3, [r2, 4]	; zero out the word
++	nop
++.Lend_zbss:
++
++	mov_s r1, @_etext	; r1 = end of the text section
++	mov_s r2, @_data	; r1 = end of the data section
++
++	sub r3, @_edata, r2	; r3 = size of the data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
++	;; branch to main
++	bl.d @arcboot_ram_main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/goya2_arc/arcboot.lds b/goya2_arc/arcboot.lds
+deleted file mode 100644
+index 9a6be86..0000000
+--- a/goya2_arc/arcboot.lds
++++ /dev/null
+@@ -1,96 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
+-	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
+-	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+-	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+-}
+-
+-REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_FW",	FWSRAM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	.text : {
+-		common/crt0.o (.text*)
+-		*(.text .text.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.fw_sram :
+-	{
+-		*(.fw_sram)
+-	} > REGION_FW
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data = .;
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+\ No newline at end of file
+diff --git a/goya2_arc/arcboot_ram.lds b/goya2_arc/arcboot_ram.lds
+new file mode 100644
+index 0000000..e6447a9
+--- /dev/null
++++ b/goya2_arc/arcboot_ram.lds
+@@ -0,0 +1,96 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
++	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
++	STM	: ORIGIN = 0x18000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
++	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
++}
++
++REGION_ALIAS("REGION_TEXT",	ICCM)
++REGION_ALIAS("REGION_FW",	FWSRAM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	.text : {
++		common/crt0_ram.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.fw_sram :
++	{
++		*(.fw_sram)
++	} > REGION_FW
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data = .;
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+\ No newline at end of file

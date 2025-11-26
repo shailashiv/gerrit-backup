@@ -1,0 +1,193 @@
+From 4e4b705fefdbe1975a254eb94f1bb96e977e86b4 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 12 Jul 2024 12:08:55 +0300
+Subject: [PATCH] [FSW-5017] fs1: implement mem copy api
+
+with this patch, added support to bootrom to use
+memcopy engine to do data transfer between
+different lbw and hbw memories. user has to make
+sure that proper security level to be enabled
+before using it, for example to write psoc fw
+sram, make sure fw_sram_sai has to set.
+
+Change-Id: Ib19bf6710bc4607fcb3e72c3c47184a257bdf5b3
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index ecb3e98..657f756 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -15,3 +15,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_boot_info.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_dma.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_security.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_mem_copy.c)
+diff --git a/arch/fs1/arc/dev_mem_copy.c b/arch/fs1/arc/dev_mem_copy.c
+new file mode 100644
+index 0000000..8015e70
+--- /dev/null
++++ b/arch/fs1/arc/dev_mem_copy.c
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <soc.h>
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <delay.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++#include <dev_mem_copy.h>
++#include <arc_local_conf_regs.h>
++#include <arc_local_conf_masks.h>
++#include <mem_copy_masks.h>
++#include <mem_copy_regs.h>
++#include <tran_chk_lbw_masks.h>
++#include <tran_chk_lbw_regs.h>
++
++static void axi_barrier()
++{
++	uint64_t start;
++	uint32_t val;
++
++	start = boot_rom_get_ts_us();
++	for (;;) {
++		val = regmap_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2));
++		if (val & ARC_LOCAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_NO_WR_INFLIGHT_M)
++			break;
++
++		if (boot_rom_timeout_expired(start, HL_W_BARRIER_TIMEOUT_US)) {
++			/* TODO: report timeout?? */
++			break;
++		}
++	}
++}
++
++static void boot_rom_mem_copy_lbw_size_check(uint32_t addr, uint32_t bit_pos, bool enable)
++{
++	uint32_t val;
++	uint32_t data = (1 << bit_pos);
++
++	val = regmap_readl(addr);
++	val &= ~data;
++	if (enable)
++		val |= data;
++	regmap_writel(val, addr);
++}
++
++int boot_rom_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool hbw)
++{
++	uint64_t start = boot_rom_get_ts_us();
++	uint32_t cpy_sts, copy_sz;
++	uint32_t cp_err, wr_err, rd_err;
++	uint32_t sz_limit, sz_shift, sz_mask;
++
++	if (hbw) {
++		sz_limit = MEM_CPY_HBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_HBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_HBW_SIZE_SHIFT_MASK;
++	} else {
++		sz_limit = MEM_CPY_LBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_LBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_LBW_SIZE_SHIFT_MASK;
++	}
++
++	if (size > sz_limit) {
++		return -1;
++	}
++
++	regmap_writel((uint32_t)src & MEM_COPY_SRC_ADDR_LSB_BITS_31_4_M,
++			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_LSB));
++	regmap_writel((uint32_t)(src >> 32), IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_SRC_ADDR_MSB));
++
++	regmap_writel((uint32_t)dst & MEM_COPY_DEST_ADDR_LSB_BITS_31_4_M,
++			IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_DEST_ADDR_LSB));
++	regmap_writel((uint32_t)(dst >> 32), IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_DEST_ADDR_MSB));
++
++	/* set size of in granuality of 4 bytes */
++	copy_sz = size >> sz_shift;
++	if (size & sz_mask) {
++		copy_sz++;
++	}
++
++	regmap_writel(copy_sz, IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_COPY_SIZE));
++
++	/* disable LBW size check per H15-255 */
++	boot_rom_mem_copy_lbw_size_check(
++		IO0_H0_PSOC_CFG_MEM_COPY_LBW_TRAN_CHK(mmTRAN_CHK_LBW_CHECK_EN),
++			TRAN_CHK_LBW_CHECK_EN_SIZE_CHK_S, false);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(MEM_COPY_COPY_EN_VAL_M, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					      mmMEM_COPY_COPY_EN);
++
++	/* let 'enable' command propagate before polling on status */
++	axi_barrier();
++
++	while (1) {
++		cpy_sts = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_COPY_EN));
++		/* COPY_EN is set by FW, and cleared by HW when copy ends */
++		if (!(cpy_sts & MEM_COPY_COPY_EN_VAL_M))
++			break;
++
++		if (boot_rom_timeout_expired(start, HL_MEM_CPY_TIMEOUT_US)) {
++			/* TODO: report memcopy timeout?? */
++			return -1;
++		}
++	}
++
++	cp_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_COPY_ERR_STS));
++	wr_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_WR_ERR_STS));
++	rd_err = regmap_readl(IO0_H0_PSOC_CFG_MEM_COPY(mmMEM_COPY_RD_ERR_STS));
++
++	return (cp_err || wr_err || rd_err);
++}
+diff --git a/arch/fs1/arc/dev_mem_copy.h b/arch/fs1/arc/dev_mem_copy.h
+new file mode 100644
+index 0000000..e98fc94
+--- /dev/null
++++ b/arch/fs1/arc/dev_mem_copy.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_MEM_COPY_H_
++#define _DEV_MEM_COPY_H_
++
++#define MEM_CPY_LBW_SIZE_LIMIT		(SZ_1MB - SZ_16)
++#define MEM_CPY_LBW_SIZE_SHIFT		2
++#define MEM_CPY_LBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_LBW_SIZE_SHIFT) - 1)
++
++#define MEM_CPY_HBW_SIZE_LIMIT		(SZ_4MB - SZ_16)
++#define MEM_CPY_HBW_SIZE_SHIFT		4
++#define MEM_CPY_HBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_HBW_SIZE_SHIFT) - 1)
++
++#define HL_MEM_CPY_TIMEOUT_US		10000
++#define HL_W_BARRIER_TIMEOUT_US		100000
++
++int boot_rom_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool hbw);
++
++#endif /* _DEV_MEM_COPY_H_ */
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index 136cc87..58219c8 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -33,10 +33,12 @@
+ };
+ 
+ #define REGION_BASE_ADDR(REG_IDX)	(REG_IDX << 28)
++#define SZ_16				0x00000010
+ #define SZ_32K				0x00008000
+ #define SZ_64K				0x00010000
+ #define SZ_128K				0x00020000
+ #define SZ_256K				0x00040000
++#define SZ_1MB				0x00100000
+ #define SZ_4MB				0x00400000
+ #define SZ_256MB			0x10000000
+ #define SZ_1G				0x40000000

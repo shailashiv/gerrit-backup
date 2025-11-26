@@ -1,0 +1,129 @@
+From 89279acb03bf2dad2f1c555153d3a542e691d68c Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 10 May 2024 13:01:34 +0300
+Subject: [PATCH] [FSW-994] fs1: rec pulse from master to all slaves
+
+with this patch, added support to send recovery
+signal from master to all slaves over recovery
+async gpio's. master will assert recovery_mode
+async gpio for 10us and slave also aligned in
+same way by waiting 10us once it receive signal
+over recovery_mode.
+
+Change-Id: Iaa81f090afb9b3160579cccaf6ac0c6c115e47d5
+---
+
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index fc22455..f2b1d02 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -11,6 +11,8 @@
+ #include <global_conf_masks.h>
+ #include <d2d_ctl_regs.h>
+ #include <global_conf_regs.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
+ #include <gpio_regs.h>
+ #include <fs1_efuse.h>
+ #include <mem_io.h>
+@@ -42,12 +44,32 @@
+ 	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
+ }
+ 
++/*
++ * TODO: waiting for recovery flow sequence from verification team.
++ */
+ void boot_rom_notify_slave(void)
+ {
+-	/*
+-	 * TODO: how master RECOVERY_OUT communicated to all slaves RECOVERY_IN?
+-	 * Implement, Notify slave's once recovery signal flow is finalized.
+-	*/
++	uint32_t def_ovrd_en, def_ovrd_val, val;
++
++	/* Set Override en for recovery mode */
++	def_ovrd_en = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_EN));
++	val = def_ovrd_en | PSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_EN_RECOVERY_MODE_M;
++	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_EN));
++
++	/* Set recovery mode value */
++	def_ovrd_val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_VAL));
++	val = def_ovrd_val | PSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_VAL_RECOVERY_MODE_M;
++	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_VAL));
++
++	udelay(RECOVERY_PULSE_DURATION);
++
++	/* Clear recovery mode value */
++	def_ovrd_val &= ~(PSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_VAL_RECOVERY_MODE_M);
++	regmap_writel(def_ovrd_val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_VAL));
++
++	/* Clear Override en for recovery mode */
++	def_ovrd_en &= ~(PSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_EN_RECOVERY_MODE_M);
++	regmap_writel(def_ovrd_en, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_OUT_OVRD_EN));
+ }
+ 
+ void boot_rom_d2d_link_init(void)
+diff --git a/arch/fs1/arc/slave.c b/arch/fs1/arc/slave.c
+index ba845f4..43e7a18 100644
+--- a/arch/fs1/arc/slave.c
++++ b/arch/fs1/arc/slave.c
+@@ -12,16 +12,43 @@
+ #include <global_conf_regs.h>
+ #include <global_conf_masks.h>
+ #include <fs1_blocks_linux_driver.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
+ #include <fs1_reg_map.h>
++#include <dev_uart.h>
+ 
+ void boot_rom_wait_for_recovery_in(void)
+ {
+-	/* TODO: print uart char to indicate waiting for recovery in */
++	uint32_t val;
++
++	boot_rom_putc('r');
+ 
+ 	/*
+-	 * TODO: how master RECOVERY_OUT communicated to all slaves RECOVERY_IN?
+-	 * Implement, Wait for RECOVERY_IN once recovery signal flow is finalized.
+-	*/
++	 * TODO: IO Die0 RECOVERY_MODE is connected to it's 2 nighbour Compute Die's?
++	 * or, IO Die0 to all slave Die's?
++	 */
++
++	/* Unmask the MASK_0 RECOVERY_MODE bit, if masked */
++	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_IN_MASK_0));
++	if ((val & PSOC_BOOT_CONF_D2D_GPIO_IN_MASK_0_RECOVERY_MODE_M) != 0) {
++		val &= ~(PSOC_BOOT_CONF_D2D_GPIO_IN_MASK_0_RECOVERY_MODE_M);
++		regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_IN_MASK_0));
++	}
++
++	/* Unmask the MASK_1 RECOVERY_MODE bit, if masked */
++	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_IN_MASK_1));
++	if ((val & PSOC_BOOT_CONF_D2D_GPIO_IN_MASK_1_RECOVERY_MODE_M) != 0) {
++		val &= ~(PSOC_BOOT_CONF_D2D_GPIO_IN_MASK_1_RECOVERY_MODE_M);
++		regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_IN_MASK_1));
++	}
++
++	while(1) {
++		val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_D2D_GPIO_IN));
++		if ((val & PSOC_BOOT_CONF_D2D_GPIO_IN_MASK_0_RECOVERY_MODE_M) != 0) {
++			udelay(RECOVERY_PULSE_DURATION);
++			break;
++		}
++	}
+ }
+ 
+ void boot_rom_wait_for_signal(void)
+diff --git a/common/recovery.h b/common/recovery.h
+index 50bb492..67e439e 100644
+--- a/common/recovery.h
++++ b/common/recovery.h
+@@ -15,6 +15,6 @@
+ void boot_rom_d2d_link_init(void);
+ void boot_rom_set_recovery_status(void);
+ 
+-#define NOTIFY_SLV_DURATION_US		10
++#define RECOVERY_PULSE_DURATION	10 /* 10us */
+ 
+ #endif /* _RECOVERY_H_ */

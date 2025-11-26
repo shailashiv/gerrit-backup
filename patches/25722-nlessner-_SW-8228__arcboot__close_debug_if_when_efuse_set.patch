@@ -1,0 +1,110 @@
+From 709866139bea1ca76d0b1dd4eb38297e28470d96 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Thu, 16 Jan 2020 13:13:58 +0200
+Subject: [PATCH] [SW-8228] arcboot: close debug_if when efuse set
+
+If disable debug_if is set in efuse then set the range
+registers to close all access of debug interfaces to memory
+space
+
+Change-Id: I41dffd4ad7b321be1f569ddc8d01a0898ecc12e2
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 33d5001..1234a1f 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -12,8 +12,8 @@
+ void arcboot_rom_init()
+ {
+ 	u32 config_fuse = 0;
+-	fuse_read(0x3A,&config_fuse);
+-	if (config_fuse & BIT(12))
++	fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
++	if (config_fuse & EFUSE_DISABLE_DEBUG_IF_MASK)
+ 		security_disable_debug_if();
+ 
+ }
+diff --git a/common/efuse.h b/common/efuse.h
+index ae073e5..7d177f0 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -7,6 +7,9 @@
+ 
+ #ifndef _EFUSE_H_
+ #define _EFUSE_H_
++#define EFUSE_SYSCFG_OFFSET		0x3A
++
++#define EFUSE_DISABLE_DEBUG_IF_MASK	BIT(12)
+ 
+ int fuse_read(u32 word, u32 *val);
+ 
+diff --git a/common/security.c b/common/security.c
+index 08ee5db..a5381d9 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -7,9 +7,47 @@
+ 
+ #include "arcboot.h"
+ 
+-void security_disable_debug_if()
++static void security_disable_i2c_s_mstr_if(void)
+ {
++	regmap_writel(0x0,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0x0,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(0xFFFFFFFF,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(0xFF,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
+ 
++static void security_disable_smi_mstr_if(void)
++{
++	regmap_writel(0x0,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0x0,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(0xFFFFFFFF,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(0xFF,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++static void security_disable_jtag_mstr_if(void)
++{
++	regmap_writel(0x0,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(0x0,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(0xFFFFFFFF,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(0xFF,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++void security_disable_debug_if(void)
++{
++	security_disable_i2c_s_mstr_if();
++	security_disable_smi_mstr_if();
++	security_disable_jtag_mstr_if();
+ }
+ 
+ void security_enable_spi_dma()
+diff --git a/common/security.h b/common/security.h
+index 5c08342..7ee84bf 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -8,8 +8,6 @@
+ #ifndef _SECURITY_H_
+ #define _SECURITY_H_
+ 
+-void security_disable_debug_if();
+-void security_enable_spi_dma();
+-void security_enable_mem_cpy();
++void security_disable_debug_if(void);
+ 
+ #endif /* _SECURITY_H_ */
+\ No newline at end of file

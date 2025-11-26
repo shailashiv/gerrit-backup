@@ -1,0 +1,140 @@
+From 269ab22e0c8cc59d9d2419f97d1592ac7b619f43 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sat, 15 Feb 2020 22:51:29 +0200
+Subject: [PATCH] [SW-8229] goya2: read efuse only on cold boot
+
+Read cold flop reset register to check if efuses where
+already read. If true dont try to read again till next
+cold powerup. Return failure to read if efuse init wasn't
+finished successfully
+
+Change-Id: I49ae7cfec2e8e1ba98d97ab3c0bf048e62d8cee5
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index ba1a65a..e4409b8 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -18,6 +18,7 @@
+ 	.config_fuse = 0,
+ 	.recovery_flag = 0,
+ 	.validation_pass = 0,
++	.efuse_read = 0,
+ 	.curr_img = 0
+ };
+ 
+@@ -53,6 +54,16 @@
+ 	regmap_writel(reg, mmPSOC_SECURITY_SW_STATUS_0);
+ }
+ 
++static void arcboot_rom_set_efuse_read(void)
++{
++	uint32_t reg;
++
++	/* validation succeeded, set only validation pass*/
++	reg = regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++	reg |= COLD_RST_FLOPS_EFUSE_READ_MASK;
++	regmap_writel(reg, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++}
++
+ static void arcboot_rom_init(void)
+ {
+ 	uint32_t reg;
+@@ -75,9 +86,14 @@
+ 		(reg & COLD_RST_FLOPS_VALIDATION_PASS_MASK) >>
+ 		 COLD_RST_FLOPS_VALIDATION_PASS_SHIFT;
+ 
++	arcboot_rom_global.efuse_read  =
++		(reg & COLD_RST_FLOPS_EFUSE_READ_MASK) >>
++		 COLD_RST_FLOPS_EFUSE_READ_SHIFT;
++
+ 	regmap_writel(SPI_FLASH_BAUDR_DIVISOR, mmPSOC_QSPI_BAUDR);
+ 	regmap_writel(write_en_16MB, mmPSOC_SECURITY_SPI_WRITE_LIMIT);
+-	fuse_init();
++	if (fuse_init() == 0)
++		arcboot_rom_set_efuse_read();
+ }
+ 
+ static void arcboot_rom_in_recovery(void)
+diff --git a/common/efuse.c b/common/efuse.c
+index 9fd46ef..be140dd 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -17,19 +17,19 @@
+ #define FUSE_RETRIES		(FUSE_TIMEOUT_US / FUSE_DELAY_US)
+ #define FUSE_WORDS_PER_BANK	64
+ 
+-static uint8_t fuse_init_fail = 1;
+-
+ /*
+  * fuse box is devided into half for redundancy
+  * each half is bank of FUSE_WORDS_PER_BANK words
+  * NOTE: bank1 is a complete duplication of bank0
+  */
+ 
+-void fuse_init(void)
++int fuse_init(void)
+ {
+ 	int i;
+ 
+-	/* TODO: add cold flop bit so we dont init efuse on warm reset */
++	if (arcboot_rom_global.efuse_read == 1)
++		return -1;
++
+ 	/* TODO: ask suyash to test time of this function */
+ 	/* TODO: facto 10 of function time ~10mS*/
+ 	regmap_writel(EFUSE_READ_RANGE_ALL,
+@@ -44,7 +44,10 @@
+ 			break;
+ 
+ 	if (i == FUSE_RETRIES)
+-		fuse_init_fail = 0;
++		return -2;
++
++	arcboot_rom_global.efuse_read = 1;
++	return 0;
+ }
+ 
+ int fuse_read(uint32_t word, uint32_t *val)
+@@ -55,7 +58,7 @@
+ 		return -1;
+ 	}
+ 
+-	if (!fuse_init_fail)
++	if (arcboot_rom_global.efuse_read == 0)
+ 		return -1;
+ 
+ 	/* read value from bank0 */
+diff --git a/common/efuse.h b/common/efuse.h
+index f99e959..552a6b7 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -39,7 +39,7 @@
+ 				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
+ 				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI)
+ 
+-void fuse_init(void);
++int fuse_init(void);
+ int fuse_read(uint32_t word, uint32_t *val);
+ uint8_t efuse_otp_get_fw_version_security(void);
+ void efuse_get_hash(uint32_t *key_hash);
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 63a2b5a..4608496 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -53,11 +53,14 @@
+ #define COLD_RST_FLOPS_RECOVERY_FLAG_MASK	0x1
+ #define COLD_RST_FLOPS_VALIDATION_PASS_SHIFT	0x1
+ #define COLD_RST_FLOPS_VALIDATION_PASS_MASK	0x2
++#define COLD_RST_FLOPS_EFUSE_READ_SHIFT		0x2
++#define COLD_RST_FLOPS_EFUSE_READ_MASK		0x4
+ 
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;
+ 	uint8_t recovery_flag;
+ 	uint8_t validation_pass;
++	uint8_t efuse_read;
+ 	uint8_t curr_img;
+ };
+ 

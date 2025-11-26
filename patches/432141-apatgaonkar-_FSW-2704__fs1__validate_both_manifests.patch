@@ -1,0 +1,84 @@
+From 1f159a4261ad20d18a0cd2d3070bd93539f3f1fb Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 10 Jul 2024 15:52:28 +0300
+Subject: [PATCH] [FSW-2704] fs1: validate both manifests
+
+For bootrom we need to validate both manifests parallely
+to meet timing requirements of pcie bringup. This patch
+validates both manifests while ppboot image fetch is
+in progress.
+
+Change-Id: I060131fbf32db15e0efd1a16fe36de1bafc6deed
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index 7395f6b..df5bca5 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -59,6 +59,8 @@
+ 			boot_rom_boot_flow_boot_ppboot(boot_rom_global.valid_manifest_idx);
+ 	}
+ 
++	boot_rom_boot_flow_validate_manifests();
++
+ 	boot_rom_init_boot_info();
+ 
+ 	return 0;
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 22d00e1..cb0e3f3 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -12,7 +12,10 @@
+ #include <common.h>
+ #include <recovery.h>
+ 
++/* These fields will be added to proper structure later */
+ static enum hl_fw_manifest_type primary_manifest_idx = HL_FW_SPI_MANIFEST_0;
++bool primary_manifest_valid;
++bool secondary_manifest_valid;
+ 
+ static uint32_t boot_flow_prefetch_img_sub(enum hl_fw_manifest_type manifest_idx,
+ 					enum hl_fw_img_type img_type, struct boot_desc *desc,
+@@ -85,6 +88,7 @@
+ 		/* No need to verify as image validation is done in previous boot */
+ 		if (desc.start_addr) {
+ 			/* TODO: Start CPLD watchdog timer */
++			/* TODO: Report security image fw version */
+ 			ppboot = (void *)((uint32_t)boot_rom_get_arc_addr(desc.start_addr));
+ 			ppboot();
+ 		}
+@@ -92,3 +96,23 @@
+ 
+ 	boot_rom_halt();
+ }
++
++static uint32_t boot_rom_verify_manifest(__unused enum hl_fw_manifest_type manifest_idx)
++{ return BOOT_ROM_SUCCESS; }
++void boot_rom_boot_flow_validate_manifests(void)
++{
++	enum hl_fw_manifest_type curr_manifest_idx = HL_FW_SPI_MANIFEST_0;
++
++	if (!!boot_rom_global.fw_upd_switch_manifest)
++		curr_manifest_idx = HL_FW_SPI_MANIFEST_1;
++
++	if (boot_rom_verify_manifest(curr_manifest_idx) == BOOT_ROM_SUCCESS)
++		primary_manifest_valid = true;
++
++	/* TODO: Add check for secondary image disabled */
++
++	curr_manifest_idx = (primary_manifest_idx + 1) % HL_FW_SPI_MANIFEST_MAX_NUM;
++
++	if (boot_rom_verify_manifest(curr_manifest_idx) == BOOT_ROM_SUCCESS)
++		secondary_manifest_valid = true;
++}
+diff --git a/common/boot_flow.h b/common/boot_flow.h
+index ea977a5..d758be6 100644
+--- a/common/boot_flow.h
++++ b/common/boot_flow.h
+@@ -8,5 +8,6 @@
+ 
+ uint32_t boot_rom_boot_flow_prefetch_img(enum hl_fw_img_type img_type);
+ void boot_rom_boot_flow_boot_ppboot(enum hl_fw_manifest_type man_idx);
++void boot_rom_boot_flow_validate_manifests(void);
+ 
+ #endif /* _BOOT_FLOW_H_ */

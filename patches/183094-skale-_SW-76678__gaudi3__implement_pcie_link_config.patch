@@ -1,0 +1,295 @@
+From df0c1d2dfec6ddea3943a2a8d465aae9df619c72 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 22 Mar 2022 19:50:23 +0200
+Subject: [PATCH] [SW-76678] gaudi3: implement pcie link config
+
+This patch implments PCIe link configuration routine as part of
+ROM PCIe recovery flow.
+
+Change-Id: I89c05f2edc8fab204ca7f578cb10883225289ca1
+---
+
+diff --git a/Makefile b/Makefile
+index 0bef4b5..0d86baf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -29,6 +29,7 @@
+ 	SPECS_DEV := goya2
+ endif
+ 
++ARCBOOT_CFLAGS += -I$(SPECS_DIR)
+ ARCBOOT_CFLAGS += -I$(SPECS_DIR)/$(SPECS_DEV)/asic_reg
+ ARCBOOT_CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ ARCBOOT_CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index bca7fb8..a448910 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -19,6 +19,7 @@
+ #include <dev_dma.h>
+ #include <gaudi3_boot_info.h>
+ #include <boot_info.h>
++#include <common/pci_ids.h>
+ 
+ #include <d0_psoc_global_conf_masks.h>
+ 
+@@ -109,29 +110,82 @@
+ 
+ void update_warm_reset_config(void) {}
+ void arcboot_rom_set_spi_write_limit(void) {}
+-void pcie_phy_para_sel_set(void) {}
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_3);
++}
++
++void pcie_wait_for_sram_init_done(void)
++{
++	while (regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_INIT_DONE_0) ||
++		regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_INIT_DONE_1) ||
++		regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_INIT_DONE_2) ||
++		regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_INIT_DONE_3))
++		;
++}
++
++void pcie_wa_snps_case_01038891(void)
++{
++	/* SNPS workaround not required for Gaudi3 */
++}
++
+ void pcie_phy_set_ext_tx_rx_ctrl(void) {}
+ void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+ void pcie_phy_set_mpll_a_b_mul_bw(__unused uint8_t separate_reference) {}
+-void pcie_wait_for_sram_init_done(void) {}
+-void pcie_phy_set_sram_ext_ld_done(void) {}
+-void pcie_config_iatu(void) {}
+-void enable_flr_handling_fsm(void) {}
+-void pcie_phy_set_mpll_a_b_ssc_enable(void) {}
++void pcie_config_iatu(void)
++{
++	/* TODO: Implement IATU configuration */
++}
+ 
+ uint32_t get_mem_cfg_mask(void)
+ {
+ 	return 0;
+ }
+ 
++void enable_flr_handling_fsm(void)
++{
++	/* TODO: Check any HW FSM bits needs to be configured */
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmD0_PCIE_PHY_PHY_SRAM_EXT_LD_DONE);
++}
++
++void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
++
++	pcie_update_reg_range(mmD0_PCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++			mmD0_PCIE_PHY_PHYX_MPLLB_SSC_EN_3, 0x1);
++	pcie_update_reg_range(mmD0_PCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++			mmD0_PCIE_PHY_PHYX_MPLLA_SSC_EN_3, 0x1);
++}
++
+ uint8_t get_sris_mode_from_strap(void)
+ {
+-	return 0;
++	uint32_t boot_strap;
++
++	boot_strap = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H);
++
++	return !!(boot_strap & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRIS_M);
+ }
++
++#define DUMP_SEL_SSC_MASK	0x2
+ 
+ uint8_t get_ssc_en_from_strap(void)
+ {
+-	return 0;
++	uint32_t boot_strap = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L);
++
++	uint32_t dump_sel = (boot_strap &
++		D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_M) >>
++		D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_S;
++
++	/* dumpsel[1] is SSC EN */
++	return !!(dump_sel & DUMP_SEL_SSC_MASK);
+ }
+ 
+ uint8_t get_srns_mode_from_strap(void)
+@@ -139,6 +193,32 @@
+ 	return 0;
+ }
+ 
++void pcie_phy_ssc_en_set(void)
++{
++	if (get_ssc_en_from_strap()) {
++		/*
++		 * TODO: check whether efuse
++		 * EFUSE_SYSCFG_WA_SNPS_CASE_01038891 needs to be checked.
++		 */
++		pcie_phy_set_mpll_a_b_ssc_enable();
++	}
++}
++
++void pcie_set_pcie_device_vendor_id(void)
++{
++	uint32_t id;
++
++	if (!arcboot_rom_global.die_id)
++		return;
++
++	id = ((PCI_VENDOR_ID_HABANALABS <
++		D1_PCIE_DBI_SIG_DEVICE_ID_VENDOR_ID_REG_PCI_TYPE0_VENDOR_ID_S) |
++		(PCI_IDS_GAUDI3_DIE1 <
++		D1_PCIE_DBI_SIG_DEVICE_ID_VENDOR_ID_REG_PCI_TYPE0_DEVICE_ID_S));
++
++	regmap_writel(id, mmD1_PCIE_DBI_SIG_DEVICE_ID_VENDOR_ID_REG);
++}
++
+ static void arcboot_rom_prstn_init(void)
+ {
+ 	if (arcboot_rom_global.die_id) {
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index fe42532..970fcad 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -5,13 +5,72 @@
+  */
+ 
+ #include <arcboot.h>
++#include <boot_desc.h>
++#include <common.h>
++#include <pcie.h>
++#include <efuse.h>
+ #include <dev_common.h>
++#include <dev_efuse.h>
++
++static void execute_erom_recovery(void)
++{
++	/* TODO: implement erom recovery */
++}
++
++static void rom_recovery(void)
++{
++	/* TODO: implement rom recovery */
++}
++
++static void rom_pcie_recovery(void)
++{
++	arcboot_rom_status_update(PROGRESS_PCIE_IN_RECOVERY);
++
++	/* Disable PCIe error responses (both HBW and LBW) */
++	regmap_writel(0x1, mmPCIE_RSP_OK);
++	regmap_writel(0x1, mmD0_PCIE_WRAP_PCIE_RSP_OK_1);
++
++	if ((arcboot_rom_global.config_fuse &
++	     EFUSE_SYSCFG_DISABLE_ROM_PCIE_RECOVERY) == 0)
++		pcie_config();
++}
++
++static void execute_rom_recovery(void)
++{
++	rom_pcie_recovery();
++	rom_recovery();
++}
+ 
+ void execute_recovery(void)
+ {
++	uint8_t recovery_location;
++
+ 	/* Notify slave if master die and dual die sku */
+ 	if ((arcboot_rom_global.sku) && (!arcboot_rom_global.die_id))
+ 		arcboot_rom_notify_slave();
+ 
+-	/* TODO: implement recovery sequence */
++	/*
++	 * efuse[14:13]:
++	 * 00: ROM
++	 * 01: eROM
++	 * 10: Reserved
++	 * 11: ROM
++	 */
++	recovery_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_RECOVERY_CODE_LOCATION) &
++			EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_MASK);
++
++	if (recovery_location != EFUSE_SYSCFG_RECOVERY_CODE_LOCATION_EROM)
++		/* In all other scenarios, execute from ROM (most secure) */
++		execute_rom_recovery();
++	else
++		execute_erom_recovery();
++
++	/*
++	 * ROM Execution is expected to reach here only in case EROM image
++	 * download and verification error.
++	 * Stay here and do not return
++	 */
++	while (1)
++		;
+ }
+diff --git a/common/pcie.c b/common/pcie.c
+index 4adf7cc..d028c5e 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -30,7 +30,7 @@
+ 		regmap_writel(value, addr);
+ }
+ 
+-static void pcie_wa_snps_case_01038891(void)
++__weak void pcie_wa_snps_case_01038891(void)
+ {
+ 	uint8_t separate_reference = 0;
+ 	uint8_t ssc_en = 0, srns = 0;
+@@ -70,10 +70,15 @@
+ 	}
+ }
+ 
+-static void pcie_config(void)
++__weak void pcie_phy_ssc_en_set(void) {}
++__weak void pcie_set_pcie_device_vendor_id(void) {}
++
++void pcie_config(void)
+ {
+ 	uint32_t link_ctrl;
+ 	uint8_t ltssm_en;
++
++	pcie_set_pcie_device_vendor_id();
+ 
+ 	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
+ 	ltssm_en = regmap_readl(mmLTSSM_EN) &
+@@ -90,6 +95,7 @@
+ 		}
+ 
+ 		pcie_wa_snps_case_01038891();
++		pcie_phy_ssc_en_set();
+ 
+ 		regmap_writel(1, mmPCIE_PHY_RST_N);
+ 
+@@ -120,6 +126,7 @@
+ 		enable_flr_handling_fsm();
+ 
+ 		/* disable HOT reset handling by HW state machine */
++		/* TODO: Check whether required for Gaudi3 */
+ 		regmap_writel(CPU_HOT_RST_CTRL_MASK,
+ 			      mmCPU_HOT_RST);
+ 
+diff --git a/common/pcie.h b/common/pcie.h
+index 33abdb3..f3ad4ae 100644
+--- a/common/pcie.h
++++ b/common/pcie.h
+@@ -17,6 +17,7 @@
+ 
+ void pcie_recovery(void);
+ void execute_recovery(void);
++void pcie_config(void);
+ void pcie_config_iatu(void);
+ void pcie_update_reg_range(uint32_t addr, uint32_t addr_end, uint32_t value);
+ void pcie_wait_for_sram_init_done(void);

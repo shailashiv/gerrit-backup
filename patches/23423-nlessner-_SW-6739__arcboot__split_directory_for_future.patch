@@ -1,0 +1,996 @@
+From 418982e724f0619e0b2280745995d4372d09e1af Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 17 Dec 2019 09:34:29 +0200
+Subject: [PATCH] [SW-6739] arcboot: split directory for future
+
+rearrange directory structure and makefile to support future
+architectures
+
+Change-Id: If76653ae49c9fee559a0a007450b566bad670413
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index e47db3d..9d870ce 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,13 +21,21 @@
+ 
+ LDFLAGS = -flto
+ LDFLAGS += -L $(LIBDIR) -lsb -lellipsys
+-LDFLAGS += -T $@.lds
++LDFLAGS += -T $(HL_DEV)/$@.lds
+ LDFLAGS += -nostartfiles
+ LDFLAGS += -Wl,-e__start
+ 
+ # This combination allows removing unused symbols from libsb.a and libellipsys.a
+ LDFLAGS += -Wl,--gc-sections
+ export CFLAGS = -Os -fdata-sections -ffunction-sections
++
++ARCBOOT_SRCS_C := common/arcboot.c
++ARCBOOT_SRCS_S := common/crt0.S
++ARCBOOT_OBJECTS := $(ARCBOOT_SRCS_C:.c=.o) $(ARCBOOT_SRCS_S:.S=.o)
++
++ARCBOOT_ROM_SRCS_C := common/arcboot_rom.c
++ARCBOOT_ROM_SRCS_S := common/crt0_rom.S
++ARCBOOT_ROM_OBJECTS := $(ARCBOOT_ROM_SRCS_C:.c=.o) $(ARCBOOT_ROM_SRCS_S:.S=.o)
+ 
+ .PHONY: all libsb libellipsys sbtool
+ all: libsb libellipsys
+@@ -40,13 +48,13 @@
+ %.bin: %
+ 	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .*data -R .test* $< $@
+ 
+-arcboot: arcboot.o crt0.o
++arcboot: $(ARCBOOT_OBJECTS)
+ 	$(CC) $^ $(LDFLAGS) -o $@
+-arcboot_rom: arcboot_rom.o crt0_rom.o
++arcboot_rom: $(ARCBOOT_ROM_OBJECTS)
+ 	@$(CC) $^ $(LDFLAGS) -o $@
+ 
+ %.o: %.c
+ 	@$(CC) $(ARCBOOT_CFLAGS) -c $< -o $@
+ 
+-%.o: %.s
++%.o: %.S
+ 	@$(CC) $(AFLAGS) -c $< -o $@
+diff --git a/arcboot.c b/arcboot.c
+deleted file mode 100644
+index 91ade8b..0000000
+--- a/arcboot.c
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+-#include <stdio.h>
+-#include "sb.h"
+-
+-unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
+-uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
+-unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
+-uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
+-unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
+-uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
+-
+-int main(void)
+-{
+-	int st, err;
+-	unsigned char block_buf[512];
+-
+-	XSTACK_INIT();
+-
+-	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
+-	 * of the data blob (test_phase0b_data) */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
+-			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
+-
+-	//printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
+-	if (err || !st) {
+-		return -1;
+-	}
+-	return 0;
+-}
+diff --git a/arcboot.lds b/arcboot.lds
+deleted file mode 100644
+index ce4ef86..0000000
+--- a/arcboot.lds
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
+-	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
+-	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+-	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+-}
+-
+-REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_DATA",	FWSRAM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	.text : {
+-		crt0.o (.text*)
+-		*(.text)
+-	} > REGION_TEXT
+-
+-	.data : {
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+\ No newline at end of file
+diff --git a/arcboot_rom.c b/arcboot_rom.c
+deleted file mode 100644
+index 91ade8b..0000000
+--- a/arcboot_rom.c
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+-#include <stdio.h>
+-#include "sb.h"
+-
+-unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
+-uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
+-unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
+-uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
+-unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
+-uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
+-
+-int main(void)
+-{
+-	int st, err;
+-	unsigned char block_buf[512];
+-
+-	XSTACK_INIT();
+-
+-	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
+-	 * of the data blob (test_phase0b_data) */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
+-			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
+-
+-	//printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
+-	if (err || !st) {
+-		return -1;
+-	}
+-	return 0;
+-}
+diff --git a/arcboot_rom.lds b/arcboot_rom.lds
+deleted file mode 100644
+index 847b11f..0000000
+--- a/arcboot_rom.lds
++++ /dev/null
+@@ -1,93 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
+-	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
+-	STM	: ORIGIN = 0x18000000, LENGTH = 32M
+-	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
+-	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
+-	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
+-	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
+-}
+-
+-REGION_ALIAS("REGION_IVT",	ICCM)
+-REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_DATA",	FWSRAM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_SBSS",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_HEAP",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	.ivt : {
+-		KEEP (*(.ivt));
+-	} > REGION_IVT
+-
+-	.text : {
+-		crt0_rom.o (.text*)
+-		*(.text)
+-	} > REGION_TEXT
+-
+-	.data : {
+-		*(.data)
+-	} > REGION_DATA
+-
+-	.sdata : {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.sbss : {
+-		__bss_start = .;
+-		PROVIDE (__sbss_start = .);
+-		PROVIDE (___sbss_start = .);
+-		*(.dynsbss)
+-		*(.sbss .sbss.* .gnu.linkonce.sb.*)
+-		*(.scommon)
+-		PROVIDE (__sbss_end = .);
+-		PROVIDE (___sbss_end = .);
+-	} > REGION_SBSS
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.heap : {
+-		. = ALIGN(32 / 8);
+-		__start_heap = . ;
+-		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
+-		__end_heap = . ;
+-		. = ALIGN(0x8);
+-	} > REGION_HEAP
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+\ No newline at end of file
+diff --git a/common/arcboot.c b/common/arcboot.c
+new file mode 100644
+index 0000000..91ade8b
+--- /dev/null
++++ b/common/arcboot.c
+@@ -0,0 +1,45 @@
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++#include <stdio.h>
++#include "sb.h"
++
++unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
++uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
++unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
++uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
++unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
++uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
++
++int main(void)
++{
++	int st, err;
++	unsigned char block_buf[512];
++
++	XSTACK_INIT();
++
++	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
++	 * of the data blob (test_phase0b_data) */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
++			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
++
++	//printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
++	if (err || !st) {
++		return -1;
++	}
++	return 0;
++}
+diff --git a/common/arcboot_rom.c b/common/arcboot_rom.c
+new file mode 100644
+index 0000000..91ade8b
+--- /dev/null
++++ b/common/arcboot_rom.c
+@@ -0,0 +1,45 @@
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++#include <stdio.h>
++#include "sb.h"
++
++unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
++uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
++unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
++uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
++unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
++uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
++
++int main(void)
++{
++	int st, err;
++	unsigned char block_buf[512];
++
++	XSTACK_INIT();
++
++	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
++	 * of the data blob (test_phase0b_data) */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
++			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
++
++	//printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
++	if (err || !st) {
++		return -1;
++	}
++	return 0;
++}
+diff --git a/common/crt0.S b/common/crt0.S
+new file mode 100644
+index 0000000..34f5c36
+--- /dev/null
++++ b/common/crt0.S
+@@ -0,0 +1,62 @@
++;; *******************************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; *******************************************************************************************************************
++.file "crt0.S"
++
++.extern main
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	mov gp, @__SDATA_BEGIN__
++
++	mov_s r2, @__sbss_start	; r2 = start of the bss section
++	sub r3, @_end, r2	; r3 = size of the bss section in bytes
++	; set up the loop counter register to the size (in words) of the bss section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov sp, @__stack_top	; initialize stack pointer
++	mov_s r3, 0
++	; loop to zero out the bss.  Enter loop only if lp_count != 0
++	lpnz @.Lend_zbss
++	st.ab r3, [r2, 4]	; zero out the word
++	nop
++.Lend_zbss:
++
++	;; branch to main
++	bl.d @main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/common/crt0_rom.S b/common/crt0_rom.S
+new file mode 100644
+index 0000000..0d9fc77
+--- /dev/null
++++ b/common/crt0_rom.S
+@@ -0,0 +1,99 @@
++;; *******************************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; *******************************************************************************************************************
++.file "crt0_rom.S"
++
++.extern main
++
++.section .ivt, "a", @progbits
++
++; Helper macro to define weak symbols to include into interrupt vector table.
++; User code may define those functions in them, so user function will be
++; referenced in the IVT. By default all handlers point to _exit_halt - so they
++; always cause application halt, because if application causes an exception or
++; interrupt, but doesn't set a handler for it - something is wrong in
++; application. Exception is "start" entry of IVT, which points to __start
++; function.
++#define IVT_ENTRY(name) \
++    .word name `\
++    .weak name `\
++    .set name, _exit_halt
++
++; handler's name,		number,	name,			offset in IVT (hex/dec)
++.word __start			; 0	program entry point	0x0		0
++IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
++IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
++IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
++IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
++IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
++IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
++IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
++IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
++IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
++IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
++IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
++IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
++IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
++IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
++IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
++IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
++IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
++IVT_ENTRY(IRQ_18)		; 18				0x48		72
++IVT_ENTRY(IRQ_19)		; 19				0x4C		76
++IVT_ENTRY(IRQ_20)		; 20				0x50		80
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	mov gp, @__SDATA_BEGIN__
++
++	mov_s r2, @__sbss_start	; r2 = start of the bss section
++	sub r3, @_end, r2	; r3 = size of the bss section in bytes
++	; set up the loop counter register to the size (in words) of the bss section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov sp, @__stack_top	; initialize stack pointer
++	mov_s r3, 0
++	; loop to zero out the bss.  Enter loop only if lp_count != 0
++	lpnz @.Lend_zbss
++	st.ab r3, [r2, 4]	; zero out the word
++	nop
++.Lend_zbss:
++
++	;; branch to main
++	bl.d @main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/crt0.S b/crt0.S
+deleted file mode 100644
+index 34f5c36..0000000
+--- a/crt0.S
++++ /dev/null
+@@ -1,62 +0,0 @@
+-;; *******************************************************************************************************************
+-;; -----------------
+-;; ARC start up file
+-;; -----------------
+-;; The startup code for the ARC family of processors does the following
+-;; before transferring control to user defined main label :
+-;;	1. Set sp to __stack_top (link time variable)
+-;;	2. Set fp to zero
+-;;	3. Zero out the bss section (for uninitialized globals)
+-;; After returning from main, the processor is halted and the pipeline is flushed out
+-;;
+-;; *******************************************************************************************************************
+-.file "crt0.S"
+-
+-.extern main
+-
+-.section .text.__startup, "ax", @progbits
+-
+-.global __start
+-.type __start, @function
+-.align 4
+-
+-; Startup code for the ARC600, ARC700 and ARCv2 processors
+-; NOTE:  The following restrictions apply on zero overhead loops (other
+-; restrictions are not pertinent to this code)
+-; - loop end should be 4 instruction words away from the lp_count setting
+-;   instruction
+-; - loop body should have at least two instruction words
+-__start:
+-	mov gp, @__SDATA_BEGIN__
+-
+-	mov_s r2, @__sbss_start	; r2 = start of the bss section
+-	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+-	; set up the loop counter register to the size (in words) of the bss section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	mov sp, @__stack_top	; initialize stack pointer
+-	mov_s r3, 0
+-	; loop to zero out the bss.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_zbss
+-	st.ab r3, [r2, 4]	; zero out the word
+-	nop
+-.Lend_zbss:
+-
+-	;; branch to main
+-	bl.d @main
+-	mov fp, 0		; initialize frame pointer
+-				; r0 contains exit code
+-	j @_exit_halt
+-
+-.global _exit_halt
+-.type _exit_halt, @function
+-.align 4
+-_exit_halt:
+-				; r0 contains exit code
+-	flag 0x01
+-	nop
+-	nop
+-	nop
+-	j @_exit_halt
+-	nop
+diff --git a/crt0_rom.S b/crt0_rom.S
+deleted file mode 100644
+index d7bbfc4..0000000
+--- a/crt0_rom.S
++++ /dev/null
+@@ -1,99 +0,0 @@
+-;; *******************************************************************************************************************
+-;; -----------------
+-;; ARC start up file
+-;; -----------------
+-;; The startup code for the ARC family of processors does the following
+-;; before transferring control to user defined main label :
+-;;	1. Set sp to __stack_top (link time variable)
+-;;	2. Set fp to zero
+-;;	3. Zero out the bss section (for uninitialized globals)
+-;; After returning from main, the processor is halted and the pipeline is flushed out
+-;;
+-;; *******************************************************************************************************************
+-.file "crt0.S"
+-
+-.extern main
+-
+-.section .ivt, "a", @progbits
+-
+-; Helper macro to define weak symbols to include into interrupt vector table.
+-; User code may define those functions in them, so user function will be
+-; referenced in the IVT. By default all handlers point to _exit_halt - so they
+-; always cause application halt, because if application causes an exception or
+-; interrupt, but doesn't set a handler for it - something is wrong in
+-; application. Exception is "start" entry of IVT, which points to __start
+-; function.
+-#define IVT_ENTRY(name) \
+-    .word name `\
+-    .weak name `\
+-    .set name, _exit_halt
+-
+-; handler's name,		number,	name,			offset in IVT (hex/dec)
+-.word __start			; 0	program entry point	0x0		0
+-IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
+-IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
+-IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
+-IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
+-IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
+-IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
+-IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
+-IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
+-IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
+-IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
+-IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
+-IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
+-IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
+-IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
+-IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
+-IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
+-IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
+-IVT_ENTRY(IRQ_18)		; 18				0x48		72
+-IVT_ENTRY(IRQ_19)		; 19				0x4C		76
+-IVT_ENTRY(IRQ_20)		; 20				0x50		80
+-
+-.section .text.__startup, "ax", @progbits
+-
+-.global __start
+-.type __start, @function
+-.align 4
+-
+-; Startup code for the ARC600, ARC700 and ARCv2 processors
+-; NOTE:  The following restrictions apply on zero overhead loops (other
+-; restrictions are not pertinent to this code)
+-; - loop end should be 4 instruction words away from the lp_count setting
+-;   instruction
+-; - loop body should have at least two instruction words
+-__start:
+-	mov gp, @__SDATA_BEGIN__
+-
+-	mov_s r2, @__sbss_start	; r2 = start of the bss section
+-	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+-	; set up the loop counter register to the size (in words) of the bss section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	mov sp, @__stack_top	; initialize stack pointer
+-	mov_s r3, 0
+-	; loop to zero out the bss.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_zbss
+-	st.ab r3, [r2, 4]	; zero out the word
+-	nop
+-.Lend_zbss:
+-
+-	;; branch to main
+-	bl.d @main
+-	mov fp, 0		; initialize frame pointer
+-				; r0 contains exit code
+-	j @_exit_halt
+-
+-.global _exit_halt
+-.type _exit_halt, @function
+-.align 4
+-_exit_halt:
+-				; r0 contains exit code
+-	flag 0x01
+-	nop
+-	nop
+-	nop
+-	j @_exit_halt
+-	nop
+diff --git a/goya2_arc/arcboot.lds b/goya2_arc/arcboot.lds
+new file mode 100644
+index 0000000..ce4ef86
+--- /dev/null
++++ b/goya2_arc/arcboot.lds
+@@ -0,0 +1,88 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
++	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
++	STM	: ORIGIN = 0x18000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
++	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
++}
++
++REGION_ALIAS("REGION_TEXT",	ICCM)
++REGION_ALIAS("REGION_DATA",	FWSRAM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	.text : {
++		crt0.o (.text*)
++		*(.text)
++	} > REGION_TEXT
++
++	.data : {
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+\ No newline at end of file
+diff --git a/goya2_arc/arcboot_rom.lds b/goya2_arc/arcboot_rom.lds
+new file mode 100644
+index 0000000..2019e3d
+--- /dev/null
++++ b/goya2_arc/arcboot_rom.lds
+@@ -0,0 +1,93 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 64K
++	SRAM	: ORIGIN = 0x10000000, LENGTH = 128M
++	STM	: ORIGIN = 0x18000000, LENGTH = 32M
++	SPI	: ORIGIN = 0x1A000000, LENGTH = 16M
++	SBROM	: ORIGIN = 0x1B040000, LENGTH = 64K
++	FWSRAM	: ORIGIN = 0x1B050000, LENGTH = 64K
++	CS	: ORIGIN = 0x1C000000, LENGTH = 64M
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 16K
++}
++
++REGION_ALIAS("REGION_IVT",	ICCM)
++REGION_ALIAS("REGION_TEXT",	ICCM)
++REGION_ALIAS("REGION_DATA",	FWSRAM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_SBSS",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_HEAP",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		common/crt0_rom.o (.text*)
++		*(.text)
++	} > REGION_TEXT
++
++	.data : {
++		*(.data)
++	} > REGION_DATA
++
++	.sdata : {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.sbss : {
++		__bss_start = .;
++		PROVIDE (__sbss_start = .);
++		PROVIDE (___sbss_start = .);
++		*(.dynsbss)
++		*(.sbss .sbss.* .gnu.linkonce.sb.*)
++		*(.scommon)
++		PROVIDE (__sbss_end = .);
++		PROVIDE (___sbss_end = .);
++	} > REGION_SBSS
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.heap : {
++		. = ALIGN(32 / 8);
++		__start_heap = . ;
++		. = . + (DEFINED(__HEAP_SIZE) ? __HEAP_SIZE : (DEFINED(__DEFAULT_HEAP_SIZE) ? __DEFAULT_HEAP_SIZE : 1k)) ;
++		__end_heap = . ;
++		. = ALIGN(0x8);
++	} > REGION_HEAP
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + (DEFINED(__STACK_SIZE) ? __STACK_SIZE : (DEFINED(__DEFAULT_STACK_SIZE) ? __DEFAULT_STACK_SIZE : 512)) ;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+\ No newline at end of file

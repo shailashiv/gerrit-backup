@@ -1,0 +1,610 @@
+From 098dccaeb32a787e52da546a3d2df034b88cfe3a Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 07 Jun 2024 15:10:51 +0300
+Subject: [PATCH] [FSW-2704] fs1: add spi dma apis
+
+This patch adds spi dma apis for bootrom. spi
+dma apis will support both older crc based
+implementation and new manual crc check
+implementation.
+
+Change-Id: If843910fe422e063af0bb49b35d647c8389d8a31
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 18cccb4..9c81ceb 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -12,3 +12,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_uart.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_recovery.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_boot_info.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_dma.c)
+diff --git a/arch/fs1/arc/dev_dma.c b/arch/fs1/arc/dev_dma.c
+new file mode 100644
+index 0000000..805446e
+--- /dev/null
++++ b/arch/fs1/arc/dev_dma.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <fs1_blocks_linux_driver.h>
++#include <parc_global_conf_masks.h>
++#include <parc_global_conf_regs.h>
++#include <fs1_reg_map.h>
++#include <dma.h>
++
++#define DMA_ADDRESS_LOW(x)	((x) & MASK_32_BIT)
++#define DMA_ADDRESS_HIGH(x)	(((x) >> 32) & MASK_32_BIT)
++#define DMA_SRC_BLOCK_SIZE	1024
++#define DMA_DST_BLOCK_SIZE	4
++
++void dma_copy_image_internal(uint16_t image_size, uint32_t flash_offset,
++		uint64_t dest_offset, uint8_t fw_sram_dst, uint8_t restart_crc,
++		uint8_t mask_crc)
++{
++	uint32_t reg_spi_dma_ctrl_s =  0;
++	uint32_t spi_dma_dst_addr_l = DMA_ADDRESS_LOW(dest_offset);
++	uint32_t spi_dma_dst_addr_h = DMA_ADDRESS_HIGH(dest_offset);
++	uint32_t flash_offset_1k = flash_offset / DMA_SRC_BLOCK_SIZE;
++	uint32_t image_size_4b = (image_size / DMA_DST_BLOCK_SIZE);
++
++	regmap_writel(spi_dma_dst_addr_l,
++		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L));
++	regmap_writel(spi_dma_dst_addr_h,
++		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H));
++
++	/* enable DMA transfer */
++	reg_spi_dma_ctrl_s = PARC_GLOBAL_CONF_SPI_DMA_CTRL_EN_M;
++
++	/* sram=1 hbw=0 as destination */
++	reg_spi_dma_ctrl_s |= fw_sram_dst << PARC_GLOBAL_CONF_SPI_DMA_CTRL_DST_SRAM_S;
++
++	/* 0: continue crc calc 1: restart crc*/
++	reg_spi_dma_ctrl_s |= restart_crc << PARC_GLOBAL_CONF_SPI_DMA_CTRL_CRC_RESTART_S;
++
++	/* 0: pass crc error to status 1: mask crc error */
++	reg_spi_dma_ctrl_s |= mask_crc << PARC_GLOBAL_CONF_SPI_DMA_CTRL_MASK_CRC_ERR_S;
++
++	/* # of 4bytes to DMA copy */
++	reg_spi_dma_ctrl_s |= image_size_4b << PARC_GLOBAL_CONF_SPI_DMA_CTRL_MEM_SIZE_S;
++
++	/* spi offset in 1k chunks */
++	reg_spi_dma_ctrl_s |= flash_offset_1k << PARC_GLOBAL_CONF_SPI_DMA_CTRL_ADDR_SHIFT_S;
++
++	regmap_writel(reg_spi_dma_ctrl_s,
++		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_CTRL));
++}
++
++int dma_wait_finish(void)
++{
++	uint32_t reg_spi_dma_status_s = 0;
++
++	do {
++		reg_spi_dma_status_s =
++		  regmap_readl(IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_STATUS));
++	} while ((reg_spi_dma_status_s & PARC_GLOBAL_CONF_SPI_DMA_STATUS_DONE_M) == 0);
++
++	return (reg_spi_dma_status_s & PARC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_M);
++}
++
++enum dma_error dma_crc_check(uint32_t expected_crc)
++{
++	uint32_t reg_spi_dma_crc_s = 0;
++
++	reg_spi_dma_crc_s =
++		regmap_readl(IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_CRC));
++
++	if (reg_spi_dma_crc_s != expected_crc)
++		return DMA_INVALID_CRC_ERROR;
++
++	return DMA_SUCCESS;
++}
+diff --git a/arch/fs1/arc/dev_dma.h b/arch/fs1/arc/dev_dma.h
+new file mode 100644
+index 0000000..0dcfb9d
+--- /dev/null
++++ b/arch/fs1/arc/dev_dma.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_DMA_H_
++#define _DEV_DMA_H_
++
++int dma_wait_finish(void);
++void dma_copy_image_internal(uint16_t image_size, uint32_t flash_offset,
++			     uint64_t dest_offset, uint8_t fw_sram_dst,
++			     uint8_t restart_crc, uint8_t mask_crc);
++enum dma_error dma_crc_check(uint32_t expected_crc);
++
++#endif /* _DEV_DMA_H_ */
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index dafa079..8740f62 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -15,119 +15,124 @@
+ 	PROGRESS_INIT_SPI_BOOT_DESC_UNALIGNED_DEST = 5,
+ 	PROGRESS_INIT_SPI_BOOT_DESC_INVALID_IMG_SIZE = 6,
+ 	PROGRESS_INIT_SPI_BOOT_DESC_UNALIGNED_IMG_SIZE = 7,
+-	PROGRESS_INIT_SPI_BOOT_DESC_DMA_ERROR = 8,
+-	PROGRESS_INIT_SPI_BOOT_DESC_DMA_FINISH = 9,
+-	PROGRESS_INIT_SPI_BOOT_DESC_HDR_MAGIC_FAIL = 10,
+-	PROGRESS_INIT_SPI_BOOT_DESC_INVALID_IMG_OFFSET = 11,
+-	PROGRESS_INIT_SPI_BOOT_DESC_VERIFICATION_FAIL = 12,
+-	PROGRESS_INIT_SPI_BOOT_DESC_INFO_SET_FAIL = 13,
+-	PROGRESS_INIT_SPI_BOOT_DESC_DATA_SET_FAIL = 14,
+-	PROGRESS_INIT_SPI_BOOT_DESC_INFO_GET_FAIL = 15,
+-	PROGRESS_INIT_SPI_BOOT_DESC_DATA_GET_FAIL = 16,
+-	PROGRESS_INIT_SPI_BOOT_DESC_FAIL = 17,
+-	PROGRESS_INIT_EFUSE_INIT_FAIL = 18,
+-	PROGRESS_INIT_EFUSE_SPI = 19,
+-	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 20,
+-	PROGRESS_REVOKE_LOC = 21,
+-	PROGRESS_REVOKE_LOC_0 = 22,
+-	PROGRESS_REVOKE_LOC_1 = 23,
+-	PROGRESS_KEY_LOC = 24,
+-	PROGRESS_KEY_LOC_0 = 25,
+-	PROGRESS_KEY_LOC_1 = 26,
+-	PROGRESS_VER_LOC = 27,
+-	PROGRESS_VER_LOC_0 = 28,
+-	PROGRESS_VER_LOC_1 = 29,
+-	PROGRESS_SLV_DIE_WAITING_ON_RECOVERY_IND = 30,
+-	PROGRESS_SPI_BOOT_DESC_VERIFY_START = 31,
+-	PROGRESS_SPI_BOOT_DESC_VERIFY_VERSION_FAIL = 32,
+-	PROGRESS_SPI_BOOT_DESC_VERIFY_KEY_REVOKED = 33,
+-	PROGRESS_SPI_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 34,
+-	PROGRESS_SPI_BOOT_DESC_VERIFY_AUTH_FAIL = 35,
+-	PROGRESS_SPI_BOOT_DESC_VERIFY_SUCCESS = 36,
+-	PROGRESS_BRINGUP_PCI_PRI = 37,
+-	PROGRESS_BRINGUP_PCI_PRI_LOADADDR_INVALID = 38,
+-	PROGRESS_BRINGUP_PCI_PRI_STARTADDR_INVALID = 39,
+-	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 40,
+-	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 41,
+-	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 42,
+-	PROGRESS_BRINGUP_PCI_PRI_INVALID_IMG_SIZE = 43,
+-	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 44,
+-	PROGRESS_BRINGUP_PCI_PRI_DMA_ERROR = 45,
+-	PROGRESS_BRINGUP_PCI_PRI_DMA = 46,
+-	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 47,
+-	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 48,
+-	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 49,
+-	PROGRESS_BRINGUP_PCI_SEC = 50,
+-	PROGRESS_BRINGUP_PCI_SEC_LOADADDR_INVALID = 51,
+-	PROGRESS_BRINGUP_PCI_SEC_STARTADDR_INVALID = 52,
+-	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 53,
+-	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 54,
+-	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 55,
+-	PROGRESS_BRINGUP_PCI_SEC_INVALID_IMG_SIZE = 56,
+-	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 57,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA_ERROR = 58,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA = 59,
+-	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 60,
+-	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 61,
+-	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 62,
+-	PROGRESS_BOOT_ROM_TPM = 63,
+-	PROGRESS_BOOT_ROM_TPM_INIT_FAIL = 64,
+-	PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL = 65,
+-	PROGRESS_BOOT_ROM_TPM_PCR_EXTEND_FAIL = 66,
+-	PROGRESS_BOOT_ROM_TPM_FINISH = 67,
+-	PROGRESS_PPBOOT_START = 68,
+-	PROGRESS_PPBOOT_FINISH = 69,
+-	PROGRESS_BOOT_ROM_IN_RECOVERY = 70,
+-	PROGRESS_BOOT_ROM_IN_ROM_RECOVERY = 71,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_START = 72,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_INIT = 73,
+-	PROGRESS_BOOT_ROM_PCIE_PHY_SRAM_INIT_TIMEDOUT = 74,
+-	PROGRESS_BOOT_ROM_PCIE_PHY_PARA_STS_CLR_TIMEDOUT = 75,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_LIMIT_GEN1 = 76,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_IATU_CONFIG = 77,
+-	PROGRESS_BOOT_ROM_PCIE_LINK_FINISH = 78,
+-	PROGRESS_BOOT_ROM_D2D_LINK_START = 79,
+-	PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY = 80,
+-	PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC = 81,
+-	PROGRESS_BOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 82,
+-	PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS = 83,
+-	PROGRESS_BOOT_ROM_RECOVERY_END = 84,
+-	PROGRESS_BOOT_ROM_IN_RECOVERY_IMG = 85,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_EXCEEDS_MAX_SIZE = 86,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_START = 87,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_CRC_FAIL = 88,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_DEST = 89,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_SIZE = 90,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_IMG_SIZE = 91,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_ERROR = 92,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_FINISH = 93,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_HDR_MAGIC_FAIL = 94,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_OFFSET = 95,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_VERIFICATION_FAIL = 96,
+-	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_FAIL = 97,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_START = 98,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_VERSION_FAIL = 99,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_REVOKED = 100,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 101,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_AUTH_FAIL = 102,
+-	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_SUCCESS = 103,
+-	PROGRESS_RECOVERY_IMG_IMG0 = 104,
+-	PROGRESS_RECOVERY_IMG_IMG0_LOADADDR_INVALID = 105,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_STARTADDR_INVALID = 106,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_START = 107,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_CRC_FAILED = 108,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_DEST = 109,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_IMG_SIZE = 110,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_IMG_SIZE = 111,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_ERROR = 112,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_FINISH = 113,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_VERIFICATION_FAIL = 114,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_START = 115,
+-	PROGRESS_BOOT_REOCVERY_IMG_IMG0_FINISH = 116,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START = 117,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 118,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 119,
+-	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 120,
++	PROGRESS_INIT_SPI_BOOT_DESC_INVALID_FLASH_OFFSET = 8,
++	PROGRESS_INIT_SPI_BOOT_DESC_DMA_ERROR = 9,
++	PROGRESS_INIT_SPI_BOOT_DESC_DMA_FINISH = 10,
++	PROGRESS_INIT_SPI_BOOT_DESC_HDR_MAGIC_FAIL = 11,
++	PROGRESS_INIT_SPI_BOOT_DESC_INVALID_IMG_OFFSET = 12,
++	PROGRESS_INIT_SPI_BOOT_DESC_VERIFICATION_FAIL = 13,
++	PROGRESS_INIT_SPI_BOOT_DESC_INFO_SET_FAIL = 14,
++	PROGRESS_INIT_SPI_BOOT_DESC_DATA_SET_FAIL = 15,
++	PROGRESS_INIT_SPI_BOOT_DESC_INFO_GET_FAIL = 16,
++	PROGRESS_INIT_SPI_BOOT_DESC_DATA_GET_FAIL = 17,
++	PROGRESS_INIT_SPI_BOOT_DESC_FAIL = 18,
++	PROGRESS_INIT_EFUSE_INIT_FAIL = 19,
++	PROGRESS_INIT_EFUSE_SPI = 20,
++	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 21,
++	PROGRESS_REVOKE_LOC = 22,
++	PROGRESS_REVOKE_LOC_0 = 23,
++	PROGRESS_REVOKE_LOC_1 = 24,
++	PROGRESS_KEY_LOC = 25,
++	PROGRESS_KEY_LOC_0 = 26,
++	PROGRESS_KEY_LOC_1 = 27,
++	PROGRESS_VER_LOC = 28,
++	PROGRESS_VER_LOC_0 = 29,
++	PROGRESS_VER_LOC_1 = 30,
++	PROGRESS_SLV_DIE_WAITING_ON_RECOVERY_IND = 31,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_START = 32,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_VERSION_FAIL = 33,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_KEY_REVOKED = 34,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 35,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_AUTH_FAIL = 36,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_SUCCESS = 37,
++	PROGRESS_BRINGUP_PCI_PRI = 38,
++	PROGRESS_BRINGUP_PCI_PRI_LOADADDR_INVALID = 39,
++	PROGRESS_BRINGUP_PCI_PRI_STARTADDR_INVALID = 40,
++	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 41,
++	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 42,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 43,
++	PROGRESS_BRINGUP_PCI_PRI_INVALID_IMG_SIZE = 44,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 45,
++	PROGRESS_BRINGUP_PCI_PRI_INVALID_FLASH_OFFSET = 46,
++	PROGRESS_BRINGUP_PCI_PRI_DMA_ERROR = 47,
++	PROGRESS_BRINGUP_PCI_PRI_DMA = 48,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 49,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 50,
++	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 51,
++	PROGRESS_BRINGUP_PCI_SEC = 52,
++	PROGRESS_BRINGUP_PCI_SEC_LOADADDR_INVALID = 53,
++	PROGRESS_BRINGUP_PCI_SEC_STARTADDR_INVALID = 54,
++	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 55,
++	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 56,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 57,
++	PROGRESS_BRINGUP_PCI_SEC_INVALID_IMG_SIZE = 58,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 59,
++	PROGRESS_BRINGUP_PCI_SEC_INVALID_FLASH_OFFSET = 60,
++	PROGRESS_BRINGUP_PCI_SEC_DMA_ERROR = 61,
++	PROGRESS_BRINGUP_PCI_SEC_DMA = 62,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 63,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 64,
++	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 65,
++	PROGRESS_BOOT_ROM_TPM = 66,
++	PROGRESS_BOOT_ROM_TPM_INIT_FAIL = 67,
++	PROGRESS_BOOT_ROM_TPM_STARTUP_FAIL = 68,
++	PROGRESS_BOOT_ROM_TPM_PCR_EXTEND_FAIL = 69,
++	PROGRESS_BOOT_ROM_TPM_FINISH = 70,
++	PROGRESS_PPBOOT_START = 71,
++	PROGRESS_PPBOOT_FINISH = 72,
++	PROGRESS_BOOT_ROM_IN_RECOVERY = 73,
++	PROGRESS_BOOT_ROM_IN_ROM_RECOVERY = 74,
++	PROGRESS_BOOT_ROM_PCIE_LINK_START = 75,
++	PROGRESS_BOOT_ROM_PCIE_LINK_INIT = 76,
++	PROGRESS_BOOT_ROM_PCIE_PHY_SRAM_INIT_TIMEDOUT = 77,
++	PROGRESS_BOOT_ROM_PCIE_PHY_PARA_STS_CLR_TIMEDOUT = 78,
++	PROGRESS_BOOT_ROM_PCIE_LINK_LIMIT_GEN1 = 79,
++	PROGRESS_BOOT_ROM_PCIE_LINK_IATU_CONFIG = 80,
++	PROGRESS_BOOT_ROM_PCIE_LINK_FINISH = 81,
++	PROGRESS_BOOT_ROM_D2D_LINK_START = 82,
++	PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY = 83,
++	PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC = 84,
++	PROGRESS_BOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 85,
++	PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS = 86,
++	PROGRESS_BOOT_ROM_RECOVERY_END = 87,
++	PROGRESS_BOOT_ROM_IN_RECOVERY_IMG = 88,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_EXCEEDS_MAX_SIZE = 89,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_START = 90,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_CRC_FAIL = 91,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_DEST = 92,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_SIZE = 93,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_UNALIGNED_IMG_SIZE = 94,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_FLASH_OFFSET = 95,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_ERROR = 96,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_DMA_FINISH = 97,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_HDR_MAGIC_FAIL = 98,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_INVALID_IMG_OFFSET = 99,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_VERIFICATION_FAIL = 100,
++	PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_FAIL = 101,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_START = 102,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_VERSION_FAIL = 103,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_REVOKED = 104,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 105,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_AUTH_FAIL = 106,
++	PROGRESS_RECOVERY_IMG_BOOT_DESC_VERIFY_SUCCESS = 107,
++	PROGRESS_RECOVERY_IMG_IMG0 = 108,
++	PROGRESS_RECOVERY_IMG_IMG0_LOADADDR_INVALID = 109,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_STARTADDR_INVALID = 110,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_START = 111,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_CRC_FAILED = 112,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_DEST = 113,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_IMG_SIZE = 114,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_UNALIGNED_IMG_SIZE = 115,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_INVALID_FLASH_OFFSET = 116,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_ERROR = 117,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_DMA_FINISH = 118,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_VERIFICATION_FAIL = 119,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_START = 120,
++	PROGRESS_BOOT_REOCVERY_IMG_IMG0_FINISH = 121,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START = 122,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 123,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 124,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 125,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index 687a381..b511c49 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -60,6 +60,7 @@
+ 
+ #define HL_GEN_MEM_BASE			REGION_BASE_ADDR(REGION_GEN_MEM_IDX)
+ #define HL_FLASH_OFFSET			0x4000000
++#define HL_FLASH_SIZE			(16 * SIZE_MB)
+ 
+ #define HL_ARC0_ICCM_OFFSET		0x0000000
+ #define HL_ARC0_DCCM_OFFSET		0x0010000
+diff --git a/common/dma.c b/common/dma.c
+new file mode 100644
+index 0000000..9fac28f
+--- /dev/null
++++ b/common/dma.c
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <dev_dma.h>
++#include <parc_global_conf_masks.h>
++#include <status.h>
++#include "dma.h"
++
++enum dma_dest_type boot_rom_get_dma_dest_type(uint64_t addr)
++{
++	/* TODO: Add checks for all offsets in FW MEM */
++	if (addr >= HL_FW_SRAM_FULL_BASE &&
++	    addr < (HL_FW_SRAM_FULL_BASE + HL_FW_SRAM_SIZE))
++		return DMA_DEST_SRAM;
++
++	/* */
++	return DMA_DEST_HBW;
++}
++
++int boot_rom_process_dma_err(int err, enum boot_rom_progress dma_sts_base)
++{
++	if (err != DMA_SUCCESS) {
++		if (err == DMA_INVALID_CRC_ERROR)
++			boot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_CRC_FAILED);
++		else if (err == DMA_UNALIGNED_DEST_ADDR)
++			boot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_UNALIGNED_DEST);
++		else if (err == DMA_INVALID_IMG_SIZE)
++			boot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_INVALID_IMG_SIZE);
++		else if (err == DMA_UNALIGNED_IMG_SIZE)
++			boot_rom_status_update_bringup(dma_sts_base,
++						       PROGRESS_DMA_UNALIGNED_IMG_SIZE);
++		else if (err == DMA_INVALID_FLASH_OFFSET)
++			boot_rom_status_update_bringup(dma_sts_base,
++						       PROGRESS_DMA_INVALID_FLASH_OFFSET);
++		else
++			boot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_ERROR);
++		return 1;
++	}
++
++	return 0;
++}
++
++enum dma_error boot_rom_spi_dma(uint32_t image_size, uint32_t flash_offset,
++				uint64_t dest_addr, bool skip_crc_check,
++				bool manual_crc, uint32_t expected_crc)
++{
++	enum dma_dest_type dest_type;
++	uint32_t copy_size, dma_size, dma_chunks;
++	uint8_t i, restart_crc = 1, mask_crc = 0;
++	uint32_t max_dma_size = MAX_DMA_SIZE_CRC + CRC32_SIZE;
++	uint32_t max_dma_chunk_size = MAX_DMA_SIZE_CRC;
++	uint32_t min_dma_size = MIN_DMA_SIZE_CRC;
++	uint32_t crc_sz_per_chunk = CRC32_SIZE;
++
++	dest_type = boot_rom_get_dma_dest_type(dest_addr);
++
++	if (dest_type >= DMA_DEST_MAX)
++		return DMA_INVALID_DEST_TYPE;
++
++	if (dest_addr % ADDR_SIZE_ALIGNMENT)
++		return DMA_UNALIGNED_DEST_ADDR;
++
++	if (manual_crc) {
++		mask_crc = 1;
++		max_dma_chunk_size = MAX_DMA_SIZE_NO_CRC;
++		max_dma_size = MAX_DMA_SIZE_NO_CRC;
++		min_dma_size = MIN_DMA_SIZE_NO_CRC;
++		crc_sz_per_chunk = 0;
++	}
++
++	if (image_size < min_dma_size)
++		return DMA_INVALID_IMG_SIZE;
++
++	if ((flash_offset + image_size) > HL_FLASH_SIZE)
++		return DMA_INVALID_FLASH_OFFSET;
++
++	dma_chunks = image_size / max_dma_size;
++	if (image_size % max_dma_size)
++		dma_chunks++;
++
++	if ((image_size - (crc_sz_per_chunk * dma_chunks)) % ADDR_SIZE_ALIGNMENT)
++		return DMA_UNALIGNED_IMG_SIZE;
++
++	copy_size = image_size;
++
++	for (i = 0; i < dma_chunks; i++) {
++		dma_size = copy_size > max_dma_size ? max_dma_size : copy_size;
++		dma_copy_image_internal(dma_size, (flash_offset + (OFFSET_64KB * i)),
++					(dest_addr + (max_dma_chunk_size * i)), dest_type,
++					restart_crc, mask_crc);
++
++		if ((!skip_crc_check) &&
++		    (dma_wait_finish() == PARC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_M))
++			return DMA_INVALID_CRC_ERROR;
++
++		/* After first chunk restart crc calculation */
++		if (manual_crc)
++			restart_crc = 0;
++
++		copy_size -= dma_size;
++	}
++
++	if (manual_crc && (!skip_crc_check))
++		return dma_crc_check(expected_crc);
++
++	return DMA_SUCCESS;
++}
+diff --git a/common/dma.h b/common/dma.h
+new file mode 100644
+index 0000000..c468c36
+--- /dev/null
++++ b/common/dma.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DMA_H_
++#define _DMA_H_
++
++#include <progress_bits.h>
++
++#define OFFSET_64KB			0x10000
++#define MAX_DMA_SIZE_CRC	0xFFF0
++#define MAX_DMA_SIZE_NO_CRC	0x10000
++#define MIN_DMA_SIZE_NO_CRC	16	/* 16 bytes */
++#define ADDR_SIZE_ALIGNMENT	16	/* 16 bytes */
++#define MIN_DMA_SIZE_CRC	(MIN_DMA_SIZE_NO_CRC + CRC32_SIZE)
++
++enum dma_error {
++	DMA_SUCCESS = 0,
++	DMA_INVALID_CRC_ERROR,
++	DMA_INVALID_DEST_TYPE,
++	DMA_UNALIGNED_IMG_SIZE,
++	DMA_UNALIGNED_DEST_ADDR,
++	DMA_INVALID_IMG_SIZE,
++	DMA_INVALID_FLASH_OFFSET, /* When flash offset + image size is beyond flash limit */
++	DMA_ERROR_MAX
++};
++
++enum dma_dest_type {
++	DMA_DEST_HBW = 0,
++	DMA_DEST_SRAM,
++	DMA_DEST_MAX
++};
++
++enum dma_dest_type boot_rom_get_dma_dest_type(uint64_t addr);
++int boot_rom_process_dma_err(int err, enum boot_rom_progress dma_sts_base);
++
++/**
++ * @brief perform spi dma
++ *
++ * This API does spi dma from spi to fw mem or hbw memory
++ *
++ * @param image_size size of the image to be dma from spi
++ * @param flash_offset start offset of image in flash
++ * @param dest_addr fw mem or hbw address where image should be copied
++ * @param skip_crc_check api will skip crc check when true
++ * @param manual_crc api will perform manual crc check at the end of dma when true
++ * @param expected_crc 32-bit crc value to compare with at the end of dma. Valid
++ * only if manual_crc is true.
++ */
++enum dma_error boot_rom_spi_dma(uint32_t image_size, uint32_t flash_offset,
++				uint64_t dest_addr, bool skip_crc_check,
++				bool manual_crc, uint32_t expected_crc);
++
++#endif /* _DMA_H_ */
+diff --git a/common/status.h b/common/status.h
+index 112f470..b141bbd 100644
+--- a/common/status.h
++++ b/common/status.h
+@@ -35,6 +35,7 @@
+ 	PROGRESS_DMA_UNALIGNED_DEST,
+ 	PROGRESS_DMA_INVALID_IMG_SIZE,
+ 	PROGRESS_DMA_UNALIGNED_IMG_SIZE,
++	PROGRESS_DMA_INVALID_FLASH_OFFSET,
+ 	PROGRESS_DMA_ERROR,
+ 	PROGRESS_DMA_FINISH,
+ 	PROGRESS_BOOT_DESC_HDR_MAGIC_FAIL,
+@@ -60,6 +61,7 @@
+ 	PROGRESS_EROM_DMA_UNALIGNED_DEST_ADDR,
+ 	PROGRESS_EROM_DMA_INVALID_IMG_SIZE,
+ 	PROGRESS_EROM_DMA_UNALIGNED_IMG_SIZE,
++	PROGRESS_EROM_DMA_INVALID_FLASH_OFFSET,
+ 	PROGRESS_EROM_DMA_ERROR,
+ 	PROGRESS_EROM_DMA_FINISH,
+ 	PROGRESS_EROM_IMG_VERIFICATION_FAIL,
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index d0fd49d..ac80bde 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -29,6 +29,10 @@
+ /* extracts "n" number of bits from position "p" in the given number "v" */
+ #define EXTRACT_BITS(v, p, n)	(((v) & (((1 << (n)) - 1) << (p))) >> (p))
+ 
++#define CRC32_SIZE		4
++#define SIZE_KB			1024
++#define SIZE_MB			(SIZE_KB * SIZE_KB)
++
+ enum boot_rom_status {
+ 	BOOT_ROM_SUCCESS,
+ 	BOOT_ROM_FAIL,
+diff --git a/include/mem_io.h b/include/mem_io.h
+index 6c1201d..ffd26ae 100644
+--- a/include/mem_io.h
++++ b/include/mem_io.h
+@@ -21,6 +21,7 @@
+ #define ARC_REG_UPD(OFFSET, ARC_REG_BASE)	((OFFSET & ~(ARC_REG_BASE_MASK)) | ARC_REG_BASE)
+ 
+ #define BIT(nr)					(1 << (nr))
++#define MASK_32_BIT				0xFFFFFFFF
+ 
+ static inline void base_writel(uint32_t val, uint32_t offset)
+ {

@@ -1,0 +1,1277 @@
+From 3e019d9739aa81c79feb9337441b32e2bdb7796b Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Fri, 31 May 2024 12:56:41 +0300
+Subject: [PATCH] [FSW-418] fs1: bootrom: add tpm support functions
+
+This patch ports the TPM functions from gaudi3 to
+FS1 as is but with minor FS1 specific changes to
+common. Device specific register accesses are moved
+to device specific folder. These functions will be
+used to initialize and extend PCRs to TPM device.
+
+Change-Id: Ic247ba278a961e71bcce338b6e49f9accb35a18b
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 9c81ceb..ddb3593 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -6,6 +6,7 @@
+ 
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_tpm.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_pcie.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
+diff --git a/arch/fs1/arc/dev_spi_tpm.c b/arch/fs1/arc/dev_spi_tpm.c
+new file mode 100644
+index 0000000..1fd3615
+--- /dev/null
++++ b/arch/fs1/arc/dev_spi_tpm.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++#include <spi_regs.h>
++#include <psoc_pad_conf_regs.h>
++#include <gpio_regs.h>
++#include "dev_spi_tpm.h"
++
++void spi_tpm_cs_gpio_set(bool cs_en)
++{
++	uint32_t reg = regmap_readl(I0_H0_PSOC_GPIO1(mmGPIO_DATAOUT));
++	uint32_t mask = BIT(TPM_CS_GPIO_PIN % GPIOS_PER_BANK);
++
++	/* CS is active low */
++	if (cs_en)
++		reg &= ~mask;
++	else
++		reg |= mask;
++
++	regmap_writel(reg, I0_H0_PSOC_GPIO1(mmGPIO_DATAOUT));
++}
++
++uint32_t spi_tpm_miso_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_15);
++}
++
++uint32_t spi_tpm_mosi_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_16);
++}
++
++uint32_t spi_tpm_sclk_out_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_17);
++}
++
++uint32_t spi_tpm_cs_pad_sel_get(void)
++{
++	return IO0_H0_PSOC_PAD_CONF(mmPSOC_PAD_CONF_PAD_SEL_18);
++}
++
++void spi_tpm_ssi_cs1_get(uint32_t *mask, uint32_t *data_offset,
++				uint32_t *out_en_offset)
++{
++	*mask = BIT(TPM_CS_GPIO_PIN % GPIOS_PER_BANK);
++	*data_offset = I0_H0_PSOC_GPIO1(mmGPIO_DATAOUT);
++	*out_en_offset = I0_H0_PSOC_GPIO1(mmGPIO_OUTENSET);
++}
++
++uint32_t spi_tpm_base_get(void)
++{
++	return IO0_H0_PSOC_SPI(mmSPI_CTRLR0);
++}
+diff --git a/arch/fs1/arc/dev_spi_tpm.h b/arch/fs1/arc/dev_spi_tpm.h
+new file mode 100644
+index 0000000..fa4bd67
+--- /dev/null
++++ b/arch/fs1/arc/dev_spi_tpm.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_SPI_TPM_H_
++#define _DEV_SPI_TPM_H_
++
++#define GPIOS_PER_BANK			16
++#define TPM_CS_GPIO_PIN			18
++
++void spi_tpm_cs_gpio_set(bool cs_en);
++uint32_t spi_tpm_miso_pad_sel_get(void);
++uint32_t spi_tpm_mosi_pad_sel_get(void);
++uint32_t spi_tpm_sclk_out_pad_sel_get(void);
++uint32_t spi_tpm_cs_pad_sel_get(void);
++void spi_tpm_ssi_cs1_get(uint32_t *mask, uint32_t *data_offset,
++				uint32_t *out_en_offset);
++uint32_t spi_tpm_base_get(void);
++
++#endif /* _DEV_SPI_TPM_H_ */
+diff --git a/common/spi.c b/common/spi.c
+new file mode 100644
+index 0000000..97785e1
+--- /dev/null
++++ b/common/spi.c
+@@ -0,0 +1,356 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <spi_regs.h>
++#include <spi_masks.h>
++
++/* Registers */
++#define	CTRLR0_TMOD_TR			0x0		/* xmit & recv */
++#define CTRLR0_TMOD_TO			0x1		/* xmit only */
++#define CTRLR0_TMOD_RO			0x2		/* recv only */
++#define CTRLR0_TMOD_EPROMREAD		0x3		/* eeprom read mode */
++
++#define CTRLR0_FRF_SPI			0x0
++#define CTRLR0_FRF_SSP			0x1
++#define CTRLR0_FRF_MICROWIRE		0x2
++#define CTRLR0_FRF_RESV			0x3
++
++#define CTRLR0_MODE_MASK		GENMASK(7, 6)
++#define CTRLR0_MODE_SCPH		0x1
++#define CTRLR0_MODE_SCPOL		0x2
++
++#define RX_TIMEOUT			1000		/* timeout in ms */
++
++#define min_t(type, x, y) ({			\
++	type __min1 = (x);			\
++	type __min2 = (y);			\
++	__min1 < __min2 ? __min1 : __min2; })
++
++#define MIN(a, b)	(((a) > (b)) ? (b) : (a))
++#define MAX(a, b)	(((a) > (b)) ? (a) : (b))
++
++#define MIN3(x, y, z) MIN((typeof(x))MIN(x, y), z)
++#define MAX3(x, y, z) MAX((typeof(x))MAX(x, y), z)
++
++#define MS_TO_US(m) ((m) * 1000)
++
++/**
++ * __ffs - find first bit in word.
++ * @word: The word to search
++ *
++ * Undefined if no bit exists, so code should check against 0 first.
++ */
++static inline int __ffs32(unsigned int word)
++{
++	int num = 0;
++
++	if ((word & 0xffff) == 0) {
++		num += 16;
++		word >>= 16;
++	}
++	if ((word & 0xff) == 0) {
++		num += 8;
++		word >>= 8;
++	}
++	if ((word & 0xf) == 0) {
++		num += 4;
++		word >>= 4;
++	}
++	if ((word & 0x3) == 0) {
++		num += 2;
++		word >>= 2;
++	}
++	if ((word & 0x1) == 0)
++		num += 1;
++	return num;
++}
++
++/**
++ * FIELD_PREP() - prepare a bitfield element
++ * @_mask: shifted mask defining the field's length and position
++ * @_val:  value to put in the field
++ *
++ * FIELD_PREP() masks and shifts up the value.  The result should
++ * be combined with other fields of the bitfield using logical OR.
++ */
++#define FIELD_PREP(_mask, _val)						  \
++	(								  \
++	    {								  \
++		    ((typeof(_mask))(_val) << __ffs32(_mask)) & (_mask);  \
++	    }								  \
++	)
++
++#define BITS_PER_LONG		32
++
++#define BITS_PER_LONG_LONG	64
++
++#define __AC(X, Y)	(X##Y)
++#define _AC(X, Y)	__AC(X, Y)
++#define _AT(T, X)	((T)(X))
++
++#define _UL(x)		(_AC(x, UL))
++#define _ULL(x)		(_AC(x, ULL))
++
++#define _BITUL(x)	(_UL(1) << (x))
++#define _BITULL(x)	(_ULL(1) << (x))
++
++#define UL(x)		(_UL(x))
++#define ULL(x)		(_ULL(x))
++
++#define GENMASK(h, l)                      \
++	(((~UL(0)) - (UL(1) << (l)) + 1) & \
++	 (~UL(0) >> (BITS_PER_LONG - 1 - (h))))
++
++#define GENMASK_ULL(h, l)                    \
++	(((~ULL(0)) - (ULL(1) << (l)) + 1) & \
++	 (~ULL(0) >> (BITS_PER_LONG_LONG - 1 - (h))))
++
++struct xfer_priv {
++	struct spi_ctx *ctx;
++	const void *tx;
++	const void *tx_end;
++	void *rx;
++	void *rx_end;
++	uint32_t fifo_len;			/* depth of the FIFO buffer */
++	uint32_t max_xfer;			/* Maximum transfer size (in bits) */
++	int len;
++	int bits_per_word;
++};
++
++static uint32_t dw_spi_dw32_update_cr0(int bits_per_word, int tmode)
++{
++	return FIELD_PREP(SPI_CTRLR0_DFS_32_M, bits_per_word - 1)
++	     | FIELD_PREP(SPI_CTRLR0_FRF_M, CTRLR0_FRF_SPI)
++	     | FIELD_PREP(CTRLR0_MODE_MASK, 0x0)
++	     | FIELD_PREP(SPI_CTRLR0_TMOD_M, tmode);
++}
++
++/* Return the max entries we can fill into tx fifo */
++static inline uint32_t tx_max(struct xfer_priv *priv)
++{
++	uint32_t tx_left, tx_room, rxtx_gap;
++
++	tx_left = (priv->tx_end - priv->tx) / (priv->bits_per_word >> 3);
++	tx_room = priv->fifo_len - spi_dw_readl(priv->ctx, mmSPI_TXFLR);
++
++	/*
++	 * Another concern is about the tx/rx mismatch, we
++	 * thought about using (priv->fifo_len - rxflr - txflr) as
++	 * one maximum value for tx, but it doesn't cover the
++	 * data which is out of tx/rx fifo and inside the
++	 * shift registers. So a control from sw point of
++	 * view is taken.
++	 */
++	rxtx_gap = ((priv->rx_end - priv->rx) - (priv->tx_end - priv->tx)) /
++		(priv->bits_per_word >> 3);
++
++	return MIN3(tx_left, tx_room, (uint32_t)(priv->fifo_len - rxtx_gap));
++}
++
++/* Return the max entries we should read out of rx fifo */
++static inline uint32_t rx_max(struct xfer_priv *priv)
++{
++	uint32_t rx_left = (priv->rx_end - priv->rx) / (priv->bits_per_word >> 3);
++
++	return min_t(uint32_t, rx_left, spi_dw_readl(priv->ctx, mmSPI_RXFLR));
++}
++
++static void dw_writer(struct xfer_priv *priv)
++{
++	uint32_t max = tx_max(priv);
++	uint32_t txw = 0x0;
++
++	while (max--) {
++		/* Set the tx word if the transfer's	*/
++		/* original "tx" is not null		*/
++		if (priv->tx_end - priv->len) {
++			if (priv->bits_per_word == 8)
++				txw = *(uint8_t *)(priv->tx);
++			else
++				txw = *(uint32_t *)(priv->tx);
++		}
++		spi_dw_writel(priv->ctx, txw, mmSPI_DR0);
++		priv->tx += priv->bits_per_word >> 3;
++	}
++}
++
++static void dw_reader(struct xfer_priv *priv)
++{
++	uint32_t max = rx_max(priv);
++	uint32_t rxw;
++
++	while (max--) {
++		rxw = spi_dw_readl(priv->ctx, mmSPI_DR0);
++
++		/* Care about rx if the transfer's original "rx" is not null */
++		if (priv->rx_end - priv->len) {
++			if (priv->bits_per_word == 8)
++				*(uint8_t *)(priv->rx) = rxw;
++			else
++				*(uint32_t *)(priv->rx) = rxw;
++		}
++		priv->rx += priv->bits_per_word >> 3;
++	}
++}
++
++static int poll_transfer(struct xfer_priv *priv)
++{
++	uint32_t count = RX_TIMEOUT;
++
++	do {
++		dw_writer(priv);
++		dw_reader(priv);
++		count--;
++	} while ((priv->rx_end > priv->rx) && (count > 0));
++
++	return 0;
++}
++
++int spi_poll_timeout(struct spi_ctx *ctx)
++{
++	uint32_t val = spi_dw_readl(ctx, mmSPI_SR), count = RX_TIMEOUT;
++
++	while (count > 0) {
++		if ((val & SPI_SR_TFE_M) && !(val & SPI_SR_BUSY_M))
++			return 0;
++		count--;
++	}
++
++	return -1;
++}
++
++/* based on u-boot designware SPI driver */
++int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
++		const void *dout, void *din, unsigned long flags)
++{
++	const uint8_t *tx = dout;
++	uint8_t *rx = din;
++	int ret = 0;
++	uint32_t cr0 = 0;
++	uint8_t tmode;			/* TR/TO/RO/EEPROM */
++	struct xfer_priv priv = {0};
++
++	priv.ctx = ctx;
++
++	if ((flags & SPI_XFER_BEGIN) && (priv.ctx->claim_bus))
++		priv.ctx->claim_bus();
++
++	/* spi core configured to do 8 bit transfers */
++	if (bitlen % 8)
++		return -1;
++
++	if (priv.ctx->spi_dword_access_support)
++		priv.bits_per_word = ((bitlen % 32) ||
++				(flags & SPI_XFER_BEGIN)) ? 8 : 32;
++	else
++		priv.bits_per_word = 8;
++
++	if (rx && tx)
++		tmode = CTRLR0_TMOD_TR;
++	else if (rx)
++		tmode = CTRLR0_TMOD_RO;
++	else
++		/*
++		 * In transmit only mode (CTRL0_TMOD_TO) input FIFO never gets
++		 * any data which breaks our logic in poll_transfer() above.
++		 */
++		tmode = CTRLR0_TMOD_TR;
++
++	cr0 = dw_spi_dw32_update_cr0(priv.bits_per_word, tmode);
++
++	priv.len = bitlen >> 3;
++
++	priv.tx = (void *)tx;
++	priv.tx_end = priv.tx + priv.len;
++	priv.rx = rx;
++	priv.rx_end = priv.rx + priv.len;
++
++	/* Disable controller before writing control registers */
++	spi_dw_writel(priv.ctx, 0, mmSPI_SSIENR);
++
++	/* Reprogram cr0 only if changed */
++	if (spi_dw_readl(priv.ctx, mmSPI_CTRLR0) != cr0)
++		spi_dw_writel(priv.ctx, cr0, mmSPI_CTRLR0);
++
++	/* Enable controller after writing control registers */
++	spi_dw_writel(priv.ctx, 1, mmSPI_SSIENR);
++
++	priv.fifo_len = ctx->fifo_len;
++
++	/* Start transfer in a polling loop */
++	ret = poll_transfer(&priv);
++
++	/*
++	 * Wait for current transmit operation to complete.
++	 * Otherwise if some data still exists in Tx FIFO it can be
++	 * silently flushed, i.e. dropped on disabling of the controller,
++	 * which happens when writing 0 to DW_SPI_SSIENR which happens
++	 * in the beginning of new transfer.
++	 */
++	ret = spi_poll_timeout(ctx);
++
++	/* Stop the transaction */
++	if ((flags & SPI_XFER_END) && (priv.ctx->release_bus))
++		priv.ctx->release_bus();
++
++	return ret;
++}
++
++static void get_fifo_len(struct spi_ctx *ctx)
++{
++	uint32_t fifo;
++
++	for (fifo = 1; fifo < 256; fifo++) {
++		spi_dw_writel(ctx, fifo, mmSPI_TXFTLR);
++		if (fifo != spi_dw_readl(ctx, mmSPI_TXFTLR))
++			break;
++	}
++
++	ctx->fifo_len = (fifo == 1) ? 0 : fifo;
++	spi_dw_writel(ctx, 0, mmSPI_TXFTLR);
++}
++
++#define DW_SPI_BAUD_RATE		4
++__weak uint32_t hl_spi_baudr_get(void)
++{
++	return DW_SPI_BAUD_RATE;
++}
++
++void spi_init(struct spi_ctx *ctx)
++{
++	uint32_t baudr;
++
++	if (ctx->spi_initialized)
++		return;
++
++	baudr = hl_spi_baudr_get();
++	/* Validate that baudr is even */
++	baudr = (baudr + 1) & ~1;
++
++	ctx->cs_init();
++	/* Disable ssi module */
++	spi_dw_writel(ctx, 0x00000000, mmSPI_SSIENR);
++	/* Set Baud rate */
++	spi_dw_writel(ctx, baudr, mmSPI_BAUDR);
++	/* Set Rx FIFO threshold value to default value */
++	spi_dw_writel(ctx, 0x00000000, mmSPI_RXFTLR);
++	/* Set Tx FIFO threshold value to default value */
++	spi_dw_writel(ctx, 0x00000000, mmSPI_TXFTLR);
++	/* Disable Interrupts */
++	spi_dw_writel(ctx, 0x00000000, mmSPI_IMR);
++	/* Set CTRL0 to default value */
++	spi_dw_writel(ctx, 0x00070000, mmSPI_CTRLR0);
++	/* Enable Slave */
++	spi_dw_writel(ctx, 0x00000001, mmSPI_SER);
++	/* Enable SSI module */
++	spi_dw_writel(ctx, 0x00000001, mmSPI_SSIENR);
++
++	get_fifo_len(ctx);
++
++	ctx->spi_initialized = true;
++}
+diff --git a/common/spi.h b/common/spi.h
+new file mode 100644
+index 0000000..606a655
+--- /dev/null
++++ b/common/spi.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _SPI_H_
++#define _SPI_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SPI_XFER_BEGIN		BIT(0)	/* Assert CS before transfer */
++#define SPI_XFER_END		BIT(1)	/* Deassert CS after transfer */
++
++struct spi_ctx {
++	uint32_t spi_base;
++	bool spi_initialized;
++	bool spi_access_is_locked;
++	uint32_t fifo_len;
++	bool spi_dword_access_support;
++	void (*cs_init)();
++	void (*claim_bus)();
++	void (*release_bus)();
++};
++
++void spi_init(struct spi_ctx *ctx);
++int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
++		const void *dout, void *din, unsigned long flags);
++void external_cs_manage(bool cs_val);
++
++#endif /* _SPI_H_ */
+diff --git a/common/tpm2.c b/common/tpm2.c
+new file mode 100644
+index 0000000..eb3b431
+--- /dev/null
++++ b/common/tpm2.c
+@@ -0,0 +1,703 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <tpm2.h>
++#include <string.h>
++#include <delay.h>
++#include <hl_tpm2.h>
++#include <errno.h>
++#include <linux/types.h>
++#include <tpm2.h>
++#include <hl_rsa_arc.h>
++#include <stdio.h>
++#include <stdarg.h>
++#include <dev_spi_tpm.h>
++#include <spi.h>
++
++/* Internal error of TPM command library */
++#define TPM_LIB_ERROR ((uint32_t)~0u)
++#define le32_to_cpu(x) ((__uint32_t)(__le32)(x))
++
++/* Internal error of TPM command library */
++#define TPM_LIB_ERROR ((uint32_t)~0u)
++
++static struct spi_ctx tpm_spi = {0};
++static int locality;
++uint8_t cmd_response_buffer[COMMAND_BUFFER_SIZE];
++uint8_t tpm_buf[TPM_DEV_BUFSIZE + sizeof(uint8_t)];  /* Max buffer size + addr */
++
++static void spi_tpm_claim_bus(void)
++{
++	spi_tpm_cs_gpio_set(true);
++}
++
++static void spi_tpm_release_bus(void)
++{
++	spi_tpm_cs_gpio_set(false);
++}
++
++/*
++ * tpm_tis_spi_xfer() - TPM <-> SPI abstraction api.
++ *
++ * @description : This api is used to communicate with the spi
++ * driver in order to send commands as per TPM 2.0 specification
++ * and to send/receive data from the TPM slave.
++ *
++ * @addr: register address to read from
++ * @out: buffer in case caller sends data to tpm slave
++ * @in: buffer in case caller requests data from tpm slave
++ *
++ * @return -1 on error, 0 on success.
++ */
++
++#define TPM_ADDR_COMMAND_OPCODE		0xD4
++static int tpm_tis_spi_xfer(uint32_t addr, const uint8_t *out, uint8_t *in, uint16_t len)
++{
++	int transfer_len, ret, i;
++	uint8_t tx_buf[MAX_SPI_FRAMESIZE];
++	uint8_t rx_buf[MAX_SPI_FRAMESIZE];
++
++	if (in && out)
++		return -1;
++
++	while (len) {
++		/* Request */
++		transfer_len = min_t(uint16_t, len, MAX_SPI_FRAMESIZE);
++		tx_buf[0] = (in ? BIT(7) : 0) | (transfer_len - 1);
++		tx_buf[1] = TPM_ADDR_COMMAND_OPCODE;
++		tx_buf[2] = addr >> 8;
++		tx_buf[3] = addr;
++
++		ret = spi_xfer(&tpm_spi, 4 * 8, tx_buf, rx_buf, SPI_XFER_BEGIN);
++		if (ret)
++			goto release_bus;
++
++		/* Wait state */
++		if (!(rx_buf[3] & 0x1)) {
++			for (i = 0; i < TPM_WAIT_STATES; i++) {
++				ret = spi_xfer(&tpm_spi, 1 * 8, NULL, rx_buf,
++						0);
++				if (ret)
++					goto release_bus;
++
++				if (rx_buf[0] & 0x1)
++					break;
++			}
++
++			if (i == TPM_WAIT_STATES) {
++				ret = -1;
++				goto release_bus;
++			}
++		}
++
++		/* Read/Write */
++		if (out) {
++			memcpy(tx_buf, out, transfer_len);
++			out += transfer_len;
++		} else {
++			memset(tx_buf, 0, transfer_len);
++		}
++
++		ret = spi_xfer(&tpm_spi, transfer_len * 8,
++			       tx_buf,
++			       in ? rx_buf : NULL,
++			       SPI_XFER_END);
++		if (ret)
++			goto release_bus;
++
++		if (in) {
++			memcpy(in, rx_buf, transfer_len);
++			in += transfer_len;
++		}
++
++		len -= transfer_len;
++	}
++
++	return ret;
++
++release_bus:
++	/* If an error occurred, release the chip by deasserting the CS */
++	spi_tpm_release_bus();
++
++	return ret;
++}
++
++static bool tpm_is_supported(void)
++{
++	return true;
++}
++
++static void spi_ssi_cs_init(void)
++{
++	unsigned int reg, mask, data, out_en;
++
++	/* GPIO AF initialization */
++	regmap_writel(1, spi_tpm_miso_pad_sel_get());
++	regmap_writel(1, spi_tpm_mosi_pad_sel_get());
++	regmap_writel(1, spi_tpm_sclk_out_pad_sel_get());
++	regmap_writel(0, spi_tpm_cs_pad_sel_get());
++
++	spi_tpm_ssi_cs1_get(&mask, &data, &out_en);
++
++	reg = regmap_readl(data);
++	reg |= mask;
++	regmap_writel(reg, data);
++
++	reg = regmap_readl(out_en);
++	reg |= mask;
++	regmap_writel(reg, out_en);
++}
++
++static void tpm_spi_init(void)
++{
++	tpm_spi.spi_base = spi_tpm_base_get();
++	tpm_spi.spi_initialized = false;
++	tpm_spi.spi_access_is_locked = false;
++	tpm_spi.cs_init = spi_ssi_cs_init;
++	tpm_spi.claim_bus = spi_tpm_claim_bus;
++	tpm_spi.release_bus = spi_tpm_release_bus;
++	tpm_spi.fifo_len = 0;
++	spi_init(&tpm_spi);
++}
++
++/*
++ * tpm_tis_spi_read() - Read from TPM register
++ *
++ * @addr: register address to read from
++ * @in: provided by caller
++ * @len: number of bytes to read
++ *
++ * Read len bytes from TPM register and put them into
++ * buffer (little-endian format, i.e. first byte is put into buffer[0]).
++ *
++ * NOTE: TPM is big-endian for multi-byte values. Multi-byte
++ * values have to be swapped.
++ *
++ * @return -1 on error, 0 on success.
++ */
++static int tpm_tis_spi_read(uint16_t addr, uint8_t *in, uint16_t len)
++{
++	return tpm_tis_spi_xfer(addr, NULL, in, len);
++}
++
++static int tpm_tis_spi_write(uint16_t addr, const uint8_t *out, uint16_t len)
++{
++	return tpm_tis_spi_xfer(addr, out, NULL, len);
++}
++
++static int tpm_tis_spi_read32(uint32_t addr, uint32_t *result)
++{
++	__le32 result_le;
++	int ret;
++
++	ret = tpm_tis_spi_read(addr, (uint8_t *)&result_le, sizeof(uint32_t));
++	if (!ret)
++		*result = le32_to_cpu(result_le);
++
++	return ret;
++}
++
++static int tpm_command_size(const void *command)
++{
++	const size_t command_size_offset = 2;
++
++	/* get unaligned be32 */
++	return get_unaligned_be32((__be32 *)(command + command_size_offset));
++}
++
++static uint32_t tpm_return_code(const void *response)
++{
++	const size_t return_code_offset = 6;
++
++	return get_unaligned_be32(response + return_code_offset);
++}
++
++static uint8_t tpm_spi_status(uint8_t *status)
++{
++	return tpm_tis_spi_read(TPM_STS(locality), status, 1);
++}
++
++static int tpm_tis_spi_cancel(void)
++{
++	uint8_t data = TPM_STS_COMMAND_READY;
++
++	return tpm_tis_spi_write(TPM_STS(locality), &data, 1);
++}
++
++static void tpm_tis_spi_release_locality(int loc, bool force)
++{
++	const uint8_t mask = TPM_ACCESS_REQUEST_PENDING | TPM_ACCESS_VALID;
++	uint8_t buf;
++
++	if (tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1) < 0)
++		return;
++
++	if (force || (buf & mask) == mask) {
++		buf = TPM_ACCESS_ACTIVE_LOCALITY;
++		tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
++	}
++}
++
++static int tpm_spi_get_burstcount(void)
++{
++	uint32_t burstcount, ret;
++	uint64_t start;
++
++	/* wait for burstcount */
++	start = boot_rom_get_ts_us();
++	do {
++		ret = tpm_tis_spi_read32(TPM_STS(locality),
++					 &burstcount);
++		if (ret)
++			return -1;
++
++		burstcount = (burstcount >> 8) & 0xFFFF;
++		if (burstcount)
++			return burstcount;
++
++	} while (!boot_rom_timeout_expired(start, MS_TO_US(TIS_SHORT_TIMEOUT_MS)));
++
++	return -1;
++}
++
++static int tpm_spi_wait_for_stat(uint8_t mask, unsigned long timeout, uint8_t *status)
++{
++	int ret;
++	uint64_t start = boot_rom_get_ts_us();
++
++	do {
++		ret = tpm_spi_status(status);
++		if (ret)
++			return ret;
++
++		if ((*status & mask) == mask)
++			return 0;
++	} while (!boot_rom_timeout_expired(start, MS_TO_US(timeout)));
++
++	return -1;
++}
++
++static uint8_t tpm_tis_spi_valid_status(uint8_t *status)
++{
++	return tpm_spi_wait_for_stat(TPM_STS_VALID, TIS_SHORT_TIMEOUT_MS,
++					status);
++}
++
++static int tpm_spi_recv_data(uint8_t *buf, size_t count)
++{
++	size_t size = 0;
++	int burstcnt, len, ret;
++	uint8_t status;
++
++	while (size < count &&
++	       tpm_spi_wait_for_stat(TPM_STS_DATA_AVAIL | TPM_STS_VALID,
++					 TIS_SHORT_TIMEOUT_MS, &status) == 0) {
++		burstcnt = tpm_spi_get_burstcount();
++		if (burstcnt < 0)
++			return burstcnt;
++
++		len = min_t(int, burstcnt, count - size);
++		ret = tpm_tis_spi_read(TPM_DATA_FIFO(locality),
++				       buf + size, len);
++		if (ret)
++			return ret;
++
++		size += len;
++	}
++
++	return size;
++}
++
++static int tpm_tis_spi_check_locality(int loc)
++{
++	const uint8_t mask = TPM_ACCESS_ACTIVE_LOCALITY | TPM_ACCESS_VALID;
++	uint8_t buf;
++	int ret;
++
++	ret = tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1);
++	if (ret)
++		return ret;
++
++	if ((buf & mask) == mask) {
++		locality = loc;
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++static int tpm_tis_spi_request_locality(int loc)
++{
++	uint8_t buf = TPM_ACCESS_REQUEST_USE;
++	int ret;
++	uint64_t start;
++
++	ret = tpm_tis_spi_check_locality(loc);
++	if (!ret)
++		return 0;
++
++	if (ret != -ENOENT)
++		return ret;
++
++	ret = tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
++	if (ret)
++		return ret;
++
++	start = boot_rom_get_ts_us();
++	do {
++		ret = tpm_tis_spi_check_locality(loc);
++		if (!ret)
++			return 0;
++
++		if (ret != -ENOENT)
++			return ret;
++
++	} while (!boot_rom_timeout_expired(start, MS_TO_US(TIS_SHORT_TIMEOUT_MS)));
++
++	return ret;
++}
++
++static int tpm_spi_recv(uint8_t *buf, size_t count)
++{
++	size_t size, expected;
++
++	if (count < TPM_HEADER_SIZE) {
++		size = -1;
++		goto out;
++	}
++
++	size = tpm_spi_recv_data(buf, TPM_HEADER_SIZE);
++	if (size < TPM_HEADER_SIZE) {
++		/* TODO: Check if size invalid requires to be returned */
++		goto out;
++	}
++
++	expected = get_unaligned_be32(buf + 2);
++	if (expected > count) {
++		size = -1;
++		goto out;
++	}
++
++	size += tpm_spi_recv_data(&buf[TPM_HEADER_SIZE],
++				   expected - TPM_HEADER_SIZE);
++	if (size < expected) {
++		size = -1;
++		goto out;
++	}
++
++out:
++	tpm_tis_spi_cancel();
++	tpm_tis_spi_release_locality(locality, false);
++
++	return size;
++}
++
++static int tpm_spi_send(const uint8_t *buf, size_t len)
++{
++	uint32_t i, size;
++	uint8_t status;
++	int burstcnt, ret;
++	uint8_t data;
++
++	if (len > TPM_DEV_BUFSIZE)
++		return -E2BIG;  /* Command is too long for our tpm, sorry */
++
++	ret = tpm_tis_spi_request_locality(locality);
++	if (ret < 0)
++		return -EBUSY;
++
++	/*
++	 * Check if the TPM is ready. If not, if not, cancel the pending command
++	 * and poll on the status to be finally ready.
++	 */
++	ret = tpm_spi_status(&status);
++	if (ret)
++		return ret;
++
++	if (!(status & TPM_STS_COMMAND_READY)) {
++		/* Force the transition, usually this will be done at startup */
++		ret = tpm_tis_spi_cancel();
++		if (ret)
++			goto out_err;
++
++		ret = tpm_spi_wait_for_stat(TPM_STS_COMMAND_READY,
++						TIS_LONG_TIMEOUT_MS, &status);
++		if (ret < 0 || !(status & TPM_STS_COMMAND_READY))
++			goto out_err;
++	}
++
++	for (i = 0; i < len - 1;) {
++		burstcnt = tpm_spi_get_burstcount();
++		if (burstcnt < 0)
++			return burstcnt;
++
++		size = min_t(int, len - i - 1, burstcnt);
++		ret = tpm_tis_spi_write(TPM_DATA_FIFO(locality),
++					buf + i, size);
++		if (ret < 0)
++			goto out_err;
++
++		i += size;
++	}
++
++	ret = tpm_tis_spi_valid_status(&status);
++	if (ret)
++		goto out_err;
++
++	if ((status & TPM_STS_DATA_EXPECT) == 0) {
++		ret = -EIO;
++		goto out_err;
++	}
++
++	ret = tpm_tis_spi_write(TPM_DATA_FIFO(locality),
++				buf + len - 1, 1);
++	if (ret)
++		goto out_err;
++
++	ret = tpm_tis_spi_valid_status(&status);
++	if (ret)
++		goto out_err;
++
++	if ((status & TPM_STS_DATA_EXPECT) != 0) {
++		ret = -EIO;
++		goto out_err;
++	}
++
++	data = TPM_STS_GO;
++	ret = tpm_tis_spi_write(TPM_STS(locality), &data, 1);
++	if (ret)
++		goto out_err;
++
++	return len;
++
++out_err:
++	tpm_tis_spi_cancel();
++	tpm_tis_spi_release_locality(locality, false);
++
++	return ret;
++}
++
++static int tpm_tis_wait_init(int loc)
++{
++	uint64_t start;
++	uint8_t status;
++	int ret;
++
++	start = boot_rom_get_ts_us();
++	do {
++		ret = tpm_tis_spi_read(TPM_ACCESS(loc), &status, 1);
++		if (ret)
++			break;
++
++		if ((status & TPM_ACCESS_VALID) && (status != 0xff))
++			return 0;
++
++	} while (!boot_rom_timeout_expired(start, MS_TO_US(TIS_LONG_TIMEOUT_MS)));
++
++	return -1;
++}
++
++int tpm2_init(void)
++{
++	int ret;
++
++	locality = 0;
++
++	if (!tpm_is_supported())
++		return 0;
++
++	tpm_spi_init();
++
++	ret = tpm_tis_wait_init(locality);
++	if (ret)
++		return ret;
++
++	ret = tpm_tis_spi_request_locality(locality);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int tpm_xfer(const uint8_t *sendbuf, size_t send_size,
++	uint8_t *recvbuf, size_t *recv_size)
++{
++	unsigned int count;
++	int ret = 0;
++
++	/* switch endianness: big->little */
++	count = get_unaligned_be32(sendbuf + TPM_CMD_COUNT_BYTE);
++
++	if (count == 0)
++		return -1;
++
++	if (count > send_size)
++		return -1;
++
++	ret = tpm_spi_send(sendbuf, send_size);
++	if (ret < 0)
++		return ret;
++
++	ret = tpm_spi_recv(tpm_buf, sizeof(tpm_buf));
++	if (ret >= 0) {
++		if (ret > (int)*recv_size)
++			return -1;
++		memcpy(recvbuf, tpm_buf, ret);
++		*recv_size = ret;
++		ret = 0;
++	}
++
++	return ret;
++}
++
++static int tpm_spi_sendrecv_command(const void *command,
++			 void *response, size_t *size_ptr)
++{
++	int err;
++	size_t response_length;
++
++	if (response) {
++		response_length = *size_ptr;
++	} else {
++		response = cmd_response_buffer;
++		response_length = sizeof(cmd_response_buffer);
++	}
++
++	err = tpm_xfer(command, tpm_command_size(command),
++		       response, &response_length);
++
++	if (err < 0)
++		return err;
++
++	if (size_ptr)
++		*size_ptr = response_length;
++
++	return tpm_return_code(response);
++}
++
++#define TPM_STARTUP_COMMAND_BUF_SIZE	12
++int tpm2_startup(enum tpm2_startup_types mode)
++{
++	const uint8_t command_v2[TPM_STARTUP_COMMAND_BUF_SIZE] = {
++		tpm_u16(TPM2_ST_NO_SESSIONS),
++		tpm_u32(TPM_STARTUP_COMMAND_BUF_SIZE),
++		tpm_u32(TPM2_CC_STARTUP),
++		tpm_u16(mode),
++	};
++	int ret;
++
++	/*
++	 * Note TPM2_Startup command will return RC_SUCCESS the first time,
++	 * but will return RC_INITIALIZE otherwise.
++	 */
++	ret = tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++	if (ret && ret != TPM2_RC_INITIALIZE)
++		return ret;
++
++	return 0;
++}
++
++static int tpm2_pack_byte_string(uint8_t *str, size_t size, const char *format, ...)
++{
++	va_list args;
++	size_t offset = 0, length = 0;
++	uint8_t *data = NULL;
++	uint32_t value = 0;
++
++	va_start(args, format);
++	for (; *format; format++) {
++		switch (*format) {
++		case 'b':
++			offset = va_arg(args, size_t);
++			value = va_arg(args, int);
++			length = 1;
++			break;
++		case 'w':
++			offset = va_arg(args, size_t);
++			value = va_arg(args, int);
++			length = 2;
++			break;
++		case 'd':
++			offset = va_arg(args, size_t);
++			value = va_arg(args, uint32_t);
++			length = 4;
++			break;
++		case 's':
++			offset = va_arg(args, size_t);
++			data = va_arg(args, uint8_t *);
++			length = va_arg(args, uint32_t);
++			break;
++		default:
++			va_end(args);
++			return -1;
++		}
++
++		if (offset + length > size) {
++			va_end(args);
++			return -1;
++		}
++
++		switch (*format) {
++		case 'b':
++			str[offset] = value;
++			break;
++		case 'w':
++			put_unaligned_be16(value, str + offset);
++			break;
++		case 'd':
++			put_unaligned_be32(value, str + offset);
++			break;
++		case 's':
++			memcpy(str + offset, data, length);
++			break;
++		}
++	}
++	va_end(args);
++
++	return 0;
++}
++
++int tpm2_pcr_extend(uint32_t index, uint32_t algorithm, const uint8_t *digest, uint32_t digest_len)
++{
++	/* Length of the message header, up to start of digest */
++	uint32_t offset = 33;
++	uint8_t command_v2[COMMAND_BUFFER_SIZE] = {
++		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
++		tpm_u32(offset + digest_len),	/* Length */
++		tpm_u32(TPM2_CC_PCR_EXTEND),	/* Command code */
++
++		/* HANDLE */
++		tpm_u32(index),			/* Handle (PCR Index) */
++
++		/* AUTH_SESSION */
++		tpm_u32(9),			/* Authorization size */
++		tpm_u32(TPM2_RS_PW),		/* Session handle */
++		tpm_u16(0),			/* Size of <nonce> */
++						/* <nonce> (if any) */
++		0,				/* Attributes: Cont/Excl/Rst */
++		tpm_u16(0),			/* Size of <hmac/password> */
++						/* <hmac/password> (if any) */
++
++		/* hashes */
++		tpm_u32(1),			/* Count (number of hashes) */
++		tpm_u16(algorithm),	/* Algorithm of the hash */
++		/* STRING(digest)		   Digest */
++	};
++	int ret;
++
++	/*
++	 * Fill the command structure starting from the first buffer:
++	 *     - the digest
++	 */
++	ret = tpm2_pack_byte_string(command_v2, sizeof(command_v2), "s",
++			       offset, digest, digest_len);
++	if (ret)
++		return TPM_LIB_ERROR;
++
++	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++}
+diff --git a/common/tpm2.h b/common/tpm2.h
+new file mode 100644
+index 0000000..5a6e4be
+--- /dev/null
++++ b/common/tpm2.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _TPM2_H_
++#define _TPM2_H_
++
++#include <hl_tpm2.h>
++
++int tpm2_init(void);
++int tpm2_startup(enum tpm2_startup_types mode);
++int tpm2_pcr_extend(uint32_t index, uint32_t algorithm, const uint8_t *digest, uint32_t digest_len);
++
++#endif /* _TPM2_H_ */
+diff --git a/include/mem_io.h b/include/mem_io.h
+index ffd26ae..de1ba6f 100644
+--- a/include/mem_io.h
++++ b/include/mem_io.h
+@@ -8,6 +8,7 @@
+ 
+ #include <stdint.h>
+ #include <soc.h>
++#include <spi.h>
+ 
+ #define HL_FLASH_BASE				(HL_GEN_MEM_BASE + HL_FLASH_OFFSET)
+ #define HL_SBROM_BASE				(HL_FW_MEM_BASE + HL_SBROM_OFFSET)
+@@ -71,4 +72,14 @@
+ 	*((volatile uint32_t *)(HL_CFG_BASE + offset)) = (uint32_t)val;
+ }
+ 
++static inline void spi_dw_writel(struct spi_ctx *ctx, uint32_t val, uint32_t offset)
++{
++	regmap_writel(val, ctx->spi_base + offset);
++}
++
++static inline uint32_t spi_dw_readl(struct spi_ctx *ctx, uint32_t offset)
++{
++	return regmap_readl(ctx->spi_base + offset);
++}
++
+ #endif /* _MEM_IO_H_ */

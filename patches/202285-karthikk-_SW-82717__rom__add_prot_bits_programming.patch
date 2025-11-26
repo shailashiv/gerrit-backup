@@ -1,0 +1,83 @@
+From d7ded5c2c53024e4196915045a6fbf87cb42c719 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Sat, 23 Apr 2022 17:45:58 +0300
+Subject: [PATCH] [SW-82717] rom: add prot bits programming
+
+In recovery flow, we need to open the PSOC_GLOBAL_CONF registers
+for fw loader application to access config spare registers. All
+other registers marked in soconline as privileged needs to be
+blocked using protection bits.
+
+Hence protection bits programming is added in rom.
+
+Change-Id: I8013e423fd3101d8523a81db5ccc937332521d7f
+---
+
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index 2462387..3789e2a 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -26,6 +26,18 @@
+ 				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
+ 				KEY_PROP_NB_SZ)
+ 
++/*
++ * PSOC_GLOBAL_CONF protection bit register position in SPECAIL_GLBL_PRIV
++ * which require user defined configuration value
++ */
++enum prot_bits_reg_idx {
++	BTM_FSM_PRSTN_REG_IDX = 0,
++	BTL_ROM_STATUS_REG_IDX = 1,
++	SCRATCHPAD_REG_IDX = 2,
++	KMD_MSG_TO_CPU_REG_IDX = 6,
++	PROT_BITS_MAX_CONF,
++};
++
+ /* 784 + 8 = 792 */
+ #define TOTAL_PUB_KEY_PROPS_SZ  (PUB_KEY_SZ + KEY_PROP_HDR_SZ)
+ 
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index fa7be13..7253a04 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -884,8 +884,40 @@
+ 	security_rr_config_hbw_if_common(&rr_ctx);
+ }
+ 
++#define SPECIAL_PRIV_PROTECT_ALL	0x0
++#define SPECIAL_PRIV_OPEN_ALL		0xFFFFFFFF
++#define MAX_NUM_SPECIAL_PRIV_REGS	32
++#define SPECIAL_GLBL_SEC_IDX		30
++static uint32_t prot_bits_user_config[PROT_BITS_MAX_CONF] = {
++	0x20400,
++	0x8,
++	SPECIAL_PRIV_OPEN_ALL,
++	SPECIAL_PRIV_PROTECT_ALL,
++	SPECIAL_PRIV_PROTECT_ALL,
++	SPECIAL_PRIV_PROTECT_ALL,
++	0x3,
++};
++
++void security_prot_bits_config(void)
++{
++	int i, reg_addr;
++	for (i = 0; i < MAX_NUM_SPECIAL_PRIV_REGS; i++)
++	{
++		reg_addr = mmD0_PSOC_GLOBAL_CONF_SPECIAL_GLBL_PRIV_0 + i * sizeof(uint32_t);
++
++		if (i < PROT_BITS_MAX_CONF)
++			regmap_writel(prot_bits_user_config[i], reg_addr);
++		else if (i == SPECIAL_GLBL_SEC_IDX)
++			/* TODO: Check if explicit write to sec reg is required */
++			regmap_writel(SPECIAL_PRIV_OPEN_ALL, reg_addr);
++		else
++			regmap_writel(SPECIAL_PRIV_PROTECT_ALL, reg_addr);
++	}
++}
++
+ void security_rr_recovery_config(void)
+ {
++	security_prot_bits_config();
+ 	security_rr_recovery_lbw_config();
+ 	security_rr_recovery_hbw_config();
+ }

@@ -1,0 +1,94 @@
+From c4c71f95f04a544e9981ab0a3d4484f28e4fe9de Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 03 Oct 2022 21:13:45 +0300
+Subject: [PATCH] [SW-0] gaudi3: qualify spi gw access via fuse
+
+Currently upon fuse emulation, master die provides required fuse
+values to slave die by writing to slave scratchpad registers using
+spi gateway. Recommendation from ARCH team is to qualify usage of spi
+gateway with fuse. This patch adds new fuse bit BIT(23) (d2d spi gw en)
+to determine access of spi gw as below.
+
+Value 0: Skip usage of spi gw. From ROM POV, Master die skips providing
+values to slave die via spi gw and slave die skips waiting for fuse
+emulation values from master.
+Value 1: Use spi gw. From ROM POV, Master uses spi gw to write values to
+slave die and slave die waits for indication from master die to
+read the fuse values.
+
+This efuse bit can be used by other FW component to determine usage
+of spi gw.
+
+Change-Id: Ifdd9463fa3ac032a8a6fda55ff50d1e963e6e7d3
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index cd6e246..591e509 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -568,6 +568,16 @@
+ 	return !!(arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_CONTROL_MASK);
+ }
+ 
++int arcboot_rom_fuse_d2d_spi_gw_en(void)
++{
++	/*
++	 * SPI GW EN FUSE LOCATION
++	 * 0: Skip access via SPI GW
++	 * 1: Perform access via SPI GW
++	 */
++	return !!(arcboot_rom_global.config_fuse & EFUSE_SYSCFG_D2D_SPI_GW_EN_LOCATION_MASK);
++}
++
+ void arcboot_rom_halt(void)
+ {
+ 	while (1)
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index be90e6b..7fd6e0f 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -39,3 +39,4 @@
+ bool arcboot_is_valid_start_addr(struct boot_desc *desc);
+ int arcboot_rom_efuse_boot_info_skip(void);
+ int arcboot_rom_fuse_pcie_ctrl_config(void);
++int arcboot_rom_fuse_d2d_spi_gw_en(void);
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index a0e1828..ac4a9a4 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -27,6 +27,7 @@
+ #define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(17)
+ #define EFUSE_SYSCFG_OOB_PROTOCOL			BIT(19)
+ #define EFUSE_SYSCFG_BACKUP_DISABLE			BIT(22)
++#define EFUSE_SYSCFG_D2D_SPI_GW_EN_LOCATION_MASK	BIT(23)
+ #define EFUSE_SYSCFG_SKU_MASK				BIT(26)
+ #define EFUSE_SYSCFG_PCIE_CONTROL_MASK			BIT(29)
+ #define EFUSE_SYSCFG_I3C_EROM_ENABLE_MASK		BIT(31)
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index a237397..095e8ef 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -46,6 +46,9 @@
+ 	uint64_t start;
+ 	uint32_t val;
+ 
++	if (!arcboot_rom_fuse_d2d_spi_gw_en())
++		return;
++
+ 	/* Clear indication before polling */
+ 	regmap_writel(0x0, mmFFUSE_WRITE_IND);
+ 
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+index 967d16f..ad74551 100644
+--- a/arch/gaudi3/arc/spi_flash.c
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -47,6 +47,9 @@
+ 	if (arcboot_rom_global.sku)
+ 		return;
+ 
++	if (!arcboot_rom_fuse_d2d_spi_gw_en())
++		return;
++
+ 	if (!arcboot_rom_global.fuse_emulation_done) {
+ 		/* Slave spi offset is stored in img_desc->spi_offset[1] */
+ 		idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, HL_FW_IMG_FAKE_EFUSE,

@@ -1,0 +1,149 @@
+From 3ab19a7f9bbf37feff50b679036b04b7739a8d10 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Fri, 22 Mar 2024 08:12:30 +0200
+Subject: [PATCH] [FSW-402] fs1: recovery: check gpio recovery
+
+This patch checks if gpio force recovery is enabled and
+puts bootrom in recovery mode if gpio1 recovery is set to 0.
+
+Change-Id: I1ae39f35f8f20d39799b51594e60f40f33932986
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index 01f69b0..1e22fc0 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -33,5 +33,7 @@
+ 
+ 	boot_rom_disable_spi_gw();
+ 
++	boot_rom_check_n_enter_recovery();
++
+ 	return 0;
+ }
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 51dabd2..1a448af 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -16,6 +16,7 @@
+ #include <d2d_spi_regs.h>
+ #include <d2d_spi_masks.h>
+ #include <fs1_reg_mask.h>
++#include <gpio_regs.h>
+ #include <fs1_fw_if.h>
+ #include <status.h>
+ #include <efuse.h>
+@@ -192,4 +193,14 @@
+ 	/* TODO: FS1 SKU decession */
+ 
+ 	/* TODO: Enable FAKE FUSE & RMA support */
+-}
+\ No newline at end of file
++}
++
++bool boot_rom_efuse_force_recovery_en(void)
++{
++	return ((boot_rom_global.config_fuse & EFUSE_SYSCFG_GPIO01_RECOVERY_CONTROL) == 0);
++}
++
++uint8_t boot_rom_read_force_recovery_gpio(void)
++{
++	return regmap_readl(I0_H0_PSOC_GPIO0(mmGPIO_DATA)) & FORCE_RECOVERY_MASK;
++}
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 120190c..9fa6f9f 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -303,3 +303,4 @@
+ 	 */
+ 	arcboot_rom_halt();
+ }
++
+diff --git a/common/common.c b/common/common.c
+index 16484ac..e03605f 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -9,6 +9,7 @@
+ #include <common.h>
+ #include <delay.h>
+ #include <spi_flash.h>
++#include <recovery.h>
+ 
+ void boot_rom_init(void)
+ {
+@@ -36,3 +37,19 @@
+ 
+ 	spi_flash_init();
+ }
++
++void boot_rom_check_n_enter_recovery(void)
++{
++	uint8_t override = 1;
++
++	if (boot_rom_efuse_force_recovery_en())
++		override = boot_rom_read_force_recovery_gpio();
++
++	/*
++	 * Enter recovery if automated GPIO[FORCE_RECOVERY_MASK] is asserted
++	 * or boot descriptor initialization for SPI manifest is failed
++	 * TODO: Add boot desc init failure check
++	 */
++	if (override == 0)
++		execute_recovery();
++}
+diff --git a/common/common.h b/common/common.h
+index c9b16d6..1bb6f3a 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -14,5 +14,7 @@
+ void boot_rom_read_cold_flops(void);
+ void boot_rom_iccm_init(void);
+ void boot_rom_disable_spi_gw(void);
++bool boot_rom_efuse_force_recovery_en(void);
++uint8_t boot_rom_read_force_recovery_gpio(void);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/common/recovery.c b/common/recovery.c
+new file mode 100644
+index 0000000..6610a27
+--- /dev/null
++++ b/common/recovery.c
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++void execute_recovery(void)
++{
++	/* Empty Body TODO: Add recovery functionality */
++}
+diff --git a/common/recovery.h b/common/recovery.h
+new file mode 100644
+index 0000000..7df4ccd
+--- /dev/null
++++ b/common/recovery.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _RECOVERY_H_
++#define _RECOVERY_H_
++
++void execute_recovery(void);
++
++#endif /* _RECOVERY_H_ */
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index e49fe13..0922ba7 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -102,5 +102,6 @@
+ enum boot_rom_die_type boot_rom_get_die_type(void);
+ void boot_rom_init(void);
+ void boot_rom_fuse(void);
++void boot_rom_check_n_enter_recovery(void);
+ 
+ #endif /* _BOOT_ROM_H_ */

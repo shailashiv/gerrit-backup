@@ -1,0 +1,196 @@
+From f3cc687a12bb4b4aa2c033fa74a71964185d3860 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 25 Nov 2024 06:24:03 +0200
+Subject: [PATCH] [FSW-7256] fs1: configure protection bits
+
+With this patch added generic api to accept array
+of protection bits page configuration, and it is
+written to optimize pb reg sets length when
+actual data is less. Also when continuous bit
+stream to be set in 29 reg copies, simple window
+concept can be used to program multiple windows.
+
+Change-Id: I595e78f973715e16edffc945422a663098215257
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 5c6dd38..d9e56c0 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -23,6 +23,8 @@
+ #include <psoc_boot_conf_regs.h>
+ #include <psoc_boot_conf_masks.h>
+ #include <dev_boot_info.h>
++#include <special_regs_regs.h>
++#include <limits.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -168,6 +170,29 @@
+ 		},	\
+ 	},	\
+ }
++
++static const uint32_t pb_access_reg[PB_GROUP_MAX] = {
++	mmSPECIAL_REGS_PROT_RO_GRP_0,
++	mmSPECIAL_REGS_PROT_RO_GRP_1,
++	mmSPECIAL_REGS_PROT_RO_GRP_2,
++};
++
++static const uint32_t pb_reg[PB_GROUP_MAX] = {
++	mmSPECIAL_REGS_PROT_BITS_GRP_0_0,
++	mmSPECIAL_REGS_PROT_BITS_GRP_1_0,
++	mmSPECIAL_REGS_PROT_BITS_GRP_2_0,
++};
++
++static const uint32_t pb_sai_reg[PB_GROUP_MAX] = {
++	mmSPECIAL_REGS_PROT_SAI_GRP_0,
++	mmSPECIAL_REGS_PROT_SAI_GRP_1,
++	mmSPECIAL_REGS_PROT_SAI_GRP_2,
++};
++
++enum prot_bits_sec_status {
++	PROT_BIT_NO_PROVISION,
++	PROT_BIT_SAI_PROVISIONED,
++};
+ 
+ void security_load_revoke_bits(void)
+ {
+@@ -409,3 +434,123 @@
+ 
+ 	regmap_writel(val, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_JTAG_DISABLE));
+ }
++
++static uint32_t prepare_mask(uint8_t min, uint8_t max)
++{
++	uint32_t mask = PB_CONF_ALL_PROTECTED;
++
++	mask = mask >> min << min;
++	mask = mask << (31 - max) >> (31 - max);
++
++	return mask;
++}
++
++static void prepare_pb_mask_array(uint32_t min_bit, uint32_t max_bit, uint32_t mask_array[], uint8_t length)
++{
++	uint32_t array_index, cur_min, msb, i;
++
++	cur_min = min_bit;
++	for (i = 0; i < length; i++) {
++		array_index = cur_min / 32;
++		msb = (32 * (array_index + 1)) - 1;
++
++		if (max_bit <= msb) {
++			mask_array[array_index] = prepare_mask(cur_min, max_bit);
++			return;
++		} else {
++			mask_array[array_index] = prepare_mask(cur_min, msb);
++		}
++		cur_min = msb + 1;
++	}
++}
++
++static uint32_t set_bit_index(uint32_t filter)
++{
++	uint32_t i, count = 0;
++
++	for (i = 0; i < (sizeof(uint32_t) * CHAR_BIT); i++) {
++		if ((filter >> i) & 1)
++			count += 1;
++	}
++
++	return count;
++}
++
++static void program_prot_bit_reg(uint32_t spl_base, uint32_t grp, struct pb_grp_ctx grp_cfg)
++{
++	regmap_writel(grp_cfg.access_type, spl_base + pb_access_reg[grp]);
++	regmap_writel(grp_cfg.sai_mask, spl_base + pb_sai_reg[grp]);
++}
++
++static void write_protection_bits(uint32_t spl_base, uint32_t grp, uint32_t set_idx, uint32_t data)
++{
++	regmap_writel(data, spl_base + pb_reg[grp] + (set_idx * sizeof(uint32_t)));
++}
++
++void boot_rom_program_prot_bits(struct pb_page_ctx *pb_cfg_data, uint32_t pb_cfg_size)
++{
++	uint32_t mask_array[PB_MAX_REG_COPY_PER_GROUP];
++	struct pb_grp_ctx grp_cfg;
++	uint8_t i, group, set_idx;
++	uint32_t page, spl_base, filter_bit_ind;
++	uint32_t pb_mask_len, pb_mask_filter;
++
++	for (page = 0; page < pb_cfg_size; page++) {
++		spl_base = pb_cfg_data[page].spl_base;
++
++		for(group = 0; group < PB_GROUP_MAX; group++) {
++			grp_cfg = pb_cfg_data[page].pb_grp_cfg[group];
++
++			if (grp_cfg.close_all != 0) {
++				program_prot_bit_reg(spl_base, group, grp_cfg);
++
++			} else if (grp_cfg.win_len == 0) {
++				program_prot_bit_reg(spl_base, group, grp_cfg);
++
++				pb_mask_filter = grp_cfg.pb_mask_filter;
++				pb_mask_len = grp_cfg.pb_mask_len;
++
++				if (pb_mask_filter == 0) {
++					/* Write pb_mask as it is, no bit sequence filter */
++					for (set_idx = 0; set_idx < pb_mask_len; set_idx++) {
++						write_protection_bits(spl_base, group, set_idx, grp_cfg.pb_mask[set_idx]);
++					}
++				} else {
++					/* Use pb_mask_filter bit sequence filter */
++					if (grp_cfg.pb_mask_set == 0) {
++						/* Write data from pb_mask based on pb_mask_filter bit sequence */
++						if (set_bit_index(pb_mask_filter) == pb_mask_len) {
++							filter_bit_ind = 0;
++							for (set_idx = 0; (set_idx < PB_MAX_REG_COPY_PER_GROUP) && (pb_mask_filter >> set_idx); set_idx++) {
++								if ((pb_mask_filter >> set_idx) & 1) {
++									write_protection_bits(spl_base, group, set_idx, grp_cfg.pb_mask[filter_bit_ind]);
++									filter_bit_ind += 1;
++								}
++							}
++						} else {
++							/* TODO: report if mask len not equal to bit set count in filter */
++						}
++					} else {
++						/* Write 32bit mask based on pb_mask_filter bit sequence */
++						for (set_idx = 0; (set_idx < PB_MAX_REG_COPY_PER_GROUP) && (pb_mask_filter >> set_idx); set_idx++) {
++							if ((pb_mask_filter >> set_idx) & 1) {
++								write_protection_bits(spl_base, group, set_idx, PB_CONF_ALL_PROTECTED);
++							}
++						}
++					}
++				}
++			} else if (grp_cfg.win_len != 0) {
++				for (i = 0; i < PB_MAX_REG_COPY_PER_GROUP; i++)
++					mask_array[i] = 0;
++
++				program_prot_bit_reg(spl_base, group, grp_cfg);
++
++				for (i = 0; i < grp_cfg.win_len; i++)
++					prepare_pb_mask_array(grp_cfg.win_strt[i], grp_cfg.win_stop[i], mask_array, PB_MAX_REG_COPY_PER_GROUP);
++
++				for (set_idx = 0; set_idx < PB_MAX_REG_COPY_PER_GROUP; set_idx++)
++					write_protection_bits(spl_base, group, set_idx, mask_array[set_idx]);
++			}
++		} /* group for loop */
++	} /* page for loop */
++}
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 94d1546..9c2d483 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -64,6 +64,9 @@
+ 	PB_PAGE_PSOC_CFG_PAD_CONF,
+ };
+ 
++#define PB_MAX_REG_COPY_PER_GROUP		29
++#define PB_CONF_ALL_PROTECTED			0xFFFFFFFF
++
+ /* Various blocks to be configured during boot rom in recovery */
+ enum security_access_ctrl_zones {
+ 	SEC_ACCESS_CTRL_QSPI,

@@ -1,0 +1,402 @@
+From 82f8c134ff6857c40903f3e80305fa8612d35ba3 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Tue, 02 Feb 2021 15:06:13 +0200
+Subject: [PATCH] [SW-20154] gaudi2: add support for image verification
+
+This patch enables RSA3072 verification of images using
+Uboot APIs and SHA384 checksum. In Gaudi2, there are only
+two possible locations for Keys - eFUSE and ROM. Hence
+the key hash checking is modified accordingly.
+
+Change-Id: Id06ea1a32ac2e88e0b616209f416372ea076318a
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/common/security.c b/common/security.c
+index 0c6a4c1..5302886 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -158,7 +158,7 @@
+ 	return -1;
+ }
+ 
+-int security_get_key_hash(uint32_t *hash, uint8_t customer)
++__attribute__((weak)) int security_get_key_hash(uint32_t *hash, uint8_t customer)
+ {
+ 	uint32_t valid_key_base;
+ 	int i;
+@@ -267,7 +267,7 @@
+ 		      SECURITY_EFUSE_FW_VERSION_OFFSET);
+ }
+ 
+-void security_load_keys(void)
++__attribute__((weak)) void security_load_keys(void)
+ {
+ 	uint8_t hash_key_index;
+ 	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
+diff --git a/common/security.h b/common/security.h
+index a2de5e3..196fb62 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -33,7 +33,6 @@
+ #define SECURITY_FW_VERSION_TO_SECURITY_BYTE(x)		((x >> 24) & 0xFF)
+ #define SECURITY_FW_VERSION_FROM_SECURITY_BYTE(x)	((x & 0xFF) << 24)
+ 
+-#define SECURITY_KEY_HASH_COUNT				5
+ #define SECURITY_KEY_HASH_HABANA_COUNT			1
+ #define SECURITY_DWORD_BIT_SIZE				(sizeof(uint32_t) * \
+ 							 CHAR_BIT)
+diff --git a/gaudi2_arc/dev_security.h b/gaudi2_arc/dev_security.h
+index ad70e78..28a618e 100644
+--- a/gaudi2_arc/dev_security.h
++++ b/gaudi2_arc/dev_security.h
+@@ -8,6 +8,31 @@
+ #ifndef _GAUDI2_DEV_SECURITY_H_
+ #define _GAUDI2_DEV_SECURITY_H_
+ 
++#include <sha512.h>
++
++#define NUM_KEYS_IN_ROM					5
++#define NUM_KEYS_IN_EFUSE				3
+ #define SECURITY_DWORD_PER_KEY				12
++#define SECURITY_KEY_HASH_COUNT				3
++
++enum security_key_location {
++	KEY_LOCATION_EFUSE,
++	KEY_LOCATION_ROM
++};
++
++/* size of key properties in bytes */
++#define KEY_PROP_RR_SZ  				384
++#define KEY_PROP_MOD_SZ					384
++#define KEY_PROP_EXP_SZ					8
++#define KEY_PROP_INV_SZ					4
++#define KEY_PROP_NB_SZ					4
++#define KEY_PROP_HDR_SZ					8
++
++/* 384 + 384 + 8 + 4 + 4 + 8 = 792 */
++#define TOTAL_PUB_KEY_PROPS_SZ  (KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
++				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
++				KEY_PROP_NB_SZ + KEY_PROP_HDR_SZ)
++
++extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+ #endif /* _GAUDI2_DEV_SECURITY_H_ */
+diff --git a/gaudi2_arc/secureboot.c b/gaudi2_arc/secureboot.c
+index eea9ba2..2ef2f58 100644
+--- a/gaudi2_arc/secureboot.c
++++ b/gaudi2_arc/secureboot.c
+@@ -3,13 +3,123 @@
+  * Copyright (C) 2021 HabanaLabs Ltd.
+  */
+ 
+-#include <stdio.h>
+-#include "sb.h"
+-#include "arcboot.h"
+-#include "efuse.h"
+-#include "secureboot.h"
+-#include "security.h"
++#include <string.h>
++#include <arcboot.h>
++#include <efuse.h>
++#include <secureboot.h>
++#include <security.h>
++#include <dev_security.h>
++#include <rsa.h>
++#include <sha512.h>
+ 
++
++const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN] = {
++	/* Habana Public Key */
++	{
++		0x09, 0xa8, 0xdd, 0xac, 0xbe, 0x8a, 0x6d, 0x34,
++		0x94, 0x23, 0x62, 0x7c, 0xd6, 0x11, 0xe8, 0x15,
++		0xb4, 0x44, 0xe2, 0x8d, 0x81, 0xc9, 0xc5, 0xd0,
++		0x49, 0x3d, 0xd6, 0x4f, 0x10, 0xac, 0xdf, 0x83,
++		0x04, 0x61, 0xb5, 0xde, 0x3e, 0x58, 0x5a, 0x73,
++		0x18, 0xb4, 0x56, 0xbc, 0xcc, 0x91, 0xf0, 0xed
++	},
++	/* Additional Keys - TODO */
++	{
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
++	},
++	{
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
++	},
++	{
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
++	},
++	{
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
++		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
++	}
++};
++
++static int security_check_key_revoke_status(uint32_t key_index)
++{
++	uint8_t max_key_index = NUM_KEYS_IN_EFUSE, key_revoke;
++
++	/*
++	 * Key index ranges from:
++	 * 0 - 4: if key location == ROM (1)
++	 * 0 - 2: if key location == eFUSE (0)
++	 */
++	/* check efuse for key location */
++	if ((arcboot_rom_global.config_fuse >> EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK)
++		max_key_index = NUM_KEYS_IN_ROM;
++
++	if (key_index >= max_key_index)
++		return -1;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++
++	/* if the key is not revoked, return 1 */
++	if ((key_revoke & BIT(key_index)) == 0)
++		return 1;
++
++	/* no valid key found */
++	return -1;
++}
++
++int security_get_key_hash(uint32_t *hash, uint8_t key_index)
++{
++	uint32_t valid_key_base, max_key_index = NUM_KEYS_IN_EFUSE;
++	int i;
++
++	/* check efuse for key location */
++	if ((arcboot_rom_global.config_fuse >> EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK) {
++
++		uint32_t *ptr;
++		max_key_index = NUM_KEYS_IN_ROM;
++
++		if (key_index >= max_key_index)
++			return -1;
++
++		/* read from ROM itself */
++		ptr = (uint32_t *)rom_key_hashes[key_index];
++		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
++			*(hash + i) = ptr[i];
++	} else {
++
++		if (key_index >= max_key_index)
++			return -1;
++
++		/* read from efuse/SP SRAM */
++		valid_key_base = (key_index * SECURITY_BYTE_PER_DWORD *
++			  SECURITY_DWORD_PER_KEY) + SECURITY_EFUSE_KEYS_OFFSET;
++
++		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
++			*(hash + i) = sp_sram_readl(valid_key_base + (i *
++					    SECURITY_BYTE_PER_DWORD));
++	}
++
++	return 1;
++}
+ /*
+  * arcboot - Signature Verification
+  *
+@@ -27,53 +137,60 @@
+  * test_public_key_len   - public key size
+  */
+ 
+-int secureboot_verify_image(__attribute__ ((unused)) uint32_t image_size,
++int secureboot_verify_image(uint32_t image_size,
+ 				uint32_t image_offset)
+ {
+-	int verify = 0;
+-	int err = 0;
+-	int key_scan;
+-	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
++	int verify = 0, ret, key_index;
++	unsigned char expected_hash[SHA384_SUM_LEN];
++	unsigned char actual_hash[SHA384_SUM_LEN];
+ 	uint32_t config_fuse;
++	uint32_t test_public_key_len = KEY_SIZE;
++	uint32_t test_sig_len = SIG_SIZE;
++	uint32_t test_data_len = image_size;
++	unsigned char *test_data = (unsigned char *)(image_offset);
++	unsigned char *test_sig = test_data + test_data_len;
+ 
+-	unsigned char *test_phase0b_data = (unsigned char *)(image_offset);
+-	uint32_t fw_version = base_readl((uint32_t)test_phase0b_data);
++	/* Key header is located as the last 2 DWORDS of the image */
++	unsigned char *ptr_key_index = test_sig - KEY_PROP_HDR_SZ;
++        unsigned char *ptr_key_prop = test_sig - TOTAL_PUB_KEY_PROPS_SZ;
++        unsigned char *test_public_key =  ptr_key_prop - test_public_key_len;
++
++	uint32_t fw_version = base_readl((uint32_t)test_data);
+ 
+ 	/* check efuse for security validation enable */
+ 	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++
+ 	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
+ 		return SECUREBOOT_VERIFY_SUCCESS;
+ 
+ 	/* check minimal valid security FW version */
+ 	if (security_check_valid_fw_version(fw_version) !=
+-	    SECURITY_FW_VERSION_SECURE)
++					SECURITY_FW_VERSION_SECURE)
+ 		return SECUREBOOT_VERIFY_VER_FAILED;
+ 
+-	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
+-	     SECUREBOOT_HABANA_KEY; key_scan--) {
+-		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
+-					  key_scan)) {
++	key_index = *(uint32_t *)ptr_key_index;
+ 
+-			/* check pub key hash versus efuse */
+-			/* TODO: replace with SHA384 function */
+-
+-			verify = 1;
+-		}
+-		/* if key is verified we can exit the loop */
+-		if (verify)
+-			break;
+-	}
+-	/* if for loop doesn't find a valid key hash in fuse, return error */
+-	if (!verify)
++	ret = security_check_key_revoke_status(key_index);
++	if (ret != 1)
+ 		return SECUREBOOT_VERIFY_KEY_FAILED;
+ 
+-	/* Phase0b uses the public key (test_public_key) to validate signature
+-	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
+-	 */
+-	/* TODO: add rsa verification function */
++	ret = security_get_key_hash((uint32_t *)expected_hash, key_index);
++	if (ret != 1)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
+ 
+-	if (err || !verify)
+-		return SECUREBOOT_VERIFY_FAILED;
++	/* check pub key hash versus efuse */
++        sha384_csum(test_public_key, test_public_key_len, actual_hash, 0);
+ 
+-	return verify;
++        verify = memcmp(actual_hash, expected_hash, SHA384_SUM_LEN);
++	if (verify)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	ret = rsa_verify(test_data, test_data_len, test_public_key,
++			test_public_key_len, test_sig, test_sig_len);
++
++	/* 0 - SUCCESS, but arcboot main code, expects 1 for SUCCESS */
++	if (!ret)
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	return SECUREBOOT_VERIFY_FAILED;
+ }
+diff --git a/gaudi2_arc/security.c b/gaudi2_arc/security.c
+index 9afb905..702cdcb 100644
+--- a/gaudi2_arc/security.c
++++ b/gaudi2_arc/security.c
+@@ -88,9 +88,73 @@
+ 	security_dcon_if1_rr_hbw_config(spi_en);
+ }
+ 
+-uint32_t security_key_soc_location_offset(
+-			__attribute__ ((unused)) uint32_t hash_key_index)
++uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
+ {
+-	/* TODO: will be added in next patch */
+-	return 0;
++	uint32_t ret;
++	uint8_t key_soc_base_index;
++	uint8_t key_soc_location_index;
++	uint32_t key_soc_location[] = {
++		mmPSOC_SECURITY_PUBLIC_KEY_0_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_1_0,
++		mmPSOC_SECURITY_PUBLIC_KEY_2_0,
++	};
++
++	/* select which index to choose */
++	key_soc_base_index = hash_key_index / SECURITY_DWORD_PER_KEY;
++	/* key is 384bit, 32bit * 12... which of the 12 location is requested */
++	key_soc_location_index = hash_key_index % SECURITY_DWORD_PER_KEY;
++
++	/* get base address of selected key index */
++	ret = key_soc_location[key_soc_base_index];
++	/* add to base address of key the spicifice location of currect DWORD */
++	ret += (key_soc_location_index * sizeof(uint32_t));
++
++	return ret;
++}
++
++void rom_get_hash(uint32_t *key_hash)
++{
++	uint32_t *ptr = (uint32_t *)rom_key_hashes;
++
++	for (int i = 0; i < SECURITY_KEY_HASH_ARRAY_SIZE; i++)
++		*(key_hash + i) = *(ptr + i);
++}
++
++void security_load_keys(void)
++{
++	uint8_t hash_key_index, num_dwords;
++	uint32_t key_hash[SECURITY_KEY_HASH_ARRAY_SIZE];
++	enum security_key_location key_location;
++
++	key_location = ((arcboot_rom_global.config_fuse >>
++			EFUSE_SYSCFG_KEY_LOCATION) &
++			EFUSE_SYSCFG_KEY_LOCATION_MASK);
++
++	arcboot_rom_status_update(PROGRESS_KEY_LOC);
++	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
++
++	switch (key_location) {
++	case KEY_LOCATION_EFUSE:
++		efuse_get_hash(key_hash);
++		break;
++	case KEY_LOCATION_ROM:
++	default:
++		rom_get_hash(key_hash);
++		break;
++	}
++
++	/* Store 3 key hashes in PSOC SECURITY, due to limited space */
++	num_dwords = NUM_KEYS_IN_EFUSE * SECURITY_DWORD_PER_KEY;
++	for (hash_key_index = 0; hash_key_index < num_dwords;
++	     hash_key_index++)
++		/* store habana key hash in PSOC_SECURITY */
++		regmap_writel(key_hash[hash_key_index],
++			      security_key_soc_location_offset(hash_key_index));
++
++	/* Store the 3 keys in SPSRAM */
++	for (hash_key_index = 0; hash_key_index < num_dwords;
++		hash_key_index++)
++		sp_sram_writel(key_hash[hash_key_index],
++			       SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
++			       SECURITY_BYTE_PER_DWORD));
+ }
+diff --git a/goya2_arc/dev_security.h b/goya2_arc/dev_security.h
+index 1d812e9..626ff68 100644
+--- a/goya2_arc/dev_security.h
++++ b/goya2_arc/dev_security.h
+@@ -9,5 +9,6 @@
+ #define _GOYA2_DEV_SECURITY_H_
+ 
+ #define SECURITY_DWORD_PER_KEY				8
++#define SECURITY_KEY_HASH_COUNT				5
+ 
+ #endif /* _GOYA2_DEV_SECURITY_H_ */

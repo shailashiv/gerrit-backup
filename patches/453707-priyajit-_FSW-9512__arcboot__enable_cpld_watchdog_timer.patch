@@ -1,0 +1,108 @@
+From 921a8a2c9346f072d709f2ef2fc1a837f5e6f645 Mon Sep 17 00:00:00 2001
+From: Priyajit Ghosh <prghosh@habana.ai>
+Date: Tue, 01 Oct 2024 14:43:26 +0300
+Subject: [PATCH] [FSW-9512] arcboot: enable cpld watchdog timer
+
+This code will start cpld boot watchdog timer before going
+to ppboot. If boot WD timer expires CPLD will set
+Force Recovery GPIO(GPIO_01). When boot rom check this GPIO
+in next reset which is because of ppboot load fail, leads to
+enter recovery.
+
+Change-Id: I6cc443ccacd7011e48541a06ea283b39bf0f8636
+Signed-off-by: Priyajit Ghosh <prghosh@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 73532a7..5178d21 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -25,6 +25,8 @@
+ #include "progress_bits.h"
+ #include <dev_mem_copy.h>
+ #include <lfs_wrapper.h>
++#include <psoc_pad_conf_regs.h>
++#include <gpio_regs.h>
+ 
+ extern const int fs1_die_type;
+ 
+@@ -428,3 +430,29 @@
+ 	cold_rst_data.valid_manifest_idx = man_idx;
+ 	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ }
++
++
++/*
++ * Request CPLD to start the watchdog, by asserting
++ * a GPIO_66 (Boot_WD).
++ */
++#define GPIOS_PER_BANK			16
++#define FS1_CPLD_WDOG_GPIO		66
++void boot_rom_start_cpld_wdtimer(void)
++{
++	uint32_t index = FS1_CPLD_WDOG_GPIO % GPIOS_PER_BANK;
++	uint32_t val, mask = BIT(index);
++
++	regmap_writel(GPIO_FUNC_1, IO0_H0_PSOC_CFG_PAD_CONF_PAD_SEL(mmPSOC_PAD_CONF_PAD_SEL_66));
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++	val = val | mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++
++	/* gpio is active high */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++	val = val | mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++
++}
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index e7e281a..2f4fc52 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -114,11 +114,11 @@
+ 	if (boot_desc_get_img_desc(man_idx, HL_FW_IMG_PPBOOT, &desc, 0) == BOOT_ROM_SUCCESS) {
+ 		/* No need to verify as image validation is done in previous boot */
+ 		if (desc.start_addr) {
+-			/* TODO: Start CPLD watchdog timer */
+ 			/* TODO: Report security image fw version */
+ 			ppboot = (void *)((uint32_t)boot_rom_get_arc_addr(desc.start_addr));
+ 			boot_rom_status_update(PROGRESS_PPBOOT_START);
+ 			boot_rom_putc('p');
++			boot_rom_start_cpld_wdtimer();
+ 			ppboot();
+ 		}
+ 	}
+@@ -158,11 +158,11 @@
+ 	/* TODO: TPM PCR extend */
+ 
+ 	if (desc.start_addr) {
+-		/* TODO: Start CPLD watchdog timer */
+ 		/* TODO: Report security image fw version */
+ 		ppboot = (void *)((uint32_t)boot_rom_get_arc_addr(desc.start_addr));
+ 		boot_rom_status_update(PROGRESS_PPBOOT_START);
+ 		boot_rom_putc('p');
++		boot_rom_start_cpld_wdtimer();
+ 		ppboot();
+ 	}
+ 
+@@ -290,7 +290,7 @@
+ 		/* TODO: Validate recovery image hash */
+ 
+ 		if (desc.start_addr) {
+-			/* TODO: Start CPLD watchdog timer */
++			boot_rom_start_cpld_wdtimer();
+ 			recovery = (void *)((uint32_t)boot_rom_get_arc_addr(desc.start_addr));
+ 			boot_rom_status_update(PROGRESS_BOOT_RECOVERY_IMG_IMG0_START);
+ 			recovery();
+diff --git a/common/common.h b/common/common.h
+index 439872b..c1a6080 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -35,5 +35,6 @@
+ uint32_t boot_rom_verify_manifest(enum hl_fw_manifest_type manifest_idx);
+ void boot_rom_validation_status(bool validation_pass);
+ void boot_rom_set_manifest_index(enum hl_fw_manifest_type manifest_idx);
++void boot_rom_start_cpld_wdtimer(void);
+ 
+ #endif /* _COMMON_H_ */

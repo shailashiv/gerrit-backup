@@ -1,0 +1,193 @@
+From 4d242d3f5223d0201b2ce30be668134a118557df Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Tue, 23 Apr 2024 14:58:38 +0300
+Subject: [PATCH] [FSW-3866] fs1: boot info support over lfs
+
+With this patch, added placeholder for boot info
+over lfs, and defined lfs disk size and offset.
+provided progress bits required for boot info
+status during cold reset and reset scenario's.
+
+Change-Id: I21a66a8fc523727de13e545dcd007ea0703efea4
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index a8fa829..4a4cea7 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -17,6 +17,7 @@
+ 	.die_id = 0,
+ 	.die_type = INVALID_DIE_TYPE,
+ 	.fake_fuse_en = false,
++	.boot_info_set_done = false,
+ };
+ 
+ struct boot_rom_manifest_s __attribute__((section (".rom_manifest_section")))boot_rom_manifest;
+@@ -33,5 +34,7 @@
+ 
+ 	boot_rom_check_n_enter_recovery();
+ 
++	boot_rom_init_boot_info();
++
+ 	return 0;
+ }
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 66e011c..18cccb4 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -11,3 +11,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_uart.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_recovery.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_boot_info.c)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 9c98bcd..0af393e 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -102,6 +102,7 @@
+ 	boot_rom_global.recovery_flag = cold_rst_data.recovery_flag;
+ 	boot_rom_global.validation_pass = cold_rst_data.validation_flag;
+ 	boot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
++	boot_rom_global.boot_info_set_done = cold_rst_data.boot_info_set_done;
+ }
+ 
+ /* TODO: Add functionality once mem init feature is added to memcpy block */
+diff --git a/arch/fs1/arc/dev_boot_info.c b/arch/fs1/arc/dev_boot_info.c
+new file mode 100644
+index 0000000..91ec87e
+--- /dev/null
++++ b/arch/fs1/arc/dev_boot_info.c
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <string.h>
++#include <stdbool.h>
++#include <boot_rom.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++#include <fs1_fw_if.h>
++#include <lfs_wrapper.h>
++#include <hl_sec_if.h>
++#include <status.h>
++#include "dev_efuse.h"
++#include <fs1_blocks_linux_driver.h>
++#include <psoc_boot_conf_regs.h>
++#include <fs1_reg_map.h>
++
++bool boot_rom_skip_boot_info(void)
++{
++	if (boot_rom_global.die_type != IO_DIE_MASTER)
++		return true;
++
++	/* TODO: efuse check can be added here */
++
++	return false;
++}
++
++void boot_rom_init_boot_info(void)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	if(boot_rom_skip_boot_info())
++		return;
++
++	if (!boot_rom_global.boot_info_set_done) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START);
++
++		/* TODO: save boot info required for other FW modules */
++
++		cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++		cold_rst_data.boot_info_set_done = 1;
++		regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH);
++	} else {
++		/* Read and make sure databackup after any reset */
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START);
++
++		/* TODO: retrieve boot info and verify */
++
++		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH);
++	}
++
++	return;
++}
+diff --git a/arch/fs1/arc/dev_boot_info.h b/arch/fs1/arc/dev_boot_info.h
+new file mode 100644
+index 0000000..cbfe35b
+--- /dev/null
++++ b/arch/fs1/arc/dev_boot_info.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++#ifndef _DEV_BOOT_INFO_H_
++#define _DEV_BOOT_INFO_H_
++
++#include <soc.h>
++#include <boot_rom.h>
++
++/* add LFS offset */
++#define OFFSET_32KB		(32 * 1024)
++#define CONFIG_BOOTINFO_ADDR	(HL_FW_MEM_BASE + HL_SCRATCHPAD_SRAM_OFFSET + OFFSET_32KB)
++#define CONFIG_BOOTINFO_SIZE	OFFSET_32KB
++
++#endif	/* _DEV_BOOT_INFO_H_ */
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index 780db47..dafa079 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -124,6 +124,10 @@
+ 	PROGRESS_BOOT_REOCVERY_IMG_IMG0_VERIFICATION_FAIL = 114,
+ 	PROGRESS_BOOT_REOCVERY_IMG_IMG0_START = 115,
+ 	PROGRESS_BOOT_REOCVERY_IMG_IMG0_FINISH = 116,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_START = 117,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_SET_FINISH = 118,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 119,
++	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 120,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/common/littlefs/lfs_wrapper.c b/common/littlefs/lfs_wrapper.c
+index 2fbee33..7658c52 100644
+--- a/common/littlefs/lfs_wrapper.c
++++ b/common/littlefs/lfs_wrapper.c
+@@ -11,12 +11,10 @@
+ #include "lfs.h"
+ #include "util.h"
+ #include <lfs_wrapper.h>
++#include <dev_boot_info.h>
+ 
+ #define DST_SAFE	true
+ #define DST_UNSAFE	false
+-
+-#define CONFIG_BOOTINFO_ADDR	0	/* TODO: Use boot info defines */
+-#define CONFIG_BOOTINFO_SIZE	0	/* TODO: Use boot info defines */
+ 
+ /* TODO: LFS_GLOBAL_VAR_SECTION */
+ bool lfs_init_done = false;
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index 6d1760f..d0fd49d 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -85,6 +85,7 @@
+ 	uint64_t ppboot_start_addr;
+ 	bool fake_fuse_en;
+ 	uint32_t fake_fuse_spi_offset;
++	bool boot_info_set_done;
+ };
+ 
+ struct boot_rom_manifest_s {
+@@ -104,5 +105,6 @@
+ void boot_rom_wait_for_signal(void);
+ void boot_rom_check_n_enter_recovery(void);
+ void boot_rom_bringup_ppboot(void);
++void boot_rom_init_boot_info(void);
+ 
+ #endif /* _BOOT_ROM_H_ */

@@ -1,0 +1,88 @@
+From 35326b00867097fa39920f0f885c88f559ddabab Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 22 Apr 2024 11:46:07 +0300
+Subject: [PATCH] [FSW-401] fs1: efuse: early efuse trigger
+
+This patch is to avoid delay with efuse shadowing
+to efuse data register. For this, boot rom will
+set efuse fsm bit in early boot rom init, and
+continue to initialize psoc resources. Once boot
+rom init completed, check fsm completed shadowing
+efuse data.
+
+Change-Id: Ib650ff1a4d195a2d5256ac7cbb954d72ab39ba55
+---
+
+diff --git a/common/common.c b/common/common.c
+index 5c54d09..cd15cf1 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -29,10 +29,13 @@
+ 
+ 	boot_rom_init_ts();
+ 
++	boot_rom_read_cold_flops();
++
++	/* Early EFUSE read trigger */
++	boot_rom_trigger_fuse_init();
++
+ 	if (boot_rom_global.die_type != IO_DIE_MASTER)
+ 		return;
+-
+-	boot_rom_read_cold_flops();
+ 
+ 	boot_rom_iccm_init();
+ 
+@@ -41,7 +44,7 @@
+ 
+ void boot_rom_fuse(void)
+ {
+-	if (boot_rom_fuse_init() != BOOT_ROM_SUCCESS)
++	if (boot_rom_check_fuse_init_done() != BOOT_ROM_SUCCESS)
+ 		goto efuse_fail_halt;
+ 
+ 	if (boot_rom_read_config_fuse() != BOOT_ROM_SUCCESS)
+diff --git a/common/efuse.c b/common/efuse.c
+index bdb18b1..3e02fcc 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -32,17 +32,22 @@
+ 	return BOOT_ROM_SUCCESS;
+ }
+ 
+-uint32_t boot_rom_fuse_init(void)
++void boot_rom_trigger_fuse_init()
+ {
+-	uint32_t i;
++	if (boot_rom_global.efuse_read == 1)
++		return;
+ 
+ 	fuse_prog_read_address();
+ 	fuse_prog_range_config();
++	fuse_set_read_ctrl_reg_val(FUSE_READ_FSM_TRIGGER);
++}
++
++uint32_t boot_rom_check_fuse_init_done()
++{
++	uint32_t i;
+ 
+ 	if (boot_rom_global.efuse_read == 1)
+ 		return BOOT_ROM_SUCCESS;
+-
+-	fuse_set_read_ctrl_reg_val(FUSE_READ_FSM_TRIGGER);
+ 
+ 	for (i = 0; i < FUSE_RETRIES; i++)
+ 		if (fuse_get_read_ctrl_reg_val())
+diff --git a/common/efuse.h b/common/efuse.h
+index 45e8ff3..01b355e 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -11,6 +11,7 @@
+ #include <spi_flash.h>
+ 
+ uint32_t boot_rom_fuse_read(uint32_t word, uint32_t *val);
+-uint32_t boot_rom_fuse_init(void);
++void boot_rom_trigger_fuse_init(void);
++uint32_t boot_rom_check_fuse_init_done(void);
+ 
+ #endif /* _EFUSE_H_ */

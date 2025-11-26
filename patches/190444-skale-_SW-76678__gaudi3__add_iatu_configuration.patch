@@ -1,0 +1,113 @@
+From cc60c29608c9b3971f42f904afada3d0909f1da3 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 18 Mar 2022 12:52:38 +0200
+Subject: [PATCH] [SW-76678] gaudi3: add iatu configuration
+
+In gaudi3, there is alternate method provided to configure
+address transalation using BMU (BAR Mapping Unit). This patch
+perform IATU configuration for following region using BMU
+1. CFG Region 256MB
+2. FW SRAM region 256MB
+3. FW MEM region 256MB
+
+Change-Id: I1987e7784c83297f4a6238fa2b79c122b090d171
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index a448910..413ef32 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -136,9 +136,92 @@
+ void pcie_phy_set_ext_tx_rx_ctrl(void) {}
+ void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+ void pcie_phy_set_mpll_a_b_mul_bw(__unused uint8_t separate_reference) {}
++
++#define IATU_BASE				(mmD0_PCIE_DBI_SIG_BASE & 0xFFFFFFF)
++#define IATU_REGION_CTRL_1_OFF_INBOUND_0	(IATU_BASE + 0x100)
++#define IATU_REGION_CTRL_2_OFF_INBOUND_0	(IATU_BASE + 0x104)
++#define IATU_REGION_CTRL_1_OFF_INBOUND_1	(IATU_BASE + 0x300)
++#define IATU_REGION_CTRL_2_OFF_INBOUND_1	(IATU_BASE + 0x304)
++#define IATU_ENABLE				D0_PCIE_AUX_DBI_VF_ACTIVE_M
++#define IATU_REGION_CTRL_1_OFF_INBOUND_0_VAL	0x0
++#define IATU_REGION_CTRL_2_OFF_INBOUND_0_VAL	0xC0000000
++#define IATU_REGION_CTRL_1_OFF_INBOUND_1_VAL	0x0
++#define IATU_REGION_CTRL_2_OFF_INBOUND_1_VAL	0xC0000400
++
++#define BMU_CFG_0_DST_BASE			0x30000
++#define BMU_CFG_R0_SRC_START			0x0
++#define BMU_CFG_0_SRC_END			0x3FFFFFF
++#define BMU_CFG_0_DST_OFFSET_R0			0xFC000000
++#define BMU_CFG_0_DST_OFFSET_R1			0x1F
++
++#define BMU_MEM_0_DST_BASE			0x200
++#define BMU_MEM_0_SRC_START			0x0
++#define BMU_MEM_0_SRC_END			0xFF
++#define BMU_MEM_0_DST_OFFSET			0xFFFFF00
++
++#define BMU_MEM_1_DST_BASE			0x300
++#define BMU_MEM_1_SRC_START			0x0
++#define BMU_MEM_1_SRC_END			0xFF
++#define BMU_MEM_1_DST_OFFSET			0x7FD00
++
+ void pcie_config_iatu(void)
+ {
+-	/* TODO: Implement IATU configuration */
++	uint32_t val, dbi_val;
++
++	dbi_val = regmap_readl(mmD0_PCIE_AUX_DBI);
++
++	/* Enable IATU */
++	regmap_writel(IATU_ENABLE, mmD0_PCIE_AUX_DBI);
++
++	/*
++	 * Configure IATU in bar match mode
++	 * BAR 0/1 -> Region 0
++	 * BAR 4/5 -> Region 1
++	 */
++	regmap_writel(IATU_REGION_CTRL_1_OFF_INBOUND_0_VAL,
++			IATU_REGION_CTRL_1_OFF_INBOUND_0);
++	regmap_writel(IATU_REGION_CTRL_2_OFF_INBOUND_0_VAL,
++			IATU_REGION_CTRL_2_OFF_INBOUND_0);
++	regmap_writel(IATU_REGION_CTRL_1_OFF_INBOUND_1_VAL,
++			IATU_REGION_CTRL_1_OFF_INBOUND_1);
++	regmap_writel(IATU_REGION_CTRL_2_OFF_INBOUND_1_VAL,
++			IATU_REGION_CTRL_2_OFF_INBOUND_1);
++
++	/* Region 0 CFG region BAR 0/1 */
++	/* configuration address space bits [63:40] */
++	regmap_writel(BMU_CFG_0_DST_BASE, mmD0_PCIE_BMU_CFG_DST_BASE);
++	regmap_writel(BMU_CFG_R0_SRC_START, mmD0_PCIE_BMU_CFG_SRC_START_0);
++	regmap_writel(BMU_CFG_0_SRC_END, mmD0_PCIE_BMU_CFG_SRC_END_0);
++	regmap_writel(BMU_CFG_0_DST_OFFSET_R0, mmD0_PCIE_BMU_CFG_DST_OFFS_R0_0);
++	regmap_writel(BMU_CFG_0_DST_OFFSET_R1, mmD0_PCIE_BMU_CFG_DST_OFFS_R1_0);
++
++	/* Region 0 MEM region SRAM BAR 4/5 */
++	/* upper 16 bits of 0x0200_FFFF_F000_0000 */
++	regmap_writel(BMU_MEM_0_DST_BASE, mmD0_PCIE_BMU_MEM_DST_BASE_0);
++	regmap_writel(BMU_MEM_0_SRC_START, mmD0_PCIE_BMU_MEM_SRC_START_0);
++	regmap_writel(BMU_MEM_0_SRC_END, mmD0_PCIE_BMU_MEM_SRC_END_0);
++	/* bits[47:20] of 0x0200_FFFF_F000_0000 */
++	regmap_writel(BMU_MEM_0_DST_OFFSET, mmD0_PCIE_BMU_MEM_DST_OFFS_0);
++
++	/* Region 1 MEM region FW MEM BAR 4/5 */
++	/* upper 16 bits of 0x0300_007F_D000_0000 */
++	regmap_writel(BMU_MEM_1_DST_BASE, mmD0_PCIE_BMU_MEM_DST_BASE_1);
++	regmap_writel(BMU_MEM_1_SRC_START, mmD0_PCIE_BMU_MEM_SRC_START_1);
++	regmap_writel(BMU_MEM_1_SRC_END, mmD0_PCIE_BMU_MEM_SRC_END_1);
++	/* bits [47:20] of 0x0300_007F_D000_0000 */
++	regmap_writel(BMU_MEM_1_DST_OFFSET, mmD0_PCIE_BMU_MEM_DST_OFFS_1);
++
++	/* Enable Region 0 CFG and MEM and Region 1 MEM */
++	val = regmap_readl(mmD0_PCIE_BMU_CFG_EN);
++	val |= D0_PCIE_BMU_CFG_EN_F0_CFG_R0_M | D0_PCIE_BMU_CFG_EN_F0_MEM_R0_M |
++		D0_PCIE_BMU_CFG_EN_F0_MEM_R1_M;
++	regmap_writel(val, mmD0_PCIE_BMU_CFG_EN);
++
++	/* Enable BMU */
++	regmap_writel(0x1, mmD0_PCIE_BMU_CFG_BMU);
++
++	/* restore IATU access state */
++	regmap_writel(dbi_val, mmD0_PCIE_AUX_DBI);
+ }
+ 
+ uint32_t get_mem_cfg_mask(void)

@@ -1,0 +1,135 @@
+From bfb1b58b953498db1fca4f85054c7b9ea1e6b9f5 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 13 Apr 2022 12:01:14 +0300
+Subject: [PATCH] [SW-82943] gaudi3: perform d2d link init in rom recovery
+
+As part of rom recovery, rom is required to perform D2D link
+initialization. ROM will not make use of D2D link but needs
+to enable it for debug purpose. This patch implements D2D link
+initialization sequence as part of rom recovery. D2D link init should
+be perfomed by both die's.
+
+Change-Id: I57d9fbcb96a6679f9380d4e324a6b119c0fe64ac
+---
+
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index 7b3be07..12229b6 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -23,6 +23,7 @@
+ #define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(17)
+ #define EFUSE_SYSCFG_BACKUP_DISABLE			BIT(22)
+ #define EFUSE_SYSCFG_SKU_MASK				BIT(26)
++#define EFUSE_SYSCFG2_D2D_DIS_MASK			BIT(31)
+ 
+ /* Following bitmaps are used in common code, hence maintained for compilation */
+ #define EFUSE_SYSCFG_REVOKATION_LOCATION		0
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 0fe2d25..ca56aa5 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <arcboot.h>
++#include <delay.h>
+ #include <boot_desc.h>
+ #include <cmd_module.h>
+ #include <security.h>
+@@ -175,11 +176,63 @@
+ 		pcie_config();
+ }
+ 
++#define D2D_LINK_STATUS_RETRIES		100
++#define D2D_LINK_STATUS_UDELAY		100
++static void rom_d2d_link_init(void)
++{
++	uint32_t retry = D2D_LINK_STATUS_RETRIES;
++	uint32_t val;
++
++	/* D2D link init will be performed by both die's */
++	if (arcboot_rom_global.sku)
++		return;
++
++	if (arcboot_rom_global.config2_fuse & EFUSE_SYSCFG2_D2D_DIS_MASK)
++		return; /* skip d2d init */
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_D2D_LINK_START);
++
++	/*
++	 * TODO: replace with register name and masks
++	 * currently not defined in specs git
++	 */
++	/* Check BUSY bit for 0 value, expected to be 0 */
++	val = regmap_readl(0xC48B0FC);
++	if (val & 0x10) {
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_D2D_LINK_STS_BUSY);
++		return;
++	}
++
++	/* Set START bit for D2D link initialization */
++	regmap_writel(BIT(0), 0xC48B0F8);
++
++	/*
++	 * Poll 10ms for BUSY bit to be 0 indicating link initialization
++	 * is completed successfully.
++	 */
++	while (1) {
++		val = regmap_readl(0xC48B0FC);
++		if (!(val & 0x10))
++			break;
++
++		retry--;
++		if (!retry) {
++			arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT);
++			return;
++		}
++
++		udelay(D2D_LINK_STATUS_UDELAY);
++	}
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS);
++}
++
+ static void execute_rom_recovery(void)
+ {
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_ROM_RECOVERY);
+ 
+ 	rom_pcie_recovery();
++	rom_d2d_link_init();
+ 	rom_recovery();
+ }
+ 
+diff --git a/include/arcboot.h b/include/arcboot.h
+index ccdeb07..f2e78fc 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -228,15 +228,19 @@
+ 	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 96,
+ 	PROGRESS_ARCBOOT_IN_ROM_RECOVERY = 97,
+ 	PROGRESS_ARCBOOT_ROM_PCIE_LINK_UP = 98,
+-	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_HEADER_CHECK_FAILED = 99,
+-	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_DESCRIPTION = 100,
+-	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_IMAGES_PARENT_NODE = 101,
+-	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_CORRUPTED_LOAD_TYPE = 102,
+-	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNSUPPORTED_LOAD_TYPE = 103,
+-	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNKNOWN_ERROR = 104,
+-	PROGRESS_ARCBOOT_ROM_FIT_LOAD_FAILED = 105,
+-	PROGRESS_ARCBOOT_ROM_FIT_LOAD_SEC_FAILED = 106,
+-	PROGRESS_ARCBOOT_ROM_FIT_LOAD_UNKNOWN_ERROR = 107,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_START = 99,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_STS_BUSY = 100,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 101,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS = 102,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_HEADER_CHECK_FAILED = 103,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_DESCRIPTION = 104,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_NO_IMAGES_PARENT_NODE = 105,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_CORRUPTED_LOAD_TYPE = 106,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNSUPPORTED_LOAD_TYPE = 107,
++	PROGRESS_ARCBOOT_ROM_FIT_FORMAT_UNKNOWN_ERROR = 108,
++	PROGRESS_ARCBOOT_ROM_FIT_LOAD_FAILED = 109,
++	PROGRESS_ARCBOOT_ROM_FIT_LOAD_SEC_FAILED = 110,
++	PROGRESS_ARCBOOT_ROM_FIT_LOAD_UNKNOWN_ERROR = 111,
+ };
+ 
+ enum security_location {

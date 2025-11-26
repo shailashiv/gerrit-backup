@@ -1,0 +1,104 @@
+From 0e74253f46456e7ac919385b38f0a4d18603646f Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 12 Aug 2024 14:42:28 +0300
+Subject: [PATCH] [FSW-8694] fs1: enable master die spi fuse
+
+Efuse bit - fuse_override is used to enable spi
+fuse feature, if this bit set spi fuse is disabled.
+After voltage protection pattern verified from
+actual efuse, boot rom will start enumerating
+this spi fuse boot desc. Developer can use this
+flexibility to create a fake fuse environment
+from spi flash binary image for development and
+to debug.
+
+Change-Id: I971b4e623194e75bab307337311cad58390f1d15
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 5178d21..86dd2f8 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -27,6 +27,7 @@
+ #include <lfs_wrapper.h>
+ #include <psoc_pad_conf_regs.h>
+ #include <gpio_regs.h>
++#include <psoc_boot_conf_masks.h>
+ 
+ extern const int fs1_die_type;
+ 
+@@ -454,5 +455,11 @@
+ 	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
+ 	val = val | mask;
+ 	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++}
+ 
++bool boot_rom_spi_efuse_enabled()
++{
++	return (((boot_rom_global.config_fuse & EFUSE_SYSCFG_DIS_EFUSE_OVERRIDE) == 0) &&
++		(regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_H)) &
++			PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_EFUSE_OVERRIDE_M));
+ }
+diff --git a/common/common.c b/common/common.c
+index b232389..afabb2f 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -18,6 +18,9 @@
+ #include <secure_boot.h>
+ #include <dev_security.h>
+ #include <boot_desc.h>
++#include <boot_flow.h>
++
++extern uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
+ 
+ void boot_rom_uart_init(void)
+ {
+@@ -113,7 +116,36 @@
+ 
+ void boot_rom_fake_fuse(void)
+ {
+-	/* Empty Body */
++	if (!boot_rom_spi_efuse_enabled())
++		return;
++
++	if (!boot_rom_in_master_die()) {
++		/* TODO: Handle slave Die */
++		return;
++	}
++
++	if (boot_rom_global.fuse_emulation_init_done)
++		return;
++
++	boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);
++
++	if (boot_flow_spi_efuse_manifest_init() == BOOT_ROM_FAIL) {
++		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DECODE_FAIL);
++		return;
++	}
++
++	boot_rom_global.fake_fuse_spi_offset = fake_fuse_offset_array[FAKE_FUSE_IO_D0];
++	boot_rom_global.fake_fuse_en = true;
++	if (boot_rom_read_config_fuse() != BOOT_ROM_SUCCESS) {
++		boot_rom_global.fake_fuse_en = false;
++		return;
++	}
++
++	boot_rom_init_sku();
++
++	/* TODO: Send fuse values to slaves */
++
++	boot_rom_set_spi_efuse_read();
+ }
+ 
+ void boot_rom_check_recovery(void)
+diff --git a/common/common.h b/common/common.h
+index c1a6080..822a332 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -36,5 +36,6 @@
+ void boot_rom_validation_status(bool validation_pass);
+ void boot_rom_set_manifest_index(enum hl_fw_manifest_type manifest_idx);
+ void boot_rom_start_cpld_wdtimer(void);
++bool boot_rom_spi_efuse_enabled(void);
+ 
+ #endif /* _COMMON_H_ */

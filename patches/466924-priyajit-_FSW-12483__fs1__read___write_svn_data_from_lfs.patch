@@ -1,0 +1,144 @@
+From 7a48e850ef796955df1213213a849bc6b2c8cab7 Mon Sep 17 00:00:00 2001
+From: Priyajit Ghosh <prghosh@habana.ai>
+Date: Thu, 19 Dec 2024 11:41:15 +0200
+Subject: [PATCH] [FSW-12483] fs1: read & write svn data from lfs
+
+This patch adds support to store svn over lfs
+as boot info file, and read back support added
+when tmp requires svn.
+
+Change-Id: Iee741345df899c4a888ca33d0a4df3b1e79ae957
+Signed-off-by: Priyajit Ghosh <prghosh@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index faa4c52..afae35f 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -31,6 +31,7 @@
+ #include <arc_regs.h>
+ #include <boot_desc.h>
+ #include <dev_spi_flash.h>
++#include <dev_boot_info.h>
+ 
+ extern const int fs1_die_type;
+ extern uint32_t fake_fuse_offset_array[MAX_DIE_COUNT];
+@@ -343,14 +344,23 @@
+ 	return (bool)boot_rom_global.validation_pass;
+ }
+ 
+-static bool boot_rom_get_svn(__unused uint8_t *hash)
++static bool boot_rom_get_svn(uint8_t *svn)
+ {
++	uint8_t fw_version_sec = boot_info_read_svn_data();
++
+ 	/*
+-	 * TODO add code to fetch SVN from littlefs
+-	 * This code will be added once the capability to read
+-	 * SVN from eFuse and store it in littlefs is integrated
++	 * If failed to get svn from boot info or boot info disabled,
++	 * Get svn from persistent dccm.
+ 	 */
+-	return false;
++	if (fw_version_sec == 0)
++		fw_version_sec = boot_rom_global.sec_data.sec_ver;
++
++	if (fw_version_sec == 0)
++		return false;
++
++	memcpy(svn, &fw_version_sec, sizeof(fw_version_sec));
++
++	return true;
+ }
+ 
+ static bool boot_rom_get_manifest_hash(__unused uint8_t *hash)
+diff --git a/arch/fs1/arc/dev_boot_info.c b/arch/fs1/arc/dev_boot_info.c
+index da4f2aa..ce71e41 100644
+--- a/arch/fs1/arc/dev_boot_info.c
++++ b/arch/fs1/arc/dev_boot_info.c
+@@ -19,6 +19,7 @@
+ #include <psoc_boot_conf_regs.h>
+ #include <fs1_reg_map.h>
+ #include <boot_desc.h>
++#include <dev_boot_info.h>
+ 
+ bool boot_rom_skip_boot_info(void)
+ {
+@@ -72,3 +73,31 @@
+ 	/* Flag which is indication for other modules to know Boot ROM done with LFS */
+ 	boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FINISHED);
+ }
++
++void boot_info_write_svn_data(uint8_t fw_version_sec)
++{
++	if (boot_rom_skip_boot_info())
++		return;
++
++	if (lfs_file_set(LFS_TAG_BOOT_INFO, HL_BOOT_INFO_SECURE_VERSION_NUMBER,
++		&fw_version_sec, sizeof(fw_version_sec))) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_SVN_SET_FAIL);
++		return;
++	}
++}
++
++uint8_t boot_info_read_svn_data(void)
++{
++	uint8_t fw_version_sec = 0;
++
++	if (boot_rom_skip_boot_info())
++		return 0;
++
++	if (lfs_file_copy(LFS_TAG_BOOT_INFO, HL_BOOT_INFO_SECURE_VERSION_NUMBER,
++		&fw_version_sec, sizeof(fw_version_sec))) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_SVN_GET_FAIL);
++		return 0;
++	}
++
++	return fw_version_sec;
++}
+diff --git a/arch/fs1/arc/dev_boot_info.h b/arch/fs1/arc/dev_boot_info.h
+index 2977fe9..7a547b8 100644
+--- a/arch/fs1/arc/dev_boot_info.h
++++ b/arch/fs1/arc/dev_boot_info.h
+@@ -18,5 +18,7 @@
+ void boot_rom_set_boot_info(void);
+ void boot_rom_get_boot_info(void);
+ bool boot_rom_skip_boot_info(void);
++void boot_info_write_svn_data(uint8_t fw_version_sec);
++uint8_t boot_info_read_svn_data(void);
+ 
+ #endif	/* _DEV_BOOT_INFO_H_ */
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index fed1f80..3386556 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -22,6 +22,7 @@
+ #include <axuser_lbw_masks.h>
+ #include <psoc_boot_conf_regs.h>
+ #include <psoc_boot_conf_masks.h>
++#include <dev_boot_info.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -150,6 +151,8 @@
+ 
+ 	/* store minimum allowed security version in persistent DCCM */
+ 	boot_rom_global.sec_data.sec_ver = fw_version_sec;
++
++	boot_info_write_svn_data(fw_version_sec);
+ }
+ 
+ void security_report_fw_version(enum hl_fw_manifest_type manifest_idx)
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index fce49ce..3ca8539 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -154,6 +154,8 @@
+ 	PROGRESS_BOOT_INFO_MANIFEST_HEADER_SET_FAIL = 144,
+ 	PROGRESS_BOOT_INFO_MANIFEST_CONTEXT_GET_FAIL = 145,
+ 	PROGRESS_BOOT_INFO_MANIFEST_HEADER_GET_FAIL = 146,
++	PROGRESS_BOOT_INFO_SVN_SET_FAIL = 147,
++	PROGRESS_BOOT_INFO_SVN_GET_FAIL = 148,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */

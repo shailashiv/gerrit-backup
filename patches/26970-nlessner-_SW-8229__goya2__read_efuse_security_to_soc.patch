@@ -1,0 +1,169 @@
+From a7ea5f2a5b9433a88ceb19cb8f8b7e0641bbbdab Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 02 Feb 2020 10:40:38 +0200
+Subject: [PATCH] [SW-8229] goya2: read efuse security to soc
+
+Finish implimenting reading of key hash and minimal
+security version allowed. Reading from efuses and
+storing in soc location for easy access
+
+Change-Id: Ibdf3a3e73441b5a8fe14e3480690413b7e0c2f72
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 0e340a3..09cb8e3 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -60,9 +60,10 @@
+ 		spi_flash_otp_access(FLASH_OTP_DISABLE);
+ 		break;
+ 	case ASIC_EFUSE:
+-		/* TODO: finish efuse hash get and fw_ver_sec */
+-		key_revoke = arcboot_rom_global.config_fuse &
+-			     EFUSE_SYSCFG_REVOKE_KEY_MASK;
++		key_revoke = (arcboot_rom_global.config_fuse &
++			      EFUSE_SYSCFG_REVOKE_KEY_MASK);
++		fw_version_sec = efuse_otp_get_fw_version_security();
++		efuse_get_hash(key_hash);
+ 		break;
+ 	}
+ 
+diff --git a/common/efuse.c b/common/efuse.c
+index 429f466..8194ddb 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -8,6 +8,9 @@
+ #include <unistd.h>
+ #include "arcboot.h"
+ #include "delay.h"
++#include "efuse.h"
++#include "security.h"
++
+ 
+ #define FUSE_TIMEOUT_US		100000
+ #define FUSE_DELAY_US		20
+@@ -49,3 +52,24 @@
+ 
+ 	return 0;
+ }
++
++uint8_t efuse_otp_get_fw_version_security(void)
++{
++	uint8_t i;
++	uint32_t fw_version[SECURITY_DWORD_PER_FW_SEC_VERSION];
++	uint8_t fw_version_sec;
++
++	/* read min security version bit map from flash */
++	for (i = 0; i < SECURITY_DWORD_PER_FW_SEC_VERSION; i++)
++		fuse_read(EFUSE_SECURITY_FW_VERSION_OFFSET + i, &fw_version[i]);
++
++	fw_version_sec = security_find_min_fw_version(fw_version);
++
++	return fw_version_sec;
++}
++
++void efuse_get_hash(uint32_t *key_hash)
++{
++	for (int i = 0; i < SECURITY_KEY_HASH_ARRAY_SIZE; i++)
++		fuse_read(EFUSE_KEY_HASH_OFFSET + i, key_hash + i);
++}
+diff --git a/common/efuse.h b/common/efuse.h
+index 2be7a5a..968b8ea 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -8,7 +8,9 @@
+ #ifndef _EFUSE_H_
+ #define _EFUSE_H_
+ 
++#define EFUSE_KEY_HASH_OFFSET			0x12
+ #define EFUSE_SYSCFG_OFFSET			0x3A
++#define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 
+ #define EFUSE_SYSCFG_SPI_CONTROLLER		BIT(20)
+ #define EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK	BIT(12)
+@@ -18,5 +20,7 @@
+ #define EFUSE_SYSCFG_REVOKE_KEY_MASK		0x1F
+ 
+ int fuse_read(u32 word, u32 *val);
++uint8_t efuse_otp_get_fw_version_security(void);
++void efuse_get_hash(uint32_t *key_hash);
+ 
+ #endif /* _EFUSE_H_ */
+diff --git a/common/security.c b/common/security.c
+index 3af4d0d..62e5c64 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -349,6 +349,27 @@
+ 	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+ }
+ 
++uint8_t security_find_min_fw_version(uint32_t *fw_version)
++{
++	uint8_t row, colume;
++	uint8_t fw_version_sec;
++
++	/* init max version */
++	fw_version_sec = SECURITY_MAX_FW_SEC_VERSION;
++
++	/* iterate from end to start, till a set bit is found */
++	for (row = SECURITY_FW_VER_LAST_DWORD; row > 0; row--) {
++		for (colume = SECURITY_FW_VER_LAST_BYTE; colume > 0; colume--) {
++			/* find highest bit set in valid FW */
++			fw_version_sec--;
++			if (fw_version[row] & BIT(colume))
++				return fw_version_sec;
++		}
++	}
++
++	return fw_version_sec;
++}
++
+ static int security_get_first_valid_key(uint8_t customer)
+ {
+ 	uint8_t end_index, key_revoke;
+diff --git a/common/security.h b/common/security.h
+index c2cde11..4e63159 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -48,6 +48,7 @@
+ void security_pcie_config(void);
+ void secuirty_debug_if_hbw_config(void);
+ void secuirty_i2c_s_enable(void);
++uint8_t security_find_min_fw_version(uint32_t *fw_version);
+ int security_get_key_hash(uint32_t *hash, uint8_t customer);
+ int security_check_valid_fw_version(uint32_t fw_version);
+ 
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index 73904b7..6905631 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -87,7 +87,7 @@
+  */
+ static uint8_t spi_flash_find_fw_version_security(uint32_t flash_fuse_offset)
+ {
+-	uint8_t i, row, colume;
++	uint8_t i;
+ 	uint32_t fw_version[SECURITY_DWORD_PER_FW_SEC_VERSION];
+ 	uint8_t fw_version_sec;
+ 
+@@ -95,18 +95,7 @@
+ 	for (i = 0; i < SECURITY_DWORD_PER_FW_SEC_VERSION; i++)
+ 		fw_version[i] = spi_flash_readl(flash_fuse_offset + i);
+ 
+-	/* init max version */
+-	fw_version_sec = SECURITY_MAX_FW_SEC_VERSION;
+-
+-	/* iterate back from 127 -> 0 till a set bit found */
+-	for (row = SECURITY_FW_VER_LAST_DWORD; row > 0; row--) {
+-		for (colume = SECURITY_FW_VER_LAST_BYTE; colume > 0; colume--) {
+-			/* find highest bit set in valid FW */
+-			fw_version_sec--;
+-			if (fw_version[row] & BIT(colume))
+-				return fw_version_sec;
+-		}
+-	}
++	fw_version_sec = security_find_min_fw_version(fw_version);
+ 	return fw_version_sec;
+ }
+ 

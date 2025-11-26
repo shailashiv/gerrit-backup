@@ -1,0 +1,227 @@
+From 40f3d82c1c0ffc8076e02006378995c711944e86 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Tue, 22 Dec 2020 16:25:43 +0200
+Subject: [PATCH] [SW-20154] make verify image code platform specific
+
+Gaudi2 will make use of uboot style of RSA verification
+code, hence to faciliate a different code, move the
+existing verification function to goya2.
+
+Change-Id: I8536da971121dfe2ac5007660794b616a292969f
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 4a0f650..35cca75 100644
+--- a/Makefile
++++ b/Makefile
+@@ -40,8 +40,7 @@
+ export CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+ ARCBOOT_COMMON_SRCS_C := $(shell ls common/*.c $(HL_DEV)/$(HL_TARGET).c)
+-ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV)/security.c)
+-ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV)/common.c)
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV)/*.c)
+ 
+ ARCBOOT_RAM_SRCS_C := app/arcboot_ram.c
+ ARCBOOT_RAM_SRCS_S := app/crt0_ram.S
+diff --git a/common/secureboot.c b/common/secureboot.c
+deleted file mode 100644
+index dc7bbf8..0000000
+--- a/common/secureboot.c
++++ /dev/null
+@@ -1,94 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include <stdio.h>
+-#include "sb.h"
+-#include "arcboot.h"
+-#include "efuse.h"
+-#include "secureboot.h"
+-#include "security.h"
+-
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+-int secureboot_verify_image(uint32_t image_size, uint32_t image_offset)
+-{
+-	int verify = 0;
+-	int err = 0;
+-	int key_scan;
+-	unsigned char block_buf[SECUREBOOT_HASH_BLOCK_CALC_BUF];
+-	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
+-	uint32_t config_fuse;
+-	uint16_t test_phase0b_data_len = image_size;
+-	uint32_t test_phase0b_sig_len = SIG_SIZE;
+-	uint32_t test_public_key_len = KEY_SIZE;
+-
+-	unsigned char *test_phase0b_data = (unsigned char *)(image_offset);
+-	unsigned char *test_phase0b_sig = test_phase0b_data +
+-					  test_phase0b_data_len;
+-	unsigned char *test_public_key = test_phase0b_sig -
+-					 test_public_key_len;
+-	uint32_t fw_version = base_readl((uint32_t)test_phase0b_data);
+-
+-	/* check efuse for security validation enable */
+-	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
+-	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
+-		return SECUREBOOT_VERIFY_SUCCESS;
+-
+-	/* check minimal valid security FW version */
+-	if (security_check_valid_fw_version(fw_version) !=
+-	    SECURITY_FW_VERSION_SECURE)
+-		return SECUREBOOT_VERIFY_VER_FAILED;
+-
+-	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
+-	     SECUREBOOT_HABANA_KEY; key_scan--) {
+-		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
+-					  key_scan)) {
+-			/* check pub key hash versus efuse */
+-			err = elp_secureboot_phase0a(sb_proxy_read,
+-						     test_public_key,
+-						     test_public_key_len,
+-						     test_phase0a_hash,
+-						     &verify, block_buf,
+-						     sizeof(block_buf));
+-		}
+-		/* if key is verified we can exit the loop */
+-		if (verify)
+-			break;
+-	}
+-	/* if for loop doesn't find a valid key hash in fuse, return error */
+-	if (!verify)
+-		return SECUREBOOT_VERIFY_KEY_FAILED;
+-
+-	/* Phase0b uses the public key (test_public_key) to validate signature
+-	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
+-	 */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data,
+-				     test_phase0b_data_len, test_public_key,
+-				     test_public_key_len, test_phase0b_sig,
+-				     test_phase0b_sig_len, &verify,
+-				     block_buf, sizeof(block_buf));
+-
+-	if (err || !verify)
+-		return SECUREBOOT_VERIFY_FAILED;
+-
+-	return verify;
+-}
+diff --git a/goya2_arc/secureboot.c b/goya2_arc/secureboot.c
+new file mode 100644
+index 0000000..dc7bbf8
+--- /dev/null
++++ b/goya2_arc/secureboot.c
+@@ -0,0 +1,94 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdio.h>
++#include "sb.h"
++#include "arcboot.h"
++#include "efuse.h"
++#include "secureboot.h"
++#include "security.h"
++
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++int secureboot_verify_image(uint32_t image_size, uint32_t image_offset)
++{
++	int verify = 0;
++	int err = 0;
++	int key_scan;
++	unsigned char block_buf[SECUREBOOT_HASH_BLOCK_CALC_BUF];
++	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
++	uint32_t config_fuse;
++	uint16_t test_phase0b_data_len = image_size;
++	uint32_t test_phase0b_sig_len = SIG_SIZE;
++	uint32_t test_public_key_len = KEY_SIZE;
++
++	unsigned char *test_phase0b_data = (unsigned char *)(image_offset);
++	unsigned char *test_phase0b_sig = test_phase0b_data +
++					  test_phase0b_data_len;
++	unsigned char *test_public_key = test_phase0b_sig -
++					 test_public_key_len;
++	uint32_t fw_version = base_readl((uint32_t)test_phase0b_data);
++
++	/* check efuse for security validation enable */
++	config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++	if ((config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK) == 0)
++		return SECUREBOOT_VERIFY_SUCCESS;
++
++	/* check minimal valid security FW version */
++	if (security_check_valid_fw_version(fw_version) !=
++	    SECURITY_FW_VERSION_SECURE)
++		return SECUREBOOT_VERIFY_VER_FAILED;
++
++	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
++	     SECUREBOOT_HABANA_KEY; key_scan--) {
++		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
++					  key_scan)) {
++			/* check pub key hash versus efuse */
++			err = elp_secureboot_phase0a(sb_proxy_read,
++						     test_public_key,
++						     test_public_key_len,
++						     test_phase0a_hash,
++						     &verify, block_buf,
++						     sizeof(block_buf));
++		}
++		/* if key is verified we can exit the loop */
++		if (verify)
++			break;
++	}
++	/* if for loop doesn't find a valid key hash in fuse, return error */
++	if (!verify)
++		return SECUREBOOT_VERIFY_KEY_FAILED;
++
++	/* Phase0b uses the public key (test_public_key) to validate signature
++	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
++	 */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data,
++				     test_phase0b_data_len, test_public_key,
++				     test_public_key_len, test_phase0b_sig,
++				     test_phase0b_sig_len, &verify,
++				     block_buf, sizeof(block_buf));
++
++	if (err || !verify)
++		return SECUREBOOT_VERIFY_FAILED;
++
++	return verify;
++}

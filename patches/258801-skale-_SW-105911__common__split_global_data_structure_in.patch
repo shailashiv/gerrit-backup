@@ -1,0 +1,192 @@
+From d7cbb6af13ff3c28e0092aad2b04c94b058d7347 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 27 Sep 2022 09:00:21 +0300
+Subject: [PATCH] [SW-105911] common: split global data structure into two structures
+
+Currently, ROM keeps the image data backup in first 3KB DCCM
+persistent memory which is filled in cold reset from SPI and re-used
+in non-cold reset based on validation pass flag. ROM doesn't make
+use of boot info get api's to retrieve image information stored in
+boot info in non-cold reset. This patch make following changes.
+
+1. split global data structure into two parts global and manifest.
+2. global data strcuture placed in 1st 512 bytes of DCCM which
+will remain as persistent memory.
+3. manifest data structure placed from 512 bytes to 3K of DCCM
+which will remain as persistent/non-persistent based on boot info
+skip flag. ie. If boot info skip flag in efuse is set, ROM will
+need 3KB memory as persistent and other FW component should not
+use it or override it.
+
+Change-Id: I6bc6d6edacb919d1925b7e0d35b65f0fe3ef134c
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 6f119ee..86f82b7 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -30,6 +30,8 @@
+ 	.fuse_spi = false,
+ };
+ 
++struct arcboot_manifest_s __attribute__((section (".rom_manifest_section"))) arcboot_rom_manifest;
++
+ #define ARCBOOT_STATUS_REG_SZ_BITS		32
+ __weak void arcboot_rom_status_update(enum arcboot_rom_progress progress)
+ {
+diff --git a/arch/gaudi3/arc/arcboot_rom.lds b/arch/gaudi3/arc/arcboot_rom.lds
+index a82b42e..b80cbbd 100644
+--- a/arch/gaudi3/arc/arcboot_rom.lds
++++ b/arch/gaudi3/arc/arcboot_rom.lds
+@@ -34,6 +34,7 @@
+ 	_dccm_begin = ORIGIN(DCCM);
+ 	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+ 	_persistent_sec_size = 3k;
++	_rom_global_data_size = 512;
+ 
+ 	.ivt : {
+ 		KEEP (*(.ivt));
+@@ -49,7 +50,9 @@
+ 		_data_after_persist_sec = _etext + _persistent_sec_size;
+ 		_data = .;
+ 	    KEEP(*(.rom_persistent_section))
+-	    . = _data + _persistent_sec_size; /* Reserve 3KB memory for persistent data section */
++	    . = _data + _rom_global_data_size; /* Reserve 512 memory for persistent data section */
++	    KEEP(*(.rom_manifest_section))
++	    . = _data + _persistent_sec_size; /* Reserve 2560 (3K - 512) memory for persistent data section */
+ 		_rom_non_persistent_dccm_start = .;
+ 		*(.data)
+ 	} > REGION_DATA
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c640601..20f523e 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -418,13 +418,19 @@
+ 
+ static void arcboot_rom_persist_data_non_zero_init(void)
+ {
+-	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].img_ptr_spi_offset = HL_EROM_IMG_PTRS_BASE;
+-	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_dma = HL_BOOT_PTR_EROM_DMA_DEST;
+-	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_arc = HL_BOOT_PTR_EROM_DMA_DEST_ARC;
++	arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].img_ptr_spi_offset =
++								HL_EROM_IMG_PTRS_BASE;
++	arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_dma =
++								HL_BOOT_PTR_EROM_DMA_DEST;
++	arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_arc =
++								HL_BOOT_PTR_EROM_DMA_DEST_ARC;
+ 
+-	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].img_ptr_spi_offset = HL_SPI_IMG_PTRS_BASE;
+-	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_dma = HL_BOOT_PTR_SPI_DMA_DEST;
+-	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_arc = HL_BOOT_PTR_SPI_DMA_DEST_ARC;
++	arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].img_ptr_spi_offset =
++								HL_SPI_IMG_PTRS_BASE;
++	arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_dma =
++								HL_BOOT_PTR_SPI_DMA_DEST;
++	arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_arc =
++								HL_BOOT_PTR_SPI_DMA_DEST_ARC;
+ }
+ 
+ #define HL_ARC1_DCCM_PERSIST_SECTION_SIZE			(3 * 1024) /* 3KB */
+@@ -824,7 +830,7 @@
+ static int arcboot_rom_boot_desc_init_done(enum hl_fw_boot_ptr_imgs img)
+ {
+ 	struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx =
+-			&arcboot_rom_global.boot_ptr_ctx[img];
++			&arcboot_rom_manifest.boot_ptr_ctx[img];
+ 
+ 	return !!p_img_ptr_ctx->boot_desc_flag;
+ }
+@@ -926,7 +932,7 @@
+ {
+ 	void (*ppboot)();
+ 	uint64_t *start_addr =
+-			&arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].start_addr;
++			&arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].start_addr;
+ 	int ret;
+ 
+ 	if (!arcboot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI)) {
+@@ -1162,7 +1168,8 @@
+ 
+ void arcboot_rom_init_boot_info(void)
+ {
+-	struct hl_fw_boot_ptrs_ctx *p_loc_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI];
++	struct hl_fw_boot_ptrs_ctx *p_loc_img_ptr_ctx =
++					&arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI];
+ 	struct hl_fw_boot_ptrs *p_loc_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
+ 	uint32_t *p_offset = (uint32_t *)(p_loc_img_ptr_ctx->dest_addr_arc + p_loc_boot_ptr->offset2array);
+ 	struct gaudi3_cold_rst_data cold_rst_data;
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index aed4986..5a0ca16 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -46,7 +46,7 @@
+ 
+ static void boot_desc_update_ptrs(enum hl_fw_boot_ptr_imgs img)
+ {
+-	p_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[img];
++	p_img_ptr_ctx = &arcboot_rom_manifest.boot_ptr_ctx[img];
+ 	if (img == HL_FW_BOOT_PTR_EROM) {
+ 		p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_EROM_DMA_DEST_ARC);
+ 	} else {
+@@ -144,19 +144,19 @@
+ 		     continue;
+ 
+ 		if (p_img_desc->magic.type == HL_FW_IMG_PPBOOT) {
+-			memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_PPBOOT],
++			memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_PPBOOT],
+ 				p_img_desc, sizeof(struct hl_fw_img_desc));
+ 		} else if (p_img_desc->magic.type == HL_FW_IMG_FAKE_EFUSE) {
+-			memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_FAKE_FUSE],
++			memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_FAKE_FUSE],
+ 				p_img_desc, sizeof(struct hl_fw_img_desc));
+ 		} else if (p_img_desc->magic.type == HL_FW_IMG_TPM_SPI) {
+-			memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_TPM],
++			memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_TPM],
+ 				p_img_desc, sizeof(struct hl_fw_img_desc));
+ 		} else {
+ 			/* Store upto 5 misc images(indifferent to ROM boot flow) */
+ 			if (misc_descs < NUM_OF_MISC_DESCS ) {
+-				memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_MISC_1 + misc_descs],
+-					p_img_desc, sizeof(struct hl_fw_img_desc));
++				memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_MISC_1 +
++				misc_descs], p_img_desc, sizeof(struct hl_fw_img_desc));
+ 				misc_descs++;
+ 			}
+ 		}
+@@ -213,7 +213,7 @@
+ {
+ 	if (img == HL_FW_BOOT_PTR_SPI) {
+ 		if (index < ROM_DESC_NUM_MAX)
+-			return &arcboot_rom_global.spi_img_desc[index];
++			return &arcboot_rom_manifest.spi_img_desc[index];
+ 	} else {
+ 		return (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
+ 					+ erom_img_descs_offset
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 6d29682..39555ad 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -102,10 +102,13 @@
+ 	uint32_t d0_fuse_spi_offset;
+ 	uint32_t d1_fuse_spi_offset;
+ 	bool fuse_spi;
+-	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
+ 	struct hl_fw_sec_info sec_data;
+-	struct hl_fw_img_desc spi_img_desc[ROM_DESC_NUM_MAX];
+ 	struct hl_fw_boot_ptrs spi_manifest_hdr;
++};
++
++struct arcboot_manifest_s {
++	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
++	struct hl_fw_img_desc spi_img_desc[ROM_DESC_NUM_MAX];
+ };
+ 
+ enum arcboot_rom_bringup_proggress {
+@@ -175,6 +178,7 @@
+ };
+ 
+ extern struct arcboot_global_s arcboot_rom_global;
++extern struct arcboot_manifest_s arcboot_rom_manifest;
+ void arcboot_rom_status_update(enum arcboot_rom_progress progress);
+ void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,
+ 					enum arcboot_rom_bringup_proggress position);

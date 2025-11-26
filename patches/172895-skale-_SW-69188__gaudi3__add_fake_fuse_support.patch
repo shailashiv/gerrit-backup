@@ -1,0 +1,267 @@
+From d0d2f3b7beebc688c55a28115c794c858ab78d70 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 27 Jan 2022 21:59:19 +0200
+Subject: [PATCH] [SW-69188] gaudi3: add fake fuse support
+
+In order to verify ROM flow based on fuse values on pre-production
+system, this patch add fake/local fuse support in ROM for gaudi3.
+
+ROM will enable fake/local fuse based on efuse bit and bootstrap bit
+dedicated for efuse override. Upon fake/local fuse enabled, ROM
+will read fuse values from SPI flash.
+
+Change-Id: Id9e31ee25c2a6792432325dd7903fa7a15ed5fb9
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 8b7adbe..a4afe00 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -23,7 +23,9 @@
+ 	.curr_img = 0,
+ 	.erom_boot_desc_flag = 0,
+ 	.die_id = 0,
+-	.sku = 0
++	.sku = 0,
++	.fuse_spi_offset = 0x0,
++	.fuse_spi = false
+ };
+ 
+ #define ARCBOOT_BRINGUP_ERROR		-1
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 36a37ff..20a5db3 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -10,6 +10,8 @@
+ #include <efuse.h>
+ #include <dev_spi_flash.h>
+ 
++#include <d0_psoc_global_conf_masks.h>
++
+ void arcboot_rom_clear_sw_status(void)
+ {
+ 	/* As per Architecture recommendation, clear status reg */
+@@ -136,7 +138,7 @@
+ 
+ void arcboot_rom_fuse(void)
+ {
+-	uint32_t val;
++	uint32_t val, strap_l;
+ 
+ 	if (fuse_init() == 0)
+ 		arcboot_rom_set_efuse_read();
+@@ -146,6 +148,12 @@
+ 
+ 	arcboot_rom_global.config_fuse = val;
+ 
++	strap_l = regmap_readl(mmD0_PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++	if (!(val & EFUSE_SYSCFG_EFUSE_LOCATION_MASK) &&
++		(strap_l & D0_PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_EFUSE_OVERRIDE_M)) {
++		spi_flash_fuse_init();
++	}
++
+ 	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SKU_MASK)
+ 		arcboot_rom_global.sku = 1;
+ }
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index 206349a..b5b8484 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -28,6 +28,7 @@
+ #define EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI		BIT(8)
+ #define EFUSE_SYSCFG_REVOKATION_LOCATION_SPI		BIT(8)
+ 
++#define EFUSE_SYSCFG_EFUSE_LOCATION_MASK		BIT(25)
+ #define EFUSE_SYSCFG_SKU_MASK				BIT(26)
+ 
+ /*
+diff --git a/arch/gaudi3/arc/dev_spi_flash.h b/arch/gaudi3/arc/dev_spi_flash.h
+index 85fb2eb..77c9c39 100644
+--- a/arch/gaudi3/arc/dev_spi_flash.h
++++ b/arch/gaudi3/arc/dev_spi_flash.h
+@@ -6,6 +6,7 @@
+ #ifndef _GAUDI3_DEV_SPI_FLASH_H_
+ #define _GAUDI3_DEV_SPI_FLASH_H_
+ 
++void spi_flash_fuse_init(void);
+ void spi_flash_init(void);
+ 
+ #endif /* _GAUDI3_DEV_SPI_FLASH_H_ */
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+index 58f5bc8..4ce1a47 100644
+--- a/arch/gaudi3/arc/spi_flash.c
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -20,3 +20,35 @@
+ 
+ 	regmap_writel(write_en_2MB, mmD0_PSOC_GLOBAL_CONF_SPI_WRITE_LIMIT);
+ }
++
++int spi_flash_fuse_read(uint32_t word, uint32_t *val)
++{
++	uint32_t offset;
++
++	/* read value from bank0 */
++	offset = (word * sizeof(uint32_t));
++	*val = spi_flash_readl(arcboot_rom_global.fuse_spi_offset + offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((FUSE_WORDS_PER_BANK + word) * sizeof(uint32_t));
++	*val |= spi_flash_readl(arcboot_rom_global.fuse_spi_offset + offset);
++	return 0;
++}
++
++void spi_flash_fuse_init(void)
++{
++	uint32_t val;
++
++	if (arcboot_rom_global.die_id)
++		return;
++
++	/* TODO: read EFUSE SPI offset from image pointers */
++	arcboot_rom_global.fuse_spi_offset = 0x80000;
++	arcboot_rom_global.fuse_spi = true;
++
++	if (fuse_read(EFUSE_SYSCFG_OFFSET, &val) == -1)
++		val = EFUSE_SYSCFG_DEFAULT;
++
++	arcboot_rom_global.config_fuse = val;
++	arcboot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);
++}
+diff --git a/common/efuse.c b/common/efuse.c
+index 3053dac..03d0571 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -11,6 +11,7 @@
+ #include "efuse.h"
+ #include "dev_efuse.h"
+ #include "security.h"
++#include "spi_flash.h"
+ 
+ 
+ #define FUSE_TIMEOUT_US		100000
+@@ -63,6 +64,9 @@
+ 	if (arcboot_rom_global.efuse_read == 0)
+ 		return -1;
+ 
++	if (arcboot_rom_global.fuse_spi)
++		return spi_flash_fuse_read(word, val);
++
+ 	/* read value from bank0 */
+ 	offset = (word * sizeof(uint32_t));
+ 	*val = regmap_readl(mmEFUSE_DATA_0 + offset);
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index 4c3d3cf..448599d 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -145,3 +145,9 @@
+ 	fw_version_sec = security_find_min_fw_version(fw_version);
+ 	return fw_version_sec;
+ }
++
++__weak int spi_flash_fuse_read(__unused uint32_t word, uint32_t *val)
++{
++	*val = 0;
++	return 0;
++}
+diff --git a/common/spi_flash.h b/common/spi_flash.h
+index 9f10a09..1900b29 100644
+--- a/common/spi_flash.h
++++ b/common/spi_flash.h
+@@ -69,5 +69,6 @@
+ void spi_flash_otp_get_revoke(uint32_t *key_revoke);
+ void spi_flash_otp_get_hash(uint32_t *key_hash);
+ uint8_t spi_flash_otp_get_fw_version_security(void);
++int spi_flash_fuse_read(uint32_t word, uint32_t *val);
+ 
+ #endif /* _SPI_FLASH_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 80d380e..a7584be 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -10,6 +10,7 @@
+ 
+ #include <stdio.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ #include "soc.h"
+ #include "regmap.h"
+ #include "regmask.h"
+@@ -67,6 +68,8 @@
+ 	uint8_t erom_boot_desc_flag;
+ 	uint8_t die_id;
+ 	uint8_t sku; /* 0: Dual die 1: Single die */
++	uint32_t fuse_spi_offset;
++	bool fuse_spi;
+ };
+ 
+ enum arcboot_rom_bringup_proggress {
+@@ -79,50 +82,51 @@
+ enum arcboot_rom_progress {
+ 	PROGRESS_INIT,
+ 	PROGRESS_INIT_SP_SRAM_NOT_COMPLETED,
++	PROGRESS_INIT_EFUSE_SPI,
+ 	PROGRESS_REVOKE_LOC,
+ 	PROGRESS_REVOKE_LOC_0,
+-	PROGRESS_REVOKE_LOC_1,
+-	PROGRESS_KEY_LOC, 			/* 5 */
++	PROGRESS_REVOKE_LOC_1,			/* 5 */
++	PROGRESS_KEY_LOC,
+ 	PROGRESS_KEY_LOC_0,
+ 	PROGRESS_KEY_LOC_1,
+ 	PROGRESS_VER_LOC,
+-	PROGRESS_VER_LOC_0,
+-	PROGRESS_VER_LOC_1,			/* 10 */
++	PROGRESS_VER_LOC_0,			/* 10 */
++	PROGRESS_VER_LOC_1,
+ 	PROGRESS_BRINGUP_PCI_PRI,
+ 	PROGRESS_BRINGUP_PCI_PRI_DMA,
+ 	PROGRESS_BRINGUP_PCI_PRI_SECURITY,
+-	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG,
+-	PROGRESS_BRINGUP_PCI_SEC,		/* 15 */
++	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG,	/* 15 */
++	PROGRESS_BRINGUP_PCI_SEC,
+ 	PROGRESS_BRINGUP_PCI_SEC_DMA,
+ 	PROGRESS_BRINGUP_PCI_SEC_SECURITY,
+ 	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG,
+-	PROGRESS_PCIE_IN_RECOVERY,
+-	PROGRESS_PPBOOT_START,			/* 20 */
++	PROGRESS_PCIE_IN_RECOVERY,		/* 20 */
++	PROGRESS_PPBOOT_START,
+ 	PROGRESS_PPBOOT_FINISH,
+ 	PROGRESS_BRINGUP_RAM_PRI,
+ 	PROGRESS_BRINGUP_RAM_PRI_DMA,
+-	PROGRESS_BRINGUP_RAM_PRI_SECURITY,
+-	PROGRESS_BRINGUP_RAM_SEC,		/* 25 */
++	PROGRESS_BRINGUP_RAM_PRI_SECURITY,	/* 25 */
++	PROGRESS_BRINGUP_RAM_SEC,
+ 	PROGRESS_BRINGUP_RAM_SEC_DMA,
+ 	PROGRESS_BRINGUP_RAM_SEC_SECURITY,
+ 	PROGRESS_ARCBOOT_RAM_START,
+-	PROGRESS_ARCBOOT_RECOVERY,
+-	PROGRESS_ARCBOOT_RECOVERY_DMA,		/* 30 */
++	PROGRESS_ARCBOOT_RECOVERY,		/* 30 */
++	PROGRESS_ARCBOOT_RECOVERY_DMA,
+ 	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR,
+ 	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START,
+ 	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH,
+-	PROGRESS_ARCBOOT_EROM_PCIE,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START,	/* 35 */
++	PROGRESS_ARCBOOT_EROM_PCIE,		/* 35 */
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START,
+ 	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH,
+ 	PROGRESS_ARCBOOT_EROM_PCIE_START,
+ 	PROGRESS_ARCBOOT_EROM_PCIE_FINISH,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START,/* 40 */
++	PROGRESS_ARCBOOT_EROM_RECOVERY,		/* 40 */
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START,
+ 	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH,
+ 	PROGRESS_ARCBOOT_EROM_RECOVERY_START,
+ 	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH,
+-	PROGRESS_ARCBOOT_EROM_TPM,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_START,	/* 45 */
++	PROGRESS_ARCBOOT_EROM_TPM,		/* 45 */
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_START,
+ 	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH,
+ 	PROGRESS_ARCBOOT_EROM_TPM_START,
+ 	PROGRESS_ARCBOOT_EROM_TPM_FINISH

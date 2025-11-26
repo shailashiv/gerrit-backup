@@ -1,0 +1,320 @@
+From bc7e100e99d0e5a6cc5229e05dbf5c75fa2cf90c Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 23 Aug 2022 12:33:36 +0300
+Subject: [PATCH] [SW-99461] gaudi3: replace boot info usage in boot flow
+
+Currently boot info is a part of boot descriptor init. In order
+to make a backup in case boot info api should not be used(determined
+using boot_info_skip efuse flag), the code needs to be restructured
+in the following way:
+
+1) Boot info infra should be used only after fake fuse is initialized.
+2) Mandatory descriptor data that was earlier read using boot info data
+should be backed up in a persistent memory.
+3) In case of a need to skip the boot info in rom, the boot flow to
+ppboot should still continue using rom variables.
+
+Change-Id: I4c573034346e2c2f5fc04d60f9ab9c1b7c54a16e
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 2ea038c..bd83401 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -468,6 +468,8 @@
+ 	return 0;
+ }
+ 
++__weak void arcboot_rom_init_boot_info(void) {}
++
+ int arcboot_rom_main(void)
+ {
+ 	arcboot_rom_init();
+@@ -486,6 +488,7 @@
+ 	if (arcboot_rom_verify(HL_FW_BOOT_PTR_SPI))
+ 		execute_recovery();
+ 
++	arcboot_rom_init_boot_info();
+ 	arcboot_rom_bringup_ppboot();
+ 	arcboot_rom_bringup_arcboot_ram();
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 95723a9..404fbcc 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1130,3 +1130,30 @@
+ 
+ 	return !!(config_fuse & EFUSE_SYSCFG_BOOT_INFO_SKIP);
+ }
++
++void arcboot_rom_init_boot_info(void)
++{
++	struct hl_fw_boot_ptrs_ctx *p_loc_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI];
++	struct hl_fw_boot_ptrs *p_loc_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
++	uint32_t *p_offset = (uint32_t *)(p_loc_img_ptr_ctx->dest_addr_arc + p_loc_boot_ptr->offset2array);
++
++	if (arcboot_rom_efuse_boot_info_skip())
++		return;
++
++	if (!arcboot_rom_global.validation_pass) {
++		if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &p_loc_img_ptr_ctx->desc_info,
++		   sizeof(struct hl_fw_desc_info)))
++			return;
++
++		if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_DATA,
++		   (uint8_t *)(p_loc_img_ptr_ctx->dest_addr_arc + p_offset[0]),
++		   p_loc_img_ptr_ctx->desc_info.desc_size * p_loc_img_ptr_ctx->desc_info.count))
++			return;
++
++		if (boot_info_set_no_merge(HL_BOOT_INFO_ROM_SECURITY_DATA, &arcboot_rom_global.sec_data,
++		    sizeof(arcboot_rom_global.sec_data)))
++			return;
++
++		boot_info_finalize_no_merge();
++	}
++}
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index e7490ba..24b7103 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -657,19 +657,6 @@
+ 	security_load_revoke_bits();
+ 	security_load_fw_version();
+ 	security_load_keys();
+-
+-	/*
+-	 * efuse data is fixed. The only scenario of security data
+-	 * being updated is during fake fuse update which would be
+-	 * done through spi update, hence can be coupled with the
+-	 * validation pass flag as every spi update would require
+-	 * re-validation of the spi images
+-	 */
+-	if (!arcboot_rom_global.validation_pass) {
+-		boot_info_set_no_merge(HL_BOOT_INFO_ROM_SECURITY_DATA, &arcboot_rom_global.sec_data,
+-				sizeof(arcboot_rom_global.sec_data));
+-		boot_info_finalize_no_merge();
+-	}
+ }
+ 
+ int security_efuse_image_validation_en(void)
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index e2b21f5..ee2de50 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -26,7 +26,7 @@
+ #define ALIGN_VAL(val, byte)	ALIGN_SUB(val, (byte - 1))
+ 
+ static struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx;
+-static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_SPI_DMA_DEST_ARC);
++static struct hl_fw_boot_ptrs *p_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
+ static uint32_t erom_img_descs_offset = 0;
+ 
+ static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+@@ -47,11 +47,10 @@
+ static void boot_desc_update_ptrs(enum hl_fw_boot_ptr_imgs img)
+ {
+ 	p_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[img];
+-
+ 	if (img == HL_FW_BOOT_PTR_EROM) {
+ 		p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_EROM_DMA_DEST_ARC);
+ 	} else {
+-		p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_SPI_DMA_DEST_ARC);
++		p_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
+ 	}
+ }
+ 
+@@ -66,13 +65,14 @@
+ 	return SPI_DMA_DST_HBW;
+ }
+ 
++#define NUM_OF_MISC_DESCS	(ROM_DESC_NUM_MAX - ROM_DESC_MISC_1)
++
+ int boot_desc_init(enum hl_fw_boot_ptr_imgs img)
+ {
+-	uint32_t i, img_ptrs_size;
++	uint32_t i, img_ptrs_size, misc_descs = 0;
+ 	uint32_t *p_offset = NULL;
+ 	enum arcboot_rom_progress dma_sts_base = PROGRESS_INIT_SPI_BOOT_DESC_EXCEEDS_MAX_SIZE;
+ 	int err;
+-	uint32_t copy_sz;
+ 	static struct hl_fw_img_desc *p_img_desc;
+ 
+ 	if (arcboot_rom_global.die_id)
+@@ -113,6 +113,9 @@
+ 
+ 	arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_FINISH);
+ 
++	if (img == HL_FW_BOOT_PTR_SPI)
++		memcpy(p_boot_ptr, (uint32_t *)(p_img_ptr_ctx->dest_addr_arc), sizeof(struct hl_fw_boot_ptrs));
++
+ 	if (p_boot_ptr->magic.val != HL_FW_BOOT_MAGIC) {
+ 		arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_BOOT_DESC_HDR_MAGIC_FAIL);
+ 		return 0;
+@@ -139,39 +142,31 @@
+ 			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_BOOT_DESC_VERIFICATION_FAIL);
+ 			return 0;
+ 		}
++
++		if (img != HL_FW_BOOT_PTR_SPI)
++		     continue;
++
++		if (p_img_desc->magic.type == HL_FW_IMG_PPBOOT) {
++			memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_PPBOOT],
++				p_img_desc, sizeof(struct hl_fw_img_desc));
++		} else if (p_img_desc->magic.type == HL_FW_IMG_FAKE_EFUSE) {
++			memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_FAKE_FUSE],
++				p_img_desc, sizeof(struct hl_fw_img_desc));
++		} else if (p_img_desc->magic.type == HL_FW_IMG_TPM_SPI) {
++			memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_TPM],
++				p_img_desc, sizeof(struct hl_fw_img_desc));
++		} else {
++			/* Store upto 5 misc images(indifferent to ROM boot flow) */
++			if (misc_descs < NUM_OF_MISC_DESCS ) {
++				memcpy(&arcboot_rom_global.spi_img_desc[ROM_DESC_MISC_1 + misc_descs],
++					p_img_desc, sizeof(struct hl_fw_img_desc));
++				misc_descs++;
++			}
++		}
+ 	}
+ 
+ skip_boot_desc_process:
+-	if (img == HL_FW_BOOT_PTR_SPI) {
+-		if (!arcboot_rom_global.validation_pass) {
+-			if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &p_img_ptr_ctx->desc_info,
+-			   sizeof(struct hl_fw_desc_info))) {
+-				arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_INFO_SET_FAIL);
+-				return 0;
+-			}
+-
+-			if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_DATA,
+-			   (uint8_t *)(p_img_ptr_ctx->dest_addr_arc + p_offset[0]),
+-			   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count)) {
+-				arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_DATA_SET_FAIL);
+-				return 0;
+-			}
+-
+-			boot_info_finalize_no_merge();
+-		}
+-		if (boot_info_get_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &p_img_ptr_ctx->desc_info,
+-		   sizeof(struct hl_fw_desc_info), &copy_sz)) {
+-			arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_INFO_GET_FAIL);
+-			return 0;
+-		}
+-
+-		if (boot_info_get_no_merge(HL_BOOT_INFO_IMG_DESC_DATA,
+-		   (uint8_t *)(p_img_ptr_ctx->dest_addr_arc + BOOT_INFO_IMG_DESC_GET_OFFSET),
+-		   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count, &copy_sz)) {
+-			arcboot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_DATA_GET_FAIL);
+-			return 0;
+-		}
+-	} else {
++	if (img == HL_FW_BOOT_PTR_EROM) {
+ 		/* Store the erom image descriptor offset to re-use in get api */
+ 		erom_img_descs_offset = p_offset[0];
+ 	}
+@@ -216,12 +211,26 @@
+ 	return idx;
+ }
+ 
++static struct hl_fw_img_desc * boot_desc_img_desc_addr_calc(enum hl_fw_boot_ptr_imgs img,
++		uint32_t index)
++{
++	if (img == HL_FW_BOOT_PTR_SPI) {
++		if (index < ROM_DESC_NUM_MAX)
++			return &arcboot_rom_global.spi_img_desc[index];
++	} else {
++		return (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
++					+ erom_img_descs_offset
++					+ p_img_ptr_ctx->desc_info.desc_size * index);
++	}
++
++	return NULL;
++}
++
+ uint32_t boot_desc_get_img_desc(enum hl_fw_boot_ptr_imgs img, int type,
+ 				struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
+ {
+ 	uint32_t i;
+ 	struct hl_fw_img_desc *p_loc_img_desc = NULL;
+-	uint32_t boot_desc_offset = 0;
+ 
+ 	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
+ 		return HL_FW_IMG_NOT_FOUND;
+@@ -232,15 +241,10 @@
+ 		return HL_FW_IMG_NOT_FOUND;
+ 
+ 	for (i = 0; i < p_img_ptr_ctx->desc_info.count ; i++) {
+-		if (img == HL_FW_BOOT_PTR_SPI) {
+-			boot_desc_offset = BOOT_INFO_IMG_DESC_GET_OFFSET;
+-		} else {
+-			boot_desc_offset = erom_img_descs_offset;
+-		}
++		p_loc_img_desc = boot_desc_img_desc_addr_calc(img, i);
+ 
+-		p_loc_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
+-						+ boot_desc_offset
+-						+ p_img_ptr_ctx->desc_info.desc_size * i);
++		if (!p_loc_img_desc)
++			continue;
+ 
+ 		if (p_loc_img_desc->magic.type != type)
+ 			continue;
+@@ -255,7 +259,6 @@
+ 				struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
+ {
+ 	struct hl_fw_img_desc *p_loc_img_desc = NULL;
+-	uint32_t boot_desc_offset = 0;
+ 
+ 	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
+ 		return HL_FW_IMG_NOT_FOUND;
+@@ -268,14 +271,10 @@
+ 	if (index >= p_img_ptr_ctx->desc_info.count)
+ 		return HL_FW_IMG_NOT_FOUND;
+ 
+-	if (img == HL_FW_BOOT_PTR_SPI)
+-		boot_desc_offset = BOOT_INFO_IMG_DESC_GET_OFFSET;
+-	else
+-		boot_desc_offset = erom_img_descs_offset;
++	p_loc_img_desc = boot_desc_img_desc_addr_calc(img, index);
+ 
+-	p_loc_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
+-					+ boot_desc_offset
+-					+ p_img_ptr_ctx->desc_info.desc_size * index);
++	if (!p_loc_img_desc)
++		return HL_FW_IMG_NOT_FOUND;
+ 
+ 	return boot_desc_copy_desc(desc, p_loc_img_desc, upd_status);
+ }
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 87d5323..8248f77 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -77,7 +77,18 @@
+ #define CRC32_SIZE		4
+ #define SYS_REF_CLOCK				50000000ULL
+ 
+-#define MAX_PERSISTENT_IMG_DESC		8
++enum rom_internal_boot_desc_idx {
++	ROM_DESC_PPBOOT,
++	ROM_DESC_FAKE_FUSE,
++	ROM_DESC_TPM,
++	ROM_DESC_MISC_1,
++	ROM_DESC_MISC_2,
++	ROM_DESC_MISC_3,
++	ROM_DESC_MISC_4,
++	ROM_DESC_MISC_5,
++	ROM_DESC_NUM_MAX,
++};
++
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;
+ 	uint32_t config2_fuse;
+@@ -92,7 +103,7 @@
+ 	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
+ 	struct hl_fw_sec_info sec_data;
+ 	uint8_t tpm_validation_pass;
+-	struct hl_fw_img_desc spi_img_desc[MAX_PERSISTENT_IMG_DESC];
++	struct hl_fw_img_desc spi_img_desc[ROM_DESC_NUM_MAX];
+ 	struct hl_fw_boot_ptrs spi_manifest_hdr;
+ };
+ 

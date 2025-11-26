@@ -1,0 +1,89 @@
+From cca4ab90dd40f7f02630a301225a219a76c296fa Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 24 Apr 2024 07:44:10 +0300
+Subject: [PATCH] [FSW-4077] fs1: efuse: verify volt protection pattern
+
+Low voltage attacks on device can cause all efuse bits to
+be read zero disabling secuirity for entire device. To
+validate if efuse values are read correctly, config fuse
+value has voltage protection pattern of '1010'. This patch
+validates said pattern and if valid pattern is not found
+bootrom goes in halt.
+
+Change-Id: I55b8861a48adbbcfabf680cef00c9ed9629a0f7c
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 91af5c7..5e74a1a 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -161,20 +161,25 @@
+ 
+ void boot_rom_fuse(void)
+ {
+-	if (boot_rom_fuse_init() == BOOT_ROM_SUCCESS) {
+-		boot_rom_set_efuse_read();
+-	} else {
+-		boot_rom_status_update(PROGRESS_INIT_EFUSE_INIT_FAIL);
+-		boot_rom_halt();
+-	}
++	if (boot_rom_fuse_init() != BOOT_ROM_SUCCESS)
++		goto efuse_fail_halt;
+ 
+ 	if (boot_rom_fuse_read(IO_EFUSE_SYSCFG_OFFSET, &boot_rom_global.config_fuse) != BOOT_ROM_SUCCESS)
+-		boot_rom_halt();
++		goto efuse_fail_halt;
+ 
+ 	if(boot_rom_fuse_read(IO_EFUSE_SYSCFG2_OFFSET, &boot_rom_global.config2_fuse) != BOOT_ROM_SUCCESS)
+-		boot_rom_halt();
++		goto efuse_fail_halt;
+ 
++	if (!fuse_valid_volt_prot_pattern(boot_rom_global.config_fuse))
++		goto efuse_fail_halt;
++
++	boot_rom_set_efuse_read();
+ 	/* TODO: FS1 SKU decession pending */
+ 
+ 	/* TODO: Enable FAKE FUSE & RMA support */
++	return;
++
++efuse_fail_halt:
++	boot_rom_status_update(PROGRESS_INIT_EFUSE_INIT_FAIL);
++	boot_rom_halt();
+ }
+diff --git a/arch/fs1/arc/dev_efuse.c b/arch/fs1/arc/dev_efuse.c
+index 4d6cbff..52cef35 100644
+--- a/arch/fs1/arc/dev_efuse.c
++++ b/arch/fs1/arc/dev_efuse.c
+@@ -37,3 +37,12 @@
+ {
+ 	regmap_writel(fsm_trigger, IO0_H0_PSOC_EFUSE(mmEFUSE_RD));
+ }
++
++bool fuse_valid_volt_prot_pattern(uint32_t config_fuse)
++{
++	if ((config_fuse & FUSE_VOLT_PROT_MASK) == FUSE_VOLT_PROT_PATTERN)
++		return true;
++
++	return false;
++}
++
+diff --git a/arch/fs1/arc/dev_efuse.h b/arch/fs1/arc/dev_efuse.h
+index eae068b..e16d951 100644
+--- a/arch/fs1/arc/dev_efuse.h
++++ b/arch/fs1/arc/dev_efuse.h
+@@ -12,11 +12,14 @@
+ #define FUSE_DELAY_US				5
+ #define FUSE_TIMEOUT_US				500
+ #define FUSE_RETRIES				(FUSE_TIMEOUT_US / FUSE_DELAY_US)
++#define FUSE_VOLT_PROT_MASK			0x3C00
++#define FUSE_VOLT_PROT_PATTERN			0x1400
+ 
+ void fuse_prog_range_config(void);
+ void fuse_prog_read_address(void);
+ uint32_t fuse_get_read_ctrl_reg_val(void);
+ void fuse_set_read_ctrl_reg_val(uint32_t fsm_trigger);
+ uint32_t fuse_read_data(uint32_t offset);
++bool fuse_valid_volt_prot_pattern(uint32_t config_fuse);
+ 
+ #endif /* _DEV_EFUSE_H_ */

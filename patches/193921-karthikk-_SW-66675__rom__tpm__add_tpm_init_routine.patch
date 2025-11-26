@@ -1,0 +1,427 @@
+From f3cd0e1ef737dbf7383961d66fc2d4f3e011766b Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 29 Mar 2022 06:13:10 +0300
+Subject: [PATCH] [SW-66675] rom: tpm: add tpm init routine
+
+Adding tpm initialization routine in rom . This initializes the
+locality in use and preliminary checks like revision id and device
+id reads from spi slave.
+
+Change-Id: I0a4fb724d821d52e7287ed68740b291534392924
+---
+
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 3d0fcd0..e14e1b1 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -6,3 +6,4 @@
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/recovery.c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dma.c)
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/tpm2.c)
+\ No newline at end of file
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index d728833..e79afed 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -789,3 +789,22 @@
+ 	if (override == 0)
+ 		execute_recovery();
+ }
++
++static void arcboot_rom_set_spi_tpm_cs_gpio(bool cs_en)
++{
++	uint32_t reg = regmap_readl(mmD0_PSOC_GPIO1_DATAOUT);
++	uint32_t mask = BIT(TPM_CS_GPIO_PIN % GPIOS_PER_BANK);
++
++	/* CS is active low */
++	if (cs_en)
++		reg &= ~mask;
++	else
++		reg |= mask;
++
++	regmap_writel(reg, mmD0_PSOC_GPIO1_DATAOUT);
++}
++
++void external_cs_manage(bool cs_en)
++{
++	arcboot_rom_set_spi_tpm_cs_gpio(cs_en);
++}
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index ca7d335..26435f2 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -6,6 +6,7 @@
+ #include <arcboot.h>
+ 
+ #define GPIOS_PER_BANK			16
++#define TPM_CS_GPIO_PIN			10
+ 
+ void arcboot_rom_notify_slave(void);
+ uint32_t arcboot_rom_get_num_crc(uint32_t size);
+diff --git a/arch/gaudi3/arc/tpm2.c b/arch/gaudi3/arc/tpm2.c
+new file mode 100644
+index 0000000..903e320
+--- /dev/null
++++ b/arch/gaudi3/arc/tpm2.c
+@@ -0,0 +1,333 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <arcboot.h>
++#include <tpm2.h>
++#include <string.h>
++#include <delay.h>
++#include <hl_tpm2.h>
++#include <errno.h>
++#include <dev_common.h>
++#include <linux/types.h>
++
++/* Internal error of TPM command library */
++#define TPM_LIB_ERROR ((uint32_t)~0u)
++#define le32_to_cpu(x) ((__uint32_t)(__le32)(x))
++
++static struct spi_ctx tpm_spi = {0};
++static int locality;
++
++static unsigned int get_cs_pad_sel_tpm(void)
++{
++	return mmD0_PSOC_GLOBAL_CONF_PAD_SEL_18;
++}
++
++static unsigned int get_miso_pad_sel_tpm(void)
++{
++	return mmD0_PSOC_GLOBAL_CONF_PAD_SEL_15;
++}
++
++static unsigned int get_mosi_pad_sel_tpm(void)
++{
++	return mmD0_PSOC_GLOBAL_CONF_PAD_SEL_16;
++}
++
++static unsigned int get_sclk_out_pad_sel_tpm(void)
++{
++	return mmD0_PSOC_GLOBAL_CONF_PAD_SEL_17;
++}
++
++static void spi_tpm_claim_bus(void)
++{
++	external_cs_manage(true);
++}
++
++static void spi_tpm_release_bus(void)
++{
++	external_cs_manage(false);
++}
++
++/*
++ * tpm_tis_spi_xfer() - TPM <-> SPI abstraction api.
++ *
++ * @description : This api is used to communicate with the spi
++ * driver in order to send commands as per TPM 2.0 specification
++ * and to send/receive data from the TPM slave.
++ *
++ * @addr: register address to read from
++ * @out: buffer in case caller sends data to tpm slave
++ * @in: buffer in case caller requests data from tpm slave
++ *
++ * @return -1 on error, 0 on success.
++ */
++
++#define TPM_ADDR_COMMAND_OPCODE		0xD4
++static int tpm_tis_spi_xfer(uint32_t addr, const uint8_t *out, uint8_t *in, uint16_t len)
++{
++	int transfer_len, ret, i;
++	uint8_t tx_buf[MAX_SPI_FRAMESIZE];
++	uint8_t rx_buf[MAX_SPI_FRAMESIZE];
++
++	if (in && out) {
++		return -1;
++	}
++
++	spi_tpm_claim_bus();
++
++	while (len) {
++		/* Request */
++		transfer_len = min_t(uint16_t, len, MAX_SPI_FRAMESIZE);
++		tx_buf[0] = (in ? BIT(7) : 0) | (transfer_len - 1);
++		tx_buf[1] = TPM_ADDR_COMMAND_OPCODE;
++		tx_buf[2] = addr >> 8;
++		tx_buf[3] = addr;
++
++		ret = spi_xfer(&tpm_spi, 4 * 8, tx_buf, rx_buf, SPI_XFER_BEGIN);
++		if (ret) {
++			goto release_bus;
++		}
++
++		/* Wait state */
++		if (!(rx_buf[3] & 0x1)) {
++			for (i = 0; i < TPM_WAIT_STATES; i++) {
++				ret = spi_xfer(&tpm_spi, 1 * 8, NULL, rx_buf,
++						0);
++				if (ret) {
++					goto release_bus;
++				}
++
++				if (rx_buf[0] & 0x1)
++					break;
++			}
++
++			if (i == TPM_WAIT_STATES) {
++				ret = -1;
++				goto release_bus;
++			}
++		}
++
++		/* Read/Write */
++		if (out) {
++			memcpy(tx_buf, out, transfer_len);
++			out += transfer_len;
++		} else {
++			memset(tx_buf, 0, transfer_len);
++		}
++
++		ret = spi_xfer(&tpm_spi, transfer_len * 8,
++			       tx_buf,
++			       in ? rx_buf : NULL,
++			       SPI_XFER_END);
++		if (ret) {
++			goto release_bus;
++		}
++
++		spi_tpm_release_bus();
++
++		if (in) {
++			memcpy(in, rx_buf, transfer_len);
++			in += transfer_len;
++		}
++
++		len -= transfer_len;
++	}
++
++	return ret;
++
++release_bus:
++	/* If an error occurred, release the chip by deasserting the CS */
++	spi_tpm_release_bus();
++
++	return ret;
++}
++
++static bool tpm_is_supported(void) {
++	return true;
++}
++
++void spi_ssi_cs1_get(unsigned int *mask, unsigned int *data_offset,
++				unsigned int *out_en_offset)
++{
++	*mask = BIT(TPM_CS_GPIO_PIN % GPIOS_PER_BANK);
++	*data_offset = mmD0_PSOC_GPIO1_DATAOUT;
++	*out_en_offset = mmD0_PSOC_GPIO1_OUTENSET;
++}
++
++static void spi_ssi_cs_init(void)
++{
++	unsigned int reg, mask, data, out_en;
++
++	/* GPIO AF initialization */
++	regmap_writel(1, get_miso_pad_sel_tpm());
++	regmap_writel(1, get_mosi_pad_sel_tpm());
++	regmap_writel(1, get_sclk_out_pad_sel_tpm());
++	regmap_writel(0, get_cs_pad_sel_tpm());
++
++	spi_ssi_cs1_get(&mask, &data, &out_en);
++
++	reg = regmap_readl(data);
++	reg |= mask;
++	regmap_writel(reg, data);
++
++	reg = regmap_readl(out_en);
++	reg |= mask;
++	regmap_writel(reg, out_en);
++}
++
++static void tpm_spi_init(void)
++{
++	tpm_spi.spi_base = mmD0_PSOC_SPI_CTRLR0;
++	tpm_spi.spi_initialized = false;
++	tpm_spi.spi_access_is_locked = false;
++	tpm_spi.cs_init = spi_ssi_cs_init;
++	tpm_spi.claim_bus = spi_tpm_claim_bus;
++	tpm_spi.release_bus = spi_tpm_release_bus;
++	tpm_spi.fifo_len = 0;
++	spi_init(&tpm_spi);
++}
++
++/*
++ * tpm_tis_spi_read() - Read from TPM register
++ *
++ * @addr: register address to read from
++ * @in: provided by caller
++ * @len: number of bytes to read
++ *
++ * Read len bytes from TPM register and put them into
++ * buffer (little-endian format, i.e. first byte is put into buffer[0]).
++ *
++ * NOTE: TPM is big-endian for multi-byte values. Multi-byte
++ * values have to be swapped.
++ *
++ * @return -1 on error, 0 on success.
++ */
++static int tpm_tis_spi_read(uint16_t addr, uint8_t *in, uint16_t len)
++{
++	return tpm_tis_spi_xfer(addr, NULL, in, len);
++}
++
++static int tpm_tis_spi_write(uint16_t addr, const uint8_t *out, uint16_t len)
++{
++	return tpm_tis_spi_xfer(addr, out, NULL, len);
++}
++
++static int tpm_tis_wait_init(int loc)
++{
++	uint8_t status;
++	int ret;
++	uint32_t count = TIS_LONG_TIMEOUT_MS / TPM_TIMEOUT_MS;
++
++	do {
++		ret = tpm_tis_spi_read(TPM_ACCESS(loc), &status, 1);
++		if (ret)
++			break;
++
++		if (status & TPM_ACCESS_VALID)
++			return 0;
++
++		udelay(MS_TO_US(TPM_TIMEOUT_MS));
++		count--;
++	} while (count > 0);
++
++	return -1;
++}
++
++static int tpm_tis_spi_check_locality(int loc)
++{
++	const uint8_t mask = TPM_ACCESS_ACTIVE_LOCALITY | TPM_ACCESS_VALID;
++	uint8_t buf;
++	int ret;
++
++	ret = tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1);
++	if (ret)
++		return ret;
++
++	if ((buf & mask) == mask) {
++		locality = loc;
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++static int tpm_tis_spi_request_locality(int loc)
++{
++	uint8_t buf = TPM_ACCESS_REQUEST_USE;
++	int ret;
++	uint32_t count = TIS_SHORT_TIMEOUT_MS / TPM_TIMEOUT_MS;
++
++	ret = tpm_tis_spi_check_locality(loc);
++	if (!ret)
++		return 0;
++
++	if (ret != -ENOENT) {
++		return ret;
++	}
++
++	ret = tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
++	if (ret) {
++		return ret;
++	}
++
++	do {
++		ret = tpm_tis_spi_check_locality(loc);
++		if (!ret)
++			return 0;
++
++		if (ret != -ENOENT) {
++			return ret;
++		}
++
++		udelay(MS_TO_US(TPM_TIMEOUT_MS));
++		count--;
++	} while (count > 0);
++
++	return ret;
++}
++
++static int tpm_tis_spi_read32(uint32_t addr, uint32_t *result)
++{
++	__le32 result_le;
++	int ret;
++
++	ret = tpm_tis_spi_read(addr, (uint8_t *)&result_le, sizeof(uint32_t));
++	if (!ret)
++		*result = le32_to_cpu(result_le);
++
++	return ret;
++}
++
++int tpm2_init(void)
++{
++	int ret;
++	uint32_t vend_dev;
++	uint8_t rid;
++
++	locality = 0;
++
++	if (!tpm_is_supported())
++		return 0;
++
++	tpm_spi_init();
++
++	ret = tpm_tis_wait_init(locality);
++	if (ret)
++		return ret;
++
++	ret = tpm_tis_spi_request_locality(locality);
++	if (ret)
++		return ret;
++
++	ret = tpm_tis_spi_read32(TPM_DID_VID(locality), &vend_dev);
++	if (ret)
++		return ret;
++
++	ret = tpm_tis_spi_read(TPM_RID(locality), &rid, 1);
++	if (ret)
++		return ret;
++
++	return 0;
++}
+diff --git a/arch/gaudi3/arc/tpm2.h b/arch/gaudi3/arc/tpm2.h
+new file mode 100644
+index 0000000..7f49e8b
+--- /dev/null
++++ b/arch/gaudi3/arc/tpm2.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#ifndef _GAUDI3_TPM2_H_
++#define _GAUDI3_TPM2_H_
++
++
++#endif /* _GAUDI3_TPM2_H_ */
+diff --git a/common/spi.h b/common/spi.h
+index e8444c4..2d2b706 100644
+--- a/common/spi.h
++++ b/common/spi.h
+@@ -26,5 +26,6 @@
+ void spi_init(struct spi_ctx *ctx);
+ int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
+ 		const void *dout, void *din, unsigned long flags);
++void external_cs_manage(bool cs_val);
+ 
+ #endif /* _SPI_H */

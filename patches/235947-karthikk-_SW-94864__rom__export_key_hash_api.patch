@@ -1,0 +1,124 @@
+From 99dc035bd2ce9e4a37c91d112e4b321924f148d8 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 25 Jul 2022 05:35:11 +0300
+Subject: [PATCH] [SW-94864] rom: export key hash api
+
+Export rom get key hash api to re-use in other fw components.
+
+Change-Id: I006b2c1d00153d14ed8ca3beeef5fa26cacb3d0b
+---
+
+diff --git a/arch/gaudi2/arc/secureboot.c b/arch/gaudi2/arc/secureboot.c
+index 851c5ce..e1c6c7a 100644
+--- a/arch/gaudi2/arc/secureboot.c
++++ b/arch/gaudi2/arc/secureboot.c
+@@ -102,7 +102,7 @@
+ 	return -1;
+ }
+ 
+-int security_get_key_hash(uint32_t *hash, uint8_t key_index)
++int security_rom_get_key_hash_by_idx(uint32_t *hash, uint8_t key_index)
+ {
+ 	uint32_t valid_key_base, max_key_index;
+ 	int i;
+@@ -205,7 +205,7 @@
+ 	if (ret != 1)
+ 		return SECUREBOOT_VERIFY_KEY_FAILED;
+ 
+-	ret = security_get_key_hash((uint32_t *)expected_hash, key_index);
++	ret = security_rom_get_key_hash_by_idx((uint32_t *)expected_hash, key_index);
+ 	if (ret != 1)
+ 		return SECUREBOOT_VERIFY_KEY_FAILED;
+ 
+diff --git a/arch/gaudi3/arc/arcboot_rom.txt b/arch/gaudi3/arc/arcboot_rom.txt
+index a6fe415..1508941 100644
+--- a/arch/gaudi3/arc/arcboot_rom.txt
++++ b/arch/gaudi3/arc/arcboot_rom.txt
+@@ -19,3 +19,6 @@
+ security_rr_config_debug_if_hbw
+ security_rr_config_pcie_lbw
+ security_rr_config_pcie_hbw
++security_rom_get_key_hash_by_idx
++security_rom_get_hash
++security_get_rom_key_hash_addr
+diff --git a/arch/gaudi3/arc/secureboot.c b/arch/gaudi3/arc/secureboot.c
+index a968585..d26f700 100644
+--- a/arch/gaudi3/arc/secureboot.c
++++ b/arch/gaudi3/arc/secureboot.c
+@@ -18,7 +18,7 @@
+ 	uint8_t expected_hash[SHA384_SUM_LEN];
+ 	uint8_t actual_hash[SHA384_SUM_LEN];
+ 
+-	if (security_get_key_hash((uint32_t *)expected_hash, key_index))
++	if (security_rom_get_key_hash_by_idx((uint32_t *)expected_hash, key_index))
+ 		return SECUREBOOT_VERIFY_KEY_FAILED;
+ 
+ 	sha384_csum(key, key_len, actual_hash, 0);
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index 66bfd44..f5d946e 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -428,7 +428,7 @@
+ 	security_rr_smi_hbw_config(rr_ctx);
+ }
+ 
+-int security_get_key_hash(uint32_t *hash, uint8_t key_index)
++int security_rom_get_key_hash_by_idx(uint32_t *hash, uint8_t key_index)
+ {
+ 	uint32_t *ptr = (uint32_t *)rom_key_hashes[key_index];
+ 
+@@ -454,9 +454,14 @@
+ 	return -1;
+ }
+ 
++uint32_t *security_rom_get_key_hash_addr(void)
++{
++	return (uint32_t *)rom_key_hashes;
++}
++
+ void security_rom_get_hash(uint32_t *key_hash)
+ {
+-	uint32_t *ptr = (uint32_t *)rom_key_hashes;
++	uint32_t *ptr = security_rom_get_key_hash_addr();
+ 	int size = NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY;
+ 
+ 	for (int i = 0; i < size; i++)
+diff --git a/arch/greco/arc_elf32/secureboot.c b/arch/greco/arc_elf32/secureboot.c
+index dc7bbf8..53948a7 100644
+--- a/arch/greco/arc_elf32/secureboot.c
++++ b/arch/greco/arc_elf32/secureboot.c
+@@ -60,7 +60,7 @@
+ 
+ 	for (key_scan = SECUREBOOT_CUSTOMER_KEY; key_scan >=
+ 	     SECUREBOOT_HABANA_KEY; key_scan--) {
+-		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
++		if (security_rom_get_key_hash_by_idx((uint32_t *)test_phase0a_hash,
+ 					  key_scan)) {
+ 			/* check pub key hash versus efuse */
+ 			err = elp_secureboot_phase0a(sb_proxy_read,
+diff --git a/common/security.c b/common/security.c
+index a05018b..e5fe0b9 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -116,7 +116,7 @@
+ 	return -1;
+ }
+ 
+-__weak int security_get_key_hash(uint32_t *hash, uint8_t customer)
++__weak int security_rom_get_key_hash_by_idx(uint32_t *hash, uint8_t customer)
+ {
+ 	uint32_t valid_key_base;
+ 	int i;
+diff --git a/common/security.h b/common/security.h
+index 245a4d8..dc42d99 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -118,7 +118,7 @@
+ void security_twi_if_rr_hbw_config(uint8_t spi_en);
+ void security_i2c_s_enable(void);
+ uint8_t security_find_min_fw_version(uint32_t *fw_version);
+-int security_get_key_hash(uint32_t *hash, uint8_t customer);
++int security_rom_get_key_hash_by_idx(uint32_t *hash, uint8_t customer);
+ int security_check_valid_fw_version(uint32_t fw_version);
+ void security_load_revoke_bits(void);
+ void security_load_fw_version(void);

@@ -1,0 +1,129 @@
+From 3eed423fac5e93bbd864dcc9dcf6253fbfc1e059 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 05 Jun 2022 15:51:21 +0300
+Subject: [PATCH] Revert "[SW-86865] gaudi3: implement bring up arc routine"
+
+Revert rom recovery implementation for secured firmware update via
+inband and OOB.
+
+This reverts commit e9297b20f3d7167154c24d30a435ff1507bea2ea.
+
+Change-Id: I82016100588430d59f67124455cf2a4887514b38
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 9682b1d..54a7ba6 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -871,7 +871,7 @@
+ #define ARC_RUN_M							BIT(0)
+ #define ARC_HALT_M							BIT(1)
+ 
+-static void run_halt_arc(int core_id, bool run)
++__unused static void run_halt_arc(int core_id, bool run)
+ {
+ 	uint32_t run_halt_offset;
+ 
+@@ -971,78 +971,6 @@
+ 	regmap_writel(D0_PSOC_DFT_EFUSE_PROG_ADDRESS_LAST_M, mmD0_PSOC_EFUSE_PROG_ADDRESS);
+ }
+ 
+-static bool is_arc_in_reset(int core_id)
+-{
+-	uint32_t reg_offset;
+-
+-	switch (core_id) {
+-	case FIT_CORE_ID_D0_PSOC_ARC0:
+-		reg_offset = mmD0_PARC_ARC0_CFG_ARC_RST;
+-		break;
+-	case FIT_CORE_ID_D0_PSOC_ARC1:
+-		reg_offset = mmD0_PARC_ARC1_CFG_ARC_RST;
+-		break;
+-	case FIT_CORE_ID_D0_PSOC_ARC2:
+-		reg_offset = mmD0_PARC_ARC2_CFG_ARC_RST;
+-		break;
+-	default:
+-		return false;
+-	}
+-
+-	if (regmap_readl(reg_offset) & D0_PARC_ARC0_CFG_ARC_RST_CORE_M)
+-		return true;
+-
+-	return false;
+-}
+-
+-#define ARC_RST_VEC_ADDR_S				0xA
+-
+-void arcboot_rom_bring_up_arc(int core_id, uint64_t load_addr)
+-{
+-
+-	uint32_t arc_dst, base_iccm_addr, arc_rst, arc_vec, val;
+-
+-	if (!is_arc_in_reset(core_id))
+-		run_halt_arc(core_id, 0);
+-
+-	switch (core_id) {
+-	case FIT_CORE_ID_D0_PSOC_ARC0:
+-		arc_rst = mmD0_PARC_ARC0_CFG_ARC_RST;
+-		arc_vec = mmD0_PARC_ARC0_CFG_RST_VEC_ADDR;
+-		base_iccm_addr = HL_ARC0_ICCM_BASE;
+-		break;
+-	case FIT_CORE_ID_D0_PSOC_ARC2:
+-		arc_rst = mmD0_PARC_ARC2_CFG_ARC_RST;
+-		arc_vec = mmD0_PARC_ARC2_CFG_RST_VEC_ADDR;
+-		base_iccm_addr = HL_ARC2_ICCM_BASE;
+-		break;
+-	default:
+-		return;
+-	}
+-
+-	/*
+-	 * Assumption made here is that deassert core will be called
+-	 * other than arc1 which is already running.
+-	 */
+-	arc_dst = (uint32_t)arcboot_rom_get_arc_addr(load_addr);
+-	if (((load_addr >= HL_ARC0_ICCM_FULL_BASE) &&
+-		(load_addr <= HL_ARC0_ICCM_FULL_BASE + ARC0_ICCM_SIZE)) ||
+-		((load_addr >= HL_ARC2_ICCM_FULL_BASE) &&
+-		(load_addr <= HL_ARC2_ICCM_FULL_BASE + ARC2_ICCM_SIZE))) {
+-		arc_dst = arc_dst - base_iccm_addr;
+-	}
+-
+-	/* put core in reset */
+-	regmap_writel(D0_PARC_ARC0_CFG_ARC_RST_CORE_M, arc_rst);
+-
+-	/* change reset vector based on load address */
+-	regmap_writel((arc_dst >> ARC_RST_VEC_ADDR_S), arc_vec);
+-
+-	/* bring core out of reset */
+-	val = (D0_PARC_ARC0_CFG_ARC_RST_PRESETDBGN_M | 0x0);
+-	regmap_writel(val, arc_rst);
+-}
+-
+ uint64_t get_pcie_pll_freq(enum pll_div_out div)
+ {
+ 	uint32_t div_sel, factor, offset;
+@@ -1073,3 +1001,4 @@
+ 
+ 	return out_freq;
+ }
++
+diff --git a/arch/gaudi3/arc/soc.h b/arch/gaudi3/arc/soc.h
+index 7f926e9..e304f57 100644
+--- a/arch/gaudi3/arc/soc.h
++++ b/arch/gaudi3/arc/soc.h
+@@ -99,14 +99,12 @@
+ #define HL_MIRROR_CFG_BASE		HL_D2D_LBW_BASE
+ 
+ #define HL_ARC0_ICCM_FULL_BASE		(HL_FW_MEM_BASE_FULL + HL_ARC0_ICCM_OFFSET)
+-#define HL_ARC0_ICCM_BASE		(HL_GEN_MEM_BASE + HL_ARC0_ICCM_OFFSET)
+ #define ARC0_ICCM_SIZE			SZ_128K
+ #define ARC0_DCCM_SIZE			SZ_32K
+ #define HL_ARC1_ICCM_FULL_BASE		(HL_FW_MEM_BASE_FULL + HL_ARC1_ICCM_OFFSET)
+ #define ARC1_ICCM_SIZE			SZ_256K
+ #define ARC1_DCCM_SIZE			SZ_64K
+ #define HL_ARC2_ICCM_FULL_BASE		(HL_FW_MEM_BASE_FULL + HL_ARC2_ICCM_OFFSET)
+-#define HL_ARC2_ICCM_BASE		(HL_GEN_MEM_BASE + HL_ARC2_ICCM_OFFSET)
+ #define ARC2_ICCM_SIZE			SZ_128K
+ #define ARC2_DCCM_SIZE			SZ_32K
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)

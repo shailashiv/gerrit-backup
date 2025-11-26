@@ -1,0 +1,104 @@
+From 0b47db7f9e8f8f51cb995b354e7869e6cdd24035 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 27 Jan 2022 16:06:18 +0200
+Subject: [PATCH] [SW-58071] gaudi3: perform spi initialization
+
+This patch add support to perform required SPI initialization
+as part of ROM init flow. The initialization is only performed
+for die 0 ie. master die.
+
+Change-Id: I57c0114a708f5c33f2d6dc9044f08aed910de59a
+---
+
+diff --git a/Makefile b/Makefile
+index f783670..b9d839a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -48,13 +48,12 @@
+ CFLAGS = -DELP_ARCV2
+ export CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+-include $(HL_DEV_ARCH)/Makefile
+-
+ ARCBOOT_COMMON_SRCS_C := $(shell ls common/*.c common/rsa/*.c $(HL_DEV_ARCH)/$(HL_TARGET).c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/secureboot.c)
+ 
++include $(HL_DEV_ARCH)/Makefile
+ 
+ ARCBOOT_RAM_SRCS_C := app/arcboot_ram.c
+ ARCBOOT_RAM_SRCS_S := app/crt0_ram.S
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 573a444..2eb9f50 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -1,3 +1,4 @@
+ LDFLAGS += -static
+ 
+ BINARIES = arcboot_rom.bin
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/spi_flash.c)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index dafe99f..c540467 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -7,6 +7,7 @@
+ #include <arcboot.h>
+ #include <delay.h>
+ #include <gaudi3_fw_if.h>
++#include <dev_spi_flash.h>
+ 
+ void arcboot_rom_clear_sw_status(void)
+ {
+@@ -118,4 +119,6 @@
+ 
+ 	/* TODO: check whether required for die1 */
+ 	arcboot_rom_init_sp_sram();
++
++	spi_flash_init();
+ }
+diff --git a/arch/gaudi3/arc/dev_spi_flash.h b/arch/gaudi3/arc/dev_spi_flash.h
+new file mode 100644
+index 0000000..85fb2eb
+--- /dev/null
++++ b/arch/gaudi3/arc/dev_spi_flash.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#ifndef _GAUDI3_DEV_SPI_FLASH_H_
++#define _GAUDI3_DEV_SPI_FLASH_H_
++
++void spi_flash_init(void);
++
++#endif /* _GAUDI3_DEV_SPI_FLASH_H_ */
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+new file mode 100644
+index 0000000..58f5bc8
+--- /dev/null
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <arcboot.h>
++#include <spi_flash.h>
++#include <efuse.h>
++
++void spi_flash_init(void)
++{
++	if (arcboot_rom_global.die_id)
++		return;
++
++	/* make sure spi controller doesn't swap bytes */
++	spi_flash_set_byte_swap(DISABLE_BYTE_SWAP);
++
++	regmap_writel(SPI_FLASH_BAUDR_DIVISOR, mmQSPI_BAUDR);
++
++	regmap_writel(write_en_2MB, mmD0_PSOC_GLOBAL_CONF_SPI_WRITE_LIMIT);
++}

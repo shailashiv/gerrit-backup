@@ -1,0 +1,174 @@
+From 03ed4826e01e73ca4ef1a89e3200799450996d44 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 25 Nov 2024 06:14:09 +0200
+Subject: [PATCH] [FSW-7256] fs1: define recovery prot bits context
+
+With this patch declared a group specific
+protection bits structures, which has various
+members to avoid fixed size arrays to configure
+pb depends upon requirement. Group specific
+structures are used to form a page specific
+structure to configure each pb page. Based
+on requirement, multiple pages can be grouped,
+For example in this patch recovery required
+pages are defined.
+
+Change-Id: I29421b037bf51e3db6dc23a41e65175af929b4ee
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 3386556..5c6dd38 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -121,6 +121,54 @@
+ 	},
+ };
+ 
++/* Assign memory to PB_REG_BITS */
++const uint32_t  rec_pb_cfg_psoc_boot_security[] = RECOVERY_PB_CFG_PSOC_BOOT_SECURITY;
++const uint32_t  rec_pb_cfg_psoc_cfg_pad_conf[] = RECOVERY_PB_CFG_PSOC_CFG_PAD_CONF;
++
++#define PROT_BITS_RECOVERY_CFG {	\
++	[PB_PAGE_PSOC_BOOT_SECURITY] = {	\
++		.spl_base = mmIO_0_CFG_HALF_0_PSOC_BOOT_SECURITY_SPECIAL_BASE,	\
++		.pb_grp_cfg[PB_GROUP_0] = {		\
++			.close_all = 0,		\
++			.access_type = PB_ACCESS_TYPE_RW,	\
++			.sai_mask = RECOVERY_INITIATORS_SAI,	\
++			.pb_mask = rec_pb_cfg_psoc_boot_security,	\
++			.pb_mask_len = ARRAY_SIZE(rec_pb_cfg_psoc_boot_security),	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_1] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_2] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++	},	\
++	[PB_PAGE_PSOC_CFG_PAD_CONF] = {	\
++		.spl_base = mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_SPECIAL_BASE,	\
++		.pb_grp_cfg[PB_GROUP_0] = {		\
++			.close_all = 0,		\
++			.access_type = PB_ACCESS_TYPE_RW,	\
++			.sai_mask = RECOVERY_INITIATORS_SAI,	\
++			.pb_mask = rec_pb_cfg_psoc_cfg_pad_conf,	\
++			.pb_mask_len = ARRAY_SIZE(rec_pb_cfg_psoc_cfg_pad_conf),	\
++			.pb_mask_filter = 0x80,	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_1] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++		.pb_grp_cfg[PB_GROUP_2] = {		\
++			.close_all = 1,		\
++			.access_type = PB_ACCESS_TYPE_RO,	\
++			.sai_mask = 0,	\
++		},	\
++	},	\
++}
++
+ void security_load_revoke_bits(void)
+ {
+ 	uint32_t key_revoke = boot_rom_global.config_fuse & EFUSE_SYSCFG_KEY_REVOCATION_BITS;
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 7d5c72f..94d1546 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -52,6 +52,18 @@
+ #define BOOT_ROM_REC_RR_GEN_MEM_MIN		(HL_FLASH_BASE)
+ #define BOOT_ROM_REC_RR_GEN_MEM_MAX		(HL_FLASH_BASE) + (HL_FLASH_SIZE - 1)
+ 
++/* SAI Table start */
++#define SECURITY_PCI_LBW_SAI_VALUE		2
++#define SECURITY_I2C_LBW_SAI_VALUE		11
++/* SAI Table end */
++
++#define RECOVERY_INITIATORS_SAI	(BIT(SECURITY_PCI_LBW_SAI_VALUE) | BIT(SECURITY_I2C_LBW_SAI_VALUE))
++
++enum security_pb_pages {
++	PB_PAGE_PSOC_BOOT_SECURITY,
++	PB_PAGE_PSOC_CFG_PAD_CONF,
++};
++
+ /* Various blocks to be configured during boot rom in recovery */
+ enum security_access_ctrl_zones {
+ 	SEC_ACCESS_CTRL_QSPI,
+@@ -97,6 +109,73 @@
+ 	uint32_t sai_base;
+ };
+ 
++enum prot_bits_groups {
++	PB_GROUP_0,
++	PB_GROUP_1,
++	PB_GROUP_2,
++	PB_GROUP_MAX,
++};
++
++enum prot_bits_access_type {
++	PB_ACCESS_TYPE_RW,
++	PB_ACCESS_TYPE_RO,
++	PB_ACCESS_INVALID,
++};
++
++/* Group level configuration flags */
++struct pb_grp_ctx {
++	uint32_t sai_mask;
++	uint8_t access_type;
++	/*
++	 * Clear/close all PB regs and SAI reg
++	 */
++	uint8_t close_all;
++	/*
++	 * This filter used if 0's are in between data sets in pb_mask - {0x12, 0, 0x23, }
++	 * To save pb_mask length data set indexes are stored in filter - 0b'101
++	 * After filter is applied, pb_mask will become - {0x12, 0x23, }
++	 */
++	uint8_t pb_mask_filter;
++	/*
++	 * Length of pb_mask data set array.
++	 */
++	uint8_t pb_mask_len;
++	/*
++	 * Applicable when win_strt and win_stop is configured.
++	 * Indicates array length of win_strt/win_stop.
++	 * Make sure length(win_strt) == length(win_stop).
++	 */
++	uint8_t win_len;
++	/*
++	 * If this flag set, pb_mask array is not considered.
++	 * Set all bits in pb reg set based on pb_mask_filter
++	 * If pb_mask_filter = 0b'101
++	 * Equivalent pb reg set data = {0xFFFFFFFF, 0, 0xFFFFFFFF }
++	 */
++	uint8_t pb_mask_set;
++	uint16_t rsvd;
++	/* array of window start bit index */
++	const uint32_t *win_strt;
++	/* array of window stop bit index */
++	const uint32_t *win_stop;
++	/*
++	 * It has required data sets to written into pb reg sets.
++	 * If pb_mask_filter == 0, pb_mask array has valid data sets.
++	 * If pb_mask_filter != 0, data set access based on filter bit indexing.
++	 */
++	const uint32_t *pb_mask;
++};
++
++/* Page level configurationb */
++struct pb_page_ctx {
++	uint32_t spl_base;
++	struct pb_grp_ctx pb_grp_cfg[PB_GROUP_MAX];
++};
++
++/* Define your PB_REG_BITS here */
++#define RECOVERY_PB_CFG_PSOC_BOOT_SECURITY	{0x1, }
++#define RECOVERY_PB_CFG_PSOC_CFG_PAD_CONF	{0x100, }
++
+ void security_load_revoke_bits(void);
+ int security_efuse_image_validation_en(void);
+ void boot_rom_eom_overrides(void);

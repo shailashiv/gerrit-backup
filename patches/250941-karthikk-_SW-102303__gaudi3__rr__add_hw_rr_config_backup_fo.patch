@@ -1,0 +1,81 @@
+From 68dfcf7107968f6e5b2360f12840bc28a843c1ef Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Sat, 03 Sep 2022 09:41:48 +0300
+Subject: [PATCH] [SW-102303] gaudi3: rr: add hw rr config backup for debug if
+
+In gaudi3, efuse bit 16 in the security dword offset 0x3A, is to be
+used to provide a backup rr config which blocks all the address
+ranges in rom, in case the hw fails to do so.
+
+BIT 16 legend:
+0 : Config rr in ROM.
+1 : HW configures the rr.
+
+The rr apis are renamed for better readability.
+
+Change-Id: Ie09bc7f0c69379c3be5b3da1d3fc92c58969a801
+---
+
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index b8ddacf..20aba1c 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -79,7 +79,7 @@
+ 				uint8_t sec_ver, uint8_t key_index);
+ 
+ int secureboot_verify_image_hash384(uint8_t *exp_hash, unsigned char *image, uint32_t image_len);
+-void security_rr_recovery_config(void);
++void security_rr_open_debug_if_config(void);
+ void security_rr_open_pcie_config(void);
+ 
+ #endif /* _GAUDI3_DEV_SECURITY_H_ */
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index dc6b960..1ed92fc 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -193,7 +193,7 @@
+ {
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_ROM_RECOVERY);
+ 
+-	security_rr_recovery_config();
++	security_rr_open_debug_if_config();
+ 	rom_pcie_recovery();
+ 
+ 	rom_d2d_link_init();
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index fbe95be..e4c2a4b 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -546,6 +546,11 @@
+ 	security_smi_access(SMI_DIS_VAL);
+ 	security_i2c_axprot_config();
+ 	security_smi_axprot_config();
++
++	if (!security_efuse_hw_rr_config()) {
++		security_rr_twi_lbw_config(&rr_ctx_lbw[RR_CLOSE_ALL]);
++		security_rr_twi_hbw_config(&rr_ctx_hbw[RR_CLOSE_ALL]);
++	}
+ }
+ 
+ void security_handle_twi(void)
+@@ -578,6 +583,11 @@
+ {
+ 	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
+ 	security_jtag_axprot_config();
++
++	if (!security_efuse_hw_rr_config()) {
++		security_rr_jtag_lbw_config(&rr_ctx_lbw[RR_CLOSE_ALL]);
++		security_rr_jtag_hbw_config(&rr_ctx_hbw[RR_CLOSE_ALL]);
++	}
+ }
+ 
+ void security_enable_jtag_if(void)
+@@ -764,7 +774,7 @@
+ 		security_rr_twi_hbw_config(rr_ctx);
+ }
+ 
+-void security_rr_recovery_config(void)
++void security_rr_open_debug_if_config(void)
+ {
+ 	security_handle_twi();
+ 

@@ -1,0 +1,129 @@
+From 41e1482e1106cfcd49f7a5670c1a7d4bf4a07d8e Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 14 Mar 2022 13:40:34 +0200
+Subject: [PATCH] [SW-56706] boot_desc : add start address field
+
+As per the new image descriptor design, start address field is added
+as a part of image descriptor data structure. This is used because
+for few images like zephyr binaries, the start address is different
+than the load address due to the linker file's section placement.
+
+This field would provide flexibility in such cases, as load address
+can be used for destination of the dma transfer and start address
+to specify the point of execution to jump to, post the dma.
+
+Change-Id: I29161eb007ea8d8421597257076052afd7b9ac73
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 80d48e4..0bad659 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -30,13 +30,13 @@
+ 		.boot_desc_flag = 0,
+ 		.img_ptr_spi_offset = HL_EROM_IMG_PTRS_BASE,
+ 		.max_imgs = HL_FW_MAX_EROM_BOOT_PTRS,
+-		.load_addr = 0,
++		.start_addr = 0,
+ 	},
+ 	.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI] = {
+ 		.boot_desc_flag = 0,
+ 		.img_ptr_spi_offset = HL_SPI_IMG_PTRS_BASE,
+ 		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS,
+-		.load_addr = 0,
++		.start_addr = 0,
+ 	},
+ };
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index d11028b..e55c062 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -340,7 +340,7 @@
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+ 
+-static int arcboot_rom_bringup_img(int img, uint64_t *load_addr)
++static int arcboot_rom_bringup_img(int img, uint64_t *start_addr)
+ {
+ 	enum fw_post_reset_cmd fw_upd_status = regmap_readl(mmD0_PSOC_GLOBAL_CONF_COLD_RST_FLOPS_3);
+ 	int ret;
+@@ -365,7 +365,7 @@
+ 	return ARCBOOT_BRINGUP_ERROR;
+ 
+ image_bringup_success:
+-	*load_addr = desc.loadaddr;
++	*start_addr = desc.start_addr;
+ 	return ARCBOOT_BRINGUP_OK;
+ 
+ }
+@@ -386,8 +386,8 @@
+ void arcboot_rom_bringup_pcie(void)
+ {
+ 	void (*ppboot)();
+-	uint64_t *loadaddr =
+-			&arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].load_addr;
++	uint64_t *start_addr =
++			&arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].start_addr;
+ 	int ret;
+ 
+ 	if (!arcboot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI)) {
+@@ -398,7 +398,7 @@
+ 		goto skip_rom_validation;
+ 
+ 	/* Check for prim/sec failure */
+-	ret = arcboot_rom_bringup_img(HL_FW_IMG_PPBOOT, loadaddr);
++	ret = arcboot_rom_bringup_img(HL_FW_IMG_PPBOOT, start_addr);
+ 	if (ret == ARCBOOT_BRINGUP_OK) {
+ 		arcboot_rom_validation_pass();
+ 	} else {
+@@ -410,8 +410,8 @@
+ 	arcboot_rom_handle_tpm();
+ 
+ 	arcboot_rom_status_update(PROGRESS_PPBOOT_START);
+-	if (loadaddr) {
+-		ppboot = (void *)((uint32_t)CONV_64B_TO_ARC(*loadaddr));
++	if (start_addr) {
++		ppboot = (void *)((uint32_t)CONV_64B_TO_ARC(*start_addr));
+ 		ppboot();
+ 	}
+ 
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 59a88f0..1cf719a 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -147,6 +147,9 @@
+ 			p_img_desc[i].load_high[idx] << 32) |
+ 			p_img_desc[i].load_low[idx];
+ 		desc->desc_ver = p_img_desc[i].desc_ver;
++		desc->start_addr = ((uint64_t)
++			p_img_desc[i].start_high[idx] << 32) |
++			p_img_desc[i].start_low[idx];
+ 
+ 		if (img != HL_FW_BOOT_PTR_SPI)
+ 			memcpy(desc->chksum, p_img_desc[i].chksum2[idx],
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index a0f62fa..b905d27 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -43,6 +43,7 @@
+ 	uint8_t sec_ver;
+ 	uint32_t pub_key_size;
+ 	uint32_t sig_size;
++	uint64_t start_addr;
+ };
+ 
+ /*
+diff --git a/common/hl_boot_desc_rom.h b/common/hl_boot_desc_rom.h
+index 417e089..2abe13a 100644
+--- a/common/hl_boot_desc_rom.h
++++ b/common/hl_boot_desc_rom.h
+@@ -34,7 +34,7 @@
+ 	uint8_t boot_desc_flag;
+ 	uint8_t max_imgs;
+ 	uint32_t img_ptr_spi_offset;
+-	uint64_t load_addr;
++	uint64_t start_addr;
+ };
+ 
+ struct hl_img_ptrs_erom {

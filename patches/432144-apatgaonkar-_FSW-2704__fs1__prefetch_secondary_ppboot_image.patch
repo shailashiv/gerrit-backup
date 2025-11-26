@@ -1,0 +1,107 @@
+From e10740f14bf01553e58bcb54d1908cfb45a7c5b2 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 11 Jul 2024 06:47:48 +0300
+Subject: [PATCH] [FSW-2704] fs1: prefetch secondary ppboot image
+
+This patch adds changes to prefetch secondary ppboot
+image.
+
+Change-Id: I2d934560e8b477095c34413e734ac3a6a6d75fcc
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index f5dcd9a..7603573 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -70,6 +70,10 @@
+ 		execute_recovery();
+ 	}
+ 
++	/* If any ppboot secondary prefetch is not done, start prefetch */
++	if (boot_rom_boot_flow_is_secondary_manifest_valid())
++		boot_rom_boot_flow_prefetch_img(HL_FW_IMG_PPBOOT);
++
+ 	boot_rom_init_boot_info();
+ 
+ 	return 0;
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 2844f97..cd8186d 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -16,6 +16,10 @@
+ static enum hl_fw_manifest_type primary_manifest_idx = HL_FW_SPI_MANIFEST_0;
+ bool primary_manifest_valid;
+ bool secondary_manifest_valid;
++bool primary_ppboot_prefetch_started;
++bool primary_ppboot_prefetch_failed;
++bool secondary_ppboot_prefetch_started;
++bool secondary_ppboot_prefetch_failed;
+ 
+ static uint32_t boot_flow_prefetch_img_sub(enum hl_fw_manifest_type manifest_idx,
+ 					enum hl_fw_img_type img_type, struct boot_desc *desc,
+@@ -49,6 +53,7 @@
+ 	/* TODO: Image status base is complicated. Handle based on img_type */
+ 	enum boot_rom_progress img_sts_base = PROGRESS_BRINGUP_PCI_PRI;
+ 	enum hl_fw_manifest_type curr_manifest_idx;
++	uint32_t ret = BOOT_ROM_FAIL;
+ 
+ 	/* If validation pass bit is set or its slave die then prefetch is not required */
+ 	if (!boot_rom_in_master_die() ||
+@@ -68,14 +73,27 @@
+ 
+ 	curr_manifest_idx = primary_manifest_idx;
+ 
+-	if (boot_flow_prefetch_img_sub(curr_manifest_idx, img_type, &desc, img_sts_base) !=
+-	    BOOT_ROM_SUCCESS) {
+-		/* TODO: Add check if secondary image is supported */
+-		curr_manifest_idx = (primary_manifest_idx + 1) % HL_FW_SPI_MANIFEST_MAX_NUM;
+-		return boot_flow_prefetch_img_sub(curr_manifest_idx, img_type, &desc, img_sts_base);
++	if (!primary_ppboot_prefetch_started && !primary_ppboot_prefetch_failed) {
++		ret = boot_flow_prefetch_img_sub(curr_manifest_idx, img_type, &desc, img_sts_base);
++		if (!ret) {
++			primary_ppboot_prefetch_started = true;
++			return BOOT_ROM_SUCCESS;
++		}
++		primary_ppboot_prefetch_failed = true;
+ 	}
+ 
+-	return BOOT_ROM_SUCCESS;
++	if (!secondary_ppboot_prefetch_started && !secondary_ppboot_prefetch_failed) {
++		/* TODO: Add check if secondary image is supported */
++		curr_manifest_idx = (primary_manifest_idx + 1) % HL_FW_SPI_MANIFEST_MAX_NUM;
++		ret = boot_flow_prefetch_img_sub(curr_manifest_idx, img_type, &desc, img_sts_base);
++		if (!ret) {
++			secondary_ppboot_prefetch_started = true;
++			return BOOT_ROM_SUCCESS;
++		}
++		secondary_ppboot_prefetch_failed = true;
++	}
++
++	return BOOT_ROM_FAIL;
+ }
+ 
+ void boot_rom_boot_flow_boot_ppboot(enum hl_fw_manifest_type man_idx)
+@@ -125,6 +143,11 @@
+ 		return secondary_manifest_valid;
+ }
+ 
++bool boot_rom_boot_flow_is_secondary_manifest_valid(void)
++{
++	return secondary_manifest_valid;
++}
++
+ void boot_rom_boot_flow_wait_for_dma_finish(void)
+ {
+ 	/*
+diff --git a/common/boot_flow.h b/common/boot_flow.h
+index 492a152..52c05fb 100644
+--- a/common/boot_flow.h
++++ b/common/boot_flow.h
+@@ -10,6 +10,7 @@
+ void boot_rom_boot_flow_boot_ppboot(enum hl_fw_manifest_type man_idx);
+ void boot_rom_boot_flow_validate_manifests(void);
+ bool boot_rom_boot_flow_is_manifest_valid(enum hl_fw_manifest_type man_idx);
++bool boot_rom_boot_flow_is_secondary_manifest_valid(void);
+ void boot_rom_boot_flow_wait_for_dma_finish(void);
+ 
+ #endif /* _BOOT_FLOW_H_ */

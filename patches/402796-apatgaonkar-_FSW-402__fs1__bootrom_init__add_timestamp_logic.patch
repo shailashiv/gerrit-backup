@@ -1,0 +1,217 @@
+From 384f35df3610ee7566e738605693377a7641297a Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 13 Mar 2024 05:12:37 +0200
+Subject: [PATCH] [FSW-402] fs1: bootrom_init: add timestamp logic
+
+This patch adds timestamp init and measurement logic.
+All functions which are doing register operations are
+moved to dev specific files.
+
+Change-Id: I80e53cbed58d5777fbf327c48e144e681b53f817
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index b1560aa..1fb9400 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -2,4 +2,7 @@
+ BOOT_ROM_CFLAGS += -I$(SPECS_H15_DIR)
+ BOOT_ROM_CFLAGS += -I$(SPECS_H15_DIR)/$(SPECS_DEV)/asic_reg
+ 
+-BINARIES = boot_rom.bin
+\ No newline at end of file
++BINARIES = boot_rom.bin
++
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
++
+diff --git a/arch/fs1/arc/dev_delay.c b/arch/fs1/arc/dev_delay.c
+new file mode 100644
+index 0000000..b265f6e
+--- /dev/null
++++ b/arch/fs1/arc/dev_delay.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++#include <timestamp_regs.h>
++#include <timestamp_masks.h>
++
++void boot_rom_clear_ts_counter(void)
++{
++	regmap_writel(0x0, IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCR));
++}
++
++void boot_rom_start_timer(uint32_t timestamp_freq)
++{
++	regmap_writel(timestamp_freq, IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTFID0));
++	regmap_writel((TIMESTAMP_CNTCR_CNTCR_EN_M | TIMESTAMP_CNTCR_CNTCR_HDBG_M),
++		      IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCR)); /* EN | HDBG */
++}
++
++uint64_t boot_rom_get_timestamp_freq(void)
++{
++	/* TODO: Confirm timestamp frequency is always constant */
++	return SYS_REF_CLOCK / 2;
++}
++
++uint64_t boot_rom_udelay_get_ts(void)
++{
++	uint32_t low, up1, up2;
++
++	up1 = regmap_readl(IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVU));
++	low = regmap_readl(IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVL));
++	up2 = regmap_readl(IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVU));
++	/* In case of overlap read low part again */
++	if (up1 != up2)
++		low = regmap_readl(IO0_HALF0_PSOC_TIMESTAMP(mmTIMESTAMP_CNTCVL));
++
++	return ((uint64_t)up2 << 32) + low;
++}
+diff --git a/common/common.c b/common/common.c
+index 8f4dfe9..568d9a9 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -7,6 +7,7 @@
+ #include <boot_rom.h>
+ #include <status.h>
+ #include <common.h>
++#include <delay.h>
+ 
+ void boot_rom_init(void)
+ {
+@@ -22,4 +23,6 @@
+ 	boot_rom_clear_status();
+ 
+ 	boot_rom_status_update(PROGRESS_INIT);
++
++        boot_rom_init_ts();
+ }
+diff --git a/common/delay.c b/common/delay.c
+new file mode 100644
+index 0000000..7766371
+--- /dev/null
++++ b/common/delay.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <boot_rom.h>
++#include <delay.h>
++
++#define USEC_PER_SEC		1000000
++#define BYPASS_CYCLES_PER_USEC	(SYS_REF_CLOCK / USEC_PER_SEC)
++
++static uint64_t cycles_per_usec = BYPASS_CYCLES_PER_USEC;
++
++uint64_t boot_rom_get_ts_us(void)
++{
++	return boot_rom_udelay_get_ts() / cycles_per_usec;
++}
++
++void boot_rom_init_ts(void)
++{
++	uint32_t timestamp_freq = boot_rom_get_timestamp_freq();
++
++	cycles_per_usec = timestamp_freq / USEC_PER_SEC;
++
++	/* stop counter */
++	boot_rom_clear_ts_counter();
++
++	/* timer init */
++	boot_rom_start_timer(timestamp_freq);
++}
++
++bool boot_rom_timeout_expired(uint64_t start_tv, uint32_t delay)
++{
++	uint64_t current, timeout_tv = start_tv + delay;
++	bool overlap = false;
++
++	if (timeout_tv < start_tv)
++		overlap = true;
++
++	current = boot_rom_get_ts_us();
++	if (!overlap) {
++		if (current > timeout_tv || current <= start_tv)
++			return true;
++	} else {
++		if (current > timeout_tv && current < start_tv)
++			return true;
++	}
++
++	return false;
++}
++
++void udelay(unsigned int usec)
++{
++	uint64_t start, current, end = cycles_per_usec * usec;
++	bool overlap = false;
++
++	start = boot_rom_udelay_get_ts();
++	end += start;
++
++	if (end < start)
++		overlap = true;
++
++	while (1) {
++		current = boot_rom_udelay_get_ts();
++		if (!overlap) {
++			/* Check also for unplanned overlap */
++			if (current > end || current <= start)
++				break;
++		} else {
++			if (current > end && current < start)
++				break;
++		}
++	}
++}
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index bb06f9a..6c63f8d 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -83,6 +83,8 @@
+ 	struct hl_fw_img_desc spi_img_desc[ROM_DESC_NUM_MAX];
+ };
+ 
++#define SYS_REF_CLOCK		50000000ULL
++
+ extern struct boot_rom_global_s boot_rom_global;
+ extern struct boot_rom_manifest_s boot_rom_manifest;
+ 
+diff --git a/include/delay.h b/include/delay.h
+new file mode 100644
+index 0000000..17fe45f
+--- /dev/null
++++ b/include/delay.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _DELAY_H_
++#define _DELAY_H_
++
++#include "soc.h"
++
++void udelay(unsigned int usec);
++void boot_rom_clear_ts_counter(void);
++void boot_rom_start_timer(uint32_t timestamp_freq);
++void boot_rom_init_ts(void);
++uint64_t boot_rom_get_timestamp_freq(void);
++bool boot_rom_timeout_expired(uint64_t start_tv, uint32_t delay);
++uint64_t boot_rom_udelay_get_ts(void);
++uint64_t boot_rom_get_ts_us(void);
++
++#endif /* _DELAY_H_ */

@@ -1,0 +1,104 @@
+From 29aa65fcaa4fbe1906eac0a1f4249c06a3730355 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 07 Feb 2022 19:49:18 +0200
+Subject: [PATCH] [SW-69189] gaudi3: implement notify slave logic
+
+In order to notify slave to execute recovery flow, this patch
+add changes for master die to notify slave using GPIO76 and
+slave die waiting for GPIO76 to be set.
+
+Change-Id: I55425096ad8b35830ac575b53a0ad99b267b72eb
+---
+
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+new file mode 100644
+index 0000000..d63eb15
+--- /dev/null
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <arcboot.h>
++
++void arcboot_rom_notify_slave(void);
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index f66a27a..e2ecd63 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -4,7 +4,14 @@
+  * All Rights Reserved.
+  */
+ 
++#include <arcboot.h>
++#include <dev_common.h>
++
+ void execute_pcie_recovery(void)
+ {
++	/* Notify slave if master die and dual die sku */
++	if ((arcboot_rom_global.sku) && (!arcboot_rom_global.die_id))
++		arcboot_rom_notify_slave();
++
+ 	/* TODO: implement recovery sequence */
+ }
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index 0d1e506..bb0d45a 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -5,16 +5,49 @@
+  */
+ 
+ #include <arcboot.h>
++#include <delay.h>
++#include <pcie.h>
+ 
++#define RECOVERY_GPIO			76
++#define GPIOS_PER_BANK			16
++#define NOTIFY_SLV_DURATION_US		10
+ 
++void arcboot_rom_notify_slave(void)
++{
++	uint32_t idx = RECOVERY_GPIO % GPIOS_PER_BANK;
++	uint32_t mask = BIT(idx), val;
++
++	/* set gpio 76 for 10us to notify slave */
++	val = regmap_readl(mmD0_PSOC_GPIO4_OUTENSET);
++	regmap_writel((val | mask), mmD0_PSOC_GPIO4_OUTENSET);
++
++	val = regmap_readl(mmD0_PSOC_GPIO4_DATAOUT);
++	regmap_writel((val | mask), mmD0_PSOC_GPIO4_DATAOUT);
++
++	udelay(NOTIFY_SLV_DURATION_US);
++
++	val &= ~(mask);
++	regmap_writel(val, mmD0_PSOC_GPIO4_DATAOUT);
++
++	/* TODO: Is there need to set gpio to input?? */
++}
++
++#define WAIT_SLEEP_DURATION_US		1
+ void arcboot_rom_wait_for_signal(void)
+ {
++	uint32_t idx, val, mask;
++
+ 	if (!arcboot_rom_global.die_id)
+ 		return;
+ 
+-	/*
+-	 * TODO:
+-	 * 1. poll on GPIO 76 for recovery signal set by master die.
+-	 * 2. If set, call recovery flow, else sleep 1us and keep polling
+-	 */
++	idx =  RECOVERY_GPIO % GPIOS_PER_BANK;
++	mask = BIT(idx);
++
++	while (1) {
++		val = mirror_readl(mmD0_PSOC_GPIO4_DATAOUT);
++		if (val & mask)
++			execute_pcie_recovery();
++
++		udelay(WAIT_SLEEP_DURATION_US);
++	}
+ }

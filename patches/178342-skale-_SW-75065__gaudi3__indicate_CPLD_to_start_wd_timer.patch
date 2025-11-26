@@ -1,0 +1,95 @@
+From 8892bbba3e89f4f7b1af40d59f595dd813af4364 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 13 Feb 2022 18:33:58 +0200
+Subject: [PATCH] [SW-75065] gaudi3: indicate CPLD to start wd timer
+
+Automated Recovery process during secure boot
+will involve the CPLD starting the watchdog. Hence
+CPLD has to be notified about the presence of a
+valid firmware, in a two step process.
+1. (ROM): Assert GPIO[index]
+2. (PREBOOT): De-Assert GPIO[index].
+
+This patch implements the first step as needed
+in the boot rom - wherein, as soon as the ROM
+detects that it is not GPIO1 recovery, the GPIO[66]
+is asserted.
+
+Change-Id: I2f2db7320d929d895d6c4ef29468379c7d21a12a
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index ad6c89a..2ccefa1 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -9,6 +9,7 @@
+ #include <gaudi3_fw_if.h>
+ #include <efuse.h>
+ #include <dev_spi_flash.h>
++#include <dev_common.h>
+ 
+ #include <d0_psoc_global_conf_masks.h>
+ 
+@@ -172,3 +173,24 @@
+ 	val &= ~(D0_D2D_SPI_GLOBAL_CFG_MSTR_ENABLE_M);
+ 	regmap_writel(val, mmD0_D2D_SPI_GLOBAL_CFG);
+ }
++
++/*
++ * Request CPLD to start the watchdog, by asserting
++ * a GPIO_66.
++ */
++#define GAUDI3_CPLD_WDOG_GPIO		66
++void arcboot_rom_request_cpld_wdog(void)
++{
++	uint32_t index = GAUDI3_CPLD_WDOG_GPIO % GPIOS_PER_BANK;
++	uint32_t val, mask = BIT(index);
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(mmD0_PSOC_GPIO4_OUTENSET);
++	val = val | mask;
++	regmap_writel(val, mmD0_PSOC_GPIO4_OUTENSET);
++
++	/* gpio is active low */
++	val = regmap_readl(mmD0_PSOC_GPIO4_OUTENSET);
++	val &= ~mask;
++	regmap_writel(val, mmD0_PSOC_GPIO4_OUTENSET);
++}
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index d63eb15..f02e43d 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -5,4 +5,6 @@
+ 
+ #include <arcboot.h>
+ 
++#define GPIOS_PER_BANK			16
++
+ void arcboot_rom_notify_slave(void);
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index f75fdd8..c1f447e 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -14,7 +14,6 @@
+ void security_disable_jtag_if(void) {}
+ void security_handle_twi(void) {}
+ void security_load_keys(void) {}
+-void arcboot_rom_request_cpld_wdog(void) {}
+ void security_enable_jtag_if(void) {}
+ void security_jtag_dap(__unused uint8_t status) {}
+ void check_and_enable_4b_termination(void) {}
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index bb0d45a..711c1ce 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -7,9 +7,9 @@
+ #include <arcboot.h>
+ #include <delay.h>
+ #include <pcie.h>
++#include <dev_common.h>
+ 
+ #define RECOVERY_GPIO			76
+-#define GPIOS_PER_BANK			16
+ #define NOTIFY_SLV_DURATION_US		10
+ 
+ void arcboot_rom_notify_slave(void)

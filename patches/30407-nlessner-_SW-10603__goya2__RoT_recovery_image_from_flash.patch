@@ -1,0 +1,77 @@
+From 2a3a0c67a86e0ed99a0fc14399269e5b9c2f9a66 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Fri, 20 Mar 2020 11:02:22 +0200
+Subject: [PATCH] [SW-10603] goya2: RoT recovery image from flash
+
+Add option to load code from area in flash which is write protected,
+after pcie_recovery we can load code to help recover the images.
+This was added to manily add support for NVMe-MI in software
+which is missing in the current HW.
+
+Change-Id: I016a69f9728c95816b91e5c0e6323c82e8bc6e5f
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index aef44a8..dda933c 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -199,6 +199,19 @@
+ 	return flash_image_offset;
+ }
+ 
++static void arcboot_rom_load_recovery(void)
++{
++	uint32_t recovery_img_size = 0;
++
++	recovery_img_size = spi_flash_readl(0);
++	dma_copy_image(recovery_img_size, 0,
++		HL_SRAM_BASE + HL_ICCM_OFFSET, SPI_DMA_DST_HBW);
++	dma_wait_finish();
++
++	/* jump to iccm start location */
++	goto *(void *)(IMAGE_SIZE_LEN);
++}
++
+ static int arcboot_rom_bringup_pcie_images(uint8_t image_ptr)
+ {
+ 	uint32_t flash_image_offset;
+@@ -295,6 +308,10 @@
+ 			    ARCBOOT_SECONDARY) != ARCBOOT_BRINGUP_OK) {
+ 				arcboot_rom_validation_fail();
+ 				pcie_recovery();
++				if ((arcboot_rom_global.config_fuse &
++				     EFUSE_SYSCFG_BACKUP_DISABLE) == 0) {
++					arcboot_rom_load_recovery();
++				}
+ 				/* PCIe link is up, no valid fw. stay here */
+ 				while (1)
+ 					;
+diff --git a/common/efuse.h b/common/efuse.h
+index be6631c..2d5141c 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -17,6 +17,7 @@
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ #define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 
++#define EFUSE_SYSCFG_BACKUP_DISABLE		BIT(20)
+ #define EFUSE_SYSCFG_DISABLE_TWI_IF_MASK	BIT(19)
+ #define EFUSE_SYSCFG_PCIE_GEN_LIMIT		BIT(18)
+ #define EFUSE_SYSCFG_SPI_CONTROLLER		BIT(17)
+diff --git a/common/pcie.c b/common/pcie.c
+index 1d07a5d..4ba5c70 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -107,8 +107,9 @@
+ 	security_debug_if_secure();
+ 	security_debug_if_shared();
+ 
+-	if ((arcboot_rom_global.config_fuse &
+-	     EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0) {
++	if (((arcboot_rom_global.config_fuse &
++	     EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0) &&
++	     (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_BACKUP_DISABLE)) {
+ 		security_twi_if_rr_hbw_config(spi_en);
+ 		security_i2c_s_enable();
+ 	}

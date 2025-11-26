@@ -1,0 +1,232 @@
+From 34c65c2f56dc31c6da0bf92c6f9d88fd77229829 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Fri, 20 Mar 2020 11:18:52 +0200
+Subject: [PATCH] [SW-10669] goya2: remove mem_cpy function
+
+mem_cpy should be done on ppboot, this is to ensure that
+memory is availabe and when warm boot is done ppboot still
+needs to copy pcie_fw again to correct place.
+
+Change-Id: I60930d3c66cd294aae387c8126c8a0ad8e99db48
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index dda933c..8b71fc6 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -8,7 +8,6 @@
+ #include "arcboot.h"
+ #include "efuse.h"
+ #include "dma.h"
+-#include "mem_cpy.h"
+ #include "security.h"
+ #include "secureboot.h"
+ #include "spi_flash.h"
+@@ -129,16 +128,6 @@
+ 	regmap_writel(reg, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
+ }
+ 
+-static void arcboot_rom_validation_success(void)
+-{
+-	uint32_t reg;
+-
+-	/* validation succeeded, set only validation pass*/
+-	reg = regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
+-	reg |= COLD_RST_FLOPS_VALIDATION_PASS_MASK;
+-	regmap_writel(reg, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
+-}
+-
+ static void arcboot_rom_clear_recovery_flag(void)
+ {
+ 	uint32_t reg;
+@@ -219,10 +208,6 @@
+ 	uint32_t flash_ppboot_pcie_offset;
+ 	uint32_t ppboot_pcie_offset;
+ 	uint16_t ppboot_pcie_size;
+-	uint16_t ppboot_size;
+-	uint16_t pcie_fw_size;
+-	uint64_t pcie_fw_offset;
+-	uint64_t pcie_fw_dest;
+ 	enum security_img_status img_status;
+ 	enum  arcboot_rom_progress image_progress;
+ 	int8_t  ret;
+@@ -269,28 +254,6 @@
+ 	}
+ 
+ 	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_SECURITY);
+-
+-	ppboot_size = fw_sram_readl(PPBOOT_IMAGE_SIZE_OFFSET);
+-
+-	/* remove ppboot size from total image size */
+-	pcie_fw_size = ppboot_pcie_size - ppboot_size;
+-	/* remove public key from image size */
+-	pcie_fw_size -= KEY_SIZE;
+-	/* remove uint32_t from pcie_fw size so we dont copy fw_version DWORD */
+-	pcie_fw_size -= FW_VERSION_SIZE;
+-	/* offset of pcie_fw in fw_sram, as source of mem_cpy */
+-	pcie_fw_offset = HL_SRAM_BASE + HL_FWSRAM_OFFSET + ppboot_size;
+-	/* address of pcie_fw_sram in sram space, as destination of mem_cpy */
+-	pcie_fw_dest = HL_SRAM_BASE + HL_PCIE_FWSRAM_OFFSET;
+-
+-	arcboot_rom_status_update_bringup(image_progress, PROGRESS_BRINGUP_MEM_CPY);
+-
+-	/* copy to pcie_fw_sram from fw_sram the pcie_fw */
+-	mem_cpy(pcie_fw_size, pcie_fw_offset, pcie_fw_dest);
+-	mem_cpy_wait_finish();
+-
+-	/* we have a valid signed image in fw_sram */
+-	arcboot_rom_validation_success();
+ 
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+diff --git a/common/mem_cpy.c b/common/mem_cpy.c
+deleted file mode 100644
+index 4de2056..0000000
+--- a/common/mem_cpy.c
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include "arcboot.h"
+-#include "mem_cpy.h"
+-
+-__attribute__((weak)) void mem_cpy(uint32_t image_size, uint64_t source, uint64_t dest)
+-{
+-	uint32_t mem_cpy_ctrl2;
+-	uint16_t image_block_count_16b;
+-
+-	/* image_size needs to be in 16 byte blocks count */
+-	image_block_count_16b = image_size / 16;
+-
+-	/* if last block isn't complete 16 bytes add 1 to count
+-	 * so we also copy part of block
+-	 */
+-	if ((image_size % 16) > 0)
+-		image_block_count_16b++;
+-
+-	regmap_writel(MEM_CPY_ADDRESS_LOW(source),
+-		      mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_L);
+-	regmap_writel(MEM_CPY_ADDRESS_HIGH(source),
+-		      mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_H);
+-
+-	regmap_writel(MEM_CPY_ADDRESS_LOW(dest),
+-		      mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
+-	regmap_writel(MEM_CPY_ADDRESS_HIGH(dest),
+-		      mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
+-
+-	mem_cpy_ctrl2 = image_block_count_16b;
+-	mem_cpy_ctrl2 += MEM_CPY_WR_OS_32 <<
+-				PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_SHIFT;
+-	regmap_writel(mem_cpy_ctrl2,
+-		      mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
+-
+-	/* start transfer */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
+-}
+-
+-
+-int mem_cpy_finish(void)
+-{
+-	uint32_t mem_cpy_status =
+-		 regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
+-
+-	return mem_cpy_status;
+-}
+-
+-__attribute__((weak)) void mem_cpy_wait_finish(void)
+-{
+-	uint32_t mem_cpy_status;
+-
+-	do {
+-		mem_cpy_status =
+-		 regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
+-	} while (!mem_cpy_status);
+-}
+diff --git a/common/mem_cpy.h b/common/mem_cpy.h
+deleted file mode 100644
+index 7ea989f..0000000
+--- a/common/mem_cpy.h
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#ifndef _MEM_CPY_H_
+-#define _MEM_CPY_H_
+-
+-#define MEM_CPY_ADDRESS_LOW(x)	((x) & 0xFFFFFFFF)
+-#define MEM_CPY_ADDRESS_HIGH(x)	(((x) >> 32) & 0xFFFF)
+-#define MEM_CPY_WR_OS_32	32
+-
+-void mem_cpy(uint32_t image_size, uint64_t source, uint64_t dest);
+-int mem_cpy_finish(void);
+-void mem_cpy_wait_finish(void);
+-
+-#endif /* _MEM_CPY_H_ */
+diff --git a/goya2_arc/onix.c b/goya2_arc/onix.c
+index 5b03968..9cd7979 100644
+--- a/goya2_arc/onix.c
++++ b/goya2_arc/onix.c
+@@ -25,12 +25,3 @@
+ 
+ 	return ret;
+ }
+-
+-void mem_cpy_wait_finish(void) {}
+-void mem_cpy(uint32_t image_size, uint64_t source, uint64_t dest)
+-{
+-	(void)image_size;
+-	(void)source;
+-	(void)dest;
+-}
+-
+diff --git a/include/arcboot.h b/include/arcboot.h
+index db9b7bd..564f4e6 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -74,7 +74,6 @@
+ 	PROGRESS_BRINGUP_START,
+ 	PROGRESS_BRINGUP_DMA,
+ 	PROGRESS_BRINGUP_SECURITY,
+-	PROGRESS_BRINGUP_MEM_CPY
+ };
+ 
+ enum arcboot_rom_progress {
+@@ -91,21 +90,19 @@
+ 	PROGRESS_BRINGUP_PCI_PRI,		/* 10 */
+ 	PROGRESS_BRINGUP_PCI_PRI_DMA,
+ 	PROGRESS_BRINGUP_PCI_PRI_SECURITY,
+-	PROGRESS_BRINGUP_PCI_PRI_MEM_CPY,
+ 	PROGRESS_BRINGUP_PCI_SEC,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA,		/* 15 */
+-	PROGRESS_BRINGUP_PCI_SEC_SECURITY,
+-	PROGRESS_BRINGUP_PCI_SEC_MEM_CPY,
++	PROGRESS_BRINGUP_PCI_SEC_DMA,
++	PROGRESS_BRINGUP_PCI_SEC_SECURITY,	/* 15 */
+ 	PROGRESS_PCIE_IN_RECOVERY,
+ 	PROGRESS_PPBOOT_START,
+-	PROGRESS_PPBOOT_FINISH,			/* 20 */
++	PROGRESS_PPBOOT_FINISH,
+ 	PROGRESS_BRINGUP_RAM_PRI,
+-	PROGRESS_BRINGUP_RAM_PRI_DMA,
++	PROGRESS_BRINGUP_RAM_PRI_DMA,		/* 20 */
+ 	PROGRESS_BRINGUP_RAM_PRI_SECURITY,
+ 	PROGRESS_BRINGUP_RAM_SEC,
+-	PROGRESS_BRINGUP_RAM_SEC_DMA,		/* 25 */
++	PROGRESS_BRINGUP_RAM_SEC_DMA,
+ 	PROGRESS_BRINGUP_RAM_SEC_SECURITY,
+-	PROGRESS_ARCBOOT_RAM_START
++	PROGRESS_ARCBOOT_RAM_START		/* 25 */
+ };
+ 
+ enum security_location {

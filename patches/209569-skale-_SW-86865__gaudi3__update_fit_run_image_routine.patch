@@ -1,0 +1,103 @@
+From 9bb2b53c4c7dd8260288efe475436fcfc825fee4 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 15 May 2022 18:42:46 +0300
+Subject: [PATCH] [SW-86865] gaudi3: update fit run image routine
+
+Currently arcboot_start_image assumes the image is expected
+to be run on ARC1 processor where arcboot rom is running. This
+assumption is incorrect and image can be executed on different ARCs.
+This patch adds support to call start_image for each core.
+
+Change-Id: I4965d4c2ec074e0fa6edf952f8b16623179ffebc
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index aa58223..c142c17 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -892,17 +892,22 @@
+ 	regmap_writel(0x0, run_halt_offset);
+ }
+ 
+-void arcboot_start_image(uint64_t startaddr)
++void arcboot_start_image(uint64_t loadaddr, int core_id)
+ {
+ 	void (*image_entry)(void);
+ 	uint32_t arc_addr;
+ 
+-	if (!startaddr)
++	if (!loadaddr)
+ 		wfe();
+ 
+-	arc_addr = (uint32_t)arcboot_rom_get_arc_addr(startaddr);
++	if (core_id != FIT_CORE_ID_D0_PSOC_ARC1) {
++		run_halt_arc(core_id, 1);
++		return;
++	}
+ 
+-	image_entry = (void *)((uint32_t) arc_addr);
++	arc_addr = (uint32_t)arcboot_rom_get_arc_addr(loadaddr);
++
++	image_entry = (void *) (*(uint32_t *)arc_addr);
+ 	image_entry();
+ }
+ 
+diff --git a/common/fit.c b/common/fit.c
+index ca463fd..10aef8c 100644
+--- a/common/fit.c
++++ b/common/fit.c
+@@ -802,24 +802,30 @@
+ 
+ void fit_run_image(void)
+ {
+-	uint64_t startaddr = 0;
++	uint64_t loadaddr = 0;
+ 	uint32_t i;
++	bool run_psoc_arc1 = false;
+ 
+ 	for (i = 0; i < FIT_MAX_IMAGES; i++) {
+ 
+-		if (strcmp(images[i].arch, "arc"))
++		if (!images[i].arch)
++			break;
++
++		/* start image of ARC1 image at last */
++		if ((images[i].core_id == FIT_CORE_ID_D0_PSOC_ARC1) && (!run_psoc_arc1)) {
++			run_psoc_arc1 = true;
++			loadaddr = images[i].loadaddr;
+ 			continue;
+-		/*
+-		 * Since we only perform agent fit download as part
+-		 * of ROM recovery, assumption is made here that
+-		 * number of fit images will be 1 and agent will
+-		 * run only on ARC.
+-		 */
+-		startaddr = images[i].startaddr;
+-		break;
++		}
++
++		if (!arc_info[images[i].core_id].run) {
++			arcboot_start_image(images[i].loadaddr, images[i].core_id);
++			arc_info[images[i].core_id].run = true;
++		}
+ 	}
+ 
+-	arcboot_start_image(startaddr);
++	if (run_psoc_arc1)
++		arcboot_start_image(loadaddr, FIT_CORE_ID_D0_PSOC_ARC1);
+ }
+ 
+ __weak size_t arcboot_get_img_sec_desc_size(void)
+diff --git a/include/arcboot.h b/include/arcboot.h
+index c5bb325..054afae 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -290,7 +290,7 @@
+ int arcboot_rom_mem_init(uint64_t addr, uint32_t size);
+ void arcboot_rom_verify(void);
+ bool arcboot_is_valid_address_range(uint64_t addr, int len);
+-void arcboot_start_image(uint64_t startaddr);
++void arcboot_start_image(uint64_t loadaddr, int core_id);
+ uint32_t arcboot_error_read_and_clr(uint32_t *major, uint32_t *minor);
+ bool arcboot_error_inform(uint32_t major, uint32_t minor);
+ bool arcboot_error_is_pending(void);

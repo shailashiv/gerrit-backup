@@ -1,0 +1,110 @@
+From 67b91e502a402e6ebc2193f76ca710d7bd3077f9 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 01 Jul 2024 07:51:12 +0300
+Subject: [PATCH] [FSW-1173] fs1: remove gaudi3_0314 workaround
+
+with this patch removed gaudi3_0314 workaround
+as it was expected to fix in fs1 psoc.
+
+Change-Id: I56dd7b658b3d5254d44d194aa9da59ae23c4aff3
+---
+
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index 2993037..65a8b7c 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -66,79 +66,6 @@
+ 	*/
+ }
+ 
+-static void boot_rom_d2d_phy_wd_hw_errata_fix()
+-{
+-	uint32_t phy_off, inter_phy_offset, ctrl0, ctrl1, ctrl3;
+-	uint8_t max_phy_count, phy_num, io_half1_off;
+-
+-	if(boot_rom_global.die_type == COMPUTE_DIE) {
+-		inter_phy_offset = COMPUTE_INTER_PHY_DIST;
+-		max_phy_count = COMPUTE_D2D_PHY_NUM;
+-
+-		ctrl0 = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE(mmCOMP_DPHY_CTRL_INIT_PLL_CTRL0);
+-		ctrl1 = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE(mmCOMP_DPHY_CTRL_INIT_PLL_CTRL1);
+-		ctrl3 = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE(mmCOMP_DPHY_CTRL_INIT_PLL_CTRL3);
+-	} else {
+-		inter_phy_offset = IO_INTER_PHY_DIST;
+-		max_phy_count = IO_D2D_PHY_NUM;
+-
+-		ctrl0 = IO0_H0_SOC_0_ID2D_PHY_0_CTL0_BASE(mmD2D_CTL_INIT_PLL_CTRL0);
+-		ctrl1 = IO0_H0_SOC_0_ID2D_PHY_0_CTL0_BASE(mmD2D_CTL_INIT_PLL_CTRL1);
+-		ctrl3 = IO0_H0_SOC_0_ID2D_PHY_0_CTL0_BASE(mmD2D_CTL_INIT_PLL_CTRL3);
+-	}
+-
+-	for (phy_num = 0; phy_num < max_phy_count; phy_num++) {
+-		phy_off = phy_num * inter_phy_offset;
+-
+-		regmap_writel(PLL_LOCK_TIMER_VAL, ctrl0 + phy_off);
+-		regmap_writel(OFFSET_CALLOCK_TIMER, ctrl1 + phy_off);
+-		regmap_writel(TIMER_1US, ctrl3 + phy_off);
+-
+-		if(boot_rom_global.die_type != COMPUTE_DIE) {
+-			io_half1_off = boot_rom_global.die_id + 1;
+-
+-			regmap_writel(PLL_LOCK_TIMER_VAL, IO_HALF1((ctrl0 + phy_off), io_half1_off));
+-			regmap_writel(OFFSET_CALLOCK_TIMER, IO_HALF1((ctrl1 + phy_off), io_half1_off));
+-			regmap_writel(TIMER_1US, IO_HALF1((ctrl3 + phy_off), io_half1_off));
+-		}
+-	}
+-}
+-
+-static void boot_rom_d2d_phy_update_train_window()
+-{
+-	uint32_t val, inter_phy_offset, phy_off, reg_addr, h1_reg_addr;
+-	uint8_t max_phy_count, phy_num;
+-
+-	if (!(boot_rom_global.config_fuse & EFUSE_SYSCFG_D2D_UPDATE_TRAIN_WINDOW))
+-		return; /* skip d2d train window update */
+-
+-	if(boot_rom_global.die_type == COMPUTE_DIE) {
+-		inter_phy_offset = COMPUTE_INTER_PHY_DIST;
+-		max_phy_count = COMPUTE_D2D_PHY_NUM;
+-		reg_addr = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_IPT_D2D_N3_TOP_CH_BCAST_PHYCTRLREG_BASE(mmIPT_D2D_N3_PHYCTRLREG_RXBITSYNCTMR);
+-	} else {
+-		inter_phy_offset = IO_INTER_PHY_DIST;
+-		max_phy_count = IO_D2D_PHY_NUM;
+-		reg_addr = IO0_H0_ID2D_PHY_0_D2D_PHY0_CH_BCAST_PHYCTRLREG_BASE(mmIPT_D2D_PHYCTRLREG_RXBITSYNCTMR);
+-	}
+-
+-	for (phy_num = 0; phy_num < max_phy_count; phy_num++) {
+-		phy_off = phy_num * inter_phy_offset;
+-
+-		val = regmap_readl(reg_addr + phy_off);
+-		val |= (BITSYNC_TRKWIN_VAL << IPT_D2D_PHYCTRLREG_RXBITSYNCTMR_BITSYNC_TRKWIN_S);
+-		regmap_writel(val, reg_addr + phy_off);
+-
+-		if(boot_rom_global.die_type != COMPUTE_DIE) {
+-			h1_reg_addr = IO_HALF1((reg_addr + phy_off), (boot_rom_global.die_id + 1));
+-
+-			val = regmap_readl(h1_reg_addr);
+-			val |= (BITSYNC_TRKWIN_VAL << IPT_D2D_PHYCTRLREG_RXBITSYNCTMR_BITSYNC_TRKWIN_S);
+-			regmap_writel(val, h1_reg_addr);
+-		}
+-	}
+-}
+-
+ void boot_rom_d2d_link_init(void)
+ {
+ 	uint64_t start;
+@@ -156,14 +83,6 @@
+ 		boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY);
+ 		return;
+ 	}
+-
+-	/*
+-	 * TODO: Decided after FS1 IO Die POR.
+-	 * SW WA for HW Errata GAUDI3_0314
+-	 */
+-	boot_rom_d2d_phy_wd_hw_errata_fix();
+-
+-	boot_rom_d2d_phy_update_train_window();
+ 
+ 	/* Master Die and Slave Die's sync for d2d rec init */
+ 	if (boot_rom_global.die_type == IO_DIE_MASTER) {

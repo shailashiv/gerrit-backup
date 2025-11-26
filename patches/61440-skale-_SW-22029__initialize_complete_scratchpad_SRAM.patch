@@ -1,0 +1,110 @@
+From 94ce3123a031f86b697d39df2e38b79d5e3b6214 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 23 Nov 2020 11:33:33 +0200
+Subject: [PATCH] [SW-22029] initialize complete scratchpad SRAM
+
+Uninitialized reads to scratchpad SRAM causes fake ECC error when byte
+reads are performed to scratchpad SRAM which turns out to be
+read-modify-write transactions. Since arcboot uses scratchpad SRAM to
+store and retrieve key hash, revoke bits, firmware version and efuse
+values, this patch add changes to initialize complete scratchpad SRAM
+region of 64KB using memcopy block as part of arcboot init to avoid any
+fake ECC errors.
+
+The total cycles taken by memcopy block to initialize complete
+scratchpad SRAM are ~53350 cycles (which is ~105 microseconds with ARC
+running @ 500 MHz).
+
+Change-Id: I23331462c9bfb2a170e30fc8059d5519be5396d6
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 44a87a1..33577e6 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -12,6 +12,7 @@
+ #include "secureboot.h"
+ #include "spi_flash.h"
+ #include "pcie.h"
++#include "delay.h"
+ 
+ struct arcboot_global_s arcboot_rom_global = {
+ 	.config_fuse = 0,
+@@ -63,6 +64,45 @@
+ 	regmap_writel(reg, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
+ }
+ 
++void arcboot_rom_init_sp_sram(void)
++{
++	uint32_t mem_cfg, cpy_sts;
++	uint8_t retry = HL_INIT_SP_SRAM_RETRIES;
++
++	/* Use memblock to initialize scratchpad memory */
++	regmap_writel((uint32_t)HL_SP_SRAM_BASE,
++			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((uint32_t)(HL_SP_SRAM_BASE >> 32),
++			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	/* set size of 64k in granularity of 16 bytes */
++	mem_cfg |= (SP_SRAM_SIZE_16B_GRANULARITY &
++			PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	mem_cfg |= (0x1 << PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT);
++
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	while (1) {
++		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts)
++			break;
++		/*
++		 * Do not wait indefinitely on copy status
++		 * Wait for 1 milliseconds (100 retries with 10 micro-
++		 * seconds sleep), else bailout.
++		 */
++		retry--;
++		if (!retry)
++			break;
++
++		udelay(HL_INIT_SP_SRAM_UDELAY);
++	}
++}
++
+ static void arcboot_rom_init(void)
+ {
+ 	uint32_t reg;
+@@ -102,6 +142,8 @@
+ 	regmap_writel(write_en_16MB, mmPSOC_SECURITY_SPI_WRITE_LIMIT);
+ 	if (fuse_init() == 0)
+ 		arcboot_rom_set_efuse_read();
++
++	arcboot_rom_init_sp_sram();
+ }
+ 
+ #define GPIO02_MASK BIT(2)
+diff --git a/include/arcboot.h b/include/arcboot.h
+index ea176aa..80b60e6 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -22,6 +22,7 @@
+ #define SPI_FLASH_BLOCK_SIZE			1024
+ 
+ #define HL_SRAM_BASE				0x7FF0000000ULL
++#define HL_SP_SRAM_BASE            		0x7FFBFE0000ULL
+ #define HL_SDRAM_BASE				0x10000000
+ #define HL_FLASH_OFFSET				0xA000000
+ #define HL_ICCM_OFFSET				0xB020000
+@@ -62,6 +63,10 @@
+ #define COLD_RST_FLOPS_EFUSE_READ_SHIFT		0x2
+ #define COLD_RST_FLOPS_EFUSE_READ_MASK		0x4
+ 
++#define HL_INIT_SP_SRAM_RETRIES			100
++#define HL_INIT_SP_SRAM_UDELAY			10
++#define SP_SRAM_SIZE_16B_GRANULARITY		0x1000
++
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;
+ 	uint8_t recovery_flag;

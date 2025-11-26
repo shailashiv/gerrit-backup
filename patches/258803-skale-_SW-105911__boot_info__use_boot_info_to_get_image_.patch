@@ -1,0 +1,121 @@
+From 9fd9a69e6fdac5f8e0b853dd3f34e4d752d11391 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 27 Sep 2022 11:51:12 +0300
+Subject: [PATCH] [SW-105911] boot_info: use boot info to get image data
+
+Currently, ROM doesn't make use of boot info get api's and use
+manifest image data stored in dccm persistent memory on non-cold
+reset. This patch add changes to retrieve data from boot info
+in case of non-cold reset and stored it in rom data structure to
+use it. This will reduce persistent memory usage in ROM in case
+no functional bug is discovered in boot info across resets.
+
+Change-Id: Ibba830720fbb7f2bf919e659f2532848fdefaf14
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 20f523e..04a8cc0 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1168,23 +1168,25 @@
+ 
+ void arcboot_rom_init_boot_info(void)
+ {
+-	struct hl_fw_boot_ptrs_ctx *p_loc_img_ptr_ctx =
++	struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx =
+ 					&arcboot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI];
+-	struct hl_fw_boot_ptrs *p_loc_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
+-	uint32_t *p_offset = (uint32_t *)(p_loc_img_ptr_ctx->dest_addr_arc + p_loc_boot_ptr->offset2array);
++	struct hl_fw_boot_ptrs *p_boot_ptr = &arcboot_rom_global.spi_manifest_hdr;
++	uint32_t *p_offset = (uint32_t *)(p_img_ptr_ctx->dest_addr_arc + p_boot_ptr->offset2array);
+ 	struct gaudi3_cold_rst_data cold_rst_data;
++	static struct hl_fw_img_desc *p_img_desc;
++	uint32_t i, copy_sz, misc_descs = 0;
+ 
+ 	if (arcboot_rom_efuse_boot_info_skip())
+ 		return;
+ 
+ 	if (!arcboot_rom_global.boot_info_set_done) {
+-		if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &p_loc_img_ptr_ctx->desc_info,
++		if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_INFO, &p_img_ptr_ctx->desc_info,
+ 		   sizeof(struct hl_fw_desc_info)))
+ 			return;
+ 
+ 		if (boot_info_set_no_merge(HL_BOOT_INFO_IMG_DESC_DATA,
+-		   (uint8_t *)(p_loc_img_ptr_ctx->dest_addr_arc + p_offset[0]),
+-		   p_loc_img_ptr_ctx->desc_info.desc_size * p_loc_img_ptr_ctx->desc_info.count))
++		   (uint8_t *)(p_img_ptr_ctx->dest_addr_arc + p_offset[0]),
++		   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count))
+ 			return;
+ 
+ 		if (boot_info_set_no_merge(HL_BOOT_INFO_ROM_SECURITY_DATA, &arcboot_rom_global.sec_data,
+@@ -1196,6 +1198,43 @@
+ 		cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
+ 		cold_rst_data.boot_info_set_done = 1;
+ 		regmap_writel(cold_rst_data.data, mmCOLD_RST_FLOPS_2);
++	} else {
++		if (boot_info_get_no_merge(HL_BOOT_INFO_IMG_DESC_INFO,
++			&p_img_ptr_ctx->desc_info,
++			sizeof(struct hl_fw_desc_info), &copy_sz))
++			return;
++
++		if (boot_info_get_no_merge(HL_BOOT_INFO_IMG_DESC_DATA,
++			(uint8_t *)(p_img_ptr_ctx->dest_addr_arc),
++			p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count,
++			&copy_sz))
++			return;
++
++		for (i = 0; i < p_img_ptr_ctx->desc_info.count; i++) {
++			p_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc +
++					(i * p_img_ptr_ctx->desc_info.desc_size));
++
++			if (p_img_desc->magic.val == (HL_FW_IMG_DESC_MAGIC | HL_FW_IMG_PPBOOT)) {
++				memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_PPBOOT],
++					p_img_desc, sizeof(struct hl_fw_img_desc));
++			} else if (p_img_desc->magic.val ==
++						(HL_FW_IMG_DESC_MAGIC | HL_FW_IMG_FAKE_EFUSE)) {
++				memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_FAKE_FUSE],
++					p_img_desc, sizeof(struct hl_fw_img_desc));
++			} else if (p_img_desc->magic.val ==
++						(HL_FW_IMG_DESC_MAGIC | HL_FW_IMG_TPM_SPI)) {
++				memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_TPM],
++					p_img_desc, sizeof(struct hl_fw_img_desc));
++			} else {
++				/* Store upto 5 misc images(indifferent to ROM boot flow) */
++				if (misc_descs < NUM_OF_MISC_DESCS) {
++					memcpy(&arcboot_rom_manifest.spi_img_desc[ROM_DESC_MISC_1 +
++						misc_descs], p_img_desc,
++						sizeof(struct hl_fw_img_desc));
++					misc_descs++;
++				}
++			}
++		}
+ 	}
+ }
+ 
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 5a0ca16..f7ca7fd 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -65,8 +65,6 @@
+ 	return SPI_DMA_DST_HBW;
+ }
+ 
+-#define NUM_OF_MISC_DESCS	(ROM_DESC_NUM_MAX - ROM_DESC_MISC_1)
+-
+ int boot_desc_init(enum hl_fw_boot_ptr_imgs img)
+ {
+ 	uint32_t i, img_ptrs_size, misc_descs = 0;
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 39555ad..a421d99 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -88,6 +88,8 @@
+ 	ROM_DESC_NUM_MAX,
+ };
+ 
++#define NUM_OF_MISC_DESCS	(ROM_DESC_NUM_MAX - ROM_DESC_MISC_1)
++
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;
+ 	uint32_t config2_fuse;

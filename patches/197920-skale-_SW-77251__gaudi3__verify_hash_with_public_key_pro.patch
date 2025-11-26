@@ -1,0 +1,105 @@
+From a5563baeca1e6ba986b71b099bffab7d96ad4aa7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sat, 09 Apr 2022 11:37:10 +0300
+Subject: [PATCH] [SW-77251] gaudi3: verify hash with public key properties
+
+ROM stores hash of public key properties ie. hash computed
+on 784 bytes of public key. The public key received as part of
+fit is complete public key dtb of 3144 bytes. This patch add
+changes to extract key properties from public key dtb and compute
+hash on 784 bytes of key properties to compare with
+stored ROM hash.
+
+Change-Id: I835cdfc81eba713dace8462282f2c3675fd44594
+---
+
+diff --git a/arch/gaudi3/arc/secureboot.c b/arch/gaudi3/arc/secureboot.c
+index aa99deb..b183d8d 100644
+--- a/arch/gaudi3/arc/secureboot.c
++++ b/arch/gaudi3/arc/secureboot.c
+@@ -114,11 +114,14 @@
+ 
+ static struct hl_fit_sec_desc fit_sec;
+ static uint8_t signature[FIT_SIGNATURE_SIZE];
++static uint8_t key_props[PUB_KEY_SZ];
+ int arcboot_verify_img_sig(const void *img, size_t img_size, enum fit_sec_failure *res,
+ 				int *key_idx)
+ {
++	const char *key_name = HL_SEC_KEY_NAME;
+ 	const void *fit_sec_off;
+ 	const void *pub_key_fit;
++	struct key_prop prop;
+ 
+ 	/* hl fit files are padded so the size is 4 bytes aligned */
+ 	img_size = ROUND_UP4(img_size);
+@@ -159,7 +162,25 @@
+ 
+ 	pub_key_fit = &fit_sec.pub_key;
+ 
+-	if (secureboot_verify_key_hash(fit_sec.key_num, (uint8_t *)pub_key_fit, FIT_PUB_KEY_SIZE)) {
++	/*
++	 * ROM stores hash of public key properties. The public key
++	 * received as part of fit is complete public key dtb of
++	 * 3144 bytes. Extract key properties and compute
++	 * hash on 784 bytes of key properties to compare with
++	 * stored ROM hash.
++	 */
++	fit_get_key_prop(pub_key_fit, key_name, &prop);
++
++	memcpy(key_props, prop.rr, KEY_PROP_RR_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ), prop.modulus, KEY_PROP_MOD_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ), prop.public_exponent,
++		KEY_PROP_EXP_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + KEY_PROP_EXP_SZ),
++		&prop.n0inv, KEY_PROP_INV_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ),
++	&prop.num_bits, KEY_PROP_NB_SZ);
++
++	if (secureboot_verify_key_hash(fit_sec.key_num, key_props, PUB_KEY_SZ)) {
+ 		*res = FIT_SEC_SIGN_FAILED;
+ 		return 1;
+ 	}
+diff --git a/common/fit.c b/common/fit.c
+index 08c69f9..0158517 100644
+--- a/common/fit.c
++++ b/common/fit.c
+@@ -197,7 +197,7 @@
+ 	return fdt_subnode_offset(pub_key_fit, sig_node, key_node_name);
+ }
+ 
+-static int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
+ 			    struct key_prop *prop)
+ {
+ 	int pub_key_node = 0;
+@@ -886,7 +886,6 @@
+ }
+ 
+ #define HL_SEC_REGIONS_CNT	2
+-#define HL_SEC_KEY_NAME		"hl_rsa3072"
+ 
+ int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
+ 		       size_t sec_desc_size, const void *pub_key_fit,
+diff --git a/common/fit.h b/common/fit.h
+index c08bf28..0a500a1 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -6,6 +6,10 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
++#include <rsa-mod-exp.h>
++
++#define HL_SEC_KEY_NAME		"hl_rsa3072"
++
+ enum fit_load_result {
+ 	FIT_LOAD_SUCCESS = 0,
+ 	FIT_LOAD_CORRUPTED,
+@@ -36,5 +40,7 @@
+ int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
+ 		       size_t sec_desc_size, const void *pub_key_fit,
+ 		       const uint8_t *sig, size_t sig_len);
++int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++		     struct key_prop *prop);
+ 
+ #endif /* _HL_FIT_H_ */

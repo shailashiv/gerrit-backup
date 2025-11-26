@@ -1,0 +1,373 @@
+From a820e8aca9892ddcb9c212a358486d40b5a655c6 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 21 Mar 2024 16:46:44 +0200
+Subject: [PATCH] [FSW-1173] fs1: bootrom: d2d link init in recovery
+
+with this patch added support to d2d link
+initialization during rom recovery, if any issue
+with d2d init in rom recovery stage efuse bit
+d2d_en can disable this init part. recovery
+signal propagation from master to slaves is
+not clear, hence kept open.
+
+Change-Id: Ic4b14d0d93664ddb4a74fd4186e258686b20e217
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index c1119dc..a8fa829 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -31,5 +31,7 @@
+ 
+ 	boot_rom_wait_for_signal();
+ 
++	boot_rom_check_n_enter_recovery();
++
+ 	return 0;
+ }
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index b64768d..4224427 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -8,3 +8,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_recovery.c)
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+new file mode 100644
+index 0000000..75c1ea7
+--- /dev/null
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -0,0 +1,181 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <recovery.h>
++#include <fs1_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <global_conf_masks.h>
++#include <d2d_ctl_regs.h>
++#include <comp_dphy_ctrl_regs.h>
++#include <ipt_d2d_phyctrlreg_regs.h>
++#include <ipt_d2d_phyctrlreg_masks.h>
++#include <ipt_d2d_n3_phyctrlreg_regs.h>
++#include <global_conf_regs.h>
++#include <fs1_efuse.h>
++#include <mem_io.h>
++
++/* TODO: we need to verify flow and params on test chip to finalize D2D link init */
++#define PLL_LOCK_TIMER_VAL		0x1D4C
++#define OFFSET_CALLOCK_TIMER	0x61A8
++#define TIMER_1US				0x32
++#define IO_D2D_PHY_NUM			2
++#define COMPUTE_D2D_PHY_NUM		8
++#define IO_INTER_PHY_DIST			(mmIO_0_CFG_HALF_0_SOC_0_ID2D_PHY_1_D2D_CTL0_BASE - \
++										mmIO_0_CFG_HALF_0_SOC_0_ID2D_PHY_0_D2D_CTL0_BASE)
++#define COMPUTE_INTER_PHY_DIST		(mmCOMPUTE_0_CFG_COMP_SOC_VD2D_PHY_1_COMP_DPHY_CTRL_BASE - \
++										mmCOMPUTE_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE)
++
++#define BITSYNC_TRKWIN_VAL		0x1F
++#define D2D_LINK_STATUS_UDELAY	10000 /* 10 ms */
++
++#define IO_HALF1(ADDRESS, DIE_ID)	((ADDRESS & ~(HL_ARC_ADDR_DIE_ID_MASK)) | (DIE_ID << HL_ARC_ADDR_DIE_ID_SHIFT))
++
++void boot_rom_notify_slave(void)
++{
++	/*
++	 * TODO: how master RECOVERY_OUT communicated to all slaves RECOVERY_IN?
++	 * Implement, Notify slave's once recovery signal flow is finalized.
++	*/
++}
++
++static void boot_rom_d2d_phy_wd_hw_errata_fix()
++{
++	uint32_t phy_off, inter_phy_offset, ctrl0, ctrl1, ctrl3;
++	uint8_t max_phy_count, phy_num, io_half1_off;
++
++	if(boot_rom_global.die_type == COMPUTE_DIE) {
++		inter_phy_offset = COMPUTE_INTER_PHY_DIST;
++		max_phy_count = COMPUTE_D2D_PHY_NUM;
++
++		ctrl0 = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE(mmCOMP_DPHY_CTRL_INIT_PLL_CTRL0);
++		ctrl1 = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE(mmCOMP_DPHY_CTRL_INIT_PLL_CTRL1);
++		ctrl3 = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_COMP_DPHY_CTRL_BASE(mmCOMP_DPHY_CTRL_INIT_PLL_CTRL3);
++	} else {
++		inter_phy_offset = IO_INTER_PHY_DIST;
++		max_phy_count = IO_D2D_PHY_NUM;
++
++		ctrl0 = IO0_H0_SOC_0_ID2D_PHY_0_CTL0_BASE(mmD2D_CTL_INIT_PLL_CTRL0);
++		ctrl1 = IO0_H0_SOC_0_ID2D_PHY_0_CTL0_BASE(mmD2D_CTL_INIT_PLL_CTRL1);
++		ctrl3 = IO0_H0_SOC_0_ID2D_PHY_0_CTL0_BASE(mmD2D_CTL_INIT_PLL_CTRL3);
++	}
++
++	for (phy_num = 0; phy_num < max_phy_count; phy_num++) {
++		phy_off = phy_num * inter_phy_offset;
++
++		regmap_writel(PLL_LOCK_TIMER_VAL, ctrl0 + phy_off);
++		regmap_writel(OFFSET_CALLOCK_TIMER, ctrl1 + phy_off);
++		regmap_writel(TIMER_1US, ctrl3 + phy_off);
++
++		if(boot_rom_global.die_type != COMPUTE_DIE) {
++			io_half1_off = boot_rom_global.die_id + 1;
++
++			base_writel(PLL_LOCK_TIMER_VAL, IO_HALF1((ctrl0 + phy_off), io_half1_off));
++			base_writel(OFFSET_CALLOCK_TIMER, IO_HALF1((ctrl1 + phy_off), io_half1_off));
++			base_writel(TIMER_1US, IO_HALF1((ctrl3 + phy_off), io_half1_off));
++		}
++	}
++}
++
++static void boot_rom_d2d_phy_update_train_window()
++{
++	uint32_t val, inter_phy_offset, phy_off, reg_addr, h1_reg_addr;
++	uint8_t max_phy_count, phy_num;
++
++	if (!(boot_rom_global.config_fuse & EFUSE_SYSCFG_D2D_UPDATE_TRAIN_WINDOW))
++		return; /* skip d2d train window update */
++
++	if(boot_rom_global.die_type == COMPUTE_DIE) {
++		inter_phy_offset = COMPUTE_INTER_PHY_DIST;
++		max_phy_count = COMPUTE_D2D_PHY_NUM;
++		reg_addr = COMP_0_CFG_COMP_SOC_VD2D_PHY_0_IPT_D2D_N3_TOP_CH_BCAST_PHYCTRLREG_BASE(mmIPT_D2D_N3_PHYCTRLREG_RXBITSYNCTMR);
++	} else {
++		inter_phy_offset = IO_INTER_PHY_DIST;
++		max_phy_count = IO_D2D_PHY_NUM;
++		reg_addr = IO0_H0_ID2D_PHY_0_D2D_PHY0_CH_BCAST_PHYCTRLREG_BASE(mmIPT_D2D_PHYCTRLREG_RXBITSYNCTMR);
++	}
++
++	for (phy_num = 0; phy_num < max_phy_count; phy_num++) {
++		phy_off = phy_num * inter_phy_offset;
++
++		val = regmap_readl(reg_addr + phy_off);
++		val |= (BITSYNC_TRKWIN_VAL << IPT_D2D_PHYCTRLREG_RXBITSYNCTMR_BITSYNC_TRKWIN_S);
++		regmap_writel(val, reg_addr + phy_off);
++
++		if(boot_rom_global.die_type != COMPUTE_DIE) {
++			h1_reg_addr = IO_HALF1((reg_addr + phy_off), (boot_rom_global.die_id + 1));
++
++			val = base_readl(h1_reg_addr);
++			val |= (BITSYNC_TRKWIN_VAL << IPT_D2D_PHYCTRLREG_RXBITSYNCTMR_BITSYNC_TRKWIN_S);
++			base_writel(val, h1_reg_addr);
++		}
++	}
++}
++
++void boot_rom_d2d_link_init(void)
++{
++	uint64_t start;
++	uint32_t val;
++
++	if (!(boot_rom_global.config2_fuse & EFUSE_SYSCFG2_D2D_ENABLE))
++		return; /* skip d2d init */
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_START);
++
++	/* TODO: IO HALF0 FSM_STS and HALF1 FSM_STS are in sync */
++	/* Check BUSY bit for 0 value, expected to be 0 */
++	val = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_DPHY_FSM_STS));
++	if (val & GLOBAL_CONF_DPHY_FSM_STS_BUSY_M) {
++		boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_STS_BUSY);
++		return;
++	}
++
++	/*
++	 * TODO: Decided after FS1 IO Die POR.
++	 * SW WA for HW Errata GAUDI3_0314
++	 */
++	boot_rom_d2d_phy_wd_hw_errata_fix();
++
++	boot_rom_d2d_phy_update_train_window();
++
++	/* Master Die and Slave Die's sync for d2d rec init */
++	if (boot_rom_global.die_type == IO_DIE_MASTER) {
++		/* Indicate slave die's that d2d init has started */
++		boot_rom_notify_slave();
++	} else {
++		boot_rom_wait_for_recovery_in();
++	}
++
++	/* Inter die indication for d2d link init handshaking */
++	boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_INTER_DIE_SYNC);
++
++	/* TODO: IO HALF0 FSM_CTL and HALF1 FSM_CTL are in sync */
++	/* Set START bit for D2D link initialization */
++	regmap_writel(GLOBAL_CONF_DPHY_FSM_CTRL_START_M, IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_DPHY_FSM_CTRL));
++
++	/*
++	 * Poll 10ms for BUSY bit to be 0 indicating link initialization
++	 * is completed successfully.
++	 */
++	start = boot_rom_get_ts_us();
++	while (1) {
++		val = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_DPHY_FSM_STS));
++		if (!(val & GLOBAL_CONF_DPHY_FSM_STS_BUSY_M))
++			break;
++
++		if (boot_rom_timeout_expired(start, D2D_LINK_STATUS_UDELAY)) {
++			boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_INIT_TIMEDOUT);
++			return;
++		}
++	}
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_D2D_LINK_INIT_SUCCESS);
++
++	/*
++	 * TODO: D2D link init success acknowledgement to initiator
++	 * If no ack back, initiator has to blindly proceed that all Die's init success.
++	*/
++}
+diff --git a/arch/fs1/arc/slave.c b/arch/fs1/arc/slave.c
+index 0ab5090..ba845f4 100644
+--- a/arch/fs1/arc/slave.c
++++ b/arch/fs1/arc/slave.c
+@@ -8,45 +8,19 @@
+ #include <status.h>
+ #include <delay.h>
+ #include <mem_io.h>
++#include <recovery.h>
+ #include <global_conf_regs.h>
+ #include <global_conf_masks.h>
+ #include <fs1_blocks_linux_driver.h>
+ #include <fs1_reg_map.h>
+ 
+-#define NOTIFY_SLV_DURATION_US		10
+-
+ void boot_rom_wait_for_recovery_in(void)
+ {
+-	uint32_t val;
+-
+ 	/* TODO: print uart char to indicate waiting for recovery in */
+ 
+-	while (1) {
+-		val = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_DIE_RECOVERY_IN));
+-		if (val & GLOBAL_CONF_DIE_RECOVERY_IN_IND_M) {
+-			/* Master die holds the indication pulse for 10us,
+-			 * Hence we need to wait for 10us after detection
+-			 * to make sure slave follows the master in terms
+-			 * of point of execution
+-			 */
+-
+-			/* TODO: print uart char to indicate, recovery in received */
+-
+-			udelay(NOTIFY_SLV_DURATION_US);
+-			break;
+-		}
+-	}
+ 	/*
+-	* No timeout added for while(1) due to the usage of this function:
+-	* 1) Recovery: It is required for slave to wait for this indication from
+-	* master. As slave die in rom is to only execute recovery, it waits forever
+-	* for this indication to be set, apart from recovery there is no logic to be
+-	* executed on slave in ROM.
+-	*
+-	* 2) D2D link init: The pcie linkup time on master cannot be predicted, hence
+-	* slave needs to wait. However the implication of this while(1) is minimal as
+-	* d2d is the last process in the recovery flow which ends also in a while(1).
+-	* Hence this would not have any functional impact.
++	 * TODO: how master RECOVERY_OUT communicated to all slaves RECOVERY_IN?
++	 * Implement, Wait for RECOVERY_IN once recovery signal flow is finalized.
+ 	*/
+ }
+ 
+@@ -59,5 +33,5 @@
+ 
+ 	boot_rom_wait_for_recovery_in();
+ 
+-	/* TODO: recovery */
++	execute_recovery();
+ }
+diff --git a/common/common.c b/common/common.c
+index cd15cf1..d9e652c 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -11,6 +11,7 @@
+ #include <spi_flash.h>
+ #include <efuse.h>
+ #include <dev_efuse.h>
++#include <recovery.h>
+ 
+ void boot_rom_init(void)
+ {
+@@ -64,3 +65,15 @@
+ 	boot_rom_status_update(PROGRESS_INIT_EFUSE_INIT_FAIL);
+ 	boot_rom_halt();
+ }
++
++static bool boot_rom_boot_desc_init_done()
++{
++	/* TODO: check boot desc init status */
++	return true;
++}
++
++void boot_rom_check_n_enter_recovery(void)
++{
++	if(!boot_rom_boot_desc_init_done())
++		execute_recovery();
++}
+diff --git a/common/recovery.c b/common/recovery.c
+new file mode 100644
+index 0000000..d12ae4f
+--- /dev/null
++++ b/common/recovery.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <recovery.h>
++#include <fs1_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <global_conf_masks.h>
++#include <global_conf_regs.h>
++
++static void execute_rom_recovery(void)
++{
++	boot_rom_status_update(PROGRESS_BOOT_ROM_IN_ROM_RECOVERY);
++
++	boot_rom_d2d_link_init();
++
++	boot_rom_status_update(PROGRESS_BOOT_ROM_RECOVERY_END);
++}
++
++void execute_recovery(void)
++{
++	boot_rom_status_update(PROGRESS_BOOT_ROM_IN_RECOVERY);
++
++	/* TODO: Add SKU check here, once SKU config finalized */
++	boot_rom_notify_slave();
++
++	execute_rom_recovery();
++}
+diff --git a/common/recovery.h b/common/recovery.h
+new file mode 100644
+index 0000000..285a935
+--- /dev/null
++++ b/common/recovery.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _RECOVERY_H_
++#define _RECOVERY_H_
++
++#include <delay.h>
++#include <status.h>
++
++void execute_recovery(void);
++void boot_rom_notify_slave(void);
++void boot_rom_wait_for_recovery_in(void);
++void boot_rom_d2d_link_init(void);
++
++#define NOTIFY_SLV_DURATION_US		10
++
++#endif /* _RECOVERY_H_ */

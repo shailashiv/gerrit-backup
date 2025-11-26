@@ -1,0 +1,149 @@
+From bde766e517186a55831e32dbed34d2c799979c0e Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Mon, 10 Jun 2024 09:05:04 +0300
+Subject: [PATCH] [FSW-418] fs1: bootrom: separate tpm sendrecv function
+
+This patch splits the TPM function that sends and
+receives commands to and from TPM, into separate
+send function and receive function.
+
+TPM has significant wait times before responding to
+commands. To avoid being idle while waiting for a
+response, the send and receive functions are split.
+Other tasks will be interleaved between the send
+and receive functions, to reduce idle time
+
+Change-Id: I6b3548ce8691e14b40fc8e6804bac2d71cbb5dc6
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/common/tpm2.c b/common/tpm2.c
+index eb3b431..5a13366 100644
+--- a/common/tpm2.c
++++ b/common/tpm2.c
+@@ -524,8 +524,7 @@
+ 	return 0;
+ }
+ 
+-static int tpm_xfer(const uint8_t *sendbuf, size_t send_size,
+-	uint8_t *recvbuf, size_t *recv_size)
++static int tpm_xfer_send(const uint8_t *sendbuf, size_t send_size)
+ {
+ 	unsigned int count;
+ 	int ret = 0;
+@@ -543,6 +542,14 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	return 0;
++}
++
++
++static int tpm_xfer_recv(uint8_t *recvbuf, size_t *recv_size)
++{
++	int ret = 0;
++
+ 	ret = tpm_spi_recv(tpm_buf, sizeof(tpm_buf));
+ 	if (ret >= 0) {
+ 		if (ret > (int)*recv_size)
+@@ -555,8 +562,18 @@
+ 	return ret;
+ }
+ 
+-static int tpm_spi_sendrecv_command(const void *command,
+-			 void *response, size_t *size_ptr)
++static int tpm_spi_send_command(const void *command)
++{
++	int err;
++
++	err = tpm_xfer_send(command, tpm_command_size(command));
++	if (err < 0)
++		return err;
++
++	return 0;
++}
++
++static int tpm_spi_recv_response(void *response, size_t *size_ptr)
+ {
+ 	int err;
+ 	size_t response_length;
+@@ -568,9 +585,7 @@
+ 		response_length = sizeof(cmd_response_buffer);
+ 	}
+ 
+-	err = tpm_xfer(command, tpm_command_size(command),
+-		       response, &response_length);
+-
++	err = tpm_xfer_recv(response, &response_length);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -581,7 +596,7 @@
+ }
+ 
+ #define TPM_STARTUP_COMMAND_BUF_SIZE	12
+-int tpm2_startup(enum tpm2_startup_types mode)
++int tpm2_startup_send_cmd(enum tpm2_startup_types mode)
+ {
+ 	const uint8_t command_v2[TPM_STARTUP_COMMAND_BUF_SIZE] = {
+ 		tpm_u16(TPM2_ST_NO_SESSIONS),
+@@ -589,13 +604,19 @@
+ 		tpm_u32(TPM2_CC_STARTUP),
+ 		tpm_u16(mode),
+ 	};
++
++	return tpm_spi_send_command(command_v2);
++}
++
++int tpm2_startup_recv_resp(void)
++{
+ 	int ret;
+ 
+ 	/*
+ 	 * Note TPM2_Startup command will return RC_SUCCESS the first time,
+ 	 * but will return RC_INITIALIZE otherwise.
+ 	 */
+-	ret = tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++	ret = tpm_spi_recv_response(NULL, NULL);
+ 	if (ret && ret != TPM2_RC_INITIALIZE)
+ 		return ret;
+ 
+@@ -662,7 +683,8 @@
+ 	return 0;
+ }
+ 
+-int tpm2_pcr_extend(uint32_t index, uint32_t algorithm, const uint8_t *digest, uint32_t digest_len)
++int tpm2_pcr_extend_send_cmd(uint32_t index, uint32_t algorithm,
++			const uint8_t *digest, uint32_t digest_len)
+ {
+ 	/* Length of the message header, up to start of digest */
+ 	uint32_t offset = 33;
+@@ -699,5 +721,10 @@
+ 	if (ret)
+ 		return TPM_LIB_ERROR;
+ 
+-	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++	return tpm_spi_send_command(command_v2);
++}
++
++int tpm2_pcr_extend_recv_resp(void)
++{
++	return tpm_spi_recv_response(NULL, NULL);
+ }
+diff --git a/common/tpm2.h b/common/tpm2.h
+index 5a6e4be..2425c94 100644
+--- a/common/tpm2.h
++++ b/common/tpm2.h
+@@ -9,7 +9,10 @@
+ #include <hl_tpm2.h>
+ 
+ int tpm2_init(void);
+-int tpm2_startup(enum tpm2_startup_types mode);
+-int tpm2_pcr_extend(uint32_t index, uint32_t algorithm, const uint8_t *digest, uint32_t digest_len);
++int tpm2_startup_send_cmd(enum tpm2_startup_types mode);
++int tpm2_startup_recv_resp(void);
++int tpm2_pcr_extend_send_cmd(uint32_t index, uint32_t algorithm,
++			const uint8_t *digest, uint32_t digest_len);
++int tpm2_pcr_extend_recv_resp(void);
+ 
+ #endif /* _TPM2_H_ */

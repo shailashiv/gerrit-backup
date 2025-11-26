@@ -1,0 +1,234 @@
+From 26507469411cf76267ebffc782a1e2a582fecd38 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Mon, 05 Aug 2024 13:00:41 +0300
+Subject: [PATCH] Code review comments
+
+Change-Id: Idd495809043797493a32f719bc14032806678cb1
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index b886080..aec542a 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -10,6 +10,11 @@
+ #include <recovery.h>
+ #include <common.h>
+ 
++/* 
++ * Code review: This 512 bytes are getting cleared to 0 in cold reset.
++ * Cold reset: if u set validation_pass=1, FW reset:  validation_pass shud be 0   
++ * TODO: Add init for this section in boot_rom_init. After DCCM init in cold reset.
++ */
+ struct boot_rom_global_s __attribute__((section (".rom_persistent_section")))boot_rom_global = {
+ 	.config_fuse = 0,
+ 	.config2_fuse = 0,
+@@ -30,6 +35,10 @@
+ 	.tpm_spi = NULL,
+ };
+ 
++/* 
++ * Reinit is not required. Dependent on validation pass bit this should be copied. 
++ * TODO: Add efuse bit to use persistant section instead of bootinfo for manifest data to be used.
++ */
+ struct boot_rom_manifest_s __attribute__((section (".rom_manifest_section")))boot_rom_manifest;
+ 
+ int boot_rom_main(void)
+diff --git a/arch/fs1/arc/asic.c b/arch/fs1/arc/asic.c
+index 4a23c15..4a532b7 100644
+--- a/arch/fs1/arc/asic.c
++++ b/arch/fs1/arc/asic.c
+@@ -32,6 +32,7 @@
+ 	// 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk
+ 	div_sel = regmap_readl((IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
+ 
++	/* Code review: Reverify formula for fout is correct */
+ 	if (div_sel == PLL_PLL_CLK || div_sel == PLL_DIV_PLL) {
+ 		// If 2'd1 - pll_clk [or] 2'd3 - divided pll_clk
+ 		reg = regmap_readl(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG_DIV));
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 1232cf7..1d4c4be 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -26,8 +26,10 @@
+ 
+ uint8_t boot_rom_get_die_id(void)
+ {
++	/* Code review: Confirm ARC CFG address manipulation is not changed by FSM in PSOC reset */
+ 	uint32_t die_cpu_id = regmap_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_DIE_CPU_ID));
+ 
++	/* Code review: Typecast here in return statement */
+ 	return ((die_cpu_id & ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_M)
+ 		>> ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_S);
+ }
+@@ -47,13 +49,21 @@
+ static void boot_rom_persist_data_non_zero_init(void)
+ {
+ 	/* TODO: init non zero data */
++	/* Code review: Priority1: Pre initialized values for boot_rom_global
++		For boot_rom_manifest currently nothing is required
++		For export APIs will the boot_desc_init will be added? Not required
++		boot_rom_manifest related constant values will not be used outside of boot_desc_init
++		Other manifest related data is getting stored in boot_info and persistant data later.
++	*/
+ }
+ 
++/* Code review: at the end verify this size and adjust accordingly. Match with linker script */
+ #define HL_ARC1_DCCM_PERSIST_SECTION_SIZE		(3 * 1024) /* 3KB */
+ void boot_rom_persistent_dccm_init(uint8_t die_id)
+ {
+ 	volatile uint32_t *dccm_addr = (uint32_t *) HL_DCCM_BASE;
+ 	uint32_t dccm_dwords = HL_ARC1_DCCM_PERSIST_SECTION_SIZE >> 2;
++	/* Code review: fs1_cold_rst data structure matches with bit definition of cold rst flops 2 */
+ 	struct fs1_cold_rst_data cold_rst_data;
+ 	uint32_t i;
+ 
+@@ -62,6 +72,7 @@
+ 	if (cold_rst_data.arc1_persist_dccm_init_done)
+ 		goto non_zero_init;
+ 
++	/* Code review: priority 2: Can we use memcopy engine here? Full address should be created based on die id and passed to api */
+ 	for (i = 0; i < dccm_dwords; i++)
+ 		*dccm_addr++ = 0;
+ 
+@@ -70,12 +81,16 @@
+ 
+ non_zero_init:
+ 	/* Non zero initializers only required for master(die 0) */
++	/* Code review: Can we use is_master_die(). */
+ 	if (die_id == IO_DIE_0)
+ 		boot_rom_persist_data_non_zero_init();
+ }
+ 
+ void boot_rom_clear_status(void)
+ {
++	/* Code review: Clear PSOC security fw versions
++	  and make sure we are setting this again even in validation pass scenario. */
++
+ 	/* As per Architecture recommendation, clear status reg */
+ 	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_STATUS));
+ 
+@@ -106,11 +121,15 @@
+ 
+ 	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ 
++	/* Code review: remove recovery flag as it is no longer used */
+ 	boot_rom_global.recovery_flag = cold_rst_data.recovery_flag;
+ 	boot_rom_global.validation_pass = cold_rst_data.validation_flag;
+ 	boot_rom_global.valid_manifest_idx = cold_rst_data.valid_manifest_idx;
+ 	boot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
++	/* Code review: boot_info_set_done is no longer required. Based on validation pass bit we can decide
++	 * whether to write boot info or not. */
+ 	boot_rom_global.boot_info_set_done = cold_rst_data.boot_info_set_done;
++	/* Code review: tpm_extend done can be handled based on validation pass? */
+ 	boot_rom_global.tpm_extend_done = cold_rst_data.tpm_validation_flag;
+ 
+ 	if (fw_upd_status == FLOPS_UPD_PENDING)
+diff --git a/arch/fs1/arc/dev_boot_info.c b/arch/fs1/arc/dev_boot_info.c
+index 91ec87e..39278e0 100644
+--- a/arch/fs1/arc/dev_boot_info.c
++++ b/arch/fs1/arc/dev_boot_info.c
+@@ -29,6 +29,7 @@
+ 	return false;
+ }
+ 
++/* Code Review: As LFS is taking care of init if required this function should be renamed boot_rom_set_boot_info */
+ void boot_rom_init_boot_info(void)
+ {
+ 	struct fs1_cold_rst_data cold_rst_data;
+diff --git a/arch/fs1/arc/dev_delay.c b/arch/fs1/arc/dev_delay.c
+index 25e4b6c..d86fa58 100644
+--- a/arch/fs1/arc/dev_delay.c
++++ b/arch/fs1/arc/dev_delay.c
+@@ -27,6 +27,7 @@
+ uint64_t boot_rom_get_timestamp_freq(void)
+ {
+ 	/* TODO: Confirm timestamp frequency is always constant */
++	/* Code review: Onix platform SYS_REF_CLOCK should be 35MHz */
+ 	return SYS_REF_CLOCK / 2;
+ }
+ 
+diff --git a/arch/fs1/arc/dev_uart.c b/arch/fs1/arc/dev_uart.c
+index 8c31aef..e9eabf4 100644
+--- a/arch/fs1/arc/dev_uart.c
++++ b/arch/fs1/arc/dev_uart.c
+@@ -14,6 +14,7 @@
+ #include "dev_uart.h"
+ #include <delay.h>
+ 
++/* Code review: No need of weak functions. Remove */
+ __weak uint32_t boot_rom_get_baudrate() { return 0; }
+ __weak uint32_t boot_rom_pll_get_freq(__unused enum boot_rom_pll_div div) { return 0; }
+ 
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+index 1935054..a23832c 100644
+--- a/arch/fs1/arc/palad.c
++++ b/arch/fs1/arc/palad.c
+@@ -29,6 +29,7 @@
+ 	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
+ 
+ 	/* Divison factor value */
++	/* Code review: PLL_DIV_PLL value should not be used here. Write divider value. Define constant if required  */
+ 	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_FACTOR */
+ 	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
+ 
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index bb916d2..5bdeb33 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -158,6 +158,7 @@
+ 			       p_img_desc, sizeof(struct hl_fw_img_desc));
+ 		} else if (p_img_desc->magic.type == HL_FW_IMG_RECOVERY) {
+ 			/* Recovery images will be stored as part of MISC descriptors */
++			/* Code review: misc desc check shoud be added */
+ 			memcpy(&p_manifest_ctx->spi_img_desc[ROM_DESC_MISC_1 + misc_descs],
+ 			       p_img_desc, sizeof(struct hl_fw_img_desc));
+ 			recovery_img_count++;
+diff --git a/common/common.c b/common/common.c
+index 7d065ef..1fb0fcb 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -42,6 +42,7 @@
+ 	/* TODO: Change Die ID register as per SOL */
+ 	uint8_t die_id = boot_rom_get_die_id();
+ 
++	/* Code review: This part is only required if we are keeping persistant data */
+ 	boot_rom_persistent_dccm_init(die_id);
+ 
+ 	boot_rom_global.die_id = die_id;
+diff --git a/common/delay.c b/common/delay.c
+index 7766371..f785192 100644
+--- a/common/delay.c
++++ b/common/delay.c
+@@ -10,9 +10,9 @@
+ 
+ #define USEC_PER_SEC		1000000
+ #define BYPASS_CYCLES_PER_USEC	(SYS_REF_CLOCK / USEC_PER_SEC)
+-
++/* Code review: No need to initialize this by default */
+ static uint64_t cycles_per_usec = BYPASS_CYCLES_PER_USEC;
+-
++/* Before init ts other functions in this file should not be called */
+ uint64_t boot_rom_get_ts_us(void)
+ {
+ 	return boot_rom_udelay_get_ts() / cycles_per_usec;
+@@ -65,7 +65,7 @@
+ 	while (1) {
+ 		current = boot_rom_udelay_get_ts();
+ 		if (!overlap) {
+-			/* Check also for unplanned overlap */
++			/* Code review: Check also for unplanned overlap */
+ 			if (current > end || current <= start)
+ 				break;
+ 		} else {
+diff --git a/include/mem_io.h b/include/mem_io.h
+index 763ca3a..ae6a331 100644
+--- a/include/mem_io.h
++++ b/include/mem_io.h
+@@ -47,6 +47,7 @@
+ 	base_writel(val, (ARC_REG_UPD(offset, HL_CFG_BASE)));
+ }
+ 
++/* Code Review: Remove regmap_readb/regmap_writeb. Wrong logic.*/
+ static inline uint8_t regmap_readb(uint32_t offset)
+ {
+ 	uint32_t reg = *((volatile uint32_t *)(HL_CFG_BASE + offset));

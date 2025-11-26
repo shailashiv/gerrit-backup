@@ -1,0 +1,253 @@
+From d3e8d39e1a2cc17538294b6843a2ecfb5419d70e Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Tue, 11 Jun 2024 04:51:53 +0300
+Subject: [PATCH] [FSW-2704] fs1: expose die info
+
+with this patch, removed die id, die type and sku
+published them in embedded specs. so subsequent
+firmware modules across fs1 can use the same.
+
+Change-Id: I561e98b6107861c88d3677a753e534dc5fcc84d0
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index b228fe4..f4af323 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -15,8 +15,6 @@
+ 	.validation_pass = 0,
+ 	.efuse_read = 0,
+ 	.curr_img = 0,
+-	.die_id = 0,
+-	.die_type = INVALID_DIE_TYPE,
+ 	.fake_fuse_en = false,
+ 	.boot_info_set_done = false,
+ 	.tpm_exec_stage = 0,
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 4aaf56a..234df71 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -33,16 +33,21 @@
+ 		>> ARC_LOCAL_CONF_DIE_CPU_ID_DIE_ID_S);
+ }
+ 
+-enum boot_rom_die_type boot_rom_get_die_type(void)
++uint8_t boot_rom_get_die_type(void)
+ {
+-	if(boot_rom_global.die_id <= COMPUTE_DIE_3)
+-		return COMPUTE_DIE;
+-	else if(boot_rom_global.die_id == IO_DIE_0)
+-		return IO_DIE_MASTER;
+-	else if(boot_rom_global.die_id == IO_DIE_1)
+-		return IO_DIE_SLAVE;
++	if(boot_rom_global.die_id <= FS1_COMPUTE_DIE_3)
++		return FS1_COMPUTE_DIE;
++	else if(boot_rom_global.die_id == FS1_IO_DIE_0)
++		return FS1_IO_DIE_MASTER;
++	else if(boot_rom_global.die_id == FS1_IO_DIE_1)
++		return FS1_IO_DIE_SLAVE;
+ 	else
+-		return INVALID_DIE_TYPE;
++		return FS1_INVALID_DIE_TYPE;
++}
++
++bool boot_rom_in_master_die()
++{
++	return (boot_rom_global.die_type == FS1_IO_DIE_MASTER);
+ }
+ 
+ static void boot_rom_persist_data_non_zero_init(void)
+@@ -63,6 +68,10 @@
+ 	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_arc =
+ 								BOOT_PTR_SPI_DMA_DEST_ARC;
+ 	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].boot_desc_flag = 0;
++
++	/* rom_persistent_section default values */
++	boot_rom_global.die_id = FS1_INVALID_DIE_ID;
++	boot_rom_global.die_type = FS1_INVALID_DIE_TYPE;
+ }
+ 
+ #define HL_ARC1_DCCM_PERSIST_SECTION_SIZE		(3 * 1024) /* 3KB */
+@@ -86,7 +95,7 @@
+ 
+ non_zero_init:
+ 	/* Non zero initializers only required for master(die 0) */
+-	if (die_id == IO_DIE_0)
++	if (die_id == FS1_IO_DIE_0)
+ 		boot_rom_persist_data_non_zero_init();
+ }
+ 
+@@ -105,7 +114,7 @@
+ 	regmap_writel(0, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SW_STATUS_7));
+ 
+ 	/* Die indication register is on io die slave and compute */
+-	if (boot_rom_global.die_type != IO_DIE_MASTER)
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
+ 		regmap_writel(0, IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2));
+ }
+ 
+@@ -139,7 +148,7 @@
+ 	struct fs1_cold_rst_data cold_rst_data;
+ 	int ret;
+ 
+-	if (boot_rom_global.die_type != IO_DIE_MASTER)
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
+ 		return;
+ 
+ 	/* Perform arc1 iccm init only on cold reset */
+diff --git a/arch/fs1/arc/dev_boot_info.c b/arch/fs1/arc/dev_boot_info.c
+index 91ec87e..de498e6 100644
+--- a/arch/fs1/arc/dev_boot_info.c
++++ b/arch/fs1/arc/dev_boot_info.c
+@@ -21,7 +21,7 @@
+ 
+ bool boot_rom_skip_boot_info(void)
+ {
+-	if (boot_rom_global.die_type != IO_DIE_MASTER)
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
+ 		return true;
+ 
+ 	/* TODO: efuse check can be added here */
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index ea11365..67f35cd 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -29,7 +29,7 @@
+ 	uint32_t index = FS1_REC_STS_GPIO % GPIOS_PER_BANK;
+ 	uint32_t val, mask = BIT(index);
+ 
+-	if (boot_rom_global.die_type != IO_DIE_MASTER)
++	if (boot_rom_global.die_type != FS1_IO_DIE_MASTER)
+ 		return;
+ 
+ 	/* TODO: check if PAD_SEL for specific GPIO needs to be set */
+@@ -92,7 +92,7 @@
+ 	}
+ 
+ 	/* Master Die and Slave Die's sync for d2d rec init */
+-	if (boot_rom_global.die_type == IO_DIE_MASTER) {
++	if (boot_rom_global.die_type == FS1_IO_DIE_MASTER) {
+ 		/* Indicate slave die's that d2d init has started */
+ 		boot_rom_notify_slave();
+ 	} else {
+diff --git a/arch/fs1/arc/slave.c b/arch/fs1/arc/slave.c
+index 43e7a18..6a45177 100644
+--- a/arch/fs1/arc/slave.c
++++ b/arch/fs1/arc/slave.c
+@@ -53,7 +53,7 @@
+ 
+ void boot_rom_wait_for_signal(void)
+ {
+-	if (boot_rom_global.die_type == IO_DIE_MASTER)
++	if (boot_rom_global.die_type == FS1_IO_DIE_MASTER)
+ 		return;
+ 
+ 	boot_rom_status_update(PROGRESS_SLV_DIE_WAITING_ON_RECOVERY_IND);
+diff --git a/common/common.c b/common/common.c
+index f2b4cf5..dc7cf88 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -61,7 +61,7 @@
+ 	/* Early EFUSE read trigger */
+ 	boot_rom_trigger_fuse_init();
+ 
+-	if (boot_rom_global.die_type != IO_DIE_MASTER)
++	if (!boot_rom_in_master_die())
+ 		return;
+ 
+ 	boot_rom_iccm_init();
+diff --git a/common/recovery.c b/common/recovery.c
+index e06fc8a..a2ff1c4 100644
+--- a/common/recovery.c
++++ b/common/recovery.c
+@@ -18,7 +18,7 @@
+ 
+ 	/* TODO: Should add fuse cfg to skip pcie init? */
+ 
+-	if (boot_rom_global.die_type == IO_DIE_MASTER)
++	if (boot_rom_in_master_die())
+ 		boot_rom_pcie_link_init();
+ 
+ 	boot_rom_d2d_link_init();
+diff --git a/common/security.c b/common/security.c
+index 787a75a..04d6d80 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -53,7 +53,7 @@
+ 	/* Based on efuse enable/disable jtag interface and clear FSM timer */
+ 	security_handle_jtag_if();
+ 
+-	if (boot_rom_global.die_type != IO_DIE_MASTER)
++	if (!boot_rom_in_master_die())
+ 		return;
+ 
+ 	security_load_sec_efuse_dword();
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index 817c740..23aa274 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -12,6 +12,7 @@
+ #include "hl_boot_desc_rom.h"
+ #include <hl_sec_if.h>
+ #include "spi.h"
++#include <fs1_fw_if.h>
+ 
+ #define wfe()	__asm__ __volatile__("sleep 0x11\n" : : )
+ 
+@@ -46,31 +47,6 @@
+ 	BOOT_ROM_IMAGE_NOT_FOUND,
+ };
+ 
+-enum boot_rom_sku_type {
+-	MULTI_DIE_SKU = 0,
+-	SINGLE_DIE_SKU = 1,
+-	INVALID_SKU = 2
+-};
+-
+-enum boot_rom_die_id {
+-	COMPUTE_DIE_0,
+-	COMPUTE_DIE_1,
+-	COMPUTE_DIE_2,
+-	COMPUTE_DIE_3,
+-	IO_DIE_0,
+-	IO_DIE_0_HALF_1,
+-	IO_DIE_1,
+-	IO_DIE_1_HALF_1,
+-	INVALID_DIE_ID,
+-};
+-
+-enum boot_rom_die_type {
+-	COMPUTE_DIE,
+-	IO_DIE_MASTER,
+-	IO_DIE_SLAVE,
+-	INVALID_DIE_TYPE,
+-};
+-
+ enum rom_internal_boot_desc_idx {
+ 	ROM_DESC_PPBOOT,
+ 	ROM_DESC_FAKE_FUSE,
+@@ -102,7 +78,7 @@
+ 	uint8_t efuse_read;
+ 	uint8_t curr_img;
+ 	uint8_t die_id;
+-	enum boot_rom_die_type die_type;
++	uint8_t die_type;
+ 	uint64_t ppboot_start_addr;
+ 	bool fake_fuse_en;
+ 	uint32_t fake_fuse_spi_offset;
+@@ -126,7 +102,7 @@
+ extern struct boot_rom_manifest_s boot_rom_manifest;
+ 
+ uint8_t boot_rom_get_die_id(void);
+-enum boot_rom_die_type boot_rom_get_die_type(void);
++uint8_t boot_rom_get_die_type(void);
+ void boot_rom_init(void);
+ void boot_rom_fuse(void);
+ void boot_rom_wait_for_signal(void);
+@@ -137,5 +113,6 @@
+ void boot_rom_tpm_spi_global_ctx_init(struct spi_ctx *tpm_spi);
+ void boot_rom_tpm_spi_init(void);
+ void boot_rom_tpm_spi_setup(void);
++bool boot_rom_in_master_die(void);
+ 
+ #endif /* _BOOT_ROM_H_ */

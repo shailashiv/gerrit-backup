@@ -1,0 +1,264 @@
+From c1a704c374ec8e97fc766c2cd10f4ad45c7a5c57 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 04 Feb 2020 13:11:27 +0200
+Subject: [PATCH] [SW-8228] copy img from flash to fw_sram via dma
+
+Use hardware DMA to copy from spi flash the image to
+fw_sram.
+Copy secondary Image if we have CRC fail on primary
+
+Change-Id: I988f946efbcd817aef2190fe4609ef358663bbcd
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index e2f8215..8b0e947 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -7,12 +7,23 @@
+ 
+ #include "arcboot.h"
+ #include "efuse.h"
++#include "dma.h"
+ #include "security.h"
++#include "secureboot.h"
+ #include "spi_flash.h"
+ 
+ struct arcboot_global_s arcboot_rom_global = {
+ 	.config_fuse = 0,
+ };
++
++#define ARCBOOT_BRINGUP_ERROR		-1
++#define ARCBOOT_BRINGUP_OK		1
++
++static void arcboot_rom_recovery(void)
++{
++	/* TODO: add "all debug components should bypass the MMU" */
++}
++
+ 
+ static void arcboot_rom_init(void)
+ {
+@@ -74,7 +85,50 @@
+ 			      security_key_soc_location_offset(hash_key_index));
+ }
+ 
+-static void arcboot_rom_bringup_pcie(void) {}
++static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
++{
++	uint32_t flash_image_offset;
++
++	if (image_ptr == ARCBOOT_SECONDARY) {
++		flash_image_offset =
++			spi_flash_readl(FLASH_SECONDARY_OFFSET);
++	} else {
++		flash_image_offset =
++			spi_flash_readl(FLASH_PRIMARY_OFFSET);
++	}
++	return flash_image_offset;
++}
++
++static int arcboot_rom_bringup_pcie_images(uint8_t image_ptr)
++{
++	uint32_t flash_image_offset;
++	uint32_t flash_ppboot_pcie_offset;
++	uint16_t ppboot_pcie_size;
++
++	flash_image_offset = arcboot_flash_image_offset(image_ptr);
++	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
++					      flash_image_offset);
++	ppboot_pcie_size = (uint16_t)spi_flash_readl(flash_ppboot_pcie_offset);
++
++	dma_copy_image(ppboot_pcie_size, flash_ppboot_pcie_offset, 0,
++		       SPI_DMA_DST_FW_SRAM);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		/* TODO: update PSOC_SECURITY about CRC error in image */
++		return ARCBOOT_BRINGUP_ERROR;
++	return ARCBOOT_BRINGUP_OK;
++}
++
++static void arcboot_rom_bringup_pcie(void)
++{
++	/* TODO: add FLASH_IMAGE_PTR decides which image first */
++	if (arcboot_rom_bringup_pcie_images(ARCBOOT_PRIMARY) !=
++	    ARCBOOT_BRINGUP_OK) {
++		if (arcboot_rom_bringup_pcie_images(ARCBOOT_SECONDARY) !=
++		    ARCBOOT_BRINGUP_OK) {
++			arcboot_rom_recovery();
++		}
++	}
++}
+ 
+ static void arcboot_rom_bringup_arcboot_ram(void) {}
+ 
+diff --git a/common/dma.c b/common/dma.c
+index 695dda6..320482e 100644
+--- a/common/dma.c
++++ b/common/dma.c
+@@ -6,32 +6,55 @@
+  */
+ 
+ #include "arcboot.h"
++#include "dma.h"
+ #include "spi_flash.h"
+ 
+-int arcboot_dma_copy_image(uint32_t image_size)
++void dma_copy_image(uint16_t image_size, uint32_t flash_offset,
++		    uint64_t dest_offset, uint8_t fw_sram_dst)
+ {
+ 	uint32_t reg_spi_dma_ctrl_s =  0;
+-	uint32_t reg_spi_dma_status_s = 0;
+-	uint32_t next_image_add = 0;
++	uint32_t spi_dma_dst_addr_l = DMA_ADDRESS_LOW(dest_offset);
++	uint32_t spi_dma_dst_addr_h = DMA_ADDRESS_HIGH(dest_offset);
++	uint16_t flash_offset_1k = flash_offset / DMA_SRC_BLOCK_SIZE;
++	uint16_t image_size_4b = (image_size / DMA_DST_BLOCK_SIZE);
+ 
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
++	/* TODO: check that in new RTL issue is fixed */
++	spi_flash_set_byte_swap(DISABLE_BYTE_SWAP);
+ 
+-	image_size = spi_flash_readl(FLASH_IMAGE_1_OFFSET +
+-				 FLASH_IMAGE_PREBOOT_OFFSET);
+-	next_image_add = image_size % SPI_FLASH_BLOCK_SIZE;
+-	next_image_add += image_size;
+-	image_size = spi_flash_readl(FLASH_IMAGE_1_OFFSET + next_image_add);
++	regmap_writel(spi_dma_dst_addr_l,
++		      mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
++	regmap_writel(spi_dma_dst_addr_h,
++		      mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
+ 
+-	reg_spi_dma_ctrl_s = image_size << 18;
+-	reg_spi_dma_ctrl_s = 0; // addr
+-	reg_spi_dma_ctrl_s = 1 << 1; //sram
+-	reg_spi_dma_ctrl_s = 1; // en
++	/* enable DMA transfer */
++	reg_spi_dma_ctrl_s = SPI_DMA_ENABLE;
++
++	/* fw_sram as destination */
++	reg_spi_dma_ctrl_s |= fw_sram_dst;
++
++	/* # of 4bytes to DMA copy */
++	reg_spi_dma_ctrl_s |= (uint32_t)image_size_4b <<
++			      PSOC_GLOBAL_CONF_SPI_DMA_CTRL_FLD_SIZE_SHIFT;
++
++	/* spi offset in 1k chunks */
++	reg_spi_dma_ctrl_s |= (uint32_t)flash_offset_1k <<
++			      PSOC_GLOBAL_CONF_SPI_DMA_CTRL_ADDR_SHIFT;
+ 
+ 	regmap_writel(reg_spi_dma_ctrl_s, mmPSOC_GLOBAL_CONF_SPI_DMA_CTRL);
++}
++
++int dma_wait_finish(void)
++{
++	uint32_t reg_spi_dma_status_s = 0;
++	int crc_error = 0;
+ 	do {
+ 		reg_spi_dma_status_s =
+ 		 regmap_readl(mmPSOC_GLOBAL_CONF_SPI_DMA_STATUS);
+-	} while (reg_spi_dma_status_s & 0x3);
+-	return 0;
++	} while ((reg_spi_dma_status_s &
++		  PSOC_GLOBAL_CONF_SPI_DMA_STATUS_DONE_MASK) == 0);
++	crc_error = (reg_spi_dma_status_s &
++		     PSOC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_MASK) >>
++		     PSOC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_SHIFT;
++
++	return crc_error;
+ }
+\ No newline at end of file
+diff --git a/common/dma.h b/common/dma.h
+index 2dc1ea7..9907966 100644
+--- a/common/dma.h
++++ b/common/dma.h
+@@ -8,6 +8,18 @@
+ #ifndef _DMA_H_
+ #define _DMA_H_
+ 
+-int arcboot_dma_copy_image(uint32_t image_size);
++#define SPI_DMA_ENABLE		BIT(0)
++#define SPI_DMA_DST_FW_SRAM	BIT(1)
++#define SPI_DMA_DST_HBW		0
++#define DMA_CRC_ERROR		1
++#define DMA_CRC_OK		0
++#define DMA_SRC_BLOCK_SIZE	1024
++#define DMA_DST_BLOCK_SIZE	4
+ 
++#define DMA_ADDRESS_LOW(x)	((x) & 0xFFFFFFFF)
++#define DMA_ADDRESS_HIGH(x)	(((x) >> 32) & 0xFFFF)
++
++void dma_copy_image(uint16_t image_size, uint32_t flash_offset,
++		    uint64_t dest_offset, uint8_t fw_sram_dst);
++int dma_wait_finish(void);
+ #endif /* _DMA_H_ */
+\ No newline at end of file
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+index adb15fc..77b601b 100644
+--- a/common/spi_flash.c
++++ b/common/spi_flash.c
+@@ -10,7 +10,7 @@
+ #include "security.h"
+ #include "spi_flash.h"
+ 
+-static void spi_flash_set_byte_swap(uint8_t enable)
++void spi_flash_set_byte_swap(uint8_t enable)
+ {
+ 	uint32_t reg_spi_direct_wr_rd_ctrl = 0;
+ 
+diff --git a/common/spi_flash.h b/common/spi_flash.h
+index 5f85477..555c2cc 100644
+--- a/common/spi_flash.h
++++ b/common/spi_flash.h
+@@ -24,6 +24,9 @@
+ #define DISABLE_BYTE_SWAP		0
+ 
+ #define SPI_FLASH_BAUDR_DIVISOR		2
++
++#define FLASH_64KB_PADD			65536
++
+ #define FLASH_OTP_OFFSET		0
+ #define FLASH_OTP_DISABLE		0
+ #define FLASH_OTP_ENABLE		1
+@@ -46,6 +49,7 @@
+ #define FLASH_EFUSE_KEYS_OFFSET		16
+ #define FLASH_EFUSE_KEYS_REVOKE_OFFSET	176
+ 
++void spi_flash_set_byte_swap(uint8_t enable);
+ u32 spi_flash_readl(u32 offset);
+ void spi_flash_writel(u32 val, u32 offset);
+ void spi_flash_get_revoke(uint32_t *key_revoke);
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 0c12c77..f4e301d 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -21,11 +21,13 @@
+ 
+ #define SPI_FLASH_BLOCK_SIZE			1024
+ 
++#define HL_SRAM_BASE				0x7FF0000000
+ #define HL_SDRAM_BASE				0x10000000
+ #define HL_FLASH_OFFSET				0xA000000
++#define HL_ICCM_OFFSET				0xB020000
+ #define HL_SBROM_OFFSET				0xB040000
+ #define HL_FWSRAM_OFFSET			0xB050000
+-
++#define HL_PCIE_FWSRAM_OFFSET			0xBFF0000
+ 
+ #define HL_FLASH_BASE				(HL_SDRAM_BASE + \
+ 						 HL_FLASH_OFFSET)
+@@ -35,12 +37,8 @@
+ 						 HL_FWSRAM_OFFSET)
+ #define HL_CFG_BASE				0xFC000000
+ 
+-//SPI FLASH CONST
+-#define FLASH_IMAGE_1_OFFSET			0x00000
+-#define FLASH_IMAGE_2_OFFSET			0x20000
+-
+-#define FLASH_IMAGE_PREBOOT_OFFSET		0x10000
+-#define FLASH_IMAGE_PCIE_FW_OFFSET		0x18000
++#define ARCBOOT_PRIMARY				0
++#define ARCBOOT_SECONDARY			1
+ 
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;

@@ -1,0 +1,191 @@
+From 86cd4e2c130126538d030603eafeb777d629960f Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 09 Feb 2022 04:27:08 +0200
+Subject: [PATCH] [SW-68803] gaudi3: access sp sram struct
+
+Currently security data from fuse that can be re-used in
+boot rom and other repos further down in the boot flow are
+stored in the initial region of the sp sram memory in order
+to enable faster access to the data.
+
+But this is stored and read using hardcoded offsets which
+leave us prone to memory holes and a ledger to maintain
+the data offsets that need to be used to read/write and
+avoid overwriting of the data.
+
+This is avoided by accessing the sp sram as a structured
+layout, hence referencing the member for read/write.
+
+Change-Id: I0099e873d57859525f261bce16ce539d0a158d08
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 80c9ba5..6ff4043 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -38,6 +38,7 @@
+ 		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS,
+ 		.load_addr = 0,
+ 	},
++	.sp_sram = (struct hl_spsram_layout *)(HL_GEN_MEM_BASE + HL_SCRATCHPAD_SRAM_OFFSET),
+ };
+ 
+ #define ARCBOOT_STATUS_REG_SZ_BITS		32
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index a402333..8382413 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -74,8 +74,7 @@
+ 
+ int security_get_key_hash(uint32_t *hash, uint8_t key_index)
+ {
+-	uint32_t valid_key_base, max_key_index;
+-	int i;
++	uint32_t max_key_index;
+ 	enum security_key_location key_location;
+ 	uint32_t *ptr;
+ 
+@@ -91,11 +90,7 @@
+ 			return 1;
+ 
+ 		/* read from efuse/SP SRAM */
+-		valid_key_base = (key_index * SECURITY_KEY_HASH_LEN) + SECURITY_EFUSE_KEYS_OFFSET;
+-
+-		for (i = 0; i < SECURITY_DWORD_PER_KEY; i++)
+-			*(hash + i) = sp_sram_readl(valid_key_base + (i *
+-					SECURITY_BYTE_PER_DWORD));
++		ptr = arcboot_rom_global.sp_sram->sec_data.keys[key_index];
+ 	} else {
+ 		/*
+ 		 * All other cases are routed into ROM, since it is
+@@ -108,8 +103,8 @@
+ 
+ 		/* read from ROM itself */
+ 		ptr = (uint32_t *)rom_key_hashes[key_index];
+-		memcpy(hash, ptr, SECURITY_KEY_HASH_LEN);
+ 	}
++	memcpy(hash, ptr, SECURITY_KEY_HASH_LEN);
+ 
+ 	return 0;
+ }
+@@ -138,7 +133,7 @@
+ 	if (key_index >= max_key_index)
+ 		return -1;
+ 
+-	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	key_revoke = arcboot_rom_global.sp_sram->sec_data.key_revoke;
+ 
+ 	/* if the key is not revoked, return 1 */
+ 	if ((key_revoke & BIT(key_index)) == 0)
+@@ -216,7 +211,7 @@
+ 
+ void security_load_keys(void)
+ {
+-	uint8_t hash_key_index, num_dwords, max_keys = NUM_KEYS_IN_ROM;
++	uint8_t max_keys = NUM_KEYS_IN_ROM;
+ 	uint32_t key_hash[NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY];
+ 	enum security_key_location key_location;
+ 
+@@ -241,13 +236,9 @@
+ 	/* store hashes in the limited space available in PSOC_SECURITY */
+ 	security_store_keys_in_psoc(max_keys, key_hash);
+ 
+-	/* Store key hashes in SPSRAM */
+-	num_dwords = max_keys * SECURITY_DWORD_PER_KEY;
+-	for (hash_key_index = 0; hash_key_index < num_dwords;
+-					hash_key_index++)
+-		sp_sram_writel(key_hash[hash_key_index],
+-			   SECURITY_EFUSE_KEYS_OFFSET + (hash_key_index *
+-			   SECURITY_BYTE_PER_DWORD));
++	/* Store key hashes in sp sram */
++	memcpy(arcboot_rom_global.sp_sram->sec_data.keys,
++			key_hash, max_keys * SECURITY_KEY_HASH_LEN);
+ }
+ 
+ void security_load_revoke_bits(void)
+@@ -277,9 +268,7 @@
+ 	/* store key_revoke map in PSOC */
+ 	regmap_writel(key_revoke, mmSECURITY_KEY_REVOKE);
+ 
+-	/* store key hashes in Scratch PAD Sram */
+-	sp_sram_writel(key_revoke,
+-		       SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	arcboot_rom_global.sp_sram->sec_data.key_revoke = key_revoke;
+ }
+ 
+ void security_load_fw_version(void)
+@@ -310,14 +299,13 @@
+ 		      mmSECURITY_MIN_FW_VERSION);
+ 
+ 	/* store minimum allowed security version in Scratch PAD Sram */
+-	sp_sram_writel(SECURITY_FW_VERSION_FROM_SECURITY_BYTE(fw_version_sec),
+-		      SECURITY_EFUSE_FW_VERSION_OFFSET);
++	arcboot_rom_global.sp_sram->sec_data.sec_ver = fw_version_sec;
+ }
+ 
+ void security_load_sec_efuse_dword(void)
+ {
+-	sp_sram_writel(arcboot_rom_global.config_fuse,
+-		       SECURITY_EFUSE_SYS_CFG_OFFSET);
++	arcboot_rom_global.sp_sram->sec_data.efuse_sys_cfg =
++			arcboot_rom_global.config_fuse;
+ }
+ 
+ void arcboot_rom_security_init(void)
+@@ -336,7 +324,7 @@
+ int security_efuse_image_validation_en(void)
+ {
+ 	/* check efuse for security validation enable */
+-	uint32_t config_fuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++	uint32_t config_fuse = arcboot_rom_global.sp_sram->sec_data.efuse_sys_cfg;
+ 
+ 	return !!(config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index c4bbf70..7381e9d 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -25,9 +25,8 @@
+ #define ALIGN_VAL(val, byte)	ALIGN_SUB(val, (byte - 1))
+ 
+ static struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx;
+-static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_SPI_BOOT_PTR_SP_SRAM_ADDR);
+-static struct hl_fw_img_desc *p_img_desc = (struct hl_fw_img_desc *)(HL_SPI_BOOT_PTR_SP_SRAM_ADDR +\
+-					BOOT_PTRS_SZ);
++static struct hl_fw_boot_ptrs *p_boot_ptr;
++static struct hl_fw_img_desc *p_img_desc;
+ 
+ static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+ {
+@@ -48,7 +47,10 @@
+ {
+ 	p_img_ptr_ctx = &arcboot_rom_global.boot_ptr_ctx[img];
+ 
+-	if (img == HL_FW_BOOT_PTR_EROM) {
++	if (img == HL_FW_BOOT_PTR_SPI) {
++		p_boot_ptr = &arcboot_rom_global.sp_sram->img_ptr.boot_ptr;
++		p_img_desc = arcboot_rom_global.sp_sram->img_ptr.img_desc;
++	} else { /* EROM img ptr */
+ 		p_boot_ptr = &arcboot_rom_global.img_ptrs_erom.boot_ptr;
+ 		p_img_desc = arcboot_rom_global.img_ptrs_erom.img_desc;
+ 	}
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 578ca42..7688694 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -15,6 +15,7 @@
+ #include "regmap.h"
+ #include "regmask.h"
+ #include "hl_boot_desc_rom.h"
++#include "hl_spsram_if.h"
+ 
+ #ifndef __weak
+ #define __weak		__attribute__((weak))
+@@ -75,6 +76,7 @@
+ 	bool fuse_spi;
+ 	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
+ 	struct hl_img_ptrs_erom img_ptrs_erom;
++	struct hl_spsram_layout *sp_sram;
+ };
+ 
+ enum arcboot_rom_bringup_proggress {

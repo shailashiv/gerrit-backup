@@ -1,0 +1,52 @@
+From b6d74f9bb4fb6205a2940d7ae3991aff111e1ac2 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 19 Apr 2022 12:36:59 +0300
+Subject: [PATCH] [SW-83787] gaudi3: implement force recovery routine
+
+Currenlty in common recovery function, the function checks for GPIO
+assert as well as recovery flag upon which it enters in recovery.
+However for automated recovery only gpio assert check is enough as
+recovery flag is set by ROM when primary/secondary image load fails
+and if that bit is not cleared, then it will force ROM to enter recovery
+again on next reset till cold reset is not issued or ROM doesn't clear
+recovery flag which is only done when primary/secondary image load is
+successful. This patch adds platform specific recovery routine for gaudi3
+which only checks force recovery GPIO to enter recovery.
+
+Change-Id: I6d605ea532f1756a4d49f23a64882ce87be59bec
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index be4e6a5..125b40b 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -219,7 +219,7 @@
+ 	arcboot_rom_init_sp_sram();
+ }
+ 
+-static void arcboot_rom_in_recovery(void)
++__weak void arcboot_rom_in_recovery(void)
+ {
+ 	uint8_t override = 1;
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 871218f..c980cd6 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -773,3 +773,16 @@
+ 
+ 	memcpy((void *)arc_dst, buf, len);
+ }
++
++void arcboot_rom_in_recovery(void)
++{
++	uint8_t override = 1;
++
++	if ((arcboot_rom_global.config_fuse &
++	     EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL) == 0)
++		override = regmap_readl(mmGPIO0_DATA) & FORCE_RECOVERY_MASK;
++
++	/* Enter recovery if automated GPIO[FORCE_RECOVERY_MASK] is asserted */
++	if (override == 0)
++		execute_recovery();
++}

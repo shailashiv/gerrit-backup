@@ -1,0 +1,96 @@
+From 0b715b535f051c87cd999845dfea0c374baf8af3 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 09 Mar 2022 16:10:02 +0200
+Subject: [PATCH] [SW-76435] rom : add crc32 code
+
+Ported crc32 code from preboot. This is in preparation to port boot
+info in rom, as boot info uses crc32 for data integrity.
+
+Change-Id: Iba96140d1e62e55c9ba1aefbca71df5454242b2c
+---
+
+diff --git a/common/crc32.c b/common/crc32.c
+new file mode 100644
+index 0000000..04ad887
+--- /dev/null
++++ b/common/crc32.c
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <arcboot.h>
++
++/*
++ * Compute CRC32 using 256 deep lookup table.
++ * Taken from Linux implementation of Sarwate algorithm with additional bit
++ * flip for pre and post CRC.
++ * This implementation is only good for little endian processor.
++ */
++
++#define CRC32_POLY	0xedb88320
++#define CRC_BITS	8
++#define TABLE_SIZE	256
++
++static uint32_t crc32table[256];
++static bool is_crc32_table_initialized;
++
++void crc32_init_lookup(void)
++{
++	unsigned int i, j;
++	uint32_t crc = 1;
++
++	crc32table[0] = 0;
++
++	for (i = TABLE_SIZE >> 1; i; i >>= 1) {
++		crc = (crc >> 1) ^ ((crc & 1) ? CRC32_POLY : 0);
++		for (j = 0; j < TABLE_SIZE; j += 2 * i)
++			crc32table[i + j] = crc ^ crc32table[j];
++	}
++	for (i = 0; i < TABLE_SIZE; i++) {
++		crc = crc32table[i];
++		crc = crc32table[crc & 0xff] ^ (crc >> 8);
++	}
++}
++
++uint32_t crc32(uint32_t crc, unsigned char const *p, size_t len)
++{
++	crc = ~crc;
++
++	if (!is_crc32_table_initialized) {
++		crc32_init_lookup();
++		is_crc32_table_initialized = true;
++	}
++
++	while (len--) {
++		crc ^= *p++;
++		crc = (crc >> 8) ^ crc32table[crc & 255];
++	}
++
++	return ~crc;
++}
+diff --git a/common/crc32.h b/common/crc32.h
+new file mode 100644
+index 0000000..e7f8239
+--- /dev/null
++++ b/common/crc32.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _CRC_H_
++#define _CRC_H_
++
++#define CRC32_LEN	4
++
++void crc32_init_lookup(void);
++uint32_t crc32(uint32_t crc, unsigned char const *p, size_t len);
++
++#endif

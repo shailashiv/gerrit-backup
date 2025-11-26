@@ -1,0 +1,83 @@
+From 562e248be948a4eeffe3a54e955e6522d81ec408 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Mon, 03 Feb 2020 09:17:06 +0200
+Subject: [PATCH] [SW-8229] goya2: pcie code cleanup
+
+Put pcie wait loop in separate function and comment warm
+reset handler function
+
+Change-Id: I26044598901279cc4748b3952e07a6767fc229b3
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/pcie.c b/common/pcie.c
+index 50a07c5..d6c19db 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -20,16 +20,23 @@
+ 	return (ltssm_en & 0x1);
+ }
+ 
++static void pcie_loop_while_prstn(uint8_t assert)
++{
++	uint8_t pcie_prstn;
++
++	do {
++		pcie_prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		pcie_prstn &= PSOC_GLOBAL_CONF_PRSTN_MASK_IND_MASK;
++	} while (pcie_prstn == assert);
++}
++
+ static void pcie_config(void)
+ {
+-	uint8_t pcie_prstn, sram_init_done;
++	uint8_t sram_init_done;
+ 	uint32_t boot_strap;
+ 
+ 	if (pcie_ltssm_en()) {
+-		do {
+-			pcie_prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-		} while (pcie_prstn != 1);
+-
++		pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
+ 		regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ 		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+ 		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+@@ -93,15 +100,18 @@
+ 
+ void pcie_warm_reset_handle(void)
+ {
+-	uint8_t pcie_prstn;
+-	/* TODO: move to function*/
+-	do {
+-		pcie_prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-	} while (pcie_prstn);
++	/* loop while prstn to de-assert */
++	pcie_loop_while_prstn(PCIE_PRSTN_DEASSERT);
+ 
+-	/* TODO: add 1uS delay */
++	/* if prstn is asserted then we're in reset, wait 1uS for bootmngr to
++	 * startup before checking its status
++	 */
+ 	udelay(BOOTMNG_STARTUP_DELAY_AFTER_PERSTN);
++
++	/* wait for bootmngr to reach idle state */
+ 	pcie_sync_btl();
++
++	/* rerun the pcie_recovery to bring minimal link up again */
+ 	pcie_recovery();
+ }
+ 
+diff --git a/common/pcie.h b/common/pcie.h
+index c6a8b27..bb21ba1 100644
+--- a/common/pcie.h
++++ b/common/pcie.h
+@@ -9,6 +9,8 @@
+ #define _PCIE_H_
+ 
+ #define BOOTMNG_STARTUP_DELAY_AFTER_PERSTN	1
++#define PCIE_PRSTN_ASSERT			0
++#define PCIE_PRSTN_DEASSERT			1
+ 
+ void pcie_recovery(void);
+ 

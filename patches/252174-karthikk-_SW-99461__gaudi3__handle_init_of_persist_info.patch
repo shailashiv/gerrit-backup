@@ -1,0 +1,211 @@
+From 281a1f3e606f2c1ed7f9f307bbb07071c1cf5e3e Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 07 Sep 2022 10:48:15 +0300
+Subject: [PATCH] [SW-99461] gaudi3: handle init of persist info
+
+In order to handle the init of dccm in a cleaner manner, keeping the
+persist info section at the beginning, the dccm init is split into
+two operations:
+
+1) Handle the non persist section's dccm init in startup every reset cycle.
+2) Handle the persist section's dccm init only in cold reset using the
+memcpy engine.
+
+We need to take care of initializing the non-zero static info in persist
+info only after the dccm init of persist info in order to avoid the
+possibility of using a non-initialized dccm. This patch takes care of
+this sequence.
+
+Change-Id: I6d6d7304043a2be47532b347c96e697d53c2c889
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index bd83401..050c3d8 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -27,24 +27,6 @@
+ 	.sku = 0,
+ 	.fuse_spi_offset = 0x0,
+ 	.fuse_spi = false,
+-	.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM] = {
+-		.boot_desc_flag = 0,
+-		.img_ptr_spi_offset = HL_EROM_IMG_PTRS_BASE,
+-		.max_imgs = HL_FW_MAX_EROM_BOOT_PTRS,
+-		.start_addr = 0,
+-		.desc_info = {0},
+-		.dest_addr_dma = HL_BOOT_PTR_EROM_DMA_DEST,
+-		.dest_addr_arc = HL_BOOT_PTR_EROM_DMA_DEST_ARC,
+-	},
+-	.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI] = {
+-		.boot_desc_flag = 0,
+-		.img_ptr_spi_offset = HL_SPI_IMG_PTRS_BASE,
+-		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS,
+-		.start_addr = 0,
+-		.desc_info = {0},
+-		.dest_addr_dma = HL_BOOT_PTR_SPI_DMA_DEST,
+-		.dest_addr_arc = HL_BOOT_PTR_SPI_DMA_DEST_ARC,
+-	},
+ 	.tpm_validation_pass = false,
+ };
+ 
+diff --git a/app/crt0_rom.S b/app/crt0_rom.S
+index ed006d1..417c5ce 100644
+--- a/app/crt0_rom.S
++++ b/app/crt0_rom.S
+@@ -86,7 +86,7 @@
+ 
+ 	mov sp, @__stack_top	; initialize stack pointer
+ 
+-	mov r2, @_dccm_begin	; r2 = start of the dccm section
++	mov r2, @_rom_non_persistent_dccm_start; r2 = start of the non persistent dccm section
+ 	sub r3, @_dccm_end, r2	; r3 = size of the dccm section in bytes
+ 	; set up the loop counter register to the size (in words) of the dccm section
+ 	asr_s r13, r3
+@@ -99,10 +99,10 @@
+ 	nop
+ .Lend_dccm:
+ 
+-	mov_s r1, @_etext	; r1 = end of the text section
+-	mov_s r2, @_data	; r1 = end of the data section
++	mov_s r1, @_data_after_persist_sec	; r1 = non persistent section begin in ROM(LMA).
++	mov_s r2, @_rom_non_persistent_dccm_start; r2 = non persistent section begin in DCCM(VMA).
+ 
+-	sub r3, @_edata, r2	; r3 = size of the data section in bytes
++	sub r3, @_edata, r2	; r3 = size of the non persistent data section in bytes
+ 
+ 	; set up the loop counter register to the size (in words) of the data section
+ 	asr_s r13, r3
+diff --git a/arch/gaudi2/arc/arcboot_rom.lds b/arch/gaudi2/arc/arcboot_rom.lds
+index 80af301..ff0dea9 100644
+--- a/arch/gaudi2/arc/arcboot_rom.lds
++++ b/arch/gaudi2/arc/arcboot_rom.lds
+@@ -33,6 +33,7 @@
+ {
+ 	_dccm_begin = ORIGIN(DCCM);
+ 	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++	_persistent_sec_size = 0;
+ 
+ 	.ivt : {
+ 		KEEP (*(.ivt));
+@@ -45,7 +46,9 @@
+ 	} > REGION_TEXT
+ 
+ 	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext + _persistent_sec_size;
+ 		_data = .;
++		_rom_non_persistent_dccm_start = _data;
+ 		KEEP(*(.rom_persistent_section))
+ 		*(.data)
+ 	} > REGION_DATA
+diff --git a/arch/gaudi3/arc/arcboot_rom.lds b/arch/gaudi3/arc/arcboot_rom.lds
+index 47263d3..a82b42e 100644
+--- a/arch/gaudi3/arc/arcboot_rom.lds
++++ b/arch/gaudi3/arc/arcboot_rom.lds
+@@ -33,6 +33,7 @@
+ {
+ 	_dccm_begin = ORIGIN(DCCM);
+ 	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++	_persistent_sec_size = 3k;
+ 
+ 	.ivt : {
+ 		KEEP (*(.ivt));
+@@ -45,9 +46,11 @@
+ 	} > REGION_TEXT
+ 
+ 	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext + _persistent_sec_size;
+ 		_data = .;
+ 	    KEEP(*(.rom_persistent_section))
+-	    . = _data + 3k; /* Reserve 3KB memory for persistent data section */
++	    . = _data + _persistent_sec_size; /* Reserve 3KB memory for persistent data section */
++		_rom_non_persistent_dccm_start = .;
+ 		*(.data)
+ 	} > REGION_DATA
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 0e86612..967b67c 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -415,8 +415,49 @@
+ 	arcboot_rom_global.tpm_validation_pass = cold_rst_data.tpm_validation_flag;
+ }
+ 
++static void arcboot_rom_persist_data_non_zero_init(void)
++{
++	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].img_ptr_spi_offset = HL_EROM_IMG_PTRS_BASE;
++	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_dma = HL_BOOT_PTR_EROM_DMA_DEST;
++	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_arc = HL_BOOT_PTR_EROM_DMA_DEST_ARC;
++
++	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].img_ptr_spi_offset = HL_SPI_IMG_PTRS_BASE;
++	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_dma = HL_BOOT_PTR_SPI_DMA_DEST;
++	arcboot_rom_global.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_arc = HL_BOOT_PTR_SPI_DMA_DEST_ARC;
++}
++
++#define HL_ARC1_DCCM_PERSIST_SECTION_SIZE			(3 * 1024) /* 3KB */
++/*
++ * Note: base_readl() and base_writel() are used in arcboot_rom_persistent_dccm_init() instead of regmap_readl()
++ * and regmap_writel(). This is because regmap_* apis use the die id from global structure to calculate the die
++ * specific addressing and the same is required for accessing die1's register space.
++ * As the global structure itself should be used only after dccm persistent section init , we perform register
++ * accesses required by dccm persist init by manually computing the required addresses and using base_* apis.
++ */
++static void arcboot_rom_persistent_dccm_init(void)
++{
++	uint8_t die_id = regmap_readl(mmD0_PARC_LOCAL_CFG_DIE_ID);
++	uint32_t die_cold_rst_flop_2 = HL_CFG_BASE + mmCOLD_RST_FLOPS_2 + die_id * HL_CFG_SPACE_DIE1_OFFSET;
++	struct gaudi3_cold_rst_data cold_rst_data;
++
++	cold_rst_data.data = base_readl(die_cold_rst_flop_2);
++	if (cold_rst_data.arc1_persist_dccm_init_done)
++		return;
++
++	memset((void *)HL_DCCM_BASE, 0, HL_ARC1_DCCM_PERSIST_SECTION_SIZE);
++
++	/* Non zero initializers only required for master(die 0) */
++	if (!die_id)
++		arcboot_rom_persist_data_non_zero_init();
++
++	cold_rst_data.arc1_persist_dccm_init_done = 1;
++	base_writel(cold_rst_data.data, die_cold_rst_flop_2);
++}
++
+ void arcboot_rom_init(void)
+ {
++	arcboot_rom_persistent_dccm_init();
++
+ 	arcboot_rom_global.die_id = regmap_readl(mmD0_PARC_LOCAL_CFG_DIE_ID);
+ 
+ 	/* clear SW Status registers */
+diff --git a/arch/gaudi3/arc/soc.h b/arch/gaudi3/arc/soc.h
+index 98e3061..9a945b9 100644
+--- a/arch/gaudi3/arc/soc.h
++++ b/arch/gaudi3/arc/soc.h
+@@ -111,5 +111,6 @@
+ #define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0xFFFFFFF) + HL_FW_MEM_BASE)
+ #define CONV_64B_TO_ARC_SRAM(addr)	((addr & 0xFFFFFFF) + HL_SRAM_BASE)
+ #define HL_CFG_SPACE_DIE1_OFFSET	BIT(23)
++#define HL_FW_MEM_SPACE_DIE1_OFFSET	BIT(27)
+ 
+ #endif /* _SOC_H_ */
+diff --git a/arch/greco/arc_elf32/arcboot_rom.lds b/arch/greco/arc_elf32/arcboot_rom.lds
+index 1cbe290..e52d758 100644
+--- a/arch/greco/arc_elf32/arcboot_rom.lds
++++ b/arch/greco/arc_elf32/arcboot_rom.lds
+@@ -35,6 +35,7 @@
+ {
+ 	_dccm_begin = ORIGIN(DCCM);
+ 	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++	_persistent_sec_size = 0;
+ 
+ 	.ivt : {
+ 		KEEP (*(.ivt));
+@@ -47,7 +48,9 @@
+ 	} > REGION_TEXT
+ 
+ 	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext + _persistent_sec_size;
+ 		_data = .;
++		_rom_non_persistent_dccm_start = _data;
+ 		 KEEP(*(.rom_persistent_section))
+ 		*(.data)
+ 	} > REGION_DATA

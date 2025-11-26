@@ -1,0 +1,98 @@
+From da5705810ad715725d1e22b33f68d35a429963b9 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Tue, 12 Mar 2024 06:05:51 +0200
+Subject: [PATCH] [FSW-402] fs1: bootrom_init: initialize dccm
+
+This patch inits dccm memory for ARC1 MNG. Only in case
+of cold reset, this init is done.
+
+Change-Id: I981d3b18e08a3ea1bca3e0367847c8ef3b11b082
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index a95cf2d..831e6b6 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -30,6 +30,54 @@
+ 		return INVALID_DIE_TYPE;
+ }
+ 
++static void boot_rom_persist_data_non_zero_init(void)
++{
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].img_ptr_spi_offset =
++							HL_EROM_IMG_PTRS_BASE;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_dma =
++							HL_BOOT_PTR_EROM_DMA_DEST;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].dest_addr_arc =
++							HL_BOOT_PTR_EROM_DMA_DEST_ARC;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_EROM].boot_desc_flag = 0;
++
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].img_ptr_spi_offset =
++							HL_SPI_IMG_PTRS_BASE;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_dma =
++							HL_BOOT_PTR_SPI_DMA_DEST;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_arc =
++							HL_BOOT_PTR_SPI_DMA_DEST_ARC;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].boot_desc_flag = 0;
++}
++
++void boot_rom_persistent_dccm_init(uint8_t die_id)
++{
++	volatile uint32_t *dccm_addr = (uint32_t *) HL_DCCM_BASE;
++	uint32_t dccm_dwords = HL_ARC1_DCCM_PERSIST_SECTION_SIZE >> 2;
++	struct fs1_cold_rst_data cold_rst_data;
++	uint32_t i;
++	uint32_t die_cold_rst_flop_2 = HL_CFG_BASE +
++				       IO0_HALF0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2);
++
++	/* Replace correct die id in register offset*/
++	die_cold_rst_flop_2 = (die_cold_rst_flop_2 & ~(HL_ARC_ADDR_DIE_ID_MASK)) |
++			      (die_id << HL_ARC_ADDR_DIE_ID_SHIFT);
++	cold_rst_data.data = base_readl(die_cold_rst_flop_2);
++
++	if (cold_rst_data.arc1_persist_dccm_init_done)
++		goto non_zero_init;
++
++	for (i = 0; i < dccm_dwords; i++)
++		*dccm_addr++ = 0;
++
++	cold_rst_data.arc1_persist_dccm_init_done = 1;
++	base_writel(cold_rst_data.data, die_cold_rst_flop_2);
++
++non_zero_init:
++	/* Non zero initializers only required for master(die 0) */
++	if (die_id == IO_DIE_0)
++		boot_rom_persist_data_non_zero_init();
++}
++
+ void boot_rom_clear_status(void)
+ {
+ 	/* As per Architecture recommendation, clear status reg */
+diff --git a/common/common.c b/common/common.c
+index c38ebc1..6053351 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -6,8 +6,6 @@
+ 
+ #include <boot_rom.h>
+ 
+-static void boot_rom_persistent_dccm_init(__unused uint8_t die_id) {}
+-
+ void boot_rom_init(void)
+ {
+ 	/* TODO: Change Die ID register as per SOL */
+diff --git a/common/common.h b/common/common.h
+index 0dc54ec..0944fd9 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -6,6 +6,10 @@
+ #ifndef _COMMON_H_
+ #define _COMMON_H_
+ 
++#include <stdio.h>
++#include <stdint.h>
++
+ void boot_rom_clear_status(void);
++void boot_rom_persistent_dccm_init(uint8_t die_id);
+ 
+ #endif /* _COMMON_H_ */

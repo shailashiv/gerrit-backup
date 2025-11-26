@@ -1,0 +1,115 @@
+From fa856570617964cdf43b872f26bf7053097a0073 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 14 Sep 2022 20:58:26 +0300
+Subject: [PATCH] [SW-104491] gaudi3: tpm: replace udelay by ts api
+
+Initially rom only supported udelay() which was used as a
+busy wait loop for timeout monitoring of tpm spi requests.
+
+Later timeout_expired() apis were added in rom. To maintain
+uniformity the timeout_expired() apis are used in tpm code
+for timeout monitoring.
+
+For logic that requires a busy wait loop udelay is used.
+
+Change-Id: I2c0c4efb9ed0059982894839523149d08b1ebdc1
+---
+
+diff --git a/arch/gaudi3/arc/tpm2.c b/arch/gaudi3/arc/tpm2.c
+index 382b780..d10120b 100644
+--- a/arch/gaudi3/arc/tpm2.c
++++ b/arch/gaudi3/arc/tpm2.c
+@@ -279,10 +279,10 @@
+ static int tpm_spi_get_burstcount(void)
+ {
+ 	uint32_t burstcount, ret;
+-	uint32_t count;
++	uint64_t start;
+ 
+ 	/* wait for burstcount */
+-	count = TIS_SHORT_TIMEOUT_MS / TPM_TIMEOUT_MS;
++	start = arcboot_rom_get_ts_us();
+ 	do {
+ 		ret = tpm_tis_spi_read32(TPM_STS(locality),
+ 					 &burstcount);
+@@ -293,17 +293,15 @@
+ 		if (burstcount)
+ 			return burstcount;
+ 
+-		udelay(MS_TO_US(TPM_TIMEOUT_MS));
+-		count --;
+-	} while (count > 0);
++	} while (!arcboot_rom_timeout_expired(start, MS_TO_US(TIS_SHORT_TIMEOUT_MS)));
+ 
+ 	return -1;
+ }
+ 
+ static int tpm_spi_wait_for_stat(uint8_t mask, unsigned long timeout, uint8_t *status)
+ {
+-	uint32_t count = timeout / TPM_TIMEOUT_MS;
+ 	int ret;
++	uint64_t start = arcboot_rom_get_ts_us();
+ 
+ 	do {
+ 		ret = tpm_spi_status(status);
+@@ -314,8 +312,7 @@
+ 			return 0;
+ 
+ 		udelay(MS_TO_US(TPM_TIMEOUT_MS));
+-		count--;
+-	} while (count > 0);
++	} while (!arcboot_rom_timeout_expired(start, MS_TO_US(timeout)));
+ 
+ 	return -1;
+ }
+@@ -373,7 +370,7 @@
+ {
+ 	uint8_t buf = TPM_ACCESS_REQUEST_USE;
+ 	int ret;
+-	uint32_t count = TIS_SHORT_TIMEOUT_MS / TPM_TIMEOUT_MS;
++	uint64_t start;
+ 
+ 	ret = tpm_tis_spi_check_locality(loc);
+ 	if (!ret)
+@@ -388,6 +385,7 @@
+ 		return ret;
+ 	}
+ 
++	start = arcboot_rom_get_ts_us();
+ 	do {
+ 		ret = tpm_tis_spi_check_locality(loc);
+ 		if (!ret)
+@@ -398,8 +396,7 @@
+ 		}
+ 
+ 		udelay(MS_TO_US(TPM_TIMEOUT_MS));
+-		count--;
+-	} while (count > 0);
++	} while (!arcboot_rom_timeout_expired(start, MS_TO_US(TIS_SHORT_TIMEOUT_MS)));
+ 
+ 	return ret;
+ }
+@@ -528,10 +525,11 @@
+ 
+ static int tpm_tis_wait_init(int loc)
+ {
++	uint64_t start;
+ 	uint8_t status;
+ 	int ret;
+-	uint32_t count = TIS_LONG_TIMEOUT_MS / TPM_TIMEOUT_MS;
+ 
++	start = arcboot_rom_get_ts_us();
+ 	do {
+ 		ret = tpm_tis_spi_read(TPM_ACCESS(loc), &status, 1);
+ 		if (ret)
+@@ -540,9 +538,7 @@
+ 		if (status & TPM_ACCESS_VALID)
+ 			return 0;
+ 
+-		udelay(MS_TO_US(TPM_TIMEOUT_MS));
+-		count--;
+-	} while (count > 0);
++	} while (!arcboot_rom_timeout_expired(start, MS_TO_US(TIS_LONG_TIMEOUT_MS)));
+ 
+ 	return -1;
+ }

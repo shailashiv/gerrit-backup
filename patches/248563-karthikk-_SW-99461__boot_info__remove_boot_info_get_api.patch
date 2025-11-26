@@ -1,0 +1,116 @@
+From 4cd07bee1e5f81afdc836932f6ce1b9f3a3342fe Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Fri, 26 Aug 2022 17:06:55 +0300
+Subject: [PATCH] [SW-99461] boot_info: remove boot info get api
+
+Removed boot info get and relevant helper functions from rom as it is
+not required anymore after the boot_info_skip related design update.
+
+ROM now requires only boot info set and finalize operation.
+
+Change-Id: Ie3676d4d0fa4b05c194d584689682394c0990865
+---
+
+diff --git a/arch/gaudi3/arc/arcboot_rom.txt b/arch/gaudi3/arc/arcboot_rom.txt
+index 5ac4c4b..6aad9b5 100644
+--- a/arch/gaudi3/arc/arcboot_rom.txt
++++ b/arch/gaudi3/arc/arcboot_rom.txt
+@@ -10,7 +10,6 @@
+ arcboot_is_valid_address_range
+ boot_info_finalize_no_merge
+ boot_info_set_no_merge
+-boot_info_get_no_merge
+ hl_get_boot_info_ver_rom
+ secureboot_verify_image_signature
+ secureboot_verify_image_hash384
+diff --git a/common/boot_info.c b/common/boot_info.c
+index a8a42be..e520816 100644
+--- a/common/boot_info.c
++++ b/common/boot_info.c
+@@ -54,16 +54,6 @@
+ 	memcpy(&desc->crc32, &crc32_res, sizeof(crc32_res));
+ }
+ 
+-static int validate_crc32_csum(const unsigned char *input,
+-			     unsigned int ilen,
+-			     struct hl_boot_info_desc *desc)
+-{
+-	uint32_t crc32_res;
+-
+-	crc32_res = crc32(0, input, ilen);
+-	return memcmp(&crc32_res, &desc->crc32, CRC32_NUM_BYTES);
+-}
+-
+ void boot_info_finalize_no_merge(void)
+ {
+ 	struct hl_boot_info_desc *desc;
+@@ -152,69 +142,4 @@
+ 	desc->offset = ptr2offset(data, 0);
+ 
+ 	return 0;
+-}
+-
+-/*
+- * Apply memory copy with 32bit access limitation from src, make sure any
+- * reminder is also read using 32bit access.
+- * Both src and dst must be 32bit aligned addresses.
+- */
+-static void boot_info_memcpy32(void *dst, void *src, uint32_t size)
+-{
+-	uint32_t *d, *s, rem;
+-	uint32_t i, rem_sz;
+-
+-	d = dst;
+-	s = src;
+-
+-	for (i = 0; i < size / sizeof(uint32_t); i++)
+-		d[i] = s[i];
+-
+-	rem_sz = size % sizeof(uint32_t);
+-	if (!rem_sz)
+-		return;
+-
+-	rem = s[i];
+-	memcpy(&d[i], &rem, rem_sz);
+-}
+-
+-int boot_info_get_no_merge(uint32_t type, void *data, uint32_t max_size, uint32_t *copy_size)
+-{
+-	struct hl_boot_info_ptrs ptrs;
+-	struct hl_boot_info_desc desc;
+-	uint32_t *offsets, i, cpy_sz;
+-	void *src;
+-	int ret;
+-
+-	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
+-	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
+-		return 1;
+-
+-	offsets = (uint32_t *)offset2ptr(ptrs.offsets_arr_off,
+-				    BOOT_INFO_BASE);
+-
+-	for (i = 0; i < ptrs.count; i++) {
+-		desc = *(struct hl_boot_info_desc *)offset2ptr(offsets[i],
+-							       BOOT_INFO_BASE);
+-		if (type != desc.type)
+-			continue;
+-
+-		if (desc.magic != (HL_BOOT_INFO_DESC_MAGIC | type))
+-			return 1;
+-
+-		cpy_sz = (max_size > desc.size) ? desc.size : max_size;
+-		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
+-		boot_info_memcpy32(data, src, cpy_sz);
+-
+-		ret = validate_crc32_csum((uint8_t *)data, desc.size,
+-					&desc);
+-		if (ret)
+-			return 1;
+-
+-		*copy_size = cpy_sz;
+-
+-		return 0;
+-	}
+-
+-	return 1;
+ }

@@ -1,0 +1,64 @@
+From 8eb3dcf9ed13fa1911763dfe84a8d5679a2cbbbb Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Mon, 13 Apr 2020 16:02:23 +0300
+Subject: [PATCH] [SW-11666] goya2: snps wa gen1 limit stabilty
+
+According to SNPS case 01038891 if we dont enable external vco,
+then gen1 limited PCIe connection will not be stable.
+
+Change-Id: I46bec7f2a03885e780575de616e1cbc3af3b346f
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/efuse.h b/common/efuse.h
+index 471cf39..9fc7b68 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -17,6 +17,7 @@
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ #define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 
++#define EFUSE_SYSCFG_WA_SNPS_CASE_01038891	BIT(23)
+ #define EFUSE_SYSCFG_DISABLE_ROM_PCIE_RECOVERY	BIT(22)
+ #define EFUSE_SYSCFG_DISABLE_SECONDARY_IMG	BIT(21)
+ #define EFUSE_SYSCFG_BACKUP_DISABLE		BIT(20)
+diff --git a/common/pcie.c b/common/pcie.c
+index 5ddcc4d..ae65fdd 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -22,6 +22,27 @@
+ 	} while (pcie_prstn == assert);
+ }
+ 
++static void pcie_update_phy_vco_config(uint32_t addr, uint32_t addr_end)
++{
++	for (; addr <= addr_end ; addr += 4)
++		regmap_writel(1, addr);
++}
++
++static void pcie_wa_snps_case_01038891(void)
++{
++	if ((arcboot_rom_global.config_fuse &
++	     EFUSE_SYSCFG_WA_SNPS_CASE_01038891) == 0) {
++		/* WA for SPNS case 01038891 */
++		pcie_update_phy_vco_config(
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7);
++		pcie_update_phy_vco_config(
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7);
++		regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
++	}
++}
++
+ static void pcie_config(void)
+ {
+ 	uint8_t sram_init_done;
+@@ -44,6 +65,7 @@
+ 		    PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
+ 			regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
+ 
++		pcie_wa_snps_case_01038891();
+ 		regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ 
+ 		sram_init_done = 0;

@@ -1,0 +1,161 @@
+From e25aa1556ffc1281619aa2406e5aea823945bb7f Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Sat, 04 May 2024 06:07:12 +0300
+Subject: [PATCH] [FSW-4076] fs1: uart platform specific changes
+
+With this patch, added support for multiple
+platforms like pldm, onix, asic. especially
+uart related platform specific changes are
+provided in this patch.
+
+Change-Id: I04204f7753997dea5c7e989e630a853cef1b0fe3
+---
+
+diff --git a/Makefile b/Makefile
+index 9a6a629..d32a396 100644
+--- a/Makefile
++++ b/Makefile
+@@ -47,6 +47,7 @@
+ 
+ BOOT_ROM_COMMON_SRCS_C := $(shell ls common/*.c common/rsa/*.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
+ 
+ include $(HL_DEV_ARCH)/Makefile
+ 
+diff --git a/arch/fs1/arc/asic.c b/arch/fs1/arc/asic.c
+new file mode 100644
+index 0000000..e29c8c7
+--- /dev/null
++++ b/arch/fs1/arc/asic.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include "dev_uart.h"
++#include <mem_io.h>
++#include <fs1_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <pll_control_regs.h>
++
++#define BOOTROM_UART_BAUDRATE	115200
++
++uint32_t boot_rom_get_baudrate()
++{
++	return BOOTROM_UART_BAUDRATE;
++}
++
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div)
++{
++	uint32_t div_sel, factor, offset;
++	uint32_t reg, fbdiv, refdiv, postdiv1, postdiv2;
++	uint64_t out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(uint32_t);
++	// 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk
++	div_sel = regmap_readl((IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
++
++	if (div_sel == PLL_PLL_CLK || div_sel == PLL_DIV_PLL) {
++		// If 2'd1 - pll_clk [or] 2'd3 - divided pll_clk
++		reg = regmap_readl(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG_DIV));
++		/* fbdiv : bits 0-11 */
++		fbdiv = EXTRACT_BITS(reg, 0, 12);
++		/* postdiv1 : bits 16-18 */
++		postdiv1 = EXTRACT_BITS(reg, 16, 3);
++		/* postdiv2 : bits 20-22 */
++		postdiv2 = EXTRACT_BITS(reg, 20, 3);
++		/* refdiv : bits 24-29 */
++		refdiv  = EXTRACT_BITS(reg, 24, 6);
++		// SPECS: Fout = Fin * FBDIV / (POSTDIV1+1) / (POSTDIV2+1) / REFDIV
++		out_freq = SYS_REF_CLOCK * fbdiv;
++		out_freq /= ((uint64_t)refdiv) * (postdiv1 + 1) * (postdiv2 + 1);
++	}
++
++	if (div_sel == PLL_DIV_REF || div_sel == PLL_DIV_PLL) {
++		// If 2'd2 - divided ref_clk [or] 2'd3 - divided pll_clk
++		factor = regmap_readl((IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
++		out_freq /= factor + 1;
++	}
++
++	return (uint32_t)out_freq;
++}
+diff --git a/arch/fs1/arc/onix.c b/arch/fs1/arc/onix.c
+new file mode 100644
+index 0000000..375964d
+--- /dev/null
++++ b/arch/fs1/arc/onix.c
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include "dev_uart.h"
++
++#define ONIX_REF_CLK		35000000ULL
++#define ONIX_UART_BAUDRATE	57600
++
++uint32_t boot_rom_get_baudrate()
++{
++	return ONIX_UART_BAUDRATE;
++}
++
++uint32_t boot_rom_pll_get_freq(__unused enum boot_rom_pll_div div)
++{
++	return ONIX_REF_CLK;
++}
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+new file mode 100644
+index 0000000..d50a78c
+--- /dev/null
++++ b/arch/fs1/arc/pldm.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include "dev_uart.h"
++#include <mem_io.h>
++#include <fs1_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <pll_control_regs.h>
++#include <uart_regs.h>
++
++#define PLDM_UART_REF_CLK	250000000ULL
++#define PLDM_UART_BAUDRATE	300
++
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div)
++{
++	uint32_t offset = div * sizeof(uint32_t);
++
++	/* 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk */
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_SEL */
++	/* Divider clock select */
++	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
++
++	/* Divison factor value */
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_FACTOR */
++	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
++
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_EN  */
++	regmap_writel(0x1, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_EN_0)) + offset); /* Enable dividers */
++
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ CFG */
++	regmap_writel(0x101, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG))); /* Enables PSOC_PLL and FOUTPOSTDIVEN */
++
++	return PLDM_UART_REF_CLK;
++}
++
++uint32_t boot_rom_get_baudrate()
++{
++	return PLDM_UART_BAUDRATE;
++}

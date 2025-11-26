@@ -1,0 +1,184 @@
+From e45ee48b51f304f4ad00d26c6db44b0988a4aa1c Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Thu, 12 Mar 2020 18:35:17 +0200
+Subject: [PATCH] [SW-10397] goya2: seperate debug interface efuse
+
+Split the disable debug I/F fuse to two seperate settings.
+TwoWireInterface (smi/I2C) is now depending on bit 19 and
+bit 12 will effect JTAG only
+
+Change-Id: Ifad92813cd44803bc38b52be2f5cffa6a758585d
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index f789488..bb374f7 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -156,9 +156,11 @@
+ 	sp_sram_writel(arcboot_rom_global.config_fuse,
+ 		       SECURITY_EFUSE_SYS_CFG_OFFSET);
+ 
+-	/* TODO: check in pldm if we have access, if yes get waves */
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK)
+-		security_disable_debug_if();
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK)
++		security_disable_jtag_if();
++
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_TWI_IF_MASK)
++		security_disable_twi_if();
+ 
+ 	security_load_revoke_bits();
+ 	security_load_fw_version();
+@@ -349,7 +351,7 @@
+ 			security_report_status(0, STATUS_FW_AUTH_FAIL);
+ 			/* if debug I/F is enabled then fall back on I2C_S */
+ 			if ((arcboot_rom_global.config_fuse &
+-			     EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK) == 0)
++			     EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0)
+ 				secuirty_i2c_s_enable();
+ 		}
+ 	}
+diff --git a/common/efuse.h b/common/efuse.h
+index a1b8e06..be6631c 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -17,9 +17,10 @@
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ #define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 
++#define EFUSE_SYSCFG_DISABLE_TWI_IF_MASK	BIT(19)
+ #define EFUSE_SYSCFG_PCIE_GEN_LIMIT		BIT(18)
+ #define EFUSE_SYSCFG_SPI_CONTROLLER		BIT(17)
+-#define EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK	BIT(12)
++#define EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK	BIT(12)
+ #define EFUSE_SYSCFG_FW_VERSION_LOCATION	13
+ #define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK	0x3
+ #define EFUSE_SYSCFG_ENABLE_VALIDATION_MASK	BIT(10)
+diff --git a/common/pcie.c b/common/pcie.c
+index 11d8a2e..99e1f14 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -108,11 +108,15 @@
+ 	security_debug_if_shared();
+ 
+ 	if ((arcboot_rom_global.config_fuse &
+-	     EFUSE_SYSCFG_DISABLE_DEBUG_IF_MASK) == 0) {
+-		secuirty_debug_if_rr_hbw_config(spi_en);
++	     EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0) {
++		security_twi_if_rr_hbw_config(spi_en);
+ 		secuirty_i2c_s_enable();
+ 	}
+ 
++	if ((arcboot_rom_global.config_fuse &
++	     EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK) == 0)
++		security_jtag_if_rr_hbw_config(spi_en);
++
+ 	security_spi_dma_mmu_bypass();
+ 	security_mem_cpy_mmu_bypass();
+ 	security_pcie_rr_config(spi_en);
+diff --git a/common/security.c b/common/security.c
+index 3316559..37e2a41 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -82,12 +82,16 @@
+ 	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_53);
+ }
+ 
+-void security_disable_debug_if(void)
++void security_disable_twi_if(void)
++{
++	security_disable_i2c_s_mstr_if();
++	security_disable_smi_mstr_if();
++}
++
++void security_disable_jtag_if(void)
+ {
+ 	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
+ 	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
+-	security_disable_i2c_s_mstr_if();
+-	security_disable_smi_mstr_if();
+ 	security_disable_jtag_pad_sel();
+ 	security_disable_jtag_mstr_if();
+ }
+@@ -271,7 +275,7 @@
+ 		mmDCON0_HBW_RTR_IF1_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+ }
+ 
+-static void secuirty_i2c_s_rr_hbw_config(uint8_t spi_controller_en)
++static void security_i2c_s_rr_hbw_config(uint8_t spi_controller_en)
+ {
+ 	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+ 		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+@@ -312,7 +316,7 @@
+ 		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+ }
+ 
+-static void secuirty_smi_rr_hbw_config(uint8_t spi_controller_en)
++static void security_smi_rr_hbw_config(uint8_t spi_controller_en)
+ {
+ 	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+ 		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+@@ -353,7 +357,7 @@
+ 		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+ }
+ 
+-static void secuirty_jtag_rr_hbw_config(uint8_t spi_controller_en)
++static void security_jtag_rr_hbw_config(uint8_t spi_controller_en)
+ {
+ 	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+ 		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
+@@ -407,7 +411,7 @@
+ 	secuirty_dcon_if1_rr_hbw_config(spi_en);
+ }
+ 
+-static void secuirty_jtag_dap_disable(void)
++static void security_jtag_dap_disable(void)
+ {
+ 	/* close dap WA jira: H5-1803 */
+ 	regmap_writel(1, mmPSOC_CS_TRACE_SPECIAL_GLBL_SPARE_0);
+@@ -416,12 +420,16 @@
+ /* If DBG I/F were not disabled, program the RR to allow access
+  * only to SPI flash and PSOC_SECURITY
+  */
+-void secuirty_debug_if_rr_hbw_config(uint8_t spi_en)
++void security_twi_if_rr_hbw_config(uint8_t spi_en)
+ {
+-	secuirty_i2c_s_rr_hbw_config(spi_en);
+-	secuirty_smi_rr_hbw_config(spi_en);
+-	secuirty_jtag_rr_hbw_config(spi_en);
+-	secuirty_jtag_dap_disable();
++	security_i2c_s_rr_hbw_config(spi_en);
++	security_smi_rr_hbw_config(spi_en);
++}
++
++void security_jtag_if_rr_hbw_config(uint8_t spi_en)
++{
++	security_jtag_rr_hbw_config(spi_en);
++	security_jtag_dap_disable();
+ }
+ 
+ void secuirty_i2c_s_enable(void)
+diff --git a/common/security.h b/common/security.h
+index 66e0ba7..ec2f8ca 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -102,14 +102,16 @@
+ /* 4 bytes */
+ #define SECURITY_EFUSE_SYS_CFG_OFFSET		192
+ 
+-void security_disable_debug_if(void);
++void security_disable_jtag_if(void);
++void security_disable_twi_if(void);
+ void security_debug_if_secure(void);
+ void security_debug_if_shared(void);
+ uint32_t security_key_soc_location_offset(uint32_t hash_key_index);
+ void security_spi_dma_mmu_bypass(void);
+ void security_mem_cpy_mmu_bypass(void);
+ void security_pcie_rr_config(uint8_t spi_en);
+-void secuirty_debug_if_rr_hbw_config(uint8_t spi_en);
++void security_jtag_if_rr_hbw_config(uint8_t spi_en);
++void security_twi_if_rr_hbw_config(uint8_t spi_en);
+ void secuirty_i2c_s_enable(void);
+ uint8_t security_find_min_fw_version(uint32_t *fw_version);
+ int security_get_key_hash(uint32_t *hash, uint8_t customer);

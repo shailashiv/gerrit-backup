@@ -1,0 +1,65 @@
+From e487515c713ce16cd559b061cd2cb5271a2ce5bd Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 24 Nov 2020 12:09:04 +0200
+Subject: [PATCH] [SW-22029] recovery: add LBW 4B termination support
+
+As per hardware team recommendation, LBW 4B termination support
+should be added in arcboot as part of recovery flow based on the
+BIT(25) of syscfg fuse. This patch add changes to enable above
+mentioned mechanism as part of recovery flow. Once enabled, any LBW
+transactions which are larger than 4B will be terminated.
+
+LBW 4B termination is enabled by setting BIT(1) of
+PCIE_WRAP_SPECIAL_GLBL_SPARE_0 register. Also the fused syscfg efuse
+value should have LBW 4B termination enabled.
+
+Change-Id: Ia2ca8e768b2108115f7121e5236e7d48683896b0
+---
+
+diff --git a/common/efuse.h b/common/efuse.h
+index aa957c9..11f54a1 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -17,6 +17,7 @@
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ #define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 
++#define EFUSE_SYSCFG_ENABLE_4B_TERMINATION	BIT(25)
+ #define EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL	BIT(24)
+ #define EFUSE_SYSCFG_WA_SNPS_CASE_01038891	BIT(23)
+ #define EFUSE_SYSCFG_DISABLE_ROM_PCIE_RECOVERY	BIT(22)
+@@ -44,7 +45,8 @@
+ 				 EFUSE_SYSCFG_ENABLE_VALIDATION_MASK | \
+ 				 EFUSE_SYSCFG_FW_VERSION_LOCATION_SPI | \
+ 				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
+-				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI)
++				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
++				 EFUSE_SYSCFG_ENABLE_4B_TERMINATION)
+ 
+ int fuse_init(void);
+ int fuse_read(uint32_t word, uint32_t *val);
+diff --git a/common/pcie.c b/common/pcie.c
+index 14e38ac..332fcd4 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -194,6 +194,20 @@
+ 
+ 	arcboot_rom_status_update(PROGRESS_PCIE_IN_RECOVERY);
+ 
++	/*
++	 * check and enable 4B termination
++	 * set bit[1] of mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0 register
++	 * to enable LBW 4B termination.
++	 */
++	if (arcboot_rom_global.config_fuse &
++				EFUSE_SYSCFG_ENABLE_4B_TERMINATION) {
++		uint32_t spare0;
++
++		spare0 = regmap_readl(mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
++		spare0 |= BIT(1);
++		regmap_writel(spare0, mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
++	}
++
+ 	security_debug_if_secure();
+ 	security_debug_if_shared();
+ 

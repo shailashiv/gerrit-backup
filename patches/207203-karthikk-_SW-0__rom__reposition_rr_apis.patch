@@ -1,0 +1,682 @@
+From c0d6f17b6c72094091a64102549032760e832179 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 09 May 2022 17:03:20 +0300
+Subject: [PATCH] [SW-0] rom: reposition rr apis
+
+Range register configuration apis are repositioned to the initial
+portion of the source code. This is in preparation to re-use the
+apis as required.
+
+Change-Id: I604320a918494ff3538d27fdd782360a991f3f18
+---
+
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index ae01925..8dc1248 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -36,6 +36,7 @@
+ #define AXPROT_OVRD_VAL_POS			4
+ #define AXPROT_SEC_VAL		((PROT_OVR_SECURE << AXPROT_OVRD_VAL_POS) | AXPROT_OVRD_EN)
+ #define AXPROT_UNPRIV_VAL	((PROT_OVR_UNPRIV << AXPROT_OVRD_VAL_POS) | AXPROT_OVRD_EN)
++#define RR_DEFAULT_VAL				0
+ /*
+  * This key hash is calculated on the Public Key Properties -
+  *   -----------------------------------------------
+@@ -92,6 +93,324 @@
+ 		0x36, 0x19, 0xee, 0x61, 0x3a, 0x10, 0x69, 0xa9
+ 	}
+ };
++
++static uint32_t security_rr_calc_rr_dist(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist;
++
++	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
++		rr_dist = (rr_ctx->rr_idx - RR_LBW_MAX_SHORT_RR) * sizeof(uint32_t);
++	else
++		rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
++
++	return rr_dist;
++}
++
++static void security_rr_update_hit_reg(uint32_t reg, uint8_t hit_idx)
++{
++	uint32_t val = regmap_readl(reg);
++
++	val |= BIT(hit_idx);
++	regmap_writel(val, reg);
++
++	val = regmap_readl(reg + RR_HIT_WR_TO_RD_DIST);
++	val |= BIT(hit_idx);
++	regmap_writel(val, reg + RR_HIT_WR_TO_RD_DIST);
++}
++
++static void security_rr_pcie_lbw_config_full(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++			rr_ctx->rr_idx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++			rr_ctx->rr_idx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
++	security_rr_update_hit_reg(mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_HIT_AW,
++				rr_ctx->rr_idx);
++}
++
++static void security_rr_pcie_lbw_config_short(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++			rr_ctx->rr_idx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++			rr_ctx->rr_idx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_HIT_AW,
++				rr_ctx->rr_idx);
++}
++
++static void security_rr_pcie_lbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
++		security_rr_pcie_lbw_config_full(rr_ctx);
++	else
++		security_rr_pcie_lbw_config_short(rr_ctx);
++}
++
++static void security_rr_pcie_hbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_min_hi,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max_hi,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_HIT_AW,
++				rr_ctx->rr_idx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_min_hi,
++			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max_hi,
++			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_HIT_AW,
++					rr_ctx->rr_idx);
++}
++
++static void security_rr_jtag_lbw_config_short(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_JT_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++						rr_ctx->rr_idx);
++}
++
++static void security_rr_jtag_lbw_config_full(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_JT_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_jtag_lbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
++		security_rr_jtag_lbw_config_full(rr_ctx);
++	else
++		security_rr_jtag_lbw_config_short(rr_ctx);
++}
++
++static void security_rr_i2c_lbw_config_short(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_i2c_lbw_config_full(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_i2c_lbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
++		security_rr_i2c_lbw_config_full(rr_ctx);
++	else
++		security_rr_i2c_lbw_config_short(rr_ctx);
++}
++
++static void security_rr_smi_lbw_config_short(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_SMI_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_smi_lbw_config_full(struct rom_rr_ctx *rr_ctx)
++{
++	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_SMI_MSTR_IF_RR_LBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_smi_lbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
++		security_rr_smi_lbw_config_full(rr_ctx);
++	else
++		security_rr_smi_lbw_config_short(rr_ctx);
++}
++
++static void security_rr_twi_lbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	security_rr_i2c_lbw_config(rr_ctx);
++	security_rr_smi_lbw_config(rr_ctx);
++}
++
++static void security_rr_jtag_hbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_min_hi,
++			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max_hi,
++			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_JT_MSTR_IF_RR_HBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_i2c_hbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_min_hi,
++			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max_hi,
++			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++}
++
++static void security_rr_smi_hbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
++
++	regmap_writel(rr_ctx->data_min,
++			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_min_hi,
++			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max,
++			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
++	regmap_writel(rr_ctx->data_max_hi,
++			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
++	regmap_writel(rr_ctx->en_val,
++			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
++
++	security_rr_update_hit_reg(mmD0_SMI_MSTR_IF_RR_HBW_PRIV_HIT_AW,
++							rr_ctx->rr_idx);
++
++}
++
++static void security_rr_twi_hbw_config(struct rom_rr_ctx *rr_ctx)
++{
++	security_rr_i2c_hbw_config(rr_ctx);
++	security_rr_smi_hbw_config(rr_ctx);
++}
+ 
+ int security_get_key_hash(uint32_t *hash, uint8_t key_index)
+ {
+@@ -486,324 +805,6 @@
+ 	return !!(config_fuse & EFUSE_SYSCFG_TPM_CODE_LOCATION_MASK);
+ }
+ 
+-static uint32_t security_rr_calc_rr_dist(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist;
+-
+-	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+-		rr_dist = (rr_ctx->rr_idx - RR_LBW_MAX_SHORT_RR) * sizeof(uint32_t);
+-	else
+-		rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
+-
+-	return rr_dist;
+-}
+-
+-static void security_rr_update_hit_reg(uint32_t reg, uint8_t hit_idx)
+-{
+-	uint32_t val = regmap_readl(reg);
+-
+-	val |= BIT(hit_idx);
+-	regmap_writel(val, reg);
+-
+-	val = regmap_readl(reg + RR_HIT_WR_TO_RD_DIST);
+-	val |= BIT(hit_idx);
+-	regmap_writel(val, reg + RR_HIT_WR_TO_RD_DIST);
+-}
+-
+-static void security_rr_pcie_lbw_config_full(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-			rr_ctx->rr_idx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-			rr_ctx->rr_idx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
+-	security_rr_update_hit_reg(mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_HIT_AW,
+-				rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_pcie_lbw_config_short(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-			rr_ctx->rr_idx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-			rr_ctx->rr_idx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_NRTR0_3CH_CTRL0_RR_LBW_PRIV_HIT_AW,
+-				rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_pcie_lbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+-		security_rr_pcie_lbw_config_full(rr_ctx);
+-	else
+-		security_rr_pcie_lbw_config_short(rr_ctx);
+-}
+-
+-static void security_rr_pcie_hbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_min_hi,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max_hi,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_PRIV_HIT_AW,
+-				rr_ctx->rr_idx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_min_hi,
+-			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max_hi,
+-			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_NRTR0_3CH_CTRL0_RR_HBW_PRIV_HIT_AW,
+-					rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_jtag_lbw_config_short(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_JT_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-						rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_jtag_lbw_config_full(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_JT_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_JT_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_jtag_lbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+-		security_rr_jtag_lbw_config_full(rr_ctx);
+-	else
+-		security_rr_jtag_lbw_config_short(rr_ctx);
+-}
+-
+-static void security_rr_i2c_lbw_config_short(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_i2c_lbw_config_full(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_I2C_S_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_i2c_lbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+-		security_rr_i2c_lbw_config_full(rr_ctx);
+-	else
+-		security_rr_i2c_lbw_config_short(rr_ctx);
+-}
+-
+-static void security_rr_smi_lbw_config_short(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_SMI_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_smi_lbw_config_full(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MIN_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_MAX_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_SMI_MSTR_IF_RR_LBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_SMI_MSTR_IF_RR_LBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_smi_lbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+-		security_rr_smi_lbw_config_full(rr_ctx);
+-	else
+-		security_rr_smi_lbw_config_short(rr_ctx);
+-}
+-
+-static void security_rr_twi_lbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	security_rr_i2c_lbw_config(rr_ctx);
+-	security_rr_smi_lbw_config(rr_ctx);
+-}
+-
+-static void security_rr_jtag_hbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_min_hi,
+-			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max_hi,
+-			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_JT_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_JT_MSTR_IF_RR_HBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_i2c_hbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_min_hi,
+-			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max_hi,
+-			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_I2C_S_MSTR_IF_RR_HBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-}
+-
+-static void security_rr_smi_hbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
+-
+-	regmap_writel(rr_ctx->data_min,
+-			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_min_hi,
+-			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max,
+-			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0 + rr_dist);
+-	regmap_writel(rr_ctx->data_max_hi,
+-			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0 + rr_dist);
+-	regmap_writel(rr_ctx->en_val,
+-			mmD0_SMI_MSTR_IF_RR_HBW_PRIV_RANGE_EN_0 + rr_dist);
+-
+-	security_rr_update_hit_reg(mmD0_SMI_MSTR_IF_RR_HBW_PRIV_HIT_AW,
+-							rr_ctx->rr_idx);
+-
+-}
+-
+-static void security_rr_twi_hbw_config(struct rom_rr_ctx *rr_ctx)
+-{
+-	security_rr_i2c_hbw_config(rr_ctx);
+-	security_rr_smi_hbw_config(rr_ctx);
+-}
+-
+ #define DEBUG_IF_ENABLE_VAL		0
+ static void security_rr_config_lbw_if_common(struct rom_rr_ctx *rr_ctx)
+ {
+@@ -818,7 +819,6 @@
+ 		security_rr_twi_lbw_config(rr_ctx);
+ }
+ 
+-#define RR_DEFAULT_VAL		0
+ static void security_rr_recovery_lbw_config(void)
+ {
+ 	/*

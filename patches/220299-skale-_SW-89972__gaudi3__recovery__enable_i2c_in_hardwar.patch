@@ -1,0 +1,77 @@
+From 0c65cabb36f1e226d400233bcfcb04df95b20f75 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 13 Jun 2022 14:47:31 +0300
+Subject: [PATCH] [SW-89972] gaudi3: recovery: enable i2c in hardware mode
+
+As part of rom recovery, ROM will enable I2C slave in HW mode to
+facilitate OOB flash programming. This patch add support to enable
+I2C slave in HW mode provided security is disabled and TWI interface
+is enabled.
+
+In rom recovery, inband/OOB flash programming will be only allowed if
+security is disabled. On production system the POR recovery is EROM and it
+is not expected to execute ROM recovery. In any case ROM recovery is executed
+we have option to switch ON RMA mode and allow usage of fake fuse by which
+required fuse settings can be done.
+
+Change-Id: Ie5e3c420600414f6489abfd8ccddd103b5f66cfd
+---
+
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index bfe7b6a..fc5cecb 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -161,16 +161,21 @@
+ 
+ static void execute_rom_recovery(void)
+ {
++	int sec_en = security_efuse_security_en();
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_ROM_RECOVERY);
+ 
+ 	if (!arcboot_rom_global.die_id)
+ 		security_rr_recovery_config();
+ 
+-	if (!(arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SECURITY_ENABLE_MASK))
++	if (!sec_en)
+ 		rom_pcie_recovery();
+ 
+ 	rom_d2d_link_init();
+ 
++	if ((!sec_en) && ((arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0))
++		security_i2c_s_enable();
++
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_RECOVERY_END);
+ }
+ 
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index ca63704..c306c04 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -682,6 +682,14 @@
+ 	return !!(config_fuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+ 
++int security_efuse_security_en(void)
++{
++	/* check efuse for security enable */
++	uint32_t config_fuse = arcboot_rom_global.sec_data.efuse_sys_cfg;
++
++	return !!(config_fuse & EFUSE_SYSCFG_SECURITY_ENABLE_MASK);
++}
++
+ int security_check_valid_fw_version(uint32_t fw_version)
+ {
+ 	if (fw_version >= arcboot_rom_global.sec_data.sec_ver)
+diff --git a/common/security.h b/common/security.h
+index 34e7c27..245a4d8 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -139,6 +139,7 @@
+ void security_handle_twi(void);
+ int security_check_key_revoke_status(uint32_t key_index);
+ int security_efuse_image_validation_en(void);
++int security_efuse_security_en(void);
+ int security_efuse_tpm_en(void);
+ int security_efuse_tpm_loc(void);
+ 

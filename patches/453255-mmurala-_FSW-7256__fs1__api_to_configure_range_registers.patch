@@ -1,0 +1,97 @@
+From d9b6e92c9f267e32a0106b702d23e520611c9e07 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Tue, 20 Aug 2024 11:01:37 +0300
+Subject: [PATCH] [FSW-7256] fs1: api to configure range registers
+
+With this patch, added support to enable range
+register to particular ip by sending rr context
+type of ip and access type. All ip block base
+addresses are stored in array and retrieved based
+on request. Context data provides the min and max
+address range of window which is going to get
+access.
+
+Change-Id: I2d81195920754c606b530fbfdedce71e4606a4c7
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 5af50b2..be1ba28 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -16,6 +16,10 @@
+ #include <boot_desc.h>
+ #include <psoc_security_masks.h>
+ #include <psoc_pad_conf_regs.h>
++#include <range_reg_lbw_regs.h>
++#include <range_reg_lbw_masks.h>
++#include <axuser_lbw_regs.h>
++#include <axuser_lbw_masks.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -250,3 +254,52 @@
+ 
+ 	regmap_writel(val, reg_addr);
+ }
++
++void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
++	const struct security_rr_ctx *rr_ip_ctx)
++{
++	uint32_t range_mask, rr_dist, initr_sai_val, initr_rd_sai, initr_wr_sai;
++	uint32_t wr_sai_val, rd_sai_val, rr_en_val;
++
++	if ((initr_data.base_addr == 0) || (initr_data.sai_base == 0)) {
++		return;
++	}
++
++	rr_dist = rr_ip_ctx->rr_idx * sizeof(uint32_t);
++
++	initr_sai_val = regmap_readl(initr_data.sai_base + mmAXUSER_LBW_LB_SAI);
++	initr_rd_sai = (initr_sai_val & AXUSER_LBW_LB_SAI_RD_M);
++	initr_wr_sai = ((initr_sai_val & AXUSER_LBW_LB_SAI_WR_M) >> AXUSER_LBW_LB_SAI_WR_S);
++
++	wr_sai_val = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_WR_RANGE_SEC_0 + rr_dist);
++	rd_sai_val = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_RD_RANGE_SEC_0 + rr_dist);
++
++	/*
++	 * TODO
++	 * 1. When efuse BLOCK_RR is 1/0, all range_en=0x11, rd/wr_range_sec=0x7fffffff?
++	 * 2. Before we use RR index which is already used for open_all, we need to clear?
++	 */
++	rr_en_val = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_RANGE_EN_0 + rr_dist);
++
++	if ((rr_ip_ctx->acc_type == SEC_ACCESS_WR_ONLY) || (rr_ip_ctx->acc_type == SEC_ACCESS_RD_WR)) {
++		rr_en_val |= RANGE_REG_LBW_RANGE_EN_0_WR_EN_M;
++		wr_sai_val |= (1 << initr_wr_sai);
++	}
++	if ((rr_ip_ctx->acc_type == SEC_ACCESS_RD_ONLY) || (rr_ip_ctx->acc_type == SEC_ACCESS_RD_WR)) {
++		rr_en_val |= RANGE_REG_LBW_RANGE_EN_0_RD_EN_M;
++		rd_sai_val |= (1 << initr_rd_sai);
++	}
++
++	range_mask = regmap_readl(initr_data.base_addr + mmRANGE_REG_LBW_RANGE_MASK_0 + rr_dist);
++	regmap_writel(rr_ip_ctx->data_min & range_mask,
++		initr_data.base_addr + mmRANGE_REG_LBW_RANGE_MIN_ADDR_0 + rr_dist);
++	regmap_writel(rr_ip_ctx->data_max & range_mask,
++		initr_data.base_addr + mmRANGE_REG_LBW_RANGE_MAX_ADDR_0 + rr_dist);
++
++	regmap_writel(wr_sai_val & RANGE_REG_LBW_WR_RANGE_SEC_0_VAL_M,
++		initr_data.base_addr + mmRANGE_REG_LBW_WR_RANGE_SEC_0 + rr_dist);
++	regmap_writel(rd_sai_val & RANGE_REG_LBW_RD_RANGE_SEC_0_VAL_M,
++		initr_data.base_addr + mmRANGE_REG_LBW_RD_RANGE_SEC_0 + rr_dist);
++
++	regmap_writel(rr_en_val, initr_data.base_addr + mmRANGE_REG_LBW_RANGE_EN_0 + rr_dist);
++}
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index c83fa74..4b7d680 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -105,6 +105,8 @@
+ void security_report_fw_version(enum hl_fw_manifest_type manifest_idx);
+ void boot_rom_report_image_status(enum hl_fw_manifest_type man_type,
+ 		enum security_img_sts error);
++void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
++	const struct security_rr_ctx *rr_ip_ctx);
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 

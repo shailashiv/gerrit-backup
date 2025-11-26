@@ -1,0 +1,135 @@
+From 4cd17909b35601802d12f748b6071a11679efa32 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 10 Jul 2024 14:52:19 +0300
+Subject: [PATCH] [FSW-2704] fs1: boot validated ppboot
+
+When validation pass flag is set then bootrom
+will check if force recovery is not set and then
+boot ppboot.
+
+Change-Id: I215e81e9a84fcab80c1e228159153f9eaa4dfbea
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index b7cc6fe..7395f6b 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -52,6 +52,13 @@
+ 
+ 	boot_rom_check_recovery();
+ 
++	if (!!boot_rom_global.validation_pass) {
++		if (!!boot_rom_global.force_recovery)
++			execute_recovery();
++		else
++			boot_rom_boot_flow_boot_ppboot(boot_rom_global.valid_manifest_idx);
++	}
++
+ 	boot_rom_init_boot_info();
+ 
+ 	return 0;
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 58801f9..2e7be7d 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -350,3 +350,19 @@
+ 
+ 	return false;
+ }
++
++uint32_t boot_rom_fw_mem_arc_addr(uint64_t addr)
++{
++	if (addr >= MNG_ARC_ICCM_FULL_BASE && addr <= MNG_ARC_ICCM_FULL_BASE + MNG_ARC_MEM_SIZE)
++		return CONV_64B_TO_ARC_FW_MEM(addr) - (HL_FW_MEM_BASE + MNG_ARC_ICCM_OFFSET);
++	else
++		return CONV_64B_TO_ARC_FW_MEM(addr);
++}
++
++uint32_t boot_rom_get_arc_addr(uint64_t addr)
++{
++	if (addr >= FW_MEM_BASE_FULL && addr <= FW_MEM_BASE_FULL + HL_FW_MEM_SIZE)
++		return boot_rom_fw_mem_arc_addr(addr);
++
++	return 0;
++}
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index f79ba28..0926c58 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -110,6 +110,8 @@
+ #define MISC_ARC_MEM_SIZE		(MISC_ARC_ICCM_SIZE + MISC_ARC_DCCM_SIZE)
+ #define CXL_ARC_MEM_SIZE		(CXL_ARC_ICCM_SIZE + CXL_ARC_DCCM_SIZE)
+ 
++#define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0x3FFFFF) + HL_FW_MEM_BASE)
++
+ #define SPI_MANIFEST_IMG_0_FLASH_OFFSET		(0x0)
+ /* manifest 0 boot pointers are DMA trans to MNG ARC ICCM at offset 0 */
+ #define SPI_MANIFEST_IMG_0_ICCM_OFFSET		(0)
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 91b70df..22d00e1 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -9,6 +9,8 @@
+ #include <boot_desc.h>
+ #include <progress_bits.h>
+ #include <dma.h>
++#include <common.h>
++#include <recovery.h>
+ 
+ static enum hl_fw_manifest_type primary_manifest_idx = HL_FW_SPI_MANIFEST_0;
+ 
+@@ -45,7 +47,9 @@
+ 	enum boot_rom_progress img_sts_base = PROGRESS_BRINGUP_PCI_PRI;
+ 	enum hl_fw_manifest_type curr_manifest_idx;
+ 
+-	if (!boot_rom_in_master_die())
++	/* If validation pass bit is set or its slave die then prefetch is not required */
++	if (!boot_rom_in_master_die() ||
++	    boot_rom_global.validation_pass)
+ 		return BOOT_ROM_SUCCESS;
+ 
+ 	/*
+@@ -70,3 +74,21 @@
+ 
+ 	return BOOT_ROM_SUCCESS;
+ }
++
++void boot_rom_boot_flow_boot_ppboot(enum hl_fw_manifest_type man_idx)
++{
++	/* TPM extend should be already done in this flow */
++	void (*ppboot)();
++	struct boot_desc desc = {0};
++
++	if (boot_desc_get_img_desc(man_idx, HL_FW_IMG_PPBOOT, &desc) == BOOT_ROM_SUCCESS) {
++		/* No need to verify as image validation is done in previous boot */
++		if (desc.start_addr) {
++			/* TODO: Start CPLD watchdog timer */
++			ppboot = (void *)((uint32_t)boot_rom_get_arc_addr(desc.start_addr));
++			ppboot();
++		}
++	}
++
++	boot_rom_halt();
++}
+diff --git a/common/boot_flow.h b/common/boot_flow.h
+index fc2e128..ea977a5 100644
+--- a/common/boot_flow.h
++++ b/common/boot_flow.h
+@@ -7,5 +7,6 @@
+ #define _BOOT_FLOW_H_
+ 
+ uint32_t boot_rom_boot_flow_prefetch_img(enum hl_fw_img_type img_type);
++void boot_rom_boot_flow_boot_ppboot(enum hl_fw_manifest_type man_idx);
+ 
+ #endif /* _BOOT_FLOW_H_ */
+diff --git a/common/common.h b/common/common.h
+index 71173a2..5302153 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -30,5 +30,6 @@
+ enum boot_rom_tpm_spi_freq_config boot_rom_get_tpm_spi_freq_config(void);
+ void boot_rom_init_sku(void);
+ bool boot_rom_in_multi_die_mode(void);
++uint32_t boot_rom_get_arc_addr(uint64_t addr);
+ 
+ #endif /* _COMMON_H_ */

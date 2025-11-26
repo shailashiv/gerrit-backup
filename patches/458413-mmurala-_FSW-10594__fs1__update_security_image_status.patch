@@ -1,0 +1,123 @@
+From c29bdaacb556b7e8340576bf664168dfed6a9e52 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 24 Oct 2024 15:30:49 +0300
+Subject: [PATCH] [FSW-10594] fs1: update security image status
+
+With this patch, added support to write image
+status psoc register to report lower firmware
+version, authentication failure, and crc error
+during firmware image bringup.
+
+Change-Id: Ia47e5f1e70ebe3e4935e6c0bfbc12bf52d4b0952
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 245687b..7fd0c8c 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -14,6 +14,7 @@
+ #include <dev_security.h>
+ #include <security.h>
+ #include <boot_desc.h>
++#include <psoc_security_masks.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -180,3 +181,31 @@
+ 
+ 	boot_rom_global.config_fuse &= ~EFUSE_SYSCFG_REVOKE_KEY_4;
+ }
++
++void boot_rom_report_image_status(enum hl_fw_manifest_type man_type, enum security_img_sts error)
++{
++	uint32_t val;
++	uint32_t reg_addr;
++
++	if (man_type == HL_FW_SPI_MANIFEST_1)
++		reg_addr = IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_SEC_IMG_STATUS);
++	else
++		reg_addr = IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_PRI_IMG_STATUS);
++
++	val = regmap_readl(reg_addr);
++	switch(error) {
++		case FW_VER_LOWER:
++			val |= PSOC_SECURITY_PRI_IMG_STATUS_FW_VER_LOWER_M;
++			break;
++		case AUTHENTICATE_FAIL:
++			val |= PSOC_SECURITY_SEC_IMG_STATUS_AUTHENTICATE_FAIL_M;
++			break;
++		case CRC_FAIL:
++			val |= PSOC_SECURITY_SEC_IMG_STATUS_CRC_FAIL_M;
++			break;
++		default:
++			return;
++	}
++
++	regmap_writel(val, reg_addr);
++}
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index f0a2e3e..611fe7d 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -25,12 +25,20 @@
+ /* 784 + 8 = 792 */
+ #define TOTAL_PUB_KEY_PROPS_SZ		(PUB_KEY_SZ + KEY_PROP_HDR_SZ)
+ 
++enum security_img_sts {
++    FW_VER_LOWER,
++    AUTHENTICATE_FAIL,
++    CRC_FAIL,
++};
++
+ void security_load_revoke_bits(void);
+ int security_efuse_image_validation_en(void);
+ void boot_rom_eom_overrides(void);
+ void security_load_fw_version(void);
+ void security_load_rom_key_hash(void);
+ void security_report_fw_version(enum hl_fw_manifest_type manifest_idx);
++void boot_rom_report_image_status(enum hl_fw_manifest_type man_type,
++		enum security_img_sts error);
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index d90b377..7762995 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -50,8 +50,10 @@
+ 
+ 	err = boot_rom_spi_dma(desc->img_size, desc->spi_offset[manifest_idx], desc->loadaddr,
+ 			       false, false, 0);
+-	if (boot_rom_process_dma_err(err, img_sts_base))
++	if (boot_rom_process_dma_err(err, img_sts_base)) {
++		boot_rom_report_image_status(manifest_idx, CRC_FAIL);
+ 		return BOOT_ROM_FAIL;
++	}
+ 
+ 	return BOOT_ROM_SUCCESS;
+ }
+@@ -238,6 +240,7 @@
+ 		return true;
+ 	}
+ 
++	boot_rom_report_image_status(man_idx, AUTHENTICATE_FAIL);
+ 	boot_rom_status_update_bringup(status_base, PROGRESS_BRINGUP_KEY_AUTH_FAIL);
+ 
+ 	return false;
+diff --git a/common/common.c b/common/common.c
+index 94efcb4..b525a8f 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -202,9 +202,10 @@
+ 	if (ret == SECUREBOOT_VERIFY_SUCCESS) {
+ 		boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_SUCCESS);
+ 	} else {
+-		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
++		if (ret == SECUREBOOT_VERIFY_VER_FAILED) {
++			boot_rom_report_image_status(manifest_idx, FW_VER_LOWER);
+ 			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_VERSION_FAIL);
+-		else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
++		} else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
+ 			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_KEY_REVOKED);
+ 		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
+ 			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_KEY_HASH_FAIL);

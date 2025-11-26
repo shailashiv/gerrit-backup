@@ -1,0 +1,139 @@
+From afe2e076a01b09f633be738887d7a4269d994005 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 24 Jan 2025 16:51:25 +0200
+Subject: [PATCH] [FSW-10594] fs1: update psoc security status reg
+
+With this patch, added support to report image
+security status of fw upgrade, min fw version,
+key revoke status with its index, spi image
+modifies and img val success.
+
+Change-Id: I2b791529caa2eddb127e4a031a960551204af802
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 1e077ad..193ad28 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -333,6 +333,44 @@
+ 	regmap_writel(val, reg_addr);
+ }
+ 
++void boot_rom_report_security_status(enum security_status status_bit, uint8_t index)
++{
++	uint32_t reg = regmap_readl(IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_STATUS));
++
++	switch(status_bit)
++	{
++		case STATUS_IMG_VALIDATED:
++			reg |= PSOC_SECURITY_STATUS_IMG_VALIDATED_M;
++			break;
++		case STATUS_FW_UPGRADE:
++			reg |= PSOC_SECURITY_STATUS_FW_UPGRADE_M;
++			break;
++		case STATUS_KEY_REVOKED:
++			reg |= PSOC_SECURITY_STATUS_KEY_REVOKED_M;
++			reg |= (index << PSOC_SECURITY_STATUS_KEY_REVOKED_IND_S);
++			break;
++		case STATUS_MIN_FW_MODIFIED:
++			reg |= PSOC_SECURITY_STATUS_MIN_FW_MODIFIED_M;
++			break;
++		case STATUS_FW_VER_INC:
++			reg |= PSOC_SECURITY_STATUS_FW_VER_INC_M;
++			break;
++		case STATUS_SPI_IMG_MODIFIES:
++			if (index == 0)
++				reg &= ~(PSOC_SECURITY_STATUS_SPI_IMG_MODIFIES_M);
++			else if (index == 1)
++				reg |= PSOC_SECURITY_STATUS_SPI_IMG_MODIFIES_M;
++			break;
++		case STATUS_FW_AUTH_FAIL:
++			reg |= PSOC_SECURITY_STATUS_FW_AUTHENTICAION_FAIL_M;
++			break;
++		default:
++			reg = 0;
++	}
++
++	regmap_writel(reg, IO0_H0_PSOC_BOOT_SECURITY(mmPSOC_SECURITY_STATUS));
++}
++
+ void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
+ 	const struct security_rr_ctx *rr_ip_ctx)
+ {
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 86fe3c8..3cc6d93 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -31,6 +31,17 @@
+     CRC_FAIL,
+ };
+ 
++enum security_status {
++	STATUS_IMG_VALIDATED,
++	STATUS_FW_UPGRADE,
++	STATUS_KEY_REVOKED,
++	STATUS_KEY_REVOKED_IND,
++	STATUS_MIN_FW_MODIFIED,
++	STATUS_FW_VER_INC,
++	STATUS_SPI_IMG_MODIFIES,
++	STATUS_FW_AUTH_FAIL,
++};
++
+ /* RECOVERY QSPI */
+ #define BOOT_ROM_REC_RR_QSPI_MIN		(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_QSPI_BASE)
+ #define BOOT_ROM_REC_RR_QSPI_MAX		(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_QSPI_BASE) + \
+@@ -187,6 +198,7 @@
+ void security_report_fw_version(enum hl_fw_manifest_type manifest_idx);
+ void boot_rom_report_image_status(enum hl_fw_manifest_type man_type,
+ 		enum security_img_sts error);
++void boot_rom_report_security_status(enum security_status status_bit, uint8_t index);
+ void security_rr_lbw_config_en(struct security_initiator_ctx initr_data,
+ 	const struct security_rr_ctx *rr_ip_ctx);
+ void security_rr_recovery_config(bool enable);
+diff --git a/common/common.c b/common/common.c
+index b525a8f..798259f 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -201,6 +201,7 @@
+ 
+ 	if (ret == SECUREBOOT_VERIFY_SUCCESS) {
+ 		boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_SUCCESS);
++		boot_rom_report_security_status(STATUS_IMG_VALIDATED, 0);
+ 	} else {
+ 		if (ret == SECUREBOOT_VERIFY_VER_FAILED) {
+ 			boot_rom_report_image_status(manifest_idx, FW_VER_LOWER);
+@@ -209,8 +210,10 @@
+ 			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_KEY_REVOKED);
+ 		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
+ 			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_KEY_HASH_FAIL);
+-		else
++		else {
+ 			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_AUTH_FAIL);
++			boot_rom_report_security_status(STATUS_FW_AUTH_FAIL, 0);
++		}
+ 
+ 		return BOOT_ROM_FAIL;
+ 	}
+diff --git a/common/security.c b/common/security.c
+index 656e7bb..3c6087d 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -31,7 +31,7 @@
+ 	uint8_t key_revoke;
+ 
+ 	if (key_index >= NUM_KEYS_IN_ROM)
+-		return -1;
++		goto report_key_fail;
+ 
+ 	key_revoke = boot_rom_global.sec_data.key_revoke;
+ 
+@@ -40,7 +40,9 @@
+ 		!!boot_rom_global.sec_data.rma_enabled)
+ 		return 1;
+ 
++report_key_fail:
+ 	/* no valid key found */
++	boot_rom_report_security_status(STATUS_KEY_REVOKED, key_index);
+ 	return -1;
+ }
+ 

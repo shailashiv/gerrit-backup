@@ -1,0 +1,163 @@
+From f9fcc0ddde129b942be77b6092d5475e829e3984 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 07 Jun 2022 09:45:44 +0300
+Subject: [PATCH] [SW-89972] boot_desc: add get api using index
+
+In order to keep flexible approach on number of images to be loaded
+as part of recovery images on SPI, this patch adds new boot descriptor
+get api which will make use of index of array to retrieve image
+descriptor.
+
+Change-Id: Ia7481a891135137cc5f4c67a727719cf90f150ec
+---
+
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index d33f61f..1d9c117 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -162,10 +162,45 @@
+ 	return p_boot_ptr->count;
+ }
+ 
++static uint32_t boot_desc_validate_ptrs()
++{
++	/* Image descriptor pointer validity check */
++	if (!p_img_ptr_ctx)
++		return 1;
++
++	if (p_img_ptr_ctx->boot_desc_flag != 1)
++		return 1;
++
++	return 0;
++}
++
++static uint32_t boot_desc_copy_desc(struct boot_desc *desc,
++				    struct hl_fw_img_desc *local_img_desc,
++				    enum fw_post_reset_cmd upd_status)
++{
++	uint32_t idx;
++
++	idx = local_img_desc->idx;
++	if (upd_status == FLOPS_UPD_PENDING)
++		idx = (idx + 1) % 2;
++
++	desc->spi_offset = local_img_desc->offset[idx];
++	desc->img_size = local_img_desc->size[idx];
++	desc->loadaddr = ((uint64_t) local_img_desc->load_high[idx] << 32) |
++		local_img_desc->load_low[idx];
++	desc->desc_ver = local_img_desc->desc_ver;
++	desc->start_addr = ((uint64_t) local_img_desc->start_high[idx] << 32) |
++		local_img_desc->start_low[idx];
++
++	memcpy(desc->chksum, local_img_desc->chksum2[idx], ARRAY_SIZE(desc->chksum));
++
++	return idx;
++}
++
+ uint32_t boot_desc_get_img_desc(enum hl_fw_boot_ptr_imgs img, int type,
+ 				struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
+ {
+-	uint32_t i, idx;
++	uint32_t i;
+ 	struct hl_fw_img_desc *p_loc_img_desc = NULL;
+ 	uint32_t boot_desc_offset = 0;
+ 
+@@ -174,11 +209,7 @@
+ 
+ 	boot_desc_update_ptrs(img);
+ 
+-	/* Image descriptor pointer validity check */
+-	if (!p_img_ptr_ctx)
+-		return HL_FW_IMG_NOT_FOUND;
+-
+-	if (p_img_ptr_ctx->boot_desc_flag != 1)
++	if (boot_desc_validate_ptrs())
+ 		return HL_FW_IMG_NOT_FOUND;
+ 
+ 	for (i = 0; i < p_img_ptr_ctx->desc_info.count ; i++) {
+@@ -195,28 +226,41 @@
+ 		if (p_loc_img_desc->magic.type != type)
+ 			continue;
+ 
+-		idx = p_loc_img_desc->idx;
+-		if (upd_status == FLOPS_UPD_PENDING)
+-			idx = (idx + 1) % 2;
+-
+-		desc->spi_offset = p_loc_img_desc->offset[idx];
+-		desc->img_size = p_loc_img_desc->size[idx];
+-		desc->loadaddr = ((uint64_t)
+-			p_loc_img_desc->load_high[idx] << 32) |
+-			p_loc_img_desc->load_low[idx];
+-		desc->desc_ver = p_loc_img_desc->desc_ver;
+-		desc->start_addr = ((uint64_t)
+-			p_loc_img_desc->start_high[idx] << 32) |
+-			p_loc_img_desc->start_low[idx];
+-
+-		memcpy(desc->chksum, p_loc_img_desc->chksum2[idx],
+-			   ARRAY_SIZE(desc->chksum));
+-
+-		return idx;
++		return boot_desc_copy_desc(desc, p_loc_img_desc, upd_status);
+ 	}
++
+ 	return HL_FW_IMG_NOT_FOUND;
+ }
+ 
++uint32_t boot_desc_get_img_desc_by_index(enum hl_fw_boot_ptr_imgs img, uint32_t index,
++				struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
++{
++	struct hl_fw_img_desc *p_loc_img_desc = NULL;
++	uint32_t boot_desc_offset = 0;
++
++	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
++		return HL_FW_IMG_NOT_FOUND;
++
++	boot_desc_update_ptrs(img);
++
++	if (boot_desc_validate_ptrs())
++		return HL_FW_IMG_NOT_FOUND;
++
++	if (index >= p_img_ptr_ctx->desc_info.count)
++		return HL_FW_IMG_NOT_FOUND;
++
++	if (img == HL_FW_BOOT_PTR_SPI)
++		boot_desc_offset = BOOT_INFO_IMG_DESC_GET_OFFSET;
++	else
++		boot_desc_offset = erom_img_descs_offset;
++
++	p_loc_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
++					+ boot_desc_offset
++					+ p_img_ptr_ctx->desc_info.desc_size * index);
++
++	return boot_desc_copy_desc(desc, p_loc_img_desc, upd_status);
++}
++
+ uint32_t boot_desc_param_get(struct hl_fw_boot_ptrs *boot_ptr)
+ {
+ 	if (!p_boot_ptr)
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 10d0f91..43f5fcb 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -77,6 +77,21 @@
+ uint32_t boot_desc_get_img_desc(enum hl_fw_boot_ptr_imgs img, int type,
+ 		struct boot_desc *desc, enum fw_post_reset_cmd upd_status);
+ 
++/*
++ * boot_desc_get_img_desc_by_index() - get the struct boot_desc of the requested index
++ *
++ * @img	- type of boot descriptor (SPI/EROM).
++ * @index	- the image index to look for
++ * @desc	- pointer to the struct boot_desc for placing the image data
++ * @upd_status - fw update status byte.
++ *
++ * Returns:
++ * On success: the index of the image to load
++ * On failure: (u32)-1 (no image by the requested index)
++ */
++uint32_t boot_desc_get_img_desc_by_index(enum hl_fw_boot_ptr_imgs img, uint32_t index,
++			struct boot_desc *desc, enum fw_post_reset_cmd upd_status);
++
+ uint32_t boot_desc_param_get(struct hl_fw_boot_ptrs *boot_ptr);
+ 
+ #endif /* _BOOT_DESC_H_ */

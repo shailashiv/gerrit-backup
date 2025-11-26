@@ -1,0 +1,200 @@
+From cc224afc75ebd0249ec4756c983d70284b327df4 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Fri, 08 Apr 2022 08:29:23 +0300
+Subject: [PATCH] [SW-79695] gaudi3: update key locations
+
+As per the updated efuse bits definition for gaudi3, we can
+remove alternate locations (efuse, spi) for keys hashes.
+
+Security key hashes will only be stored in ROM.
+
+Change-Id: I69e96eee38133020c0746ab1e1162a778979d7ed
+---
+
+diff --git a/arch/gaudi2/arc/dev_security.h b/arch/gaudi2/arc/dev_security.h
+index 9247604..d4def78 100644
+--- a/arch/gaudi2/arc/dev_security.h
++++ b/arch/gaudi2/arc/dev_security.h
+@@ -16,11 +16,6 @@
+ #define SECURITY_KEY_HASH_COUNT				3
+ #define NUM_DWORDS_AVLBL_IN_PSOC_SEC			8
+ 
+-enum security_key_location {
+-	KEY_LOCATION_ROM,
+-	KEY_LOCATION_EFUSE
+-};
+-
+ /* size of key properties in bytes */
+ #define KEY_PROP_RR_SZ  				384
+ #define KEY_PROP_MOD_SZ					384
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index b5b8484..cb9e5a7 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -6,9 +6,8 @@
+ #ifndef _GAUDI3_DEV_EFUSE_H_
+ #define _GAUDI3_DEV_EFUSE_H_
+ 
+-/* TODO: Replace with gaudi3 values */
+-
+-#define EFUSE_KEY_HASH_OFFSET				0x14
++/* Unused for gaudi3. Maintained for common code compilation */
++#define EFUSE_KEY_HASH_OFFSET				0x0
+ 
+ /*
+  * 00: ROM, 01: EROM, 10: RSVD, 11:ROM
+@@ -20,8 +19,6 @@
+ #define EFUSE_SYSCFG_ENABLE_TPM_MASK			BIT(11)
+ #define EFUSE_SYSCFG_FW_VERSION_LOCATION		7
+ #define EFUSE_SYSCFG_FW_VERSION_LOCATION_MASK		0x3
+-#define EFUSE_SYSCFG_KEY_LOCATION			5
+-#define EFUSE_SYSCFG_KEY_LOCATION_MASK			0x3
+ #define EFUSE_SYSCFG_REVOKATION_LOCATION		7
+ #define EFUSE_SYSCFG_REVOKATION_LOCATION_MASK		0x3
+ 
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index 72403c5..b43bc66 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -9,15 +9,9 @@
+ #include <sha512.h>
+ 
+ #define NUM_KEYS_IN_ROM					5
+-#define NUM_KEYS_IN_EFUSE				3
+ #define SECURITY_DWORD_PER_KEY				12
+ #define SECURITY_KEY_HASH_COUNT				3
+ #define SECURITY_KEY_HASH_LEN			SHA384_SUM_LEN
+-
+-enum security_key_location {
+-	KEY_LOCATION_ROM,
+-	KEY_LOCATION_EFUSE
+-};
+ 
+ /* size of key properties in bytes */
+ #define KEY_PROP_RR_SZ					384
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index 7947c80..144fec3 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -71,36 +71,8 @@
+ 
+ int security_get_key_hash(uint32_t *hash, uint8_t key_index)
+ {
+-	uint32_t max_key_index;
+-	enum security_key_location key_location;
+-	uint32_t *ptr;
++	uint32_t *ptr = (uint32_t *)rom_key_hashes[key_index];
+ 
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-
+-	/* check efuse for key location */
+-	if (key_location == KEY_LOCATION_EFUSE) {
+-		max_key_index = NUM_KEYS_IN_EFUSE;
+-
+-		if (key_index >= max_key_index)
+-			return 1;
+-
+-		/* read from efuse/SP SRAM */
+-		ptr = arcboot_rom_global.sec_data.keys[key_index];
+-	} else {
+-		/*
+-		 * All other cases are routed into ROM, since it is
+-		 * the more secure way
+-		 */
+-		max_key_index = NUM_KEYS_IN_ROM;
+-
+-		if (key_index >= max_key_index)
+-			return 1;
+-
+-		/* read from ROM itself */
+-		ptr = (uint32_t *)rom_key_hashes[key_index];
+-	}
+ 	memcpy(hash, ptr, SECURITY_KEY_HASH_LEN);
+ 
+ 	return 0;
+@@ -108,26 +80,9 @@
+ 
+ int security_check_key_revoke_status(uint32_t key_index)
+ {
+-	uint8_t max_key_index = NUM_KEYS_IN_ROM, key_revoke;
+-	enum security_key_location key_location;
++	uint8_t key_revoke;
+ 
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-	/*
+-	 * key location = EFUSE (1)
+-	 * key location = ROM (0, 2, 3)
+-	 * Key index ranges from:
+-	 * 0 - 4(5 keys): if key location == ROM
+-	 * 0 - 2(3 keys): if key location == eFUSE
+-	 * Except a value of 1 for EFUSE, rest all are
+-	 * routed into ROM, since thats the secure way.
+-	 */
+-	/* check efuse for key location */
+-	if (key_location == KEY_LOCATION_EFUSE)
+-		max_key_index = NUM_KEYS_IN_EFUSE;
+-
+-	if (key_index >= max_key_index)
++	if (key_index >= NUM_KEYS_IN_ROM)
+ 		return -1;
+ 
+ 	key_revoke = arcboot_rom_global.sec_data.key_revoke;
+@@ -208,33 +163,16 @@
+ 
+ void security_load_keys(void)
+ {
+-	uint8_t max_keys = NUM_KEYS_IN_ROM;
+-	uint32_t key_hash[NUM_KEYS_IN_ROM * SECURITY_DWORD_PER_KEY];
+-	enum security_key_location key_location;
+-
+-	key_location = ((arcboot_rom_global.config_fuse >>
+-			EFUSE_SYSCFG_KEY_LOCATION) &
+-			EFUSE_SYSCFG_KEY_LOCATION_MASK);
+-
+ 	arcboot_rom_status_update(PROGRESS_KEY_LOC);
+-	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0, key_location);
+-
+-	switch (key_location) {
+-	case KEY_LOCATION_EFUSE:
+-		max_keys = NUM_KEYS_IN_EFUSE;
+-		efuse_get_hash(key_hash);
+-		break;
+-	case KEY_LOCATION_ROM:
+-	default:
+-		security_rom_get_hash(key_hash);
+-		break;
+-	}
++	/* KEY LOCATION: ROM */
++	arcboot_rom_status_update_location(PROGRESS_KEY_LOC_0,
++					KEY_LOCATION_ROM);
+ 
+ 	/* store hashes in the limited space available in PSOC_SECURITY */
+-	security_store_keys_in_psoc(max_keys, key_hash);
++	security_store_keys_in_psoc(NUM_KEYS_IN_ROM, (uint32_t *)rom_key_hashes);
+ 
+ 	memcpy(arcboot_rom_global.sec_data.keys,
+-			key_hash, max_keys * SECURITY_KEY_HASH_LEN);
++			rom_key_hashes, NUM_KEYS_IN_ROM * SECURITY_KEY_HASH_LEN);
+ }
+ 
+ void security_load_revoke_bits(void)
+diff --git a/include/arcboot.h b/include/arcboot.h
+index cc138d6..7a013ed 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -251,6 +251,11 @@
+ 	FIT_SEC_SIGN_FAILED,
+ };
+ 
++enum security_key_location {
++	KEY_LOCATION_ROM,
++	KEY_LOCATION_EFUSE
++};
++
+ extern struct arcboot_global_s arcboot_rom_global;
+ void arcboot_rom_status_update(enum arcboot_rom_progress progress);
+ void arcboot_rom_status_update_bringup(enum arcboot_rom_progress progress,

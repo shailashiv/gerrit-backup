@@ -1,0 +1,123 @@
+From e24fde32788c4b003866e952ff125f747948b220 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 05 Jun 2022 16:14:20 +0300
+Subject: [PATCH] Revert "[SW-77251] fit: gaudi3: add verify image signature function"
+
+Revert rom recovery implementation for secured firmware update via
+inband and OOB.
+
+This reverts commit 406cabc06f272b5e7c3eb9c303f21ce95ecef397.
+
+Change-Id: Ic25147ee61db68d63f6edd684f5dc0e4f17258ec
+---
+
+diff --git a/arch/gaudi3/arc/secureboot.c b/arch/gaudi3/arc/secureboot.c
+index 30a4fe4..446be6c 100644
+--- a/arch/gaudi3/arc/secureboot.c
++++ b/arch/gaudi3/arc/secureboot.c
+@@ -12,8 +12,6 @@
+ #include <dev_security.h>
+ #include <rsa.h>
+ #include <sha512.h>
+-#include <fit.h>
+-#include <gaudi3_security.h>
+ 
+ bool arcboot_rom_is_image_sig_supported(void)
+ {
+@@ -112,96 +110,3 @@
+ 	return 0;
+ }
+ 
+-static struct hl_fit_sec_desc fit_sec;
+-static uint8_t signature[FIT_SIGNATURE_SIZE];
+-static uint8_t key_props[PUB_KEY_SZ];
+-int arcboot_verify_img_sig(const void *img, size_t img_size, enum fit_sec_failure *res,
+-				int *key_idx)
+-{
+-	const char *key_name = HL_SEC_KEY_NAME;
+-	const void *fit_sec_off;
+-	const void *pub_key_fit;
+-	struct key_prop prop;
+-
+-	if (!security_efuse_image_validation_en())
+-		return 0;
+-
+-	/* hl fit files are padded so the size is 4 bytes aligned */
+-	img_size = ROUND_UP4(img_size);
+-
+-	/* security descriptor is at the footer of the image */
+-	fit_sec_off = (const void *)((uint8_t *)img + img_size);
+-
+-	/* check that the calculated memory range are legal */
+-	if (!arcboot_is_valid_address_range((uintptr_t)fit_sec_off,
+-						 sizeof(fit_sec)))
+-		return 1;
+-
+-	memcpy(&fit_sec, fit_sec_off, FIT_SEC_DESC_SIZE);
+-
+-	if (fit_sec.magic_number != FIT_SEC_MAGIC)
+-		return 1;
+-
+-	if ((fit_sec.desc_version_maj != FIT_SEC_DESC_VER_MAJOR) ||
+-	    (fit_sec.desc_version_min != FIT_SEC_DESC_VER_MINOR))
+-		return 1;
+-
+-	if (fit_sec.desc_size < FIT_SEC_DESC_SIZE)
+-		return 1;
+-
+-	if (fit_sec.img_size != img_size)
+-		return 1;
+-
+-	if (security_check_valid_fw_version(fit_sec.sec_version) !=
+-					SECURITY_FW_VERSION_SECURE) {
+-		*res = FIT_SEC_SVN_INVALID;
+-		return 1;
+-	}
+-
+-	if (security_check_key_revoke_status(fit_sec.key_num) != 1) {
+-		*res = FIT_SEC_KEY_REVOKED;
+-		return 1;
+-	}
+-
+-	pub_key_fit = &fit_sec.pub_key;
+-
+-	/*
+-	 * ROM stores hash of public key properties. The public key
+-	 * received as part of fit is complete public key dtb of
+-	 * 3144 bytes. Extract key properties and compute
+-	 * hash on 784 bytes of key properties to compare with
+-	 * stored ROM hash.
+-	 */
+-	fit_get_key_prop(pub_key_fit, key_name, &prop);
+-
+-	memcpy(key_props, prop.rr, KEY_PROP_RR_SZ);
+-	memcpy((key_props + KEY_PROP_RR_SZ), prop.modulus, KEY_PROP_MOD_SZ);
+-	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ), prop.public_exponent,
+-		KEY_PROP_EXP_SZ);
+-	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + KEY_PROP_EXP_SZ),
+-		&prop.n0inv, KEY_PROP_INV_SZ);
+-	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ),
+-	&prop.num_bits, KEY_PROP_NB_SZ);
+-
+-	if (secureboot_verify_key_hash(fit_sec.key_num, key_props, PUB_KEY_SZ)) {
+-		*res = FIT_SEC_SIGN_FAILED;
+-		return 1;
+-	}
+-
+-	/*
+-	 * signature is calculated on both the fit image and the security
+-	 * descriptor with the signature field of the descriptor zeroized.
+-	 */
+-	memcpy(signature, fit_sec.signature, FIT_SIGNATURE_SIZE);
+-	memset(fit_sec.signature, 0, FIT_SIGNATURE_SIZE);
+-
+-	if (fit_verify_img_sig(img, img_size, &fit_sec, FIT_SEC_DESC_SIZE,
+-			       pub_key_fit, signature, FIT_SIGNATURE_SIZE)) {
+-		*res = FIT_SEC_SIGN_FAILED;
+-		return 1;
+-	}
+-
+-	*key_idx = fit_sec.key_num;
+-
+-	return 0;
+-}

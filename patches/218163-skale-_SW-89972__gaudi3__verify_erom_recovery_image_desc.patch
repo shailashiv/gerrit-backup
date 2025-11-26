@@ -1,0 +1,464 @@
+From 2fd1c44af6c70dfa3182325e083ab1e92e6b154b Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 07 Jun 2022 13:28:18 +0300
+Subject: [PATCH] [SW-89972] gaudi3: verify erom/recovery image descriptor
+
+EROM/Recovery image descriptors are stored at 0x0 offset. In previous
+platform only hash verification was perform on erom images and executed
+by ROM. Signature verification on EROM images was not perfomed as we
+couldnt meet deadline of 100ms to establish PCIe link if we would
+perform signature verification of three images (ppboot primary,
+ppboot secondary and PCIe EROM).
+
+As per OCP spec, any image from SPI should not be executed unverified.
+Due to this requirement, this patch adds support to verify signature on
+EROM image descriptor. Due to new design in gaudi3 where signature
+verification is performed on image descriptor instead of individual
+ppboot image and only hash verfication is performed on ppboot image,
+we will be well within 100ms deadline with signature verification
+enabled for EROM image descriptor.
+
+Change-Id: Icfea5a2ab14eca64a62625e1d82699ed981c6a82
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 47c62d3..769f60b 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -463,7 +463,10 @@
+ __weak void arcboot_rom_disable_spi_gw(void) {}
+ __weak void arcboot_rom_wait_for_signal(void) {}
+ __weak void arcboot_rom_security_init(void) {}
+-__weak void arcboot_rom_verify(void) {}
++__weak int arcboot_rom_verify(__unused enum hl_fw_boot_ptr_imgs img)
++{
++	return 0;
++}
+ 
+ int arcboot_rom_main(void)
+ {
+@@ -474,7 +477,9 @@
+ 	arcboot_rom_wait_for_signal();
+ 	arcboot_rom_in_recovery();
+ 	arcboot_rom_request_cpld_wdog();
+-	arcboot_rom_verify();
++	if (arcboot_rom_verify(HL_FW_BOOT_PTR_SPI))
++		execute_recovery();
++
+ 	arcboot_rom_bringup_pcie();
+ 	arcboot_rom_bringup_arcboot_ram();
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index b6bfcdb..4a7df1d 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -789,8 +789,9 @@
+ 	return HL_BOOT_INFO_VERSION;
+ }
+ 
+-void arcboot_rom_verify(void)
++int arcboot_rom_verify(enum hl_fw_boot_ptr_imgs img)
+ {
++	enum arcboot_rom_progress verify_sts_base = PROGRESS_SPI_BOOT_DESC_VERIFY_START;
+ 	struct hl_fw_boot_ptrs boot_ptr;
+ 	uint32_t boot_ptr_addr = 0;
+ 	int ret;
+@@ -798,12 +799,17 @@
+ 	uint8_t crc_bytes, num_chunks;
+ 
+ 	if ((arcboot_rom_global.validation_pass) || (!security_efuse_image_validation_en()))
+-		return;
++		return 0;
+ 
+-	boot_ptr_addr = boot_desc_param_get(&boot_ptr);
++	if (img == HL_FW_BOOT_PTR_EROM)
++		verify_sts_base = PROGRESS_EROM_BOOT_DESC_VERIFY_START;
++
++	boot_ptr_addr = boot_desc_param_get(img, &boot_ptr);
+ 
+ 	if (!boot_ptr_addr)
+-		execute_recovery();
++		return 1;
++
++	arcboot_rom_status_update_bringup(verify_sts_base, PROGRESS_VERIFY_START);
+ 
+ 	num_chunks = boot_ptr.boot_ptrs_img_sz / MAX_DMA_SIZE_CRC;
+ 	if (boot_ptr.boot_ptrs_img_sz % MAX_DMA_SIZE_CRC)
+@@ -819,19 +825,25 @@
+ 			boot_ptr.sec_ver, boot_ptr.key_idx);
+ 
+ 	if (ret == SECUREBOOT_VERIFY_SUCCESS) {
+-		arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_SUCCESS);
++		arcboot_rom_status_update_bringup(verify_sts_base, PROGRESS_VERIFY_SUCCESS);
+ 	} else {
+ 		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
+-			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_VERSION_FAIL);
++			arcboot_rom_status_update_bringup(verify_sts_base,
++					PROGRESS_VERIFY_VERSION_FAIL);
+ 		else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
+-			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_KEY_REVOKED);
++			arcboot_rom_status_update_bringup(verify_sts_base,
++					PROGRESS_VERIFY_KEY_REVOKED);
+ 		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
+-			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_KEY_HASH_FAIL);
++			arcboot_rom_status_update_bringup(verify_sts_base,
++					PROGRESS_VERIFY_KEY_HASH_FAIL);
+ 		else // (ret = SECUREBOOT_VERIFY_FAILED)
+-			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_AUTH_FAIL);
++			arcboot_rom_status_update_bringup(verify_sts_base,
++					PROGRESS_VERIFY_AUTH_FAIL);
+ 
+-		execute_recovery();
++		return 1;
+ 	}
++
++	return 0;
+ }
+ 
+ void arcboot_rom_in_recovery(void)
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 5b59b66..8525c3a 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -95,26 +95,6 @@
+ 	arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_EROM_IMG_FINISH);
+ }
+ 
+-static void execute_erom_recovery(void)
+-{
+-	uint32_t count, i;
+-
+-	/* EROM recovery not supported in slave die */
+-	if (arcboot_rom_global.die_id)
+-		return;
+-
+-	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_EROM_RECOVERY);
+-
+-	count = boot_desc_init(HL_FW_BOOT_PTR_EROM);
+-	if (!count) {
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR);
+-		return;
+-	}
+-
+-	for (i = 0; i < count; i++)
+-		ext_rom_load_erom_image(i);
+-}
+-
+ static void rom_pcie_recovery(void)
+ {
+ 	uint32_t pcie_ctrl_val = arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_CONTROL_MASK;
+@@ -190,6 +170,34 @@
+ 	rom_d2d_link_init();
+ }
+ 
++static void execute_erom_recovery(void)
++{
++	uint32_t count, i;
++
++	/* EROM recovery not supported in slave die */
++	if (arcboot_rom_global.die_id)
++		return;
++
++	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_EROM_RECOVERY);
++
++	count = boot_desc_init(HL_FW_BOOT_PTR_EROM);
++	if (!count) {
++		arcboot_rom_status_update(PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR);
++		goto rom_recovery;
++	}
++
++	if (arcboot_rom_verify(HL_FW_BOOT_PTR_EROM))
++		goto rom_recovery;
++
++	for (i = 0; i < count; i++)
++		ext_rom_load_erom_image(i);
++
++	return;
++
++rom_recovery:
++	execute_rom_recovery();
++}
++
+ void execute_recovery(void)
+ {
+ 	arcboot_rom_status_update(PROGRESS_ARCBOOT_IN_RECOVERY);
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 1d9c117..1ab9195 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -50,6 +50,8 @@
+ 
+ 	if (img == HL_FW_BOOT_PTR_EROM) {
+ 		p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_EROM_DMA_DEST_ARC);
++	} else {
++		p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_SPI_DMA_DEST_ARC);
+ 	}
+ }
+ 
+@@ -261,12 +263,17 @@
+ 	return boot_desc_copy_desc(desc, p_loc_img_desc, upd_status);
+ }
+ 
+-uint32_t boot_desc_param_get(struct hl_fw_boot_ptrs *boot_ptr)
++uint32_t boot_desc_param_get(enum hl_fw_boot_ptr_imgs img, struct hl_fw_boot_ptrs *boot_ptr)
+ {
++	boot_desc_update_ptrs(img);
++
+ 	if (!p_boot_ptr)
+ 		return 0;
+ 
+ 	memcpy(boot_ptr, p_boot_ptr, sizeof(struct hl_fw_boot_ptrs));
+ 
+-	return HL_BOOT_PTR_SPI_DMA_DEST_ARC;
++	if (img == HL_FW_BOOT_PTR_EROM)
++		return HL_BOOT_PTR_EROM_DMA_DEST_ARC;
++	else
++		return HL_BOOT_PTR_SPI_DMA_DEST_ARC;
+ }
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 43f5fcb..dbf0c01 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -92,6 +92,6 @@
+ uint32_t boot_desc_get_img_desc_by_index(enum hl_fw_boot_ptr_imgs img, uint32_t index,
+ 			struct boot_desc *desc, enum fw_post_reset_cmd upd_status);
+ 
+-uint32_t boot_desc_param_get(struct hl_fw_boot_ptrs *boot_ptr);
++uint32_t boot_desc_param_get(enum hl_fw_boot_ptr_imgs img, struct hl_fw_boot_ptrs *boot_ptr);
+ 
+ #endif /* _BOOT_DESC_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index a099b94..09de156 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -116,6 +116,15 @@
+ 	PROGRESS_BOOT_DESC_VERIFICATION_FAIL,
+ };
+ 
++enum arcboot_rom_boot_desc_verify_progress {
++	PROGRESS_VERIFY_START,
++	PROGRESS_VERIFY_VERSION_FAIL,
++	PROGRESS_VERIFY_KEY_REVOKED,
++	PROGRESS_VERIFY_KEY_HASH_FAIL,
++	PROGRESS_VERIFY_AUTH_FAIL,
++	PROGRESS_VERIFY_SUCCESS,
++};
++
+ enum arcboot_rom_erom_img_progress {
+ 	PROGRESS_EROM_BRINGUP_START,
+ 	PROGRESS_EROM_DMA_START,
+@@ -156,102 +165,109 @@
+ 	PROGRESS_VER_LOC = 23,
+ 	PROGRESS_VER_LOC_0 = 24,
+ 	PROGRESS_VER_LOC_1 = 25,
+-	PROGRESS_BOOT_DESC_VERIFY_VERSION_FAIL = 26,
+-	PROGRESS_BOOT_DESC_VERIFY_KEY_REVOKED = 27,
+-	PROGRESS_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 28,
+-	PROGRESS_BOOT_DESC_VERIFY_AUTH_FAIL = 29,
+-	PROGRESS_BOOT_DESC_VERIFY_SUCCESS = 30,
+-	PROGRESS_BRINGUP_PCI_PRI = 31,
+-	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 32,
+-	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 33,
+-	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 34,
+-	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 35,
+-	PROGRESS_BRINGUP_PCI_PRI_DMA_ERROR = 36,
+-	PROGRESS_BRINGUP_PCI_PRI_DMA = 37,
+-	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 38,
+-	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 39,
+-	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 40,
+-	PROGRESS_BRINGUP_PCI_SEC = 41,
+-	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 42,
+-	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 43,
+-	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 44,
+-	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 45,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA_ERROR = 46,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA = 47,
+-	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 48,
+-	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 49,
+-	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 50,
+-	PROGRESS_ARCBOOT_IN_RECOVERY = 51,
+-	PROGRESS_ARCBOOT_ROM_TPM = 52,
+-	PROGRESS_ARCBOOT_ROM_TPM_INIT_FAIL = 53,
+-	PROGRESS_ARCBOOT_ROM_TPM_STARTUP_FAIL = 54,
+-	PROGRESS_ARCBOOT_ROM_TPM_PCR_EXTEND_FAIL = 55,
+-	PROGRESS_ARCBOOT_ROM_TPM_FINISH = 56,
+-	PROGRESS_PPBOOT_START = 57,
+-	PROGRESS_PPBOOT_FINISH = 58,
+-	PROGRESS_BRINGUP_RAM_PRI = 59,
+-	PROGRESS_BRINGUP_RAM_PRI_DMA = 60,
+-	PROGRESS_BRINGUP_RAM_PRI_SECURITY = 61,
+-	PROGRESS_BRINGUP_RAM_SEC = 62,
+-	PROGRESS_BRINGUP_RAM_SEC_DMA = 63,
+-	PROGRESS_BRINGUP_RAM_SEC_SECURITY = 64,
+-	PROGRESS_ARCBOOT_RAM_START = 65,
+-	PROGRESS_ARCBOOT_RECOVERY = 66,
+-	PROGRESS_ARCBOOT_RECOVERY_DMA = 67,
+-	PROGRESS_ARCBOOT_IN_ROM_RECOVERY = 68,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_START = 69,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_STS_BUSY = 70,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 71,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS = 72,
+-	PROGRESS_ARCBOOT_IN_EROM_RECOVERY = 73,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START = 74,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_UNALIGNED_DEST = 75,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_UNALIGNED_IMG_SIZE = 76,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_ERROR = 77,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH = 78,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_HDR_MAGIC_FAIL = 79,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_VERIFICATION_FAIL = 80,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR = 81,
+-	PROGRESS_ARCBOOT_EROM_PCIE = 82,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START = 83,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_CRC_FAILED = 84,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_UNALIGNED_DEST = 85,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_UNALIGNED_IMG_SIZE = 86,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_ERROR = 87,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH = 88,
+-	PROGRESS_ARCBOOT_EROM_PCIE_VERIFICATION_FAIL = 89,
+-	PROGRESS_ARCBOOT_EROM_PCIE_START = 90,
+-	PROGRESS_ARCBOOT_EROM_PCIE_FINISH = 91,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY = 92,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START = 93,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_CRC_FAILED = 94,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_UNALIGNED_DEST = 95,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_UNALIGNED_IMG_SIZE = 96,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_ERROR = 97,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH = 98,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_VERIFICATION_FAIL = 99,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_START = 100,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH = 101,
+-	PROGRESS_ARCBOOT_EROM_TPM = 102,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_START = 103,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_CRC_FAILED = 104,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_UNALIGNED_DEST = 105,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_UNALIGNED_IMG_SIZE = 106,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_ERROR = 107,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH = 108,
+-	PROGRESS_ARCBOOT_EROM_TPM_VERIFICATION_FAIL = 109,
+-	PROGRESS_ARCBOOT_EROM_TPM_START = 110,
+-	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 111,
+-	PROGRESS_ARCBOOT_EROM_IMG0 = 112,
+-	PROGRESS_ARCBOOT_EROM_IMG0_DMA_START = 113,
+-	PROGRESS_ARCBOOT_EROM_IMG0_DMA_CRC_FAILED = 114,
+-	PROGRESS_ARCBOOT_EROM_IMG0_DMA_UNALIGNED_DEST = 115,
+-	PROGRESS_ARCBOOT_EROM_IMG0_DMA_UNALIGNED_IMG_SIZE = 116,
+-	PROGRESS_ARCBOOT_EROM_IMG0_DMA_ERROR = 117,
+-	PROGRESS_ARCBOOT_EROM_IMG0_DMA_FINISH = 118,
+-	PROGRESS_ARCBOOT_EROM_IMG0_VERIFICATION_FAIL = 119,
+-	PROGRESS_ARCBOOT_EROM_IMG0_START = 120,
+-	PROGRESS_ARCBOOT_EROM_IMG0_FINISH = 121,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_START = 26,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_VERSION_FAIL = 27,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_KEY_REVOKED = 28,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 29,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_AUTH_FAIL = 30,
++	PROGRESS_SPI_BOOT_DESC_VERIFY_SUCCESS = 31,
++	PROGRESS_BRINGUP_PCI_PRI = 32,
++	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 33,
++	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 34,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 35,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 36,
++	PROGRESS_BRINGUP_PCI_PRI_DMA_ERROR = 37,
++	PROGRESS_BRINGUP_PCI_PRI_DMA = 38,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 39,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 40,
++	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 41,
++	PROGRESS_BRINGUP_PCI_SEC = 42,
++	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 43,
++	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 44,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 45,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 46,
++	PROGRESS_BRINGUP_PCI_SEC_DMA_ERROR = 47,
++	PROGRESS_BRINGUP_PCI_SEC_DMA = 48,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 49,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 50,
++	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 51,
++	PROGRESS_ARCBOOT_IN_RECOVERY = 52,
++	PROGRESS_ARCBOOT_ROM_TPM = 53,
++	PROGRESS_ARCBOOT_ROM_TPM_INIT_FAIL = 54,
++	PROGRESS_ARCBOOT_ROM_TPM_STARTUP_FAIL = 55,
++	PROGRESS_ARCBOOT_ROM_TPM_PCR_EXTEND_FAIL = 56,
++	PROGRESS_ARCBOOT_ROM_TPM_FINISH = 57,
++	PROGRESS_PPBOOT_START = 58,
++	PROGRESS_PPBOOT_FINISH = 59,
++	PROGRESS_BRINGUP_RAM_PRI = 60,
++	PROGRESS_BRINGUP_RAM_PRI_DMA = 61,
++	PROGRESS_BRINGUP_RAM_PRI_SECURITY = 62,
++	PROGRESS_BRINGUP_RAM_SEC = 63,
++	PROGRESS_BRINGUP_RAM_SEC_DMA = 64,
++	PROGRESS_BRINGUP_RAM_SEC_SECURITY = 65,
++	PROGRESS_ARCBOOT_RAM_START = 66,
++	PROGRESS_ARCBOOT_RECOVERY = 67,
++	PROGRESS_ARCBOOT_RECOVERY_DMA = 68,
++	PROGRESS_ARCBOOT_IN_ROM_RECOVERY = 69,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_START = 70,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_STS_BUSY = 71,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 72,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS = 73,
++	PROGRESS_ARCBOOT_IN_EROM_RECOVERY = 74,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START = 75,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_UNALIGNED_DEST = 76,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_UNALIGNED_IMG_SIZE = 77,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_ERROR = 78,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH = 79,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_HDR_MAGIC_FAIL = 80,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_VERIFICATION_FAIL = 81,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR = 82,
++	PROGRESS_EROM_BOOT_DESC_VERIFY_START = 83,
++	PROGRESS_EROM_BOOT_DESC_VERIFY_VERSION_FAIL = 84,
++	PROGRESS_EROM_BOOT_DESC_VERIFY_KEY_REVOKED = 85,
++	PROGRESS_EROM_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 86,
++	PROGRESS_EROM_BOOT_DESC_VERIFY_AUTH_FAIL = 87,
++	PROGRESS_EROM_BOOT_DESC_VERIFY_SUCCESS = 88,
++	PROGRESS_ARCBOOT_EROM_PCIE = 89,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START = 90,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_CRC_FAILED = 91,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_UNALIGNED_DEST = 92,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_UNALIGNED_IMG_SIZE = 93,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_ERROR = 94,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH = 95,
++	PROGRESS_ARCBOOT_EROM_PCIE_VERIFICATION_FAIL = 96,
++	PROGRESS_ARCBOOT_EROM_PCIE_START = 97,
++	PROGRESS_ARCBOOT_EROM_PCIE_FINISH = 98,
++	PROGRESS_ARCBOOT_EROM_RECOVERY = 99,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START = 100,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_CRC_FAILED = 101,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_UNALIGNED_DEST = 102,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_UNALIGNED_IMG_SIZE = 103,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_ERROR = 104,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH = 105,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_VERIFICATION_FAIL = 106,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_START = 107,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH = 108,
++	PROGRESS_ARCBOOT_EROM_TPM = 109,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_START = 110,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_CRC_FAILED = 111,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_UNALIGNED_DEST = 112,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_UNALIGNED_IMG_SIZE = 113,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_ERROR = 114,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH = 115,
++	PROGRESS_ARCBOOT_EROM_TPM_VERIFICATION_FAIL = 116,
++	PROGRESS_ARCBOOT_EROM_TPM_START = 117,
++	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 118,
++	PROGRESS_ARCBOOT_EROM_IMG0 = 119,
++	PROGRESS_ARCBOOT_EROM_IMG0_DMA_START = 120,
++	PROGRESS_ARCBOOT_EROM_IMG0_DMA_CRC_FAILED = 121,
++	PROGRESS_ARCBOOT_EROM_IMG0_DMA_UNALIGNED_DEST = 122,
++	PROGRESS_ARCBOOT_EROM_IMG0_DMA_UNALIGNED_IMG_SIZE = 123,
++	PROGRESS_ARCBOOT_EROM_IMG0_DMA_ERROR = 124,
++	PROGRESS_ARCBOOT_EROM_IMG0_DMA_FINISH = 125,
++	PROGRESS_ARCBOOT_EROM_IMG0_VERIFICATION_FAIL = 126,
++	PROGRESS_ARCBOOT_EROM_IMG0_START = 127,
++	PROGRESS_ARCBOOT_EROM_IMG0_FINISH = 128,
+ };
+ 
+ enum security_location {
+@@ -276,7 +292,7 @@
+ void arcboot_rom_clear_recovery_flag(void);
+ void arcboot_rom_load_recovery(void);
+ int arcboot_rom_mem_init(uint64_t addr, uint32_t size);
+-void arcboot_rom_verify(void);
++int arcboot_rom_verify(enum hl_fw_boot_ptr_imgs img);
+ 
+ #define CLEAR_DMA_SECURITY_PROGRESS 0x3
+ 

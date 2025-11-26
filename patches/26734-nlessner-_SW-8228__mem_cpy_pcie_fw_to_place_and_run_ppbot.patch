@@ -1,0 +1,169 @@
+From aab0a3a9cc9e577e941016e0acf3d5061ba9fd2c Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 04 Feb 2020 13:22:16 +0200
+Subject: [PATCH] [SW-8228] mem_cpy pcie fw to place and run ppbot
+
+Copy PCIe fw from fw_sram to pcie_fw_sram with mem_cpy a HW subsystem.
+If all is done correct run ppboot, else fall back to pcie recovery mode
+
+Change-Id: I6e85e9d82be863821b4e5c0b57fc809afeca360f
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 8a7db31..ff1e647 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -8,6 +8,7 @@
+ #include "arcboot.h"
+ #include "efuse.h"
+ #include "dma.h"
++#include "mem_cpy.h"
+ #include "security.h"
+ #include "secureboot.h"
+ #include "spi_flash.h"
+@@ -104,6 +105,9 @@
+ 	uint32_t flash_image_offset;
+ 	uint32_t flash_ppboot_pcie_offset;
+ 	uint16_t ppboot_pcie_size;
++	uint16_t ppboot_size;
++	uint16_t pcie_fw_size;
++	void (*ppboot)();
+ 
+ 	flash_image_offset = arcboot_flash_image_offset(image_ptr);
+ 	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
+@@ -120,6 +124,25 @@
+ 	    SECUREBOOT_VERIFY_FAILED)
+ 		/* TODO: update PSOC_SECURITY about verify fail in image */
+ 		return ARCBOOT_BRINGUP_ERROR;
++
++	ppboot_size = fw_sram_readl(PPBOOT_IMAGE_SIZE_OFFSET);
++
++	/* to find the pcie fw size we take total image size
++	 * subtract ppboot size, signature, key, image length,
++	 * fw version, crc32 size
++	 */
++	pcie_fw_size = ppboot_pcie_size - ppboot_size - SIG_SIZE - KEY_SIZE -
++		       IMG_LEN_SIZE - CRC32_SIZE - FW_VERSION_SIZE;
++
++	/* copy to pcie_fw_sram from fw_sram the pcie_fw */
++	mem_cpy(pcie_fw_size, HL_SRAM_BASE + HL_FWSRAM_OFFSET + ppboot_size,
++		HL_SRAM_BASE + HL_PCIE_FWSRAM_OFFSET);
++	mem_cpy_wait_finish();
++
++	/* cast ppboot location as function and execute it */
++	ppboot = (void *)(HL_FWSRAM_BASE + PPBOOT_IMAGE_CODE_OFFSET);
++	ppboot();
++
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+ 
+diff --git a/common/mem_cpy.c b/common/mem_cpy.c
+new file mode 100644
+index 0000000..ffa7e6e
+--- /dev/null
++++ b/common/mem_cpy.c
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include "arcboot.h"
++#include "mem_cpy.h"
++
++void mem_cpy(uint32_t image_size, uint64_t source, uint64_t dest)
++{
++	uint32_t mem_cpy_ctrl2;
++	uint16_t image_block_count_16b;
++
++	/* image_size needs to be in 16 byte blocks count */
++	image_block_count_16b = image_size / 16;
++
++	/* if last block isn't complete 16 bytes add 1 to count */
++	/* so we also copy part of block			*/
++	if ((image_size % 16) > 0)
++		image_block_count_16b++;
++
++	regmap_writel(MEM_CPY_ADDRESS_LOW(source),
++		      mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_L);
++	regmap_writel(MEM_CPY_ADDRESS_HIGH(source),
++		      mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_H);
++
++	regmap_writel(MEM_CPY_ADDRESS_LOW(dest),
++		      mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel(MEM_CPY_ADDRESS_HIGH(dest),
++		      mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cpy_ctrl2 = image_block_count_16b;
++	mem_cpy_ctrl2 += MEM_CPY_WR_OS_32 <<
++				PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_SHIFT;
++	regmap_writel(mem_cpy_ctrl2,
++		      mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* start transfer */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++}
++
++
++int mem_cpy_finish(void)
++{
++	uint32_t mem_cpy_status =
++		 regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++
++	return mem_cpy_status;
++}
++
++void mem_cpy_wait_finish(void)
++{
++	uint32_t mem_cpy_status;
++
++	do {
++		mem_cpy_status =
++		 regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++	} while (!mem_cpy_status);
++}
+diff --git a/common/mem_cpy.h b/common/mem_cpy.h
+new file mode 100644
+index 0000000..7ea989f
+--- /dev/null
++++ b/common/mem_cpy.h
+@@ -0,0 +1,19 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _MEM_CPY_H_
++#define _MEM_CPY_H_
++
++#define MEM_CPY_ADDRESS_LOW(x)	((x) & 0xFFFFFFFF)
++#define MEM_CPY_ADDRESS_HIGH(x)	(((x) >> 32) & 0xFFFF)
++#define MEM_CPY_WR_OS_32	32
++
++void mem_cpy(uint32_t image_size, uint64_t source, uint64_t dest);
++int mem_cpy_finish(void);
++void mem_cpy_wait_finish(void);
++
++#endif /* _MEM_CPY_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index f4e301d..d5e42a2 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -40,6 +40,12 @@
+ #define ARCBOOT_PRIMARY				0
+ #define ARCBOOT_SECONDARY			1
+ 
++#define PPBOOT_IMAGE_SIZE_OFFSET		8
++#define PPBOOT_IMAGE_OFFSET			12
++#define PPBOOT_IMAGE_CODE_ALIGN			4
++#define PPBOOT_IMAGE_CODE_OFFSET		(PPBOOT_IMAGE_OFFSET + \
++						 PPBOOT_IMAGE_CODE_ALIGN)
++
+ struct arcboot_global_s {
+ 	uint32_t config_fuse;
+ };

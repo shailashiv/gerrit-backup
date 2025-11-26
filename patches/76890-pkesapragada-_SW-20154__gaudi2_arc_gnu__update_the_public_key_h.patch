@@ -1,0 +1,145 @@
+From 9f86ee3ad5ad639ca2716122d7c076e705104e21 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Tue, 16 Feb 2021 16:53:55 +0200
+Subject: [PATCH] [SW-20154] gaudi2_arc_gnu: update the public key hash
+
+Public key is usually the modulus value. Since the
+properties are included in the image, there is no need
+to include an additional 384bytes in the form of public
+key. Hence remove it. Since the recommendation from
+Arch team is that the hash calculation should consider
+entire public key props, the hash is also updated.
+
+Change-Id: I228883b39c726465f6f17ec539e2a1ea60386e6b
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/common/rsa/rsa-verify.c b/common/rsa/rsa-verify.c
+index e306e43..dc352be 100644
+--- a/common/rsa/rsa-verify.c
++++ b/common/rsa/rsa-verify.c
+@@ -137,11 +137,12 @@
+  */
+ 
+ /*
+- * Packing of public key and key properties is done as below -
++ * Packing of public key properties is done as below -
+  *
+  * All the sizes mentioned are fixed for RSA3072 encryption.
+- *  ------------------------
+- * |  Public key (384 bytes) |
++ * Since the Key Props (r^2, modulus, exponent, Inverse, num_bits)
++ * are being directly used, there is no need of public key.
++ * This is as per recommendation from Security Architect.
+  *  ------------------------
+  * |    r^2 (384 bytes)      |
+  *  ------------------------
+@@ -153,8 +154,6 @@
+  *  ------------------------
+  * |   num bits (4 bytes)    |
+  *  ------------------------
+- * |   key header (8 bytes)  |
+- *  ------------------------
+  */
+ int rsa_verify_with_pkey(uint8_t *key,
+ 		 	__attribute__ ((unused))uint32_t key_len,
+@@ -162,7 +161,7 @@
+ {
+ 	struct key_prop prop;
+ 	int ret;
+-	uint8_t *hl_props = (uint8_t *)(key + RSA3072_BYTES);
++	uint8_t *hl_props = (uint8_t *)key;
+ 
+ 	/*
+ 	 * Uboot RSA code calls the rsa_gen_key_prop function here,
+diff --git a/gaudi2_arc_gnu/dev_security.h b/gaudi2_arc_gnu/dev_security.h
+index 28a618e..cbae31c 100644
+--- a/gaudi2_arc_gnu/dev_security.h
++++ b/gaudi2_arc_gnu/dev_security.h
+@@ -28,10 +28,13 @@
+ #define KEY_PROP_NB_SZ					4
+ #define KEY_PROP_HDR_SZ					8
+ 
+-/* 384 + 384 + 8 + 4 + 4 + 8 = 792 */
+-#define TOTAL_PUB_KEY_PROPS_SZ  (KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
++/* 384 + 384 + 8 + 4 + 4 = 784 bytes */
++#define PUB_KEY_SZ		(KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + \
+ 				KEY_PROP_EXP_SZ + KEY_PROP_INV_SZ + \
+-				KEY_PROP_NB_SZ + KEY_PROP_HDR_SZ)
++				KEY_PROP_NB_SZ)
++
++/* 784 + 8 = 792 */
++#define TOTAL_PUB_KEY_PROPS_SZ  (PUB_KEY_SZ + KEY_PROP_HDR_SZ)
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+diff --git a/gaudi2_arc_gnu/secureboot.c b/gaudi2_arc_gnu/secureboot.c
+index 2ef2f58..8a3a60e 100644
+--- a/gaudi2_arc_gnu/secureboot.c
++++ b/gaudi2_arc_gnu/secureboot.c
+@@ -12,16 +12,24 @@
+ #include <rsa.h>
+ #include <sha512.h>
+ 
+-
++/*
++ * This key hash is calculated on the Public Key Properties -
++ *   -----------------------------------------------
++ * | R ^ 2 | modulus | exponent | inverse | num bits |
++ *   -----------------------------------------------
++ * Since the key props are directly given to the ROM, there is
++ * no need to explicitly include the Public key, which is
++ * usually the modulus.
++ */
+ const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN] = {
+ 	/* Habana Public Key */
+ 	{
+-		0x09, 0xa8, 0xdd, 0xac, 0xbe, 0x8a, 0x6d, 0x34,
+-		0x94, 0x23, 0x62, 0x7c, 0xd6, 0x11, 0xe8, 0x15,
+-		0xb4, 0x44, 0xe2, 0x8d, 0x81, 0xc9, 0xc5, 0xd0,
+-		0x49, 0x3d, 0xd6, 0x4f, 0x10, 0xac, 0xdf, 0x83,
+-		0x04, 0x61, 0xb5, 0xde, 0x3e, 0x58, 0x5a, 0x73,
+-		0x18, 0xb4, 0x56, 0xbc, 0xcc, 0x91, 0xf0, 0xed
++		0xa6, 0xec, 0xfe, 0x38, 0x44, 0x0b, 0x8b, 0xf2,
++		0xef, 0x96, 0xef, 0x2f, 0x8d, 0xcb, 0xf1, 0x5a,
++		0x76, 0x4a, 0xdf, 0x3a, 0xda, 0xce, 0x33, 0x03,
++		0x67, 0x30, 0x32, 0xfd, 0xda, 0x74, 0xd0, 0x6d,
++		0x64, 0x1b, 0x00, 0x92, 0x4c, 0x07, 0xad, 0xd5,
++		0xfc, 0xde, 0x0c, 0xba, 0xc1, 0xbd, 0x8b, 0x30
+ 	},
+ 	/* Additional Keys - TODO */
+ 	{
+@@ -144,7 +152,8 @@
+ 	unsigned char expected_hash[SHA384_SUM_LEN];
+ 	unsigned char actual_hash[SHA384_SUM_LEN];
+ 	uint32_t config_fuse;
+-	uint32_t test_public_key_len = KEY_SIZE;
++	/* Public key is the total size of Public Key Props */
++	uint32_t test_public_key_len = PUB_KEY_SZ;
+ 	uint32_t test_sig_len = SIG_SIZE;
+ 	uint32_t test_data_len = image_size;
+ 	unsigned char *test_data = (unsigned char *)(image_offset);
+@@ -152,8 +161,8 @@
+ 
+ 	/* Key header is located as the last 2 DWORDS of the image */
+ 	unsigned char *ptr_key_index = test_sig - KEY_PROP_HDR_SZ;
+-        unsigned char *ptr_key_prop = test_sig - TOTAL_PUB_KEY_PROPS_SZ;
+-        unsigned char *test_public_key =  ptr_key_prop - test_public_key_len;
++	unsigned char *ptr_key_prop = test_sig - TOTAL_PUB_KEY_PROPS_SZ;
++	unsigned char *test_public_key =  ptr_key_prop;
+ 
+ 	uint32_t fw_version = base_readl((uint32_t)test_data);
+ 
+diff --git a/gaudi2_arc_gnu/soc.h b/gaudi2_arc_gnu/soc.h
+index 12ac0cb..53a5172 100644
+--- a/gaudi2_arc_gnu/soc.h
++++ b/gaudi2_arc_gnu/soc.h
+@@ -12,7 +12,7 @@
+ 
+ #define FW_SIZE					65535
+ #define SIG_SIZE				384
+-#define KEY_SIZE				384
++#define KEY_SIZE				784
+ #define BLOB_START				4
+ 
+ #define SPI_FLASH_BLOCK_SIZE			1024

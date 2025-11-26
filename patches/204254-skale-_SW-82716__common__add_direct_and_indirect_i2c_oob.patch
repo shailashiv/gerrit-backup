@@ -1,0 +1,1705 @@
+From 122b0fa94010e2baf233533f0891a2ec0b251d54 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 28 Apr 2022 19:20:56 +0300
+Subject: [PATCH] [SW-82716] common: add direct and indirect i2c oob commands
+
+This patch adds direct and indirect I2C commands as part of
+ROM recovery I2C OOB secure firmware update. Following indirect
+commands are supported.
+1. HL_I2CI_REQ_OP_DEVICE_INFO
+2. HL_I2CI_REQ_OP_DEVICE_STATUS
+3. HL_I2CI_REQ_OP_CONFIG_ACCESS
+4. HL_I2CI_REQ_OP_MEMCPY_CTRL
+5. HL_I2CI_REQ_OP_MEMCPY_DATA
+
+All the changes are ported from preboot code.
+
+Change-Id: Id83097c4b3aa0a700945dd6f555b425b3599ee78
+---
+
+diff --git a/Makefile b/Makefile
+index 0d86baf..b37a47f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,7 +15,7 @@
+ ARCBOOT_VER := 0x0
+ 
+ LIBDIR = sdk/lib
+-ARCBOOT_CFLAGS = -Wall -W -Werror -O3 -g
++ARCBOOT_CFLAGS = -Wall -W -Werror -O3 -g -Wimplicit-fallthrough=0
+ ARCBOOT_CFLAGS += -Iinclude
+ ARCBOOT_CFLAGS += -Icommon
+ ARCBOOT_CFLAGS += -Icommon/rsa
+diff --git a/arch/gaudi2/arc/sha.h b/arch/gaudi2/arc/sha.h
+new file mode 100644
+index 0000000..bd3df9f
+--- /dev/null
++++ b/arch/gaudi2/arc/sha.h
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
+diff --git a/arch/gaudi2/arc/soc.h b/arch/gaudi2/arc/soc.h
+index 4b5eec5..c21c8de 100644
+--- a/arch/gaudi2/arc/soc.h
++++ b/arch/gaudi2/arc/soc.h
+@@ -47,4 +47,6 @@
+ #define HL_SRAM_PHY_END			(HL_SRAM_PHY_BASE +\
+ 					HL_SRAM_PHY_SIZE - 1)
+ 
++#define SDRAM_BASE			0x11000000
++
+ #endif /* _SOC_H_ */
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index 26435f2..1fea950 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -10,5 +10,4 @@
+ 
+ void arcboot_rom_notify_slave(void);
+ uint32_t arcboot_rom_get_num_crc(uint32_t size);
+-uint32_t arcboot_rom_get_arc_addr(uint64_t addr);
+ void arcboot_rom_wait_for_fuse_data(void);
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 2dbf9bd..52dcf62 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -50,6 +50,16 @@
+ 		.teardown = noop,
+ 		.run_noreturn = module_fwupd_run_noret,
+ 	},
++	{       /* I2C SLAVE module */
++		.setup = module_i2c_s_setup,
++		.check = module_i2c_s_check,
++		.disable = module_i2c_s_disable,
++		.run = module_i2c_s_run,
++		.enable = module_i2c_s_enable,
++		.run_fast = module_i2c_s_run_fast,
++		.teardown = module_i2c_s_teardown,
++		.run_noreturn = module_i2c_s_run_noret,
++	},
+ };
+ 
+ static enum dma_dest_type arcboot_rom_get_dma_dest_type(uint64_t addr)
+diff --git a/arch/greco/arc_elf32/sha.h b/arch/greco/arc_elf32/sha.h
+new file mode 100644
+index 0000000..bd3df9f
+--- /dev/null
++++ b/arch/greco/arc_elf32/sha.h
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
+diff --git a/arch/greco/arc_elf32/soc.h b/arch/greco/arc_elf32/soc.h
+index bf96f88..3c141f3 100644
+--- a/arch/greco/arc_elf32/soc.h
++++ b/arch/greco/arc_elf32/soc.h
+@@ -39,4 +39,6 @@
+ 
+ #define HL_CFG_BASE				0xFC000000
+ 
++#define SDRAM_BASE				0x10000000
++
+ #endif /* _SOC_H_ */
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 9add463..5035a3a 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -93,5 +93,15 @@
+ uint32_t i2c_fwupd_readl(uint32_t offset);
+ void i2c_fwupd_writel(uint32_t offset, uint32_t val);
+ 
++/* I2C SLAVE */
++void module_i2c_s_setup(void);
++enum cmd_check_res module_i2c_s_check(void);
++void module_i2c_s_disable(void);
++void module_i2c_s_enable(void);
++void module_i2c_s_run(void);
++void module_i2c_s_run_fast(void);
++void module_i2c_s_teardown(void);
++void module_i2c_s_run_noret(void);
++
+ void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
+ #endif /* _HL_CMD_MODULE_H_ */
+diff --git a/common/device.h b/common/device.h
+index 50c5765..8f62af9 100644
+--- a/common/device.h
++++ b/common/device.h
+@@ -8,6 +8,32 @@
+ struct device_global_conf {
+ 	uint32_t upd_cmd_map;
+ 	uint32_t upd_sts_map;
++	uint32_t i2c_slv_reg;
++	uint32_t i2c_slv_intr_mask_reg;
++};
++
++struct device_i2c_s {
++	uint32_t enable_reg;
++	uint32_t sar_reg;
++	uint32_t con_reg;
++	uint32_t intr_mask_reg;
++	uint32_t intr_stat_reg;
++	uint32_t rx_tl_reg;
++	uint32_t tx_tl_reg;
++	uint32_t data_cmd_reg;
++	uint32_t clr_tx_abrt_reg;
++	uint32_t clr_rx_under_reg;
++	uint32_t clr_rx_over_reg;
++	uint32_t clr_tx_over_reg;
++	uint32_t clr_rx_done_reg;
++	uint32_t clr_activity_reg;
++	uint32_t clr_stop_det_reg;
++	uint32_t clr_start_det_reg;
++	uint32_t clr_gen_call_reg;
++	uint32_t clr_rd_req_reg;
++	uint32_t clr_intr_reg;
++	uint32_t rxflr_reg;
+ };
+ 
+ extern struct device_global_conf global_conf;
++extern struct device_i2c_s i2c_s;
+diff --git a/common/efuse.h b/common/efuse.h
+index cd4567b..9e883f6 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -14,6 +14,8 @@
+ #define EFUSE_READ_DONE				0x2
+ #define EFUSE_NOT_READ				0x1
+ 
++#define EFUSE_DEVICE_ID_0_OFFSET		0x1
++#define EFUSE_DEVICE_ID_1_OFFSET		0x2
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ 
+ #define EFUSE_SYSCFG_GPIO02_RECOVERY_CONTROL	BIT(24)
+diff --git a/common/i2cslave_indirect.c b/common/i2cslave_indirect.c
+new file mode 100644
+index 0000000..eba79e4
+--- /dev/null
++++ b/common/i2cslave_indirect.c
+@@ -0,0 +1,828 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include <bitops.h>
++#include <arcboot.h>
++#include <address_space.h>
++#include <module_i2c_slave.h>
++#include <cmd_module.h>
++#include <hl_i2c_indirect_protocol.h>
++#include <hl_i2c_indirect.h>
++#include <hl_i2c_slave_events.h>
++#include <crc32.h>
++#include <hl_fw_if.h>
++#include <boot_desc.h>
++#include <memory.h>
++#include <efuse.h>
++
++#include "fit.h"
++#include "i2cslave_indirect.h"
++#include <sha.h>
++
++#define SUPPORTED_OPCODES_MASK	( \
++				BIT(HL_I2CI_REQ_OP_DEVICE_INFO) | \
++				BIT(HL_I2CI_REQ_OP_DEVICE_STATUS) | \
++				BIT(HL_I2CI_REQ_OP_CONFIG_ACCESS) | \
++				BIT(HL_I2CI_REQ_OP_MEMCPY_CTRL) | \
++				BIT(HL_I2CI_REQ_OP_MEMCPY_DATA) \
++				)
++
++#define FUSE_DEVID_SIZE		8
++
++struct i2csi_wdata_chunk_context {
++	uint16_t offset; /* Chunk offset within the request */
++	struct hl_i2ci_wdata_chunk_hdr hdr;
++};
++
++struct i2csi_wdata_read_context {
++	uint8_t *data; /* Pointer to data to be read */
++	uint16_t length;
++	union {
++		uint32_t crc;
++		uint8_t req_crc_data[4];
++	};
++	struct hl_i2ci_rdata_hdr hdr;
++};
++
++struct i2csi_wdata_write_context {
++	uint8_t *data;	/* Pointer to written data */
++	uint16_t offset;	/* Offset of overall written data */
++	uint16_t length;	/* Length of bytes to write in a single iteration */
++	uint32_t crc;	/* Calculated CRC */
++	union {
++		uint32_t req_crc;		/* Request CRC from master */
++		uint8_t req_crc_data[4];
++		uint8_t unused[4];		/* For unused data needed for CRC */
++	};
++	struct hl_i2ci_wdata_hdr hdr;
++};
++
++struct i2csi_block_write {
++	uint8_t length;
++	union {
++		struct hl_i2ci_wdata_hdr wdata;
++
++		struct {
++			struct hl_i2ci_req_cfg req_cfg;
++			uint8_t req_cfg_pec;
++		} __packed;
++
++		struct {
++			struct hl_i2ci_ctrl_cmd ctrl_cmd;
++			uint8_t ctrl_cmd_pec;
++		} __packed;
++	};
++} __packed;
++
++struct i2csi_block_write_context {
++	bool is_full_block;
++	struct i2csi_block_write data;
++};
++
++static struct i2csi_block_write_context block_write;
++
++static struct hl_i2ci_req_cfg req_cfg;
++static struct hl_i2ci_req_sts req_sts;
++static struct i2csi_wdata_chunk_context req_chunk;
++static struct i2csi_wdata_read_context req_rd;
++static struct i2csi_wdata_write_context req_wd;
++
++static struct hl_i2ci_device_status op_status = {
++	.device_status = HL_I2CI_REQ_DEV_STS_ARCBOOT,
++	.valid_opcode_map = SUPPORTED_OPCODES_MASK,
++};
++
++static struct hl_i2ci_device_info op_info = {
++	.device_id = 0,
++	.asic_sn = 0,
++};
++
++static struct hl_i2ci_config_access op_config;
++
++static uint32_t op_memcpy_offset;
++static struct hl_i2ci_memcpy_ctrl op_memcpy __aligned(8);
++
++struct hl_i2ci_error_status op_err_status;
++struct hl_i2ci_dram op_dram;
++
++static struct hl_i2ci_ctrl_cmd ctrl_cmd;
++static struct hl_i2ci_ctrl_sts ctrl_sts;
++
++static uint32_t i2csi_block_wait_for(uint8_t block_cmd, uint8_t cmd, uint8_t len, uint8_t **data)
++{
++	uint8_t offset = cmd - block_cmd;
++	bool is_virt = I2CSLAVE_IS_VIRTUAL_CMD(cmd);
++	uint8_t overhead;
++
++	*data = ((uint8_t *)&block_write.data) + offset;
++	if (is_virt || offset) {
++		block_write.is_full_block = false;
++		overhead = 1; /* Adding 1 for len byte itself */
++	} else {
++		block_write.is_full_block = true;
++		overhead = 2; /* Adding 2 for len and pec */
++	}
++
++	return len + overhead - offset;
++}
++
++static void i2csi_req_config_access(void)
++{
++	switch (op_config.command) {
++	case HL_I2CI_CONFIG_CMD_READ:
++		if (i2c_fwupd_owned(op_config.address))
++			op_config.data = i2c_fwupd_readl(op_config.address);
++		else
++			op_config.data = regmap_readl(op_config.address);
++
++		break;
++	case HL_I2CI_CONFIG_CMD_WRITE:
++		if (i2c_fwupd_owned(op_config.address))
++			i2c_fwupd_writel(op_config.address, op_config.data);
++		else
++			regmap_writel(op_config.data, op_config.address);
++
++		break;
++	}
++
++	op_config.status = HL_I2CI_CONFIG_STS_SUCCESS;
++}
++
++static void i2csi_req_load_fw(void)
++{
++	struct mem_desc desc;
++	/*
++	 * Received firmware length is the last requset RDQL + previous
++	 * requests length which is calculate by the header offset.
++	 * Integrity check is not supported for opcode 12 (load fw)
++	 */
++	unsigned int fw_len = req_wd.hdr.rqdl +
++		(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
++
++	arcboot_get_mem_region(MEM_I2C, &desc);
++
++	if (fit_validate_size((void *)desc.base, fw_len))
++		return; /* More data is needed */
++
++	if (fit_load_images((void *)desc.base))
++		req_sts.err = HL_I2CI_REQ_ERR_PROCESS;
++	else
++		i2cslave_fit_set_checked();
++
++}
++
++static void i2csi_req_memcpy_ctrl(void)
++{
++	op_memcpy.address = arcboot_rom_get_arc_addr(op_memcpy.address);
++	if (op_memcpy.address < SDRAM_BASE)
++		goto memcpy_ctrl_fail;
++
++	if (op_memcpy.address > SDRAM_BASE + SRAM_SIZE)
++		goto memcpy_ctrl_fail;
++
++	if (op_memcpy.size > SRAM_SIZE)
++		goto memcpy_ctrl_fail;
++
++	op_memcpy.status = HL_I2CI_MEMCPY_STS_PASS;
++	return;
++
++memcpy_ctrl_fail:
++	op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
++}
++
++static void i2csi_req_memcpy_iterate(void)
++{
++	uint32_t bytes_left;
++
++	switch (op_memcpy.status) {
++	case HL_I2CI_MEMCPY_STS_FAIL:
++	case HL_I2CI_MEMCPY_STS_PASS:
++		op_memcpy_offset = 0;
++		break;
++	case HL_I2CI_MEMCPY_STS_IN_PROGRESS:
++		bytes_left = op_memcpy.size - op_memcpy_offset;
++
++		if (bytes_left > HL_I2CI_MEMCPY_REQ_MAX) {
++			op_memcpy_offset += HL_I2CI_MEMCPY_REQ_MAX;
++		} else {
++			op_memcpy.status = HL_I2CI_MEMCPY_STS_PASS;
++			op_memcpy_offset = 0;
++		}
++
++		break;
++	}
++}
++
++static uint8_t *i2csi_req_memcpy_rw(uint16_t *length)
++{
++	uint32_t bytes_left;
++
++	bytes_left = op_memcpy.size - op_memcpy_offset;
++	if (bytes_left > HL_I2CI_MEMCPY_REQ_MAX)
++		*length = HL_I2CI_MEMCPY_REQ_MAX;
++	else
++		*length = bytes_left;
++
++	if (op_memcpy.status == HL_I2CI_MEMCPY_STS_FAIL) {
++		req_sts.err = HL_I2CI_REQ_ERR_PROCESS;
++		return NULL;
++	}
++
++	op_memcpy.status = HL_I2CI_MEMCPY_STS_IN_PROGRESS;
++	return (uint8_t *)(uintptr_t)(op_memcpy.address + op_memcpy_offset);
++}
++
++static inline void i2csi_req_wdata_wait_for(uint8_t *data, uint16_t length)
++{
++	if (req_wd.hdr.ic && !data && req_wd.offset < req_wd.hdr.rqdl) {
++		/* Data is coming but its unused, we still need to calc CRC */
++		req_wd.data = req_wd.unused;
++		if (length > sizeof(req_wd.unused))
++			length = sizeof(req_wd.unused);
++
++		req_wd.length = length;
++	} else {
++		req_wd.data = data;
++		req_wd.length = length;
++	}
++}
++
++static inline void i2csi_req_wdata_done(void)
++{
++	i2csi_req_wdata_wait_for(NULL, 0);
++}
++
++static void i2csi_req_buffer_get_writable(uint16_t rsize, uint8_t *data, int dlow,
++					  int dhigh)
++{
++	int rlow = req_wd.hdr.offset + req_wd.offset;
++	int rhigh = req_wd.hdr.offset + rsize;
++
++	/* Check out of bound */
++	if (rlow >= dhigh || rhigh <= dlow) {
++		/* If that is not a partial request, produce an error */
++		if (!req_wd.offset)
++			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++
++		i2csi_req_wdata_wait_for(NULL, rhigh - rlow);
++		return;
++	}
++
++	/*
++	 * Check if the lower part of the request tries to write before the
++	 * writable area. Ignore these bytes but don't produce an error since
++	 * the next iteration is valid.
++	 */
++	if (rlow < dlow) {
++		i2csi_req_wdata_wait_for(NULL, dlow - rlow);
++		return;
++	}
++
++	/*
++	 * Check if the write request overshoots the upper writable limit and
++	 * make adjusments accordingly.
++	 */
++	if (rhigh > dhigh)
++		rhigh = dhigh;
++
++	i2csi_req_wdata_wait_for(&data[rlow], rhigh - rlow);
++}
++
++static void i2csi_req_opcode_get_buffer(uint16_t size)
++{
++	int upper_bound;
++	uint8_t *data;
++	struct mem_desc mdesc;
++
++	switch (req_wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++		upper_bound = offsetof(struct hl_i2ci_config_access, status);
++
++		i2csi_req_buffer_get_writable(size, (uint8_t *)&op_config, 0,
++					      upper_bound);
++		break;
++
++	case HL_I2CI_REQ_OP_FW_LOADER:
++		/*
++		 * The firmware data is being placed directly to FIT base
++		 * buffer, it may be assembled by multiple requests so we used
++		 * the offset int the header an index.
++		 * Integrity check is not supported for opcode 12 (fw load)
++		 */
++		arcboot_get_mem_region(MEM_I2C, &mdesc);
++		data = (uint8_t *)mdesc.base +
++			(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
++		i2csi_req_wdata_wait_for(data, size);
++		break;
++
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++		upper_bound = offsetof(struct hl_i2ci_memcpy_ctrl, status);
++
++		i2csi_req_buffer_get_writable(size, (uint8_t *)&op_memcpy, 0,
++					      upper_bound);
++		break;
++
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		i2csi_req_memcpy_iterate();
++
++		if (op_memcpy.command != HL_I2CI_MEMCPY_CMD_WRITE)
++			op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
++
++		data = i2csi_req_memcpy_rw(&size);
++		i2csi_req_wdata_wait_for(data, size);
++		break;
++	default:
++		/* Data will be consumed from HW but not stored anywhere */
++		i2csi_req_wdata_wait_for(NULL, size);
++	}
++}
++
++static inline void i2csi_req_process_read_opcode(void)
++{
++	uint32_t sn_array[FUSE_DEVID_SIZE >> 2];
++
++	switch (req_wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_DEVICE_INFO:
++		if (!op_info.device_id)
++			op_info.device_id = (uint16_t)arcboot_rom_get_device_id();
++
++		if (!op_info.asic_sn) {
++			fuse_read(EFUSE_DEVICE_ID_0_OFFSET, &sn_array[0]);
++			fuse_read(EFUSE_DEVICE_ID_1_OFFSET, &sn_array[1]);
++			memcpy((uint8_t *)&op_info.asic_sn, sn_array, sizeof(op_info.asic_sn));
++		}
++
++		req_rd.data = (uint8_t *)&op_info;
++		req_rd.length = sizeof(op_info);
++		break;
++	case HL_I2CI_REQ_OP_DEVICE_STATUS:
++		op_status.used_btl_image_index = 0; /* No BTL index so set as 0 */
++		req_rd.data = (uint8_t *)&op_status;
++		req_rd.length = sizeof(op_status);
++		break;
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++		req_rd.data = (uint8_t *)&op_config;
++		req_rd.length = sizeof(op_config);
++		break;
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++		req_rd.data = (uint8_t *)&op_memcpy;
++		req_rd.length = sizeof(op_memcpy);
++		break;
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		i2csi_req_memcpy_iterate();
++
++		if (op_memcpy.command != HL_I2CI_MEMCPY_CMD_READ)
++			op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
++
++		req_rd.data = i2csi_req_memcpy_rw(&req_rd.length);
++		break;
++	default:
++		if ((BIT(req_wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
++			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++		else
++			req_sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++		break;
++	}
++}
++
++__weak bool i2c_config_is_address_valid(__unused uint32_t addr)
++{
++	return true;
++}
++
++static inline void i2csi_req_process_write_opcode(void)
++{
++	switch (req_wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++		if (i2c_config_is_address_valid(op_config.address))
++			i2csi_req_config_access();
++		else
++			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++		break;
++	case HL_I2CI_REQ_OP_FW_LOADER:
++		i2csi_req_load_fw();
++		break;
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++		i2csi_req_memcpy_ctrl();
++		break;
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		/* Do nothing */
++		break;
++	case HL_I2CI_REQ_OP_ERROR_STATUS:
++		/* Do nothing */
++		break;
++	default:
++		if ((BIT(req_wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
++			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++		else
++			req_sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++		break;
++	}
++}
++
++static void i2csi_req_wdata_handle_chunk(uint8_t cnt)
++{
++	if (cnt == 2) { /* Chunk (partial payload) is expected */
++		i2csi_req_opcode_get_buffer(req_chunk.hdr.rqcl);
++		if (req_wd.data)
++			req_wd.data += req_chunk.offset;
++
++		return;
++	}
++
++	/* Chunk received */
++	req_chunk.offset += req_chunk.hdr.rqcl;
++
++	/* Payload fully received */
++	if (req_chunk.offset == req_wd.hdr.rqdl) {
++		req_chunk.offset = 0;
++		req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++	}
++
++	i2csi_req_wdata_done();
++}
++
++static void i2csi_req_wdata_handle_payload(void)
++{
++	/* Payload is expected */
++	if (req_wd.offset < req_wd.hdr.rqdl) {
++		i2csi_req_opcode_get_buffer(req_wd.hdr.rqdl);
++		return;
++	}
++
++	/* The payload has arrived, wait for CRC */
++	if (req_wd.hdr.ic) {
++		if (req_wd.offset < req_wd.hdr.rqdl + 4) {
++			i2csi_req_wdata_wait_for(req_wd.req_crc_data, 4);
++			return;
++		} else if (req_wd.req_crc != req_wd.crc) {
++			req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++			req_sts.err = HL_I2CI_REQ_ERR_INTEGRITY;
++			i2csi_req_wdata_done();
++			return;
++		}
++	}
++
++	/* Payload received */
++	req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++	i2csi_req_wdata_done();
++}
++
++static inline void i2csi_req_reset(void)
++{
++	req_sts.err = HL_I2CI_REQ_ERR_NONE;
++	req_sts.rsdl = 0;
++	req_chunk.hdr.rqcl = 0;
++	req_rd.data = NULL;
++	req_rd.length = 0;
++	req_wd.length = 0;
++	req_wd.offset = 0;
++	req_wd.crc = 0;
++	req_wd.hdr.ic = 0;
++}
++
++void i2csi_req_wdata_handle_write(uint8_t cnt)
++{
++	if (cnt > 1) /* Skip the header */
++		req_wd.offset += req_wd.length;
++
++	if (req_chunk.hdr.rqcl) {
++		i2csi_req_wdata_handle_chunk(cnt);
++		return;
++	}
++
++	if (req_wd.hdr.ic && req_wd.length && req_wd.offset <= req_wd.hdr.rqdl)
++		req_wd.crc = crc32(req_wd.crc, req_wd.data, req_wd.length);
++
++	i2csi_req_wdata_handle_payload();
++}
++
++void i2csi_req_wdata_handle_read(uint8_t cnt)
++{
++	if (req_wd.hdr.ic) {
++		switch (cnt) {
++		case 1: /* Header received, wait for CRC */
++			i2csi_req_wdata_wait_for(req_wd.req_crc_data, 4);
++			return;
++
++		case 2: /* CRC received, validate it */
++			if (req_wd.req_crc != req_wd.crc) {
++				req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++				req_sts.err = HL_I2CI_REQ_ERR_INTEGRITY;
++				i2csi_req_wdata_done();
++				return;
++			}
++		}
++	}
++
++	req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++
++	/* Data read with chunks is not supported */
++	if (req_chunk.hdr.rqcl)
++		req_sts.err = HL_I2CI_REQ_ERR_P_DATA_SIZE;
++	else
++		i2csi_req_process_read_opcode();
++
++	if (req_rd.data) {
++		if (req_wd.hdr.offset < req_rd.length) {
++			/* Adjust the read offset */
++			req_rd.data += req_wd.hdr.offset;
++			req_rd.length -= req_wd.hdr.offset;
++		} else {
++			/* Offset overshoots the read data */
++			req_rd.data = NULL;
++			req_rd.length = 0;
++		}
++
++		/* In case master requested partial data */
++		if (req_wd.hdr.rqdl < req_rd.length)
++			req_rd.length = req_wd.hdr.rqdl;
++
++		req_rd.hdr.rsdl = req_wd.hdr.rqdl;
++		req_sts.rsdl = req_wd.hdr.rqdl;
++		req_sts.sm_sts = HL_I2CI_REQ_ST_TRANSMIT;
++	} else {
++		req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	}
++
++	i2csi_req_wdata_done();
++}
++
++/*
++ * Handle request port WDATA command. This command holds a data buffer which
++ * is being transferred by the master. The request may be divided into chunks
++ * and this function also handles this possibility.
++ *
++ * This function is being called 3-4 time per WDATA command. Depends whether
++ * the request is divided into chunks or not.
++ * - 1. [cnt=0] WDATA was recorded, wait for header.
++ * - 2. [cnt=1] Header arrived, wait for chunk header or payload
++ * - 3. [cnt=2,no chunks] - payload was written, done this WDATA command
++ *      [cnt=2,chunks]    - chunk header was written, wait for payload
++ * - 4. [cnt=3,chunks]    - payload was written, done this WDATA command
++ *
++ * Arguments:
++ * - cnt:  the number of time this function is called per current command
++ *         context.
++ */
++static void i2csi_req_wdata_process_data(uint8_t cnt)
++{
++	if (cnt == 1) { /* Chunk header or payload are expected */
++		req_wd.hdr = block_write.data.wdata;
++		if (HL_I2CI_REQ_RQCL_IS_EXISTS(req_wd.hdr)) {
++			i2csi_req_wdata_wait_for(req_chunk.hdr.data,
++						 HL_I2CI_REQ_CHUNK_LEN);
++			return;
++		}
++
++		if (req_wd.hdr.ic)
++			req_wd.crc = crc32(0, req_wd.hdr.data,
++					   sizeof(req_wd.hdr));
++	}
++
++	if (req_wd.hdr.write)
++		i2csi_req_wdata_handle_write(cnt);
++	else
++		i2csi_req_wdata_handle_read(cnt);
++}
++
++uint32_t i2csi_req_handle_wdata(uint8_t cmd, uint8_t **data, uint8_t cnt)
++{
++	if (!cnt) { /* Header is expected */
++		req_sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
++		i2csi_req_reset();
++		block_write.data.wdata = req_wd.hdr;
++		return i2csi_block_wait_for(HL_INDIRECT_REQ_WDATA_CODE, cmd,
++					    HL_I2CI_REQ_WDATA_LEN, data);
++	}
++
++	i2csi_req_wdata_process_data(cnt);
++	*data = req_wd.data;
++
++	return req_wd.length;
++}
++
++/*
++ * Handle request port status reading by the master. Update the request status
++ * header with the latest WDATA opcode data and send it on its way.
++ */
++uint8_t i2csi_req_handle_sts(uint8_t cmd)
++{
++	int idx = cmd - HL_INDIRECT_REQ_STS_DATA;
++
++	if (idx >= HL_I2CI_REQ_STS_LEN)
++		return 0;
++
++	req_sts.opcode = req_wd.hdr.opcode;
++	req_sts.write = req_wd.hdr.write;
++	req_sts.ic = req_wd.hdr.ic;
++
++	return req_sts.data[idx];
++}
++
++/*
++ * Handle request port read request. Return the RDATA header, followed by the
++ * payload.
++ */
++uint8_t i2csi_req_handle_rdata(uint8_t cmd, uint32_t read_seq)
++{
++	int idx = cmd + read_seq - HL_INDIRECT_REQ_RDATA_DATA;
++	uint8_t zero = 0, rd_data;
++
++	/* Header */
++	if (idx < HL_I2CI_REQ_RDATA_LEN)
++		return req_rd.hdr.data[idx];
++
++	if (req_wd.hdr.ic && (uint32_t) idx == HL_I2CI_REQ_RDATA_LEN)
++		req_rd.crc = crc32(0, req_rd.hdr.data, HL_I2CI_REQ_RDATA_LEN);
++
++	/* Payload */
++	idx -= HL_I2CI_REQ_RDATA_LEN;
++	if (idx < req_rd.length) {
++		rd_data = req_rd.data[idx];
++		return rd_data;
++	}
++
++	if (req_wd.hdr.ic && idx < req_rd.hdr.rsdl + 4) {
++		if (idx == req_rd.length) {
++			req_rd.crc = crc32(req_rd.crc, req_rd.data,
++					   req_rd.length);
++		}
++
++		/* CRC trivial read 0 for reading of out bound */
++		if (idx < req_rd.hdr.rsdl)
++			req_rd.crc = crc32(req_rd.crc, &zero, 1);
++
++		/* CRC */
++		if (idx >= req_rd.hdr.rsdl && idx < req_rd.hdr.rsdl + 4) {
++			idx -= req_rd.hdr.rsdl;
++			if (idx < (int) sizeof(req_rd.req_crc_data))
++				return req_rd.req_crc_data[idx];
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Lower layer reports sync error. This means it expected the master to write
++ * bytes but instead is got a read request.
++ * In this case we zero out the state machine and buffer offsets.
++ */
++void i2csi_req_handle_sync_error(void)
++{
++	if (req_sts.sm_sts == HL_I2CI_REQ_ST_IDLE)
++		return;
++
++	req_chunk.offset = 0;
++	req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	req_sts.rsdl = 0;
++	req_sts.err = HL_I2CI_REQ_ERR_P_DATA_SIZE;
++}
++
++/*
++ * Handle request port configuration register. Set the init bit in request
++ * status reply.
++ * This function is called when the lower layer needs a buffer to write the
++ * data to and the number of bytes it whould write before calling this function
++ * again.
++ *
++ * Arguments:
++ * - data: needs to be set to a designated buffer on which a new data will be
++ *         written into.
++ * - cnt:  the number of time this function is called per current command
++ *         context.
++ *
++ * Returns:
++ *   The number of bytes the lower layer should write into supplied buffer
++ *   before calling this function again. Returning 0 means the command handling
++ *   was finished.
++ */
++uint32_t i2csi_req_handle_cfg(uint8_t cmd, uint8_t **data, uint8_t cnt)
++{
++	if (!cnt) {/* Header is expected */
++		block_write.data.req_cfg = req_cfg;
++		return i2csi_block_wait_for(HL_INDIRECT_REQ_CFG_CODE, cmd,
++					    HL_I2CI_REQ_CFG_LEN, data);
++	}
++
++	if (block_write.is_full_block) {
++		i2cslave_valid_pec = i2cslave_pec;
++		if (i2cslave_pec != block_write.data.req_cfg_pec)
++			return 0;
++	}
++
++	req_cfg = block_write.data.req_cfg;
++
++	/* Request config received */
++	req_sts.init = req_cfg.init;
++	req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	req_sts.err = HL_I2CI_REQ_ERR_NONE;
++
++	return 0;
++}
++
++void i2csi_req_set_idle(void)
++{
++	req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	req_sts.rsdl = 0;
++	req_sts.err = HL_I2CI_REQ_ERR_NONE;
++}
++
++void i2csi_req_handle_process_op(void)
++{
++	i2csi_req_process_write_opcode();
++	req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++}
++
++bool i2csi_req_is_process_op(void)
++{
++	return req_sts.sm_sts == HL_I2CI_REQ_ST_PROCESS;
++}
++
++bool i2csi_req_op_is_fast(void)
++{
++	switch (req_wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		return true;
++	case HL_I2CI_REQ_OP_FW_LOADER:
++	default:
++		return false;
++	}
++}
++
++uint32_t i2csi_ctrl_handle_command(uint8_t cmd, uint8_t **data, uint8_t cnt)
++{
++	struct hl_i2ci_ctrl_cpsr *cpsr;
++
++	/* Command is expected */
++	if (!cnt) {
++		block_write.data.ctrl_cmd = ctrl_cmd;
++		return i2csi_block_wait_for(HL_INDIRECT_CTRL_CMD_CODE, cmd,
++					    HL_I2CI_CTRL_CMD_LEN, data);
++	}
++
++	if (block_write.is_full_block) {
++		i2cslave_valid_pec = i2cslave_pec;
++		if (i2cslave_pec != block_write.data.ctrl_cmd_pec)
++			return 0;
++	}
++
++	ctrl_cmd = block_write.data.ctrl_cmd;
++
++	ctrl_sts.tag = ctrl_cmd.tag;
++	ctrl_sts.status = HL_I2CI_CTRL_STS_BUSY;
++	ctrl_sts.error = HL_I2CI_CTRL_ERR_NONE;
++	cpsr = &ctrl_sts.cpsr;
++
++	switch (ctrl_cmd.opcode) {
++	case HL_I2CI_CTRL_OP_ABORT:
++		i2csi_req_set_idle();
++		cpsr->abort.status = HL_I2CI_CTRL_ABORT_NONE;
++		break;
++	case HL_I2CI_CTRL_OP_GET_API_VER:
++		cpsr->version.major = HL_I2CI_API_VERSION_MAJOR;
++		cpsr->version.minor = HL_I2CI_API_VERSION_MINOR;
++		cpsr->version.patch = HL_I2CI_API_VERSION_PATCH;
++		break;
++	case HL_I2CI_CTRL_OP_GET_OS_STATE:
++		cpsr->os_state.pcie_access = HL_I2CI_CTRL_ACCESS_FULL;
++		cpsr->os_state.mgmt_access = HL_I2CI_CTRL_ACCESS_FULL;
++		cpsr->os_state.os_state = HL_I2CI_CTRL_OS_ARCBOOT;
++		break;
++	case HL_I2CI_CTRL_OP_RESET_DEVICE:
++		/* Remain busy - action will take place from I2C SM */
++		return 0;
++	default:
++		ctrl_sts.error = HL_I2CI_CTRL_ERR_INVALID_OPCODE;
++	}
++
++	ctrl_sts.status = HL_I2CI_CTRL_STS_RESP_RDY;
++
++	return 0;
++}
++
++uint8_t i2csi_ctrl_handle_status(uint8_t cmd)
++{
++	register int idx = cmd - HL_INDIRECT_CTRL_STS_DATA;
++	uint8_t ret;
++
++	if (idx >= HL_I2CI_CTRL_STS_LEN)
++		return 0;
++
++	ret = ctrl_sts.data[idx];
++
++	/* Read till the end - return to idle */
++	if (idx == HL_I2CI_CTRL_STS_LEN - 1)
++		memset(ctrl_sts.data, 0, HL_I2CI_CTRL_STS_LEN);
++
++	return ret;
++}
+diff --git a/common/i2cslave_indirect.h b/common/i2cslave_indirect.h
+new file mode 100644
+index 0000000..1836a0d
+--- /dev/null
++++ b/common/i2cslave_indirect.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _I2CSLAVE_INDIRECT_H_
++#define _I2CSLAVE_INDIRECT_H_
++
++#include <hl_fw_if.h>
++
++uint8_t i2csi_req_handle_sts(uint8_t cmd);
++uint8_t i2csi_req_handle_rdata(uint8_t cmd, uint32_t read_seq);
++uint32_t i2csi_req_handle_wdata(uint8_t cmd, uint8_t **data, uint8_t cnt);
++uint32_t i2csi_req_handle_cfg(uint8_t cmd, uint8_t **data, uint8_t cnt);
++uint32_t i2csi_ctrl_handle_command(uint8_t cmd, uint8_t **data, uint8_t cnt);
++uint8_t i2csi_ctrl_handle_status(uint8_t cmd);
++void i2csi_req_set_idle(void);
++void i2csi_req_handle_sync_error(void);
++void i2csi_req_handle_process_op(void);
++bool i2csi_req_is_process_op(void);
++bool i2csi_req_op_is_fast(void);
++
++#endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+new file mode 100644
+index 0000000..827065e
+--- /dev/null
++++ b/common/module_i2c_slave.c
+@@ -0,0 +1,585 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stdint.h>
++#include <stddef.h>
++#include <arcboot.h>
++#include <address_space.h>
++#include <device.h>
++#include <delay.h>
++#include <fit.h>
++#include <hl_fw_if.h>
++#include <hl_i2c_slave_events.h>
++#include <hl_i2c_indirect_protocol.h>
++#include <hl_i2c_indirect.h>
++#include <i2cslave_indirect.h>
++#include <common/pci_ids.h>
++#include <crc8.h>
++#include "cmd_module.h"
++#include "common.h"
++#include "module_i2c_slave.h"
++
++#define I2C_SLAVE_ADDRESS		0x6A
++#define I2C_SLAVE_ADDRESS_DBG		I2C_SLAVE_ADDRESS
++#define I2C_SLAVE_DEFAULT_INTR_MASK	0x48FF
++
++struct i2cslave_seq {
++	uint32_t rd;
++	uint32_t wr;
++};
++
++struct i2cslave_buf {
++	uint8_t *data;
++	uint8_t cmd;
++	uint8_t seq_cmd;
++	uint8_t cnt;
++	bool is_sync_error;
++	bool is_direct_pec;
++};
++
++struct i2cslave_data {
++	struct i2cslave_seq seq;
++	struct i2cslave_buf buf;
++};
++
++struct device_i2c_s i2c_s;
++static struct i2cslave_data i2cs_data;
++static bool is_fit_checked;
++
++uint8_t i2cslave_valid_pec;
++uint8_t i2cslave_pec;
++static uint8_t pec_table[CRC8_TABLE_SIZE];
++
++void i2cslave_fit_set_checked(void)
++{
++	is_fit_checked = true;
++}
++
++bool i2cslave_fit_is_checked(void)
++{
++	return is_fit_checked;
++}
++
++void i2cslave_fit_run_image(void)
++{
++	fit_run_image();
++}
++
++bool i2cslave_is_reset_dev(void)
++{
++	return false; /* TODO: Implement reset routine */
++}
++
++void i2cslave_reset_dev(void)
++{
++	/* TODO: Implement reset routine */
++}
++
++bool i2cslave_indirect_is_process_op(void)
++{
++	return i2csi_req_is_process_op();
++}
++
++void i2cslave_indirect_process_op(void)
++{
++	i2csi_req_handle_process_op();
++}
++
++bool i2cslave_indirect_op_is_fast(void)
++{
++	return i2csi_req_op_is_fast();
++}
++
++static void i2cslave_reset_buffer(struct i2cslave_buf *buf)
++{
++	buf->data = &i2cs_data.buf.cmd;
++	buf->cnt = 0;
++	buf->is_sync_error = false;
++	i2cslave_pec = 0;
++	i2cslave_pec_digest(I2C_SLAVE_ADDRESS << 1);
++}
++
++static void i2cslave_init(void)
++{
++	/* Check if already enabled */
++	if (regmap_readl(i2c_s.enable_reg))
++		return;
++
++	/* Program IC_SAR with address to which slave responds */
++	regmap_writel(I2C_SLAVE_ADDRESS, i2c_s.sar_reg);
++
++	/* Enable I2C Slave */
++	regmap_writel(0x1, global_conf.i2c_slv_reg);
++
++	/* Enable I2C Slave interrupts */
++	regmap_writel(0x0, global_conf.i2c_slv_intr_mask_reg);
++
++	/* Program IC_CON */
++	regmap_writel(0x22, i2c_s.con_reg);
++
++	/* Set INTR mask to default */
++	regmap_writel(I2C_SLAVE_DEFAULT_INTR_MASK, i2c_s.intr_mask_reg);
++
++	/* Write to IC_RX_TL to set Rx FIFO threshold level */
++	regmap_writel(0x0, i2c_s.rx_tl_reg);
++
++	/* Write to IC_TX_TL to set Tx FIFO threshold level */
++	regmap_writel(0x7, i2c_s.tx_tl_reg);
++
++	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
++	regmap_writel(0x1, i2c_s.enable_reg);
++}
++
++#define PSOC_I2C_S_IC_INTR_STAT_R_RX_UNDER_MASK		0x1
++#define PSOC_I2C_S_IC_INTR_STAT_R_RX_OVER_MASK		0x2
++#define PSOC_I2C_S_IC_INTR_STAT_R_TX_OVER_MASK		0x8
++#define PSOC_I2C_S_IC_INTR_STAT_R_TX_ABRT_MASK		0x40
++#define PSOC_I2C_S_IC_INTR_STAT_R_RX_DONE_MASK		0x80
++#define PSOC_I2C_S_IC_INTR_STAT_R_ACTIVITY_MASK		0x100
++#define PSOC_I2C_S_IC_INTR_STAT_R_STOP_DET_MASK		0x200
++#define PSOC_I2C_S_IC_INTR_STAT_R_START_DET_MASK	0x400
++#define PSOC_I2C_S_IC_INTR_STAT_R_GEN_CALL_MASK		0x800
++
++static uint32_t i2cslave_dw_read_clear_intrbits_slave(void)
++{
++	register uint32_t stat;
++
++	/*
++	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
++	 * Ths unmasked raw version of interrupt status bits are available
++	 * in the IC_RAW_INTR_STAT register.
++	 *
++	 * That is,
++	 *   stat = regmap_readl(IC_INTR_STAT);
++	 * equals to,
++	 *   stat = regmap_readl(IC_RAW_INTR_STAT) & regmap_readl(IC_INTR_MASK);
++	 *
++	 * The raw version might be useful for debugging purposes.
++	 */
++	stat = regmap_readl(i2c_s.intr_stat_reg);
++
++	/*
++	 * Do not use the IC_CLR_INTR register to clear interrupts, or
++	 * you'll miss some interrupts, triggered during the period from
++	 * regmap_readl(IC_INTR_STAT) to regmap_readl(IC_CLR_INTR).
++	 *
++	 * Instead, use the separately-prepared IC_CLR_* registers.
++	 */
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_ABRT_MASK)
++		regmap_readl(i2c_s.clr_tx_abrt_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_UNDER_MASK)
++		regmap_readl(i2c_s.clr_rx_under_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_OVER_MASK)
++		regmap_readl(i2c_s.clr_rx_over_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_OVER_MASK)
++		regmap_readl(i2c_s.clr_tx_over_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_DONE_MASK)
++		regmap_readl(i2c_s.clr_rx_done_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_ACTIVITY_MASK)
++		regmap_readl(i2c_s.clr_activity_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_STOP_DET_MASK)
++		regmap_readl(i2c_s.clr_stop_det_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_START_DET_MASK)
++		regmap_readl(i2c_s.clr_start_det_reg);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_GEN_CALL_MASK)
++		regmap_readl(i2c_s.clr_gen_call_reg);
++
++	return stat;
++}
++
++#define PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK		0x4
++#define PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK		0x20
++
++static void i2cslave_flush(void)
++{
++	uint32_t stat = regmap_readl(i2c_s.intr_stat_reg);
++
++	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK |
++		    PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK))
++		module_i2c_s_run();
++}
++
++void module_i2c_s_enable(void)
++{
++	i2cslave_init();
++
++	i2cslave_flush();
++	regmap_writel(0x1, i2c_s.enable_reg);
++	i2cslave_flush();
++}
++
++void i2cslave_pec_init(void)
++{
++	crc8_populate_msb(pec_table, HL_I2C_CRC8_POLYNOMIAL);
++}
++
++void i2cslave_pec_digest(uint8_t val)
++{
++	i2cslave_pec = crc8(pec_table, &val, 1, i2cslave_pec);
++}
++
++void module_i2c_s_setup(void)
++{
++	i2cslave_pec_init();
++	module_i2c_s_enable();
++}
++
++enum cmd_check_res module_i2c_s_check(void)
++{
++	uint32_t stat;
++
++	if (i2cslave_fit_is_checked() || i2cslave_is_reset_dev())
++		return FOUND_NO_RETURN;
++
++	stat = i2cslave_dw_read_clear_intrbits_slave();
++
++	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
++	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)) {
++		return FOUND_SLOW_RETURN;
++	}
++
++	if (i2cslave_indirect_is_process_op()) {
++		if (i2cslave_indirect_op_is_fast())
++			return FOUND_FAST_RETURN;
++		else
++			return FOUND_SLOW_RETURN;
++	}
++
++	return NOT_FOUND;
++}
++
++#define PSOC_I2C_S_IC_CON_IC_SLAVE_DISABLE_MASK		0x40
++
++void module_i2c_s_disable(void)
++{
++	uint32_t val;
++
++	i2cslave_flush();
++	regmap_writel(0x0, i2c_s.enable_reg);
++	udelay(100);
++
++	/* Write IC_SLAVE_DISABLE to IC_CON */
++	val = regmap_readl(i2c_s.con_reg);
++	val |= PSOC_I2C_S_IC_CON_IC_SLAVE_DISABLE_MASK;
++	regmap_writel(val, i2c_s.con_reg);
++
++	udelay(1000);
++
++	i2cslave_flush();
++}
++
++uint8_t i2cslave_pcie_vendor_id_cmd(uint8_t cmd)
++{
++	uint8_t ret;
++	uint32_t dev_id = arcboot_rom_get_device_id();
++
++	switch (cmd) {
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++		ret = PCI_VENDOR_ID_HABANALABS >> 8;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++		ret = PCI_VENDOR_ID_HABANALABS & 0xFF;
++		break;
++	case HL_PCIE_DEVICE_ID_VAL_LOW:
++		ret = (uint8_t)(dev_id >> 8);
++		break;
++	case HL_PCIE_DEVICE_ID_VAL_HIGH:
++		ret = (uint8_t)dev_id;
++		break;
++	default:
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
++uint8_t i2cslave_handle_read_req(uint8_t cmd, uint32_t read_seq)
++{
++	uint32_t ret = 0;
++
++	switch (cmd) {
++	case HL_DEVICE_STATUS_CMD_CODE:
++		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
++		break;
++	case HL_DEVICE_STATUS:
++		ret = HL_DEVICE_STATUS_ARCBOOT;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++	case HL_PCIE_DEVICE_ID_VAL_LOW:
++	case HL_PCIE_DEVICE_ID_VAL_HIGH:
++		ret = i2cslave_pcie_vendor_id_cmd(cmd);
++		break;
++	case HL_INDIRECT_REQ_STS_CODE:
++		ret = HL_I2CI_REQ_STS_LEN;
++		break;
++	case HL_INDIRECT_REQ_STS_DATA:
++	case HL_INDIRECT_REQ_STS_DATA_1:
++	case HL_INDIRECT_REQ_STS_DATA_2:
++	case HL_INDIRECT_REQ_STS_DATA_3:
++	case HL_INDIRECT_REQ_STS_DATA_4:
++		ret = i2csi_req_handle_sts(cmd);
++		break;
++	case HL_INDIRECT_REQ_WDATA_CODE:
++		ret = HL_I2CI_REQ_WDATA_LEN;
++		break;
++	case HL_INDIRECT_REQ_CFG_CODE:
++		ret = HL_I2CI_REQ_CFG_LEN;
++		break;
++	case HL_INDIRECT_REQ_RDATA_CODE:
++		if (!read_seq) {
++			ret = HL_I2CI_REQ_RDATA_LEN;
++			break;
++		}
++	case HL_INDIRECT_REQ_RDATA_DATA:
++	case HL_INDIRECT_REQ_RDATA_DATA_1:
++	case HL_INDIRECT_REQ_RDATA_DATA_2:
++	case HL_INDIRECT_REQ_RDATA_DATA_3:
++		ret = i2csi_req_handle_rdata(cmd, read_seq);
++		break;
++	case HL_INDIRECT_CTRL_CMD_CODE:
++		ret = HL_I2CI_CTRL_CMD_LEN;
++		break;
++	case HL_INDIRECT_CTRL_STS_CODE:
++		ret = HL_I2CI_CTRL_STS_LEN;
++		break;
++	case HL_INDIRECT_CTRL_STS_DATA:
++	case HL_INDIRECT_CTRL_STS_DATA_1:
++	case HL_INDIRECT_CTRL_STS_DATA_2:
++	case HL_INDIRECT_CTRL_STS_DATA_3:
++		ret = i2csi_ctrl_handle_status(cmd);
++		break;
++	default:
++		if (HL_I2C_EVENT_IS_PEC(cmd))
++			ret = i2cslave_pec;
++		else
++			ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
++uint32_t i2cslave_handle_write_req(uint8_t cmd, uint8_t **data, uint8_t cnt)
++{
++	switch (cmd) {
++	case HL_INDIRECT_REQ_WDATA_CODE:
++	case HL_INDIRECT_REQ_WDATA_DATA:
++		return i2csi_req_handle_wdata(cmd, data, cnt);
++	case HL_INDIRECT_REQ_CFG_CODE:
++	case HL_INDIRECT_REQ_CFG_DATA:
++	case HL_INDIRECT_REQ_CFG_PEC:
++		return i2csi_req_handle_cfg(cmd, data, cnt);
++	case HL_INDIRECT_CTRL_CMD_CODE:
++	case HL_INDIRECT_CTRL_CMD_DATA:
++	case HL_INDIRECT_CTRL_CMD_DATA_1:
++	case HL_INDIRECT_CTRL_CMD_DATA_2:
++	case HL_INDIRECT_CTRL_CMD_DATA_3:
++	case HL_INDIRECT_CTRL_CMD_PEC:
++		return i2csi_ctrl_handle_command(cmd, data, cnt);
++	case HL_INDIRECT_REQ_RDATA_CODE:
++	case HL_INDIRECT_REQ_RDATA_DATA:
++		i2csi_req_set_idle();
++		break;
++	default:
++		return 0;
++	}
++
++	return 0;
++}
++
++void i2cslave_handle_sync_error(void)
++{
++	i2csi_req_handle_sync_error();
++}
++
++static inline uint8_t *i2cslave_consume_hw(uint8_t *data, uint8_t cnt)
++{
++	register uint8_t val = (uint8_t)regmap_readl(i2c_s.data_cmd_reg);
++	register uint8_t cmd;
++	bool is_virt;
++	bool is_pec;
++
++	if (data) {
++		*data = (uint8_t)val;
++		data++;
++	}
++
++	/* New command code, save it for sequential increase */
++	if (!cnt)
++		i2cs_data.buf.seq_cmd = i2cs_data.buf.cmd;
++
++	cmd = i2cs_data.buf.seq_cmd;
++	is_virt = I2CSLAVE_IS_VIRTUAL_CMD(cmd);
++	if (!is_virt) {
++		is_pec = HL_I2C_EVENT_IS_PEC(cmd);
++		if (!is_pec)
++			i2cslave_pec_digest(val);
++
++		/* Increase command sequence for data bytes */
++		if (cnt)
++			i2cs_data.buf.seq_cmd = cmd + 1;
++	}
++
++	return data;
++}
++
++static inline uint32_t i2cslave_produce_handler(struct i2cslave_buf *buf)
++{
++	register uint32_t seq_wr = 0;
++	register uint8_t cmd = buf->cmd;
++
++	/* Just started to process and PEC cmd called directly */
++	buf->is_direct_pec = !buf->cnt && HL_I2C_EVENT_IS_PEC(cmd);
++
++	/* Notify upper layer */
++	if (!buf->is_direct_pec)
++		seq_wr = i2cslave_handle_write_req(cmd, &buf->data, buf->cnt);
++
++	if (seq_wr)
++		buf->cnt++;
++
++	return seq_wr;
++}
++
++static void module_i2c_s_do_write(void)
++{
++	register struct i2cslave_seq seq = i2cs_data.seq;
++	register uint8_t *data = i2cs_data.buf.data;
++	register uint8_t cnt = i2cs_data.buf.cnt;
++
++	/* Next read will start from offset 0 */
++	seq.rd = 0;
++
++	do {
++		/* Upper layer finished it's process, reset buffer */
++		if (!seq.wr) {
++			i2cslave_reset_buffer(&i2cs_data.buf);
++			seq.wr = 1;
++			data = i2cs_data.buf.data;
++			cnt = i2cs_data.buf.cnt;
++		}
++		/* Consume data as long as we expect it */
++		if (seq.wr) {
++			seq.wr--;
++			data = i2cslave_consume_hw(data, cnt);
++		}
++		/* Additional data is not expected, produce data */
++		if (!seq.wr) {
++			seq.wr = i2cslave_produce_handler(&i2cs_data.buf);
++			data = i2cs_data.buf.data;
++			cnt = i2cs_data.buf.cnt;
++		}
++	} while (regmap_readl(i2c_s.rxflr_reg));
++
++	i2cs_data.seq = seq;
++	i2cs_data.buf.data = data;
++}
++
++static inline uint8_t i2cslave_consume_handler(void)
++{
++	struct i2cslave_buf *buf = &i2cs_data.buf;
++	uint8_t seq_cmd = buf->seq_cmd;
++	uint8_t ret;
++
++	if (i2cs_data.buf.is_direct_pec)
++		return i2cslave_valid_pec;
++
++	/* Check if we are in the middle of write request processing */
++	if (i2cs_data.seq.wr) {
++		i2cslave_handle_sync_error();
++		i2cs_data.seq.wr = 0;
++		buf->is_sync_error = true;
++	}
++
++	if (buf->is_sync_error)
++		return 0;
++
++	ret = i2cslave_handle_read_req(seq_cmd, i2cs_data.seq.rd);
++
++	if (!i2cs_data.seq.rd)
++		i2cslave_pec_digest((I2C_SLAVE_ADDRESS << 1) | 1);
++
++	/* For next sequential read */
++	i2cs_data.seq.rd++;
++	if (!I2CSLAVE_IS_VIRTUAL_CMD(seq_cmd)) {
++		i2cs_data.buf.seq_cmd = seq_cmd + 1;
++		i2cslave_pec_digest(ret);
++	}
++
++	return ret;
++}
++
++static inline void i2cslave_produce_hw(uint8_t data)
++{
++	regmap_readl(i2c_s.clr_rd_req_reg);
++	regmap_readl(i2c_s.clr_rx_under_reg);
++	regmap_writel(data, i2c_s.data_cmd_reg);
++}
++
++static void module_i2c_s_do_read(void)
++{
++	uint8_t data = i2cslave_consume_handler();
++
++	i2cslave_produce_hw(data);
++}
++
++void module_i2c_s_run(void)
++{
++	uint32_t stat = regmap_readl(i2c_s.intr_stat_reg);
++
++	/*
++	 * Process the read request only after all the written data is
++	 * consumed.
++	 */
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)
++		module_i2c_s_do_write();
++	else if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK)
++		module_i2c_s_do_read();
++	else
++		i2cslave_indirect_process_op();
++}
++
++void module_i2c_s_run_fast(void)
++{
++	i2cslave_indirect_process_op();
++}
++
++void module_i2c_s_teardown(void)
++{
++	uint32_t val;
++
++	/* Write 0 to IC_ENABLE to disable DW_apb_i2c */
++	regmap_writel(0, i2c_s.enable_reg);
++
++	/* wait for disable to impact */
++	udelay(100);
++
++	/* Disable all interrupts */
++	regmap_writel(0x0, i2c_s.intr_mask_reg);
++	regmap_readl(i2c_s.clr_intr_reg);
++
++	/* Write IC_SLAVE_DISABLE to IC_CON */
++	val = regmap_readl(i2c_s.con_reg);
++	val |= PSOC_I2C_S_IC_CON_IC_SLAVE_DISABLE_MASK;
++	regmap_writel(val, i2c_s.con_reg);
++
++	/* Make sure all transactions arrived */
++	udelay(1000);
++
++	i2cslave_flush();
++}
++
++void module_i2c_s_run_noret(void)
++{
++	module_i2c_s_teardown();
++	if (i2cslave_is_reset_dev())
++		i2cslave_reset_dev();
++	else
++		i2cslave_fit_run_image();
++}
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+new file mode 100644
+index 0000000..a6acc28
+--- /dev/null
++++ b/common/module_i2c_slave.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _MODULE_I2C_SLAVE_H_
++#define _MODULE_I2C_SLAVE_H_
++
++#define I2CSLAVE_IS_VIRTUAL_CMD(cmd) (			\
++		(cmd) >= HL_INDIRECT_REQ_WDATA_CODE &&	\
++		(cmd) <= HL_INDIRECT_REQ_RDATA_DATA_3	\
++	)
++
++extern uint32_t err_sts_reg_val;
++
++uint8_t i2cslave_pcie_vendor_id_cmd(uint8_t cmd);
++uint8_t i2cslave_handle_read_req(uint8_t cmd, uint32_t read_seq);
++uint32_t i2cslave_handle_write_req(uint8_t cmd, uint8_t **data, uint8_t cnt);
++void i2cslave_handle_sync_error(void);
++void i2cslave_fit_set_checked(void);
++bool i2cslave_fit_is_checked(void);
++void i2cslave_fit_run_image(void);
++bool i2cslave_indirect_is_process_op(void);
++bool i2cslave_indirect_op_is_fast(void);
++void i2cslave_indirect_process_op(void);
++bool i2cslave_is_reset_dev(void);
++void i2cslave_reset_dev(void);
++
++extern uint8_t i2cslave_pec;		/* Ongoing digest of CRC-8 */
++extern uint8_t i2cslave_valid_pec;	/* To validate PEC by Master */
++
++void i2cslave_pec_init(void);
++void i2cslave_pec_digest(uint8_t val);
++
++#endif /* _MODULE_I2C_SLAVE_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index fd6fc56..0984180 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -8,6 +8,7 @@
+ #ifndef _ARCBOOT_H_
+ #define _ARCBOOT_H_
+ 
++#include <stddef.h>
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <stdbool.h>
+@@ -31,6 +32,10 @@
+ 
+ #ifndef __unused
+ #define __unused	__attribute__((__unused__))
++#endif
++
++#ifndef __aligned
++#define __aligned(x)	__attribute__((aligned(x)))
+ #endif
+ 
+ #define ROUND_UP4(n)			(((n) + sizeof(uint32_t) - 1) & ~(sizeof(uint32_t) - 1))
+@@ -284,6 +289,7 @@
+ uint32_t arcboot_error_read_and_clr(uint32_t *major, uint32_t *minor);
+ bool arcboot_error_inform(uint32_t major, uint32_t minor);
+ bool arcboot_error_is_pending(void);
++uint32_t arcboot_rom_get_arc_addr(uint64_t addr);
+ uint32_t arcboot_rom_get_device_id(void);
+ 
+ #define CLEAR_DMA_SECURITY_PROGRESS 0x3

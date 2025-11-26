@@ -1,0 +1,150 @@
+From b8eb5d02591a0d47de934442ac01a339e5a9972b Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 14 Mar 2024 06:53:20 +0200
+Subject: [PATCH] [FSW-402] fs1: bootrom_init: add spi flash init
+
+This patch adds spi flash init support which will set
+baud rate and write limit and disable byte swap.
+
+Change-Id: I59b52e347039b56c18ab0950fd96e29dfa55abdc
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 1fb9400..b3e84cc 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -5,4 +5,5 @@
+ BINARIES = boot_rom.bin
+ 
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
+ 
+diff --git a/arch/fs1/arc/dev_spi_flash.c b/arch/fs1/arc/dev_spi_flash.c
+new file mode 100644
+index 0000000..2f52ebf
+--- /dev/null
++++ b/arch/fs1/arc/dev_spi_flash.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <mem_io.h>
++#include <spi_flash.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++#include <global_conf_regs.h>
++#include <global_conf_masks.h>
++#include <spi_regs.h>
++
++void spi_flash_set_byte_swap(uint8_t enable)
++{
++	uint32_t reg_spi_direct_wr_rd_ctrl = 0;
++
++	/* clear BYTE SWAP in SPI DMA so we dont switch endianness */
++	reg_spi_direct_wr_rd_ctrl =
++		regmap_readl(IO0_HALF0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL));
++	if (enable)
++		reg_spi_direct_wr_rd_ctrl |=
++			GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL_BYTE_SWAP_M;
++	else
++		reg_spi_direct_wr_rd_ctrl &=
++			~GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL_BYTE_SWAP_M;
++
++	regmap_writel(reg_spi_direct_wr_rd_ctrl,
++		      IO0_HALF0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL));
++}
++
++void spi_flash_set_baud_rate(uint8_t baud_rate)
++{
++	regmap_writel(baud_rate, IO0_HALF0_PSOC_QSPI_BASE(mmSPI_BAUDR));
++}
++
++void spi_flash_set_write_limit(enum flash_write_limit write_limit)
++{
++	regmap_writel(write_limit, IO0_HALF0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SPI_WRITE_LIMIT));
++}
+diff --git a/common/common.c b/common/common.c
+index 849e246..9bb2ba4 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -8,6 +8,7 @@
+ #include <status.h>
+ #include <common.h>
+ #include <delay.h>
++#include <spi_flash.h>
+ 
+ void boot_rom_init(void)
+ {
+@@ -30,4 +31,6 @@
+ 		return;
+ 
+ 	boot_rom_read_cold_flops();
++
++	spi_flash_init();
+ }
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+new file mode 100644
+index 0000000..37c4b6b
+--- /dev/null
++++ b/common/spi_flash.c
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <spi_flash.h>
++
++void spi_flash_init(void)
++{
++	/* make sure spi controller doesn't swap bytes */
++	spi_flash_set_byte_swap(DISABLE_BYTE_SWAP);
++
++	spi_flash_set_baud_rate(SPI_FLASH_BAUDR_DIVISOR);
++
++	spi_flash_set_write_limit(write_en_2MB);
++}
++
+diff --git a/common/spi_flash.h b/common/spi_flash.h
+new file mode 100644
+index 0000000..83a06fe
+--- /dev/null
++++ b/common/spi_flash.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _SPI_FLASH_H_
++#define _SPI_FLASH_H_
++
++enum flash_write_limit {
++	write_en_64K,
++	write_en_128KB,
++	write_en_256KB,
++	write_en_512KB,
++	write_en_1MB,
++	write_en_2MB,
++	write_en_4MB,
++	write_en_8MB,
++	write_en_16MB
++};
++
++#define ENABLE_BYTE_SWAP		1
++#define DISABLE_BYTE_SWAP		0
++
++#define SPI_FLASH_BAUDR_DIVISOR		2
++
++void spi_flash_set_byte_swap(uint8_t enable);
++void spi_flash_set_baud_rate(uint8_t baud_rate);
++void spi_flash_set_write_limit(enum flash_write_limit write_limit);
++void spi_flash_init(void);
++
++#endif /* _SPI_FLASH_H_ */

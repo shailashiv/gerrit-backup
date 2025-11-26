@@ -1,0 +1,345 @@
+From 2c1630bc97536a470cbb5d0d1f2e1f58d524b440 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Fri, 22 Mar 2024 11:43:06 +0200
+Subject: [PATCH] [FSW-2704] fs1: load ppboot firmware
+
+This patch add support to load ppboot.
+Image validation will be added as part
+of security features.
+
+Change-Id: I96069cd8201812fbe537a00f8b207b744a8e99e8
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index 4a4cea7..7f0d945 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -36,5 +36,7 @@
+ 
+ 	boot_rom_init_boot_info();
+ 
++	boot_rom_bringup_ppboot();
++
+ 	return 0;
+ }
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 0af393e..0c9fe00 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -13,6 +13,7 @@
+ #include <psoc_boot_conf_regs.h>
+ #include <psoc_security_regs.h>
+ #include <global_conf_regs.h>
++#include <gpio_regs.h>
+ #include <fs1_reg_mask.h>
+ #include <fs1_fw_if.h>
+ #include <status.h>
+@@ -41,7 +42,22 @@
+ 
+ static void boot_rom_persist_data_non_zero_init(void)
+ {
+-	/* TODO: init non zero data */
++	/* TODO: Use pre init structure */
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_RECOVERY].img_ptr_spi_offset =
++								REC_IMG_PTRS_BASE;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_RECOVERY].dest_addr_dma =
++								BOOT_PTR_REC_DMA_DEST;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_RECOVERY].dest_addr_arc =
++								BOOT_PTR_REC_DMA_DEST_ARC;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_RECOVERY].boot_desc_flag = 0;
++
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].img_ptr_spi_offset =
++								SPI_IMG_PTRS_BASE;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_dma =
++								BOOT_PTR_SPI_DMA_DEST;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].dest_addr_arc =
++								BOOT_PTR_SPI_DMA_DEST_ARC;
++	boot_rom_manifest.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI].boot_desc_flag = 0;
+ }
+ 
+ #define HL_ARC1_DCCM_PERSIST_SECTION_SIZE		(3 * 1024) /* 3KB */
+@@ -166,3 +182,47 @@
+ 	cold_rst_data.efuse_read_flag = 1;
+ 	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
+ }
++
++uint32_t boot_rom_read_upd_status(void)
++{
++	return regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_3));
++}
++
++bool boot_rom_secondary_img_disabled(void)
++{
++	return (boot_rom_global.config_fuse & EFUSE_SYSCFG_DIS_SECONDARY_IMG);
++}
++
++void boot_rom_set_validation(bool status)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	/*
++	 * validation pass, set validation flag and clear recovery
++	 * validation failed, set recovery flag and clear validation
++	 */
++	cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	cold_rst_data.validation_flag = (status) ? 1 : 0;
++	cold_rst_data.recovery_flag = (status) ? 0 : 1;
++	regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++}
++
++uint32_t boot_rom_fw_mem_arc_addr(uint64_t addr)
++{
++	uint32_t ret_addr;
++
++	if (addr >= HL_ARC1_ICCM_FULL_BASE && addr <= HL_ARC1_ICCM_FULL_BASE + ARC1_ICCM_SIZE)
++		ret_addr = CONV_64B_TO_ARC_FW_MEM(addr) - (HL_FW_MEM_BASE + HL_ICCM_OFFSET);
++	else
++		ret_addr = CONV_64B_TO_ARC_FW_MEM(addr);
++
++	return ret_addr;
++}
++
++uint32_t boot_rom_get_arc_addr(uint64_t addr)
++{
++	if (addr >= HL_FW_MEM_BASE_FULL && addr <= HL_FW_MEM_BASE_FULL + HL_FW_MEM_SIZE)
++		return boot_rom_fw_mem_arc_addr(addr);
++
++	return 0;
++}
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index a02a145..136cc87 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -94,6 +94,8 @@
+ #define HL_FW_SRAM_FULL_BASE		(HL_FW_MEM_BASE_FULL + HL_FWSRAM_OFFSET)
+ #define HL_FW_SRAM_SIZE			SZ_128K
+ 
++#define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0x3FFFFF) + HL_FW_MEM_BASE)
++
+ #define REC_IMG_PTRS_BASE			(0x0)
+ /* recovery boot descriptors are DMA trans to ARC1 ICCM at offset 192K */
+ #define REC_IMG_DESC_ICCM_OFFSET	(192 * 1024)
+diff --git a/common/common.c b/common/common.c
+index f1e336a..5226df4 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -15,6 +15,7 @@
+ #include <hl_fw_upd_if.h>
+ #include "dev_uart.h"
+ #include <boot_desc.h>
++#include <dma.h>
+ 
+ void boot_rom_uart_init(void)
+ {
+@@ -104,3 +105,171 @@
+ 	if(!boot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI))
+ 		execute_recovery();
+ }
++
++bool boot_rom_is_valid_address_range(uint64_t addr, int len)
++{
++	if (addr >= (uint64_t)SP_SRAM_BASE &&
++	    addr + len <= (uint64_t)(SP_SRAM_BASE + HL_SP_SRAM_SIZE) )
++		return true;
++
++	if (addr >= HL_SP_SRAM_BASE &&
++	    addr + len <= HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE)
++		return true;
++
++	if (addr >= HL_ARC0_ICCM_FULL_BASE &&
++	    addr + len <= HL_ARC0_ICCM_FULL_BASE + ARC0_MEM_SIZE)
++		return true;
++
++	if (addr >= HL_ARC1_ICCM_FULL_BASE &&
++	    addr + len <= HL_ARC1_ICCM_FULL_BASE + ARC1_MEM_SIZE)
++		return true;
++
++	if (addr >= HL_ARC2_ICCM_FULL_BASE &&
++	    addr + len <= HL_ARC2_ICCM_FULL_BASE + ARC2_MEM_SIZE)
++		return true;
++
++	if (addr >= (uint64_t)(HL_FW_MEM_BASE + HL_FWSRAM_OFFSET) &&
++	    addr + len <= (uint64_t)(HL_FW_MEM_BASE + HL_FWSRAM_OFFSET + HL_FW_SRAM_SIZE) )
++		return true;
++
++	if (addr >= HL_FW_SRAM_FULL_BASE &&
++	    addr + len <= HL_FW_SRAM_FULL_BASE + HL_FW_SRAM_SIZE)
++		return true;
++
++	return false;
++}
++
++bool boot_rom_is_valid_start_addr(struct boot_desc *desc)
++{
++	if ((desc->start_addr >= desc->loadaddr) &&
++	   (desc->start_addr < desc->loadaddr + desc->img_size))
++		return true;
++
++	return false;
++}
++
++#define PPBOOT_MAX_IMAGE_SIZE	(2 * MAX_DMA_SIZE_CRC)
++static int boot_rom_bringup_img_sub(int img, struct boot_desc *desc,
++	enum fw_post_reset_cmd upd_status, uint8_t cur_img)
++{
++	enum dma_error err = DMA_SUCCESS;
++	enum boot_rom_progress img_sts_base = PROGRESS_BRINGUP_PCI_PRI;
++	boot_rom_global.curr_img = cur_img;
++
++	if (cur_img == BOOT_ROM_SECONDARY)
++		img_sts_base = PROGRESS_BRINGUP_PCI_SEC;
++		/* TODO: Check what is TPM_SPI and progress status */
++
++	boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_START);
++	boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, img, desc, upd_status);
++	if (!boot_rom_is_valid_address_range(desc->loadaddr, desc->img_size)) {
++		boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_LOADADDR_INVALID);
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	if (!boot_rom_is_valid_start_addr(desc)) {
++		boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_STARTADDR_INVALID);
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	//boot_rom_security_report_img_fw(boot_rom_global.curr_img, desc->sec_ver); /* TODO: security_impl */
++	if ((img == HL_FW_IMG_PPBOOT) && (desc->img_size > PPBOOT_MAX_IMAGE_SIZE)) {
++		boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_TOO_BIG);
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	err = boot_rom_spi_dma(desc->img_size, desc->spi_offset, desc->loadaddr, false, false, 0);
++
++	if (err != DMA_SUCCESS) {
++		if (err == DMA_INVALID_CRC_ERROR) {
++			/*
++			 * TPM validation is after ppboot image validation, hence the
++			 * image status of ppboot can be overwritten by tpm validation logic.
++			 * Hence the PSOC debug registers for image status should not be
++			 * done for TPM image.
++			 */
++			// if (img != HL_FW_IMG_TPM_SPI)
++			// 	boot_rom_security_report_img_status(cur_img, IMG_STATUS_CRC_FAIL); /* TODO: security_impl */
++			boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_CRC_FAIL);
++		} else if (err == DMA_UNALIGNED_DEST_ADDR) {
++			boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_UNALIGNED_DEST_ADDR);
++		} else if (err == DMA_INVALID_IMG_SIZE) {
++			boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_INVALID_IMG_SIZE);
++		} else if (err == DMA_UNALIGNED_IMG_SIZE) {
++			boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE);
++		} else {
++			boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_DMA_ERROR);
++		}
++
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_DMA);
++
++	/* TODO: security_impl */
++
++	return BOOT_ROM_SUCCESS;
++}
++
++static int boot_rom_bringup_img(int img, uint64_t *start_addr)
++{
++	enum fw_post_reset_cmd fw_upd_status = boot_rom_read_upd_status();
++	int ret;
++	struct boot_desc desc = {0};
++
++	ret = boot_rom_bringup_img_sub(img, &desc, fw_upd_status, BOOT_ROM_PRIMARY);
++	if (ret == BOOT_ROM_SUCCESS)
++		goto image_bringup_success;
++
++	if (boot_rom_secondary_img_disabled())
++		return BOOT_ROM_FAIL;
++
++	/* Try the secondary image by toggling upd_status variable */
++	fw_upd_status = (fw_upd_status == FLOPS_UPD_PENDING) ? FLOPS_UPD_NOOP :
++			 FLOPS_UPD_PENDING;
++
++	ret = boot_rom_bringup_img_sub(img, &desc, fw_upd_status, BOOT_ROM_SECONDARY);
++	if (ret == BOOT_ROM_SUCCESS)
++		goto image_bringup_success;
++
++	return BOOT_ROM_FAIL;
++
++image_bringup_success:
++	*start_addr = desc.start_addr;
++
++	return BOOT_ROM_SUCCESS;
++}
++
++void boot_rom_bringup_ppboot(void)
++{
++	void (*ppboot)();
++	uint64_t *start_addr = &boot_rom_global.ppboot_start_addr;
++	int ret;
++
++	/* TODO: add check for boot desc init */
++
++	if (boot_rom_global.validation_pass)
++		goto skip_rom_validation;
++
++	/* Check for prim/sec failure */
++	ret = boot_rom_bringup_img(HL_FW_IMG_PPBOOT, start_addr);
++	if (ret == BOOT_ROM_SUCCESS) {
++		boot_rom_set_validation(true);
++	} else {
++		boot_rom_set_validation(false);
++		goto skip_bringup;
++	}
++
++skip_rom_validation:
++	/* TODO: Add tpm init code */
++
++	boot_rom_status_update(PROGRESS_PPBOOT_START);
++	if (*start_addr) {
++		/* TODO: start cpld watchdog timer */
++		ppboot = (void *)((uint32_t)boot_rom_get_arc_addr(*start_addr));
++		ppboot();
++	}
++
++skip_bringup:
++	execute_recovery();
++}
+diff --git a/common/common.h b/common/common.h
+index 1472203..d861096 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -17,5 +17,10 @@
+ void boot_rom_halt(void);
+ enum boot_rom_status boot_rom_read_config_fuse(void);
+ void boot_rom_set_efuse_read(void);
++void boot_rom_disable_spi_gw(void);
++uint32_t boot_rom_read_upd_status(void);
++bool boot_rom_secondary_img_disabled(void);
++void boot_rom_set_validation(bool status);
++uint32_t boot_rom_get_arc_addr(uint64_t addr);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/common/status.h b/common/status.h
+index b141bbd..ed3bb53 100644
+--- a/common/status.h
++++ b/common/status.h
+@@ -21,6 +21,7 @@
+ 	PROGRESS_BRINGUP_UNALIGNED_DEST_ADDR,
+ 	PROGRESS_BRINGUP_INVALID_IMG_SIZE,
+ 	PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE,
++	PROGRESS_BRINGUP_INVALID_FLASH_OFFSET,
+ 	PROGRESS_BRINGUP_DMA_ERROR,
+ 	PROGRESS_BRINGUP_DMA,
+ 	PROGRESS_BRINGUP_KEY_REVOKED,
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index a871316..966e22c 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -33,6 +33,8 @@
+ #define CRC32_SIZE		4
+ #define SIZE_KB			1024
+ #define SIZE_MB			(SIZE_KB * SIZE_KB)
++#define BOOT_ROM_PRIMARY				0
++#define BOOT_ROM_SECONDARY				1
+ 
+ enum boot_rom_status {
+ 	BOOT_ROM_SUCCESS,

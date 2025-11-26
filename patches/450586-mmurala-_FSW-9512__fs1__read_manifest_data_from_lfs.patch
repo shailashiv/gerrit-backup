@@ -1,0 +1,115 @@
+From 81e720fe6e71a8ab67e61b86e91272fa83ed1e74 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 18 Sep 2024 17:36:32 +0300
+Subject: [PATCH] [FSW-9512] fs1: read manifest data from lfs
+
+Added support to read manifest data from lfs
+life to actual global manifest variables.
+Non cold reset scenario's, boot rom can get
+already initialized manifest data during
+cold reset instead of doing desc init again.
+
+Change-Id: I58b2f8b29e9ab32c9158833d116061b6e097e93e
+---
+
+diff --git a/arch/fs1/arc/dev_boot_info.c b/arch/fs1/arc/dev_boot_info.c
+index c3ef1ed..95e283d 100644
+--- a/arch/fs1/arc/dev_boot_info.c
++++ b/arch/fs1/arc/dev_boot_info.c
+@@ -56,11 +56,14 @@
+ 
+ void boot_rom_get_boot_info(void)
+ {
++	if(boot_rom_skip_boot_info())
++		return;
++
+ 	if (boot_rom_global.boot_info_set_done) {
+ 		/* Read and make sure proper data after any reset */
+ 		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START);
+ 
+-		/* TODO: retrieve boot info and verify */
++		boot_desc_get_manifest_boot_info_data();
+ 
+ 		boot_rom_status_update(PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH);
+ 	}
+diff --git a/arch/fs1/arc/dev_boot_info.h b/arch/fs1/arc/dev_boot_info.h
+index 027448e..2977fe9 100644
+--- a/arch/fs1/arc/dev_boot_info.h
++++ b/arch/fs1/arc/dev_boot_info.h
+@@ -17,5 +17,6 @@
+ 
+ void boot_rom_set_boot_info(void);
+ void boot_rom_get_boot_info(void);
++bool boot_rom_skip_boot_info(void);
+ 
+ #endif	/* _DEV_BOOT_INFO_H_ */
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index 08e4cda..966f56a 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -154,6 +154,8 @@
+ 	PROGRESS_BOOT_INFO_LFS_FINISHED = 144,
+ 	PROGRESS_BOOT_INFO_MANIFEST_CONTEXT_SET_FAIL = 145,
+ 	PROGRESS_BOOT_INFO_MANIFEST_HEADER_SET_FAIL = 146,
++	PROGRESS_BOOT_INFO_MANIFEST_CONTEXT_GET_FAIL = 147,
++	PROGRESS_BOOT_INFO_MANIFEST_HEADER_GET_FAIL = 148,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index cf388a4..e4cbb6f 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -98,8 +98,11 @@
+ 
+ 	if (boot_rom_global.validation_pass &&
+ 	    boot_rom_global.valid_manifest_idx == manifest_type) {
+-		/* TODO: Move to boot_rom_get_boot_info */
+-		boot_rom_handle_manifest_data(manifest_type, false);
++
++		if(boot_rom_skip_boot_info())
++			boot_rom_handle_manifest_data(manifest_type, false);
++
++		boot_rom_get_boot_info();
+ 		goto skip_boot_desc_process;
+ 	}
+ 
+@@ -185,8 +188,6 @@
+ 
+ skip_boot_desc_process:
+ 	p_manifest_ctx->boot_desc_flag = 1;
+-
+-	boot_rom_get_boot_info();
+ 
+ 	return BOOT_ROM_SUCCESS;
+ }
+@@ -431,3 +432,17 @@
+ 		return;
+ 	}
+ }
++
++void boot_desc_get_manifest_boot_info_data(void)
++{
++	if (lfs_file_copy(LFS_TAG_BOOT_INFO, HL_BOOT_INFO_IMG_DESC_MANIFEST_CONTEXT,
++		&spi_manifest_ctx, sizeof(spi_manifest_ctx))) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_MANIFEST_CONTEXT_GET_FAIL);
++		return;
++	}
++	if (lfs_file_copy(LFS_TAG_BOOT_INFO, HL_BOOT_INFO_IMG_DESC_MANIFEST_HEADER,
++		&spi_manifest_hdr, sizeof(spi_manifest_hdr))) {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_MANIFEST_HEADER_GET_FAIL);
++		return;
++	}
++}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index ec22d36..5d971b6 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -43,6 +43,7 @@
+ uint8_t boot_desc_spi_efuse_init(uint8_t die_id_index, enum hl_fw_manifest_type manifest_idx);
+ void boot_rom_handle_manifest_data(enum hl_fw_manifest_type manifest_type, bool write);
+ void boot_desc_save_manifest_boot_info_data(void);
++void boot_desc_get_manifest_boot_info_data(void);
+ 
+ #endif /* _BOOT_DESC_H_ */
+ 

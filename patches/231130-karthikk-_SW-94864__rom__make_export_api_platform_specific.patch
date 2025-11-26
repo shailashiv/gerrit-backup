@@ -1,0 +1,210 @@
+From d787be64ee72233c33f95453f1477039d22b1b57 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 12 Jul 2022 11:37:11 +0300
+Subject: [PATCH] [SW-94864] rom: make export api platform specific
+
+Dma v2 api was introduced for gaudi3. As the export apis are
+to be made project specific, this api and data type which was
+added in gaudi3 cannot be referenced in common code.
+
+This patch makes such changes platform agnostic.
+
+Change-Id: Ic72651f53c05b6094271dd8cf64574b2b1c72442
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index effbaa7..80be49f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -962,3 +962,21 @@
+ 	return out_freq;
+ }
+ 
++int boot_desc_process_dma_err(int err, enum arcboot_rom_progress dma_sts_base)
++{
++	if (err != DMA_SUCCESS) {
++		if (err == DMA_INVALID_CRC_ERROR)
++			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_CRC_FAILED);
++		else if (err == DMA_UNALIGNED_DEST_ADDR)
++			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_UNALIGNED_DEST);
++		else if (err == DMA_INVALID_IMG_SIZE)
++			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_INVALID_IMG_SIZE);
++		else if (err == DMA_UNALIGNED_IMG_SIZE)
++			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_UNALIGNED_IMG_SIZE);
++		else
++			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_ERROR);
++		return 1;
++	}
++
++	return 0;
++}
+diff --git a/arch/gaudi3/arc/dev_dma.h b/arch/gaudi3/arc/dev_dma.h
+index fed69ed..5ad12f0 100644
+--- a/arch/gaudi3/arc/dev_dma.h
++++ b/arch/gaudi3/arc/dev_dma.h
+@@ -5,6 +5,7 @@
+ 
+ #include <secureboot.h>
+ #include <dma.h>
++#include <arcboot_export_dev.h>
+ 
+ #define MAX_DMA_SIZE		0xFFF0
+ #define MAX_DMA_SIZE_CRC	(MAX_DMA_SIZE + CRC32_SIZE)
+diff --git a/arch/gaudi3/arc/dma.c b/arch/gaudi3/arc/dma.c
+index 74a5f73..0d5fe7f 100644
+--- a/arch/gaudi3/arc/dma.c
++++ b/arch/gaudi3/arc/dma.c
+@@ -54,3 +54,12 @@
+ 
+ 	return DMA_SUCCESS;
+ }
++
++int dma_copy_image_dev(uint32_t image_size, uint32_t flash_offset,
++		 uint64_t dest_addr, int dest_type,
++		 bool skip_crc_check)
++{
++	return dma_copy_image_v2(image_size, flash_offset,
++					 dest_addr, dest_type,
++					 skip_crc_check);
++}
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 91c7863..63e26e5 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -25,6 +25,11 @@
+ 	return DMA_DEST_HBW;
+ }
+ 
++int boot_desc_get_dest_type(uint64_t addr)
++{
++	return arcboot_rom_get_dma_dest_type(addr);
++}
++
+ static void ext_rom_load_erom_image(uint32_t index)
+ {
+ 	enum arcboot_rom_progress img_sts_base = PROGRESS_ARCBOOT_EROM_IMG0;
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 7159724..a7ff9e4 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -55,12 +55,23 @@
+ 	}
+ }
+ 
++__weak int boot_desc_process_dma_err(__unused int err,
++		__unused enum arcboot_rom_progress dma_sts_base)
++{
++	return 0;
++}
++
++__weak int boot_desc_get_dest_type(__unused uint64_t addr)
++{
++	return SPI_DMA_DST_HBW;
++}
++
+ int boot_desc_init(enum hl_fw_boot_ptr_imgs img)
+ {
+ 	uint32_t i, img_ptrs_size;
+ 	uint32_t *p_offset = NULL;
+ 	enum arcboot_rom_progress dma_sts_base = PROGRESS_INIT_SPI_BOOT_DESC_DMA_START;
+-	enum dma_error err;
++	int err;
+ 	uint32_t copy_sz;
+ 	static struct hl_fw_img_desc *p_img_desc;
+ 
+@@ -88,21 +99,12 @@
+ 	arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_START);
+ 
+ 	/* Fetch boot desc using DMA into dest offset */
+-	err = dma_copy_image_v2(img_ptrs_size, p_img_ptr_ctx->img_ptr_spi_offset,
+-			p_img_ptr_ctx->dest_addr_dma, DMA_DEST_HBW, false);
+-	if (err != DMA_SUCCESS) {
+-		if (err == DMA_INVALID_CRC_ERROR)
+-			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_CRC_FAILED);
+-		else if (err == DMA_UNALIGNED_DEST_ADDR)
+-			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_UNALIGNED_DEST);
+-		else if (err == DMA_INVALID_IMG_SIZE)
+-			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_INVALID_IMG_SIZE);
+-		else if (err == DMA_UNALIGNED_IMG_SIZE)
+-			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_UNALIGNED_IMG_SIZE);
+-		else
+-			arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_ERROR);
++	err = dma_copy_image_dev(img_ptrs_size, p_img_ptr_ctx->img_ptr_spi_offset,
++			p_img_ptr_ctx->dest_addr_dma,
++			boot_desc_get_dest_type(p_img_ptr_ctx->dest_addr_dma), false);
++
++	if (boot_desc_process_dma_err(err, dma_sts_base))
+ 		return 0;
+-	}
+ 
+ 	arcboot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_FINISH);
+ 
+diff --git a/common/dma.c b/common/dma.c
+index 9019ae8..f866d6b 100644
+--- a/common/dma.c
++++ b/common/dma.c
+@@ -64,14 +64,14 @@
+ 	return crc_error;
+ }
+ 
+-__weak enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
+-		 uint64_t dest_addr, enum dma_dest_type dest_type,
++__weak int dma_copy_image_dev(uint32_t image_size, uint32_t flash_offset,
++		 uint64_t dest_addr, int dest_type,
+ 		 bool skip_crc_check)
+ {
+ 	dma_copy_image(image_size, flash_offset, dest_addr, dest_type);
+ 
+ 	if ((!skip_crc_check) && (dma_wait_finish() == DMA_CRC_ERROR))
+-		return DMA_INVALID_CRC_ERROR;
++		return DMA_CRC_ERROR;
+ 
+-	return DMA_SUCCESS;
++	return DMA_CRC_OK;
+ }
+diff --git a/common/dma.h b/common/dma.h
+index 247e8f0..1c088ff 100644
+--- a/common/dma.h
++++ b/common/dma.h
+@@ -19,36 +19,12 @@
+ #define DMA_ADDRESS_LOW(x)	((x) & 0xFFFFFFFF)
+ #define DMA_ADDRESS_HIGH(x)	(((x) >> 32) & 0xFFFFFFFF)
+ 
+-enum dma_error {
+-	DMA_SUCCESS = 0,
+-	DMA_INVALID_CRC_ERROR,
+-	DMA_INVALID_DEST_TYPE,
+-	DMA_UNALIGNED_IMG_SIZE,
+-	DMA_UNALIGNED_DEST_ADDR,
+-	DMA_INVALID_IMG_SIZE,
+-	DMA_ERROR_MAX
+-};
+-
+-enum dma_dest_type {
+-	DMA_DEST_HBW = 0,
+-	DMA_DEST_SRAM,
+-	DMA_DEST_MAX
+-};
+-
+ void dma_copy_image(uint16_t image_size, uint32_t flash_offset,
+ 		    uint64_t dest_offset, uint8_t fw_sram_dst);
+ int dma_wait_finish(void);
+-/*
+- * dma_copy_image_v2 - dma copy using spi dma above 64KB size
+- * @image_size: Total image size including CRCs (in bytes)
+- * @flash_offset: SPI flash offset
+- * @dest_addr: Full 64 bit destination address
+- * @dest_type: Destination HBW: 0 SRAM: 1
+- * @skip_crc_check: whether to skip CRC check
+- *
+- * Return: enum dma_error
+- */
+-enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
+-				 uint64_t dest_addr, enum dma_dest_type dest_type,
+-				 bool skip_crc_check);
++
++int dma_copy_image_dev(uint32_t image_size, uint32_t flash_offset,
++		 uint64_t dest_addr, int dest_type,
++		 bool skip_crc_check);
++
+ #endif /* _DMA_H_ */

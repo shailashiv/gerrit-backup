@@ -1,0 +1,493 @@
+From 6ce9c6ce029888970ea2ccef7267f35fe1ab4d7e Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 28 Mar 2022 05:39:49 +0300
+Subject: [PATCH] [SW-66675] rom: add spi driver
+
+Added spi driver infra in rom. This is in preparation to port tpm to
+rom as fw requires spi driver to communicate with the tpm slave
+device.
+
+The spi driver is ported from preboot.
+
+Change-Id: I73d7b719e40214dabd04ce287407fa748147fbb7
+---
+
+diff --git a/common/spi.c b/common/spi.c
+new file mode 100644
+index 0000000..4b84b6a
+--- /dev/null
++++ b/common/spi.c
+@@ -0,0 +1,387 @@
++/*
++ * (C) Copyright 2022 HabanaLabs, Ltd.
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <arcboot.h>
++
++/* Registers */
++#define CTRLR0				0x0
++#define SSIENR				0x8
++#define SER				0x10
++#define BAUDR				0x14
++#define TXFTLR				0x18
++#define RXFTLR				0x1C
++#define TXFLR				0x20
++#define RXFLR				0x24
++#define SR				0x28
++#define IMR				0x2C
++#define DR0				0x60
++
++#define CTRLR0_TMOD_MASK		GENMASK(9, 8)
++#define	CTRLR0_TMOD_TR			0x0		/* xmit & recv */
++#define CTRLR0_TMOD_TO			0x1		/* xmit only */
++#define CTRLR0_TMOD_RO			0x2		/* recv only */
++#define CTRLR0_TMOD_EPROMREAD		0x3		/* eeprom read mode */
++
++#define CTRLR0_FRF_MASK			GENMASK(5, 4)
++#define CTRLR0_FRF_SPI			0x0
++#define CTRLR0_FRF_SSP			0x1
++#define CTRLR0_FRF_MICROWIRE		0x2
++#define CTRLR0_FRF_RESV			0x3
++
++#define CTRLR0_MODE_MASK		GENMASK(7, 6)
++#define CTRLR0_MODE_SCPH		0x1
++#define CTRLR0_MODE_SCPOL		0x2
++
++/* Only present when SSI_MAX_XFER_SIZE=32 */
++#define CTRLR0_DFS_32_MASK		GENMASK(20, 16)
++#define CTRLR0_FRF_SPI			0x0
++
++/* Bit fields in SR, 7 bits */
++#define SR_MASK				GENMASK(6, 0)	/* cover 7 bits */
++#define SR_BUSY				BIT(0)
++#define SR_TF_NOT_FULL			BIT(1)
++#define SR_TF_EMPT			BIT(2)
++#define SR_RF_NOT_EMPT			BIT(3)
++#define SR_RF_FULL			BIT(4)
++#define SR_TX_ERR			BIT(5)
++#define SR_DCOL				BIT(6)
++
++#define RX_TIMEOUT			1000		/* timeout in ms */
++
++#define frame_size_bits(b)		((b) << 16)
++
++#define min_t(type, x, y) ({			\
++	type __min1 = (x);			\
++	type __min2 = (y);			\
++	__min1 < __min2 ? __min1 : __min2; })
++
++#define MIN(a, b)	(((a) > (b)) ? (b) : (a))
++#define MAX(a, b)	(((a) > (b)) ? (a) : (b))
++
++#define MIN3(x, y, z) MIN((typeof(x))MIN(x, y), z)
++#define MAX3(x, y, z) MAX((typeof(x))MAX(x, y), z)
++
++#define MS_TO_US(m) ((m) * 1000)
++
++/**
++ * __ffs - find first bit in word.
++ * @word: The word to search
++ *
++ * Undefined if no bit exists, so code should check against 0 first.
++ */
++static inline int __ffs32(unsigned int word)
++{
++	int num = 0;
++
++	if ((word & 0xffff) == 0) {
++		num += 16;
++		word >>= 16;
++	}
++	if ((word & 0xff) == 0) {
++		num += 8;
++		word >>= 8;
++	}
++	if ((word & 0xf) == 0) {
++		num += 4;
++		word >>= 4;
++	}
++	if ((word & 0x3) == 0) {
++		num += 2;
++		word >>= 2;
++	}
++	if ((word & 0x1) == 0)
++		num += 1;
++	return num;
++}
++
++/**
++ * FIELD_PREP() - prepare a bitfield element
++ * @_mask: shifted mask defining the field's length and position
++ * @_val:  value to put in the field
++ *
++ * FIELD_PREP() masks and shifts up the value.  The result should
++ * be combined with other fields of the bitfield using logical OR.
++ */
++#define FIELD_PREP(_mask, _val)						  \
++	(								  \
++	    {								  \
++		    ((typeof(_mask))(_val) << __ffs32(_mask)) & (_mask);  \
++	    }								  \
++	)
++
++#define BITS_PER_LONG		32
++
++#define BITS_PER_LONG_LONG	64
++
++#define __AC(X, Y)	(X##Y)
++#define _AC(X, Y)	__AC(X, Y)
++#define _AT(T, X)	((T)(X))
++
++#define _UL(x)		(_AC(x, UL))
++#define _ULL(x)		(_AC(x, ULL))
++
++#define _BITUL(x)	(_UL(1) << (x))
++#define _BITULL(x)	(_ULL(1) << (x))
++
++#define UL(x)		(_UL(x))
++#define ULL(x)		(_ULL(x))
++
++#define GENMASK(h, l)                      \
++	(((~UL(0)) - (UL(1) << (l)) + 1) & \
++	 (~UL(0) >> (BITS_PER_LONG - 1 - (h))))
++
++#define GENMASK_ULL(h, l)                    \
++	(((~ULL(0)) - (ULL(1) << (l)) + 1) & \
++	 (~ULL(0) >> (BITS_PER_LONG_LONG - 1 - (h))))
++
++struct xfer_priv {
++	struct spi_ctx *ctx;
++	const void *tx;
++	const void *tx_end;
++	void *rx;
++	void *rx_end;
++	uint32_t fifo_len;			/* depth of the FIFO buffer */
++	uint32_t max_xfer;			/* Maximum transfer size (in bits) */
++	int len;
++	int bits_per_word;
++};
++
++static uint32_t dw_spi_dw32_update_cr0(int bits_per_word, int tmode)
++{
++	return FIELD_PREP(CTRLR0_DFS_32_MASK, bits_per_word - 1)
++	     | FIELD_PREP(CTRLR0_FRF_MASK, CTRLR0_FRF_SPI)
++	     | FIELD_PREP(CTRLR0_MODE_MASK, 0x0)
++	     | FIELD_PREP(CTRLR0_TMOD_MASK, tmode);
++}
++
++/* Return the max entries we can fill into tx fifo */
++static inline uint32_t tx_max(struct xfer_priv *priv)
++{
++	uint32_t tx_left, tx_room, rxtx_gap;
++
++	tx_left = (priv->tx_end - priv->tx) / (priv->bits_per_word >> 3);
++	tx_room = priv->fifo_len - spi_readl(priv->ctx, TXFLR);
++
++	/*
++	 * Another concern is about the tx/rx mismatch, we
++	 * thought about using (priv->fifo_len - rxflr - txflr) as
++	 * one maximum value for tx, but it doesn't cover the
++	 * data which is out of tx/rx fifo and inside the
++	 * shift registers. So a control from sw point of
++	 * view is taken.
++	 */
++	rxtx_gap = ((priv->rx_end - priv->rx) - (priv->tx_end - priv->tx)) /
++		(priv->bits_per_word >> 3);
++
++	return MIN3(tx_left, tx_room, (uint32_t)(priv->fifo_len - rxtx_gap));
++}
++
++/* Return the max entries we should read out of rx fifo */
++static inline uint32_t rx_max(struct xfer_priv *priv)
++{
++	uint32_t rx_left = (priv->rx_end - priv->rx) / (priv->bits_per_word >> 3);
++
++	return min_t(uint32_t, rx_left, spi_readl(priv->ctx, RXFLR));
++}
++
++static void dw_writer(struct xfer_priv *priv)
++{
++	uint32_t max = tx_max(priv);
++	uint32_t txw = 0x0;
++
++	while (max--) {
++		/* Set the tx word if the transfer's	*/
++		/* original "tx" is not null		*/
++		if (priv->tx_end - priv->len) {
++			if (priv->bits_per_word == 8)
++				txw = *(uint8_t *)(priv->tx);
++			else
++				txw = *(uint32_t *)(priv->tx);
++		}
++		spi_writel(priv->ctx, txw, DR0);
++		priv->tx += priv->bits_per_word >> 3;
++	}
++}
++
++static void dw_reader(struct xfer_priv *priv)
++{
++	uint32_t max = rx_max(priv);
++	uint32_t rxw;
++
++	while (max--) {
++		rxw = spi_readl(priv->ctx, DR0);
++
++		/* Care about rx if the transfer's original "rx" is not null */
++		if (priv->rx_end - priv->len) {
++			if (priv->bits_per_word == 8)
++				*(uint8_t *)(priv->rx) = rxw;
++			else
++				*(uint32_t *)(priv->rx) = rxw;
++		}
++		priv->rx += priv->bits_per_word >> 3;
++	}
++}
++
++static int poll_transfer(struct xfer_priv *priv)
++{
++	uint32_t count = RX_TIMEOUT;
++
++	do {
++		dw_writer(priv);
++		dw_reader(priv);
++		count --;
++	} while ((priv->rx_end > priv->rx) && (count > 0));
++
++	return 0;
++}
++
++int spi_poll_timeout(struct spi_ctx *ctx)
++{
++	uint32_t val = spi_readl(ctx, SR), count = RX_TIMEOUT;
++
++	while (count > 0)
++	{
++		if ((val & SR_TF_EMPT) && !(val & SR_BUSY))
++			return 0;
++		count --;
++	}
++
++	return -1;
++}
++
++__weak void external_cs_manage(__unused bool cs_val){}
++
++/* based on u-boot designware SPI driver */
++int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
++		const void *dout, void *din, unsigned long flags)
++{
++	const uint8_t *tx = dout;
++	uint8_t *rx = din;
++	int ret = 0;
++	uint32_t cr0 = 0;
++	uint8_t tmode;			/* TR/TO/RO/EEPROM */
++	struct xfer_priv priv = {0};
++
++	priv.ctx = ctx;
++
++	if ((flags & SPI_XFER_BEGIN) && (priv.ctx->claim_bus))
++		priv.ctx->claim_bus();
++
++	/* spi core configured to do 8 bit transfers */
++	if (bitlen % 8) {
++		return -1;
++	}
++
++	if (priv.ctx->spi_dword_access_support)
++		priv.bits_per_word = ((bitlen % 32) ||
++				(flags & SPI_XFER_BEGIN)) ? 8 : 32;
++	else
++		priv.bits_per_word = 8;
++
++	if (rx && tx)
++		tmode = CTRLR0_TMOD_TR;
++	else if (rx)
++		tmode = CTRLR0_TMOD_RO;
++	else
++		/*
++		 * In transmit only mode (CTRL0_TMOD_TO) input FIFO never gets
++		 * any data which breaks our logic in poll_transfer() above.
++		 */
++		tmode = CTRLR0_TMOD_TR;
++
++	cr0 = dw_spi_dw32_update_cr0(priv.bits_per_word, tmode);
++
++	priv.len = bitlen >> 3;
++
++	priv.tx = (void *)tx;
++	priv.tx_end = priv.tx + priv.len;
++	priv.rx = rx;
++	priv.rx_end = priv.rx + priv.len;
++
++	/* Disable controller before writing control registers */
++	spi_writel(priv.ctx, 0, SSIENR);
++
++	/* Reprogram cr0 only if changed */
++	if (spi_readl(priv.ctx, CTRLR0) != cr0)
++		spi_writel(priv.ctx, cr0, CTRLR0);
++
++	/* Enable controller after writing control registers */
++	spi_writel(priv.ctx, 1, SSIENR);
++
++	priv.fifo_len = ctx->fifo_len;
++
++	/* Start transfer in a polling loop */
++	ret = poll_transfer(&priv);
++
++	/*
++	 * Wait for current transmit operation to complete.
++	 * Otherwise if some data still exists in Tx FIFO it can be
++	 * silently flushed, i.e. dropped on disabling of the controller,
++	 * which happens when writing 0 to DW_SPI_SSIENR which happens
++	 * in the beginning of new transfer.
++	 */
++	ret = spi_poll_timeout(ctx) ;
++
++	/* Stop the transaction */
++	if ((flags & SPI_XFER_END) && (priv.ctx->release_bus))
++		priv.ctx->release_bus();
++
++	return ret;
++}
++
++static void get_fifo_len(struct spi_ctx *ctx)
++{
++	uint32_t fifo;
++
++	for (fifo = 1; fifo < 256; fifo++) {
++		spi_writel(ctx, fifo, TXFTLR);
++		if (fifo != spi_readl(ctx, TXFTLR))
++			break;
++	}
++
++	ctx->fifo_len = (fifo == 1) ? 0 : fifo;
++	spi_writel(ctx, 0, TXFTLR);
++}
++
++#define DW_SPI_BAUD_MIN		2
++__weak uint32_t hl_spi_baudr_get()
++{
++	return DW_SPI_BAUD_MIN;
++}
++
++void spi_init(struct spi_ctx *ctx)
++{
++	uint32_t baudr;
++
++	if (ctx->spi_initialized)
++		return;
++
++	baudr = hl_spi_baudr_get();
++	/* Validate that baudr is even */
++	baudr = (baudr + 1) & ~1;
++
++	ctx->cs_init();
++	/* Disable ssi module */
++	spi_writel(ctx, 0x00000000, SSIENR);
++	/* Set Baud rate */
++	spi_writel(ctx, baudr, BAUDR);
++	/* Set Rx FIFO threshold value to default value */
++	spi_writel(ctx, 0x00000000, RXFTLR);
++	/* Set Tx FIFO threshold value to default value */
++	spi_writel(ctx, 0x00000000, TXFTLR);
++	/* Disable Interrupts */
++	spi_writel(ctx, 0x00000000, IMR);
++	/* Set CTRL0 to default value */
++	spi_writel(ctx, 0x00070000, CTRLR0);
++	/* Enable Slave */
++	spi_writel(ctx, 0x00000001, SER);
++	/* Enable SSI module */
++	spi_writel(ctx, 0x00000001, SSIENR);
++
++	get_fifo_len(ctx);
++
++	ctx->spi_initialized = true;
++}
+diff --git a/common/spi.h b/common/spi.h
+new file mode 100644
+index 0000000..e8444c4
+--- /dev/null
++++ b/common/spi.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++#ifndef _SPI_H
++#define _SPI_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SPI_XFER_BEGIN		BIT(0)	/* Assert CS before transfer */
++#define SPI_XFER_END		BIT(1)	/* Deassert CS after transfer */
++
++struct spi_ctx {
++	uint32_t spi_base;
++	bool spi_initialized;
++	bool spi_access_is_locked;
++	uint32_t fifo_len;
++	bool spi_dword_access_support;
++	void (*cs_init)();
++	void (*claim_bus)();
++	void (*release_bus)();
++};
++
++void spi_init(struct spi_ctx *ctx);
++int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
++		const void *dout, void *din, unsigned long flags);
++
++#endif /* _SPI_H */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index f2e78fc..5e26a8e 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -16,6 +16,7 @@
+ #include "regmask.h"
+ #include "hl_boot_desc_rom.h"
+ #include "hl_sec_if.h"
++#include "spi.h"
+ 
+ /* TODO: check whether below command puts ARC to sleep */
+ #define wfe()	__asm__ __volatile__("sleep 0x11\n" : : )
+@@ -349,4 +350,37 @@
+ 	base_writel(val, HL_MIRROR_CFG_BASE + offset);
+ }
+ #endif /* HL_MIRROR_CFG_BASE */
++
++static inline void spi_writel(struct spi_ctx *ctx, uint32_t val, uint32_t offset)
++{
++	regmap_writel(val, ctx->spi_base + offset);
++}
++
++static inline uint32_t spi_readl(struct spi_ctx *ctx, uint32_t offset)
++{
++	return regmap_readl(ctx->spi_base + offset);
++}
++
++static inline uint8_t regmap_readb(uint32_t offset)
++{
++	uint32_t reg = *((volatile uint32_t *)(HL_CFG_BASE + offset));
++
++	return (uint8_t)(reg & 0xFF);
++}
++
++static inline void regmap_writeb(uint8_t val, uint32_t offset)
++{
++	*((volatile uint32_t *)(HL_CFG_BASE + offset)) = (uint32_t)val;
++}
++
++static inline void spi_writeb(struct spi_ctx *ctx, uint8_t val, uint32_t offset)
++{
++	regmap_writeb(val, ctx->spi_base + offset);
++}
++
++static inline uint8_t spi_readb(struct spi_ctx *ctx, uint32_t offset)
++{
++	return regmap_readb(ctx->spi_base + offset);
++}
++
+ #endif /* _ARCBOOT_H_ */

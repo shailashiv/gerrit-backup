@@ -1,0 +1,180 @@
+From 054b010819213a032c23e525ecfaa713231a99c9 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 17 Jul 2024 19:34:00 +0300
+Subject: [PATCH] [FSW-7413] fs1: generate boot rom bin for compute
+
+With this patch, added support to generate boot
+rom binary for compute die, the only difference
+between io and compute boot rom binary is a four
+byte constant memory section that has some unique
+value for io and compute. remaining complete
+binary should be the same. The reason for this
+change is to avoid risk if someone modify
+die id's intentionally, hence we can avoid
+compute die running io bootrom.
+
+Change-Id: I7806579d117c49da839a7b09d96d32a53f845277
+---
+
+diff --git a/Makefile b/Makefile
+index 6f9794c..e7d77eb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,6 +23,9 @@
+ 
+ BOOT_ROM_LFS = common/littlefs
+ 
++DIE_TYPE_IO = 5
++DIE_TYPE_COMP = 10
++
+ LIBDIR = sdk/lib
+ BOOT_ROM_CFLAGS = -Wall -W -Werror -Wno-misleading-indentation -O3 -g
+ BOOT_ROM_CFLAGS += -Iinclude
+@@ -40,16 +43,26 @@
+ BOOT_ROM_CFLAGS += -I$(SPECS_EMBEDDED_DIR)/fs/$(SPECS_EMB_DEV)
+ BOOT_ROM_CFLAGS += -DFLASH_START_OFFSET=0x60000
+ 
++BOOT_ROM_CFLAGS_IO = $(BOOT_ROM_CFLAGS)
++BOOT_ROM_CFLAGS_IO += -DDIE_TYPE=$(DIE_TYPE_IO)
++
++BOOT_ROM_CFLAGS_COMP += $(BOOT_ROM_CFLAGS)
++BOOT_ROM_CFLAGS_COMP += -DDIE_TYPE=$(DIE_TYPE_COMP)
++
+ ifneq ($(CROSS_COMPILE),)
+ LDFLAGS = -flto
+ LDFLAGS += -L $(LIBDIR) -L $(HL_DEV_ARCH)
+-LDFLAGS += -T $(HL_DEV_ARCH)/$(HL_TARGET)_$@.lds
+ LDFLAGS += -nostartfiles
+ LDFLAGS += -Wl,-e__start
+ LDFLAGS += -static
+ 
+ # This combination allows removing unused symbols from libsb.a and libellipsys.a
+ LDFLAGS += -Wl,--gc-sections
++LDFLAGS_COMP = $(LDFLAGS)
++LDFLAGS_COMP += -T $(HL_DEV_ARCH)/$(HL_TARGET)_boot_rom.lds
++LDFLAGS_IO = $(LDFLAGS)
++LDFLAGS_IO += -T $(HL_DEV_ARCH)/$(HL_TARGET)_$@.lds
++
+ CFLAGS = -DELP_ARCV2
+ export CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+@@ -60,9 +73,10 @@
+ 
+ include $(HL_DEV_ARCH)/Makefile
+ 
+-BOOT_ROM_ROM_SRCS_C := app/boot_rom.c
+-BOOT_ROM_ROM_SRCS_S := app/crt0_rom.S
+-BOOT_ROM_ROM_OBJECTS := $(BOOT_ROM_COMMON_SRCS_C:.c=.o) $(BOOT_ROM_ROM_SRCS_C:.c=.o) $(BOOT_ROM_ROM_SRCS_S:.S=.o)
++BOOT_ROM_SRCS_C := app/boot_rom.c
++BOOT_ROM_SRCS_S := app/crt0_rom.S
++BOOT_ROM_IO_OBJECTS := $(BOOT_ROM_COMMON_SRCS_C:.c=.o) $(BOOT_ROM_SRCS_C:.c=.o) $(BOOT_ROM_SRCS_S:.S=.o)
++BOOT_ROM_COMP_OBJECTS := $(BOOT_ROM_COMMON_SRCS_C:.c=_comp.o) $(BOOT_ROM_SRCS_C:.c=_comp.o) $(BOOT_ROM_SRCS_S:.S=.o)
+ endif
+ 
+ .PHONY: all
+@@ -72,12 +86,22 @@
+ %.bin: %
+ 	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .test* $< $@
+ 
+-boot_rom: $(BOOT_ROM_ROM_OBJECTS)
+-	@$(CC) $^ $(LDFLAGS) -o $@
++%.bin: boot_rom_comp
++	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .test* $< $@
++
++boot_rom: $(BOOT_ROM_IO_OBJECTS)
++	@$(CC) $^ $(LDFLAGS_IO) -o $@
+ 	@$(OBJCOPY) --strip-all --keep-symbols=$(HL_DEV_ARCH)/$@.txt $@ exports.elf
+ 
++boot_rom_comp: $(BOOT_ROM_COMP_OBJECTS)
++	@$(CC) $^ $(LDFLAGS_COMP) -o $@
++	@$(OBJCOPY) --strip-all --keep-symbols=$(HL_DEV_ARCH)/boot_rom.txt $@ exports.elf
++
+ %.o: %.c
+-	@$(CC) $(BOOT_ROM_CFLAGS) -c $< -o $@
++	@$(CC) $(BOOT_ROM_CFLAGS_IO) -c $< -o $@
++
++%_comp.o: %.c
++	@$(CC) $(BOOT_ROM_CFLAGS_COMP) -c $< -o $@
+ 
+ %.o: %.S
+ 	@$(CC) $(AFLAGS) -c $< -o $@
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index f4af323..e49551d 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -8,6 +8,8 @@
+ #include <security.h>
+ #include <recovery.h>
+ 
++const int fs1_die_type = DIE_TYPE;
++
+ struct boot_rom_global_s __attribute__((section (".rom_persistent_section")))boot_rom_global = {
+ 	.config_fuse = 0,
+ 	.config2_fuse = 0,
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 657f756..70076c1 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -2,7 +2,7 @@
+ BOOT_ROM_CFLAGS += -I$(SPECS_H15_DIR)
+ BOOT_ROM_CFLAGS += -I$(SPECS_H15_DIR)/$(SPECS_DEV)/asic_reg
+ 
+-BINARIES = boot_rom.bin
++BINARIES = boot_rom.bin boot_rom_comp.bin
+ 
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 234df71..015bd5f 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -25,6 +25,8 @@
+ #include "dev_uart.h"
+ #include "progress_bits.h"
+ 
++extern const int fs1_die_type;
++
+ uint8_t boot_rom_get_die_id(void)
+ {
+ 	uint32_t die_cpu_id = regmap_readl(IO0_H0_PSOC_ARC_MNG_LOCAL(mmARC_LOCAL_CONF_DIE_CPU_ID));
+@@ -35,14 +37,18 @@
+ 
+ uint8_t boot_rom_get_die_type(void)
+ {
+-	if(boot_rom_global.die_id <= FS1_COMPUTE_DIE_3)
+-		return FS1_COMPUTE_DIE;
+-	else if(boot_rom_global.die_id == FS1_IO_DIE_0)
+-		return FS1_IO_DIE_MASTER;
+-	else if(boot_rom_global.die_id == FS1_IO_DIE_1)
+-		return FS1_IO_DIE_SLAVE;
+-	else
+-		return FS1_INVALID_DIE_TYPE;
++	if (fs1_die_type == STATIC_DIE_TYPE_COMP) {
++		if (boot_rom_global.die_id <= FS1_COMPUTE_DIE_3)
++			return FS1_COMPUTE_DIE;
++	} else if (fs1_die_type == STATIC_DIE_TYPE_IO) {
++		if (boot_rom_global.die_id == FS1_IO_DIE_0)
++			return FS1_IO_DIE_MASTER;
++		else if (boot_rom_global.die_id == FS1_IO_DIE_1)
++			return FS1_IO_DIE_SLAVE;
++	}
++
++	/* TODO: Assert? */
++	return FS1_INVALID_DIE_TYPE;
+ }
+ 
+ bool boot_rom_in_master_die()
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index 23aa274..5852dec 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -38,6 +38,9 @@
+ #define BOOT_ROM_PRIMARY				0
+ #define BOOT_ROM_SECONDARY				1
+ 
++#define STATIC_DIE_TYPE_IO				0x5
++#define STATIC_DIE_TYPE_COMP				0xA
++
+ enum boot_rom_status {
+ 	BOOT_ROM_SUCCESS,
+ 	BOOT_ROM_FAIL,

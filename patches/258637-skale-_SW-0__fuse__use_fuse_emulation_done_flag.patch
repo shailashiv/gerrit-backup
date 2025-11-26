@@ -1,0 +1,105 @@
+From 1c73f1e62021b381ed4bec835a1d1e24ed88fc89 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 26 Sep 2022 14:30:24 +0300
+Subject: [PATCH] [SW-0] fuse: use fuse emulation done flag
+
+Currently, validation pass flag is used to determine whether to
+read fake fuse offset from manifest image or use directly from
+rom global structure. Using validation pass may cause problems
+in scenario where ppboot image was failed to dma, verify and
+validation pass flag was not set. This will cause ROM to read
+spi offset from manifest again in next non-cold reset. In order
+to avoid such dependencies, this patch adds separate flag for
+fuse emulation init done indication.
+
+Change-Id: Ia353b07bb679d7011284facea4c33277e8e7b1c9
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 3fb803e..1775c74 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -21,6 +21,7 @@
+ 	.config2_fuse = 0,
+ 	.recovery_flag = 0,
+ 	.validation_pass = 0,
++	.fuse_emulation_done = 0,
+ 	.efuse_read = 0,
+ 	.curr_img = 0,
+ 	.die_id = 0,
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 573ec0a..920efce 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -412,6 +412,7 @@
+ 	arcboot_rom_global.recovery_flag = cold_rst_data.recovery_flag;
+ 	arcboot_rom_global.validation_pass = cold_rst_data.validation_flag;
+ 	arcboot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
++	arcboot_rom_global.fuse_emulation_done = cold_rst_data.fuse_emulation_done;
+ }
+ 
+ static void arcboot_rom_persist_data_non_zero_init(void)
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+index 69b74ec..967d16f 100644
+--- a/arch/gaudi3/arc/spi_flash.c
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -10,6 +10,7 @@
+ #include <boot_desc.h>
+ #include <dev_common.h>
+ #include <soc.h>
++#include <gaudi3_fw_if.h>
+ 
+ void spi_flash_init(void)
+ {
+@@ -46,7 +47,7 @@
+ 	if (arcboot_rom_global.sku)
+ 		return;
+ 
+-	if (!arcboot_rom_global.validation_pass) {
++	if (!arcboot_rom_global.fuse_emulation_done) {
+ 		/* Slave spi offset is stored in img_desc->spi_offset[1] */
+ 		idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, HL_FW_IMG_FAKE_EFUSE,
+ 						&desc, FLOPS_UPD_PENDING);
+@@ -82,6 +83,7 @@
+ 
+ void spi_flash_fuse_init(void)
+ {
++	struct gaudi3_cold_rst_data cold_rst_data;
+ 	struct boot_desc desc;
+ 	uint32_t val, idx;
+ 
+@@ -90,7 +92,7 @@
+ 		return;
+ 	}
+ 
+-	if (!arcboot_rom_global.validation_pass) {
++	if (!arcboot_rom_global.fuse_emulation_done) {
+ 		idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, HL_FW_IMG_FAKE_EFUSE,
+ 						&desc, FLOPS_UPD_NOOP);
+ 		if (idx == HL_FW_IMG_NOT_FOUND)
+@@ -107,5 +109,13 @@
+ 
+ 	arcboot_rom_global.config_fuse = val;
+ 	fuse_read(EFUSE_SYSCFG2_OFFSET, &arcboot_rom_global.config2_fuse);
++
++	/* Since spi fuse init is successful, set fuse_emulation_done to true */
++	if (!arcboot_rom_global.fuse_emulation_done) {
++		cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
++		cold_rst_data.fuse_emulation_done = 1;
++		regmap_writel(cold_rst_data.data, mmCOLD_RST_FLOPS_2);
++	}
++
+ 	arcboot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);
+ }
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 6893bd0..8a8c358 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -93,6 +93,7 @@
+ 	uint32_t config2_fuse;
+ 	uint8_t recovery_flag;
+ 	uint8_t validation_pass;
++	uint8_t fuse_emulation_done;
+ 	uint8_t efuse_read;
+ 	uint8_t curr_img;
+ 	uint8_t die_id;

@@ -1,0 +1,843 @@
+From 9f21c318b8c566282882710d441f69574e1da0f0 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 14 Jan 2020 11:45:30 +0200
+Subject: [PATCH] [SW-8228] arcboot: prepare basic boot flow
+
+move dma and security implementation to seperate files and
+prepare stubs in main arcboot_rom for basic boot flow
+
+Change-Id: I46d31310dab0c6a3cd2ab8acee5deb49a9731005
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index f4361df..b00298c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -12,6 +12,7 @@
+ LIBDIR = sdk/lib
+ ARCBOOT_CFLAGS = -Wall -W -Werror -O3
+ ARCBOOT_CFLAGS += -Iinclude
++ARCBOOT_CFLAGS += -Icommon
+ ARCBOOT_CFLAGS += -I$(HL_DEV)
+ ARCBOOT_CFLAGS += -Isdk/src
+ ARCBOOT_CFLAGS += -Isdk/src/include
+@@ -32,13 +33,15 @@
+ CFLAGS = -DELP_ARCV2
+ export CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+-ARCBOOT_RAM_SRCS_C := common/arcboot_ram.c
+-ARCBOOT_RAM_SRCS_S := common/crt0_ram.S
+-ARCBOOT_RAM_OBJECTS := $(ARCBOOT_RAM_SRCS_C:.c=.o) $(ARCBOOT_RAM_SRCS_S:.S=.o)
++ARCBOOT_COMMON_SRCS_C := $(shell ls common/*.c)
+ 
+-ARCBOOT_ROM_SRCS_C := common/arcboot_rom.c
+-ARCBOOT_ROM_SRCS_S := common/crt0_rom.S
+-ARCBOOT_ROM_OBJECTS := $(ARCBOOT_ROM_SRCS_C:.c=.o) $(ARCBOOT_ROM_SRCS_S:.S=.o)
++ARCBOOT_RAM_SRCS_C := app/arcboot_ram.c
++ARCBOOT_RAM_SRCS_S := app/crt0_ram.S
++ARCBOOT_RAM_OBJECTS := $(ARCBOOT_COMMON_SRCS_C:.c=.o) $(ARCBOOT_RAM_SRCS_C:.c=.o) $(ARCBOOT_RAM_SRCS_S:.S=.o)
++
++ARCBOOT_ROM_SRCS_C := app/arcboot_rom.c
++ARCBOOT_ROM_SRCS_S := app/crt0_rom.S
++ARCBOOT_ROM_OBJECTS := $(ARCBOOT_COMMON_SRCS_C:.c=.o) $(ARCBOOT_ROM_SRCS_C:.c=.o) $(ARCBOOT_ROM_SRCS_S:.S=.o)
+ 
+ .PHONY: all libsb libellipsys sbtool
+ all: libsb libellipsys
+@@ -49,7 +52,7 @@
+ sbtool:
+ 	@$(MAKE) -C sdk $@ > /dev/null
+ %.bin: %
+-	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .fw_sram -R .test* $< $@
++	@$(OBJCOPY) -O binary -R .note.gnu.build-id -R .test* $< $@
+ 
+ arcboot_ram: $(ARCBOOT_RAM_OBJECTS)
+ 	@$(CC) $^ $(LDFLAGS) -o $@
+diff --git a/app/arcboot_ram.c b/app/arcboot_ram.c
+new file mode 100644
+index 0000000..27f0711
+--- /dev/null
++++ b/app/arcboot_ram.c
+@@ -0,0 +1,8 @@
++#include <stdio.h>
++#include "soc.h"
++#include "arcboot.h"
++
++int arcboot_ram_main(void)
++{
++	return 0;
++}
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+new file mode 100644
+index 0000000..a991c41
+--- /dev/null
++++ b/app/arcboot_rom.c
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdio.h>
++#include "soc.h"
++#include "sb.h"
++#include "arcboot.h"
++
++void arcboot_rom_init()
++{
++
++}
++
++void arcboot_rom_bringup_pcie()
++{
++
++}
++
++void arcboot_rom_bringup_arcboot_ram()
++{
++
++}
++
++int arcboot_rom_main(void)
++{
++	arcboot_rom_init();
++	arcboot_rom_bringup_pcie();
++	arcboot_rom_bringup_arcboot_ram();
++
++	return 0;
++}
+diff --git a/app/crt0_ram.S b/app/crt0_ram.S
+new file mode 100644
+index 0000000..cc2c4c3
+--- /dev/null
++++ b/app/crt0_ram.S
+@@ -0,0 +1,77 @@
++;; *******************************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; *******************************************************************************************************************
++.file "crt0_ram.S"
++
++.extern main
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	mov gp, @__SDATA_BEGIN__
++
++	mov_s r2, @__sbss_start	; r2 = start of the bss section
++	sub r3, @_end, r2	; r3 = size of the bss section in bytes
++	; set up the loop counter register to the size (in words) of the bss section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov sp, @__stack_top	; initialize stack pointer
++	mov_s r3, 0
++	; loop to zero out the bss.  Enter loop only if lp_count != 0
++	lpnz @.Lend_zbss
++	st.ab r3, [r2, 4]	; zero out the word
++	nop
++.Lend_zbss:
++
++	mov_s r1, @_etext	; r1 = end of the text section
++	mov_s r2, @_data	; r1 = end of the data section
++
++	sub r3, @_edata, r2	; r3 = size of the data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
++	;; branch to main
++	bl.d @arcboot_ram_main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/app/crt0_rom.S b/app/crt0_rom.S
+new file mode 100644
+index 0000000..d4680ee
+--- /dev/null
++++ b/app/crt0_rom.S
+@@ -0,0 +1,132 @@
++;; *******************************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; *******************************************************************************************************************
++.file "crt0_rom.S"
++
++.macro CPU_EARLY_SETUP
++	; enable I-cache/D-cache
++	lr	r5, [ic_ctrl]
++	bclr	r5, r5, 0	; 0 - Enable, 1 is Disable
++	sr	r5, [ic_ctrl]
++
++	lr	r5, [dc_ctrl]
++	bclr	r5, r5, 6	; Invalidate (discard w/o wback)
++	bclr	r5, r5, 0	; Enable (+Inv)
++	sr	r5, [dc_ctrl]
++
++	; Disable alignment checking
++	lr	r5, [status32]
++	bset	r5, r5, 19
++	kflag	r5
++.endm
++
++.extern main
++
++.section .ivt, "a", @progbits
++
++; Helper macro to define weak symbols to include into interrupt vector table.
++; User code may define those functions in them, so user function will be
++; referenced in the IVT. By default all handlers point to _exit_halt - so they
++; always cause application halt, because if application causes an exception or
++; interrupt, but doesn't set a handler for it - something is wrong in
++; application. Exception is "start" entry of IVT, which points to __start
++; function.
++#define IVT_ENTRY(name) \
++    .word name `\
++    .weak name `\
++    .set name, _exit_halt
++
++; handler's name,		number,	name,			offset in IVT (hex/dec)
++.word __start			; 0	program entry point	0x0		0
++IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
++IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
++IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
++IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
++IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
++IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
++IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
++IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
++IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
++IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
++IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
++IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
++IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
++IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
++IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
++IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
++IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
++IVT_ENTRY(IRQ_18)		; 18				0x48		72
++IVT_ENTRY(IRQ_19)		; 19				0x4C		76
++IVT_ENTRY(IRQ_20)		; 20				0x50		80
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	CPU_EARLY_SETUP
++	mov gp, @__SDATA_BEGIN__
++
++	mov_s r2, @__sbss_start	; r2 = start of the bss section
++	sub r3, @_end, r2	; r3 = size of the bss section in bytes
++	; set up the loop counter register to the size (in words) of the bss section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov sp, @__stack_top	; initialize stack pointer
++	mov_s r3, 0
++	; loop to zero out the bss.  Enter loop only if lp_count != 0
++	lpnz @.Lend_zbss
++	st.ab r3, [r2, 4]	; zero out the word
++	nop
++.Lend_zbss:
++
++	mov_s r1, @_etext	; r1 = end of the text section
++	mov_s r2, @_data	; r1 = end of the data section
++
++	sub r3, @_edata, r2	; r3 = size of the data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
++	;; branch to main
++	bl.d @arcboot_rom_main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/common/arcboot_ram.c b/common/arcboot_ram.c
+deleted file mode 100644
+index 27f0711..0000000
+--- a/common/arcboot_ram.c
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#include <stdio.h>
+-#include "soc.h"
+-#include "arcboot.h"
+-
+-int arcboot_ram_main(void)
+-{
+-	return 0;
+-}
+diff --git a/common/arcboot_rom.c b/common/arcboot_rom.c
+deleted file mode 100644
+index e010359..0000000
+--- a/common/arcboot_rom.c
++++ /dev/null
+@@ -1,103 +0,0 @@
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+-#include <stdio.h>
+-#include "soc.h"
+-#include "sb.h"
+-#include "arcboot.h"
+-
+-unsigned char __attribute__ ((section(".fw_sram"))) fw_sram[FW_SIZE];
+-
+-int arcboot_dma_copy_image(uint32_t image_size)
+-{
+-	uint32_t reg_spi_dma_ctrl_s =  0;
+-	uint32_t reg_spi_dma_status_s = 0;
+-	uint32_t tmp = 0;
+-	uint32_t next_image_add = 0;
+-
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
+-
+-	image_size = flash_readl(FLASH_IMAGE_1_OFFSET +
+-				 FLASH_IMAGE_PREBOOT_OFFSET);
+-	regmap_writel(image_size, mmPSOC_SECURITY_SW_STATUS_0);
+-
+-	next_image_add = image_size % SPI_FLASH_BLOCK_SIZE;
+-	regmap_writel(next_image_add, mmPSOC_SECURITY_SW_STATUS_1);
+-
+-	next_image_add += image_size;
+-	regmap_writel(next_image_add, mmPSOC_SECURITY_SW_STATUS_2);
+-
+-	image_size = flash_readl(FLASH_IMAGE_1_OFFSET + next_image_add);
+-	regmap_writel(tmp, mmPSOC_SECURITY_SW_STATUS_4);
+-
+-	reg_spi_dma_ctrl_s = image_size << 18;
+-	reg_spi_dma_ctrl_s = 0; // addr
+-	reg_spi_dma_ctrl_s = 1 << 1; //sram
+-	reg_spi_dma_ctrl_s = 1; // en
+-
+-	regmap_writel(reg_spi_dma_ctrl_s, mmPSOC_GLOBAL_CONF_SPI_DMA_CTRL);
+-	do {
+-		tmp = regmap_readl(mmPSOC_SECURITY_SW_STATUS_0) + 1;
+-		regmap_writel(tmp, mmPSOC_SECURITY_SW_STATUS_0);
+-		reg_spi_dma_status_s =
+-		 regmap_readl(mmPSOC_GLOBAL_CONF_SPI_DMA_STATUS);
+-		regmap_writel(reg_spi_dma_status_s,
+-				  mmPSOC_SECURITY_SW_STATUS_1);
+-	} while (reg_spi_dma_status_s & 0x3);
+-	return 0;
+-}
+-
+-int arcboot_verify_image(uint32_t image_size)
+-{
+-	int st, err;
+-	unsigned char block_buf[512];
+-	uint16_t test_phase0b_data_len = image_size - SIG_SIZE - BLOB_START;
+-
+-	unsigned char *test_phase0b_data = &fw_sram[BLOB_START];
+-	unsigned char *test_phase0b_sig = &fw_sram[test_phase0b_data_len + BLOB_START];
+-	unsigned char *test_public_key = test_phase0b_sig - KEY_SIZE;
+-	uint32_t test_phase0b_sig_len = SIG_SIZE;
+-	uint32_t test_public_key_len = KEY_SIZE;
+-
+-	XSTACK_INIT();
+-
+-	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
+-	 * of the data blob (test_phase0b_data) */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
+-			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
+-
+-	if (err || !st) {
+-		regmap_writel(0x800, mmPSOC_SECURITY_STATUS);
+-		regmap_writel(err, mmPSOC_SECURITY_SW_STATUS_0);
+-		regmap_writel(st, mmPSOC_SECURITY_SW_STATUS_1);
+-	}
+-
+-	regmap_writel(1, mmPSOC_SECURITY_STATUS);
+-	return 0;
+-}
+-
+-int arcboot_rom_main(void)
+-{
+-	uint32_t image_size = 0;
+-
+-	image_size = ((uint32_t *)fw_sram)[0];
+-	//arcboot_dma_copy_image(image_size);
+-	arcboot_verify_image(image_size);
+-
+-	return 0;
+-}
+diff --git a/common/crt0_ram.S b/common/crt0_ram.S
+deleted file mode 100644
+index cc2c4c3..0000000
+--- a/common/crt0_ram.S
++++ /dev/null
+@@ -1,77 +0,0 @@
+-;; *******************************************************************************************************************
+-;; -----------------
+-;; ARC start up file
+-;; -----------------
+-;; The startup code for the ARC family of processors does the following
+-;; before transferring control to user defined main label :
+-;;	1. Set sp to __stack_top (link time variable)
+-;;	2. Set fp to zero
+-;;	3. Zero out the bss section (for uninitialized globals)
+-;; After returning from main, the processor is halted and the pipeline is flushed out
+-;;
+-;; *******************************************************************************************************************
+-.file "crt0_ram.S"
+-
+-.extern main
+-
+-.section .text.__startup, "ax", @progbits
+-
+-.global __start
+-.type __start, @function
+-.align 4
+-
+-; Startup code for the ARC600, ARC700 and ARCv2 processors
+-; NOTE:  The following restrictions apply on zero overhead loops (other
+-; restrictions are not pertinent to this code)
+-; - loop end should be 4 instruction words away from the lp_count setting
+-;   instruction
+-; - loop body should have at least two instruction words
+-__start:
+-	mov gp, @__SDATA_BEGIN__
+-
+-	mov_s r2, @__sbss_start	; r2 = start of the bss section
+-	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+-	; set up the loop counter register to the size (in words) of the bss section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	mov sp, @__stack_top	; initialize stack pointer
+-	mov_s r3, 0
+-	; loop to zero out the bss.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_zbss
+-	st.ab r3, [r2, 4]	; zero out the word
+-	nop
+-.Lend_zbss:
+-
+-	mov_s r1, @_etext	; r1 = end of the text section
+-	mov_s r2, @_data	; r1 = end of the data section
+-
+-	sub r3, @_edata, r2	; r3 = size of the data section in bytes
+-
+-	; set up the loop counter register to the size (in words) of the data section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_cdata
+-	ld.ab	r5,[r1,4]
+-	st.ab	r5,[r2,4]
+-.Lend_cdata:
+-
+-	;; branch to main
+-	bl.d @arcboot_ram_main
+-	mov fp, 0		; initialize frame pointer
+-				; r0 contains exit code
+-	j @_exit_halt
+-
+-.global _exit_halt
+-.type _exit_halt, @function
+-.align 4
+-_exit_halt:
+-				; r0 contains exit code
+-	flag 0x01
+-	nop
+-	nop
+-	nop
+-	j @_exit_halt
+-	nop
+diff --git a/common/crt0_rom.S b/common/crt0_rom.S
+deleted file mode 100644
+index d4680ee..0000000
+--- a/common/crt0_rom.S
++++ /dev/null
+@@ -1,132 +0,0 @@
+-;; *******************************************************************************************************************
+-;; -----------------
+-;; ARC start up file
+-;; -----------------
+-;; The startup code for the ARC family of processors does the following
+-;; before transferring control to user defined main label :
+-;;	1. Set sp to __stack_top (link time variable)
+-;;	2. Set fp to zero
+-;;	3. Zero out the bss section (for uninitialized globals)
+-;; After returning from main, the processor is halted and the pipeline is flushed out
+-;;
+-;; *******************************************************************************************************************
+-.file "crt0_rom.S"
+-
+-.macro CPU_EARLY_SETUP
+-	; enable I-cache/D-cache
+-	lr	r5, [ic_ctrl]
+-	bclr	r5, r5, 0	; 0 - Enable, 1 is Disable
+-	sr	r5, [ic_ctrl]
+-
+-	lr	r5, [dc_ctrl]
+-	bclr	r5, r5, 6	; Invalidate (discard w/o wback)
+-	bclr	r5, r5, 0	; Enable (+Inv)
+-	sr	r5, [dc_ctrl]
+-
+-	; Disable alignment checking
+-	lr	r5, [status32]
+-	bset	r5, r5, 19
+-	kflag	r5
+-.endm
+-
+-.extern main
+-
+-.section .ivt, "a", @progbits
+-
+-; Helper macro to define weak symbols to include into interrupt vector table.
+-; User code may define those functions in them, so user function will be
+-; referenced in the IVT. By default all handlers point to _exit_halt - so they
+-; always cause application halt, because if application causes an exception or
+-; interrupt, but doesn't set a handler for it - something is wrong in
+-; application. Exception is "start" entry of IVT, which points to __start
+-; function.
+-#define IVT_ENTRY(name) \
+-    .word name `\
+-    .weak name `\
+-    .set name, _exit_halt
+-
+-; handler's name,		number,	name,			offset in IVT (hex/dec)
+-.word __start			; 0	program entry point	0x0		0
+-IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
+-IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
+-IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
+-IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
+-IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
+-IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
+-IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
+-IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
+-IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
+-IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
+-IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
+-IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
+-IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
+-IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
+-IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
+-IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
+-IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
+-IVT_ENTRY(IRQ_18)		; 18				0x48		72
+-IVT_ENTRY(IRQ_19)		; 19				0x4C		76
+-IVT_ENTRY(IRQ_20)		; 20				0x50		80
+-
+-.section .text.__startup, "ax", @progbits
+-
+-.global __start
+-.type __start, @function
+-.align 4
+-
+-; Startup code for the ARC600, ARC700 and ARCv2 processors
+-; NOTE:  The following restrictions apply on zero overhead loops (other
+-; restrictions are not pertinent to this code)
+-; - loop end should be 4 instruction words away from the lp_count setting
+-;   instruction
+-; - loop body should have at least two instruction words
+-__start:
+-	CPU_EARLY_SETUP
+-	mov gp, @__SDATA_BEGIN__
+-
+-	mov_s r2, @__sbss_start	; r2 = start of the bss section
+-	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+-	; set up the loop counter register to the size (in words) of the bss section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	mov sp, @__stack_top	; initialize stack pointer
+-	mov_s r3, 0
+-	; loop to zero out the bss.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_zbss
+-	st.ab r3, [r2, 4]	; zero out the word
+-	nop
+-.Lend_zbss:
+-
+-	mov_s r1, @_etext	; r1 = end of the text section
+-	mov_s r2, @_data	; r1 = end of the data section
+-
+-	sub r3, @_edata, r2	; r3 = size of the data section in bytes
+-
+-	; set up the loop counter register to the size (in words) of the data section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_cdata
+-	ld.ab	r5,[r1,4]
+-	st.ab	r5,[r2,4]
+-.Lend_cdata:
+-
+-	;; branch to main
+-	bl.d @arcboot_rom_main
+-	mov fp, 0		; initialize frame pointer
+-				; r0 contains exit code
+-	j @_exit_halt
+-
+-.global _exit_halt
+-.type _exit_halt, @function
+-.align 4
+-_exit_halt:
+-				; r0 contains exit code
+-	flag 0x01
+-	nop
+-	nop
+-	nop
+-	j @_exit_halt
+-	nop
+diff --git a/common/dma.c b/common/dma.c
+new file mode 100644
+index 0000000..1f07a3d
+--- /dev/null
++++ b/common/dma.c
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdio.h>
++#include "soc.h"
++#include "sb.h"
++#include "arcboot.h"
++
++int arcboot_dma_copy_image(uint32_t image_size)
++{
++	uint32_t reg_spi_dma_ctrl_s =  0;
++	uint32_t reg_spi_dma_status_s = 0;
++	uint32_t tmp = 0;
++	uint32_t next_image_add = 0;
++
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
++
++	image_size = flash_readl(FLASH_IMAGE_1_OFFSET +
++				 FLASH_IMAGE_PREBOOT_OFFSET);
++	next_image_add = image_size % SPI_FLASH_BLOCK_SIZE;
++	next_image_add += image_size;
++	image_size = flash_readl(FLASH_IMAGE_1_OFFSET + next_image_add);
++
++	reg_spi_dma_ctrl_s = image_size << 18;
++	reg_spi_dma_ctrl_s = 0; // addr
++	reg_spi_dma_ctrl_s = 1 << 1; //sram
++	reg_spi_dma_ctrl_s = 1; // en
++
++	regmap_writel(reg_spi_dma_ctrl_s, mmPSOC_GLOBAL_CONF_SPI_DMA_CTRL);
++	do {
++		reg_spi_dma_status_s =
++		 regmap_readl(mmPSOC_GLOBAL_CONF_SPI_DMA_STATUS);
++	} while (reg_spi_dma_status_s & 0x3);
++	return 0;
++}
+\ No newline at end of file
+diff --git a/common/secureboot.c b/common/secureboot.c
+new file mode 100644
+index 0000000..6ba6d4e
+--- /dev/null
++++ b/common/secureboot.c
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdio.h>
++#include "soc.h"
++#include "sb.h"
++#include "arcboot.h"
++
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++int arcboot_verify_image(uint32_t image_size)
++{
++	int st, err;
++	unsigned char block_buf[512];
++	uint16_t test_phase0b_data_len = image_size - SIG_SIZE - BLOB_START;
++
++	unsigned char *test_phase0b_data = &fw_sram[BLOB_START];
++	unsigned char *test_phase0b_sig = &fw_sram[test_phase0b_data_len + BLOB_START];
++	unsigned char *test_public_key = test_phase0b_sig - KEY_SIZE;
++	uint32_t test_phase0b_sig_len = SIG_SIZE;
++	uint32_t test_public_key_len = KEY_SIZE;
++
++	XSTACK_INIT();
++
++	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
++	 * of the data blob (test_phase0b_data) */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
++			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
++
++	if (err || !st) {
++		regmap_writel(0x800, mmPSOC_SECURITY_STATUS);
++		regmap_writel(err, mmPSOC_SECURITY_SW_STATUS_0);
++		regmap_writel(st, mmPSOC_SECURITY_SW_STATUS_1);
++	}
++
++	regmap_writel(1, mmPSOC_SECURITY_STATUS);
++	return 0;
++}
+\ No newline at end of file
+diff --git a/goya2_arc/arcboot_ram.lds b/goya2_arc/arcboot_ram.lds
+index e6447a9..3630a3f 100644
+--- a/goya2_arc/arcboot_ram.lds
++++ b/goya2_arc/arcboot_ram.lds
+@@ -21,7 +21,6 @@
+ }
+ 
+ REGION_ALIAS("REGION_TEXT",	ICCM)
+-REGION_ALIAS("REGION_FW",	FWSRAM)
+ REGION_ALIAS("REGION_DATA",	DCCM)
+ REGION_ALIAS("REGION_SDATA",	DCCM)
+ REGION_ALIAS("REGION_SBSS",	DCCM)
+@@ -34,15 +33,10 @@
+ SECTIONS
+ {
+ 	.text : {
+-		common/crt0_ram.o (.text*)
++		app/crt0_ram.o (.text*)
+ 		*(.text .text.*)
+ 		_etext = . ;
+ 	} > REGION_TEXT
+-
+-	.fw_sram :
+-	{
+-		*(.fw_sram)
+-	} > REGION_FW
+ 
+ 	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+ 		_data = .;
+diff --git a/goya2_arc/arcboot_rom.lds b/goya2_arc/arcboot_rom.lds
+index 2f46595..39ba169 100644
+--- a/goya2_arc/arcboot_rom.lds
++++ b/goya2_arc/arcboot_rom.lds
+@@ -22,7 +22,6 @@
+ 
+ REGION_ALIAS("REGION_IVT",	SBROM)
+ REGION_ALIAS("REGION_TEXT",	SBROM)
+-REGION_ALIAS("REGION_FW",	FWSRAM)
+ REGION_ALIAS("REGION_DATA",	DCCM)
+ REGION_ALIAS("REGION_SDATA",	DCCM)
+ REGION_ALIAS("REGION_SBSS",	DCCM)
+@@ -39,14 +38,10 @@
+ 	} > REGION_IVT
+ 
+ 	.text : {
+-		common/crt0_rom.o (.text*)
++		app/crt0_rom.o (.text*)
+ 		*(.text .text.*)
+ 		_etext = . ;
+ 	} > REGION_TEXT
+-
+-	.fw_sram : {
+-		*(.fw_sram)
+-	} > REGION_FW
+ 
+ 	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+ 		_data = .;

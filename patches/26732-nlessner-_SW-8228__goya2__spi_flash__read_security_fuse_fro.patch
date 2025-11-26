@@ -1,0 +1,223 @@
+From ea520eb5bfec331ed8a5ab4b6c3427cc0ceda6d8 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Wed, 29 Jan 2020 00:57:58 +0200
+Subject: [PATCH] [SW-8228] goya2: spi_flash: read security fuse from flash
+
+Add support to read the key hash, revoked keys and fw security version
+from spi flash location
+
+Change-Id: I38fd200630a604694f5ebbcb8560e2ac806044f2
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index e7ed554..ec82dbf 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -8,6 +8,7 @@
+ #include "arcboot.h"
+ #include "efuse.h"
+ #include "security.h"
++#include "spi_flash.h"
+ 
+ struct arcboot_global_s arcboot_rom_global = {
+ 	.config_fuse = 0,
+@@ -35,6 +36,10 @@
+ 
+ 	switch (current_security_location) {
+ 	case SPI_FLASH:
++		/* TODO: invert revoke bit logic for spi */
++		spi_flash_get_revoke(&key_revoke);
++		spi_flash_get_hash(key_hash);
++		fw_version_sec = spi_flash_get_fw_version_security();
+ 		break;
+ 	case SPI_OTP:
+ 		break;
+diff --git a/common/dma.c b/common/dma.c
+index f3666d8..695dda6 100644
+--- a/common/dma.c
++++ b/common/dma.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "arcboot.h"
++#include "spi_flash.h"
+ 
+ int arcboot_dma_copy_image(uint32_t image_size)
+ {
+@@ -16,11 +17,11 @@
+ 	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
+ 	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
+ 
+-	image_size = flash_readl(FLASH_IMAGE_1_OFFSET +
++	image_size = spi_flash_readl(FLASH_IMAGE_1_OFFSET +
+ 				 FLASH_IMAGE_PREBOOT_OFFSET);
+ 	next_image_add = image_size % SPI_FLASH_BLOCK_SIZE;
+ 	next_image_add += image_size;
+-	image_size = flash_readl(FLASH_IMAGE_1_OFFSET + next_image_add);
++	image_size = spi_flash_readl(FLASH_IMAGE_1_OFFSET + next_image_add);
+ 
+ 	reg_spi_dma_ctrl_s = image_size << 18;
+ 	reg_spi_dma_ctrl_s = 0; // addr
+diff --git a/common/spi_flash.c b/common/spi_flash.c
+new file mode 100644
+index 0000000..dbbb9b0
+--- /dev/null
++++ b/common/spi_flash.c
+@@ -0,0 +1,104 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include "arcboot.h"
++#include "spi_flash.h"
++
++static void spi_flash_set_byte_swap(uint8_t enable)
++{
++	uint32_t reg_spi_direct_wr_rd_ctrl = 0;
++
++	/* clear BYTE SWAP in SPI DMA so we dont switch endianness */
++	reg_spi_direct_wr_rd_ctrl =
++		regmap_readl(mmPSOC_GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL);
++	if (enable)
++		reg_spi_direct_wr_rd_ctrl |=
++			PSOC_GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL_BYTE_SWAP_MASK;
++	else
++		reg_spi_direct_wr_rd_ctrl &=
++			~PSOC_GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL_BYTE_SWAP_MASK;
++
++	regmap_writel(reg_spi_direct_wr_rd_ctrl,
++		      mmPSOC_GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL);
++}
++
++u32 spi_flash_readl(u32 offset)
++{
++	spi_flash_set_byte_swap(ENABLE_BYTE_SWAP);
++	u32 reg = base_readl(HL_FLASH_BASE + offset);
++
++	return reg;
++}
++
++void spi_flash_writel(u32 val, u32 offset)
++{
++	spi_flash_set_byte_swap(ENABLE_BYTE_SWAP);
++	base_writel(val, HL_FLASH_BASE + offset);
++}
++
++void spi_flash_get_revoke(uint32_t *key_revoke)
++{
++	uint32_t flash_efuse_offset, revoke_status;
++	uint8_t i;
++	*key_revoke = 0;
++	flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET);
++	revoke_status =  spi_flash_readl(flash_efuse_offset +
++					 FLASH_EFUSE_KEYS_REVOKE_OFFSET);
++	/* check for revoke habana key bit and customer bit 0 - 3 */
++	for (i = 0; i < 4; i++) {
++		if ((revoke_status >> i) & 1)
++			*key_revoke |= BIT(i);
++		revoke_status = revoke_status >> 4;
++	}
++
++	flash_efuse_offset += 4;
++	revoke_status =  spi_flash_readl(flash_efuse_offset +
++					 FLASH_EFUSE_KEYS_REVOKE_OFFSET);
++	/* check for revoke bit of customer key 4 */
++	if ((revoke_status & 1) == 1)
++		*key_revoke |= BIT(4);
++}
++
++void spi_flash_get_hash(uint32_t *key_hash)
++{
++	uint8_t i;
++	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
++						FLASH_EFUSE_KEYS_OFFSET;
++	for (i = 0; i < 40; i++)
++		*(key_hash + i) = spi_flash_readl(flash_efuse_offset + i);
++}
++
++/* minimal allowed security version is defined by a 128bit map, to find this
++ * we scan from end to beginning of map looking for the first set bit. once
++ * it's found this indicated the minimal version allowed to run on the system
++ */
++uint8_t spi_flash_get_fw_version_security(void)
++{
++	uint8_t i, row, colume;
++	uint32_t fw_version[4];
++	uint8_t fw_version_sec;
++	uint32_t flash_efuse_offset = spi_flash_readl(FLASH_EFUSE_OFFSET) +
++						FLASH_EFUSE_FW_VERSION_OFFSET;
++
++	/* read min security version bit map from flash */
++	for (i = 0; i < 4; i++)
++		fw_version[i] = spi_flash_readl(flash_efuse_offset + i);
++
++	/* init max version */
++	fw_version_sec = 128;
++
++	/* iterate back from 127 -> 0 till a set bit found */
++	for (row = 3; row > 0; row--) {
++		for (colume = 31; colume > 0; colume--) {
++			/* find highest bit set in valid FW */
++			fw_version_sec--;
++			if (fw_version[row] & BIT(colume))
++				return fw_version_sec;
++		}
++	}
++	return fw_version_sec;
++}
+diff --git a/common/spi_flash.h b/common/spi_flash.h
+new file mode 100644
+index 0000000..9e99bef
+--- /dev/null
++++ b/common/spi_flash.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _SPI_FLASH_H_
++#define _SPI_FLASH_H_
++
++#define ENABLE_BYTE_SWAP		1
++#define DISABLE_BYTE_SWAP		0
++
++#define FLASH_PRIMARY_OFFSET		0
++#define FLASH_SECONDARY_OFFSET		4
++#define FLASH_EFUSE_OFFSET		8
++#define FLASH_IMAGE_PTR			12
++
++#define FLASH_EFUSE_FW_VERSION_OFFSET	0
++#define FLASH_EFUSE_KEYS_OFFSET		16
++#define FLASH_EFUSE_KEYS_REVOKE_OFFSET	176
++
++u32 spi_flash_readl(u32 offset);
++void spi_flash_writel(u32 val, u32 offset);
++void spi_flash_get_revoke(uint32_t *key_revoke);
++void spi_flash_get_hash(uint32_t *key_hash);
++uint8_t spi_flash_get_fw_version_security(void);
++
++#endif /* _SPI_FLASH_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 2a4036a..0c12c77 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -87,13 +87,6 @@
+ 	return reg;
+ }
+ 
+-static inline u32 flash_readl(u32 offset)
+-{
+-	u32 reg = base_readl(HL_FLASH_BASE + offset);
+-
+-	return reg;
+-}
+-
+ static inline u32 fw_sram_readl(u32 offset)
+ {
+ 	u32 reg = base_readl(HL_FWSRAM_BASE + offset);

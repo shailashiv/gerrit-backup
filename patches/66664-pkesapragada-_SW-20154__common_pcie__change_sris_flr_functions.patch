@@ -1,0 +1,117 @@
+From c10164d8f3e9dc6935dcf570740c9e2a400052bb Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Sun, 17 Jan 2021 11:37:48 +0200
+Subject: [PATCH] [SW-20154] common/pcie: change sris/flr functions
+
+PCIe configuration code like pcie_config, snps
+workaround etc involves registers that
+are specific to Goya2 like the SRIS mode bit,
+FLR handling. Since the same SNPS workaroud
+is needed for Gaudi2, most of the pcie related
+code is left common. Only the SRIS query,
+FLR handling is implemented as a platform specific
+function
+
+Change-Id: I6bf9da29aa11a32113b1cb3b48545717248d6f65
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/common/common.h b/common/common.h
+index 1707161..674f4ba 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -7,5 +7,7 @@
+ #define _COMMON_H_
+ 
+ uint32_t get_mem_cfg_mask(void);
++uint8_t get_sris_mode_from_strap(void);
++void enable_flr_handling_fsm(void);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/common/pcie.c b/common/pcie.c
+index 5e6fdf3..1f866e3 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -11,6 +11,7 @@
+ #include "efuse.h"
+ #include "pcie.h"
+ #include "delay.h"
++#include <common.h>
+ 
+ static void pcie_loop_while_prstn(uint8_t assert)
+ {
+@@ -35,10 +36,7 @@
+ 	uint8_t separate_reference = 0;
+ 	uint8_t ssc_en = 0;
+ 
+-	/* SRIS mode enable */
+-	if (boot_strap &
+-	    PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
+-		separate_reference = 1;
++	separate_reference = get_sris_mode_from_strap();
+ 
+ 	/* SRNS mode enable */
+ 	if ((boot_strap &
+@@ -112,7 +110,7 @@
+ static void pcie_config(void)
+ {
+ 	uint8_t sram_init_done;
+-	uint32_t boot_strap, flr_ctrl, link_ctrl;
++	uint32_t boot_strap, link_ctrl;
+ 	uint8_t ltssm_en;
+ 
+ 	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
+@@ -127,8 +125,7 @@
+ 		/* gpio bootstrap pin gpio17 = 0 */
+ 		boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+ 
+-		if (boot_strap &
+-		    PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK) {
++		if (get_sris_mode_from_strap()) {
+ 			regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
+ 			regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
+ 		}
+@@ -172,9 +169,7 @@
+ 		regmap_writel(0xC0080000, IATU_REGION_CTRL_2_OFF_INBOUND);
+ 
+ 		/* enable flr handling by HW state machine */
+-		flr_ctrl = regmap_readl(mmPCIE_AUX_FLR_CTRL);
+-		flr_ctrl |= (1 << PCIE_AUX_FLR_CTRL_FSM_EN_SHIFT);
+-		regmap_writel(flr_ctrl, mmPCIE_AUX_FLR_CTRL);
++		enable_flr_handling_fsm();
+ 
+ 		/* disable HOT reset handling by HW state machine */
+ 		regmap_writel(PCIE_WRAP_CPU_HOT_RST_CTRL_MASK,
+diff --git a/goya2_arc/common.c b/goya2_arc/common.c
+index cde0aa7..48c2967 100644
+--- a/goya2_arc/common.c
++++ b/goya2_arc/common.c
+@@ -9,6 +9,7 @@
+ #include <efuse.h>
+ #include <psoc_efuse_regs.h>
+ #include <psoc_global_conf_masks.h>
++#include <arcboot.h>
+ 
+ uint32_t get_efuse_read_reg(void)
+ {
+@@ -19,3 +20,20 @@
+ {
+ 	return PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK;
+ }
++
++uint8_t get_sris_mode_from_strap(void)
++{
++	uint32_t boot_strap;
++
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK);
++}
++
++void enable_flr_handling_fsm(void)
++{
++	uint32_t flr_ctrl = regmap_readl(mmPCIE_AUX_FLR_CTRL);
++
++	flr_ctrl |= (1 << PCIE_AUX_FLR_CTRL_FSM_EN_SHIFT);
++	regmap_writel(flr_ctrl, mmPCIE_AUX_FLR_CTRL);
++}

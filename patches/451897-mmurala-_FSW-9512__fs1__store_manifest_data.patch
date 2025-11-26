@@ -1,0 +1,83 @@
+From 2fa2f0203133ffce613914246a244e906b700c55 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Tue, 24 Sep 2024 14:26:02 +0300
+Subject: [PATCH] [FSW-9512] fs1: store manifest data
+
+With this patch, added support to copy manifest
+header and context into persistent dccm upon
+successful boot desc init and image validation
+pass. Irrespective of boot info status boot rom
+will store manifest contents into persistent dccm
+
+Change-Id: Ifeb2ec55554355336e0e201479a4643728193560
+---
+
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 2f3d1cc..f569807 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -61,14 +61,21 @@
+ 	p_spi_manifest_const = &spi_manifest_consts[manifest_type];
+ }
+ 
+-void boot_rom_load_manifest_from_persistent_data(struct hl_fw_manifest_ctx *p_manifest_ctx,
+-						 struct hl_fw_boot_ptrs *p_manifest_hdr)
++void boot_rom_handle_manifest_data(enum hl_fw_manifest_type manifest_type, bool write)
+ {
+-	/* TODO: load from boot info instead of persistent memory */
+-	memcpy(p_manifest_hdr, &(boot_rom_manifest.spi_manifest_hdr),
+-	       sizeof(struct hl_fw_boot_ptrs));
+-	memcpy(p_manifest_ctx, &(boot_rom_manifest.manifest_ctx),
+-	       sizeof(struct hl_fw_manifest_ctx));
++	boot_desc_update_ptrs(manifest_type);
++
++	if (write) {
++		memcpy(&(boot_rom_manifest.spi_manifest_hdr), p_boot_ptr,
++			sizeof(struct hl_fw_boot_ptrs));
++		memcpy(&(boot_rom_manifest.manifest_ctx), p_manifest_ctx,
++			sizeof(struct hl_fw_manifest_ctx));
++	} else {
++		memcpy(p_boot_ptr, &(boot_rom_manifest.spi_manifest_hdr),
++			sizeof(struct hl_fw_boot_ptrs));
++		memcpy(p_manifest_ctx, &(boot_rom_manifest.manifest_ctx),
++			sizeof(struct hl_fw_manifest_ctx));
++	}
+ }
+ 
+ int boot_desc_init(enum hl_fw_manifest_type manifest_type)
+@@ -90,7 +97,8 @@
+ 
+ 	if (boot_rom_global.validation_pass &&
+ 	    boot_rom_global.valid_manifest_idx == manifest_type) {
+-		boot_rom_load_manifest_from_persistent_data(p_manifest_ctx, p_boot_ptr);
++		/* TODO: Move to boot_rom_get_boot_info */
++		boot_rom_handle_manifest_data(manifest_type, false);
+ 		goto skip_boot_desc_process;
+ 	}
+ 
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 8f0913f..d179539 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -41,6 +41,7 @@
+ uint32_t boot_desc_get_recovery_img_count(enum hl_fw_manifest_type manifest_idx);
+ uint32_t boot_desc_get_boot_pointer(enum hl_fw_manifest_type manifest_type);
+ uint8_t boot_desc_spi_efuse_init(uint8_t die_id_index, enum hl_fw_manifest_type manifest_idx);
++void boot_rom_handle_manifest_data(enum hl_fw_manifest_type manifest_type, bool write);
+ 
+ #endif /* _BOOT_DESC_H_ */
+ 
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 1e0440a..e7e281a 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -150,6 +150,9 @@
+ 
+ 	/* TODO: Set other manifest as invalid */
+ 
++	/* For redundancy, Write irrespective of boot info enable/disable */
++	boot_rom_handle_manifest_data(man_idx, true);
++
+ 	boot_rom_set_boot_info();
+ 
+ 	/* TODO: TPM PCR extend */

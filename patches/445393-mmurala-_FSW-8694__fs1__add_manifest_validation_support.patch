@@ -1,0 +1,101 @@
+From bb58742391bea36fe3ded56056afe200d2db8404 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 28 Aug 2024 10:38:34 +0300
+Subject: [PATCH] [FSW-8694] fs1: add manifest validation support
+
+Manifest has all the img desc data which is
+used to locate firmware binaries. Verification
+of manifest is very important as subsequent
+firmware binaries get loaded after boot rom is
+based on manifest data. Hence, added verification
+support to make sure manifest not corrupted.
+With this support, manifest verified using key
+check and signature check.
+
+Change-Id: Ibc9ebad7a34fadc311c7847010417c5d2d124214
+---
+
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 19758a2..d82b61b 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -161,8 +161,6 @@
+ 	boot_rom_halt();
+ }
+ 
+-static uint32_t boot_rom_verify_manifest(__unused enum hl_fw_manifest_type manifest_idx)
+-{ return BOOT_ROM_SUCCESS; }
+ void boot_rom_boot_flow_validate_manifests(void)
+ {
+ 	enum hl_fw_manifest_type curr_manifest_idx = HL_FW_SPI_MANIFEST_0;
+diff --git a/common/common.c b/common/common.c
+index fa3cc2a..00c8771 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -133,3 +133,55 @@
+ 		boot_rom_global.force_recovery = true;
+ }
+ 
++uint32_t boot_rom_verify_manifest(enum hl_fw_manifest_type manifest_idx)
++{
++	enum boot_rom_progress boot_desc_verif_base = PROGRESS_SPI_MANIFEST_0_VERIFY_START;
++	struct hl_fw_boot_ptrs *boot_ptr;
++	uint32_t boot_ptr_addr = 0;
++	int ret;
++	uint32_t img_plus_key_len;
++
++	if (!security_efuse_image_validation_en())
++		return BOOT_ROM_SUCCESS;
++
++	if ((boot_rom_global.valid_manifest_idx == manifest_idx) && (boot_rom_global.validation_pass)) {
++		boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_SUCCESS);
++		return BOOT_ROM_SUCCESS;
++	}
++
++	if (manifest_idx == HL_FW_SPI_MANIFEST_1)
++		boot_desc_verif_base = PROGRESS_SPI_MANIFEST_1_VERIFY_START;
++
++	boot_ptr_addr = boot_desc_get_boot_pointer(manifest_idx);
++
++	if (boot_ptr_addr == 0)
++		return BOOT_ROM_FAIL;
++
++	boot_ptr = (struct hl_fw_boot_ptrs *)boot_ptr_addr;
++
++	boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_START);
++
++	img_plus_key_len = boot_ptr->boot_ptrs_img_sz - boot_ptr->sig_sz - CRC32_SIZE;
++
++	ret = secure_boot_verify_image_signature((uint8_t *)boot_ptr_addr, img_plus_key_len,
++			(uint8_t *)(boot_ptr_addr + img_plus_key_len - boot_ptr->pub_key_sz),
++			boot_ptr->pub_key_sz, (uint8_t *)(boot_ptr_addr + img_plus_key_len), boot_ptr->sig_sz,
++			boot_ptr->sec_ver, boot_ptr->key_idx);
++
++	if (ret == SECUREBOOT_VERIFY_SUCCESS) {
++		boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_SUCCESS);
++	} else {
++		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
++			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_VERSION_FAIL);
++		else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
++			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_KEY_REVOKED);
++		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
++			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_KEY_HASH_FAIL);
++		else
++			boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_AUTH_FAIL);
++
++		return BOOT_ROM_FAIL;
++	}
++
++	return BOOT_ROM_SUCCESS;
++}
+diff --git a/common/common.h b/common/common.h
+index 3b34b57..b40f7d7 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -32,5 +32,6 @@
+ void boot_rom_init_sku(void);
+ bool boot_rom_in_multi_die_mode(void);
+ uint32_t boot_rom_get_arc_addr(uint64_t addr);
++uint32_t boot_rom_verify_manifest(enum hl_fw_manifest_type manifest_idx);
+ 
+ #endif /* _COMMON_H_ */

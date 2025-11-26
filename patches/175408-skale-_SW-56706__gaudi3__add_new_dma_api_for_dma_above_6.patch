@@ -1,0 +1,144 @@
+From b283c73717ee75bceba1c6d7b3db4644f5429478 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 03 Feb 2022 18:52:35 +0200
+Subject: [PATCH] [SW-56706] gaudi3: add new dma api for dma above 64kb
+
+In Gaudi3, there is possibility of ppboot size might
+increase above 64KB. Current DMA api implemented in ROM
+only supports maximum DMA size of 64KB. The SPI DMA
+hardware has a limitation on max size of 0xFFFC bytes and
+also has alignment required of address and size.
+
+This patch add new DMA API which support size upto 128KB - 8 bytes
+and does check all alignment requirement and also performs all
+adjustments to overcome SPI DMA max size limitation. This API
+waits internally for DMA to finish and reports success/failure
+accordingly. This API will also be exported for ppboot to reuse
+while performing copy of preboot image.
+
+Change-Id: Icf3b3280828c9213aea50418e75fc5efd56fd350
+---
+
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 561e6f8..798c409 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -4,3 +4,4 @@
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/spi_flash.c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
+ ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/recovery.c)
++ARCBOOT_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dma.c)
+diff --git a/arch/gaudi3/arc/arcboot_rom.txt b/arch/gaudi3/arc/arcboot_rom.txt
+index 92277c6..7f81c2c 100644
+--- a/arch/gaudi3/arc/arcboot_rom.txt
++++ b/arch/gaudi3/arc/arcboot_rom.txt
+@@ -4,3 +4,4 @@
+ secureboot_verify_image
+ dma_copy_image
+ spi_flash_readl
++dma_copy_image_v2
+diff --git a/arch/gaudi3/arc/dev_dma.h b/arch/gaudi3/arc/dev_dma.h
+new file mode 100644
+index 0000000..fdbb7a1
+--- /dev/null
++++ b/arch/gaudi3/arc/dev_dma.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <secureboot.h>
++
++#define MAX_DMA_SIZE		0xFFF0
++#define MAX_IMAGE_SIZE		(2 * (MAX_DMA_SIZE + CRC32_SIZE))
++#define OFFSET_64KB		0x10000
++#define ADDR_SIZE_ALIGNMENT	16	/* 16 bytes */
++
++enum dma_error {
++	DMA_SUCCESS = 0,
++	DMA_INVALID_CRC_ERROR,
++	DMA_INVALID_IMG_SIZE,
++	DMA_INVALID_DEST_TYPE,
++	DMA_UNALIGNED_IMG_SIZE,
++	DMA_UNALIGNED_DEST_ADDR,
++	DMA_ERROR_MAX
++};
++
++enum dma_dest_type {
++	DMA_DEST_HBW = 0,
++	DMA_DEST_SRAM,
++	DMA_DEST_MAX
++};
++
++/*
++ * dma_copy_image_v2 - dma copy using spi dma above 64KB size
++ * @image_size: Total image size including CRCs (in bytes)
++ * @flash_offset: SPI flash offset
++ * @dest_addr: Full 64 bit destination address
++ * @dest_type: Destination HBW: 0 SRAM: 1
++ *
++ * Return: enum dma_error
++ */
++enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
++				 uint64_t dest_addr, enum dma_dest_type dest_type);
+diff --git a/arch/gaudi3/arc/dma.c b/arch/gaudi3/arc/dma.c
+new file mode 100644
+index 0000000..c6ea038
+--- /dev/null
++++ b/arch/gaudi3/arc/dma.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <arcboot.h>
++#include <dma.h>
++#include <dev_dma.h>
++
++enum dma_error dma_copy_image_v2(uint32_t image_size, uint32_t flash_offset,
++				 uint64_t dest_addr, enum dma_dest_type dest_type)
++{
++	uint32_t payload_size, copy_size;
++
++	if (image_size > MAX_IMAGE_SIZE)
++		return DMA_INVALID_IMG_SIZE;
++
++	if (dest_type >= DMA_DEST_MAX)
++		return DMA_INVALID_DEST_TYPE;
++
++	if (dest_addr % ADDR_SIZE_ALIGNMENT)
++		return DMA_UNALIGNED_DEST_ADDR;
++
++	if (image_size <=  (MAX_DMA_SIZE + CRC32_SIZE)) {
++		if ((image_size - CRC32_SIZE) % ADDR_SIZE_ALIGNMENT)
++			return DMA_UNALIGNED_IMG_SIZE;
++
++		dma_copy_image(image_size, flash_offset, dest_addr, dest_type);
++		if (dma_wait_finish() == DMA_CRC_ERROR)
++			return DMA_INVALID_CRC_ERROR;
++		else
++			return DMA_SUCCESS;
++	}
++
++	payload_size = image_size - (2 * CRC32_SIZE);
++	if (payload_size % ADDR_SIZE_ALIGNMENT)
++		return DMA_UNALIGNED_IMG_SIZE;
++
++	/* copy 1st chunk flash_off to dest_off */
++	copy_size = MAX_DMA_SIZE + CRC32_SIZE;
++	dma_copy_image(copy_size, flash_offset, dest_addr, dest_type);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return DMA_INVALID_CRC_ERROR;
++
++	/* copy 2nd chunk from flash_off + 0x10000 to dest_off + MAX_DMA_SIZE */
++	copy_size = payload_size - MAX_DMA_SIZE + CRC32_SIZE;
++	dma_copy_image(copy_size, (flash_offset + OFFSET_64KB),
++			(dest_addr + MAX_DMA_SIZE), dest_type);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return DMA_INVALID_CRC_ERROR;
++
++	return DMA_SUCCESS;
++}

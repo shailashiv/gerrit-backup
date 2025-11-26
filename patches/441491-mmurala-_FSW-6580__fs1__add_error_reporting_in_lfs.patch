@@ -1,0 +1,198 @@
+From 99ad1f7d553b805720e36495501b02f2f7cff240 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Sat, 10 Aug 2024 09:42:54 +0300
+Subject: [PATCH] [FSW-6580] fs1: add error reporting in lfs
+
+With this patch, added support to report errors
+in lfs library during run time. It will catch
+internal errors during mount, format, read and
+write.
+With this error report enablement, identified
+corrupted dir pair error from lfs_dir_fetchmatch.
+This particular error will occuer only when mount
+performed on empty disk. So it was recomended
+that format and mount the disk when we know disk
+is empty in some well known conditions like cold
+reset.
+There is no error identified when direct mount
+without format on disk which has pre existing
+data, especially scenarios like hard reset.
+
+Change-Id: If55deb7f41f71025da78caf373fd76c969765f77
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index c690e3a..9989515 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -95,6 +95,11 @@
+ 	boot_rom_global.die_id = FS1_INVALID_DIE_ID;
+ 	boot_rom_global.die_type = FS1_INVALID_DIE_TYPE;
+ 	boot_rom_global.sku = FS1_INVALID_SKU;
++	/*
++	 * Will clear this flag, Irrespective of cold/hard reset.
++	 * So that once in a uptime, flow will format and mount or simple mount.
++	 */
++	boot_rom_global.lfs_disk_mount = false;
+ }
+ 
+ #define HL_ARC1_DCCM_PERSIST_SECTION_SIZE		(3 * 1024) /* 3KB */
+@@ -157,6 +162,7 @@
+ 	boot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
+ 	boot_rom_global.boot_info_set_done = cold_rst_data.boot_info_set_done;
+ 	boot_rom_global.tpm_extend_done = cold_rst_data.tpm_validation_flag;
++	boot_rom_global.lfs_non_cold_reset = cold_rst_data.lfs_non_cold_reset;
+ }
+ 
+ int boot_rom_mem_init(uint64_t addr, uint32_t size)
+@@ -385,3 +391,21 @@
+ 
+ 	return 0;
+ }
++
++bool boot_rom_lfs_status(bool set)
++{
++	struct fs1_cold_rst_data cold_rst_data;
++
++	if (set == false)
++		/*
++		 * We update boot_rom_global.lfs_non_cold_reset only at begining of boot.
++		 */
++		return (boot_rom_global.lfs_non_cold_reset == 0);
++	else {
++		cold_rst_data.data = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++		cold_rst_data.lfs_non_cold_reset = 1;
++		regmap_writel(cold_rst_data.data, IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_COLD_RST_REG_2));
++	}
++
++	return set;
++}
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index b41af29..c7a889c 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -135,6 +135,8 @@
+ 	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_START = 125,
+ 	PROGRESS_BOOT_INFO_IMG_DESC_INFO_GET_FINISH = 126,
+ 	PROGRESS_BOOT_INFO_LFS_DISK_MOUNT_FAIL = 127,
++	PROGRESS_BOOT_INFO_LFS_ERROR = 128,
++	PROGRESS_BOOT_INFO_LFS_ASSERT = 129,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/common/common.h b/common/common.h
+index 18d62a0..1797270 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -34,5 +34,6 @@
+ enum boot_rom_tpm_spi_freq_config boot_rom_get_tpm_spi_freq_config(void);
+ void boot_rom_init_sku(void);
+ bool boot_rom_in_multi_die_mode(void);
++bool boot_rom_lfs_status(bool set);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/common/littlefs/lfs_util.h b/common/littlefs/lfs_util.h
+index faf2d91..3d450f1 100644
+--- a/common/littlefs/lfs_util.h
++++ b/common/littlefs/lfs_util.h
+@@ -25,6 +25,7 @@
+ #include <stdbool.h>
+ #include <string.h>
+ #include <inttypes.h>
++#include <status.h>
+ 
+ #define LFS_NO_ASSERT
+ #define LFS_NO_MALLOC
+@@ -84,7 +85,7 @@
+ #ifndef LFS_ERROR
+ #ifndef LFS_NO_ERROR
+ #define LFS_ERROR_(fmt, ...)
+-#define LFS_ERROR(...) LFS_ERROR_(__VA_ARGS__, "")
++#define LFS_ERROR(...) boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_ERROR);
+ #else
+ #define LFS_ERROR(...)
+ #endif
+@@ -93,7 +94,7 @@
+ // Runtime assertions
+ #ifndef LFS_ASSERT
+ #ifndef LFS_NO_ASSERT
+-#define LFS_ASSERT(test) assert(test)
++#define LFS_ASSERT(test) boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_ASSERT);
+ #else
+ #define LFS_ASSERT(test)
+ #endif
+diff --git a/common/littlefs/lfs_wrapper.c b/common/littlefs/lfs_wrapper.c
+index efdc55d..c50c871 100644
+--- a/common/littlefs/lfs_wrapper.c
++++ b/common/littlefs/lfs_wrapper.c
+@@ -13,12 +13,10 @@
+ #include <lfs_wrapper.h>
+ #include <dev_boot_info.h>
+ #include <status.h>
++#include <common.h>
+ 
+ #define DST_SAFE	true
+ #define DST_UNSAFE	false
+-
+-/* TODO: LFS_GLOBAL_VAR_SECTION */
+-bool lfs_init_done = false;
+ 
+ static void memcpy32_rev(void *dst, void *src, int size)
+ {
+@@ -176,20 +174,31 @@
+ {
+ 	int err;
+ 
+-	if (lfs_init_done)
++	if (boot_rom_global.lfs_disk_mount)
+ 		return 0;
+ 
+-	err = lfs_mount(&lfs, &lfs_cfg);
+-	if (err) {
++	if (boot_rom_lfs_status(false)) {
++		/* Always format to make sure start with fresh disk in CR */
+ 		err = lfs_format(&lfs, &lfs_cfg);
+-		if (!err)
++		if (!err) {
+ 			err = lfs_mount(&lfs, &lfs_cfg);
++			boot_rom_lfs_status(true);
++		}
++	} else {
++		/* Any hard reset scenario's,
++		 * First mount should be always success bcz we have data of previous CR
++		 */
++		err = lfs_mount(&lfs, &lfs_cfg);
+ 	}
+ 
+ 	if (!err) {
+-		lfs_init_done = true;
++		boot_rom_global.lfs_disk_mount = true;
+ 	} else {
+ 		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_DISK_MOUNT_FAIL);
++		/*
++		 * TODO: Boot rom going ahead without LFS?
++		 * How to inform to other modules?
++		 */
+ 	}
+ 
+ 	return err;
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index b2f48a3..eca7bb0 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -76,6 +76,7 @@
+ struct boot_rom_global_s {
+ 	uint32_t config_fuse;
+ 	uint32_t config2_fuse;
++	uint8_t lfs_non_cold_reset;
+ 	uint8_t recovery_flag;
+ 	uint8_t validation_pass;
+ 	uint8_t efuse_read;
+@@ -93,6 +94,7 @@
+ 	uint8_t tpm_extend_done;
+ 	uint8_t tpm_next_pcr_index;
+ 	struct spi_ctx *tpm_spi;
++	bool lfs_disk_mount;
+ };
+ 
+ struct boot_rom_manifest_s {

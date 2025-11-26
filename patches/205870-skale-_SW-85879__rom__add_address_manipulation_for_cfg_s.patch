@@ -1,0 +1,136 @@
+From 1b77bfde46e01d802e7ced2ae121caf5d9cbb9fb Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 05 May 2022 07:00:07 +0300
+Subject: [PATCH] [SW-85879] rom: add address manipulation for cfg space
+
+Currently the ROM code assumes the address manipulation for config
+space is done by hardware. ie. if die1 performs read/write with
+die0 register offset, hardware will route it to die1 register offset.
+
+However, with latest update from ARCH/HW team, the address manipulation
+by hardware for config space is only done for PARC_LOCAL_CFG page where
+die-id register resides and not complete config space. This patch
+add changes to perform address manipulation for config space.
+
+Change-Id: I74569b10fe4dd110baa55d1e313dff8bdb08d846
+---
+
+diff --git a/arch/gaudi2/arc/soc.h b/arch/gaudi2/arc/soc.h
+index c21c8de..66f48d1 100644
+--- a/arch/gaudi2/arc/soc.h
++++ b/arch/gaudi2/arc/soc.h
+@@ -48,5 +48,6 @@
+ 					HL_SRAM_PHY_SIZE - 1)
+ 
+ #define SDRAM_BASE			0x11000000
++#define HL_CFG_SPACE_DIE1_OFFSET	0
+ 
+ #endif /* _SOC_H_ */
+diff --git a/arch/gaudi3/arc/regmap.h b/arch/gaudi3/arc/regmap.h
+index 614fdf7..5195d6e 100644
+--- a/arch/gaudi3/arc/regmap.h
++++ b/arch/gaudi3/arc/regmap.h
+@@ -6,6 +6,11 @@
+ #ifndef _GAUDI3_REGMAP_H_
+ #define _GAUDI3_REGMAP_H_
+ 
++/*
++ * NOTE: All register offsets used for regmap_readl & regmap_writel should be of DIE0 as
++ * the api will perform address manipulation for DIE1. Hardware performs address manipulation
++ * only for PARC_LOCAL_CFG page in configuration space where DIE ID register is available.
++ */
+ #define mmI2C_S_IC_CON			mmD0_PSOC_I2C_S_IC_CON
+ #define mmI2C_S_IC_SAR			mmD0_PSOC_I2C_S_IC_SAR
+ #define mmI2C_S_IC_INTR_MASK		mmD0_PSOC_I2C_S_IC_INTR_MASK
+@@ -44,8 +49,8 @@
+ #define mmMEM_CPY_CTRL2			mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2
+ #define mmMEM_CPY_AXUSER		mmD0_PSOC_GLOBAL_CONF2_MEM_CPY_HBW_ATTR_CTRL_HB_MMU_BYPASS_OVRD
+ #define mmSPI_DIRECT_WR_RD_CTRL		mmD0_PSOC_GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL
+-#define mmD1_SYSCFG1_EFUSE_DATA		mmD1_PSOC_GLOBAL_CONF_SCRATCHPAD_0
+-#define mmD1_SYSCFG2_EFUSE_DATA		mmD1_PSOC_GLOBAL_CONF_SCRATCHPAD_1
++#define mmSYSCFG1_EFUSE_DATA		mmD0_PSOC_GLOBAL_CONF_SCRATCHPAD_0
++#define mmSYSCFG2_EFUSE_DATA		mmD0_PSOC_GLOBAL_CONF_SCRATCHPAD_1
+ 
+ #define mmGPIO0_DATA			mmD0_PSOC_GPIO0_DATA
+ 
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index e96d5a2..9011723 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -71,6 +71,6 @@
+ 		udelay(FUSE_EMULATION_DATA_UDELAY);
+ 	}
+ 
+-	arcboot_rom_global.config_fuse = regmap_readl(mmD1_SYSCFG1_EFUSE_DATA);
+-	arcboot_rom_global.config2_fuse = regmap_readl(mmD1_SYSCFG2_EFUSE_DATA);
++	arcboot_rom_global.config_fuse = regmap_readl(mmSYSCFG1_EFUSE_DATA);
++	arcboot_rom_global.config2_fuse = regmap_readl(mmSYSCFG2_EFUSE_DATA);
+ }
+diff --git a/arch/gaudi3/arc/soc.h b/arch/gaudi3/arc/soc.h
+index 24fe6fc..e304f57 100644
+--- a/arch/gaudi3/arc/soc.h
++++ b/arch/gaudi3/arc/soc.h
+@@ -115,4 +115,6 @@
+ 
+ #define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0xFFFFFFF) + HL_FW_MEM_BASE)
+ #define CONV_64B_TO_ARC_SRAM(addr)	((addr & 0xFFFFFFF) + HL_SRAM_BASE)
++#define HL_CFG_SPACE_DIE1_OFFSET	BIT(23)
++
+ #endif /* _SOC_H_ */
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+index a75c954..7034f9b 100644
+--- a/arch/gaudi3/arc/spi_flash.c
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -9,6 +9,7 @@
+ #include <efuse.h>
+ #include <boot_desc.h>
+ #include <dev_common.h>
++#include <soc.h>
+ 
+ void spi_flash_init(void)
+ {
+@@ -68,8 +69,8 @@
+ 	d1_syscfg2 |= spi_flash_readl(desc.spi_offset + offset);
+ 
+ 	/* Notify slave config fuse value in slave scratchpad 0/1 register */
+-	mirror_writel(d1_syscfg1, mmD1_SYSCFG1_EFUSE_DATA);
+-	mirror_writel(d1_syscfg2, mmD1_SYSCFG2_EFUSE_DATA);
++	mirror_writel(d1_syscfg1, (mmSYSCFG1_EFUSE_DATA + HL_CFG_SPACE_DIE1_OFFSET));
++	mirror_writel(d1_syscfg2, (mmSYSCFG2_EFUSE_DATA + HL_CFG_SPACE_DIE1_OFFSET));
+ }
+ 
+ void spi_flash_fuse_init(void)
+diff --git a/arch/greco/arc_elf32/soc.h b/arch/greco/arc_elf32/soc.h
+index 3c141f3..ecb331e 100644
+--- a/arch/greco/arc_elf32/soc.h
++++ b/arch/greco/arc_elf32/soc.h
+@@ -40,5 +40,6 @@
+ #define HL_CFG_BASE				0xFC000000
+ 
+ #define SDRAM_BASE				0x10000000
++#define HL_CFG_SPACE_DIE1_OFFSET		0
+ 
+ #endif /* _SOC_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index f731a1d..c5bb325 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -313,14 +313,16 @@
+ 
+ static inline uint32_t regmap_readl(uint32_t offset)
+ {
+-	uint32_t reg = base_readl(HL_CFG_BASE + offset);
++	uint32_t reg = base_readl(HL_CFG_BASE + offset +
++				(arcboot_rom_global.die_id * HL_CFG_SPACE_DIE1_OFFSET));
+ 
+ 	return reg;
+ }
+ 
+ static inline void regmap_writel(uint32_t val, uint32_t offset)
+ {
+-	base_writel(val, HL_CFG_BASE + offset);
++	base_writel(val, (HL_CFG_BASE + offset +
++				(arcboot_rom_global.die_id * HL_CFG_SPACE_DIE1_OFFSET)));
+ }
+ 
+ static inline uint32_t rom_readl(uint32_t offset)

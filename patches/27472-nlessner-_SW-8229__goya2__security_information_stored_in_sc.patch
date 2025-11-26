@@ -1,0 +1,166 @@
+From b80e6e3d9b868b836e746c3fc92742432f08701b Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sun, 09 Feb 2020 10:23:38 +0200
+Subject: [PATCH] [SW-8229] goya2: security information stored in scratchpad
+
+When loading security data like key hash, revoke bit map of
+keys and security fw_version we store them now in scratchpad
+for future access. This section is secured by range registers
+so no outside tampering can occur
+
+Change-Id: Idcbde95dc4d64bd8c9818839a3c8e1fdb1ea59bf
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/common/security.c b/common/security.c
+index 9391bad..ec02f2e 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -457,8 +457,7 @@
+ 	else
+ 		end_index = SECURITY_KEY_HASH_HABANA_COUNT;
+ 
+-	key_revoke = regmap_readl(mmPSOC_SECURITY_KEY_REVOKE);
+-
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+ 	/* return offset of first non-revoked key
+ 	 * habana will scan index 0 only
+ 	 * customer will scan index 1 - 5
+@@ -479,18 +478,9 @@
+ 	if (valid_key_offset < 0)
+ 		return valid_key_offset;
+ 
+-	if (customer) {
+-		/* adjust index to exclude habana key */
+-		valid_key_offset--;
+-		/* absolute location in fuse map */
+-		valid_key_offset *= SECURITY_DWORD_PER_KEY;
+-		valid_key_offset += mmPSOC_SECURITY_PUBLIC_KEY_0_0;
+-	} else {
+-		valid_key_offset = mmPSOC_SECURITY_HABANA_KEY_0;
+-	}
+-
+ 	for (int i = 0; i < SECURITY_KEY_HASH_COUNT; i++)
+-		*hash = regmap_readl((valid_key_offset++) * 4);
++		*hash = sp_sram_readl((SECURITY_EFUSE_KEYS_OFFSET + i) *
++				      SECURITY_BYTE_PER_DWORD);
+ 
+ 	return 1;
+ }
+@@ -501,8 +491,8 @@
+ 	uint32_t valid_fw_version;
+ 	uint8_t fw_version_sec, valid_fw_version_sec;
+ 
+-	valid_fw_version = regmap_readl(mmPSOC_SECURITY_MIN_FW_VERSION);
+ 	fw_version_sec = SECURITY_FW_VERSION_TO_SECURITY_BYTE(fw_version);
++	valid_fw_version = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+ 	valid_fw_version_sec =
+ 		SECURITY_FW_VERSION_TO_SECURITY_BYTE(valid_fw_version);
+ 
+@@ -539,6 +529,10 @@
+ 
+ 	/* store key_revoke map in PSOC */
+ 	regmap_writel(key_revoke, mmPSOC_SECURITY_KEY_REVOKE);
++
++	/* store key hashes in Scratch PAD Sram */
++	sp_sram_writel(key_revoke,
++		       SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+ }
+ 
+ void security_load_fw_version(void)
+@@ -567,9 +561,12 @@
+ 		break;
+ 	}
+ 	/* store minimum allowed security version in PSOC */
+-	/* TODO: for all revoke,fw, and key store in SP_SRAM also */
+ 	regmap_writel(SECURITY_FW_VERSION_FROM_SECURITY_BYTE(fw_version_sec),
+ 		      mmPSOC_SECURITY_MIN_FW_VERSION);
++
++	/* store minimum allowed security version in Scratch PAD Sram */
++	sp_sram_writel(SECURITY_FW_VERSION_FROM_SECURITY_BYTE(fw_version_sec),
++		      SECURITY_EFUSE_FW_VERSION_OFFSET);
+ }
+ 
+ void security_load_keys(void)
+@@ -597,9 +594,13 @@
+ 		break;
+ 	}
+ 
+-	/* store habana key hash in PSOC */
+ 	for (hash_key_index = 0; hash_key_index < SECURITY_KEY_HASH_ARRAY_SIZE;
+-	     hash_key_index++)
++	     hash_key_index++) {
++		/* store habana key hash in PSOC_SECURITY */
+ 		regmap_writel(key_hash[hash_key_index],
+ 			      security_key_soc_location_offset(hash_key_index));
++		/* store key hashes in Scratch PAD Sram */
++		sp_sram_writel(key_hash[hash_key_index],
++			       SECURITY_EFUSE_KEYS_OFFSET + hash_key_index);
++	}
+ }
+diff --git a/common/security.h b/common/security.h
+index 56bc54c..4083cf0 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -17,6 +17,8 @@
+ #define SECURITY_DWORD_PER_KEY				8
+ #define SECURITY_DWORD_BIT_SIZE				(sizeof(uint32_t) * \
+ 							 CHAR_BIT)
++#define SECURITY_BYTE_PER_DWORD				(sizeof(uint32_t) / \
++							 CHAR_BIT)
+ 
+ #define SECURITY_KEY_REVOKE_MAP				0x1F
+ 
+@@ -77,6 +79,13 @@
+ #define MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN	1
+ #define MSTR_IF_AXUSER_CORE_SHARED		1
+ 
++/* 16 byte */
++#define SECURITY_EFUSE_FW_VERSION_OFFSET	0
++/* 160 bytes */
++#define SECURITY_EFUSE_KEYS_OFFSET		16
++/* 16 bytes */
++#define SECURITY_EFUSE_KEYS_REVOKE_OFFSET	176
++
+ 
+ void security_disable_debug_if(void);
+ void security_debug_if_secure(void);
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 87c0efc..28379ac 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -27,6 +27,7 @@
+ #define HL_ICCM_OFFSET				0xB020000
+ #define HL_SBROM_OFFSET				0xB040000
+ #define HL_FWSRAM_OFFSET			0xB050000
++#define HL_SCRATCHPAD_SRAM_OFFSET		0xBFE0000
+ #define HL_PCIE_FWSRAM_OFFSET			0xBFF0000
+ 
+ #define HL_FLASH_BASE				(HL_SDRAM_BASE + \
+@@ -35,6 +36,9 @@
+ 						 HL_SBROM_OFFSET)
+ #define HL_FWSRAM_BASE				(HL_SDRAM_BASE + \
+ 						 HL_FWSRAM_OFFSET)
++#define HL_SCRATCHPAD_SRAM_BASE			(HL_SDRAM_BASE + \
++						 HL_SCRATCHPAD_SRAM_OFFSET)
++
+ #define HL_CFG_BASE				0xFC000000
+ 
+ #define ARCBOOT_PRIMARY				0
+@@ -108,4 +112,16 @@
+ 	base_writel(val, HL_FWSRAM_BASE + offset);
+ }
+ 
++static inline uint32_t sp_sram_readl(uint32_t offset)
++{
++	uint32_t reg = base_readl(HL_SCRATCHPAD_SRAM_BASE + offset);
++
++	return reg;
++}
++
++static inline void sp_sram_writel(uint32_t val, uint32_t offset)
++{
++	base_writel(val, HL_SCRATCHPAD_SRAM_BASE + offset);
++}
++
+ #endif /* _ARCBOOT_H_ */

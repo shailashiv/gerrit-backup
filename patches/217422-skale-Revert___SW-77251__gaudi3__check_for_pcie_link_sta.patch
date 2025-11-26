@@ -1,0 +1,306 @@
+From 451926da0c3743448f6587a6c748244e8bae6b08 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 05 Jun 2022 18:46:57 +0300
+Subject: [PATCH] Revert "[SW-77251] gaudi3: check for pcie link status"
+
+Revert rom recovery implementation for secured firmware update via
+inband and OOB.
+
+This reverts commit 4736a74cc4e863c9abd98640e98dfd1b412e2881.
+
+Change-Id: Ice943e26bbb3d7d1a128751931099acf2570d6e4
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 6f13d1c..47c62d3 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -45,7 +45,6 @@
+ 		.dest_addr_dma = HL_BOOT_PTR_SPI_DMA_DEST,
+ 		.dest_addr_arc = HL_BOOT_PTR_SPI_DMA_DEST_ARC,
+ 	},
+-	.pci_link_up = false,
+ 	.tpm_validation_pass = false,
+ };
+ 
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index 2de249d..3b0373c 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -7,7 +7,6 @@
+ #include <arcboot.h>
+ #include <delay.h>
+ #include <boot_desc.h>
+-#include <cmd_module.h>
+ #include <security.h>
+ #include <dev_security.h>
+ #include <common.h>
+@@ -16,19 +15,6 @@
+ #include <dev_common.h>
+ #include <dev_efuse.h>
+ #include <dev_dma.h>
+-
+-static struct cmd_module_ops cmd_ops[] = {
+-	{	/* PCI module */
+-		.setup = module_pci_setup,
+-		.check = module_pci_check,
+-		.disable = module_pci_disable,
+-		.run = module_pci_run,
+-		.enable = module_pci_enable,
+-		.run_fast = module_pci_run_fast,
+-		.teardown = module_pci_teardown,
+-		.run_noreturn = noop,
+-	},
+-};
+ 
+ static enum dma_dest_type arcboot_rom_get_dma_dest_type(uint64_t addr)
+ {
+@@ -137,7 +123,7 @@
+ 	if (arcboot_rom_global.die_id)
+ 		return;
+ 
+-	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
++	/* TODO: implement rom recovery */
+ }
+ 
+ static void rom_pcie_recovery(void)
+@@ -249,36 +235,4 @@
+ 	 */
+ 	while (1)
+ 		;
+-}
+-
+-bool is_pcie_initialized(void)
+-{
+-	uint32_t prstn, ltssm, smlh, rdlh;
+-
+-	if (arcboot_rom_global.pci_link_up)
+-		return true;
+-
+-	prstn = regmap_readl(mmD0_PSOC_GLOBAL_CONF_PRSTN);
+-	ltssm = regmap_readl(mmD0_PCIE_AUX_LTSSM_EN);
+-	smlh = regmap_readl(mmD0_PCIE_AUX_SMLH_LINK_UP);
+-	rdlh = regmap_readl(mmD0_PCIE_AUX_RDLH_LINK_UP);
+-
+-	if (prstn && smlh && rdlh) {
+-		arcboot_rom_global.pci_link_up = true;
+-		regmap_writel(0x3, mmD0_PCIE_AUX_LTSSM_EN);
+-		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_PCIE_LINK_UP);
+-		return true;
+-	}
+-
+-	if (!prstn && ltssm) {
+-		regmap_writel(0, mmD0_PCIE_AUX_LTSSM_EN);
+-		return false;
+-	}
+-
+-	if (prstn && !ltssm) {
+-		regmap_writel(0x3, mmD0_PCIE_AUX_LTSSM_EN);
+-		return false;
+-	}
+-
+-	return false;
+ }
+diff --git a/common/cmd_module.c b/common/cmd_module.c
+deleted file mode 100644
+index de1dce6..0000000
+--- a/common/cmd_module.c
++++ /dev/null
+@@ -1,52 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2022 HabanaLabs Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <arcboot.h>
+-#include <cmd_module.h>
+-
+-
+-void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size)
+-{
+-	int i = 0, j;
+-	enum cmd_check_res res = NOT_FOUND;
+-
+-	for (j = 0; j < size; j++)
+-		cmd_ops[j].setup();
+-
+-	while (1) {
+-		res = cmd_ops[i].check();
+-		switch (res) {
+-		case NOT_FOUND:
+-			break;
+-		case FOUND_FAST_RETURN:
+-			cmd_ops[i].run_fast();
+-			break;
+-		case FOUND_SLOW_RETURN:
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].disable();
+-
+-			cmd_ops[i].run();
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].enable();
+-
+-			break;
+-		case FOUND_NO_RETURN:
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].teardown();
+-
+-			cmd_ops[i].run_noreturn();
+-			break;
+-		default:
+-			break;
+-		}
+-
+-		if (++i == size)
+-			i = 0;
+-	}
+-}
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+deleted file mode 100644
+index 90aa87b..0000000
+--- a/common/cmd_module.h
++++ /dev/null
+@@ -1,79 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0+ */
+-/*
+- * Copyright 2022 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#ifndef _HL_CMD_MODULE_H_
+-#define _HL_CMD_MODULE_H_
+-
+-#include <stdbool.h>
+-#include <hl_boot_if.h>
+-/*
+- * enum cmd_check_res	- used to specify various results that check() routine
+- *			  can return following its check.
+- *
+- * NOT_FOUND		- check() routine has not discovered any request which
+- *			  is related to its module.
+- * FOUND_FAST_RETURN	- check() routine has discovered a request that is very
+- *			  fast to handle.
+- * FOUND_SLOW_RETURN	- check() routine has discovered a request that will
+- *			  take relatively large amount time to handle and after
+- *			  it has been handled, the execution will return back
+- * FOUND_NO_RETURN	- check() routine has discovered a request and its
+- *			  handling will never return back.
+- */
+-enum cmd_check_res {
+-	NOT_FOUND,
+-	FOUND_FAST_RETURN,
+-	FOUND_SLOW_RETURN,
+-	FOUND_NO_RETURN,
+-};
+-
+-/*
+- * struct cmd_module_ops	- operations defined for all registered modules
+- *
+- * setup()		- setup the module and prepare checking for
+- *			  commands/requests and handling them
+- * check()		- check if there is a command/request pending and return
+- *			  the appropriate result
+- * disable()		- temporarily disable the module to enable another
+- *			  module execution of run() routine
+- * run()		- run the handling of the command/request discovered by
+- *			  the check() routine - can be slow since other modules
+- *			  have been disabled by disable() routine
+- * enable()		- enable the module after it was disabled by disable()
+- *			  callback
+- * run_fast()		- run the handling of the command/request discovered by
+- *			  the check() routine - must take low amount of time
+- *			  since other modules have not been disabled
+- * teardown()		- the opposite from setup(), the module will no longer
+- *			  be checked or handled - stop the module
+- * run_noreturn()	- all modules have been teared down, so run the handling
+- *			  w/o returning
+- */
+-struct cmd_module_ops {
+-	void (*setup)(void);
+-	enum cmd_check_res (*check)(void);
+-	void (*disable)(void);
+-	void (*run)(void);
+-	void (*enable)(void);
+-	void (*run_fast)(void);
+-	void (*teardown)(void);
+-	void (*run_noreturn)(void);
+-};
+-
+-/* a dummy to fill in irrelevant entries */
+-static inline void noop(void) {}
+-
+-/* PCI */
+-void module_pci_setup(void);
+-enum cmd_check_res module_pci_check(void);
+-void module_pci_disable(void);
+-void module_pci_run(void);
+-void module_pci_run_fast(void);
+-void module_pci_enable(void);
+-void module_pci_teardown(void);
+-
+-void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
+-#endif /* _HL_CMD_MODULE_H_ */
+diff --git a/common/module_pci.c b/common/module_pci.c
+deleted file mode 100644
+index 911368f..0000000
+--- a/common/module_pci.c
++++ /dev/null
+@@ -1,26 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2022 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <arcboot.h>
+-#include <cmd_module.h>
+-
+-__weak bool is_pcie_initialized(void) { return true; }
+-
+-void module_pci_setup(void) {}
+-
+-enum cmd_check_res module_pci_check(void)
+-{
+-	if (!is_pcie_initialized())
+-		return NOT_FOUND;
+-
+-	return NOT_FOUND;
+-}
+-
+-void module_pci_disable(void) {}
+-void module_pci_run(void) {}
+-void module_pci_run_fast(void) {}
+-void module_pci_enable(void) {}
+-void module_pci_teardown(void) {}
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 9f8f5c7..d5ca802 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -89,7 +89,6 @@
+ 	bool fuse_spi;
+ 	struct hl_fw_boot_ptrs_ctx boot_ptr_ctx[HL_FW_BOOT_PTR_MAX_IMG];
+ 	struct hl_fw_sec_info sec_data;
+-	bool pci_link_up;
+ 	uint8_t tpm_validation_pass;
+ };
+ 
+@@ -239,11 +238,10 @@
+ 	PROGRESS_ARCBOOT_EROM_TPM_START = 105,
+ 	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 106,
+ 	PROGRESS_ARCBOOT_IN_ROM_RECOVERY = 107,
+-	PROGRESS_ARCBOOT_ROM_PCIE_LINK_UP = 108,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_START = 109,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_STS_BUSY = 110,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 111,
+-	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS = 112,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_START = 108,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_STS_BUSY = 109,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_TIMEDOUT = 110,
++	PROGRESS_ARCBOOT_ROM_D2D_LINK_INIT_SUCCESS = 111,
+ };
+ 
+ enum security_location {

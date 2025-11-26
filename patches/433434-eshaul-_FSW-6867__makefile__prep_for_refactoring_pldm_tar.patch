@@ -1,0 +1,364 @@
+From a6e5e7456209cf8bfc2dd1e118b2f13281f7a6ec Mon Sep 17 00:00:00 2001
+From: Erez Shaul <eshaul@habana.ai>
+Date: Tue, 16 Jul 2024 09:53:58 +0300
+Subject: [PATCH] [FSW-6867] makefile: prep for refactoring pldm target
+
+this is a preparation for target refactor from pldm to palad
+this change will enable to use both pldm and palad target words
+once jenkins scripts will be adjusted to palad the override can
+be reverted
+
+Change-Id: I2377dc356a1ed74e4b65689fbe8f134cf19af898
+Signed-off-by: Erez Shaul <eshaul@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 1fa2f7b..6f9794c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -6,6 +6,11 @@
+ HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
+ HL_DEV_ARCH := arch/$(shell echo $(HL_DEV) | cut -d'_' -f1)/$(HL_DEV_SUBTYPE)
+ 
++# TODO: remove this after switch to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ # removed liblto_plugin.so plugin from flags.
+ # after upgrading to Synopsys Arc toolchain 2023.03, ar error is observed when attempt to use
+ # lto plugin. In addition, when building without lto plugin no change in binary is observed.
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+new file mode 100644
+index 0000000..1935054
+--- /dev/null
++++ b/arch/fs1/arc/palad.c
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include "dev_uart.h"
++#include <mem_io.h>
++#include <fs1_reg_map.h>
++#include <fs1_blocks_linux_driver.h>
++#include <pll_control_regs.h>
++#include <uart_regs.h>
++#include <dev_efuse.h>
++#include <common.h>
++#include <tpm.h>
++
++#define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
++#define PLDM_UART_REF_CLK	250000000ULL
++#define PLDM_UART_BAUDRATE	300
++
++uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div)
++{
++	uint32_t offset = div * sizeof(uint32_t);
++
++	/* 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk */
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_SEL */
++	/* Divider clock select */
++	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
++
++	/* Divison factor value */
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_FACTOR */
++	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
++
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_EN  */
++	regmap_writel(0x1, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_EN_0)) + offset); /* Enable dividers */
++
++	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ CFG */
++	regmap_writel(0x101, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG))); /* Enables PSOC_PLL and FOUTPOSTDIVEN */
++
++	return PLDM_UART_REF_CLK;
++}
++
++uint32_t boot_rom_get_baudrate()
++{
++	return PLDM_UART_BAUDRATE;
++}
++
++bool fuse_valid_volt_prot_pattern(uint32_t config_fuse)
++{
++	if ((config_fuse & EFUSE_SYSCFG_VOLT_PROT_BITS) == FUSE_VOLT_PROT_PATTERN)
++		return true;
++
++	return false;
++}
++
++uint32_t boot_rom_tpm_spi_baudr_get(void)
++{
++	enum boot_rom_tpm_spi_freq_config freq_config;
++	uint32_t baudr;
++
++	freq_config = boot_rom_get_tpm_spi_freq_config();
++
++	if (freq_config == FREQ_CFG_12_5MHZ)
++		baudr = (SYS_CLOCK_FREQUENCY / SPI_TPM_FREQ_12_5M);
++	else
++		baudr = (SYS_CLOCK_FREQUENCY / SPI_TPM_FREQ_6_25M);
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	baudr = (baudr < 2) ? 2 : baudr;
++	baudr = (baudr + 1) & 0xFFFE;
++
++	return baudr;
++}
+\ No newline at end of file
+diff --git a/arch/fs1/arc/palad_boot_rom.lds b/arch/fs1/arc/palad_boot_rom.lds
+new file mode 100644
+index 0000000..34786be
+--- /dev/null
++++ b/arch/fs1/arc/palad_boot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++INCLUDE boot_rom.lds
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+deleted file mode 100644
+index 1935054..0000000
+--- a/arch/fs1/arc/pldm.c
++++ /dev/null
+@@ -1,74 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2024 HabanaLabs Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <boot_rom.h>
+-#include "dev_uart.h"
+-#include <mem_io.h>
+-#include <fs1_reg_map.h>
+-#include <fs1_blocks_linux_driver.h>
+-#include <pll_control_regs.h>
+-#include <uart_regs.h>
+-#include <dev_efuse.h>
+-#include <common.h>
+-#include <tpm.h>
+-
+-#define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
+-#define PLDM_UART_REF_CLK	250000000ULL
+-#define PLDM_UART_BAUDRATE	300
+-
+-uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div)
+-{
+-	uint32_t offset = div * sizeof(uint32_t);
+-
+-	/* 2'd0 - ref_clk, 2'd1 - pll_clk, 2'd2 - divided ref_clk, 2'd3 - divided pll_clk */
+-	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_SEL */
+-	/* Divider clock select */
+-	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_SEL_0)) + offset);
+-
+-	/* Divison factor value */
+-	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_FACTOR */
+-	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
+-
+-	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_EN  */
+-	regmap_writel(0x1, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_EN_0)) + offset); /* Enable dividers */
+-
+-	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ CFG */
+-	regmap_writel(0x101, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG))); /* Enables PSOC_PLL and FOUTPOSTDIVEN */
+-
+-	return PLDM_UART_REF_CLK;
+-}
+-
+-uint32_t boot_rom_get_baudrate()
+-{
+-	return PLDM_UART_BAUDRATE;
+-}
+-
+-bool fuse_valid_volt_prot_pattern(uint32_t config_fuse)
+-{
+-	if ((config_fuse & EFUSE_SYSCFG_VOLT_PROT_BITS) == FUSE_VOLT_PROT_PATTERN)
+-		return true;
+-
+-	return false;
+-}
+-
+-uint32_t boot_rom_tpm_spi_baudr_get(void)
+-{
+-	enum boot_rom_tpm_spi_freq_config freq_config;
+-	uint32_t baudr;
+-
+-	freq_config = boot_rom_get_tpm_spi_freq_config();
+-
+-	if (freq_config == FREQ_CFG_12_5MHZ)
+-		baudr = (SYS_CLOCK_FREQUENCY / SPI_TPM_FREQ_12_5M);
+-	else
+-		baudr = (SYS_CLOCK_FREQUENCY / SPI_TPM_FREQ_6_25M);
+-
+-	/* baud rate doesn't support odd number and must not be 0 */
+-	baudr = (baudr < 2) ? 2 : baudr;
+-	baudr = (baudr + 1) & 0xFFFE;
+-
+-	return baudr;
+-}
+\ No newline at end of file
+diff --git a/arch/fs1/arc/pldm_boot_rom.lds b/arch/fs1/arc/pldm_boot_rom.lds
+deleted file mode 100644
+index 34786be..0000000
+--- a/arch/fs1/arc/pldm_boot_rom.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2024 HabanaLabs Ltd.
+- */
+-
+-INCLUDE boot_rom.lds
+diff --git a/arch/gaudi2/arc/palad.c b/arch/gaudi2/arc/palad.c
+new file mode 100644
+index 0000000..7b6e440
+--- /dev/null
++++ b/arch/gaudi2/arc/palad.c
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
+diff --git a/arch/gaudi2/arc/palad_arcboot_ram.lds b/arch/gaudi2/arc/palad_arcboot_ram.lds
+new file mode 100644
+index 0000000..827fe1f
+--- /dev/null
++++ b/arch/gaudi2/arc/palad_arcboot_ram.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_ram.lds
+diff --git a/arch/gaudi2/arc/palad_arcboot_rom.lds b/arch/gaudi2/arc/palad_arcboot_rom.lds
+new file mode 100644
+index 0000000..9e1e858
+--- /dev/null
++++ b/arch/gaudi2/arc/palad_arcboot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_rom.lds
+diff --git a/arch/gaudi2/arc/pldm.c b/arch/gaudi2/arc/pldm.c
+deleted file mode 100644
+index 7b6e440..0000000
+--- a/arch/gaudi2/arc/pldm.c
++++ /dev/null
+@@ -1,4 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+diff --git a/arch/gaudi2/arc/pldm_arcboot_ram.lds b/arch/gaudi2/arc/pldm_arcboot_ram.lds
+deleted file mode 100644
+index 827fe1f..0000000
+--- a/arch/gaudi2/arc/pldm_arcboot_ram.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_ram.lds
+diff --git a/arch/gaudi2/arc/pldm_arcboot_rom.lds b/arch/gaudi2/arc/pldm_arcboot_rom.lds
+deleted file mode 100644
+index 9e1e858..0000000
+--- a/arch/gaudi2/arc/pldm_arcboot_rom.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_rom.lds
+diff --git a/arch/gaudi3/arc/palad.c b/arch/gaudi3/arc/palad.c
+new file mode 100644
+index 0000000..9598d8d
+--- /dev/null
++++ b/arch/gaudi3/arc/palad.c
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <dev_common.h>
++
++void arcboot_rom_disable_spi_gw(void)
++{
++	disable_spi_gw();
++}
++
++uint64_t arcboot_rom_get_timestamp_freq(void)
++{
++	return get_pcie_pll_freq(PLL_DIV3);
++}
++
++uint32_t hl_spi_baudr_get(void)
++{
++	return spi_baudr_get();
++}
+diff --git a/arch/gaudi3/arc/palad_arcboot_rom.lds b/arch/gaudi3/arc/palad_arcboot_rom.lds
+new file mode 100644
+index 0000000..c03adee
+--- /dev/null
++++ b/arch/gaudi3/arc/palad_arcboot_rom.lds
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++ INCLUDE arcboot_rom.lds
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+deleted file mode 100644
+index 9598d8d..0000000
+--- a/arch/gaudi3/arc/pldm.c
++++ /dev/null
+@@ -1,22 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2022 HabanaLabs Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <dev_common.h>
+-
+-void arcboot_rom_disable_spi_gw(void)
+-{
+-	disable_spi_gw();
+-}
+-
+-uint64_t arcboot_rom_get_timestamp_freq(void)
+-{
+-	return get_pcie_pll_freq(PLL_DIV3);
+-}
+-
+-uint32_t hl_spi_baudr_get(void)
+-{
+-	return spi_baudr_get();
+-}
+diff --git a/arch/gaudi3/arc/pldm_arcboot_rom.lds b/arch/gaudi3/arc/pldm_arcboot_rom.lds
+deleted file mode 100644
+index c03adee..0000000
+--- a/arch/gaudi3/arc/pldm_arcboot_rom.lds
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2022 HabanaLabs Ltd.
+- */
+-
+- INCLUDE arcboot_rom.lds

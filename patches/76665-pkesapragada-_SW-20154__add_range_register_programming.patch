@@ -1,0 +1,577 @@
+From 98a8a934289fd29183bf3eee4d8a9bb94779f0cd Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Mon, 15 Feb 2021 17:17:08 +0200
+Subject: [PATCH] [SW-20154] add range register programming
+
+This patch adds range register programming for
+I2C, SMI, JTAG and PCI interfaces such that attacks
+from these interfaces is not possible.
+
+Change-Id: I1e54b505c57bd3ad6aaf3ef4e8ac3ff565a39f03
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index ec00cc4..0f7f1fd 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -109,12 +109,18 @@
+ 
+ __attribute__((weak)) void update_warm_reset_config(void){}
+ 
++__attribute__((weak)) void security_disable_interfaces(void)
++{
++	/* by default disable jtag I/F as soon as possible */
++	security_disable_jtag_if();
++}
++
+ static void arcboot_rom_init(void)
+ {
+ 	uint32_t reg;
+ 
+-	/* by default disable jtag I/F as soon as possible */
+-	security_disable_jtag_if();
++	/* lock everything as soon as possible */
++	security_disable_interfaces();
+ 
+ 	arcboot_rom_status_update(PROGRESS_INIT);
+ 
+@@ -204,8 +210,8 @@
+ 	     EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK) == 0)
+ 		security_enable_jtag_if();
+ 
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_TWI_IF_MASK)
+-		security_disable_twi_if();
++	/* based on efuse, handle twi enable/disable */
++	security_handle_twi();
+ 
+ 	security_load_revoke_bits();
+ 	security_load_fw_version();
+diff --git a/common/security.c b/common/security.c
+index 5302886..b033760 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -50,32 +50,6 @@
+ 		      mmPSOC_GLOBAL_CONF_MEM_CPY_AXUSER);
+ }
+ 
+-void security_elbi_rr_lbw_config(uint8_t spi_controller_en)
+-{
+-	regmap_writel(SECURITY_PSOC_START_LBW,
+-		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-
+-	if (spi_controller_en) {
+-		regmap_writel(SECURITY_QSPI_START_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(SECURITY_QSPI_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
+-	} else {
+-		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
+-		regmap_writel(SECURITY_PSOC_END_LBW,
+-			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+-	}
+-}
+-
+ /* If DBG I/F were not disabled, program the RR to allow access
+  * only to SPI flash and PSOC_SECURITY
+  */
+diff --git a/common/security.h b/common/security.h
+index bd2d942..3f6553e 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -134,7 +134,8 @@
+ void security_smi_rr_hbw_config(uint8_t spi_controller_en);
+ void security_jtag_rr_hbw_config(uint8_t spi_controller_en);
+ void security_jtag_dap(uint8_t status);
+-void security_elbi_rr_lbw_config(uint8_t spi_controller_en);
+ void check_and_enable_4b_termination(void);
++void security_enable_twi_if(void);
++void security_handle_twi(void);
+ 
+ #endif /* _SECURITY_H_ */
+diff --git a/gaudi2_arc_gnu/security.c b/gaudi2_arc_gnu/security.c
+index 671db24..d573349 100644
+--- a/gaudi2_arc_gnu/security.c
++++ b/gaudi2_arc_gnu/security.c
+@@ -9,21 +9,171 @@
+ #include "security.h"
+ #include "spi_flash.h"
+ 
++#define GAUDI2_SECURITY_END_HBW_LSB		0xFFFFFFFF
++#define GAUDI2_SECURITY_END_HBW_MSB		0xFFFFF
++#define GAUDI2_SECURITY_START_HBW_LSB		0x0
++#define GAUDI2_SECURITY_START_HBW_MSB		0x0
++#define GAUDI2_DISABLE_PCIE_TRAFFIC		0x0
++#define GAUDI2_ENABLE_PCIE_TRAFFIC		0x3
++#define GAUDI2_SECURITY_LBW_MASK		0x7FFFFFF
++#define GAUDI2_SECURITY_PSOC_START_LBW		0x0
++#define GAUDI2_SECURITY_PSOC_END_LBW		0x7FFFFFF
++
+ static void security_disable_i2c_s_mstr_if(void)
+ {
+-	/* TODO */
++	/* override AXI prot bit by master IF to secure, unprivileged access */
++	/* ovrd_en = 1, and overd_value of 0 */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++			mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* disable pcie traffic by writing 0 */
++	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* Block Everything:
++	 * Set MIN = 0x0
++	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
++	 */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++			mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++static void security_enable_i2c_s_mstr_if(void)
++{
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0,
++		mmI2C_S_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable pcie traffic by writing 1 */
++	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* enable access to all:
++	 * MIN = 0xFFFFFFFFFFFFF
++	 * MAX = 0
++	 */
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++}
++
++static void security_enable_smi_mstr_if(void)
++{
++	/* 0: Disable access, 1: Enable Access */
++	regmap_writel(1,
++		mmPSOC_GLOBAL_CONF_SMI_ACCESS_EN);
++
++	/* enable pcie traffic by writing 1 */
++	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0,
++		mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable access to all:
++	 * MIN = 0xFFFFFFFFFFFFF
++	 * MAX = 0
++	 */
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+ }
+ 
+ static void security_disable_smi_mstr_if(void)
+ {
++	/* 0: Disable access, 1: Enable Access */
++	regmap_writel(0,
++		mmPSOC_GLOBAL_CONF_SMI_ACCESS_EN);
++
++	/* override AXI prot bit by master IF to secure, unprivileged access */
++	/* ovrd_en = 1, and overd_value of 0 */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		mmSMI_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* disable pcie traffic by writing 0 */
++	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* Block Everything:
++	 * Set MIN = 0x0
++	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
++	 */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+ }
+ 
+ void security_disable_jtag_mstr_if(void)
+ {
++
++	/* override AXI prot bit by master IF to secure, unprivileged access */
++	/* ovrd_en = 1, and overd_value of 0 */
++	regmap_writel(MSTR_IF_CORE_HBW_AXPROT_OVRD_OVRD_EN,
++		mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* disable pcie traffic by writing 0 */
++	regmap_writel(GAUDI2_DISABLE_PCIE_TRAFFIC,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* Block Everything:
++	 * Set MIN = 0x0
++	 * Set Max = 0xFFFFFFFFFFFFF;	//52 bits
++	 */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+ }
+ 
+ void security_enable_jtag_mstr_if(void)
+ {
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++
++	/* enable pcie traffic by writing 1 */
++	regmap_writel(GAUDI2_ENABLE_PCIE_TRAFFIC,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_PCIE_EN);
++
++	/* enable access to all */
++	/* MIN = 0xFFFFFFFFFFFFF
++	 * MAX = 0
++	 */
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	/* LBW is not implemented for JT, so nothing to be done there */
+ }
+ 
+ void security_disable_twi_if(void)
+@@ -32,44 +182,204 @@
+ 	security_disable_smi_mstr_if();
+ }
+ 
+-void security_jtag_dap(__attribute__ ((unused)) uint8_t status)
++void security_enable_twi_if(void)
+ {
+-	/* TODO: close dap WA jira: H5-1803 */
++	security_enable_i2c_s_mstr_if();
++	security_enable_smi_mstr_if();
++}
++
++void security_jtag_dap(uint8_t status)
++{
++	regmap_writel(status, mmPSOC_CS_TRACE_SECURITY_CTRL);
+ }
+ 
+ void security_debug_if_shared(void)
+ {
+-	/* Configure SMI,I2C and JTAG to be "shared" engine */
++	/* There is no concept of shared engine in Gaudi2 */
+ }
+ 
+-static void security_dcon_rr_lbw_config(
++static void security_pcie_rr_lbw_config(
+ 			__attribute__ ((unused))uint8_t spi_controller_en)
+ {
++	/* Gaudi2, FW update does not involve direct update from Host.
++	 * Hence lock the full region except PSOC SECURITY
++	 */
++	uint32_t security_addr_start = mmPSOC_SECURITY_BASE &
++				GAUDI2_SECURITY_LBW_MASK;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE &
++				GAUDI2_SECURITY_LBW_MASK;
++
++	regmap_writel(GAUDI2_SECURITY_PSOC_START_LBW,
++		mmPCIE_LBW_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(security_addr_start,
++		mmPCIE_LBW_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	regmap_writel(security_addr_end,
++		mmPCIE_LBW_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++	regmap_writel(SECURITY_PSOC_END_LBW,
++		mmPCIE_LBW_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++
+ }
+ 
+-static void security_dcon_if0_rr_hbw_config(
++static void security_pcie_mstr_rr_hbw_config(
+ 			__attribute__ ((unused))uint8_t spi_controller_en)
+ {
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel((security_addr_start >> 32),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel((security_addr_end >> 32),
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+ }
+ 
+-static void security_dcon_if1_rr_hbw_config(
++static void security_pcie_mstr_rr_lbw_config(
+ 			__attribute__ ((unused))uint8_t spi_controller_en)
+ {
++	/* Gaudi2, FW update does not involve direct update from Host.
++	 * Hence lock the full region except PSOC SECURITY
++	 */
++	uint32_t security_addr_start = mmPSOC_SECURITY_BASE &
++				GAUDI2_SECURITY_LBW_MASK;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE &
++				GAUDI2_SECURITY_LBW_MASK;
++
++	regmap_writel(GAUDI2_SECURITY_PSOC_START_LBW,
++		mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(security_addr_start,
++		mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	regmap_writel(security_addr_end,
++		mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++	regmap_writel(SECURITY_PSOC_END_LBW,
++		mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+ }
+ 
+ void security_i2c_s_rr_hbw_config(
+ 			__attribute__ ((unused))uint8_t spi_controller_en)
+ {
++	/* TODO: Check what regions to open in HBW, during recovery */
++
++	/* This can be done by eROM, since this is called,
++	 * after the Image verification is failed for PRI/SEC
++	 */
++
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel((security_addr_start >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel((security_addr_end >> 32),
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+ }
+ 
+ void security_smi_rr_hbw_config(
+ 			__attribute__ ((unused))uint8_t spi_controller_en)
+ {
++	/* TODO: Check what regions to open in HBW, during recovery */
++
++	/* This can be done by eROM, since this is called,
++	 * after the Image verification is failed for PRI/SEC
++	 */
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel((security_addr_start >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel((security_addr_end >> 32),
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmSMI_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
+ }
+ 
+ void security_jtag_rr_hbw_config(
+ 			__attribute__ ((unused))uint8_t spi_controller_en)
+ {
++	/* TODO: Check what regions to open in HBW, during recovery */
++
++	/* This can be done by eROM, since this is called,
++	 * after the Image verification is failed for PRI/SEC
++	 */
++	uint64_t security_addr_start = mmPSOC_SECURITY_BASE >> 12;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE >> 12;
++
++	/* enable access to PSOC_SECURITY only */
++	regmap_writel(GAUDI2_SECURITY_START_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(GAUDI2_SECURITY_START_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel((security_addr_start & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel((security_addr_start >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
++
++	regmap_writel((security_addr_end & 0xFFFFFFFF),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_1);
++	regmap_writel((security_addr_end >> 32),
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_1);
++	regmap_writel(GAUDI2_SECURITY_END_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_1);
++}
++
++static void security_elbi_rr_lbw_config(
++			__attribute__ ((unused))uint8_t spi_controller_en)
++{
++	/* Gaudi2, FW update does not involve direct update from Host.
++	 * Hence lock the full region except PSOC SECURITY
++	 */
++	uint32_t security_addr_start = mmPSOC_SECURITY_BASE &
++				GAUDI2_SECURITY_LBW_MASK;
++	uint64_t security_addr_end = mmJT_MSTR_IF_RR_SHRD_HBW_BASE &
++				GAUDI2_SECURITY_LBW_MASK;
++
++	regmap_writel(GAUDI2_SECURITY_PSOC_START_LBW,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(security_addr_start,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	regmap_writel(security_addr_end,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++	regmap_writel(SECURITY_PSOC_END_LBW,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
+ }
+ 
+ void security_pcie_rr_config(uint8_t spi_en)
+@@ -78,14 +388,12 @@
+ 		      PCIE_WRAP_PCIE_PROT_OVR_RD_EN_MASK,
+ 		      mmPCIE_WRAP_PCIE_PROT_OVR);
+ 
+-	/* NO Shared Initiator bits for Gaudi2, what to do? */
+-	/* regmap_writel(PCIE_MSTR_RR_MSTR_IF_AXUSER_CORE_SHARED_MASK,
+-		      mmPCIE_MSTR_RR_MSTR_IF_AXUSER_CORE);
+-	*/
++	/* NO Shared Initiator bits for Gaudi2, hence no need to set the mask */
++
+ 	security_elbi_rr_lbw_config(spi_en);
+-	security_dcon_rr_lbw_config(spi_en);
+-	security_dcon_if0_rr_hbw_config(spi_en);
+-	security_dcon_if1_rr_hbw_config(spi_en);
++	security_pcie_rr_lbw_config(spi_en);
++	security_pcie_mstr_rr_hbw_config(spi_en);
++	security_pcie_mstr_rr_lbw_config(spi_en);
+ }
+ 
+ uint32_t security_key_soc_location_offset(uint32_t hash_key_index)
+@@ -163,3 +471,19 @@
+ {
+ 	/* Not needed for Gaudi2 */
+ }
++
++void security_disable_interfaces(void)
++{
++	/* by default disable jtag I/F as soon as possible */
++	security_disable_jtag_if();
++
++	/* by default disable TWI I/F as soon as possible */
++	security_disable_twi_if();
++}
++
++void security_handle_twi(void)
++{
++	if ((arcboot_rom_global.config_fuse &
++			EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0)
++		security_enable_twi_if();
++}
+diff --git a/goya2_arc/security.c b/goya2_arc/security.c
+index 4bee9aa..079906d 100644
+--- a/goya2_arc/security.c
++++ b/goya2_arc/security.c
+@@ -269,6 +269,33 @@
+ 		mmI2C_S_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_2);
+ }
+ 
++static void security_elbi_rr_lbw_config(
++				uint8_t spi_controller_en)
++{
++	regmap_writel(SECURITY_PSOC_START_LBW,
++		mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++
++	if (spi_controller_en) {
++		regmap_writel(SECURITY_QSPI_START_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(SECURITY_QSPI_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_2);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_2);
++	} else {
++		regmap_writel(SECURITY_PSOC_SECURITY_START_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(SECURITY_PSOC_SECURITY_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_1);
++		regmap_writel(SECURITY_PSOC_END_LBW,
++			mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_1);
++	}
++}
++
+ void security_smi_rr_hbw_config(uint8_t spi_controller_en)
+ {
+ 	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
+@@ -405,3 +432,10 @@
+ 		regmap_writel(spare0, mmPCIE_WRAP_SPECIAL_GLBL_SPARE_0);
+ 	}
+ }
++
++void security_handle_twi(void)
++{
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_TWI_IF_MASK)
++		security_disable_twi_if();
++}
++

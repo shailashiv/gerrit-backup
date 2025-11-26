@@ -1,0 +1,71 @@
+From 3a76047cc66c109730724dab816fb72f055db807 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 19 Jul 2024 09:52:13 +0300
+Subject: [PATCH] [FSW-7412] fs1: eom related efuse overrides
+
+with this patch, we forcibly set few efuse flags
+those are only required for pre production, and
+enabling them in production causes security risk.
+Also revoking lower keys when higher keys are
+revoked and lower are in non revoke state.
+
+Change-Id: I966915fe8bf6ddca1eae7af16070cfc2b50f08f2
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 9c854ff..a1221d4 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -92,3 +92,27 @@
+ 
+ 	return !!(sys_cfg & EFUSE_SYSCFG_SIG_VAL_EN);
+ }
++
++void boot_rom_eom_overrides()
++{
++	uint32_t key_revoke;
++
++	if (boot_rom_global.config_fuse & EFUSE_SYSCFG_EOM_BIT)
++		boot_rom_global.config_fuse |= EFUSE_SYSCFG_PRE_PRODUCTION_FLAGS;
++
++	key_revoke = boot_rom_global.config_fuse & EFUSE_SYSCFG_KEY_REVOCATION_BITS;
++
++	/*
++	 * Validate key revokation bits. Expected values from fuse are
++	 * 0, 1, 3, 7, 15. If any other values are read from fuse override
++	 * them accordingly.
++	 */
++	if (key_revoke == 2)
++		boot_rom_global.config_fuse |=  EFUSE_SYSCFG_REVOKE_KEY_0_1;
++	else if ((key_revoke < 7) && (key_revoke > 3))
++		boot_rom_global.config_fuse |=  EFUSE_SYSCFG_REVOKE_KEY_0_1_2;
++	else if ((key_revoke < 17) && (key_revoke > 7))
++		boot_rom_global.config_fuse |=  EFUSE_SYSCFG_REVOKE_KEY_0_1_2_3;
++
++	boot_rom_global.config_fuse &= ~EFUSE_SYSCFG_REVOKE_KEY_4;
++}
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 7ad211d..3b4cb98 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -27,6 +27,7 @@
+ 
+ void security_load_revoke_bits(void);
+ int security_efuse_image_validation_en(void);
++void boot_rom_eom_overrides(void);
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+diff --git a/common/common.c b/common/common.c
+index 308869f..f2b4cf5 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -87,6 +87,8 @@
+ 
+ 	boot_rom_set_efuse_read();
+ 
++	boot_rom_eom_overrides();
++
+ 	/* TODO: FS1 SKU decession pending */
+ 
+ 	/* TODO: Enable FAKE FUSE & RMA support */

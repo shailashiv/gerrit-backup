@@ -1,0 +1,71 @@
+From 7ddeb4c93e46740b7181b90f8bd7fa9a2d4bc17f Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 27 Jan 2022 15:55:20 +0200
+Subject: [PATCH] [SW-58071] gaudi3: read cold flops in init flow
+
+This patch add support to read cold flops values for recovery_flag,
+validation_pass and efuse_read and store in local data structure. This
+values will be used further in arcboot execution.
+
+Change-Id: Ib7d938b489d89030fc9b7cf87d791495bc7dd462
+---
+
+diff --git a/Makefile b/Makefile
+index 8821593..f783670 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,7 @@
+ CC = $(CROSS_COMPILE)gcc
+ AR = $(CROSS_COMPILE)ar
+ RANLIB = $(CROSS_COMPILE)ranlib
++SPECS_EMB_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
+ HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
+ HL_DEV_ARCH := arch/$(shell echo $(HL_DEV) | cut -d'_' -f1)/$(HL_DEV_SUBTYPE)
+ ifneq ($(CROSS_COMPILE),)
+@@ -30,6 +31,7 @@
+ 
+ ARCBOOT_CFLAGS += -I$(SPECS_DIR)/$(SPECS_DEV)/asic_reg
+ ARCBOOT_CFLAGS += -I$(SPECS_EMBEDDED_DIR)
++ARCBOOT_CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)
+ ARCBOOT_CFLAGS += -DBTLVER=$(ARCBOOT_VER)
+ ARCBOOT_CFLAGS += -DBTLID=0x30
+ ARCBOOT_CFLAGS += -DFLASH_START_OFFSET=0x60000
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index d142243..90f31fc 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <arcboot.h>
++#include <gaudi3_fw_if.h>
+ 
+ void arcboot_rom_clear_sw_status(void)
+ {
+@@ -53,6 +54,19 @@
+ 	return 0;
+ }
+ 
++static void arcboot_rom_read_cold_flops(void)
++{
++	struct gaudi3_cold_rst_data cold_rst_data;
++
++	if (arcboot_rom_global.die_id)
++		return;
++
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
++	arcboot_rom_global.recovery_flag = cold_rst_data.recovery_flag;
++	arcboot_rom_global.validation_pass = cold_rst_data.validation_flag;
++	arcboot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
++}
++
+ void arcboot_rom_init(void)
+ {
+ 	arcboot_rom_global.die_id = regmap_readl(mmD0_PARC_LOCAL_CFG_DIE_ID);
+@@ -61,4 +75,6 @@
+ 	arcboot_rom_clear_sw_status();
+ 
+ 	arcboot_rom_status_update(PROGRESS_INIT);
++
++	arcboot_rom_read_cold_flops();
+ }

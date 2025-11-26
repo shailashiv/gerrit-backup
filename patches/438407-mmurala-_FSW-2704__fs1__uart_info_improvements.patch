@@ -1,0 +1,141 @@
+From 49ca3ec17a0a59635071e036af89d693f7024110 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Mon, 29 Jul 2024 17:08:46 +0300
+Subject: [PATCH] [FSW-2704] fs1: uart info improvements
+
+with this patch, added support to indicate
+succesfull ppboot load by boot rom with
+character p over uart.
+added correction for uart character print
+during halt condition, to avoid continious
+character prints.
+increased worst case waiting time to 1us
+for the uart transmitter buffer to clear.
+
+Change-Id: Iec2107c27dde835d69fc63adc2493a4f7442cca5
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 49d01bb..c690e3a 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -194,8 +194,8 @@
+ 
+ void boot_rom_halt(void)
+ {
++	boot_rom_putc('h');
+ 	while (1) {
+-		boot_rom_putc('h');
+ 		wfe();
+ 	}
+ }
+diff --git a/arch/fs1/arc/dev_uart.c b/arch/fs1/arc/dev_uart.c
+index 8c31aef..e6406ef 100644
+--- a/arch/fs1/arc/dev_uart.c
++++ b/arch/fs1/arc/dev_uart.c
+@@ -14,9 +14,6 @@
+ #include "dev_uart.h"
+ #include <delay.h>
+ 
+-__weak uint32_t boot_rom_get_baudrate() { return 0; }
+-__weak uint32_t boot_rom_pll_get_freq(__unused enum boot_rom_pll_div div) { return 0; }
+-
+ void boot_rom_uart_dev_init(unsigned int val)
+ {
+ 	regmap_writel(0x0, IO0_H0_PSOC_CFG_UART(mmUART_CTRL));
+@@ -36,17 +33,20 @@
+ 
+ void boot_rom_putc(const char ch)
+ {
+-	uint8_t loop;
++	uint64_t start;
+ 
+ 	/*
+ 	 * TODO: DIE_CHECK
+ 	 * Confirm with system team, uart required for slave's or not
+ 	 */
+ 
+-	for (loop = 0; loop < UART_TX_FULL_RETRY_COUNT; loop++) {
++	start = boot_rom_get_ts_us();
++	for (;;) {
+ 		if ((regmap_readl(IO0_H0_PSOC_CFG_UART(mmUART_STATE)) & UART_SR_TXFULL) == 0) {
+ 			regmap_writel(ch, IO0_H0_PSOC_CFG_UART(mmUART_DATA));
+ 			break;
+ 		}
++		if (boot_rom_timeout_expired(start, UART_TX_FULL_TIMEOUT_US))
++			break;
+ 	}
+ }
+diff --git a/arch/fs1/arc/dev_uart.h b/arch/fs1/arc/dev_uart.h
+index 0b4a6e0..6ff8a0c 100644
+--- a/arch/fs1/arc/dev_uart.h
++++ b/arch/fs1/arc/dev_uart.h
+@@ -6,7 +6,7 @@
+ #ifndef _DEV_UART_
+ #define _DEV_UART_
+ 
+-#define UART_TX_FULL_RETRY_COUNT	10
++#define UART_TX_FULL_TIMEOUT_US	5
+ 
+ /* UART state bits */
+ #define UART_SR_TXFULL			(1 << 0) /* TX Buffer Full */
+@@ -31,6 +31,8 @@
+ 	PLL_DIV_PLL
+ };
+ 
++#define PLDM_UART_PLL_DIVIDER_VAL	3
++
+ void boot_rom_config_uart_gpio(void);
+ void boot_rom_uart_dev_init(unsigned int val);
+ uint32_t boot_rom_pll_get_freq(enum boot_rom_pll_div div);
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+index 1935054..9c4388d 100644
+--- a/arch/fs1/arc/palad.c
++++ b/arch/fs1/arc/palad.c
+@@ -14,6 +14,7 @@
+ #include <dev_efuse.h>
+ #include <common.h>
+ #include <tpm.h>
++#include <pll_control_masks.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
+ #define PLDM_UART_REF_CLK	250000000ULL
+@@ -30,13 +31,16 @@
+ 
+ 	/* Divison factor value */
+ 	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_FACTOR */
+-	regmap_writel(PLL_DIV_PLL, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
++	regmap_writel(PLDM_UART_PLL_DIVIDER_VAL,
++		(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_FACTOR_0)) + offset);
+ 
+ 	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ DIV_EN  */
+-	regmap_writel(0x1, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_EN_0)) + offset); /* Enable dividers */
++	regmap_writel(PLL_CONTROL_DIV_EN_0_VAL_M,
++		(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_DIV_EN_0)) + offset);
+ 
+ 	/* H15_PROJECT ➔ IO_0_CFG ➔ HALF_0 ➔ SOC_0 ➔ PLL_0 ➔ PSOC_PLL ➔ CTRL ➔ CFG */
+-	regmap_writel(0x101, (IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG))); /* Enables PSOC_PLL and FOUTPOSTDIVEN */
++	regmap_writel(PLL_CONTROL_CFG_FOUTPOSTDIVEN_M | PLL_CONTROL_CFG_EN_M,
++		(IO0_H0_SOC_0_PLL_0_PSOC_PLL(mmPLL_CONTROL_CFG)));
+ 
+ 	return PLDM_UART_REF_CLK;
+ }
+@@ -71,4 +75,4 @@
+ 	baudr = (baudr + 1) & 0xFFFE;
+ 
+ 	return baudr;
+-}
+\ No newline at end of file
++}
+diff --git a/common/common.c b/common/common.c
+index a44fdd5..3fe2322 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -295,6 +295,7 @@
+ 
+ 	boot_rom_status_update(PROGRESS_PPBOOT_START);
+ 	if (*start_addr) {
++		boot_rom_putc('p');
+ 		/* TODO: start cpld watchdog timer */
+ 		ppboot = (void *)((uint32_t)boot_rom_get_arc_addr(*start_addr));
+ 		ppboot();

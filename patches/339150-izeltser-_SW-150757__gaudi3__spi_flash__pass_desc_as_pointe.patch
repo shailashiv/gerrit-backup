@@ -1,0 +1,63 @@
+From 348b0bd15ee1c3eaea1f03e0f80fe2c594382d28 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 03 Jul 2023 13:12:58 +0300
+Subject: [PATCH] [SW-150757] gaudi3: spi_flash: pass desc as pointer
+
+for some odd reason the compiler sees desc.spi_offset under
+spi_flash_slave_init() as a dangling pointer.
+this seems like a compiler confusion, but as a WA, instead of
+defining desc on the stack it is passed from the calling function
+as a pointer, since it's already defined there.
+
+compiler output:
+spi_flash.c:60: error: dangling pointer to 'desc' may be used
+
+Change-Id: I72b72c637c129ad39a0c84c9f797c8910828c87a
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+index a471d98..3d542e3 100644
+--- a/arch/gaudi3/arc/spi_flash.c
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -39,10 +39,9 @@
+ 	return 0;
+ }
+ 
+-void spi_flash_slave_init(void)
++static void spi_flash_slave_init(struct boot_desc *desc)
+ {
+ 	uint32_t offset, d1_syscfg1, d1_syscfg2, idx;
+-	struct boot_desc desc;
+ 
+ 	if (arcboot_rom_global.sku)
+ 		return;
+@@ -51,13 +50,16 @@
+ 		return;
+ 
+ 	if (!arcboot_rom_global.fuse_emulation_done) {
+-		/* Slave spi offset is stored in img_desc->spi_offset[1] */
++		/*
++		 * Slave spi offset is stored in img_desc->spi_offset[1].
++		 * using desc from calling function to avoid "dangling pointer" compiler error.
++		 */
+ 		idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, HL_FW_IMG_FAKE_EFUSE,
+-						&desc, FLOPS_UPD_PENDING);
++						desc, FLOPS_UPD_PENDING);
+ 		if (idx == HL_FW_IMG_NOT_FOUND)
+ 			return;
+ 
+-		arcboot_rom_global.d1_fuse_spi_offset = desc.spi_offset;
++		arcboot_rom_global.d1_fuse_spi_offset = desc->spi_offset;
+ 	}
+ 
+ 	/* read value from bank0 */
+@@ -115,7 +117,7 @@
+ 	if ((!arcboot_rom_global.sku) && (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SKU_MASK))
+ 		arcboot_rom_global.sku = 1;
+ 
+-	spi_flash_slave_init();
++	spi_flash_slave_init(&desc);
+ 
+ 	/* Since spi fuse init is successful, set fuse_emulation_done to true */
+ 	if (!arcboot_rom_global.fuse_emulation_done) {

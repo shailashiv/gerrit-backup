@@ -1,0 +1,59 @@
+From 6ea1bdd5d5f94d7eae89e952a074854ef00840ab Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 19 Apr 2022 13:37:54 +0300
+Subject: [PATCH] [SW-83787] gaudi3: move start wd timer before ppboot execution
+
+Currently, start of CPLD WD timer is performed much early before DMA
+and verification of primary/secondary of ppboot image. This means that
+if there is problem with ppboot primary/secondary image, ROM will still
+start the WD timer and enter recovery flow. And since the preboot image
+was not loaded the GPIO will not be de-asserted which is done in preboot
+and CPLD will assert GPIO[2] after WD timer expires. This will lead to
+FW entering recovery again after prstn/FW reset.
+
+Ideally CPLD should assert GPIO[2] if there is problem in
+ppboot/preboot execution or preboot image DMA/verification fails. In order
+to make sure ROM enters recovery only once in above mentioned scenario,
+this patch add changes to start CPLD WD timer just before jumping to
+ppboot code which indicates that ROM has successfully DMAed/verified
+ppboot image.
+
+Change-Id: Icf517c45c798039235b6ce2ec1b353e4d32b3e7a
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c980cd6..242f5da 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -440,12 +440,22 @@
+ 	regmap_writel(val, mmD0_D2D_SPI_GLOBAL_CFG);
+ }
+ 
++
++void arcboot_rom_request_cpld_wdog(void)
++{
++	/*
++	 * In gaudi3, the request to start watchdog timer is performed
++	 * before jumping to ppboot code. Since this function is called
++	 * from common routine, keep it empty.
++	 */
++}
++
+ /*
+  * Request CPLD to start the watchdog, by asserting
+  * a GPIO_66.
+  */
+ #define GAUDI3_CPLD_WDOG_GPIO		66
+-void arcboot_rom_request_cpld_wdog(void)
++static void arcboot_rom_start_cpld_wdtimer(void)
+ {
+ 	uint32_t index = GAUDI3_CPLD_WDOG_GPIO % GPIOS_PER_BANK;
+ 	uint32_t val, mask = BIT(index);
+@@ -663,6 +673,7 @@
+ 
+ 	arcboot_rom_status_update(PROGRESS_PPBOOT_START);
+ 	if (start_addr) {
++		arcboot_rom_start_cpld_wdtimer();
+ 		ppboot = (void *)((uint32_t)arcboot_rom_get_arc_addr(*start_addr));
+ 		ppboot();
+ 	}

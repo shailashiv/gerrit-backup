@@ -1,0 +1,348 @@
+From a4c50f6e7bbc03ef6334759276dc38e4ca36c723 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Mon, 01 Mar 2021 12:11:41 +0200
+Subject: [PATCH] [SW-20154] split pcie configuration code
+
+PCIe link related configuration code needs additional
+settings to a few registers for Gaudi2, which are
+not needed for Goya2. Hence this patch makes such
+settings as platform specific functions, while
+keeping the original code as common as possible.
+
+Change-Id: I826ca1105a7807d048964c3faa7684e4d42813bb
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/common/pcie.c b/common/pcie.c
+index 2502590..5176de9 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -23,7 +23,7 @@
+ 	} while (pcie_prstn == assert);
+ }
+ 
+-static void pcie_update_reg_range(uint32_t addr, uint32_t addr_end,
++void pcie_update_reg_range(uint32_t addr, uint32_t addr_end,
+ 				  uint32_t value)
+ {
+ 	for (; addr <= addr_end ; addr += 4)
+@@ -32,7 +32,6 @@
+ 
+ static void pcie_wa_snps_case_01038891(uint32_t boot_strap)
+ {
+-	uint32_t reg = 0;
+ 	uint8_t separate_reference = 0;
+ 	uint8_t ssc_en = 0;
+ 
+@@ -51,10 +50,9 @@
+ 	if ((arcboot_rom_global.config_fuse &
+ 	     EFUSE_SYSCFG_WA_SNPS_CASE_01038891) == 0) {
+ 		if (ssc_en) {
+-			pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
+-					mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
+-			pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
+-					mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
++
++			pcie_phy_set_mpll_a_b_ssc_enable();
++
+ 			regmap_writel(0x5000, mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
+ 			regmap_writel(0x19CE,
+ 				      mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
+@@ -63,45 +61,11 @@
+ 				      mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
+ 		}
+ 
+-		pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
+-				mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
+-		pcie_update_reg_range(
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
+-		pcie_update_reg_range(
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++		pcie_phy_set_ext_tx_rx_ctrl();
+ 
+-		if (separate_reference) {
+-			reg = 0xA0;
+-			regmap_writel(0x00250025,
+-				      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
+-			regmap_writel(0x00250025,
+-				      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-		} else {
+-			reg = 0x50;
+-			regmap_writel(0x01C301C3,
+-				      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-		}
++		pcie_phy_set_mpll_a_b_mul_bw(separate_reference);
+ 
+-		regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
+-		regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
+-		regmap_writel(0x30,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
+-		regmap_writel(0x30,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
+-		regmap_writel(0x30,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
+-		regmap_writel(0x30,
+-			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
+-		pcie_update_reg_range(
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
+-
+-		regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
+-				mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
+-		regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
+-				mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
++		pcie_phy_set_protocol0_ext_tx_rx();
+ 
+ 		regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
+ 	}
+@@ -109,7 +73,6 @@
+ 
+ static void pcie_config(void)
+ {
+-	uint8_t sram_init_done;
+ 	uint32_t boot_strap, link_ctrl;
+ 	uint8_t ltssm_en;
+ 
+@@ -119,8 +82,8 @@
+ 
+ 	if (!ltssm_en) {
+ 		regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+-		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+-		regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++
++		pcie_phy_para_sel_set();
+ 
+ 		/* gpio bootstrap pin gpio17 = 0 */
+ 		boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+@@ -133,20 +96,9 @@
+ 		pcie_wa_snps_case_01038891(boot_strap);
+ 		regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ 
+-		sram_init_done = 0;
+-		do {
+-			sram_init_done =
+-				regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
+-		} while (sram_init_done != 1);
++		pcie_wait_for_sram_init_done();
+ 
+-		sram_init_done = 0;
+-		do {
+-			sram_init_done =
+-				regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
+-		} while (sram_init_done != 1);
+-
+-		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
+-		regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
++		pcie_phy_set_sram_ext_ld_done();
+ 
+ 		if ((arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0) {
+ 			/* limit PCIe link gen to 1 */
+diff --git a/common/pcie.h b/common/pcie.h
+index 8cf83fe..42ca652 100644
+--- a/common/pcie.h
++++ b/common/pcie.h
+@@ -18,5 +18,13 @@
+ void pcie_recovery(void);
+ void execute_pcie_recovery(void);
+ void pcie_config_iatu(void);
++void pcie_update_reg_range(uint32_t addr, uint32_t addr_end, uint32_t value);
++void pcie_wait_for_sram_init_done(void);
++void pcie_phy_set_sram_ext_ld_done(void);
++void pcie_phy_para_sel_set(void);
++void pcie_phy_set_mpll_a_b_ssc_enable(void);
++void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference);
++void pcie_phy_set_ext_tx_rx_ctrl(void);
++void pcie_phy_set_protocol0_ext_tx_rx(void);
+ 
+ #endif /* _PCIE_H_ */
+diff --git a/gaudi2_arc_gnu/common.c b/gaudi2_arc_gnu/common.c
+index 5558292..7e8cb41 100644
+--- a/gaudi2_arc_gnu/common.c
++++ b/gaudi2_arc_gnu/common.c
+@@ -350,3 +350,78 @@
+ 	regmap_writel(IATU_INBOUND_HI_OFFSET_ADDR,
+ 		(pci_dbi_base + IATU_REGION_CTRL_2_OFF_INBOUND_OFF));
+ }
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
++}
++
++void pcie_wait_for_sram_init_done(void)
++{
++	uint8_t sram_init_done = 0;
++
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3);
++	} while (sram_init_done != 1);
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmPCIE_PHY_PHY_SRAM_EXT_LD_DONE);
++}
++
++void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
++
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLB_SSC_EN_3, 0x1);
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLA_SSC_EN_3, 0x1);
++}
++
++void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
++{
++	uint32_t reg;
++
++	if (separate_reference) {
++		reg = 0xA0;
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = 0x50;
++		regmap_writel(0x00530053,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x01C301C3,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++}
++
++void pcie_phy_set_ext_tx_rx_ctrl(void) {}
++void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+diff --git a/goya2_arc/common.c b/goya2_arc/common.c
+index fa82171..fc55336 100644
+--- a/goya2_arc/common.c
++++ b/goya2_arc/common.c
+@@ -7,6 +7,7 @@
+ 
+ #include <unistd.h>
+ #include <efuse.h>
++#include <pcie.h>
+ #include <psoc_efuse_regs.h>
+ #include <psoc_global_conf_masks.h>
+ #include <arcboot.h>
+@@ -66,3 +67,93 @@
+ 	regmap_writel(0, IATU_REGION_CTRL_1_OFF_INBOUND);
+ 	regmap_writel(0xC0080000, IATU_REGION_CTRL_2_OFF_INBOUND);
+ }
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++}
++
++void pcie_wait_for_sram_init_done(void)
++{
++	uint8_t sram_init_done = 0;
++
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++	} while (sram_init_done != 1);
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
++}
++
++void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
++
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++			mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
++}
++
++void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
++{
++	uint32_t reg;
++
++	if (separate_reference) {
++		reg = 0xA0;
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = 0x50;
++		regmap_writel(0x01C301C3,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++}
++
++void pcie_phy_set_ext_tx_rx_ctrl(void)
++{
++	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
++			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
++
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++}
++
++void pcie_phy_set_protocol0_ext_tx_rx(void)
++{
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
++	regmap_writel(0x30,
++		      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
++		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
++
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
++}

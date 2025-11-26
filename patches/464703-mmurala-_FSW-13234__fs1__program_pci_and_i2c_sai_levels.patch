@@ -1,0 +1,87 @@
+From 5ee982e727260b1ac62e6b505cdb5882fa33a9a1 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 29 Nov 2024 07:21:54 +0200
+Subject: [PATCH] [FSW-13234] fs1: program pci and i2c sai levels
+
+Added support to program i2c and pci sai levels
+to its lb_sai and lb_sai_overd registers.
+
+Change-Id: Ie5137dcde4237b7bdca7c284d0ab765bc2168592
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index e36ef5d..95e65a2 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -459,9 +459,20 @@
+ 	}
+ }
+ 
++static void security_program_sai_levels(struct security_initiator_ctx initr_ctx, uint8_t sai_val)
++{
++	regmap_writel(INITIATOR_SAI_REG_FORMAT(sai_val), initr_ctx.sai_base +
++		mmAXUSER_LBW_LB_SAI);
++	regmap_writel(INITIATOR_SAI_REG_FORMAT(sai_val), initr_ctx.sai_base +
++		mmAXUSER_LBW_LB_SAI_OVRD);
++}
++
+ static void security_rr_jtag_config(bool enable)
+ {
+ 	uint32_t rr_idx;
++
++	security_program_sai_levels(initiator_data[SECURITY_INITIATOR_JTAG_MSTR],
++			SECURITY_JTAG_LBW_SAI_VALUE);
+ 
+ 	if (enable) {
+ 		security_rr_lbw_config_en(initiator_data[SECURITY_INITIATOR_JTAG_MSTR],
+@@ -630,3 +641,11 @@
+ 
+ 	boot_rom_program_prot_bits(pb_rec_cfg, ARRAY_SIZE(pb_rec_cfg));
+ }
++
++void security_program_pci_i2c_sai()
++{
++	security_program_sai_levels(initiator_data[SECURITY_INITIATOR_PCIE],
++		SECURITY_PCI_LBW_SAI_VALUE);
++	security_program_sai_levels(initiator_data[SECURITY_INITIATOR_I2C_S_MSTR],
++		SECURITY_I2C_LBW_SAI_VALUE);
++}
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index 51f3d6d..733d584 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -66,9 +66,13 @@
+ /* SAI Table start */
+ #define SECURITY_PCI_LBW_SAI_VALUE		2
+ #define SECURITY_I2C_LBW_SAI_VALUE		11
++#define SECURITY_JTAG_LBW_SAI_VALUE		9 /* TODO: Consider JTAG Green from SAI Assignment Doc */
+ /* SAI Table end */
+ 
+ #define RECOVERY_INITIATORS_SAI	(BIT(SECURITY_PCI_LBW_SAI_VALUE) | BIT(SECURITY_I2C_LBW_SAI_VALUE))
++
++#define INITIATOR_SAI_REG_FORMAT(SAI_VAL)	(SAI_VAL & AXUSER_LBW_LB_SAI_RD_M) | \
++								((SAI_VAL << AXUSER_LBW_LB_SAI_WR_S) & AXUSER_LBW_LB_SAI_WR_M)
+ 
+ enum security_pb_pages {
+ 	PB_PAGE_PSOC_BOOT_SECURITY,
+@@ -205,6 +209,7 @@
+ void security_rr_recovery_config(bool enable);
+ void security_handle_jtag_if(void);
+ void security_pb_recovery_config(void);
++void security_program_pci_i2c_sai(void);
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+diff --git a/common/common.c b/common/common.c
+index 798259f..f5642ac 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -70,6 +70,8 @@
+ 	if (!boot_rom_in_master_die())
+ 		return;
+ 
++	security_program_pci_i2c_sai();
++
+ 	boot_rom_iccm_init();
+ 
+ 	spi_flash_init();

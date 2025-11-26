@@ -1,0 +1,682 @@
+From 2c223e3639dcb692a7879646892528c0c104fca8 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 31 Mar 2022 21:48:52 +0300
+Subject: [PATCH] [SW-77251] gaudi3: add firmware update command ops
+
+As part of ROM recovery, ROM is expected to support firmware update
+via PCIe inband. This patch adds support for firmware update
+module operations which will listen on specific registers to receive
+command and perform operations accordingly.
+
+Change-Id: I72f62d8054217efffc38a9fadfc82d47d7d55870
+---
+
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+index c9217ac..b679507 100644
+--- a/arch/gaudi2/arc/Makefile
++++ b/arch/gaudi2/arc/Makefile
+@@ -2,4 +2,4 @@
+ 
+ BINARIES = arcboot_rom.bin arcboot_ram.bin
+ 
+-ARCBOOT_COMMON_SRCS_C := $(filter-out common/fit_regions.c common/fit.c common/memory.c, $(ARCBOOT_COMMON_SRCS_C))
++ARCBOOT_COMMON_SRCS_C := $(filter-out common/fit_regions.c common/fit.c common/memory.c common/module_fwupd.c, $(ARCBOOT_COMMON_SRCS_C))
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index df73d47..f73cf91 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -12,6 +12,7 @@
+ #include <efuse.h>
+ #include <dev_common.h>
+ #include <dev_efuse.h>
++#include <device.h>
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+ 	{	/* PCI module */
+@@ -24,6 +25,16 @@
+ 		.teardown = module_pci_teardown,
+ 		.run_noreturn = noop,
+ 	},
++	{	/* FW UPD module */
++		.setup = module_fwupd_setup,
++		.check = module_fwupd_check,
++		.disable = noop,
++		.run = module_fwupd_run,
++		.enable = noop,
++		.run_fast = module_fwupd_run_fast,
++		.teardown = noop,
++		.run_noreturn = module_fwupd_run_noret,
++	},
+ };
+ 
+ static void execute_erom_recovery(void)
+diff --git a/arch/greco/arc_elf32/Makefile b/arch/greco/arc_elf32/Makefile
+index 4d3384c..729142f 100644
+--- a/arch/greco/arc_elf32/Makefile
++++ b/arch/greco/arc_elf32/Makefile
+@@ -1,3 +1,3 @@
+ BINARIES = arcboot_rom.bin arcboot_ram.bin
+ 
+-ARCBOOT_COMMON_SRCS_C := $(filter-out common/fit_regions.c common/fit.c common/memory.c, $(ARCBOOT_COMMON_SRCS_C))
++ARCBOOT_COMMON_SRCS_C := $(filter-out common/fit_regions.c common/fit.c common/memory.c common/module_fwupd.c, $(ARCBOOT_COMMON_SRCS_C))
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 90aa87b..61268ad 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -75,5 +75,14 @@
+ void module_pci_enable(void);
+ void module_pci_teardown(void);
+ 
++/* FWUPD */
++void module_fwupd_setup(void);
++enum cmd_check_res module_fwupd_check(void);
++void module_fwupd_run_fast(void);
++void module_fwupd_run(void);
++void module_fwupd_run_noret(void);
++void module_fwupd_pcie_disable(bool is_pcie_disabled);
++bool module_fwupd_is_disabled(void);
++
+ void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
+ #endif /* _HL_CMD_MODULE_H_ */
+diff --git a/common/device.h b/common/device.h
+new file mode 100644
+index 0000000..50c5765
+--- /dev/null
++++ b/common/device.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++struct device_global_conf {
++	uint32_t upd_cmd_map;
++	uint32_t upd_sts_map;
++};
++
++extern struct device_global_conf global_conf;
+diff --git a/common/module_fwupd.c b/common/module_fwupd.c
+new file mode 100644
+index 0000000..3730c19
+--- /dev/null
++++ b/common/module_fwupd.c
+@@ -0,0 +1,577 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2022 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <arcboot.h>
++#include <libfdt.h>
++#include <stdint.h>
++#include <inttypes.h>
++#include <string.h>
++
++#include <device.h>
++#include <hl_fw_if.h>
++#include <hl_fit_if.h>
++#include <fit_load_type.h>
++#include <security.h>
++#include <memory.h>
++
++#include "cmd_module.h"
++#include "fit.h"
++
++#define WFC_TIMEOUT_MS			500
++#define TIMEOUT_US			1000
++
++struct device_global_conf global_conf;
++uint32_t err_sts_reg_val;
++
++struct fwupd_state {
++	bool sending_error_flag;
++	unsigned int map_size;
++	void *map_offset;
++	struct hl_upd_command cmd;
++	struct hl_upd_command wfc_cmd;
++	enum cmd_check_res exec_res;
++	enum cmd_check_res sync_exec_res;
++	uint32_t cmd_reg;
++	uint32_t sts_reg;
++	uint64_t noret_delay;
++	void (*sts_writel)(uint32_t val);
++	uint32_t (*cmd_readl)(void);
++	bool is_disabled;
++	bool use_security;
++	bool synced_no_return;
++	enum mem_region mregion;
++};
++
++struct fwupd_resp_prop {
++	const char *name;
++	const void *data;
++	uint32_t size;
++};
++
++enum fwupd_resp_prop_type {
++	RESP_PROP_STATUS,
++	RESP_PROP_SPI_VERSION,
++	RESP_PROP_NUM
++};
++
++static struct fwupd_state state;
++static struct fwupd_resp_prop resp_props[RESP_PROP_NUM];
++
++uint32_t fwupd_cmd_readl(void)
++{
++	return regmap_readl(global_conf.upd_cmd_map);
++}
++
++void fwupd_sts_writel(uint32_t val)
++{
++	regmap_writel(val, global_conf.upd_sts_map);
++}
++
++static void fwupd_get_proto_status(struct hl_upd_proto_status *status,
++				   int err, int serr)
++{
++	status->version = HL_UPD_PROTO_VERSION;
++	status->compat_mask = 0x0;
++	status->fw_comp = HL_FW_COMP_ROM;
++	status->err = err;
++	status->sub_err = serr;
++}
++
++static int fwupd_create_resp(void *res_fit, uint32_t avail_sz, const int load_type,
++			     const struct fwupd_resp_prop *props, int prop_cnt, uint32_t *out_sz)
++{
++	int err, i;
++	unsigned int sz;
++
++	err = fit_init_resp(res_fit, avail_sz);
++	if (err)
++		goto fit_init_err;
++
++	err = fdt_property_u32(res_fit, HL_FIT_LOAD_TYPE_PROP, load_type);
++	if (err)
++		goto fit_init_err;
++
++	for (i = 0; i < prop_cnt; i++) {
++		err = fdt_property(res_fit, props[i].name, props[i].data, props[i].size);
++		if (err)
++			goto fit_init_err;
++	}
++
++	err = fit_fin_resp(res_fit, &sz);
++	if (err)
++		goto fit_init_err;
++
++	*out_sz = sz;
++
++fit_init_err:
++	return err;
++}
++
++static void module_fwupd_send_status_fast(struct fwupd_state *state,
++					  enum hl_upd_sts sts, void *offset)
++{
++	struct hl_upd_status status;
++	uintptr_t address = (uintptr_t)offset;
++
++	status.val = 0;
++	status.status = sts;
++
++	/* only if we get a address we need to calc offset */
++	if (address >=  SDRAM_BASE)
++		status.offset = (uint32_t)((address - SDRAM_BASE) &
++				~HL_UPD_STS_OFFSET_MASK);
++	else
++		status.offset = (uint32_t)(address & ~HL_UPD_STS_OFFSET_MASK);
++
++	state->sts_writel(status.val);
++}
++
++static int module_fwupd_proto_status(struct fwupd_state *state,
++				     struct hl_upd_proto_status *ret_status)
++{
++	struct hl_upd_proto_status status;
++	struct fwupd_resp_prop *resp_prop;
++	struct mem_desc mdesc;
++	uint32_t sts_err, sts_serr;
++	int err;
++
++	resp_prop = &resp_props[RESP_PROP_STATUS];
++	resp_prop->name = HL_FIT_RES_PROTO_STS_PROP;
++	resp_prop->data = &status;
++	resp_prop->size = sizeof(status);
++
++	resp_prop = &resp_props[RESP_PROP_SPI_VERSION];
++	resp_prop->name = HL_FIT_RES_SPI_VERSION_PROP;
++	resp_prop->data = "ARCBOOT";
++	resp_prop->size = VERSION_MAX_LEN;
++
++	err = arcboot_get_mem_region(state->mregion, &mdesc);
++	if (err)
++		return err;
++
++	state->map_offset = (void *)mdesc.base;
++
++	/*
++	 * Here we assume that the error is reported only once and
++	 * regardless of the interface
++	 */
++	arcboot_error_read_and_clr(&sts_err, &sts_serr);
++	fwupd_get_proto_status(&status, sts_err, sts_serr);
++
++	err = fwupd_create_resp(state->map_offset, mdesc.size, FIT_LOAD_TYPE_PROTO_STATUS,
++				resp_props, ARRAY_SIZE(resp_props), &state->map_size);
++
++	/* TODO: add error checks */
++
++	if (ret_status)
++		*ret_status = status;
++
++	return err;
++}
++
++static void module_fwupd_send_status(struct fwupd_state *state,
++				     enum hl_upd_sts sts, void *offset)
++{
++	int err;
++	void *tmp_offset = offset;
++
++	/*
++	 * can send fast if not error
++	 * if it is error - must be slow
++	 */
++	switch (sts) {
++	case HL_UPD_STS_MAP_ERR:
++	case HL_UPD_STS_ERR:
++	case HL_UPD_STS_RST_ERR:
++	case HL_UPD_STS_VALID_ERR:
++	case HL_UPD_STS_TIMEOUT_ERR:
++		/*
++		 * The error inform function, work in such a way
++		 * that the error will be set only once (assuming no
++		 * concurrency) so if the error inform function is called before
++		 * entering the current function, module_fwupd_send_status,
++		 * the second call will not overrun its values.
++		 * it allows support legacy code by setting the sent error
++		 * status as protocol error and set it's minor value.
++		 */
++		arcboot_error_inform(HL_FW_ERR_PROTO, sts);
++		if (state->exec_res != FOUND_SLOW_RETURN) {
++			/*
++			 * error status response requires FIT creation, that
++			 * implies - SLOW MODE
++			 * if an error status request has been done from within
++			 * a slow mode invocation. The request can be served
++			 * and skip this conditional block.
++			 * otherwise, the control should be returned to the main
++			 * event loop,with request for change into SLOW MODE and
++			 * execute a command state to send the error status.
++			 * There is not enough commands bits to add this
++			 * command state, so the alternative for that, is using
++			 * a flag to ask for running the state. That condition
++			 * is not enough; an error should be inform in order to
++			 * trigger the response.
++			 * Both of those condition should be checked in the
++			 * module's check and run functions.
++			 * The error was set previously (2 lines above), and
++			 * the request to change the state is done by this flag.
++			 *
++			 * WARNING:	don't change state->exec_res it is the
++			 *		check function responsibility
++			 */
++			state->sending_error_flag = true;
++			break;
++		}
++
++		/* if an explicit FIT was attached - use it */
++		if (!offset) {
++			tmp_offset = state->map_offset;
++			err = module_fwupd_proto_status(state, NULL);
++
++			/* if prepare fails - just don't include it*/
++			if (err)
++				tmp_offset = 0;
++		}
++		break;
++	default:
++		break;
++	}
++
++	/* on STS_OK / STS_ACK etc,  the original offset is set */
++	module_fwupd_send_status_fast(state, sts, tmp_offset);
++}
++
++void module_fwupd_setup(void)
++{
++	state.cmd_readl = fwupd_cmd_readl;
++	state.sts_writel = fwupd_sts_writel;
++	state.use_security = true;
++	state.mregion = MEM_FWUPD_PCI;
++	module_fwupd_send_status(&state, HL_UPD_STS_RST_OK, NULL);
++}
++
++/* NOOP is a sync command, so here we decide what execution type is needed */
++static enum cmd_check_res module_fwupd_check_noop(struct fwupd_state *state)
++{
++	enum cmd_check_res res = NOT_FOUND;
++
++	/* check the command we got before waiting for sync */
++	switch (state->wfc_cmd.cmd) {
++	case HL_UPD_NOOP:
++		break;
++	case HL_UPD_RUN_SRAM:
++	case HL_UPD_GET_PROTO_STATUS:
++		res = FOUND_SLOW_RETURN;
++		break;
++	case HL_UPD_RST_STATE:
++	case HL_UPD_MAP_SRAM:
++	default:
++		res = FOUND_FAST_RETURN;
++		break;
++	}
++
++	return res;
++}
++
++static enum cmd_check_res __module_fwupd_check(struct fwupd_state *state)
++{
++	enum cmd_check_res res = NOT_FOUND;
++
++	if (state->is_disabled)
++		return res;
++
++	/*
++	 * the error status response, involved
++	 * the creation of a FIT file.
++	 * this implies a slow return
++	 * Due to the lack of commands numbers the cmd state (4 bits)
++	 * can't be change to a specific state therefore a flag was added
++	 * other option is to add an internal cmd level.
++	 */
++	if (state->sending_error_flag && arcboot_error_is_pending())
++		return FOUND_SLOW_RETURN;
++
++	if (state->exec_res != NOT_FOUND)
++		return state->exec_res;
++
++	state->cmd.val = state->cmd_readl();
++
++	if (state->cmd.cmd == state->wfc_cmd.cmd)
++		return NOT_FOUND;
++
++	switch (state->cmd.cmd) {
++	case HL_UPD_NOOP:	/* NOOP is a special command */
++		res = module_fwupd_check_noop(state);
++		break;
++	case HL_UPD_CLR_STS:
++	case HL_UPD_RST_STATE:
++	case HL_UPD_MAP_SRAM:
++	case HL_UPD_RUN_SRAM:
++	case HL_UPD_GET_PROTO_STATUS:
++		res = FOUND_FAST_RETURN;
++		break;
++	default:
++		break;
++	}
++
++	return res;
++}
++
++enum cmd_check_res module_fwupd_check(void)
++{
++	return __module_fwupd_check(&state);
++}
++
++static void module_fwupd_state_shift(struct fwupd_state *state)
++{
++	/* do not shift if got CLR_STS several times */
++	if (state->cmd.cmd == HL_UPD_CLR_STS)
++		return;
++
++	/* save current command waiting for clear, until handled */
++	state->wfc_cmd = state->cmd;
++}
++
++static void module_fwupd_reset_state(struct fwupd_state *state)
++{
++	state->cmd.val = 0;	/* NOOP */
++	state->wfc_cmd.val = 0;	/* NOOP */
++	state->exec_res = NOT_FOUND;
++	state->sync_exec_res = NOT_FOUND;
++	state->map_size = 0;
++	state->map_offset = NULL;
++	state->sending_error_flag = false;
++	state->noret_delay = 0;
++}
++
++static void module_fwupd_reset_state_secure(struct fwupd_state *state)
++{
++	module_fwupd_reset_state(state);
++}
++
++bool module_fwupd_is_disabled(void)
++{
++	return state.is_disabled;
++}
++
++static enum hl_upd_sts module_fwupd_map(struct fwupd_state *state,
++					unsigned int size, __unused enum hl_upd_cmd cmd)
++{
++	int err;
++	struct mem_desc mdesc;
++	enum hl_upd_sts sts = HL_UPD_STS_MAP_OK;
++	uintptr_t base_offset;
++
++	err = arcboot_get_mem_region(state->mregion, &mdesc);
++	if (err)
++		return HL_UPD_STS_MAP_ERR;
++
++	base_offset = mdesc.base;
++
++	err = !arcboot_is_valid_address_range(base_offset, size);
++	if (err || size > mdesc.size)
++		return HL_UPD_STS_VALID_ERR;
++
++	state->map_offset = (void *)base_offset;
++	state->map_size = size;
++
++	return sts;
++}
++
++static void module_fwupd_run_fast_noop(struct fwupd_state *state)
++{
++	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
++
++	/* depending on the current state machine, perform action */
++	switch (state->wfc_cmd.cmd) {
++	case HL_UPD_NOOP:
++	case HL_UPD_CLR_STS:
++		break;
++	case HL_UPD_RST_STATE:
++		module_fwupd_reset_state_secure(state);
++		module_fwupd_send_status(state, HL_UPD_STS_RST_OK, NULL);
++		break;
++	case HL_UPD_MAP_SRAM:
++		sts = module_fwupd_map(state, state->wfc_cmd.size, state->wfc_cmd.cmd);
++		module_fwupd_send_status(state, sts, state->map_offset);
++		break;
++	case HL_UPD_RUN_SRAM:
++	case HL_UPD_GET_PROTO_STATUS:
++	default:	/* should never get here */
++		break;
++	}
++}
++
++static void __module_fwupd_run_fast(struct fwupd_state *state)
++{
++	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
++	int err = 0;
++
++	switch (state->cmd.cmd) {
++	case HL_UPD_NOOP:	/* NOOP is a special command */
++		module_fwupd_run_fast_noop(state);
++		break;
++	case HL_UPD_CLR_STS:
++		/* Clear the status */
++		module_fwupd_send_status(state, HL_UPD_STS_NOOP, NULL);
++		break;
++	case HL_UPD_RST_STATE:
++		module_fwupd_send_status(state, HL_UPD_STS_RST_ACK, NULL);
++		break;
++	case HL_UPD_MAP_SRAM:
++		/* Protect from multi-MAP */
++		if (state->map_offset || state->map_size) {
++			sts = HL_UPD_STS_VALID_ERR;
++			err = 1;
++		} else {
++			sts = HL_UPD_STS_MAP_ACK;
++		}
++
++		module_fwupd_send_status(state, sts, NULL);
++		break;
++	case HL_UPD_RUN_SRAM:
++		/* Protect from RUN before MAP */
++		if (state->map_offset && state->map_size) {
++			sts = HL_UPD_STS_ACK;
++		} else {
++			sts = HL_UPD_STS_VALID_ERR;
++			err = 1;
++		}
++
++		module_fwupd_send_status(state, sts, NULL);
++		break;
++	case HL_UPD_GET_PROTO_STATUS:
++		module_fwupd_send_status(state, HL_UPD_STS_ACK, NULL);
++		/* We ACK the command, but handle only on CLR, so save cmd */
++		break;
++	default:
++		module_fwupd_send_status(state, HL_UPD_STS_VALID_ERR, NULL);
++		err = 1;
++		break;
++	}
++
++	if (!err)
++		module_fwupd_state_shift(state);
++}
++
++void module_fwupd_run_fast(void)
++{
++	__module_fwupd_run_fast(&state);
++}
++
++static int module_fwupd_load_type_run(struct fwupd_state *state, void *fit)
++{
++	int err;
++
++	state->exec_res = NOT_FOUND;
++
++	err = fit_load_images(fit);
++	if (err)
++		return err;
++
++	state->exec_res = FOUND_NO_RETURN;
++	return err;
++}
++
++static int module_fwupd_load_type(struct fwupd_state *state)
++{
++	uint32_t load_type;
++	int ret;
++
++	ret = fit_get_load_type(state->map_offset, &load_type);
++	if (ret) {
++		fit_format_update_status(ret);
++		return 1;
++	}
++
++	switch (load_type) {
++	case FIT_LOAD_TYPE_RUN:
++		return module_fwupd_load_type_run(state, state->map_offset);
++	default:
++		return 1;
++	}
++
++	return 0;
++}
++
++static enum hl_upd_sts module_fwupd_run_cmd(struct fwupd_state *state,
++					    __unused enum hl_upd_cmd cmd,
++					    enum hl_upd_sts *status)
++{
++	int err;
++	enum hl_upd_sts sts = HL_UPD_STS_OK;
++
++	err = module_fwupd_load_type(state);
++	if (err)
++		sts = HL_UPD_STS_ERR;
++
++	*status = sts;
++	return err;
++}
++
++static void module_fwupd_push_error_status(struct fwupd_state *state)
++{
++	int err;
++	void *offset = state->map_offset;
++	struct hl_upd_proto_status status;
++
++	err = module_fwupd_proto_status(state, &status);
++	if (err)
++		offset = 0;
++
++	module_fwupd_send_status(state, status.err, offset);
++	module_fwupd_send_status(state, HL_UPD_STS_NOOP, offset);
++}
++
++static void __module_fwupd_run(struct fwupd_state *state)
++{
++	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
++	int err = 0;
++
++	if (state->sending_error_flag && arcboot_error_is_pending()) {
++		module_fwupd_push_error_status(state);
++		state->sending_error_flag = false;
++	}
++
++	switch (state->wfc_cmd.cmd) {
++	case HL_UPD_RUN_SRAM:
++		err = module_fwupd_run_cmd(state, state->wfc_cmd.cmd, &sts);
++		module_fwupd_send_status(state, sts, NULL);
++		break;
++	case HL_UPD_GET_PROTO_STATUS:
++		err = module_fwupd_proto_status(state, NULL);
++		if (err)
++			module_fwupd_send_status(state, HL_UPD_STS_ERR, NULL);
++		else
++			module_fwupd_send_status(state, HL_UPD_STS_OK,
++						 state->map_offset);
++		break;
++	default:	/* should never get here */
++		break;
++	}
++
++	/* NOTE: at this point we have code that reset the protocol FSM state,
++	 *       on error, and only registers on NOT_FOUND result.
++	 *       Do not run the secured version here. The response memory must
++	 *       be kept open until an explicit request for RST_STATE invoked
++	 *       by the host arrives.
++	 */
++	if (err) {
++		module_fwupd_reset_state(state);
++	} else if (state->exec_res == NOT_FOUND) {
++		state->wfc_cmd.val = 0;	/* NOOP - clear cmds state machine */
++		state->cmd.val = 0;	/* NOOP */
++	}
++}
++
++void module_fwupd_run(void)
++{
++	__module_fwupd_run(&state);
++}
++
++void module_fwupd_run_noret(void)
++{
++	fit_run_image();
++}

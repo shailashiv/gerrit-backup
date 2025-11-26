@@ -1,0 +1,290 @@
+From c86b6da74fd9d7eff63abe4be4ae3a3804671ea1 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 04 Feb 2020 13:14:10 +0200
+Subject: [PATCH] [SW-8228] verify image signature and key hash
+
+Run synopsys verification SDK to validate the signature
+of the image. Also verify that the key of the image is a
+valid key.
+
+Change-Id: I4d17a5eaf845ac7c5ede2f7aff8cd04ed34fbf04
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 8b0e947..8a7db31 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -115,6 +115,11 @@
+ 	if (dma_wait_finish() == DMA_CRC_ERROR)
+ 		/* TODO: update PSOC_SECURITY about CRC error in image */
+ 		return ARCBOOT_BRINGUP_ERROR;
++
++	if (secureboot_verify_image(ppboot_pcie_size, HL_FWSRAM_BASE) ==
++	    SECUREBOOT_VERIFY_FAILED)
++		/* TODO: update PSOC_SECURITY about verify fail in image */
++		return ARCBOOT_BRINGUP_ERROR;
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+ 
+diff --git a/common/secureboot.c b/common/secureboot.c
+index 2015c0a..7a83a6b 100644
+--- a/common/secureboot.c
++++ b/common/secureboot.c
+@@ -6,9 +6,10 @@
+  */
+ 
+ #include <stdio.h>
+-#include "soc.h"
+ #include "sb.h"
+ #include "arcboot.h"
++#include "secureboot.h"
++#include "security.h"
+ 
+ /*
+  * arcboot - Signature Verification
+@@ -27,31 +28,72 @@
+  * test_public_key_len   - public key size
+  */
+ 
+-int arcboot_verify_image(uint32_t image_size)
++int secureboot_verify_image(uint32_t image_size, uint32_t image_offset)
+ {
+-	int st, err;
+-	unsigned char block_buf[512];
+-	uint16_t test_phase0b_data_len = image_size - SIG_SIZE - BLOB_START;
+-
+-	unsigned char *test_phase0b_data = (unsigned char *)(HL_SBROM_BASE + BLOB_START);
+-	unsigned char *test_phase0b_sig = (unsigned char *)(HL_SBROM_BASE + test_phase0b_data_len + BLOB_START);
+-	unsigned char *test_public_key = test_phase0b_sig - KEY_SIZE;
++	int verify = 0;
++	int err = 0;
++	unsigned char block_buf[SECUREBOOT_HASH_BLOCK_CALC_BUF];
++	unsigned char test_phase0a_hash[SECURITY_KEY_HASH_ARRAY_BIT_SIZE];
++	uint16_t test_phase0b_data_len = image_size - SIG_SIZE - IMG_LEN_SIZE -
++					 CRC32_SIZE;
+ 	uint32_t test_phase0b_sig_len = SIG_SIZE;
+ 	uint32_t test_public_key_len = KEY_SIZE;
+ 
+-	XSTACK_INIT();
++	unsigned char *test_phase0b_data = (unsigned char *)(IMG_LEN_SIZE +
++							     image_offset);
++	unsigned char *test_phase0b_sig = test_phase0b_data +
++					  test_phase0b_data_len;
++	unsigned char *test_public_key = test_phase0b_sig -
++					 test_public_key_len;
++	uint32_t fw_version = base_readl((u32)test_phase0b_data);
+ 
+-	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
+-	 * of the data blob (test_phase0b_data) */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
+-			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
++	/* check minimal valid security FW version */
++	if (security_check_valid_fw_version(fw_version) !=
++	    SECURITY_FW_VERSION_SECURE)
++		return SECUREBOOT_VERIFY_FAILED;
+ 
+-	if (err || !st) {
+-		regmap_writel(0x800, mmPSOC_SECURITY_STATUS);
++	for (int key_scan = SECUREBOOT_CUSTOMER_KEY;
++	     key_scan >= SECUREBOOT_HABANA_KEY; key_scan--) {
++		if (security_get_key_hash((uint32_t *)test_phase0a_hash,
++					  key_scan)) {
++			/* check pub key hash versus efuse */
++			err = elp_secureboot_phase0a(sb_proxy_read,
++						     test_public_key,
++						     test_public_key_len,
++						     test_phase0a_hash,
++						     &verify, block_buf,
++						     sizeof(block_buf));
++			if (!verify && (key_scan == SECUREBOOT_HABANA_KEY)) {
++				regmap_writel(err,
++					      mmPSOC_SECURITY_SW_STATUS_0);
++				regmap_writel(verify,
++					      mmPSOC_SECURITY_SW_STATUS_1);
++				return SECUREBOOT_VERIFY_FAILED;
++			}
++		} else {
++			/* if (key_scan == SECUREBOOT_HABANA_KEY) &&
++			 *(security_all_customer_revoked()){
++			 *	security_check_force_habana_key();
++			 *}
++			 */
++		}
++	}
++	/* TODO: add if for loop doesn't find a valid key hash in fuse */
++
++	/* Phase0b uses the public key (test_public_key) to validate signature
++	 * (test_phase0b_sig) of the data blob (test_phase0b_data)
++	 */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data,
++				     test_phase0b_data_len, test_public_key,
++				     test_public_key_len, test_phase0b_sig,
++				     test_phase0b_sig_len, &verify,
++				     block_buf, sizeof(block_buf));
++
++	if (err || !verify) {
++		/* TODO: status of verify fail */
+ 		regmap_writel(err, mmPSOC_SECURITY_SW_STATUS_0);
+-		regmap_writel(st, mmPSOC_SECURITY_SW_STATUS_1);
++		regmap_writel(verify, mmPSOC_SECURITY_SW_STATUS_1);
+ 	}
+ 
+-	regmap_writel(1, mmPSOC_SECURITY_STATUS);
+-	return 0;
++	return verify;
+ }
+\ No newline at end of file
+diff --git a/common/secureboot.h b/common/secureboot.h
+index ad7bb7e..f50d065 100644
+--- a/common/secureboot.h
++++ b/common/secureboot.h
+@@ -8,6 +8,20 @@
+ #ifndef _SECUREBOOT_H_
+ #define _SECUREBOOT_H_
+ 
+-int arcboot_verify_image(uint32_t image_size);
++#define SIG_SIZE			384
++#define KEY_SIZE			392
++#define IMG_LEN_SIZE			4
++#define FW_VERSION_SIZE			4
++#define CRC32_SIZE			4
++
++#define SECUREBOOT_HASH_BLOCK_CALC_BUF	512
++
++#define SECUREBOOT_VERIFY_FAILED	0
++#define SECUREBOOT_VERIFY_SUCCESS	1
++
++#define SECUREBOOT_HABANA_KEY		0
++#define SECUREBOOT_CUSTOMER_KEY		1
++
++int secureboot_verify_image(uint32_t image_size, uint32_t image_offset);
+ 
+ #endif /* _SECUREBOOT_H_ */
+\ No newline at end of file
+diff --git a/common/security.c b/common/security.c
+index 759781c..fff8ff0 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -7,6 +7,9 @@
+ 
+ #include "arcboot.h"
+ #include "security.h"
++#include "efuse.h"
++#include "security.h"
++#include "spi_flash.h"
+ 
+ static void security_disable_i2c_s_mstr_if(void)
+ {
+@@ -85,3 +88,70 @@
+ {
+ 	regmap_writel(mmPSOC_GLOBAL_CONF_MEM_CPY_AXUSER,0x400);
+ }
++
++static int security_get_first_valid_key(uint8_t customer)
++{
++	uint8_t end_index, key_revoke;
++
++	/* customer keys are from index 1 - 4
++	 * habana key is only at index 0
++	 */
++	if (customer)
++		end_index = SECURITY_KEY_HASH_COUNT;
++	else
++		end_index = SECURITY_KEY_HASH_HABANA_COUNT;
++
++	key_revoke = regmap_readl(mmPSOC_SECURITY_KEY_REVOKE);
++
++	/* return offset of first non-revoked key
++	 * habana will scan index 0 only
++	 * customer will scan index 1 - 5
++	 */
++	for (uint8_t i = customer; i < end_index; i++) {
++		if ((key_revoke & BIT(i)) == 0)
++			return i;
++	}
++
++	/* no valid key found */
++	return -1;
++}
++
++int security_get_key_hash(uint32_t *hash, uint8_t customer)
++{
++	int valid_key_offset = security_get_first_valid_key(customer);
++
++	if (valid_key_offset < 0)
++		return valid_key_offset;
++
++	if (customer) {
++		/* adjust index to exclude habana key */
++		valid_key_offset--;
++		/* absolute location in fuse map */
++		valid_key_offset *= SECURITY_DWORD_PER_KEY;
++		valid_key_offset += mmPSOC_SECURITY_PUBLIC_KEY_0_0;
++	} else {
++		valid_key_offset = mmPSOC_SECURITY_HABANA_KEY_0;
++	}
++
++	for (int i = 0; i < SECURITY_KEY_HASH_COUNT; i++)
++		*hash = regmap_readl((valid_key_offset++) * 4);
++
++	return 1;
++}
++
++
++int security_check_valid_fw_version(uint32_t fw_version)
++{
++	uint32_t valid_fw_version;
++	uint8_t fw_version_sec, valid_fw_version_sec;
++
++	valid_fw_version = regmap_readl(mmPSOC_SECURITY_MIN_FW_VERSION);
++	fw_version_sec = SECURITY_FW_VERSION_TO_SECURITY_BYTE(fw_version);
++	valid_fw_version_sec =
++		SECURITY_FW_VERSION_TO_SECURITY_BYTE(valid_fw_version);
++
++	if (fw_version_sec >= valid_fw_version_sec)
++		return SECURITY_FW_VERSION_SECURE;
++
++	return SECURITY_FW_VERSION_NOT_SECURE;
++}
+diff --git a/common/security.h b/common/security.h
+index 6408462..102ef38 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -9,8 +9,11 @@
+ #define _SECURITY_H_
+ #include <limits.h>
+ 
++#define SECURITY_FW_VERSION_TO_SECURITY_BYTE(x)		((x >> 24) & 0xFF)
+ #define SECURITY_FW_VERSION_FROM_SECURITY_BYTE(x)	((x & 0xFF) << 24)
++
+ #define SECURITY_KEY_HASH_COUNT				5
++#define SECURITY_KEY_HASH_HABANA_COUNT			1
+ #define SECURITY_DWORD_PER_KEY				8
+ #define SECURITY_DWORD_BIT_SIZE				(sizeof(uint32_t) * \
+ 							 CHAR_BIT)
+@@ -23,10 +26,22 @@
+ #define SECURITY_DWORD_PER_FW_SEC_VERSION	(SECURITY_MAX_FW_SEC_VERSION / \
+ 						 SECURITY_DWORD_BIT_SIZE)
+ 
++#define SECURITY_HABANA_KEY				0
++#define SECURITY_CUSTOMER_KEY				1
++
++#define SECURITY_KEY_REVOKE_MAP				0x1F
++
++#define SECURITY_FW_VERSION_SECURE			1
++#define SECURITY_FW_VERSION_NOT_SECURE			-1
++
+ #define SECURITY_KEY_HASH_ARRAY_SIZE		(SECURITY_DWORD_PER_KEY * \
+ 						SECURITY_KEY_HASH_COUNT)
++#define SECURITY_KEY_HASH_ARRAY_BIT_SIZE	(SECURITY_KEY_HASH_ARRAY_SIZE *\
++						sizeof(uint32_t))
+ 
+ void security_disable_debug_if(void);
+ uint32_t security_key_soc_location_offset(uint32_t hash_key_index);
++int security_get_key_hash(uint32_t *hash, uint8_t customer);
++int security_check_valid_fw_version(uint32_t fw_version);
+ 
+-#endif /* _SECURITY_H_ */
+\ No newline at end of file
++#endif /* _SECURITY_H_ */

@@ -1,0 +1,281 @@
+From 6b6ce5dc8ffbb54ee49c247d054be598cc132a37 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Fri, 29 Apr 2022 05:54:54 +0300
+Subject: [PATCH] [SW-82717] rom: configure rr in recovery flow
+
+Lbw and hbw ranges are required to be accessible over pcie. But by
+default, HW blocks all ranges for read/write accesses over pcie.
+Hence the selective ranges in config space are opened for lbw.
+
+SRAM in opened in HBW in order to load fit image received over pcie.
+
+Change-Id: Idfd52a9ccad69d2765241ccd80f5216926dbd1d6
+---
+
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index 42aedf4..2462387 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -40,11 +40,43 @@
+ 	uint32_t data_max_hi;
+ };
+ 
++/*
++ * There are 18(0..17 rr idx) RRs for LBW.
++ *
++ * 1) 14(0..13 rr idx) Regions with 4KB granularity
++ *
++ * 2) 4(14..17 rr idx) Regions with full address range.
++ *
++ * HW uses index 13 to configure the default protection.
++ *
++ * rr idx type : gaudi3_sec_if_lbw_rrs
++ */
++enum gaudi3_sec_if_lbw_rrs {
++	HL_SEC_LBW_RR_SHORT_0 = 0,
++	HL_SEC_LBW_RR_SHORT_1 = 1,
++	HL_SEC_LBW_RR_SHORT_2 = 2,
++	HL_SEC_LBW_RR_SHORT_13 = 13,
++	HL_SEC_LBW_RR_FULL_0 = 14,
++	HL_SEC_LBW_RR_FULL_1 = 15,
++	HL_SEC_LBW_RR_FULL_2 = 16,
++};
++
++/*
++ * There are 8(0..7 rr idx) RRs for HBW with 16KB granularity.
++ * HW uses index 7 to configure the default protection.
++ */
++enum gaudi3_sec_if_hbw_rrs {
++	HL_SEC_HBW_RR_SHORT_0 = 0,
++	HL_SEC_HBW_RR_SHORT_1 = 1,
++	HL_SEC_HBW_RR_SHORT_7 = 7,
++};
++
+ int secureboot_verify_image_v2(const uint8_t *image, uint32_t image_len, uint8_t *key,
+ 				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
+ 				uint8_t sec_ver, uint8_t key_index);
+ 
+ int secureboot_verify_image_hash384(uint8_t *exp_hash, unsigned char *image, uint32_t image_len);
+ int secureboot_verify_key_hash(int key_index, uint8_t *key, uint32_t key_len);
++void security_rr_recovery_config(void);
+ 
+ #endif /* _GAUDI3_DEV_SECURITY_H_ */
+diff --git a/arch/gaudi3/arc/recovery.c b/arch/gaudi3/arc/recovery.c
+index fc68bb6..ad7671c 100644
+--- a/arch/gaudi3/arc/recovery.c
++++ b/arch/gaudi3/arc/recovery.c
+@@ -211,6 +211,8 @@
+ 
+ 	arcboot_rom_init_ts();
+ 
++	security_rr_recovery_config();
++
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
+ 
+diff --git a/arch/gaudi3/arc/security.c b/arch/gaudi3/arc/security.c
+index 60cf666..fa7be13 100644
+--- a/arch/gaudi3/arc/security.c
++++ b/arch/gaudi3/arc/security.c
+@@ -12,6 +12,9 @@
+ #include <string.h>
+ #include <boot_info.h>
+ #include <dev_efuse.h>
++#include <gaudi3_security.h>
++#include <gaudi3/gaudi3.h>
++#include <gaudi3_blocks.h>
+ 
+ #define RR_LBW_PRIV_RANGE_MIN_SHORT_VAL		0x0
+ #define RR_LBW_PRIV_RANGE_MAX_SHORT_VAL		0x1FFFF000
+@@ -527,7 +530,7 @@
+ 				rr_ctx->rr_idx);
+ }
+ 
+-__unused static void security_rr_pcie_lbw_config(struct rom_rr_ctx *rr_ctx)
++static void security_rr_pcie_lbw_config(struct rom_rr_ctx *rr_ctx)
+ {
+ 	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+ 		security_rr_pcie_lbw_config_full(rr_ctx);
+@@ -535,7 +538,7 @@
+ 		security_rr_pcie_lbw_config_short(rr_ctx);
+ }
+ 
+-__unused static void security_rr_pcie_hbw_config(struct rom_rr_ctx *rr_ctx)
++static void security_rr_pcie_hbw_config(struct rom_rr_ctx *rr_ctx)
+ {
+ 	uint32_t rr_dist = security_rr_calc_rr_dist(rr_ctx);
+ 
+@@ -598,7 +601,7 @@
+ 							rr_ctx->rr_idx);
+ }
+ 
+-__unused static void security_rr_jtag_lbw_config(struct rom_rr_ctx *rr_ctx)
++static void security_rr_jtag_lbw_config(struct rom_rr_ctx *rr_ctx)
+ {
+ 	if (rr_ctx->rr_idx > RR_LBW_MAX_SHORT_IDX)
+ 		security_rr_jtag_lbw_config_full(rr_ctx);
+@@ -682,13 +685,13 @@
+ 		security_rr_smi_lbw_config_short(rr_ctx);
+ }
+ 
+-__unused static void security_rr_twi_lbw_config(struct rom_rr_ctx *rr_ctx)
++static void security_rr_twi_lbw_config(struct rom_rr_ctx *rr_ctx)
+ {
+ 	security_rr_i2c_lbw_config(rr_ctx);
+ 	security_rr_smi_lbw_config(rr_ctx);
+ }
+ 
+-__unused static void security_rr_jtag_hbw_config(struct rom_rr_ctx *rr_ctx)
++static void security_rr_jtag_hbw_config(struct rom_rr_ctx *rr_ctx)
+ {
+ 	uint8_t rr_dist = rr_ctx->rr_idx * sizeof(uint32_t);
+ 
+@@ -746,12 +749,147 @@
+ 
+ }
+ 
+-__unused static void security_rr_twi_hbw_config(struct rom_rr_ctx *rr_ctx)
++static void security_rr_twi_hbw_config(struct rom_rr_ctx *rr_ctx)
+ {
+ 	security_rr_i2c_hbw_config(rr_ctx);
+ 	security_rr_smi_hbw_config(rr_ctx);
+ }
+ 
++#define DEBUG_IF_ENABLE_VAL		0
++static void security_rr_config_lbw_if_common(struct rom_rr_ctx *rr_ctx)
++{
++	security_rr_pcie_lbw_config(rr_ctx);
++
++	if ((arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK) == DEBUG_IF_ENABLE_VAL)
++		security_rr_jtag_lbw_config(rr_ctx);
++
++	if ((arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == DEBUG_IF_ENABLE_VAL)
++		security_rr_twi_lbw_config(rr_ctx);
++}
++
++#define RR_DEFAULT_VAL		0
++static void security_rr_recovery_lbw_config(void)
++{
++	/*
++	 * PSOC_UART_0 base to PSOC_GLOBAL_CONF start
++	 * 0x0300007FFC485000 - 0x0300007FFC48B000
++	 */
++	struct rom_rr_ctx rr_ctx = {
++			.rr_idx = HL_SEC_LBW_RR_SHORT_1,
++			.data_min = (uint32_t)mmD0_PSOC_UART_0_BASE,
++			.data_max = (uint32_t)mmD0_PSOC_GLOBAL_CONF_BASE,
++			.en_val = RR_PRIV_RANGE_EN,
++	};
++
++	security_rr_config_lbw_if_common(&rr_ctx);
++
++	/*
++	 * PSOC_BTL base to PSOC Security start
++	 * 0x0300007FFC48C000 - 0x0300007FFC494000
++	 */
++	rr_ctx.rr_idx = HL_SEC_LBW_RR_SHORT_2;
++	rr_ctx.data_min = (uint32_t)mmD0_PSOC_BTL_BASE;
++	rr_ctx.data_max = (uint32_t)mmD0_PSOC_SECURITY_BASE;
++	security_rr_config_lbw_if_common(&rr_ctx);
++
++	/*
++	 * JT_MSTR_IF start to PSOC_GPIO_DATAOUT
++	 * 0x0300007FFC495000 - 0x300007FFC4C0004
++	 */
++	rr_ctx.rr_idx = HL_SEC_LBW_RR_FULL_0;
++	rr_ctx.data_min = (uint32_t)mmD0_JT_MSTR_IF_RR_HBW_BASE;
++	rr_ctx.data_max = HL_CFG_BASE + mmD0_PSOC_GPIO0_DATAOUT;
++	security_rr_config_lbw_if_common(&rr_ctx);
++
++	/*
++	 * PSOC_GPIO_OUTENCLR base to PARC_ARC1_KMD_HW_DIRTY_STATUS
++	 * 0x0300007FFC48C000 - 0x0300007FFC4E3200
++	 */
++	rr_ctx.rr_idx = HL_SEC_LBW_RR_FULL_1;
++	rr_ctx.data_min = HL_CFG_BASE + mmD0_PSOC_GPIO0_OUTENCLR;
++	rr_ctx.data_max = HL_CFG_BASE + mmD0_PARC_ARC1_CFG_KMD_HW_DIRTY_STATUS;
++	security_rr_config_lbw_if_common(&rr_ctx);
++
++	/*
++	 * ARC1_CFG_PF_PQ_PI base to CFG_END
++	 * 0x0300007FFC4E3204 - 0x300007FFFFFF000
++	 */
++	rr_ctx.rr_idx = HL_SEC_LBW_RR_FULL_2;
++	rr_ctx.data_min =  HL_CFG_BASE + mmD0_PARC_ARC1_CFG_PF_PQ_PI;
++	rr_ctx.data_max = RR_LBW_PRIV_RANGE_MAX_SHORT_VAL;
++	security_rr_config_lbw_if_common(&rr_ctx);
++
++	/*
++	 * CFG_SPACE base to PSOC_QSPI
++	 * 0x0300007FE0000000 - 0x0300007FFC484000
++	 */
++	rr_ctx.rr_idx = HL_SEC_LBW_RR_SHORT_0;
++	rr_ctx.data_min = RR_LBW_PRIV_RANGE_MIN_SHORT_VAL;
++	rr_ctx.data_max = (uint32_t)mmD0_PSOC_QSPI_BASE;
++	security_rr_config_lbw_if_common(&rr_ctx);
++
++	/* RR config by HW is neutralized */
++	rr_ctx.rr_idx = HL_SEC_LBW_RR_SHORT_13;
++	rr_ctx.data_min = RR_DEFAULT_VAL;
++	rr_ctx.data_max = RR_DEFAULT_VAL;
++	rr_ctx.en_val = RR_PRIV_RANGE_DIS;
++	security_rr_config_lbw_if_common(&rr_ctx);
++}
++
++static void security_rr_config_hbw_if_common(struct rom_rr_ctx *rr_ctx)
++{
++	security_rr_pcie_hbw_config(rr_ctx);
++
++	if ((arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK) == DEBUG_IF_ENABLE_VAL)
++		security_rr_jtag_hbw_config(rr_ctx);
++
++	if ((arcboot_rom_global.config_fuse &
++		EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == DEBUG_IF_ENABLE_VAL)
++		security_rr_twi_hbw_config(rr_ctx);
++}
++
++#define BITS_PER_DWORD			32
++static void security_rr_recovery_hbw_config(void)
++{
++	/* SRAM_END to HBW_MAX_VAL */
++	struct rom_rr_ctx rr_ctx = {
++		.rr_idx = HL_SEC_HBW_RR_SHORT_1,
++		.data_min = (uint32_t)(SRAM_BASE_ADDR + SRAM_SIZE),
++		.data_min_hi = (uint32_t)((SRAM_BASE_ADDR + SRAM_SIZE) >> BITS_PER_DWORD),
++		.data_max = RR_HBW_PRIV_RANGE_MAX_LO_VAL,
++		.data_max_hi = RR_HBW_PRIV_RANGE_MAX_HI_VAL,
++		.en_val = RR_PRIV_RANGE_EN,
++	};
++
++	security_rr_config_hbw_if_common(&rr_ctx);
++
++	/* HBW_MIN_VAL to SRAM_BEGIN */
++	rr_ctx.rr_idx = HL_SEC_HBW_RR_SHORT_0;
++	rr_ctx.data_min = RR_DEFAULT_VAL;
++	rr_ctx.data_min_hi = RR_DEFAULT_VAL;
++	rr_ctx.data_max = (uint32_t)SRAM_BASE_ADDR;
++	rr_ctx.data_max_hi = (uint32_t)(SRAM_BASE_ADDR >> BITS_PER_DWORD);
++	security_rr_config_hbw_if_common(&rr_ctx);
++
++	/* RR config by HW is neutralized */
++	rr_ctx.rr_idx = HL_SEC_HBW_RR_SHORT_7;
++	rr_ctx.data_min = RR_DEFAULT_VAL;
++	rr_ctx.data_min_hi = RR_DEFAULT_VAL;
++	rr_ctx.data_max = RR_DEFAULT_VAL;
++	rr_ctx.data_max_hi = RR_DEFAULT_VAL;
++	rr_ctx.en_val = RR_PRIV_RANGE_DIS;
++	security_rr_config_hbw_if_common(&rr_ctx);
++}
++
++void security_rr_recovery_config(void)
++{
++	security_rr_recovery_lbw_config();
++	security_rr_recovery_hbw_config();
++}
++
+ void check_and_enable_4b_termination(void) {}
+ void security_debug_if_shared(void) {}
+ void security_pcie_rr_config(__unused uint8_t spi_en) {}

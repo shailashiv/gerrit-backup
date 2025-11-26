@@ -1,0 +1,86 @@
+From 0a8d53462d99f233d5c9821dc62fa9b988fa4676 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Mon, 22 Mar 2021 13:58:22 +0200
+Subject: [PATCH] [SW-0] add provision to set recovery gpio
+
+Automated Recovery process during secure boot
+will involve the CPLD starting the watchdog. Hence
+CPLD has to be notified about the presence of a
+valid firmware, in a two step process.
+1. (ROM): Assert GPIO[index]
+2. (PREBOOT): De-Assert GPIO[index].
+
+This patch implements the first step as needed
+in the boot rom - wherein, as soon as the ROM
+detects that it is not GPIO2 recovery, the GPIO[62]
+is asserted.
+
+Change-Id: If7c837aec4e406290f23f6848f97c04a567a412f
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 1d7b9f8..00ef437 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -447,6 +447,7 @@
+ 	arcboot_rom_init();
+ 	arcboot_rom_fuse();
+ 	arcboot_rom_in_recovery();
++	arcboot_rom_request_cpld_wdog();
+ 	arcboot_rom_bringup_pcie();
+ 	arcboot_rom_bringup_arcboot_ram();
+ 
+diff --git a/common/common.h b/common/common.h
+index c6b403c..aa62007 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -12,5 +12,6 @@
+ uint32_t get_fld_size_shift(void);
+ void update_warm_reset_config(void);
+ void arcboot_rom_handle_tpm(void);
++void arcboot_rom_request_cpld_wdog(void);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/gaudi2_arc_gnu/common.c b/gaudi2_arc_gnu/common.c
+index 8d4339c..d01465b 100644
+--- a/gaudi2_arc_gnu/common.c
++++ b/gaudi2_arc_gnu/common.c
+@@ -466,3 +466,24 @@
+ 	/* dumpsel[1] is SSC EN */
+ 	return !!(dump_sel & DUMP_SEL_SSC_MASK);
+ }
++
++/*
++ * Request CPLD to start the watchdog, by asserting
++ * a GPIO.
++ */
++#define GAUDI2_CPLD_WDOG_GPIO_INDEX	62
++void arcboot_rom_request_cpld_wdog(void)
++{
++	uint32_t index = GAUDI2_CPLD_WDOG_GPIO_INDEX % 16;
++	uint32_t val, mask = BIT(index);
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(mmPSOC_GPIO3_OUTENSET);
++	val = val | mask;
++	regmap_writel(val, mmPSOC_GPIO3_OUTENSET);
++
++	/* gpio is active low */
++	val = regmap_readl(mmPSOC_GPIO3_DATAOUT);
++	val &= ~mask;
++	regmap_writel(val, mmPSOC_GPIO3_DATAOUT);
++}
+diff --git a/greco_arc/common.c b/greco_arc/common.c
+index b6ea28d..aeeed80 100644
+--- a/greco_arc/common.c
++++ b/greco_arc/common.c
+@@ -167,3 +167,8 @@
+ 	return (!!(boot_strap &
+ 			PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK));
+ }
++
++void arcboot_rom_request_cpld_wdog(void)
++{
++	/* Do this after boot rom code, since it is beyond TO */
++}

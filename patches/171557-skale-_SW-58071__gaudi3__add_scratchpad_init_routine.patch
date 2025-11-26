@@ -1,0 +1,89 @@
+From 8e2998f57387d317607ffbf78ac68171600516ef Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 24 Jan 2022 14:39:05 +0200
+Subject: [PATCH] [SW-58071] gaudi3: add scratchpad init routine
+
+This patch adds scratchpad init routine as part of ROM init for
+gaudi3 device. scratchpad initialization will be done in case of cold
+reset only.
+
+Change-Id: I4f65123e2998c368135550bf3d41efc5dacba002
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 342d958..2d3f7cd 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -71,7 +71,7 @@
+ 	regmap_writel(reg, mmCOLD_RST_FLOPS_2);
+ }
+ 
+-void arcboot_rom_init_sp_sram(void)
++static void arcboot_rom_init_sp_sram(void)
+ {
+ 	uint32_t mem_cfg, cpy_sts;
+ 	uint8_t retry = HL_INIT_SP_SRAM_RETRIES;
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 90f31fc..dafe99f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <arcboot.h>
++#include <delay.h>
+ #include <gaudi3_fw_if.h>
+ 
+ void arcboot_rom_clear_sw_status(void)
+@@ -67,6 +68,43 @@
+ 	arcboot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
+ }
+ 
++static void arcboot_rom_init_sp_sram(void)
++{
++	struct gaudi3_cold_rst_data cold_rst_data;
++	uint32_t init_sts;
++	uint8_t retry = HL_INIT_SP_SRAM_RETRIES;
++
++	/* Perform scratchpad init only on cold reset */
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
++	if (cold_rst_data.spsram_init_done)
++		return;
++
++	regmap_writel(D0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_START_M,
++			mmD0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL);
++	while (1) {
++		init_sts = regmap_readl(mmD0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL);
++		if (init_sts & D0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_DONE_M) {
++			cold_rst_data.spsram_init_done = 1;
++			regmap_writel(cold_rst_data.data, mmCOLD_RST_FLOPS_2);
++			break;
++		}
++
++		/*
++		 * Do not wait indefinitely on copy status
++		 * Wait for 1 milliseconds (100 retries with 10 micro-
++		 * seconds sleep), else bailout.
++		 */
++		retry--;
++		if (!retry) {
++			arcboot_rom_status_update(
++					PROGRESS_INIT_SP_SRAM_NOT_COMPLETED);
++			break;
++		}
++
++		udelay(HL_INIT_SP_SRAM_UDELAY);
++	}
++}
++
+ void arcboot_rom_init(void)
+ {
+ 	arcboot_rom_global.die_id = regmap_readl(mmD0_PARC_LOCAL_CFG_DIE_ID);
+@@ -77,4 +115,7 @@
+ 	arcboot_rom_status_update(PROGRESS_INIT);
+ 
+ 	arcboot_rom_read_cold_flops();
++
++	/* TODO: check whether required for die1 */
++	arcboot_rom_init_sp_sram();
+ }

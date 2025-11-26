@@ -1,0 +1,147 @@
+From 7678c930c270ff16379d1495a5ad6adca32ab16c Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 27 Jan 2022 21:31:19 +0200
+Subject: [PATCH] [SW-69188] gaudi3: add efuse init support
+
+This patch adds fuse init routine for gaudi3 with required device
+specific changes.
+
+Change-Id: If6342040d56d2102a8c40199a76c359193bcc3ff
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 2d3f7cd..54b8432 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -207,7 +207,7 @@
+ 	regmap_writel(reg, mmCOLD_RST_FLOPS_2);
+ }
+ 
+-static void arcboot_rom_fuse(void)
++__weak void arcboot_rom_fuse(void)
+ {
+ 	if (fuse_read(EFUSE_SYSCFG_OFFSET,
+ 		      &arcboot_rom_global.config_fuse) == -1)
+diff --git a/arch/gaudi2/arc/dev_efuse.h b/arch/gaudi2/arc/dev_efuse.h
+index 57550a9..898eb8e 100644
+--- a/arch/gaudi2/arc/dev_efuse.h
++++ b/arch/gaudi2/arc/dev_efuse.h
+@@ -29,3 +29,6 @@
+  * can be 0 (with no enabling of the Signature of Validation also.
+  */
+ #define EFUSE_SYSCFG_DEFAULT				0
++
++#define EFUSE_READ_RANGE_ALL				0x3F80
++#define FUSE_WORDS_PER_BANK				64
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c540467..7ce19ad 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -7,6 +7,7 @@
+ #include <arcboot.h>
+ #include <delay.h>
+ #include <gaudi3_fw_if.h>
++#include <efuse.h>
+ #include <dev_spi_flash.h>
+ 
+ void arcboot_rom_clear_sw_status(void)
+@@ -22,6 +23,16 @@
+ 	regmap_writel(0, mmD0_PSOC_SECURITY_SW_STATUS_5);
+ 	regmap_writel(0, mmD0_PSOC_SECURITY_SW_STATUS_6);
+ 	regmap_writel(0, mmD0_PSOC_SECURITY_SW_STATUS_7);
++}
++
++static void arcboot_rom_set_efuse_read(void)
++{
++	struct gaudi3_cold_rst_data cold_rst_data;
++
++	/* efuse init successful, set cold flops */
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
++	cold_rst_data.efuse_read_flag = 1;
++	regmap_writel(cold_rst_data.data, mmCOLD_RST_FLOPS_2);
+ }
+ 
+ void update_warm_reset_config(void) {}
+@@ -122,3 +133,16 @@
+ 
+ 	spi_flash_init();
+ }
++
++void arcboot_rom_fuse(void)
++{
++	uint32_t val;
++
++	if (fuse_init() == 0)
++		arcboot_rom_set_efuse_read();
++
++	if (fuse_read(EFUSE_SYSCFG_OFFSET, &val) != 0)
++		val = EFUSE_SYSCFG_DEFAULT;
++
++	arcboot_rom_global.config_fuse = val;
++}
+diff --git a/arch/gaudi3/arc/dev_efuse.h b/arch/gaudi3/arc/dev_efuse.h
+index 4c862c8..70bdf04 100644
+--- a/arch/gaudi3/arc/dev_efuse.h
++++ b/arch/gaudi3/arc/dev_efuse.h
+@@ -35,4 +35,7 @@
+  */
+ #define EFUSE_SYSCFG_DEFAULT				0
+ 
++#define EFUSE_READ_RANGE_ALL				0xFF00
++#define FUSE_WORDS_PER_BANK				128
++
+ #endif /* _GAUDI3_DEV_EFUSE_H_ */
+diff --git a/arch/greco/arc_elf32/dev_efuse.h b/arch/greco/arc_elf32/dev_efuse.h
+index 11a630a..bc08814 100644
+--- a/arch/greco/arc_elf32/dev_efuse.h
++++ b/arch/greco/arc_elf32/dev_efuse.h
+@@ -22,3 +22,6 @@
+ 				 EFUSE_SYSCFG_KEY_LOCATION_SPI | \
+ 				 EFUSE_SYSCFG_REVOKATION_LOCATION_SPI | \
+ 				 EFUSE_SYSCFG_ENABLE_4B_TERMINATION)
++
++#define EFUSE_READ_RANGE_ALL				0x3F80
++#define FUSE_WORDS_PER_BANK				64
+diff --git a/common/efuse.c b/common/efuse.c
+index e2aa755..3053dac 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -9,13 +9,13 @@
+ #include "arcboot.h"
+ #include "delay.h"
+ #include "efuse.h"
++#include "dev_efuse.h"
+ #include "security.h"
+ 
+ 
+ #define FUSE_TIMEOUT_US		100000
+ #define FUSE_DELAY_US		20
+ #define FUSE_RETRIES		(FUSE_TIMEOUT_US / FUSE_DELAY_US)
+-#define FUSE_WORDS_PER_BANK	64
+ 
+ /*
+  * fuse box is devided into half for redundancy
+@@ -57,9 +57,8 @@
+ {
+ 	int offset;
+ 
+-	if (word > 64) {
++	if (word > FUSE_WORDS_PER_BANK)
+ 		return -1;
+-	}
+ 
+ 	if (arcboot_rom_global.efuse_read == 0)
+ 		return -1;
+diff --git a/common/efuse.h b/common/efuse.h
+index e3f6aea..abd3827 100644
+--- a/common/efuse.h
++++ b/common/efuse.h
+@@ -14,8 +14,6 @@
+ #define EFUSE_READ_DONE				0x2
+ #define EFUSE_NOT_READ				0x1
+ 
+-#define EFUSE_READ_RANGE_ALL			0x3F80
+-
+ #define EFUSE_SYSCFG_OFFSET			0x3A
+ #define EFUSE_SECURITY_FW_VERSION_OFFSET	0x3B
+ 

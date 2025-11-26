@@ -1,0 +1,116 @@
+From c71cf49d082eacc1aebe4204479468489bd96e25 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Tue, 20 Aug 2024 09:57:36 +0300
+Subject: [PATCH] [FSW-7256] fs1: define rr config context
+
+This patch defines context of range register
+configuration, such as min, max address, rr
+index and read/write for required access zones.
+
+Change-Id: I701436ca786fd91f2f4364cd16c7219f46096b74
+---
+
+diff --git a/arch/fs1/arc/dev_security.c b/arch/fs1/arc/dev_security.c
+index 0df1a37..5af50b2 100644
+--- a/arch/fs1/arc/dev_security.c
++++ b/arch/fs1/arc/dev_security.c
+@@ -15,6 +15,7 @@
+ #include <security.h>
+ #include <boot_desc.h>
+ #include <psoc_security_masks.h>
++#include <psoc_pad_conf_regs.h>
+ 
+ /*
+  * This key hash is calculated on the Public Key Properties -
+@@ -84,6 +85,35 @@
+ 	},
+ };
+ 
++struct security_rr_ctx lbw_rr_ctx[SEC_ACCESS_CTRL_MAX] = {
++	/* controller enabled(ce) recovery */
++	[SEC_ACCESS_CTRL_QSPI] = {
++		.rr_idx = LBW_RR_IDX_0,
++		.acc_type = SEC_ACCESS_RD_WR,
++		.data_min = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_QSPI_MIN),
++		.data_max = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_QSPI_MAX),
++	},
++	[SEC_ACCESS_CTRL_PAD_SEL] = {
++		.rr_idx = LBW_RR_IDX_1,
++		.acc_type = SEC_ACCESS_RD_WR,
++		.data_min = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_PAD_SEL_MIN),
++		.data_max = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_PAD_SEL_MAX),
++	},
++	[SEC_ACCESS_CTRL_PSOC_SEC] = {
++		.rr_idx = LBW_RR_IDX_2,
++		.acc_type = SEC_ACCESS_WR_ONLY,
++		.data_min = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_SECURITY_MIN),
++		.data_max = CONV_ARC_REG_TO_CFG_MEM(BOOT_ROM_REC_RR_PSOC_SECURITY_MAX),
++	},
++	/* Direct memory mapped(mm) recovery */
++	[SEC_ACCESS_CTRL_GEN_MEM] = {
++		.rr_idx = LBW_RR_IDX_3,
++		.acc_type = SEC_ACCESS_WR_ONLY,
++		.data_min = CONV_ARC_REG_TO_GEN_MEM(BOOT_ROM_REC_RR_GEN_MEM_MIN),
++		.data_max = CONV_ARC_REG_TO_GEN_MEM(BOOT_ROM_REC_RR_GEN_MEM_MAX),
++	},
++};
++
+ void security_load_revoke_bits(void)
+ {
+ 	uint32_t key_revoke = boot_rom_global.config_fuse & EFUSE_SYSCFG_KEY_REVOCATION_BITS;
+diff --git a/arch/fs1/arc/dev_security.h b/arch/fs1/arc/dev_security.h
+index d52b5b9..c83fa74 100644
+--- a/arch/fs1/arc/dev_security.h
++++ b/arch/fs1/arc/dev_security.h
+@@ -31,6 +31,27 @@
+     CRC_FAIL,
+ };
+ 
++/* RECOVERY QSPI */
++#define BOOT_ROM_REC_RR_QSPI_MIN		(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_QSPI_BASE)
++#define BOOT_ROM_REC_RR_QSPI_MAX		(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_QSPI_BASE) + \
++							(IO_0_CFG_HALF_0_PSOC_PSOC_CFG_QSPI_SECTION - 1)
++
++/* RECOVERY PAD_SEL */
++#define BOOT_ROM_REC_RR_PSOC_PAD_SEL_MIN	(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE) + \
++							(mmPSOC_PAD_CONF_PAD_SEL_8)
++#define BOOT_ROM_REC_RR_PSOC_PAD_SEL_MAX	(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE) + \
++							(mmPSOC_PAD_CONF_PAD_SEL_9 - 1)
++
++/* RECOVERY PSOC SECURITY */
++#define BOOT_ROM_REC_RR_PSOC_SECURITY_MIN	(mmIO_0_CFG_HALF_0_PSOC_BOOT_SECURITY_BASE) + \
++							(mmPSOC_SECURITY_FW_RST)
++#define BOOT_ROM_REC_RR_PSOC_SECURITY_MAX	(mmIO_0_CFG_HALF_0_PSOC_BOOT_SECURITY_BASE) + \
++							(mmPSOC_SECURITY_MIN_FW_VERSION - 1)
++
++/* RECOVERY GEN_MEM */
++#define BOOT_ROM_REC_RR_GEN_MEM_MIN		(HL_FLASH_BASE)
++#define BOOT_ROM_REC_RR_GEN_MEM_MAX		(HL_FLASH_BASE) + (HL_FLASH_SIZE - 1)
++
+ /* Various blocks to be configured during boot rom in recovery */
+ enum security_access_ctrl_zones {
+ 	SEC_ACCESS_CTRL_QSPI,
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index 15195c2..570c622 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -94,6 +94,8 @@
+ #define PCIE_FWSRAM_OFFSET		0x0380000
+ #define PCIE_FWSRAM_SIZE		SZ_64K
+ 
++#define GEN_MEM_FULL_BASE		0x300007f00000000ull
++#define CFG_MEM_FULL_BASE		0x300007ff0000000ull
+ #define FULL_ADDR_MSB			0x300007F
+ #define FW_MEM_BASE_FULL		0x300007FF8800000ull
+ #define SCRATCHPAD_SRAM_BASE		(HL_FW_MEM_BASE + SCRATCHPAD_SRAM_OFFSET)
+@@ -113,6 +115,10 @@
+ 
+ #define CONV_64B_TO_ARC_FW_MEM(addr)	((addr & 0x3FFFFF) + HL_FW_MEM_BASE)
+ 
++/* This 2 macro's to convert ARC based 32B address to LBW MEM map address of 32B */
++#define CONV_ARC_REG_TO_GEN_MEM(addr)	(((addr) & 0xFFFFFFF) + ((GEN_MEM_FULL_BASE) & 0xFFFFFFFF))
++#define CONV_ARC_REG_TO_CFG_MEM(addr)	(((addr) & 0xFFFFFFF) + ((CFG_MEM_FULL_BASE) & 0xFFFFFFFF))
++
+ #define SPI_MANIFEST_IMG_0_FLASH_OFFSET		(0x0)
+ /* manifest 0 boot pointers are DMA trans to MNG ARC ICCM at offset 0 */
+ #define SPI_MANIFEST_IMG_0_ICCM_OFFSET		(0)

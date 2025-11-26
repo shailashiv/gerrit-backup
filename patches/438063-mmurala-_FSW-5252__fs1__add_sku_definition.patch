@@ -1,0 +1,126 @@
+From 68cc5df60ec4ca0ed781eb2b573b871790fd7483 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Sun, 28 Jul 2024 12:59:41 +0300
+Subject: [PATCH] [FSW-5252] fs1: add sku definition
+
+with this patch, reading sku information from
+sys cfg and storing it in persistent sku data
+field to use across bootrom. sku check is added
+in recovery flow to stop slave notification and
+d2d link init when single die sku.
+
+Change-Id: Id71463fff837e0a2c787e740c7d326f47ad48af4
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 015bd5f..7eca8d5 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -51,6 +51,21 @@
+ 	return FS1_INVALID_DIE_TYPE;
+ }
+ 
++void boot_rom_init_sku(void)
++{
++	boot_rom_global.sku = (boot_rom_global.config_fuse & EFUSE_SYSCFG_SKU)
++		>> EFUSE_SYSCFG_SKU_SHIFT;
++
++	if (boot_rom_global.sku >= FS1_INVALID_SKU) {
++		boot_rom_global.sku = FS1_FULL_PACKAGE;
++	}
++}
++
++bool boot_rom_in_multi_die_mode(void)
++{
++	return (boot_rom_global.sku != FS1_IO_DIE_SA);
++}
++
+ bool boot_rom_in_master_die()
+ {
+ 	return (boot_rom_global.die_type == FS1_IO_DIE_MASTER);
+@@ -78,6 +93,7 @@
+ 	/* rom_persistent_section default values */
+ 	boot_rom_global.die_id = FS1_INVALID_DIE_ID;
+ 	boot_rom_global.die_type = FS1_INVALID_DIE_TYPE;
++	boot_rom_global.sku = FS1_INVALID_SKU;
+ }
+ 
+ #define HL_ARC1_DCCM_PERSIST_SECTION_SIZE		(3 * 1024) /* 3KB */
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index 67f35cd..f3fadf9 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -78,6 +78,9 @@
+ 	uint64_t start;
+ 	uint32_t val;
+ 
++	if (boot_rom_global.sku == FS1_IO_DIE_SA)
++		return;
++
+ 	if (boot_rom_global.config2_fuse & EFUSE_SYSCFG2_D2D_DISABLE)
+ 		return; /* skip d2d init */
+ 
+diff --git a/common/common.c b/common/common.c
+index dc7cf88..a44fdd5 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -89,9 +89,10 @@
+ 
+ 	boot_rom_eom_overrides();
+ 
+-	/* TODO: FS1 SKU decession pending */
+-
+ 	/* TODO: Enable FAKE FUSE & RMA support */
++
++	boot_rom_init_sku();
++
+ 	return;
+ 
+ efuse_fail_halt:
+diff --git a/common/common.h b/common/common.h
+index 707e309..18d62a0 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -32,5 +32,7 @@
+ bool boot_rom_get_hash_for_tpm_pcr(uint8_t tpm_pcr_index, uint8_t *hash);
+ enum boot_rom_progress boot_rom_get_tpm_extend_fail_prog_bit(uint8_t tpm_pcr_index);
+ enum boot_rom_tpm_spi_freq_config boot_rom_get_tpm_spi_freq_config(void);
++void boot_rom_init_sku(void);
++bool boot_rom_in_multi_die_mode(void);
+ 
+ #endif /* _COMMON_H_ */
+diff --git a/common/recovery.c b/common/recovery.c
+index a2ff1c4..f7e23f4 100644
+--- a/common/recovery.c
++++ b/common/recovery.c
+@@ -11,6 +11,7 @@
+ #include <global_conf_masks.h>
+ #include <global_conf_regs.h>
+ #include <pcie.h>
++#include <common.h>
+ 
+ static void execute_rom_recovery(void)
+ {
+@@ -32,8 +33,8 @@
+ 
+ 	boot_rom_set_recovery_status();
+ 
+-	/* TODO: Add SKU check here, once SKU config finalized */
+-	boot_rom_notify_slave();
++	if (boot_rom_in_multi_die_mode())
++		boot_rom_notify_slave();
+ 
+ 	execute_rom_recovery();
+ }
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index 5852dec..b2f48a3 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -82,6 +82,7 @@
+ 	uint8_t curr_img;
+ 	uint8_t die_id;
+ 	uint8_t die_type;
++	uint8_t sku;
+ 	uint64_t ppboot_start_addr;
+ 	bool fake_fuse_en;
+ 	uint32_t fake_fuse_spi_offset;

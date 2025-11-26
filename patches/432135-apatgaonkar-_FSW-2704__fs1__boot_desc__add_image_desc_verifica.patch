@@ -1,0 +1,138 @@
+From 567216f24606dc59de81d393d2b1d107504244d1 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 04 Jul 2024 16:10:54 +0300
+Subject: [PATCH] [FSW-2704] fs1: boot_desc: add image desc verification
+
+This patch adds image descriptor address range verification
+function. This can be used to verify all addresses like
+loadaddr, dma addr, start addr and offset verification.
+
+Change-Id: I5a430c4db8dbc7e03d7b4054db05ed9974730f5f
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index c63c04e..5e46dc2 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -309,3 +309,36 @@
+ 	return true;
+ }
+ 
++/* This function is only applicable for io die master */
++bool boot_rom_is_valid_address_range(uint64_t addr, int len)
++{
++	if (addr >= (uint64_t)SCRATCHPAD_SRAM_BASE &&
++	    addr + len <= (uint64_t)(SCRATCHPAD_SRAM_BASE + SCRATCHPAD_SRAM_SIZE))
++		return true;
++
++	if (addr >= SCRATCHPAD_SRAM_BASE_FULL &&
++	    addr + len <= SCRATCHPAD_SRAM_BASE_FULL + SCRATCHPAD_SRAM_SIZE)
++		return true;
++
++	if (addr >= RST_ARC_ICCM_FULL_BASE &&
++	    addr + len <= RST_ARC_ICCM_FULL_BASE + RST_ARC_MEM_SIZE)
++		return true;
++
++	if (addr >= MNG_ARC_ICCM_FULL_BASE &&
++	    addr + len <= MNG_ARC_ICCM_FULL_BASE + MNG_ARC_MEM_SIZE)
++		return true;
++
++	if (addr >= PID_ARC_ICCM_FULL_BASE &&
++	    addr + len <= PID_ARC_ICCM_FULL_BASE + PID_ARC_MEM_SIZE)
++		return true;
++
++	if (addr >= (uint64_t)(HL_FW_MEM_BASE + PSOC_FWSRAM_OFFSET) &&
++	    addr + len <= (uint64_t)(HL_FW_MEM_BASE + PSOC_FWSRAM_OFFSET + PSOC_FWSRAM_SIZE))
++		return true;
++
++	if (addr >= PSOC_FW_SRAM_FULL_BASE &&
++	    addr + len <= PSOC_FW_SRAM_FULL_BASE + PSOC_FWSRAM_SIZE)
++		return true;
++
++	return false;
++}
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 1762eaf..b992365 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -15,6 +15,7 @@
+ #include <spi_flash.h>
+ #include <dev_spi_flash.h>
+ #include <dma.h>
++#include <common.h>
+ 
+ static struct hl_fw_manifest_ctx *p_manifest_ctx;
+ static struct hl_fw_boot_ptrs *p_boot_ptr;
+@@ -254,3 +255,37 @@
+ 
+ 	return p_manifest_ctx->boot_desc_flag;
+ }
++
++static bool boot_rom_is_valid_start_addr(struct boot_desc *desc)
++{
++	if ((desc->start_addr >= desc->loadaddr) &&
++	   (desc->start_addr < desc->loadaddr + desc->img_size))
++		return true;
++
++	return false;
++}
++
++#define PPBOOT_MAX_IMAGE_SIZE	(2 * MAX_DMA_SIZE_NO_CRC)
++uint32_t boot_rom_verify_img_desc_address_range(struct boot_desc *desc,
++						enum boot_rom_progress img_sts_base,
++						enum hl_fw_img_type img)
++{
++	if (!boot_rom_is_valid_address_range(desc->loadaddr, desc->img_size)) {
++		boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_LOADADDR_INVALID);
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	/* TODO: Veirfy DMA destination address */
++
++	if (!boot_rom_is_valid_start_addr(desc)) {
++		boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_STARTADDR_INVALID);
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	if ((img == HL_FW_IMG_PPBOOT) && (desc->img_size > PPBOOT_MAX_IMAGE_SIZE)) {
++		boot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_TOO_BIG);
++		return BOOT_ROM_BRINGUP_ERROR;
++	}
++
++	return BOOT_ROM_SUCCESS;
++}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 7022a9d..5ad2c69 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -6,6 +6,8 @@
+ #ifndef _BOOT_DESC_H_
+ #define _BOOT_DESC_H_
+ 
++#include <progress_bits.h>
++
+ #define HL_IMG_PTRS_MAX_SIZE		0x10000 /* 64KB */
+ 
+ #define DESC_MAGIC_MASK		0xFFFFFF00
+@@ -31,6 +33,9 @@
+ uint32_t boot_desc_get_img_desc(enum hl_fw_manifest_type manifest_type, int boot_desc_type,
+ 				struct boot_desc *desc);
+ bool boot_rom_boot_desc_init_done(enum hl_fw_manifest_type manifest_type);
++uint32_t boot_rom_verify_img_desc_address_range(struct boot_desc *desc,
++						enum boot_rom_progress img_sts_base,
++						enum hl_fw_img_type img);
+ 
+ #endif /* _BOOT_DESC_H_ */
+ 
+diff --git a/common/common.h b/common/common.h
+index bc18e6b..71173a2 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -17,6 +17,7 @@
+ void boot_rom_halt(void);
+ enum boot_rom_status boot_rom_read_config_fuse(void);
+ void boot_rom_set_efuse_read(void);
++bool boot_rom_is_valid_address_range(uint64_t addr, int len);
+ void boot_rom_set_tpm_extend_done(void);
+ enum boot_rom_tpm_exec_stage boot_rom_get_tpm_exec_stage(void);
+ uint8_t boot_rom_get_tpm_next_pcr_index(void);

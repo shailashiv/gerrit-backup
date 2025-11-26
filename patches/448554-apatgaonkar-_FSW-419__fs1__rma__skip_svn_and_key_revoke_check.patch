@@ -1,0 +1,119 @@
+From a53694a79c8c49844e80de302ebb0f6bacb13900 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 11 Sep 2024 09:17:57 +0300
+Subject: [PATCH] [FSW-419] fs1: rma: skip svn and key revoke check
+
+For rma enabled card, bootrom will check if rma_manifest
+bit is set in manifest header. If both conditions are true
+then svn and key revoke check are skipped for secure boot.
+
+Change-Id: If0c79fad3f7f8cd0e9bccf3538642a2657968358
+---
+
+diff --git a/common/common.c b/common/common.c
+index b232389..fe34d97 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -161,7 +161,7 @@
+ 	ret = secure_boot_verify_image_signature((uint8_t *)boot_ptr_addr, img_plus_key_len,
+ 			(uint8_t *)(boot_ptr_addr + img_plus_key_len - boot_ptr->pub_key_sz),
+ 			boot_ptr->pub_key_sz, (uint8_t *)(boot_ptr_addr + img_plus_key_len), boot_ptr->sig_sz,
+-			boot_ptr->sec_ver, boot_ptr->key_idx);
++			boot_ptr->sec_ver, boot_ptr->key_idx, boot_ptr->rma_manifest);
+ 
+ 	if (ret == SECUREBOOT_VERIFY_SUCCESS) {
+ 		boot_rom_status_update_bringup(boot_desc_verif_base, PROGRESS_VERIFY_SUCCESS);
+diff --git a/common/secure_boot.c b/common/secure_boot.c
+index a152a48..395d797 100644
+--- a/common/secure_boot.c
++++ b/common/secure_boot.c
+@@ -37,7 +37,7 @@
+ 
+ int secure_boot_verify_image_signature(const uint8_t *image, uint32_t image_len, uint8_t *key,
+ 				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
+-				uint8_t sec_ver, uint8_t key_index)
++				uint8_t sec_ver, uint8_t key_index, uint8_t rma_manifest)
+ {
+ 	int ret;
+ 
+@@ -47,11 +47,11 @@
+ 	if ((key_len > TOTAL_PUB_KEY_PROPS_SZ) || (sig_len > SIG_SIZE))
+ 		return SECUREBOOT_VERIFY_FAILED;
+ 
+-	if (security_check_valid_fw_version(sec_ver) != SECURITY_FW_VERSION_SECURE) {
++	if (security_check_valid_fw_version(sec_ver, rma_manifest) != SECURITY_FW_VERSION_SECURE) {
+ 		return SECUREBOOT_VERIFY_VER_FAILED;
+ 	}
+ 
+-	ret = security_check_key_revoke_status(key_index);
++	ret = security_check_key_revoke_status(key_index, rma_manifest);
+ 	if (ret != 1)
+ 		return SECUREBOOT_VERIFY_KEY_REVOKED;
+ 
+diff --git a/common/secure_boot.h b/common/secure_boot.h
+index 479f201..b336706 100644
+--- a/common/secure_boot.h
++++ b/common/secure_boot.h
+@@ -15,6 +15,6 @@
+ int secure_boot_verify_image_hash384(uint8_t *exp_hash, unsigned char *img, uint32_t img_len);
+ int secure_boot_verify_image_signature(const uint8_t *image, uint32_t image_len, uint8_t *key,
+ 				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
+-				uint8_t sec_ver, uint8_t key_index);
++				uint8_t sec_ver, uint8_t key_index, uint8_t rma_manifest);
+ 
+ #endif /* _SECURE_BOOT_H_ */
+diff --git a/common/security.c b/common/security.c
+index 04d6d80..ebab361 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -10,17 +10,19 @@
+ #include <string.h>
+ #include <security.h>
+ 
+-int security_check_valid_fw_version(uint32_t fw_version)
++int security_check_valid_fw_version(uint32_t fw_version, uint8_t rma_manifest)
+ {
+-	if ((fw_version < boot_rom_global.sec_data.sec_ver) ||
+-		(fw_version > SECURITY_MAX_FW_SEC_VERSION)) {
+-		return SECURITY_FW_VERSION_NOT_SECURE;
++	if (!(!!boot_rom_global.sec_data.rma_enabled && !!rma_manifest)) {
++		if ((fw_version < boot_rom_global.sec_data.sec_ver) ||
++			(fw_version > SECURITY_MAX_FW_SEC_VERSION)) {
++			return SECURITY_FW_VERSION_NOT_SECURE;
++		}
+ 	}
+ 
+ 	return SECURITY_FW_VERSION_SECURE;
+ }
+ 
+-int security_check_key_revoke_status(uint32_t key_index)
++int security_check_key_revoke_status(uint32_t key_index, uint8_t rma_manifest)
+ {
+ 	uint8_t key_revoke;
+ 
+@@ -30,7 +32,9 @@
+ 	key_revoke = boot_rom_global.sec_data.key_revoke;
+ 
+ 	/* if the key is not revoked, return 1 */
+-	if ((key_revoke & (1 << key_index)) == 0)
++	if (((key_revoke & (1 << key_index)) == 0) ||
++		(!!boot_rom_global.sec_data.rma_enabled &&
++		!!rma_manifest))
+ 		return 1;
+ 
+ 	/* no valid key found */
+diff --git a/common/security.h b/common/security.h
+index 1d03c35..e0213a0 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -11,8 +11,8 @@
+ #define SECURITY_MAX_FW_SEC_VERSION		128
+ 
+ void boot_rom_security_init(void);
+-int security_check_key_revoke_status(uint32_t key_index);
++int security_check_key_revoke_status(uint32_t key_index, uint8_t rma_manifest);
+ int security_rom_get_key_hash_by_idx(uint32_t *hash, uint8_t key_index);
+-int security_check_valid_fw_version(uint32_t fw_version);
++int security_check_valid_fw_version(uint32_t fw_version, uint8_t rma_manifest);
+ 
+ #endif /* _SECURITY_H_ */

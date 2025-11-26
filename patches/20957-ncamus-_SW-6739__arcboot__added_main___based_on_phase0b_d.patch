@@ -1,0 +1,159 @@
+From 7561af147f8c41f0f47b9c95002aa8554592497b Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sun, 10 Nov 2019 09:31:19 +0200
+Subject: [PATCH] [SW-6739] arcboot: added main() based on phase0b demo
+
+This is the basic functionality we should grow from
+
+There are 2 binaries one to be on ROM and another on ICCM
+
+Change-Id: I8effbcbb465ed702bb2a698750d76395f8bc072f
+---
+
+diff --git a/Makefile b/Makefile
+index 1181082..fad35bf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,11 +1,37 @@
+ CC = $(CROSS_COMPILE)gcc
+ AR = $(CROSS_COMPILE)ar
+ RANLIB = $(CROSS_COMPILE)ranlib
++ifneq ($(CROSS_COMPILE),)
++	LTO_PLUGIN := $(shell find $(abspath ../../) -name liblto_plugin.so)
++	RANLIB += --plugin=$(LTO_PLUGIN)
++endif
+ export CC AR RANLIB
++OBJCOPY = $(CROSS_COMPILE)objcopy
++
++LIBDIR = sdk/lib
++CFLAGS = -DSB_RSA_STD -DSB_FAST_MODE -DELP_SOURCE -Wall -W -O3
++CFLAGS += -Isdk/src
++CFLAGS += -Isdk/src/include
++CFLAGS += -Isdk/elpsoft/src/headers
++CFLAGS += -Isdk/elpsoft/src/math
++#LDFLAGS = -flto
++LDFLAGS += -L $(LIBDIR) -lsb -lellipsys
++LDFLAGS += -Wl,--defsym=lf2flt=0x124
+ 
+ .PHONY: all libsb libellipsys sbtool
+-all: libsb libellipsys
++all: arcboot.bin arcboot_rom.bin
+ 	@touch arcboot.bin
+ 
+ libsb libellipsys sbtool:
+-	@$(MAKE) -C sdk $@
+\ No newline at end of file
++	@$(MAKE) -C sdk $@
++
++%.bin: %
++	@$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
++
++arcboot: arcboot.o libsb libellipsys
++	@$(CC) $< $(LDFLAGS) -o $@
++arcboot_rom: arcboot_rom.o libsb libellipsys
++	@$(CC) $< $(LDFLAGS) -o $@
++
++%.o: %.c
++	@$(CC) $(CFLAGS) -c $< -o $@
+diff --git a/arcboot.c b/arcboot.c
+new file mode 100644
+index 0000000..896dcf9
+--- /dev/null
++++ b/arcboot.c
+@@ -0,0 +1,45 @@
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++#include <stdio.h>
++#include "sb.h"
++
++unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
++uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
++unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
++uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
++unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
++uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
++
++int main(void)
++{
++	int st, err;
++	unsigned char block_buf[512];
++
++	XSTACK_INIT();
++
++	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
++	 * of the data blob (test_phase0b_data) */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
++			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
++
++	printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
++	if (err || !st) {
++		return -1;
++	}
++	return 0;
++}
+diff --git a/arcboot_rom.c b/arcboot_rom.c
+new file mode 100644
+index 0000000..896dcf9
+--- /dev/null
++++ b/arcboot_rom.c
+@@ -0,0 +1,45 @@
++/*
++ * arcboot - Signature Verification
++ *
++ * A simple application which call phase0b to validate the signature
++ * of a blob of data.
++ *
++ * Both the protected data and the signature of the protected data can be
++ * changed, but the public key should be locked into the device.
++ *
++ * test_phase0b_data     - blob of protected data
++ * test_phase0b_data_len - size of the blob
++ * test_phase0b_sig      - signature of the blob
++ * test_phase0b_sig_len  - signature size
++ * test_public_key       - public key
++ * test_public_key_len   - public key size
++ */
++
++#include <stdio.h>
++#include "sb.h"
++
++unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
++uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
++unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
++uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
++unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
++uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
++
++int main(void)
++{
++	int st, err;
++	unsigned char block_buf[512];
++
++	XSTACK_INIT();
++
++	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
++	 * of the data blob (test_phase0b_data) */
++	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
++			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
++
++	printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
++	if (err || !st) {
++		return -1;
++	}
++	return 0;
++}

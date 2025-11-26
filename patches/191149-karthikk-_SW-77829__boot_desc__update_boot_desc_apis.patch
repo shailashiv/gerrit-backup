@@ -1,0 +1,131 @@
+From 04e5e68b631cf08ca9a2939f5b914403c0e64c1f Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 21 Mar 2022 08:55:02 +0200
+Subject: [PATCH] [SW-77829] boot_desc: update boot desc apis
+
+As we skip the re-processing of the boot descriptors based
+on validation pass flag, the source of data should be a
+source that would retain its value over reset cycles (except
+cold reset).
+
+Hence all the pointer accesses are replaced with data from
+boot info which is stored in sp sram.
+
+We now get the desc size and count from boot info, rather
+than usage of pointers.
+
+Return value checks have also been added for boot info api calls.
+
+Change-Id: I85e4e8930285b0cce91db9fb82f9f7f37565a49d
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 885c3ba..93c752f 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -31,12 +31,14 @@
+ 		.img_ptr_spi_offset = HL_EROM_IMG_PTRS_BASE,
+ 		.max_imgs = HL_FW_MAX_EROM_BOOT_PTRS,
+ 		.start_addr = 0,
++		.desc_info = {0},
+ 	},
+ 	.boot_ptr_ctx[HL_FW_BOOT_PTR_SPI] = {
+ 		.boot_desc_flag = 0,
+ 		.img_ptr_spi_offset = HL_SPI_IMG_PTRS_BASE,
+ 		.max_imgs = HL_FW_IMG_SPI_MAX_BOOT_PTRS,
+ 		.start_addr = 0,
++		.desc_info = {0},
+ 	},
+ };
+ 
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 8bfdc0b..3b6a4e9 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -28,7 +28,6 @@
+ static struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx;
+ static struct hl_fw_boot_ptrs *p_boot_ptr = (struct hl_fw_boot_ptrs *)(HL_BOOT_PTR_DEST_ARC);
+ static struct hl_fw_img_desc *p_img_desc;
+-struct hl_fw_desc_info desc_info;
+ 
+ static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+ {
+@@ -105,6 +104,9 @@
+ 	if (p_boot_ptr->magic.val != HL_FW_BOOT_MAGIC)
+ 		return 0;
+ 
++	p_img_ptr_ctx->desc_info.desc_size = p_boot_ptr->img_desc_sz;
++	p_img_ptr_ctx->desc_info.count = p_boot_ptr->count;
++
+ 	p_offset = (uint32_t *)(boot_ptr_start_addr + p_boot_ptr->offset2array);
+ 
+ 	/* Validate all descriptors */
+@@ -123,16 +125,25 @@
+ skip_boot_desc_process:
+ 	if (img == HL_FW_BOOT_PTR_SPI) {
+ 		if (!arcboot_rom_global.validation_pass) {
+-			desc_info.count = p_boot_ptr->count;
+-			desc_info.desc_size = p_boot_ptr->img_desc_sz;
+-			boot_info_set(HL_BOOT_INFO_IMG_DESC_INFO, &desc_info, sizeof(desc_info));
+-			boot_info_set(HL_BOOT_INFO_IMG_DESC_DATA, (uint8_t *)(boot_ptr_start_addr + p_offset[0]),
+-					p_boot_ptr->img_desc_sz * p_boot_ptr->count);
++			if (boot_info_set(HL_BOOT_INFO_IMG_DESC_INFO, &p_img_ptr_ctx->desc_info,
++			   sizeof(struct hl_fw_desc_info)))
++				return 0;
++
++			if (boot_info_set(HL_BOOT_INFO_IMG_DESC_DATA,
++			   (uint8_t *)(boot_ptr_start_addr + p_offset[0]),
++			   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count))
++				return 0;
++
+ 			boot_info_finalize();
+ 		}
+-		boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA,
+-				(uint8_t *)(boot_ptr_start_addr + BOOT_INFO_IMG_DESC_GET_OFFSET),
+-				p_boot_ptr->img_desc_sz * p_boot_ptr->count, &copy_sz);
++		if (boot_info_get(HL_BOOT_INFO_IMG_DESC_INFO, &p_img_ptr_ctx->desc_info,
++		   sizeof(struct hl_fw_desc_info), &copy_sz))
++			return 0;
++
++		if (boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA,
++		   (uint8_t *)(boot_ptr_start_addr + BOOT_INFO_IMG_DESC_GET_OFFSET),
++		   p_img_ptr_ctx->desc_info.desc_size * p_img_ptr_ctx->desc_info.count, &copy_sz))
++			return 0;
+ 	}
+ 
+ 	p_img_ptr_ctx->boot_desc_flag = 1;
+@@ -151,18 +162,18 @@
+ 
+ 	boot_desc_update_ptrs(img);
+ 
+-	/* Image descriptor pointers validity check */
+-	if (!p_img_ptr_ctx || !p_boot_ptr || !p_img_desc)
++	/* Image descriptor pointer validity check */
++	if (!p_img_ptr_ctx)
+ 		return HL_FW_IMG_NOT_FOUND;
+ 
+ 	if (p_img_ptr_ctx->boot_desc_flag != 1)
+ 		return HL_FW_IMG_NOT_FOUND;
+ 
+-	for (i = 0; i < p_boot_ptr->count; i++) {
++	for (i = 0; i < p_img_ptr_ctx->desc_info.count ; i++) {
+ 		if (img == HL_FW_BOOT_PTR_SPI) {
+ 			p_loc_img_desc = (struct hl_fw_img_desc *)(HL_BOOT_PTR_DEST_ARC
+ 					+ BOOT_INFO_IMG_DESC_GET_OFFSET
+-					+ p_boot_ptr->img_desc_sz * i);
++					+ p_img_ptr_ctx->desc_info.desc_size * i);
+ 		} else {
+ 			p_loc_img_desc = &p_img_desc[i];
+ 		}
+diff --git a/common/hl_boot_desc_rom.h b/common/hl_boot_desc_rom.h
+index 2abe13a..90ec135 100644
+--- a/common/hl_boot_desc_rom.h
++++ b/common/hl_boot_desc_rom.h
+@@ -35,6 +35,7 @@
+ 	uint8_t max_imgs;
+ 	uint32_t img_ptr_spi_offset;
+ 	uint64_t start_addr;
++	struct hl_fw_desc_info desc_info;
+ };
+ 
+ struct hl_img_ptrs_erom {

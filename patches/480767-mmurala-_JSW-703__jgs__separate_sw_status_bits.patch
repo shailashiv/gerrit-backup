@@ -1,0 +1,469 @@
+From 4cf90bdd5a2b5da5587ac634629e18b931d856e0 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 29 May 2025 11:15:30 +0300
+Subject: [PATCH] [JSW-703] jgs: separate sw status bits
+
+This patch, separates the sw status bits and
+corresponding enums between fs1 and jgs.
+We have JGS specific changes coming to sw
+status bits, which may distrub existing fs1
+flow.
+
+Change-Id: I3ded86a71cef211e6f174c9293479466a06c4bbb
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 5f1c68a..0ede52b 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -17,3 +17,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_security.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_mem_copy.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/fake_fuse_flow.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/status.c)
+diff --git a/arch/fs1/arc/status.c b/arch/fs1/arc/status.c
+new file mode 100644
+index 0000000..8610681
+--- /dev/null
++++ b/arch/fs1/arc/status.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier:     GPL-2.0-or-later
++/*
++ * Copyright (C) 2025 Intel Corporation.
++ */
++
++#include <boot_rom.h>
++#include <status.h>
++
++void boot_rom_status_update(enum boot_rom_progress progress)
++{
++	uint32_t status_base, reg, offset;
++
++	status_base = boot_rom_get_status_base();
++	offset = progress / BOOT_ROM_STATUS_REG_SZ_BITS;
++	progress = progress % BOOT_ROM_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl(status_base + offset * 4);
++	reg |= BIT(progress);
++	regmap_writel(reg, (status_base + offset * 4));
++}
++
++void boot_rom_status_update_bringup(enum boot_rom_progress progress, uint32_t position)
++{
++	boot_rom_status_update(progress + position);
++}
++
++void boot_rom_status_update_val(enum boot_rom_progress progress, uint32_t val, uint8_t bits)
++{
++	uint32_t status_base, reg, offset;
++
++	status_base = boot_rom_get_status_base();
++	offset = progress / BOOT_ROM_STATUS_REG_SZ_BITS;
++	progress = progress % BOOT_ROM_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl(status_base + offset * 4);
++	reg |= val << progress;
++	regmap_writel(reg, status_base + offset * 4);
++
++	if ((progress + bits) > BOOT_ROM_STATUS_REG_SZ_BITS) {
++		offset++;
++		val = val >> (BOOT_ROM_STATUS_REG_SZ_BITS - progress);
++		reg = regmap_readl(status_base + offset * 4);
++		reg |= val;
++		regmap_writel(reg, status_base + offset * 4);
++	}
++}
++
+diff --git a/arch/fs1/arc/status.h b/arch/fs1/arc/status.h
+new file mode 100644
+index 0000000..68a1649
+--- /dev/null
++++ b/arch/fs1/arc/status.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier:     GPL-2.0-or-later
++ *
++ * Copyright (C) 2025 Intel Corporation.
++ */
++
++#ifndef _STATUS_H_
++#define _STATUS_H_
++
++#include <progress_bits.h>
++#include <mem_io.h>
++
++#define BOOT_ROM_STATUS_REG_SZ_BITS	32
++
++enum boot_rom_bringup_proggress {
++	PROGRESS_BRINGUP_START,
++	PROGRESS_BRINGUP_NO_IMG_DESC,
++	PROGRESS_BRINGUP_LOADADDR_INVALID,
++	PROGRESS_BRINGUP_STARTADDR_INVALID,
++	PROGRESS_BRINGUP_TOO_BIG,
++	PROGRESS_BRINGUP_CRC_FAIL,
++	PROGRESS_BRINGUP_UNALIGNED_DEST_ADDR,
++	PROGRESS_BRINGUP_INVALID_IMG_SIZE,
++	PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE,
++	PROGRESS_BRINGUP_DMA_ERROR,
++	PROGRESS_BRINGUP_DMA,
++	PROGRESS_BRINGUP_KEY_AUTH_FAIL,
++	PROGRESS_BRINGUP_VERIFY_SUCCESS,
++};
++
++enum boot_rom_boot_desc_progress {
++	PROGRESS_BOOT_DESC_EXCEEDS_MAX_SIZE,
++	PROGRESS_DMA_START,
++	PROGRESS_DMA_CRC_FAILED,
++	PROGRESS_DMA_UNALIGNED_DEST,
++	PROGRESS_DMA_INVALID_IMG_SIZE,
++	PROGRESS_DMA_UNALIGNED_IMG_SIZE,
++	PROGRESS_DMA_INVALID_FLASH_OFFSET,
++	PROGRESS_DMA_ERROR,
++	PROGRESS_DMA_FINISH,
++	PROGRESS_BOOT_DESC_HDR_MAGIC_FAIL,
++	PROGRESS_BOOT_DESC_INVALID_IMG_OFFSET,
++	PROGRESS_BOOT_DESC_VERIFICATION_FAIL,
++};
++
++enum boot_rom_boot_desc_verify_progress {
++	PROGRESS_VERIFY_START,
++	PROGRESS_VERIFY_VERSION_FAIL,
++	PROGRESS_VERIFY_KEY_REVOKED,
++	PROGRESS_VERIFY_KEY_HASH_FAIL,
++	PROGRESS_VERIFY_AUTH_FAIL,
++	PROGRESS_VERIFY_SUCCESS,
++};
++
++enum boot_rom_erom_img_progress {
++	PROGRESS_EROM_BRINGUP_START,
++	PROGRESS_EROM_LOADADDR_INVALID,
++	PROGRESS_EROM_STARTADDR_INVALID,
++	PROGRESS_EROM_DMA_START,
++	PROGRESS_EROM_DMA_CRC_FAILED,
++	PROGRESS_EROM_DMA_UNALIGNED_DEST_ADDR,
++	PROGRESS_EROM_DMA_INVALID_IMG_SIZE,
++	PROGRESS_EROM_DMA_UNALIGNED_IMG_SIZE,
++	PROGRESS_EROM_DMA_INVALID_FLASH_OFFSET,
++	PROGRESS_EROM_DMA_ERROR,
++	PROGRESS_EROM_DMA_FINISH,
++	PROGRESS_EROM_IMG_VERIFICATION_FAIL,
++	PROGRESS_EROM_IMG_START,
++	PROGRESS_EROM_IMG_FINISH,
++};
++
++void boot_rom_status_update(enum boot_rom_progress progress);
++void boot_rom_status_update_bringup(enum boot_rom_progress progress, uint32_t position);
++void boot_rom_status_update_val(enum boot_rom_progress progress, uint32_t val, uint8_t bits);
++uint32_t boot_rom_get_status_base(void);
++
++#endif /* _STATUS_H_ */
+diff --git a/arch/jgs/arc/Makefile b/arch/jgs/arc/Makefile
+index fad4b79..4427bf2 100644
+--- a/arch/jgs/arc/Makefile
++++ b/arch/jgs/arc/Makefile
+@@ -17,3 +17,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_security.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_mem_copy.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/fake_fuse_flow.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/status.c)
+\ No newline at end of file
+diff --git a/arch/jgs/arc/dev_boot_info.c b/arch/jgs/arc/dev_boot_info.c
+index 0300ce9..a5c7dbe 100644
+--- a/arch/jgs/arc/dev_boot_info.c
++++ b/arch/jgs/arc/dev_boot_info.c
+@@ -5,8 +5,6 @@
+  *
+  */
+ 
+-#include <string.h>
+-#include <stdbool.h>
+ #include <boot_rom.h>
+ #include <hl_boot_desc.h>
+ #include <common.h>
+diff --git a/arch/jgs/arc/status.c b/arch/jgs/arc/status.c
+new file mode 100644
+index 0000000..8610681
+--- /dev/null
++++ b/arch/jgs/arc/status.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier:     GPL-2.0-or-later
++/*
++ * Copyright (C) 2025 Intel Corporation.
++ */
++
++#include <boot_rom.h>
++#include <status.h>
++
++void boot_rom_status_update(enum boot_rom_progress progress)
++{
++	uint32_t status_base, reg, offset;
++
++	status_base = boot_rom_get_status_base();
++	offset = progress / BOOT_ROM_STATUS_REG_SZ_BITS;
++	progress = progress % BOOT_ROM_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl(status_base + offset * 4);
++	reg |= BIT(progress);
++	regmap_writel(reg, (status_base + offset * 4));
++}
++
++void boot_rom_status_update_bringup(enum boot_rom_progress progress, uint32_t position)
++{
++	boot_rom_status_update(progress + position);
++}
++
++void boot_rom_status_update_val(enum boot_rom_progress progress, uint32_t val, uint8_t bits)
++{
++	uint32_t status_base, reg, offset;
++
++	status_base = boot_rom_get_status_base();
++	offset = progress / BOOT_ROM_STATUS_REG_SZ_BITS;
++	progress = progress % BOOT_ROM_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl(status_base + offset * 4);
++	reg |= val << progress;
++	regmap_writel(reg, status_base + offset * 4);
++
++	if ((progress + bits) > BOOT_ROM_STATUS_REG_SZ_BITS) {
++		offset++;
++		val = val >> (BOOT_ROM_STATUS_REG_SZ_BITS - progress);
++		reg = regmap_readl(status_base + offset * 4);
++		reg |= val;
++		regmap_writel(reg, status_base + offset * 4);
++	}
++}
++
+diff --git a/arch/jgs/arc/status.h b/arch/jgs/arc/status.h
+new file mode 100644
+index 0000000..68a1649
+--- /dev/null
++++ b/arch/jgs/arc/status.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier:     GPL-2.0-or-later
++ *
++ * Copyright (C) 2025 Intel Corporation.
++ */
++
++#ifndef _STATUS_H_
++#define _STATUS_H_
++
++#include <progress_bits.h>
++#include <mem_io.h>
++
++#define BOOT_ROM_STATUS_REG_SZ_BITS	32
++
++enum boot_rom_bringup_proggress {
++	PROGRESS_BRINGUP_START,
++	PROGRESS_BRINGUP_NO_IMG_DESC,
++	PROGRESS_BRINGUP_LOADADDR_INVALID,
++	PROGRESS_BRINGUP_STARTADDR_INVALID,
++	PROGRESS_BRINGUP_TOO_BIG,
++	PROGRESS_BRINGUP_CRC_FAIL,
++	PROGRESS_BRINGUP_UNALIGNED_DEST_ADDR,
++	PROGRESS_BRINGUP_INVALID_IMG_SIZE,
++	PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE,
++	PROGRESS_BRINGUP_DMA_ERROR,
++	PROGRESS_BRINGUP_DMA,
++	PROGRESS_BRINGUP_KEY_AUTH_FAIL,
++	PROGRESS_BRINGUP_VERIFY_SUCCESS,
++};
++
++enum boot_rom_boot_desc_progress {
++	PROGRESS_BOOT_DESC_EXCEEDS_MAX_SIZE,
++	PROGRESS_DMA_START,
++	PROGRESS_DMA_CRC_FAILED,
++	PROGRESS_DMA_UNALIGNED_DEST,
++	PROGRESS_DMA_INVALID_IMG_SIZE,
++	PROGRESS_DMA_UNALIGNED_IMG_SIZE,
++	PROGRESS_DMA_INVALID_FLASH_OFFSET,
++	PROGRESS_DMA_ERROR,
++	PROGRESS_DMA_FINISH,
++	PROGRESS_BOOT_DESC_HDR_MAGIC_FAIL,
++	PROGRESS_BOOT_DESC_INVALID_IMG_OFFSET,
++	PROGRESS_BOOT_DESC_VERIFICATION_FAIL,
++};
++
++enum boot_rom_boot_desc_verify_progress {
++	PROGRESS_VERIFY_START,
++	PROGRESS_VERIFY_VERSION_FAIL,
++	PROGRESS_VERIFY_KEY_REVOKED,
++	PROGRESS_VERIFY_KEY_HASH_FAIL,
++	PROGRESS_VERIFY_AUTH_FAIL,
++	PROGRESS_VERIFY_SUCCESS,
++};
++
++enum boot_rom_erom_img_progress {
++	PROGRESS_EROM_BRINGUP_START,
++	PROGRESS_EROM_LOADADDR_INVALID,
++	PROGRESS_EROM_STARTADDR_INVALID,
++	PROGRESS_EROM_DMA_START,
++	PROGRESS_EROM_DMA_CRC_FAILED,
++	PROGRESS_EROM_DMA_UNALIGNED_DEST_ADDR,
++	PROGRESS_EROM_DMA_INVALID_IMG_SIZE,
++	PROGRESS_EROM_DMA_UNALIGNED_IMG_SIZE,
++	PROGRESS_EROM_DMA_INVALID_FLASH_OFFSET,
++	PROGRESS_EROM_DMA_ERROR,
++	PROGRESS_EROM_DMA_FINISH,
++	PROGRESS_EROM_IMG_VERIFICATION_FAIL,
++	PROGRESS_EROM_IMG_START,
++	PROGRESS_EROM_IMG_FINISH,
++};
++
++void boot_rom_status_update(enum boot_rom_progress progress);
++void boot_rom_status_update_bringup(enum boot_rom_progress progress, uint32_t position);
++void boot_rom_status_update_val(enum boot_rom_progress progress, uint32_t val, uint8_t bits);
++uint32_t boot_rom_get_status_base(void);
++
++#endif /* _STATUS_H_ */
+diff --git a/common/recovery.c b/common/recovery.c
+index 842abac..a7c9cc4 100644
+--- a/common/recovery.c
++++ b/common/recovery.c
+@@ -6,11 +6,9 @@
+ 
+ #include <boot_rom.h>
+ #include <recovery.h>
+-#include <boot_rom.h>
+ #include <boot_flow.h>
+ #include <common.h>
+ #include <pcie.h>
+-#include <common.h>
+ #include <dev_security.h>
+ 
+ static void execute_rom_recovery(void)
+diff --git a/common/status.c b/common/status.c
+deleted file mode 100644
+index 8c88ec8..0000000
+--- a/common/status.c
++++ /dev/null
+@@ -1,48 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2023 HabanaLabs Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <boot_rom.h>
+-#include <status.h>
+-
+-void boot_rom_status_update(enum boot_rom_progress progress)
+-{
+-	uint32_t status_base, reg, offset;
+-
+-	status_base = boot_rom_get_status_base();
+-	offset = progress / BOOT_ROM_STATUS_REG_SZ_BITS;
+-	progress = progress % BOOT_ROM_STATUS_REG_SZ_BITS;
+-
+-	reg = regmap_readl(status_base + offset * 4);
+-	reg |= BIT(progress);
+-	regmap_writel(reg, (status_base + offset * 4));
+-}
+-
+-void boot_rom_status_update_bringup(enum boot_rom_progress progress, uint32_t position)
+-{
+-	boot_rom_status_update(progress + position);
+-}
+-
+-void boot_rom_status_update_val(enum boot_rom_progress progress, uint32_t val, uint8_t bits)
+-{
+-	uint32_t status_base, reg, offset;
+-
+-	status_base = boot_rom_get_status_base();
+-	offset = progress / BOOT_ROM_STATUS_REG_SZ_BITS;
+-	progress = progress % BOOT_ROM_STATUS_REG_SZ_BITS;
+-
+-	reg = regmap_readl(status_base + offset * 4);
+-	reg |= val << progress;
+-	regmap_writel(reg, status_base + offset * 4);
+-
+-	if ((progress + bits) > BOOT_ROM_STATUS_REG_SZ_BITS) {
+-		offset++;
+-		val = val >> (BOOT_ROM_STATUS_REG_SZ_BITS - progress);
+-		reg = regmap_readl(status_base + offset * 4);
+-		reg |= val;
+-		regmap_writel(reg, status_base + offset * 4);
+-	}
+-}
+-
+diff --git a/common/status.h b/common/status.h
+deleted file mode 100644
+index 3f06c23..0000000
+--- a/common/status.h
++++ /dev/null
+@@ -1,77 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2023 HabanaLabs Ltd.
+- */
+-
+-#ifndef _STATUS_H_
+-#define _STATUS_H_
+-
+-#include <stdint.h>
+-#include <progress_bits.h>
+-#include <mem_io.h>
+-
+-#define BOOT_ROM_STATUS_REG_SZ_BITS	32
+-
+-enum boot_rom_bringup_proggress {
+-	PROGRESS_BRINGUP_START,
+-	PROGRESS_BRINGUP_NO_IMG_DESC,
+-	PROGRESS_BRINGUP_LOADADDR_INVALID,
+-	PROGRESS_BRINGUP_STARTADDR_INVALID,
+-	PROGRESS_BRINGUP_TOO_BIG,
+-	PROGRESS_BRINGUP_CRC_FAIL,
+-	PROGRESS_BRINGUP_UNALIGNED_DEST_ADDR,
+-	PROGRESS_BRINGUP_INVALID_IMG_SIZE,
+-	PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE,
+-	PROGRESS_BRINGUP_DMA_ERROR,
+-	PROGRESS_BRINGUP_DMA,
+-	PROGRESS_BRINGUP_KEY_AUTH_FAIL,
+-	PROGRESS_BRINGUP_VERIFY_SUCCESS,
+-};
+-
+-enum boot_rom_boot_desc_progress {
+-	PROGRESS_BOOT_DESC_EXCEEDS_MAX_SIZE,
+-	PROGRESS_DMA_START,
+-	PROGRESS_DMA_CRC_FAILED,
+-	PROGRESS_DMA_UNALIGNED_DEST,
+-	PROGRESS_DMA_INVALID_IMG_SIZE,
+-	PROGRESS_DMA_UNALIGNED_IMG_SIZE,
+-	PROGRESS_DMA_INVALID_FLASH_OFFSET,
+-	PROGRESS_DMA_ERROR,
+-	PROGRESS_DMA_FINISH,
+-	PROGRESS_BOOT_DESC_HDR_MAGIC_FAIL,
+-	PROGRESS_BOOT_DESC_INVALID_IMG_OFFSET,
+-	PROGRESS_BOOT_DESC_VERIFICATION_FAIL,
+-};
+-
+-enum boot_rom_boot_desc_verify_progress {
+-	PROGRESS_VERIFY_START,
+-	PROGRESS_VERIFY_VERSION_FAIL,
+-	PROGRESS_VERIFY_KEY_REVOKED,
+-	PROGRESS_VERIFY_KEY_HASH_FAIL,
+-	PROGRESS_VERIFY_AUTH_FAIL,
+-	PROGRESS_VERIFY_SUCCESS,
+-};
+-
+-enum boot_rom_erom_img_progress {
+-	PROGRESS_EROM_BRINGUP_START,
+-	PROGRESS_EROM_LOADADDR_INVALID,
+-	PROGRESS_EROM_STARTADDR_INVALID,
+-	PROGRESS_EROM_DMA_START,
+-	PROGRESS_EROM_DMA_CRC_FAILED,
+-	PROGRESS_EROM_DMA_UNALIGNED_DEST_ADDR,
+-	PROGRESS_EROM_DMA_INVALID_IMG_SIZE,
+-	PROGRESS_EROM_DMA_UNALIGNED_IMG_SIZE,
+-	PROGRESS_EROM_DMA_INVALID_FLASH_OFFSET,
+-	PROGRESS_EROM_DMA_ERROR,
+-	PROGRESS_EROM_DMA_FINISH,
+-	PROGRESS_EROM_IMG_VERIFICATION_FAIL,
+-	PROGRESS_EROM_IMG_START,
+-	PROGRESS_EROM_IMG_FINISH,
+-};
+-
+-void boot_rom_status_update(enum boot_rom_progress progress);
+-void boot_rom_status_update_bringup(enum boot_rom_progress progress, uint32_t position);
+-void boot_rom_status_update_val(enum boot_rom_progress progress, uint32_t val, uint8_t bits);
+-uint32_t boot_rom_get_status_base(void);
+-
+-#endif /* _STATUS_H_ */

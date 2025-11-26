@@ -1,0 +1,386 @@
+From 077762c604ebe5c5ef00588d49aa56ef2806691d Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 07 Jun 2024 08:44:19 +0300
+Subject: [PATCH] [FSW-2704] fs1: add boot descriptor library
+
+with this patch, added boot descriptor library
+to retrieve different firmware images descriptor
+information and enumerate them when they are
+requested based on dynamic load scenarios.
+
+Change-Id: Ice3e988c44402a5a8d32eb17b08ab143641858a2
+---
+
+diff --git a/arch/fs1/arc/soc.h b/arch/fs1/arc/soc.h
+index b511c49..a02a145 100644
+--- a/arch/fs1/arc/soc.h
++++ b/arch/fs1/arc/soc.h
+@@ -94,4 +94,21 @@
+ #define HL_FW_SRAM_FULL_BASE		(HL_FW_MEM_BASE_FULL + HL_FWSRAM_OFFSET)
+ #define HL_FW_SRAM_SIZE			SZ_128K
+ 
++#define REC_IMG_PTRS_BASE			(0x0)
++/* recovery boot descriptors are DMA trans to ARC1 ICCM at offset 192K */
++#define REC_IMG_DESC_ICCM_OFFSET	(192 * 1024)
++#define BOOT_DESC_REC_OFFSET		(HL_ICCM_OFFSET + REC_IMG_DESC_ICCM_OFFSET)
++#define BOOT_PTR_REC_DMA_DEST		(HL_FW_MEM_BASE_FULL + BOOT_DESC_REC_OFFSET)
++/* 32Bit arc viewpoint address of boot pointer stored in ICCM */
++#define BOOT_PTR_REC_DMA_DEST_ARC	(HL_FW_MEM_BASE + BOOT_DESC_REC_OFFSET)
++
++
++/* spi images(ppboot, preboot etc) pointer binary placed in flash at sector 6 */
++#define SPI_IMG_PTRS_BASE			(0x60000)
++/* spi img boot descriptors are DMA trans to ARC1 ICCM at offset 0 */
++#define BOOT_DESC_SPI_IMG_OFFSET	(HL_ICCM_OFFSET)
++#define BOOT_PTR_SPI_DMA_DEST		(HL_FW_MEM_BASE_FULL + BOOT_DESC_SPI_IMG_OFFSET)
++/* 32Bit arc viewpoint address of boot pointer stored in ICCM */
++#define BOOT_PTR_SPI_DMA_DEST_ARC	(HL_FW_MEM_BASE + BOOT_DESC_SPI_IMG_OFFSET)
++
+ #endif /* _SOC_H_ */
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+new file mode 100644
+index 0000000..3046937
+--- /dev/null
++++ b/common/boot_desc.c
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stdint.h>
++#include <string.h>
++#include <stdbool.h>
++#include <hl_fw_upd_if.h>
++#include <boot_rom.h>
++#include "boot_desc.h"
++#include <status.h>
++#include <spi_flash.h>
++#include <dev_spi_flash.h>
++#include <dma.h>
++
++static struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx;
++static struct hl_fw_boot_ptrs *p_boot_ptr = &boot_rom_global.spi_manifest_hdr;
++static uint32_t erom_img_descs_offset = 0;
++
++static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	if ((img_desc->magic.val & DESC_MAGIC_MASK) != HL_FW_IMG_DESC_MAGIC)
++		return false;
++
++	if ((img_desc->desc_ver == INV_VER1) ||
++	    (img_desc->desc_ver == INV_VER2))
++		return false;
++
++	if (img_desc->idx >= INVALID_DESC_ID)
++		return false;
++
++	return true;
++}
++
++static void boot_desc_update_ptrs(enum hl_fw_boot_ptr_imgs img)
++{
++	p_img_ptr_ctx = &boot_rom_manifest.boot_ptr_ctx[img];
++	if (img == HL_FW_BOOT_PTR_RECOVERY) {
++		p_boot_ptr = (struct hl_fw_boot_ptrs *)(BOOT_PTR_REC_DMA_DEST_ARC);
++	} else {
++		p_boot_ptr = &boot_rom_global.spi_manifest_hdr;
++	}
++}
++
++int boot_desc_init(enum hl_fw_boot_ptr_imgs img)
++{
++	uint32_t i, img_ptrs_size, misc_descs = 0;
++	uint32_t *p_offset = NULL;
++	enum boot_rom_progress dma_sts_base = PROGRESS_INIT_SPI_BOOT_DESC_EXCEEDS_MAX_SIZE;
++	int err;
++	static struct hl_fw_img_desc *p_img_desc;
++
++	if (img >= HL_FW_BOOT_PTR_MAX_IMG)
++		return 0;
++
++	boot_desc_update_ptrs(img);
++
++	/* Initialize boot descriptor once */
++	if (p_img_ptr_ctx->boot_desc_flag)
++		return p_boot_ptr->count;
++
++	if (img == HL_FW_BOOT_PTR_RECOVERY) {
++		dma_sts_base = PROGRESS_INIT_RECOVERY_IMG_BOOT_DESC_EXCEEDS_MAX_SIZE;
++	} else {
++		if (boot_rom_global.validation_pass)
++			goto skip_boot_desc_process;
++	}
++
++	img_ptrs_size = spi_flash_readl(p_img_ptr_ctx->img_ptr_spi_offset);
++	if (img_ptrs_size > HL_IMG_PTRS_MAX_SIZE) {
++		boot_rom_status_update_bringup(dma_sts_base,
++				PROGRESS_BOOT_DESC_EXCEEDS_MAX_SIZE);
++		return 0;
++	}
++
++	boot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_START);
++
++	/* Fetch boot desc using DMA into dest offset */
++	err = boot_rom_spi_dma(img_ptrs_size, p_img_ptr_ctx->img_ptr_spi_offset,
++			p_img_ptr_ctx->dest_addr_dma, false, false, 0);
++
++	if (boot_rom_process_dma_err(err, dma_sts_base))
++		return 0;
++
++	boot_rom_status_update_bringup(dma_sts_base, PROGRESS_DMA_FINISH);
++
++	if (img == HL_FW_BOOT_PTR_SPI)
++		memcpy(p_boot_ptr, (uint32_t *)(p_img_ptr_ctx->dest_addr_arc), sizeof(struct hl_fw_boot_ptrs));
++
++	if (p_boot_ptr->magic.val != HL_FW_BOOT_MAGIC) {
++		boot_rom_status_update_bringup(dma_sts_base, PROGRESS_BOOT_DESC_HDR_MAGIC_FAIL);
++		return 0;
++	}
++
++	p_img_ptr_ctx->desc_info.desc_size = p_boot_ptr->img_desc_sz;
++	p_img_ptr_ctx->desc_info.count = p_boot_ptr->count;
++
++	p_offset = (uint32_t *)(p_img_ptr_ctx->dest_addr_arc + p_boot_ptr->offset2array);
++
++	/* Validate all descriptors */
++	for (i = 0; i < p_boot_ptr->count; i++) {
++		p_img_desc = (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc + p_offset[i]);
++
++		/* Range check for p_img_desc */
++		if (!(((uint32_t) p_img_desc >= p_img_ptr_ctx->dest_addr_arc) &&
++			((uint32_t) p_img_desc < p_img_ptr_ctx->dest_addr_arc + img_ptrs_size))) {
++			boot_rom_status_update_bringup(dma_sts_base,
++				PROGRESS_BOOT_DESC_INVALID_IMG_OFFSET);
++			return 0;
++		}
++
++		if (!boot_desc_img_desc_is_valid(p_img_desc)) {
++			boot_rom_status_update_bringup(dma_sts_base, PROGRESS_BOOT_DESC_VERIFICATION_FAIL);
++			return 0;
++		}
++
++		if (img != HL_FW_BOOT_PTR_SPI)
++		     continue;
++
++		if (p_img_desc->magic.type == HL_FW_IMG_PPBOOT) {
++			memcpy(&boot_rom_manifest.spi_img_desc[ROM_DESC_PPBOOT],
++				p_img_desc, sizeof(struct hl_fw_img_desc));
++		} else if (p_img_desc->magic.type == HL_FW_IMG_FAKE_EFUSE) {
++			memcpy(&boot_rom_manifest.spi_img_desc[ROM_DESC_FAKE_FUSE],
++				p_img_desc, sizeof(struct hl_fw_img_desc));
++		} else if (p_img_desc->magic.type == HL_FW_IMG_TPM_SPI) {
++			memcpy(&boot_rom_manifest.spi_img_desc[ROM_DESC_TPM],
++				p_img_desc, sizeof(struct hl_fw_img_desc));
++		} else {
++			/* Store upto 5 misc images(indifferent to ROM boot flow) */
++			if (misc_descs < NUM_OF_MISC_DESCS ) {
++				memcpy(&boot_rom_manifest.spi_img_desc[ROM_DESC_MISC_1 +
++				misc_descs], p_img_desc, sizeof(struct hl_fw_img_desc));
++				misc_descs++;
++			}
++		}
++	}
++
++skip_boot_desc_process:
++	if (img == HL_FW_BOOT_PTR_RECOVERY) {
++		/* Store the erom image descriptor offset to re-use in get api */
++		erom_img_descs_offset = p_offset[0];
++	}
++
++	p_img_ptr_ctx->boot_desc_flag = 1;
++
++	return p_boot_ptr->count;
++}
++
++static uint32_t boot_desc_validate_ptrs()
++{
++	/* Image descriptor pointer validity check */
++	if (!p_img_ptr_ctx)
++		return 1;
++
++	if (p_img_ptr_ctx->boot_desc_flag != 1)
++		return 1;
++
++	return 0;
++}
++
++static uint32_t boot_desc_copy_desc(struct boot_desc *desc,
++				    struct hl_fw_img_desc *local_img_desc,
++				    enum fw_post_reset_cmd upd_status)
++{
++	uint32_t idx;
++
++	idx = local_img_desc->idx;
++	if (upd_status == FLOPS_UPD_PENDING)
++		idx = (idx + 1) % 2;
++
++	desc->spi_offset = local_img_desc->offset[idx];
++	desc->img_size = local_img_desc->size[idx];
++	desc->loadaddr = ((uint64_t) local_img_desc->load_high[idx] << 32) |
++		local_img_desc->load_low[idx];
++	desc->desc_ver = local_img_desc->desc_ver;
++	desc->start_addr = ((uint64_t) local_img_desc->start_high[idx] << 32) |
++		local_img_desc->start_low[idx];
++
++	memcpy(desc->chksum, local_img_desc->chksum2[idx], ARRAY_SIZE(desc->chksum));
++
++	return idx;
++}
++
++static struct hl_fw_img_desc * boot_desc_img_desc_addr_calc(enum hl_fw_boot_ptr_imgs img,
++		uint32_t index)
++{
++	if (img == HL_FW_BOOT_PTR_SPI) {
++		if (index < ROM_DESC_NUM_MAX)
++			return &boot_rom_manifest.spi_img_desc[index];
++	} else {
++		return (struct hl_fw_img_desc *)(p_img_ptr_ctx->dest_addr_arc
++					+ erom_img_descs_offset
++					+ p_img_ptr_ctx->desc_info.desc_size * index);
++	}
++
++	return NULL;
++}
++
++uint32_t boot_desc_get_img_desc(enum hl_fw_boot_ptr_imgs boot_ptr_type, int boot_desc_type,
++				struct boot_desc *desc, enum fw_post_reset_cmd upd_status)
++{
++	uint32_t i;
++	struct hl_fw_img_desc *p_loc_img_desc = NULL;
++
++	if (boot_ptr_type >= HL_FW_BOOT_PTR_MAX_IMG)
++		return BOOT_ROM_IMAGE_NOT_FOUND;
++
++	boot_desc_update_ptrs(boot_ptr_type);
++
++	if (boot_desc_validate_ptrs())
++		return BOOT_ROM_IMAGE_NOT_FOUND;
++
++	for (i = 0; i < p_img_ptr_ctx->desc_info.count ; i++) {
++		p_loc_img_desc = boot_desc_img_desc_addr_calc(boot_ptr_type, i);
++
++		if (!p_loc_img_desc)
++			continue;
++
++		if (p_loc_img_desc->magic.type != boot_desc_type)
++			continue;
++
++		return boot_desc_copy_desc(desc, p_loc_img_desc, upd_status);
++	}
++
++	return BOOT_ROM_IMAGE_NOT_FOUND;
++}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+new file mode 100644
+index 0000000..1a8b10e
+--- /dev/null
++++ b/common/boot_desc.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#ifndef _BOOT_DESC_H_
++#define _BOOT_DESC_H_
++
++#define HL_IMG_PTRS_MAX_SIZE		0x10000 /* 64KB */	/* TODO: Check size for FS1 */
++
++#define DESC_MAGIC_MASK		0xFFFFFF00
++#define INV_VER1		((uint32_t)0)
++#define INV_VER2		((uint32_t) -1)
++#define INVALID_DESC_ID		2
++
++struct boot_desc {
++	uint32_t desc_ver;
++	uint32_t spi_offset;
++	uint32_t img_size;
++	uint64_t loadaddr;
++	uint8_t chksum[SHA384_SUM_LEN];
++	uint8_t sec_ver;
++	uint32_t pub_key_size;
++	uint32_t sig_size;
++	uint64_t start_addr;
++};
++
++int boot_desc_init(enum hl_fw_boot_ptr_imgs img);
++uint32_t boot_desc_get_img_desc(enum hl_fw_boot_ptr_imgs img, int type,
++				struct boot_desc *desc, enum fw_post_reset_cmd upd_status);
++
++#endif /* _BOOT_DESC_H_ */
++
+diff --git a/common/common.c b/common/common.c
+index bf2816a..f1e336a 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -14,6 +14,7 @@
+ #include <recovery.h>
+ #include <hl_fw_upd_if.h>
+ #include "dev_uart.h"
++#include <boot_desc.h>
+ 
+ void boot_rom_uart_init(void)
+ {
+@@ -63,6 +64,9 @@
+ 	boot_rom_iccm_init();
+ 
+ 	spi_flash_init();
++
++	if (!boot_desc_init(HL_FW_BOOT_PTR_SPI))
++		boot_rom_status_update(PROGRESS_INIT_SPI_BOOT_DESC_FAIL);
+ }
+ 
+ void boot_rom_fuse(void)
+@@ -88,14 +92,15 @@
+ 	boot_rom_halt();
+ }
+ 
+-static bool boot_rom_boot_desc_init_done()
++static bool boot_rom_boot_desc_init_done(enum hl_fw_boot_ptr_imgs img)
+ {
+-	/* TODO: check boot desc init status */
+-	return true;
++	struct hl_fw_boot_ptrs_ctx *p_img_ptr_ctx = &boot_rom_manifest.boot_ptr_ctx[img];
++
++	return p_img_ptr_ctx->boot_desc_flag;
+ }
+ 
+ void boot_rom_check_n_enter_recovery(void)
+ {
+-	if(!boot_rom_boot_desc_init_done())
++	if(!boot_rom_boot_desc_init_done(HL_FW_BOOT_PTR_SPI))
+ 		execute_recovery();
+ }
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index dcf35e1..a871316 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -39,6 +39,8 @@
+ 	BOOT_ROM_FAIL,
+ 	BOOT_ROM_TIMEOUT,
+ 	BOOT_ROM_CFG_ERROR,
++	BOOT_ROM_BRINGUP_ERROR,
++	BOOT_ROM_IMAGE_NOT_FOUND,
+ };
+ 
+ enum boot_rom_sku_type {
+@@ -78,6 +80,8 @@
+ 	ROM_DESC_NUM_MAX,
+ };
+ 
++#define NUM_OF_MISC_DESCS	(ROM_DESC_NUM_MAX - ROM_DESC_MISC_1)	/* TODO: do we need really MISC desc??*/
++
+ struct boot_rom_global_s {
+ 	uint32_t config_fuse;
+ 	uint32_t config2_fuse;
+@@ -90,6 +94,7 @@
+ 	uint64_t ppboot_start_addr;
+ 	bool fake_fuse_en;
+ 	uint32_t fake_fuse_spi_offset;
++	struct hl_fw_boot_ptrs spi_manifest_hdr;
+ 	bool boot_info_set_done;
+ 	struct hl_fw_sec_info sec_data;
+ };

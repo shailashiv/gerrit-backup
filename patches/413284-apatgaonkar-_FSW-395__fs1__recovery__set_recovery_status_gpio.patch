@@ -1,0 +1,79 @@
+From 86fa430b54d455b9e12ccc318e7f1ef4d77508f4 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Sun, 28 Apr 2024 09:16:54 +0300
+Subject: [PATCH] [FSW-395] fs1: recovery: set recovery status gpio
+
+When IO die 0 (master die) is going into recovery it needs
+to set GPIO_77 to 1 to inform CPLD that it is entering
+recovery.
+
+Change-Id: I9cf4c53b8db5fd914f880f2e913686c3c64826f6
+---
+
+diff --git a/arch/fs1/arc/dev_recovery.c b/arch/fs1/arc/dev_recovery.c
+index 75c1ea7..b03ef80 100644
+--- a/arch/fs1/arc/dev_recovery.c
++++ b/arch/fs1/arc/dev_recovery.c
+@@ -15,6 +15,7 @@
+ #include <ipt_d2d_phyctrlreg_masks.h>
+ #include <ipt_d2d_n3_phyctrlreg_regs.h>
+ #include <global_conf_regs.h>
++#include <gpio_regs.h>
+ #include <fs1_efuse.h>
+ #include <mem_io.h>
+ 
+@@ -34,6 +35,29 @@
+ 
+ #define IO_HALF1(ADDRESS, DIE_ID)	((ADDRESS & ~(HL_ARC_ADDR_DIE_ID_MASK)) | (DIE_ID << HL_ARC_ADDR_DIE_ID_SHIFT))
+ 
++#define FS1_REC_STS_GPIO		77
++#define GPIOS_PER_BANK			16
++void boot_rom_set_recovery_status(void)
++{
++	uint32_t index = FS1_REC_STS_GPIO % GPIOS_PER_BANK;
++	uint32_t val, mask = BIT(index);
++
++	if (boot_rom_global.die_type != IO_DIE_MASTER)
++		return;
++
++	/* TODO: check if PAD_SEL for specific GPIO needs to be set */
++
++	/* configure GPIO in output mode */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++	val = val | mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_OUTENSET));
++
++	/* TODO: Confirm gpio is active low/high */
++	val = regmap_readl(I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++	val |= mask;
++	regmap_writel(val, I0_H0_PSOC_GPIO4(mmGPIO_DATAOUT));
++}
++
+ void boot_rom_notify_slave(void)
+ {
+ 	/*
+diff --git a/common/recovery.c b/common/recovery.c
+index cdf877f..e06fc8a 100644
+--- a/common/recovery.c
++++ b/common/recovery.c
+@@ -30,6 +30,8 @@
+ {
+ 	boot_rom_status_update(PROGRESS_BOOT_ROM_IN_RECOVERY);
+ 
++	boot_rom_set_recovery_status();
++
+ 	/* TODO: Add SKU check here, once SKU config finalized */
+ 	boot_rom_notify_slave();
+ 
+diff --git a/common/recovery.h b/common/recovery.h
+index 285a935..50bb492 100644
+--- a/common/recovery.h
++++ b/common/recovery.h
+@@ -13,6 +13,7 @@
+ void boot_rom_notify_slave(void);
+ void boot_rom_wait_for_recovery_in(void);
+ void boot_rom_d2d_link_init(void);
++void boot_rom_set_recovery_status(void);
+ 
+ #define NOTIFY_SLV_DURATION_US		10
+ 

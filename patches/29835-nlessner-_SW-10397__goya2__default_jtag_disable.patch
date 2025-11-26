@@ -1,0 +1,145 @@
+From 54a5b69694caa3ddbf462408b35b706722dd8231 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Thu, 12 Mar 2020 18:55:44 +0200
+Subject: [PATCH] [SW-10397] goya2: default jtag disable
+
+Disable jtag interface by default as soon as possible, only re-enable
+if efuse allows the interface. this is to try and minimize as much as
+possible illegal access via the interface.
+
+Change-Id: I5efdc4617deb4e0cd50368990c4f379c63591881
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index bb374f7..3e2d830 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -68,6 +68,9 @@
+ {
+ 	uint32_t reg;
+ 
++	/* by default disable jtag I/F as soon as possible */
++	security_disable_jtag_if();
++
+ 	arcboot_rom_status_update(PROGRESS_INIT);
+ 
+ 	/* make sure spi controller doesn't swap bytes */
+@@ -156,8 +159,9 @@
+ 	sp_sram_writel(arcboot_rom_global.config_fuse,
+ 		       SECURITY_EFUSE_SYS_CFG_OFFSET);
+ 
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK)
+-		security_disable_jtag_if();
++	if ((arcboot_rom_global.config_fuse &
++	     EFUSE_SYSCFG_DISABLE_JTAG_IF_MASK) == 0)
++		security_enable_jtag_if();
+ 
+ 	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_DISABLE_TWI_IF_MASK)
+ 		security_disable_twi_if();
+diff --git a/common/security.c b/common/security.c
+index 37e2a41..8ab4618 100644
+--- a/common/security.c
++++ b/common/security.c
+@@ -64,22 +64,21 @@
+ 		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+ }
+ 
+-static void security_disable_jtag_pad_sel(void)
++static void security_enable_jtag_mstr_if(void)
+ {
+-	/* disable TCK functionality */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_49);
++	regmap_writel(0, mmJT_MSTR_IF_AXUSER_CORE);
++	/* don't override AXI prot bit by master IF */
++	regmap_writel(0, mmJT_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+ 
+-	/* disable TMOD functionality */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_50);
+-
+-	/* disable DATA IN functionality */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_51);
+-
+-	/* disable TRSTn functionality */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_52);
+-
+-	/* disable DATA OUT functionality */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_53);
++	/* enable access to all */
++	regmap_writel(SECURITY_PSOC_END_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0);
++	regmap_writel(SECURITY_PSOC_END_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_LSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0);
++	regmap_writel(SECURITY_PSOC_START_HBW_MSB,
++		      mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0);
+ }
+ 
+ void security_disable_twi_if(void)
+@@ -88,12 +87,26 @@
+ 	security_disable_smi_mstr_if();
+ }
+ 
++static void security_jtag_dap(uint8_t status)
++{
++	/* close dap WA jira: H5-1803 */
++	regmap_writel(status, mmPSOC_CS_TRACE_SPECIAL_GLBL_SPARE_0);
++}
++
+ void security_disable_jtag_if(void)
+ {
+ 	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
+ 	regmap_writel(0, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
+-	security_disable_jtag_pad_sel();
++	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
+ 	security_disable_jtag_mstr_if();
++}
++
++void security_enable_jtag_if(void)
++{
++	regmap_writel(0xFFFFFFFF, mmPSOC_CS_TRACE_TOP_ROM_VALID_0);
++	regmap_writel(0xFFFFFFFF, mmPSOC_CS_TRACE_TOP_ROM_VALID_1);
++	security_jtag_dap(SECURITY_JTAG_DAP_ENABLE);
++	security_enable_jtag_mstr_if();
+ }
+ 
+ void security_debug_if_secure(void)
+@@ -411,12 +424,6 @@
+ 	secuirty_dcon_if1_rr_hbw_config(spi_en);
+ }
+ 
+-static void security_jtag_dap_disable(void)
+-{
+-	/* close dap WA jira: H5-1803 */
+-	regmap_writel(1, mmPSOC_CS_TRACE_SPECIAL_GLBL_SPARE_0);
+-}
+-
+ /* If DBG I/F were not disabled, program the RR to allow access
+  * only to SPI flash and PSOC_SECURITY
+  */
+@@ -429,7 +436,7 @@
+ void security_jtag_if_rr_hbw_config(uint8_t spi_en)
+ {
+ 	security_jtag_rr_hbw_config(spi_en);
+-	security_jtag_dap_disable();
++	security_jtag_dap(SECURITY_JTAG_DAP_DISABLE);
+ }
+ 
+ void secuirty_i2c_s_enable(void)
+diff --git a/common/security.h b/common/security.h
+index ec2f8ca..1aa032b 100644
+--- a/common/security.h
++++ b/common/security.h
+@@ -102,7 +102,11 @@
+ /* 4 bytes */
+ #define SECURITY_EFUSE_SYS_CFG_OFFSET		192
+ 
++#define SECURITY_JTAG_DAP_ENABLE		0
++#define SECURITY_JTAG_DAP_DISABLE		1
++
+ void security_disable_jtag_if(void);
++void security_enable_jtag_if(void);
+ void security_disable_twi_if(void);
+ void security_debug_if_secure(void);
+ void security_debug_if_shared(void);

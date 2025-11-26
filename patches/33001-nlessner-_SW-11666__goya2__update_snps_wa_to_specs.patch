@@ -1,0 +1,122 @@
+From 16d595d7ad3524b476a19cb9234b571f44b084f7 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Mon, 20 Apr 2020 12:25:38 +0300
+Subject: [PATCH] [SW-11666] goya2: update snps wa to specs
+
+Update snps workaround for gen1 according to new specs. Add bootstrap to
+controll SSC selection.
+
+Change-Id: I930af9d95cb30fec8b3cee991a6aa732f61b7239
+---
+
+diff --git a/common/pcie.c b/common/pcie.c
+index ae65fdd..c7bbaaf 100644
+--- a/common/pcie.c
++++ b/common/pcie.c
+@@ -22,23 +22,77 @@
+ 	} while (pcie_prstn == assert);
+ }
+ 
+-static void pcie_update_phy_vco_config(uint32_t addr, uint32_t addr_end)
++static void pcie_update_reg_range(uint32_t addr, uint32_t addr_end,
++				  uint32_t value)
+ {
+ 	for (; addr <= addr_end ; addr += 4)
+-		regmap_writel(1, addr);
++		regmap_writel(value, addr);
+ }
+ 
+-static void pcie_wa_snps_case_01038891(void)
++static void pcie_wa_snps_case_01038891(uint8_t ssc_en)
+ {
++	uint32_t reg = 0;
++
+ 	if ((arcboot_rom_global.config_fuse &
+ 	     EFUSE_SYSCFG_WA_SNPS_CASE_01038891) == 0) {
+-		/* WA for SPNS case 01038891 */
+-		pcie_update_phy_vco_config(
++		if (ssc_en) {
++			pcie_update_reg_range(
++				mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++				mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
++			pcie_update_reg_range(
++				mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++				mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
++		}
++
++		pcie_update_reg_range(
++			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
++			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
++
++		pcie_update_reg_range(
+ 			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7);
+-		pcie_update_phy_vco_config(
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
++		pcie_update_reg_range(
+ 			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7);
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++
++		if (ssc_en) {
++			reg = 0xA0;
++		} else {
++			reg = 0x50;
++		}
++		regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++		regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++
++		if (ssc_en) {
++			regmap_writel(0x00250025,
++				      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++			regmap_writel(0x00250025,
++				      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++			regmap_writel(0x5000,
++				      mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
++			regmap_writel(0x19CE,
++				      mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
++			regmap_writel(0x6666,
++				      mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
++			regmap_writel(0x2108,
++				      mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
++		} else {
++			regmap_writel(0x01C301C3,
++				      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++		}
++
++		regmap_writel(0x30,
++			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
++		regmap_writel(0x30,
++			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
++		regmap_writel(0x30,
++			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
++		regmap_writel(0x30,
++			      mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
++		pcie_update_reg_range(
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
++
+ 		regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
+ 	}
+ }
+@@ -46,6 +100,7 @@
+ static void pcie_config(void)
+ {
+ 	uint8_t sram_init_done;
++	uint8_t ssc_en = 0;
+ 	uint32_t boot_strap, flr_ctrl, link_ctrl;
+ 	uint8_t ltssm_en;
+ 
+@@ -65,7 +120,11 @@
+ 		    PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
+ 			regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
+ 
+-		pcie_wa_snps_case_01038891();
++		if (boot_strap &
++		    PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK)
++			ssc_en= 1;
++
++		pcie_wa_snps_case_01038891(ssc_en);
+ 		regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ 
+ 		sram_init_done = 0;

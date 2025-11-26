@@ -1,0 +1,116 @@
+From 31d97506f00d7360b2e8d806d85d384fe660bdb5 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Fri, 22 Mar 2024 04:28:02 +0200
+Subject: [PATCH] [FSW-417] fs1: io die1 rom support
+
+with this patch, added slave support to wait for
+recovery_in sync signal from master, once recovery
+in comes salve will wait for 10us to avoid
+duplicate trigger as master holds it for 10us.
+
+Change-Id: I62723a68074d4bafbdb3b50a4130eb46e8617133
+---
+
+diff --git a/app/boot_rom.c b/app/boot_rom.c
+index 31e6add..c1119dc 100644
+--- a/app/boot_rom.c
++++ b/app/boot_rom.c
+@@ -29,5 +29,7 @@
+ 
+ 	boot_rom_security_init();
+ 
++	boot_rom_wait_for_signal();
++
+ 	return 0;
+ }
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index 14b4125..b64768d 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -7,3 +7,4 @@
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_delay.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_spi_flash.c)
+ BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/dev_efuse.c)
++BOOT_ROM_COMMON_SRCS_C += $(shell ls $(HL_DEV_ARCH)/slave.c)
+diff --git a/arch/fs1/arc/slave.c b/arch/fs1/arc/slave.c
+new file mode 100644
+index 0000000..0ab5090
+--- /dev/null
++++ b/arch/fs1/arc/slave.c
+@@ -0,0 +1,63 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <boot_rom.h>
++#include <status.h>
++#include <delay.h>
++#include <mem_io.h>
++#include <global_conf_regs.h>
++#include <global_conf_masks.h>
++#include <fs1_blocks_linux_driver.h>
++#include <fs1_reg_map.h>
++
++#define NOTIFY_SLV_DURATION_US		10
++
++void boot_rom_wait_for_recovery_in(void)
++{
++	uint32_t val;
++
++	/* TODO: print uart char to indicate waiting for recovery in */
++
++	while (1) {
++		val = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_DIE_RECOVERY_IN));
++		if (val & GLOBAL_CONF_DIE_RECOVERY_IN_IND_M) {
++			/* Master die holds the indication pulse for 10us,
++			 * Hence we need to wait for 10us after detection
++			 * to make sure slave follows the master in terms
++			 * of point of execution
++			 */
++
++			/* TODO: print uart char to indicate, recovery in received */
++
++			udelay(NOTIFY_SLV_DURATION_US);
++			break;
++		}
++	}
++	/*
++	* No timeout added for while(1) due to the usage of this function:
++	* 1) Recovery: It is required for slave to wait for this indication from
++	* master. As slave die in rom is to only execute recovery, it waits forever
++	* for this indication to be set, apart from recovery there is no logic to be
++	* executed on slave in ROM.
++	*
++	* 2) D2D link init: The pcie linkup time on master cannot be predicted, hence
++	* slave needs to wait. However the implication of this while(1) is minimal as
++	* d2d is the last process in the recovery flow which ends also in a while(1).
++	* Hence this would not have any functional impact.
++	*/
++}
++
++void boot_rom_wait_for_signal(void)
++{
++	if (boot_rom_global.die_type == IO_DIE_MASTER)
++		return;
++
++	boot_rom_status_update(PROGRESS_SLV_DIE_WAITING_ON_RECOVERY_IND);
++
++	boot_rom_wait_for_recovery_in();
++
++	/* TODO: recovery */
++}
+diff --git a/include/boot_rom.h b/include/boot_rom.h
+index 13dc3ed..6d1760f 100644
+--- a/include/boot_rom.h
++++ b/include/boot_rom.h
+@@ -101,5 +101,8 @@
+ enum boot_rom_die_type boot_rom_get_die_type(void);
+ void boot_rom_init(void);
+ void boot_rom_fuse(void);
++void boot_rom_wait_for_signal(void);
++void boot_rom_check_n_enter_recovery(void);
++void boot_rom_bringup_ppboot(void);
+ 
+ #endif /* _BOOT_ROM_H_ */

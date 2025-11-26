@@ -1,0 +1,87 @@
+From bf1f73ae24e6258195d5ad7c46966dbce149d25b Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 23 Nov 2020 17:41:38 +0200
+Subject: [PATCH] [SW-22029] initialize complete dccm memory
+
+Currently, in order to avoid fake DCCM memory exceptions caused due
+to uninitialized DCCM reads, DCCM memory used by arcboot ROM is been
+initialized to zero. Based on recommendations from hardware team and
+to avoid any uninitialized reads to DCCM, this patch adds changes to
+initialize complete DCCM memory of 16KB. Since complete DCCM memory is
+initialized, initialization of bss, heap and stack sections which
+resides on DCCM are not required and are removed.
+
+The total cycles taken to initialize complete DCCM memory are ~4100
+cycles.
+
+Change-Id: I331097bdd15ec12202b28710e98904c9268e1828
+---
+
+diff --git a/app/crt0_rom.S b/app/crt0_rom.S
+index dd8b3c8..ed006d1 100644
+--- a/app/crt0_rom.S
++++ b/app/crt0_rom.S
+@@ -86,42 +86,18 @@
+ 
+ 	mov sp, @__stack_top	; initialize stack pointer
+ 
+-	mov_s r2, @__sbss_start	; r2 = start of the bss section
+-	sub r3, @_end, r2	; r3 = size of the bss section in bytes
+-	; set up the loop counter register to the size (in words) of the bss section
++	mov r2, @_dccm_begin	; r2 = start of the dccm section
++	sub r3, @_dccm_end, r2	; r3 = size of the dccm section in bytes
++	; set up the loop counter register to the size (in words) of the dccm section
+ 	asr_s r13, r3
+ 	asr.f lp_count, r13
+ 
+-	mov r4, 0
+-	; loop to zero out the bss.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_zbss
++	mov r4, 0x0
++	; loop to zero out the dccm.  Enter loop only if lp_count != 0
++	lpnz @.Lend_dccm
+ 	st.ab r4, [r2, 4]	; zero out the word
+ 	nop
+-.Lend_zbss:
+-
+-	mov_s r2, @__start_heap	; r2 = start of the heap section
+-	sub r3, @__end_heap, r2	; r3 = size of the heap section in bytes
+-	; set up the loop counter register to the size (in words) of the heap section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	; loop to zero out the heap.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_heap
+-	st.ab r4, [r2, 4]	; zero out the word
+-	nop
+-.Lend_heap:
+-
+-	mov_s r2, @__stack		; r2 = start of the stack section
+-	sub r3, @__stack_top, r2	; r3 = size of the stack section in bytes
+-	; set up the loop counter register to the size (in words) of the stack section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	; loop to zero out the stack.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_stack
+-	st.ab r4, [r2, 4]	; zero out the word
+-	nop
+-.Lend_stack:
++.Lend_dccm:
+ 
+ 	mov_s r1, @_etext	; r1 = end of the text section
+ 	mov_s r2, @_data	; r1 = end of the data section
+diff --git a/goya2_arc/arcboot_rom.lds b/goya2_arc/arcboot_rom.lds
+index d7f132c..cce0716 100644
+--- a/goya2_arc/arcboot_rom.lds
++++ b/goya2_arc/arcboot_rom.lds
+@@ -33,6 +33,9 @@
+ 
+ SECTIONS
+ {
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
+ 	.ivt : {
+ 		KEEP (*(.ivt));
+ 	} > REGION_IVT

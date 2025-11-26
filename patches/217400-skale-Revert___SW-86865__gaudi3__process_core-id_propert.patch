@@ -1,0 +1,120 @@
+From 3292377062cc82c10bcd07c3fbab3ecfeb50c03c Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 05 Jun 2022 15:48:13 +0300
+Subject: [PATCH] Revert "[SW-86865] gaudi3: process core-id property of images"
+
+Revert rom recovery implementation for secured firmware update via
+inband and OOB.
+
+This reverts commit ae28d06d81dbe3bc458d13ab21e3721083bb17fa.
+
+Change-Id: Ie790d3b0569cebba7fb4a9a8459baff8aba002b7
+---
+
+diff --git a/common/fit.c b/common/fit.c
+index ca463fd..0158517 100644
+--- a/common/fit.c
++++ b/common/fit.c
+@@ -14,7 +14,6 @@
+ #include <fit_load_type.h>
+ #include <boot_info.h>
+ #include <hl_fw_if.h>
+-#include <hl_fit_if.h>
+ #include "fit.h"
+ #include "fit_rsa.h"
+ #include "fit_regions.h"
+@@ -60,18 +59,11 @@
+ 	uint64_t loadaddr;
+ 	uint64_t startaddr;
+ 	const char *arch;
+-	int core_id;
+-};
+-
+-struct arc_status {
+-		bool config;
+-		bool run;
+ };
+ 
+ struct fit_image images[FIT_MAX_IMAGES];
+ struct fdt_region fdt_regions[MAX_FDT_REGIONS];
+ struct image_region region[MAX_FDT_REGIONS];
+-struct arc_status arc_info[FIT_CORE_ID_COUNT];
+ static int arcboot_key_idx;
+ 
+ __weak void arcboot_copy_image(uint64_t dst, const void *buf, int len,
+@@ -493,34 +485,6 @@
+ 	return err;
+ }
+ 
+-__weak void arcboot_rom_bring_up_arc(__unused int core_id, __unused uint64_t load_addr) {}
+-
+-static int fit_process_core_id(int core_id, uint64_t load)
+-{
+-	if (core_id > FIT_CORE_ID_COUNT)
+-		return 1;
+-
+-	/* arcboot rom only support fit load for master psoc arc0 to arc2 */
+-	if (core_id > FIT_CORE_ID_D0_PSOC_ARC2)
+-		return 1;
+-
+-	/* Nothing needs to be done for psoc arc1 as its already running */
+-	if (core_id == FIT_CORE_ID_D0_PSOC_ARC1)
+-		return 0;
+-
+-	/*
+-	 * It is expected to receive two images for single core (iccm/dccm),
+-	 * so assumption is made here that 1st image will be iccm followed
+-	 * by dccm.
+-	 */
+-	if (!arc_info[core_id].config) {
+-		arcboot_rom_bring_up_arc(core_id, load);
+-		arc_info[core_id].config = true;
+-	}
+-
+-	return 0;
+-}
+-
+ static int fit_copy_image(uint64_t dst, const void *buf, int len, const char *arch,
+ 			  const char *cmpr)
+ {
+@@ -613,13 +577,12 @@
+ static enum fit_load_result fit_copy_images(const void *fit,
+ 					    enum fit_sec_failure *res)
+ {
+-	int node, len, core_id_len;
++	int node, len;
+ 	int conf, num_images, i;
+ 	const uint8_t *buf;
+ 	uint64_t load, start;
+ 	const char *cmpr;
+ 	size_t fit_size = fdt_totalsize(fit);
+-	const uint32_t *core_id;
+ 
+ 	/* Check if image supports a minimum FDT version or newer */
+ 	if (fdt_version(fit) < FDT_MIN_SUPPORTED_VERSION)
+@@ -685,17 +648,6 @@
+ 
+ 		images[i].loadaddr = load;
+ 		images[i].startaddr = start;
+-
+-		core_id = fdt_getprop(fit, node, FIT_CORE_ID_PROP, &core_id_len);
+-		if (!core_id)
+-			return FIT_LOAD_CORRUPTED;
+-
+-		if (core_id_len != sizeof(*core_id))
+-			return FIT_LOAD_CORRUPTED;
+-
+-		images[i].core_id = fdt32_to_cpu(*core_id);
+-		if (fit_process_core_id(images[i].core_id, load))
+-			return FIT_LOAD_CORRUPTED;
+ 
+ 		if (fit_copy_image(load, buf, len, images[i].arch, cmpr))
+ 			return FIT_LOAD_CORRUPTED;
+@@ -774,7 +726,6 @@
+ 	enum fit_format_result fit_format_error;
+ 
+ 	memset(&images, 0x0, sizeof(images));
+-	memset(&arc_info, 0x0, sizeof(arc_info));
+ 
+ 	fit_format_error = fit_check_format(fit);
+ 	if (fit_format_error) {

@@ -1,0 +1,379 @@
+From 60814429f60bbde7aed602577709443b759df271 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 09 Mar 2022 14:14:26 +0200
+Subject: [PATCH] [SW-77829] rom: update image validation design
+
+As per the new image validation design, the signature validation is
+to be done on the image descriptor data and not on the actual ppboot
+and preboot image. The ppboot and preboot image validation would
+only consist of sha verification of the actual image compared to the
+hash stored in image descriptor.
+
+Hence the validation functions are defined as:
+1) secureboot_verify_image_v2() : api that is used to verify
+the signature on image descriptor manifest.
+2) secureboot_verify_image_hash384() : New api to perform sha384
+checksum verification on payload (ppboot/preboot) images.
+
+Change-Id: I9a2ade956fa3c0fedc873e1238caabf2ecff9622
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 0bad659..4f10828 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -459,6 +459,7 @@
+ __weak void arcboot_rom_disable_spi_gw(void) {}
+ __weak void arcboot_rom_wait_for_signal(void) {}
+ __weak void arcboot_rom_security_init(void) {}
++__weak void arcboot_rom_verify(void) {}
+ 
+ int arcboot_rom_main(void)
+ {
+@@ -469,6 +470,7 @@
+ 	arcboot_rom_wait_for_signal();
+ 	arcboot_rom_in_recovery();
+ 	arcboot_rom_request_cpld_wdog();
++	arcboot_rom_verify();
+ 	arcboot_rom_bringup_pcie();
+ 	arcboot_rom_bringup_arcboot_ram();
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c23749c..4d4dd05 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -261,7 +261,7 @@
+ 		uint8_t cur_img)
+ {
+ 	uint32_t act_img_size, image_len, loadaddr_arc, num_crc;
+-	unsigned char *image, *signature, *pub_key;
++	unsigned char *image;
+ 	enum arcboot_rom_progress img_sts_base = PROGRESS_BRINGUP_PCI_PRI;
+ 	enum dma_error err = DMA_SUCCESS;
+ 	int ret;
+@@ -299,6 +299,9 @@
+ 		} else if (err == DMA_UNALIGNED_IMG_SIZE) {
+ 			arcboot_rom_status_update_bringup(img_sts_base,
+ 					PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE);
++		} else {
++			arcboot_rom_status_update_bringup(img_sts_base,
++					PROGRESS_BRINGUP_DMA_ERROR);
+ 		}
+ 
+ 		return ARCBOOT_BRINGUP_ERROR;
+@@ -313,27 +316,17 @@
+ 	if (desc->img_size % MAX_DMA_SIZE_CRC)
+ 		num_crc++;
+ 
+-	act_img_size = desc->img_size - desc->pub_key_size - desc->sig_size;
++	act_img_size = desc->img_size;
+ 	act_img_size = act_img_size - (num_crc * CRC32_SIZE);
+ 
+ 	/* Derive key and signature parameters */
+ 	loadaddr_arc = (uint32_t)CONV_64B_TO_ARC(desc->loadaddr);
+ 	image = (unsigned char *)(loadaddr_arc);
+-	image_len = act_img_size + desc->pub_key_size; /* img + public key*/
+-	pub_key = (unsigned char *)(loadaddr_arc + act_img_size);
+-	signature = (unsigned char *)(loadaddr_arc + image_len);
++	image_len = act_img_size;
+ 
+-	ret = secureboot_verify_image_v2(image, image_len,
+-			pub_key, desc->pub_key_size, signature, desc->sig_size, desc->sec_ver);
+-	if (ret != SECUREBOOT_VERIFY_SUCCESS) {
+-		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
+-			security_report_img_status(cur_img, IMG_STATUS_FW_VERSION_LOW);
+-		else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
+-			arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_KEY_REVOKED);
+-		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
+-			arcboot_rom_status_update_bringup(img_sts_base, PROGRESS_BRINGUP_KEY_AUTH_FAIL);
+-		else
+-			security_report_img_status(cur_img, IMG_STATUS_SIG_AUTH_FAIL);
++	ret = secureboot_verify_image_hash384(desc->chksum, image, image_len);
++	if (ret) {
++		security_report_img_status(cur_img, IMG_STATUS_SIG_AUTH_FAIL);
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 	}
+ 
+@@ -426,3 +419,48 @@
+ {
+ 	return HL_BOOT_INFO_VERSION;
+ }
++
++void arcboot_rom_verify(void)
++{
++	struct hl_fw_boot_ptrs boot_ptr;
++	uint32_t boot_ptr_addr = 0;
++	int ret;
++	uint32_t img_plus_key_len;
++	uint8_t crc_bytes, num_chunks;
++
++	if (!security_efuse_image_validation_en())
++		return;
++
++	boot_ptr_addr = boot_desc_param_get(&boot_ptr);
++
++	if (!boot_ptr_addr)
++		execute_pcie_recovery();
++
++	num_chunks = boot_ptr.boot_ptrs_img_sz / MAX_DMA_SIZE_CRC;
++	if (boot_ptr.boot_ptrs_img_sz % MAX_DMA_SIZE_CRC)
++		num_chunks++;
++
++	crc_bytes = num_chunks * CRC32_SIZE;
++
++	img_plus_key_len = boot_ptr.boot_ptrs_img_sz - boot_ptr.sig_sz - crc_bytes;
++
++	ret = secureboot_verify_image_v2((uint8_t *)boot_ptr_addr, img_plus_key_len,
++			(uint8_t *)(boot_ptr_addr + img_plus_key_len - boot_ptr.pub_key_sz), boot_ptr.pub_key_sz,
++			(uint8_t *)(boot_ptr_addr + img_plus_key_len), boot_ptr.sig_sz,
++			boot_ptr.sec_ver, boot_ptr.key_idx);
++
++	if (ret == SECUREBOOT_VERIFY_SUCCESS) {
++		arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_SUCCESS);
++	} else {
++		if (ret == SECUREBOOT_VERIFY_VER_FAILED)
++			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_VERSION_FAIL);
++		else if (ret == SECUREBOOT_VERIFY_KEY_REVOKED)
++			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_KEY_REVOKED);
++		else if (ret == SECUREBOOT_VERIFY_KEY_FAILED)
++			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_KEY_HASH_FAIL);
++		else // (ret = SECUREBOOT_VERIFY_FAILED)
++			arcboot_rom_status_update(PROGRESS_BOOT_DESC_VERIFY_AUTH_FAIL);
++
++		execute_pcie_recovery();
++	}
++}
+diff --git a/arch/gaudi3/arc/dev_security.h b/arch/gaudi3/arc/dev_security.h
+index 916b130..e068a7e 100644
+--- a/arch/gaudi3/arc/dev_security.h
++++ b/arch/gaudi3/arc/dev_security.h
+@@ -37,8 +37,10 @@
+ 
+ extern const uint8_t rom_key_hashes[NUM_KEYS_IN_ROM][SHA384_SUM_LEN];
+ 
+-int secureboot_verify_image_v2(const uint8_t *image, uint32_t image_len,
+-		uint8_t *key, uint32_t key_len,
+-		uint8_t *sig, uint32_t sig_len, uint8_t sec_ver);
++int secureboot_verify_image_v2(const uint8_t *image, uint32_t image_len, uint8_t *key,
++				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
++				uint8_t sec_ver, uint8_t key_index);
++
++int secureboot_verify_image_hash384(uint8_t *exp_hash, unsigned char *image, uint32_t image_len);
+ 
+ #endif /* _GAUDI3_DEV_SECURITY_H_ */
+diff --git a/arch/gaudi3/arc/secureboot.c b/arch/gaudi3/arc/secureboot.c
+index 1a05da5..2a791d0 100644
+--- a/arch/gaudi3/arc/secureboot.c
++++ b/arch/gaudi3/arc/secureboot.c
+@@ -34,11 +34,13 @@
+  *
+  * @arguments:
+  * image     - pointer to blob of protected data
+- * image_len - size of the blob (Image + public key (inc key header))
++ * image_len - size of the blob (Image + public key)
+  * sig       - pointer to signature of the blob
+  * sig_len   - signature size
+  * key       - pointer to public key
+- * key_len   - public key size + key header (784 + 8 = 792 bytes)
++ * key_len   - public key size
++ * sec_ver   - security firmware version.
++ * key_index - key idx to be used for authentication.
+  *
+  * @return:
+  * SECUREBOOT_VERIFY_SUCCESS    : Signature validation successful
+@@ -48,9 +50,9 @@
+  */
+ int secureboot_verify_image_v2(const uint8_t *image, uint32_t image_len, uint8_t *key,
+ 				uint32_t key_len, uint8_t *sig, uint32_t sig_len,
+-				uint8_t sec_ver)
++				uint8_t sec_ver, uint8_t key_index)
+ {
+-	int ret, key_index;
++	int ret;
+ 
+ 	if (!security_efuse_image_validation_en())
+ 		return SECUREBOOT_VERIFY_SUCCESS;
+@@ -62,8 +64,6 @@
+ 			!= SECURITY_FW_VERSION_SECURE) {
+ 		return SECUREBOOT_VERIFY_VER_FAILED;
+ 	}
+-
+-	key_index = *(uint32_t*) (key + key_len - KEY_PROP_HDR_SZ);
+ 
+ 	/* TODO: Confirm if key revocation failure needs a dedicated status bit */
+ 	ret = security_check_key_revoke_status(key_index);
+@@ -82,6 +82,15 @@
+ 	return SECUREBOOT_VERIFY_FAILED;
+ }
+ 
++int secureboot_verify_image_hash384(uint8_t *exp_hash, unsigned char *image, uint32_t image_len)
++{
++	uint8_t actual_hash[SHA384_SUM_LEN];
++
++	sha384_csum(image, image_len, actual_hash, 0);
++
++	return memcmp(actual_hash, exp_hash, SHA384_SUM_LEN);
++}
++
+ /*
+  * Dummy function.
+  */
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index dae4056..a7e6305 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -186,3 +186,13 @@
+ 	}
+ 	return HL_FW_IMG_NOT_FOUND;
+ }
++
++uint32_t boot_desc_param_get(struct hl_fw_boot_ptrs *boot_ptr)
++{
++	if (!p_boot_ptr)
++		return 0;
++
++	memcpy(boot_ptr, p_boot_ptr, sizeof(struct hl_fw_boot_ptrs));
++
++	return HL_BOOT_PTR_DEST_ARC;
++}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index b905d27..b951d73 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -69,4 +69,6 @@
+ uint32_t boot_desc_get_img_desc(enum hl_fw_boot_ptr_imgs img, int type,
+ 		struct boot_desc *desc, enum fw_post_reset_cmd upd_status);
+ 
++uint32_t boot_desc_param_get(struct hl_fw_boot_ptrs *boot_ptr);
++
+ #endif /* _BOOT_DESC_H_ */
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 4cbe82a..54bf66d 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -87,6 +87,7 @@
+ 	PROGRESS_BRINGUP_CRC_FAIL,
+ 	PROGRESS_BRINGUP_UNALIGNED_DEST_ADDR,
+ 	PROGRESS_BRINGUP_UNALIGNED_IMG_SIZE,
++	PROGRESS_BRINGUP_DMA_ERROR,
+ 	PROGRESS_BRINGUP_DMA,
+ 	PROGRESS_BRINGUP_KEY_REVOKED,
+ 	PROGRESS_BRINGUP_KEY_AUTH_FAIL,
+@@ -114,54 +115,61 @@
+ 	PROGRESS_VER_LOC = 17,
+ 	PROGRESS_VER_LOC_0 = 18,
+ 	PROGRESS_VER_LOC_1 = 19,
+-	PROGRESS_BRINGUP_PCI_PRI = 20,
+-	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 21,
+-	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 22,
+-	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 23,
+-	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 24,
+-	PROGRESS_BRINGUP_PCI_PRI_DMA = 25,
+-	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 26,
+-	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 27,
+-	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 28,
+-	PROGRESS_BRINGUP_PCI_SEC = 29,
+-	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 30,
+-	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 31,
+-	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 32,
+-	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 33,
+-	PROGRESS_BRINGUP_PCI_SEC_DMA = 34,
+-	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 35,
+-	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 36,
+-	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 37,
+-	PROGRESS_PCIE_IN_RECOVERY = 38,
+-	PROGRESS_PPBOOT_START = 39,
+-	PROGRESS_PPBOOT_FINISH = 40,
+-	PROGRESS_BRINGUP_RAM_PRI = 41,
+-	PROGRESS_BRINGUP_RAM_PRI_DMA = 42,
+-	PROGRESS_BRINGUP_RAM_PRI_SECURITY = 43,
+-	PROGRESS_BRINGUP_RAM_SEC = 44,
+-	PROGRESS_BRINGUP_RAM_SEC_DMA = 45,
+-	PROGRESS_BRINGUP_RAM_SEC_SECURITY = 46,
+-	PROGRESS_ARCBOOT_RAM_START = 47,
+-	PROGRESS_ARCBOOT_RECOVERY = 48,
+-	PROGRESS_ARCBOOT_RECOVERY_DMA = 49,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR = 50,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START = 51,
+-	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH = 52,
+-	PROGRESS_ARCBOOT_EROM_PCIE = 53,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START = 54,
+-	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH = 55,
+-	PROGRESS_ARCBOOT_EROM_PCIE_START = 56,
+-	PROGRESS_ARCBOOT_EROM_PCIE_FINISH = 57,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY = 58,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START = 59,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH = 60,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_START = 61,
+-	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH = 62,
+-	PROGRESS_ARCBOOT_EROM_TPM = 63,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_START = 64,
+-	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH = 65,
+-	PROGRESS_ARCBOOT_EROM_TPM_START = 66,
+-	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 67,
++	PROGRESS_BOOT_DESC_VERIFY_VERSION_FAIL = 20,
++	PROGRESS_BOOT_DESC_VERIFY_KEY_REVOKED = 21,
++	PROGRESS_BOOT_DESC_VERIFY_KEY_HASH_FAIL = 22,
++	PROGRESS_BOOT_DESC_VERIFY_AUTH_FAIL = 23,
++	PROGRESS_BOOT_DESC_VERIFY_SUCCESS = 24,
++	PROGRESS_BRINGUP_PCI_PRI = 25,
++	PROGRESS_BRINGUP_PCI_PRI_TOO_BIG = 26,
++	PROGRESS_BRINGUP_PCI_PRI_CRC_FAIL = 27,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_DEST_ADDR = 28,
++	PROGRESS_BRINGUP_PCI_PRI_UNALIGNED_IMG_SIZE = 29,
++	PROGRESS_BRINGUP_PCI_PRI_DMA_ERROR = 30,
++	PROGRESS_BRINGUP_PCI_PRI_DMA = 31,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_REVOKED = 32,
++	PROGRESS_BRINGUP_PCI_PRI_KEY_AUTH_FAIL = 33,
++	PROGRESS_BRINGUP_PCI_PRI_SECURITY = 34,
++	PROGRESS_BRINGUP_PCI_SEC = 35,
++	PROGRESS_BRINGUP_PCI_SEC_TOO_BIG = 36,
++	PROGRESS_BRINGUP_PCI_SEC_CRC_FAIL = 37,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_DEST_ADDR = 38,
++	PROGRESS_BRINGUP_PCI_SEC_UNALIGNED_IMG_SIZE = 39,
++	PROGRESS_BRINGUP_PCI_SEC_DMA_ERROR = 40,
++	PROGRESS_BRINGUP_PCI_SEC_DMA = 41,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_REVOKED = 42,
++	PROGRESS_BRINGUP_PCI_SEC_KEY_AUTH_FAIL = 43,
++	PROGRESS_BRINGUP_PCI_SEC_SECURITY = 44,
++	PROGRESS_PCIE_IN_RECOVERY = 45,
++	PROGRESS_PPBOOT_START = 46,
++	PROGRESS_PPBOOT_FINISH = 47,
++	PROGRESS_BRINGUP_RAM_PRI = 48,
++	PROGRESS_BRINGUP_RAM_PRI_DMA = 49,
++	PROGRESS_BRINGUP_RAM_PRI_SECURITY = 50,
++	PROGRESS_BRINGUP_RAM_SEC = 51,
++	PROGRESS_BRINGUP_RAM_SEC_DMA = 52,
++	PROGRESS_BRINGUP_RAM_SEC_SECURITY = 53,
++	PROGRESS_ARCBOOT_RAM_START = 54,
++	PROGRESS_ARCBOOT_RECOVERY = 55,
++	PROGRESS_ARCBOOT_RECOVERY_DMA = 56,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_ERROR = 57,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_START = 58,
++	PROGRESS_ARCBOOT_EROM_BOOT_DESC_DMA_FINISH = 59,
++	PROGRESS_ARCBOOT_EROM_PCIE = 60,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_START = 61,
++	PROGRESS_ARCBOOT_EROM_PCIE_DMA_FINISH = 62,
++	PROGRESS_ARCBOOT_EROM_PCIE_START = 63,
++	PROGRESS_ARCBOOT_EROM_PCIE_FINISH = 64,
++	PROGRESS_ARCBOOT_EROM_RECOVERY = 65,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_START = 66,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_DMA_FINISH = 67,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_START = 68,
++	PROGRESS_ARCBOOT_EROM_RECOVERY_FINISH = 69,
++	PROGRESS_ARCBOOT_EROM_TPM = 70,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_START = 71,
++	PROGRESS_ARCBOOT_EROM_TPM_DMA_FINISH = 72,
++	PROGRESS_ARCBOOT_EROM_TPM_START = 73,
++	PROGRESS_ARCBOOT_EROM_TPM_FINISH = 74,
+ };
+ 
+ enum security_location {
+@@ -181,6 +189,7 @@
+ void arcboot_rom_clear_recovery_flag(void);
+ void arcboot_rom_load_recovery(void);
+ int arcboot_rom_mem_init(uint64_t addr, uint32_t size);
++void arcboot_rom_verify(void);
+ 
+ #define CLEAR_DMA_SECURITY_PROGRESS 0x3
+ 

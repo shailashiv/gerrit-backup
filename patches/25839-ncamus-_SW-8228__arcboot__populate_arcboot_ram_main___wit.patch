@@ -1,0 +1,147 @@
+From 77acd63f54e29a6804cd6c294a40ca686f1dfb9e Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sat, 18 Jan 2020 21:52:08 +0200
+Subject: [PATCH] [SW-8228] arcboot: populate arcboot_ram_main() with arm_call()
+
+This is taken from BTL code
+
+Change-Id: I73f180777675044c397efba5790820469e24095e
+---
+
+diff --git a/Makefile b/Makefile
+index b00298c..58b8d1a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -9,6 +9,8 @@
+ export CC AR RANLIB
+ OBJCOPY = $(CROSS_COMPILE)objcopy
+ 
++ARCBOOT_VER := 0x0$(shell cat localversion-habanalabs)
++
+ LIBDIR = sdk/lib
+ ARCBOOT_CFLAGS = -Wall -W -Werror -O3
+ ARCBOOT_CFLAGS += -Iinclude
+@@ -21,6 +23,8 @@
+ SPECS_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
+ ARCBOOT_CFLAGS += -I$(dir $(BR2_EXTERNAL))/specs/$(SPECS_DEV)/asic_reg
+ ARCBOOT_CFLAGS += -I$(dir $(BR2_EXTERNAL))/embedded/specs
++ARCBOOT_CFLAGS += -DBTLVER=$(ARCBOOT_VER)
++ARCBOOT_CFLAGS += -DBTLID=0x30
+ 
+ LDFLAGS = -flto
+ LDFLAGS += -L $(LIBDIR) -lsb -lellipsys
+diff --git a/app/arcboot_ram.c b/app/arcboot_ram.c
+index 5f4c686..b9f2300 100644
+--- a/app/arcboot_ram.c
++++ b/app/arcboot_ram.c
+@@ -6,8 +6,98 @@
+  */
+ 
+ #include "arcboot.h"
++#include "delay.h"
++
++static void init_misc(void)
++{
++	/* Enable gpio 13/12 as outputs used by LEDs */
++	regmap_writel(0x3000, mmPSOC_GPIO0_OUTENSET);
++	/* Trigger boot manager on next reset */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_BOOT_SEQ_RE_START);
++	/* Set status to CPU_BOOT_STATUS_IN_BTL */
++	regmap_writel(0x4, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
++}
++
++static void init_pll_cpu(void)
++{
++	/* Gate the clock */
++	regmap_writel(0, mmPSOC_CPU_PLL_DIV_0_RLX_CLK_GATER);
++	regmap_writel(0, mmPSOC_CPU_PLL_DIV_1_RLX_CLK_GATER);
++	regmap_writel(0, mmPSOC_CPU_PLL_DIV_2_RLX_CLK_GATER);
++	regmap_writel(0, mmPSOC_CPU_PLL_DIV_3_RLX_CLK_GATER);
++	/* Actual values written into the register are (val - 1) */
++	regmap_writel(0x503b, mmPSOC_CPU_PLL_CTRL_CFG_DIV); /* 1, 6, 60 */
++	regmap_writel(0x11, mmPSOC_CPU_PLL_CTRL_DATA_CHNG);
++
++	/* use PLL clock, no divisor */
++	regmap_writel(0x1, mmPSOC_CPU_PLL_CTRL_DIV_SEL_0);
++
++	/* use PLL clock, no divisor */
++	regmap_writel(0x1, mmPSOC_CPU_PLL_CTRL_DIV_SEL_1);
++
++	regmap_writel(0x4, mmPSOC_CPU_PLL_CTRL_DIV_FACTOR_2);	/* 5 */
++	regmap_writel(0x1, mmPSOC_CPU_PLL_CTRL_DIV_FACTOR_CMD_2);
++	regmap_writel(0x1, mmPSOC_CPU_PLL_CTRL_DIV_EN_2);
++	/* use PLL clock, w/ divisor */
++	regmap_writel(0x3, mmPSOC_CPU_PLL_CTRL_DIV_SEL_2);
++
++	/* use REF clock, w/o divisor */
++	regmap_writel(0x0, mmPSOC_CPU_PLL_CTRL_DIV_SEL_3);
++
++	/* Wait 40us before un-gating the clock */
++	udelay(40);
++	regmap_writel(1, mmPSOC_CPU_PLL_DIV_0_RLX_CLK_GATER);
++	regmap_writel(1, mmPSOC_CPU_PLL_DIV_1_RLX_CLK_GATER);
++	regmap_writel(1, mmPSOC_CPU_PLL_DIV_2_RLX_CLK_GATER);
++	regmap_writel(1, mmPSOC_CPU_PLL_DIV_3_RLX_CLK_GATER);
++}
++
++/* Functionality used to be run by BTL */
++static void arm_prepare(void)
++{
++	init_misc();
++	init_pll_cpu();
++}
++
++static void arm_wakeup(void)
++{
++	/*
++	 * TODO: set proper value '1'|'2'
++	 * according to what pass verification
++	 * '1' - Primary SPI image [Default]
++	 * '2' - Secondary SPI image
++	 * In the meantime we used predefined '0'
++	 */
++	unsigned int arcboot_id = BTLID;
++
++	/*
++	 * Using scratchpad registers for
++	 * passing the current running BTL ID to CPU SW
++	 * ------------------------------
++	 */
++	regmap_writel(arcboot_id, mmPSOC_GLOBAL_CONF_SCRATCHPAD_31);
++
++	/* Passing the BTL version to preboot through the scratchpad 28 register */
++	regmap_writel(BTLVER, mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
++
++	/* Set CPU0 Reset address to PREBOOT */
++	regmap_writel(PREBOOT_ADDR_L, mmCPU_CA53_CFG_RST_ADDR_LSB_0);
++	regmap_writel(PREBOOT_ADDR_H, mmCPU_CA53_CFG_RST_ADDR_MSB_0);
++
++	/* Wake up CPU0, after we put all CPUs in reset */
++	regmap_writel(0x0, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
++static void arm_call(void)
++{
++	arm_prepare();
++	arm_wakeup();
++}
+ 
+ int arcboot_ram_main(void)
+ {
++	arm_call();
++
+ 	return 0;
+ }
+diff --git a/goya2_arc/soc.h b/goya2_arc/soc.h
+index b1a4946..a986555 100644
+--- a/goya2_arc/soc.h
++++ b/goya2_arc/soc.h
+@@ -11,5 +11,7 @@
+ 
+ #define CPU_FREQ	500000000
+ #define CPU_FREQ_US	500	/* CPU_FREQ / 1000000 */
++#define PREBOOT_ADDR_H	0x7F
++#define PREBOOT_ADDR_L	0xF0000000
+ 
+ #endif /* _SOC_H_ */

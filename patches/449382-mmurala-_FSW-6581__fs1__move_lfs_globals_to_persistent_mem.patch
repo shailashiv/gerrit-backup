@@ -1,0 +1,144 @@
+From 5dc489a9bf5fa9d33966fb866e55aac6d52846e6 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Sat, 14 Sep 2024 19:32:59 +0300
+Subject: [PATCH] [FSW-6581] fs1: move lfs globals to persistent mem
+
+LFS is planned to use across all subsequent
+modules and once boot rom handover control to
+next module, lfs globals overwritten as part
+of data section reused for next module.
+To avoid this, we are placing all lfs globals
+to persistent memory.
+
+Change-Id: If7ca07550c857dbaefa42ad78c613fab97b93fbe
+---
+
+diff --git a/arch/fs1/arc/boot_rom.lds b/arch/fs1/arc/boot_rom.lds
+index a8efd5e..0215d6a 100644
+--- a/arch/fs1/arc/boot_rom.lds
++++ b/arch/fs1/arc/boot_rom.lds
+@@ -31,7 +31,7 @@
+ 	_dccm_begin = ORIGIN(DCCM);
+ 	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+ 	_persistent_sec_size = 3k;
+-	_rom_global_data_size = 512;
++	_rom_global_data_size = 1024;
+ 
+ 	.ivt : {
+ 		KEEP (*(.ivt));
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 4a4be86..17f4a2f 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -24,6 +24,7 @@
+ #include "dev_uart.h"
+ #include "progress_bits.h"
+ #include <dev_mem_copy.h>
++#include <lfs_wrapper.h>
+ 
+ extern const int fs1_die_type;
+ 
+@@ -102,6 +103,7 @@
+ 	/* Non zero initializers only required for master(die 0) */
+ 	if (die_id == FS1_IO_DIE_0)
+ 		boot_rom_persist_data_non_zero_init();
++		lfs_globals_pre_init();
+ }
+ 
+ void boot_rom_clear_status(void)
+diff --git a/common/littlefs/lfs_wrapper.c b/common/littlefs/lfs_wrapper.c
+index cf820c3..76a4d20 100644
+--- a/common/littlefs/lfs_wrapper.c
++++ b/common/littlefs/lfs_wrapper.c
+@@ -16,8 +16,7 @@
+ #define DST_SAFE	true
+ #define DST_UNSAFE	false
+ 
+-/* TODO: LFS_GLOBAL_VAR_SECTION */
+-bool lfs_init_done = false;
++bool __attribute__((section (".rom_persistent_section")))lfs_init_done;
+ 
+ static void memcpy32_rev(void *dst, void *src, int size)
+ {
+@@ -118,34 +117,47 @@
+ static int ram_block_erase(const struct lfs_config *c, lfs_block_t block);
+ static int ram_block_sync(const struct lfs_config *c);
+ 
+-/* TODO: LFS_GLOBAL_VAR_SECTION */
+ // variables used by the filesystem
+-lfs_t lfs;
+-uint8_t pcache[CACHE_BUFFER_SIZE], rcache[CACHE_BUFFER_SIZE], fcache[CACHE_BUFFER_SIZE];
+-uint8_t lookahead[CACHE_BUFFER_SIZE];
++lfs_t __attribute__((section (".rom_persistent_section")))lfs;
++uint8_t __attribute__((section (".rom_persistent_section")))pcache[CACHE_BUFFER_SIZE];
++uint8_t __attribute__((section (".rom_persistent_section")))rcache[CACHE_BUFFER_SIZE];
++uint8_t __attribute__((section (".rom_persistent_section")))fcache[CACHE_BUFFER_SIZE];
++uint8_t __attribute__((section (".rom_persistent_section")))lookahead[CACHE_BUFFER_SIZE];
+ 
+ // configuration of the filesystem is provided by this struct
+-struct lfs_config lfs_cfg = {
+-    // block device operations
+-    .read  = ram_block_read,
+-    .prog  = ram_block_prog,
+-    .erase = ram_block_erase,	/* TODO: remove if unused, once all export API's finalized */
+-    .sync  = ram_block_sync,	/* TODO: remove if unused, once all export API's finalized */
++struct lfs_config __attribute__((section (".rom_persistent_section")))lfs_cfg;
+ 
+-    // block device configuration
+-    .read_size = sizeof(uint32_t),
+-    .prog_size = sizeof(uint32_t),
+-    .block_size = BLOCK_SIZE,
+-    .block_count = CONFIG_BOOTINFO_SIZE / BLOCK_SIZE,
+-    .cache_size = sizeof(pcache),
+-    .prog_buffer = pcache, // 4?
+-    .read_buffer = rcache,
+-    .lookahead_size = sizeof(lookahead),
+-    .lookahead_buffer = lookahead,
+-    .block_cycles = 500,
+-};
++struct lfs_file_config __attribute__((section (".rom_persistent_section")))defaults;
+ 
+-struct lfs_file_config defaults = { .buffer = fcache, };
++void lfs_globals_pre_init()
++{
++	/* It is used to avoid multiple mounts in cold reset */
++	lfs_init_done = false;
++
++	lfs_cfg = (struct lfs_config) {
++		// block device operations
++		.read  = ram_block_read,
++		.prog  = ram_block_prog,
++		.erase = ram_block_erase,	/* TODO: remove if unused, once all export API's finalized */
++		.sync  = ram_block_sync,	/* TODO: remove if unused, once all export API's finalized */
++
++		// block device configuration
++		.read_size = sizeof(uint32_t),
++		.prog_size = sizeof(uint32_t),
++		.block_size = BLOCK_SIZE,
++		.block_count = CONFIG_BOOTINFO_SIZE / BLOCK_SIZE,
++		.cache_size = sizeof(pcache),
++		.prog_buffer = pcache,
++		.read_buffer = rcache,
++		.lookahead_size = sizeof(lookahead),
++		.lookahead_buffer = lookahead,
++		.block_cycles = 500,
++	};
++
++	defaults = (struct lfs_file_config) {
++		.buffer = fcache,
++	};
++}
+ 
+ static int ram_block_read(const struct lfs_config *c __attribute__((unused)), lfs_block_t block,
+         lfs_off_t off, void *buffer, lfs_size_t size)
+diff --git a/common/littlefs/lfs_wrapper.h b/common/littlefs/lfs_wrapper.h
+index acd4e35..7aada80 100644
+--- a/common/littlefs/lfs_wrapper.h
++++ b/common/littlefs/lfs_wrapper.h
+@@ -16,5 +16,6 @@
+ int lfs_file_copy_partial(const char *file_tag, uint32_t type, void *data,
+ 			uint32_t offset, uint32_t size);
+ uint32_t lfs_disk_set_empty();
++void lfs_globals_pre_init();
+ 
+ #endif	/* _LFS_WRAPPER_H_ */

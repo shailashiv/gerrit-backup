@@ -1,0 +1,81 @@
+From 06d6459b67b78c841da0a0dee8bd2ff4ebd82cbb Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 04 Jul 2024 15:40:06 +0300
+Subject: [PATCH] [FSW-2704] fs1: add boot desc init
+
+This patch initializes boot descriptor for both
+manifests. If validation pass bit is set then only
+valid manifest index gets desc initialized.
+
+Change-Id: Idf0a73578bcd91d56b04cce525b9b41bec7d9ee6
+---
+
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index f4a5cf5..285cd3b 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -43,11 +43,12 @@
+ 	PROGRESS_INIT_SPI_MANIFEST_1_INFO_GET_FAIL = 33,
+ 	PROGRESS_INIT_SPI_MANIFEST_1_DATA_GET_FAIL = 34,
+ 	PROGRESS_INIT_SPI_MANIFEST_1_FAIL = 35,
+-	PROGRESS_INIT_EFUSE_INIT_FAIL = 36,
+-	PROGRESS_INIT_EFUSE_SPI = 37,
+-	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 38,
+-	PROGRESS_REVOKE_LOC_ASIC_EFUSE = 39,
+-	PROGRESS_REVOKE_LOC_FAKE_FUSE = 40, /* TODO */
++	PROGRESS_INIT_SPI_VALID_MANIFEST_INDEX_FAIL = 36,
++	PROGRESS_INIT_EFUSE_INIT_FAIL = 37,
++	PROGRESS_INIT_EFUSE_SPI = 38,
++	PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT = 39,
++	PROGRESS_REVOKE_LOC_ASIC_EFUSE = 40,
++	PROGRESS_REVOKE_LOC_FAKE_FUSE = 41, /* TODO */
+ 	PROGRESS_KEY_LOC = 42,
+ 	PROGRESS_KEY_LOC_0 = 43,
+ 	PROGRESS_KEY_LOC_1 = 44,
+diff --git a/common/common.c b/common/common.c
+index c8eb182..c09aef2 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -68,9 +68,21 @@
+ 
+ 	spi_flash_init();
+ 
+-	/* TODO: Manifest 1 boot_desc_init to be added */
+-	if (boot_desc_init(HL_FW_SPI_MANIFEST_0) != BOOT_ROM_SUCCESS)
+-		boot_rom_status_update(PROGRESS_INIT_SPI_MANIFEST_0_FAIL);
++	if (boot_rom_global.validation_pass) {
++		if (boot_desc_init(boot_rom_global.valid_manifest_idx) != BOOT_ROM_SUCCESS) {
++			boot_rom_status_update(PROGRESS_INIT_SPI_VALID_MANIFEST_INDEX_FAIL);
++			/* Clear boot rom validation pass in this case and reload manifests */
++			boot_rom_global.validation_pass = 0;
++		}
++	}
++
++	if (!boot_rom_global.validation_pass) {
++		if (!boot_desc_init(HL_FW_SPI_MANIFEST_0))
++			boot_rom_status_update(PROGRESS_INIT_SPI_MANIFEST_0_FAIL);
++
++		if (!boot_desc_init(HL_FW_SPI_MANIFEST_1))
++			boot_rom_status_update(PROGRESS_INIT_SPI_MANIFEST_1_FAIL);
++	}
+ 
+ 	boot_rom_tpm_next_pcr_index_init();
+ }
+@@ -99,7 +111,6 @@
+ 	boot_rom_halt();
+ }
+ 
+-
+ void boot_rom_fake_fuse(void)
+ {
+ 	/* Empty Body */
+@@ -117,7 +128,8 @@
+ 	if (boot_rom_efuse_force_recovery_en())
+ 		override = boot_rom_read_force_recovery_gpio();
+ 
+-	if ((!boot_rom_boot_desc_init_done(HL_FW_SPI_MANIFEST_0)) || (!override))
++	if (((!boot_rom_boot_desc_init_done(HL_FW_SPI_MANIFEST_0)) &&
++		(!boot_rom_boot_desc_init_done(HL_FW_SPI_MANIFEST_1))) || (!override))
+ 		execute_recovery();
+ }
+ 

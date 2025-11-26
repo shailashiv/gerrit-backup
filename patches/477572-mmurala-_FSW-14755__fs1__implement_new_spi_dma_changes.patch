@@ -1,0 +1,284 @@
+From dca8c270aff7a3d2d71d97c3924421b513337926 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Thu, 03 Apr 2025 12:53:34 +0300
+Subject: [PATCH] [FSW-14755] fs1: implement new spi dma changes
+
+with this patch, added continuous crc calculation
+support to spi dma api. hence, no crc check at
+end of every dma chunk and crc check done only
+after last chunk. This crc check controlled by
+crc error check flag.
+
+Change-Id: I4be229040e97f86fe6c24e0a45870f6da8616e66
+---
+
+diff --git a/arch/fs1/arc/dev_dma.c b/arch/fs1/arc/dev_dma.c
+index 48d3f1f..9cdd971 100644
+--- a/arch/fs1/arc/dev_dma.c
++++ b/arch/fs1/arc/dev_dma.c
+@@ -11,6 +11,7 @@
+ #include <parc_global_conf_masks.h>
+ #include <parc_global_conf_regs.h>
+ #include <fs1_reg_map.h>
++#include <progress_bits.h>
+ #include <dma.h>
+ 
+ #define DMA_ADDRESS_LOW(x)	((x) & MASK_32_BIT)
+@@ -65,7 +66,7 @@
+ 		      IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_CTRL));
+ }
+ 
+-int dma_wait_finish(void)
++uint32_t dma_wait_finish(void)
+ {
+ 	uint32_t reg_spi_dma_status_s = 0;
+ 
+@@ -74,18 +75,6 @@
+ 		  regmap_readl(IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_STATUS));
+ 	} while ((reg_spi_dma_status_s & PARC_GLOBAL_CONF_SPI_DMA_STATUS_DONE_M) == 0);
+ 
++	/* TODO: implement timeout for 64KB data chunk */
+ 	return (reg_spi_dma_status_s & PARC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_M);
+-}
+-
+-enum dma_error dma_crc_check(uint32_t expected_crc)
+-{
+-	uint32_t reg_spi_dma_crc_s = 0;
+-
+-	reg_spi_dma_crc_s =
+-		regmap_readl(IO0_H0_PSOC_PARC_CFG_MISC_BASE(mmPARC_GLOBAL_CONF_SPI_DMA_CRC));
+-
+-	if (reg_spi_dma_crc_s != expected_crc)
+-		return DMA_INVALID_CRC_ERROR;
+-
+-	return DMA_SUCCESS;
+ }
+diff --git a/arch/fs1/arc/dev_dma.h b/arch/fs1/arc/dev_dma.h
+index 0dcfb9d..7d101d3 100644
+--- a/arch/fs1/arc/dev_dma.h
++++ b/arch/fs1/arc/dev_dma.h
+@@ -6,10 +6,9 @@
+ #ifndef _DEV_DMA_H_
+ #define _DEV_DMA_H_
+ 
+-int dma_wait_finish(void);
++uint32_t dma_wait_finish(void);
+ void dma_copy_image_internal(uint16_t image_size, uint32_t flash_offset,
+ 			     uint64_t dest_offset, uint8_t fw_sram_dst,
+ 			     uint8_t restart_crc, uint8_t mask_crc);
+-enum dma_error dma_crc_check(uint32_t expected_crc);
+ 
+ #endif /* _DEV_DMA_H_ */
+diff --git a/arch/jgs/arc/dev_dma.c b/arch/jgs/arc/dev_dma.c
+index a34b1a0..80467fb 100644
+--- a/arch/jgs/arc/dev_dma.c
++++ b/arch/jgs/arc/dev_dma.c
+@@ -11,6 +11,7 @@
+ #include <parc_global_conf_masks.h>
+ #include <parc_global_conf_regs.h>
+ #include <jgs_reg_map.h>
++#include <progress_bits.h>
+ #include <dma.h>
+ #include <address_space.h>
+ 
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 934209a..fdbca6e 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -117,7 +117,7 @@
+ 
+ 	/* Fetch boot desc using DMA into dest offset */
+ 	err = boot_rom_spi_dma(img_ptrs_size, p_spi_manifest_const->manifest_spi_offset,
+-			       p_spi_manifest_const->dest_addr_dma, false, false, 0);
++			       p_spi_manifest_const->dest_addr_dma, true);
+ 
+ 	if (boot_rom_process_dma_err(err, dma_sts_base))
+ 		return BOOT_ROM_FAIL;
+@@ -295,7 +295,7 @@
+ 	return false;
+ }
+ 
+-#define PPBOOT_MAX_IMAGE_SIZE	(2 * MAX_DMA_SIZE_NO_CRC)
++#define PPBOOT_MAX_IMAGE_SIZE	((2 * MAX_DMA_SIZE) + (CRC32_SIZE))
+ uint32_t boot_rom_verify_img_desc_address_range(struct boot_desc *desc,
+ 						enum boot_rom_progress img_sts_base,
+ 						enum hl_fw_img_type img)
+@@ -380,7 +380,7 @@
+ 
+ 	/* Fetch boot desc using DMA into dest offset */
+ 	ret = boot_rom_spi_dma(fake_fuse_boot_ptr_size, fake_fuse_base,
+-		spi_manifest_consts.dest_addr_dma, false, false, 0);
++		spi_manifest_consts.dest_addr_dma, true);
+ 
+ 	if (ret != DMA_SUCCESS) {
+ 		boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_DMA_COPY_FAIL);
+diff --git a/common/boot_flow.c b/common/boot_flow.c
+index 0e7e1c9..badee10 100644
+--- a/common/boot_flow.c
++++ b/common/boot_flow.c
+@@ -49,7 +49,8 @@
+ 		return BOOT_ROM_FAIL;
+ 
+ 	err = boot_rom_spi_dma(desc->img_size, desc->spi_offset[manifest_idx], desc->loadaddr,
+-			       false, false, 0);
++		true);
++
+ 	if (boot_rom_process_dma_err(err, img_sts_base)) {
+ 		boot_rom_report_image_status(manifest_idx, CRC_FAIL);
+ 		return BOOT_ROM_FAIL;
+@@ -290,7 +291,8 @@
+ 			return BOOT_ROM_FAIL;
+ 
+ 		err = boot_rom_spi_dma(desc.img_size, desc.spi_offset[manifest_idx], desc.loadaddr,
+-				false, false, 0);
++			true);
++
+ 		if (boot_rom_process_dma_err(err, img_sts_base))
+ 			return BOOT_ROM_FAIL;
+ 
+diff --git a/common/dma.c b/common/dma.c
+index d7c00a0..f1ecad4 100644
+--- a/common/dma.c
++++ b/common/dma.c
+@@ -35,16 +35,13 @@
+ }
+ 
+ enum dma_error boot_rom_spi_dma(uint32_t image_size, uint32_t flash_offset,
+-				uint64_t dest_addr, bool skip_crc_check,
+-				bool manual_crc, uint32_t expected_crc)
++				uint64_t dest_addr, bool wait)
+ {
+ 	enum dma_dest_type dest_type;
+ 	uint32_t copy_size, dma_size, dma_chunks;
+-	uint8_t i, restart_crc = 1, mask_crc = 0;
+-	uint32_t max_dma_size = MAX_DMA_SIZE_CRC + CRC32_SIZE;
+-	uint32_t max_dma_chunk_size = MAX_DMA_SIZE_CRC;
+-	uint32_t min_dma_size = MIN_DMA_SIZE_CRC;
+-	uint32_t crc_sz_per_chunk = CRC32_SIZE;
++	uint8_t i, restart_crc = 0, mask_crc_err = 0;
++	uint32_t max_dma_size = MAX_DMA_SIZE;
++	uint32_t image_size_no_crc = 0, ret = 0;
+ 
+ 	dest_type = boot_rom_get_dma_dest_type(dest_addr);
+ 
+@@ -54,48 +51,48 @@
+ 	if (dest_addr % ADDR_SIZE_ALIGNMENT)
+ 		return DMA_UNALIGNED_DEST_ADDR;
+ 
+-	if (manual_crc) {
+-		mask_crc = 1;
+-		max_dma_chunk_size = MAX_DMA_SIZE_NO_CRC;
+-		max_dma_size = MAX_DMA_SIZE_NO_CRC;
+-		min_dma_size = MIN_DMA_SIZE_NO_CRC;
+-		crc_sz_per_chunk = 0;
+-	}
+-
+-	if (image_size < min_dma_size)
++	if (image_size < (MIN_DMA_SIZE + CRC32_SIZE))
+ 		return DMA_INVALID_IMG_SIZE;
+ 
+ 	if ((flash_offset + image_size) > SPI_FLASH_SIZE)
+ 		return DMA_INVALID_FLASH_OFFSET;
+ 
+-	dma_chunks = image_size / max_dma_size;
+-	if (image_size % max_dma_size)
+-		dma_chunks++;
+-
+-	if ((image_size - (crc_sz_per_chunk * dma_chunks)) % ADDR_SIZE_ALIGNMENT)
++	if ((image_size - (CRC32_SIZE)) % ADDR_SIZE_ALIGNMENT)
+ 		return DMA_UNALIGNED_IMG_SIZE;
+ 
+-	copy_size = image_size;
++	image_size_no_crc = image_size - CRC32_SIZE;
++	dma_chunks = image_size_no_crc / max_dma_size;
++	if (image_size_no_crc % max_dma_size)
++		dma_chunks++;
++
++	copy_size = image_size_no_crc;
+ 
+ 	for (i = 0; i < dma_chunks; i++) {
+-		dma_size = copy_size > max_dma_size ? max_dma_size : copy_size;
+-		dma_copy_image_internal(dma_size, (flash_offset + (OFFSET_64KB * i)),
+-					(dest_addr + (max_dma_chunk_size * i)), dest_type,
+-					restart_crc, mask_crc);
++		/* Restart crc calculation freshly from 1st dma chunk */
++		restart_crc = (i == 0) ? 1 : 0;
+ 
+-		if ((!skip_crc_check) &&
+-		    (dma_wait_finish() == PARC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_M))
+-			return DMA_INVALID_CRC_ERROR;
++		/* Enable crc error check for last dma chunk */
++		mask_crc_err = (i == (dma_chunks - 1)) ? 0 : 1;
+ 
+-		/* After first chunk restart crc calculation */
+-		if (manual_crc)
+-			restart_crc = 0;
++		dma_size = (copy_size > max_dma_size) ? max_dma_size : copy_size;
++		if (mask_crc_err == 0)
++			dma_size =  dma_size + CRC32_SIZE;
++
++		dma_copy_image_internal(dma_size, (flash_offset + (OFFSET_63KB * i)),
++					(dest_addr + (max_dma_size * i)), dest_type,
++					restart_crc, mask_crc_err);
+ 
+ 		copy_size -= dma_size;
+-	}
+ 
+-	if (manual_crc && (!skip_crc_check))
+-		return dma_crc_check(expected_crc);
++		if (wait) {
++			ret = dma_wait_finish();
++			if ((mask_crc_err == 0) && (ret == PARC_GLOBAL_CONF_SPI_DMA_STATUS_ERROR_M)) {
++				return DMA_INVALID_CRC_ERROR;
++			}
++		} else {
++			/* TODO: background spi dma copy */
++		}
++	}
+ 
+ 	return DMA_SUCCESS;
+ }
+diff --git a/common/dma.h b/common/dma.h
+index c468c36..87b7c02 100644
+--- a/common/dma.h
++++ b/common/dma.h
+@@ -6,14 +6,17 @@
+ #ifndef _DMA_H_
+ #define _DMA_H_
+ 
+-#include <progress_bits.h>
++#define OFFSET_63KB			0xFC00
+ 
+-#define OFFSET_64KB			0x10000
+-#define MAX_DMA_SIZE_CRC	0xFFF0
+-#define MAX_DMA_SIZE_NO_CRC	0x10000
+-#define MIN_DMA_SIZE_NO_CRC	16	/* 16 bytes */
++/*
++ * MEM Size - Bit[17-4]. Total 14 bits, map -> 0x3FFF.
++ * 0x3FFF * 4 = 0xFFFC. Which is not aligned to 16Bytes.
++ * And SPI offset can be multiples of 1KB.
++ * Hence, use nearest multiple of 1K and 16Byte aligned is 63KB.
++ */
++#define MAX_DMA_SIZE		OFFSET_63KB
++#define MIN_DMA_SIZE		16	/* 16 bytes */
+ #define ADDR_SIZE_ALIGNMENT	16	/* 16 bytes */
+-#define MIN_DMA_SIZE_CRC	(MIN_DMA_SIZE_NO_CRC + CRC32_SIZE)
+ 
+ enum dma_error {
+ 	DMA_SUCCESS = 0,
+@@ -43,13 +46,9 @@
+  * @param image_size size of the image to be dma from spi
+  * @param flash_offset start offset of image in flash
+  * @param dest_addr fw mem or hbw address where image should be copied
+- * @param skip_crc_check api will skip crc check when true
+- * @param manual_crc api will perform manual crc check at the end of dma when true
+- * @param expected_crc 32-bit crc value to compare with at the end of dma. Valid
+- * only if manual_crc is true.
++ * @param wait flag to decide wait or return after dma transfer start
+  */
+ enum dma_error boot_rom_spi_dma(uint32_t image_size, uint32_t flash_offset,
+-				uint64_t dest_addr, bool skip_crc_check,
+-				bool manual_crc, uint32_t expected_crc);
++				uint64_t dest_addr, bool wait);
+ 
+ #endif /* _DMA_H_ */

@@ -1,0 +1,178 @@
+From 265dbfc8162a478589508780f3ca9ea946bea065 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 12 Apr 2022 20:21:01 +0300
+Subject: [PATCH] [SW-78052] gaudi3: notify slave fuse value
+
+Currently, for fake fuse emulation the values used are common for master
+and slave die. However certain fuse bits have different meaning for master
+and slave die. This leads to create different set of fuse values
+for both dies. This patch adds implementation for master to read slave
+die fuse values from slave fuse offset and inform required fuse value to
+slave die as slave die cannot access SPI flash. Notifying fuse value
+from master to slave die is only valid for fake fuse emulation.
+
+Change-Id: Ic975074921f1d198e0400f75617637ad28c50669
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 19d1a5c..871218f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -403,6 +403,9 @@
+ 	arcboot_rom_global.config_fuse = val;
+ 	fuse_read(EFUSE_SYSCFG2_OFFSET, &arcboot_rom_global.config2_fuse);
+ 
++	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SKU_MASK)
++		arcboot_rom_global.sku = 1;
++
+ 	/* Override the fuse values as per requirement */
+ 	arcboot_rom_fuse_override();
+ 
+@@ -410,10 +413,18 @@
+ 	if (!(val & EFUSE_SYSCFG_EFUSE_LOCATION_MASK) &&
+ 		(strap_l & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L_EFUSE_OVERRIDE_M)) {
+ 		spi_flash_fuse_init();
+-	}
++		/*
++		 * Re-configure sku value based on new config_fuse,
++		 * Don't re-configure if original sku value is 1.
++		 */
++		if (arcboot_rom_global.sku)
++			return;
+ 
+-	if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SKU_MASK)
+-		arcboot_rom_global.sku = 1;
++		if (arcboot_rom_global.config_fuse & EFUSE_SYSCFG_SKU_MASK)
++			arcboot_rom_global.sku = 1;
++		else
++			arcboot_rom_global.sku = 0;
++	}
+ }
+ 
+ void arcboot_rom_disable_spi_gw(void)
+diff --git a/arch/gaudi3/arc/dev_common.h b/arch/gaudi3/arc/dev_common.h
+index 708e5c0..ca7d335 100644
+--- a/arch/gaudi3/arc/dev_common.h
++++ b/arch/gaudi3/arc/dev_common.h
+@@ -10,3 +10,4 @@
+ void arcboot_rom_notify_slave(void);
+ uint32_t arcboot_rom_get_num_crc(uint32_t size);
+ uint32_t arcboot_rom_get_arc_addr(uint64_t addr);
++void arcboot_rom_wait_for_fuse_data(void);
+diff --git a/arch/gaudi3/arc/regmap.h b/arch/gaudi3/arc/regmap.h
+index 7418e6e..5ad5cfe 100644
+--- a/arch/gaudi3/arc/regmap.h
++++ b/arch/gaudi3/arc/regmap.h
+@@ -38,6 +38,8 @@
+ #define mmMEM_CPY_CTRL2			mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2
+ #define mmMEM_CPY_AXUSER		mmD0_PSOC_GLOBAL_CONF2_MEM_CPY_HBW_ATTR_CTRL_HB_MMU_BYPASS_OVRD
+ #define mmSPI_DIRECT_WR_RD_CTRL		mmD0_PSOC_GLOBAL_CONF_SPI_DIRECT_WR_RD_CTRL
++#define mmD1_SYSCFG1_EFUSE_DATA		mmD1_PSOC_GLOBAL_CONF_SCRATCHPAD_0
++#define mmD1_SYSCFG2_EFUSE_DATA		mmD1_PSOC_GLOBAL_CONF_SCRATCHPAD_1
+ 
+ #define mmGPIO0_DATA			mmD0_PSOC_GPIO0_DATA
+ 
+diff --git a/arch/gaudi3/arc/slave.c b/arch/gaudi3/arc/slave.c
+index 6092903..e96d5a2 100644
+--- a/arch/gaudi3/arc/slave.c
++++ b/arch/gaudi3/arc/slave.c
+@@ -51,3 +51,26 @@
+ 		udelay(WAIT_SLEEP_DURATION_US);
+ 	}
+ }
++
++#define FUSE_EMULATION_DATA_RETRIES	50
++#define FUSE_EMULATION_DATA_UDELAY	100
++void arcboot_rom_wait_for_fuse_data(void)
++{
++	uint32_t retry = FUSE_EMULATION_DATA_RETRIES;
++	uint32_t val;
++
++	while (1) {
++		val = mirror_readl(mmD0_PSOC_SECURITY_SW_STATUS_0);
++		if (val & BIT(PROGRESS_INIT_EFUSE_SPI))
++			break;
++
++		retry--;
++		if (!retry)
++			return;
++
++		udelay(FUSE_EMULATION_DATA_UDELAY);
++	}
++
++	arcboot_rom_global.config_fuse = regmap_readl(mmD1_SYSCFG1_EFUSE_DATA);
++	arcboot_rom_global.config2_fuse = regmap_readl(mmD1_SYSCFG2_EFUSE_DATA);
++}
+diff --git a/arch/gaudi3/arc/spi_flash.c b/arch/gaudi3/arc/spi_flash.c
+index 372b8b1..a75c954 100644
+--- a/arch/gaudi3/arc/spi_flash.c
++++ b/arch/gaudi3/arc/spi_flash.c
+@@ -8,6 +8,7 @@
+ #include <spi_flash.h>
+ #include <efuse.h>
+ #include <boot_desc.h>
++#include <dev_common.h>
+ 
+ void spi_flash_init(void)
+ {
+@@ -36,13 +37,50 @@
+ 	return 0;
+ }
+ 
++void spi_flash_slave_init(void)
++{
++	uint32_t offset, d1_syscfg1, d1_syscfg2, idx;
++	struct boot_desc desc;
++
++	if (arcboot_rom_global.sku)
++		return;
++
++	/* Slave spi offset is stored in img_desc->spi_offset[1] */
++	idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, HL_FW_IMG_FAKE_EFUSE,
++					&desc, FLOPS_UPD_PENDING);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return;
++
++	/* read value from bank0 */
++	offset = (EFUSE_SYSCFG_OFFSET * sizeof(uint32_t));
++	d1_syscfg1 = spi_flash_readl(desc.spi_offset + offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((FUSE_WORDS_PER_BANK + EFUSE_SYSCFG_OFFSET) * sizeof(uint32_t));
++	d1_syscfg1 |= spi_flash_readl(desc.spi_offset + offset);
++
++	/* read value from bank0 */
++	offset = (EFUSE_SYSCFG2_OFFSET * sizeof(uint32_t));
++	d1_syscfg2 = spi_flash_readl(desc.spi_offset + offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((FUSE_WORDS_PER_BANK + EFUSE_SYSCFG2_OFFSET) * sizeof(uint32_t));
++	d1_syscfg2 |= spi_flash_readl(desc.spi_offset + offset);
++
++	/* Notify slave config fuse value in slave scratchpad 0/1 register */
++	mirror_writel(d1_syscfg1, mmD1_SYSCFG1_EFUSE_DATA);
++	mirror_writel(d1_syscfg2, mmD1_SYSCFG2_EFUSE_DATA);
++}
++
+ void spi_flash_fuse_init(void)
+ {
+ 	struct boot_desc desc;
+ 	uint32_t val, idx;
+ 
+-	if (arcboot_rom_global.die_id)
++	if (arcboot_rom_global.die_id) {
++		arcboot_rom_wait_for_fuse_data();
+ 		return;
++	}
+ 
+ 	idx = boot_desc_get_img_desc(HL_FW_BOOT_PTR_SPI, HL_FW_IMG_FAKE_EFUSE,
+ 					&desc, FLOPS_UPD_NOOP);
+@@ -55,6 +93,8 @@
+ 	if (fuse_read(EFUSE_SYSCFG_OFFSET, &val) == -1)
+ 		val = EFUSE_SYSCFG_DEFAULT;
+ 
++	spi_flash_slave_init();
++
+ 	arcboot_rom_global.config_fuse = val;
+ 	fuse_read(EFUSE_SYSCFG2_OFFSET, &arcboot_rom_global.config2_fuse);
+ 	arcboot_rom_status_update(PROGRESS_INIT_EFUSE_SPI);

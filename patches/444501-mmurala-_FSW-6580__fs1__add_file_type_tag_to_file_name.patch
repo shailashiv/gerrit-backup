@@ -1,0 +1,136 @@
+From 6dbd0756d50d7bfdd66c29592494ffdcf45d7f8b Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Sat, 24 Aug 2024 19:19:50 +0300
+Subject: [PATCH] [FSW-6580] fs1: add file type tag to file name
+
+To make file name more informative and for better
+way of identifying the data stored in particular
+file, added file type tag in front of file name.
+
+Change-Id: I2f212a5c32942ca9ef19dc6f613ade94b443a3ac
+---
+
+diff --git a/arch/fs1/arc/progress_bits.h b/arch/fs1/arc/progress_bits.h
+index d7d7fa8..ef10861 100644
+--- a/arch/fs1/arc/progress_bits.h
++++ b/arch/fs1/arc/progress_bits.h
+@@ -146,6 +146,7 @@
+ 	PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL = 134,
+ 	PROGRESS_BOOT_INFO_LFS_FILE_COPY_PART_FAIL = 135,
+ 	PROGRESS_BOOT_INFO_LFS_FILE_SET_FAIL = 136,
++	PROGRESS_BOOT_INFO_LFS_FILE_NAME_FAIL = 137,
+ };
+ 
+ #endif /* _PROGRESS_BITS_H_ */
+diff --git a/common/littlefs/lfs_wrapper.c b/common/littlefs/lfs_wrapper.c
+index a644a9d..4181819 100644
+--- a/common/littlefs/lfs_wrapper.c
++++ b/common/littlefs/lfs_wrapper.c
+@@ -222,10 +222,25 @@
+ 	return str;
+ }
+ 
+-static int __lfs_file_set(uint32_t type, const void *data,
++void lfs_get_file_name(char *file_name, const char *file_tag, uint32_t file_num)
++{
++	char *file_num_str = type2file(file_num);
++	uint8_t i, j;
++
++	for (i = 0; file_tag[i] && (i < LFS_NAME_MAX); i++) {
++		file_name[i] = file_tag[i];
++	}
++
++	for (j = 0; file_num_str[j] && (i < LFS_NAME_MAX); j++, i++) {
++		file_name[i] = file_num_str[j];
++	}
++	file_name[i] = '\0';
++}
++
++static int __lfs_file_set(const char *file_tag, uint32_t type, const void *data,
+ 		     uint32_t size, bool is_truncate)
+ {
+-
++	static char full_name[LFS_NAME_MAX] = { '\0' };
+ 	lfs_file_t file;
+ 	int ret;
+ 
+@@ -233,7 +248,13 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = lfs_file_opencfg(&lfs, &file, type2file(type), LFS_O_RDWR | LFS_O_CREAT | (is_truncate ? LFS_O_TRUNC : 0), &defaults);
++	lfs_get_file_name(full_name, file_tag, type);
++	if (full_name[0] == '\0') {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_NAME_FAIL);
++		return 1;
++	}
++
++	ret = lfs_file_opencfg(&lfs, &file, full_name, LFS_O_RDWR | LFS_O_CREAT | (is_truncate ? LFS_O_TRUNC : 0), &defaults);
+ 	if (ret < 0) {
+ 		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL);
+ 		return ret;
+@@ -252,16 +273,17 @@
+ }
+ 
+ /* lfs_file_set() must use globally allocated 'data' or finalize */
+-int lfs_file_set(uint32_t type, const void *data,
++int lfs_file_set(const char *file_tag, uint32_t type, const void *data,
+ 		     uint32_t size)
+ {
+-	return __lfs_file_set(type, data, size, true);
++	return __lfs_file_set(file_tag, type, data, size, true);
+ }
+ 
+ /* Copy partial info from boot info data stored for type */
+-int lfs_file_copy_partial(uint32_t type, void *data,
++int lfs_file_copy_partial(const char *file_tag, uint32_t type, void *data,
+ 			uint32_t offset, uint32_t size)
+ {
++	static char full_name[LFS_NAME_MAX] = { '\0' };
+ 	lfs_file_t file;
+ 	int ret;
+ 	size_t fsize;
+@@ -270,7 +292,13 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = lfs_file_opencfg(&lfs, &file, type2file(type), LFS_O_RDONLY, &defaults);
++	lfs_get_file_name(full_name, file_tag, type);
++	if (full_name[0] == '\0') {
++		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_NAME_FAIL);
++		return 1;
++	}
++
++	ret = lfs_file_opencfg(&lfs, &file, full_name, LFS_O_RDONLY, &defaults);
+ 	if (ret < 0) {
+ 		boot_rom_status_update(PROGRESS_BOOT_INFO_LFS_FILE_OPEN_CFG_FAIL);
+ 		return ret;
+@@ -305,9 +333,9 @@
+ 	}
+ }
+ 
+-int lfs_file_copy(uint32_t type, void *desc_data, uint32_t size)
++int lfs_file_copy(const char *file_tag, uint32_t type, void *desc_data, uint32_t size)
+ {
+-	return lfs_file_copy_partial(type, desc_data, FULL_COPY, size);
++	return lfs_file_copy_partial(file_tag, type, desc_data, FULL_COPY, size);
+ }
+ 
+ uint32_t lfs_disk_set_empty()
+diff --git a/common/littlefs/lfs_wrapper.h b/common/littlefs/lfs_wrapper.h
+index a5c3116..acd4e35 100644
+--- a/common/littlefs/lfs_wrapper.h
++++ b/common/littlefs/lfs_wrapper.h
+@@ -11,9 +11,9 @@
+ 
+ int lfs_init_disk(void);
+ 
+-int lfs_file_set(uint32_t type, const void *data, uint32_t size);
+-int lfs_file_copy(uint32_t type, void *desc_data, uint32_t size);
+-int lfs_file_copy_partial(uint32_t type, void *data,
++int lfs_file_set(const char *file_tag, uint32_t type, const void *data, uint32_t size);
++int lfs_file_copy(const char *file_tag, uint32_t type, void *desc_data, uint32_t size);
++int lfs_file_copy_partial(const char *file_tag, uint32_t type, void *data,
+ 			uint32_t offset, uint32_t size);
+ uint32_t lfs_disk_set_empty();
+ 

@@ -1,0 +1,78 @@
+From fa8809c321650b615b7ca72ef0b1520114a54e02 Mon Sep 17 00:00:00 2001
+From: Murala S Swamy <ssmurala@habana.ai>
+Date: Wed, 11 Sep 2024 19:41:23 +0300
+Subject: [PATCH] [FSW-8694] fs1: handle slave spi fuse
+
+Added slave die support to wait for spi fuse
+values from master die, slave will wait for
+trigger over scratch_pad_2 register from master.
+As slave die doesnt have access to SPI flash
+memory, master is responsible to read and
+distribute spi fuse values to all slave die's.
+
+Change-Id: I6c61434bc48a32a420fb949fa47ac53559b4110e
+---
+
+diff --git a/arch/fs1/arc/slave.c b/arch/fs1/arc/slave.c
+index 6a45177..1d82582 100644
+--- a/arch/fs1/arc/slave.c
++++ b/arch/fs1/arc/slave.c
+@@ -16,6 +16,9 @@
+ #include <psoc_boot_conf_masks.h>
+ #include <fs1_reg_map.h>
+ #include <dev_uart.h>
++#include <spi_flash.h>
++
++#define SPI_FUSE_EMULATION_DATA_UDELAY	5000 /* 5ms */
+ 
+ void boot_rom_wait_for_recovery_in(void)
+ {
+@@ -62,3 +65,24 @@
+ 
+ 	execute_recovery();
+ }
++
++void boot_rom_wait_for_spi_fuse_data(void)
++{
++	uint64_t start;
++	uint32_t val;
++
++	start = boot_rom_get_ts_us();
++	while (1) {
++		val = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_2));
++		if (val == FFUSE_WRITE_IND_MAGIC)
++			break;
++
++		if (boot_rom_timeout_expired(start, SPI_FUSE_EMULATION_DATA_UDELAY)) {
++			boot_rom_status_update(PROGRESS_INIT_EFUSE_SPI_SLV_TIMEDOUT);
++			return;
++		}
++	}
++
++	boot_rom_global.config_fuse = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_0));
++	boot_rom_global.config2_fuse = regmap_readl(IO0_H0_PSOC_GLOBAL_CONF(mmGLOBAL_CONF_SCRATCHPAD_1));
++}
+diff --git a/common/common.c b/common/common.c
+index e66f180..94efcb4 100644
+--- a/common/common.c
++++ b/common/common.c
+@@ -123,7 +123,7 @@
+ 		return;
+ 
+ 	if (!boot_rom_in_master_die()) {
+-		/* TODO: Handle slave Die */
++		boot_rom_wait_for_spi_fuse_data();
+ 		return;
+ 	}
+ 
+diff --git a/common/common.h b/common/common.h
+index 4d591be..85de629 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -39,5 +39,6 @@
+ bool boot_rom_spi_efuse_enabled(void);
+ void boot_rom_config_arc_regions(void);
+ void boot_rom_init_slave_spi_efuse(void);
++void boot_rom_wait_for_spi_fuse_data(void);
+ 
+ #endif /* _COMMON_H_ */

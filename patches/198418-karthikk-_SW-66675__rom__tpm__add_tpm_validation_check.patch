@@ -1,0 +1,86 @@
+From 555c35c333b88e2d33f5662a78a921814c85a4cd Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 11 Apr 2022 09:09:05 +0300
+Subject: [PATCH] [SW-66675] rom: tpm: add tpm validation check
+
+In order to avoid re-processing, tpm validation pass bit is added
+in the cold reset flops flags.
+
+Using this we can skip re-validation of a tpm image that has already
+been validated.
+
+Change-Id: I6d7f7c757b909997c04e31d2eab689e5ed81569c
+---
+
+diff --git a/app/arcboot_rom.c b/app/arcboot_rom.c
+index 125b40b..71bc5dd 100644
+--- a/app/arcboot_rom.c
++++ b/app/arcboot_rom.c
+@@ -52,6 +52,7 @@
+ 		.desc_info = {0},
+ 	},
+ 	.pci_link_up = false,
++	.tpm_validation_pass = false,
+ };
+ 
+ static struct hl_rsp_err pending_error;
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 91788f4..0beea1c 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -342,6 +342,7 @@
+ 	arcboot_rom_global.recovery_flag = cold_rst_data.recovery_flag;
+ 	arcboot_rom_global.validation_pass = cold_rst_data.validation_flag;
+ 	arcboot_rom_global.efuse_read = cold_rst_data.efuse_read_flag;
++	arcboot_rom_global.tpm_validation_pass = cold_rst_data.tpm_validation_flag;
+ }
+ 
+ void arcboot_rom_init(void)
+@@ -659,6 +660,16 @@
+ 	return 0;
+ }
+ 
++static void arcboot_rom_tpm_validation(bool pass)
++{
++	struct gaudi3_cold_rst_data cold_rst_data;
++
++	/* validation pass, set validation flag and clear recovery */
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_FLOPS_2);
++	cold_rst_data.tpm_validation_flag = pass;
++	regmap_writel(cold_rst_data.data, mmCOLD_RST_FLOPS_2);
++}
++
+ void arcboot_rom_handle_tpm(void)
+ {
+ 	if (!security_efuse_tpm_en())
+@@ -668,8 +679,17 @@
+ 		/* TODO: Add erom tpm routine*/
+ 	} else {
+ 		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_TPM);
+-		if (arcboot_rom_tpm_rom())
++
++		if (arcboot_rom_global.tpm_validation_pass) {
++			arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_TPM_FINISH);
+ 			return;
++		}
++
++		if (!arcboot_rom_tpm_rom()) {
++			arcboot_rom_tpm_validation(true);
++		} else {
++			arcboot_rom_tpm_validation(false);
++		}
+ 	}
+ }
+ 
+diff --git a/include/arcboot.h b/include/arcboot.h
+index 53e3ead..7a79275 100644
+--- a/include/arcboot.h
++++ b/include/arcboot.h
+@@ -90,6 +90,7 @@
+ 	struct hl_img_ptrs_erom img_ptrs_erom;
+ 	struct hl_fw_sec_info sec_data;
+ 	bool pci_link_up;
++	uint8_t tpm_validation_pass;
+ };
+ 
+ enum arcboot_rom_bringup_proggress {

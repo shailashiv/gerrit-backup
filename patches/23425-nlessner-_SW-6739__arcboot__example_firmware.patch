@@ -1,0 +1,337 @@
+From 5a00660f01e9719a4715c47fd1b48c79ab5093a7 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 17 Dec 2019 09:56:38 +0200
+Subject: [PATCH] [SW-6739] arcboot: example firmware
+
+add support for soc addressing
+arcboot example for SPI DMA
+arcboot_rom example for secureboot sdk
+
+Change-Id: If94b52a9641477dafe19338dce4139a8ead3801a
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 26d25b1..905353b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -11,6 +11,8 @@
+ 
+ LIBDIR = sdk/lib
+ ARCBOOT_CFLAGS = -DSB_RSA_STD -DSB_FAST_MODE -DELP_SOURCE -Wall -W -Werror -O3
++ARCBOOT_CFLAGS += -Iinclude
++ARCBOOT_CFLAGS += -I$(HL_DEV)
+ ARCBOOT_CFLAGS += -Isdk/src
+ ARCBOOT_CFLAGS += -Isdk/src/include
+ ARCBOOT_CFLAGS += -Isdk/elpsoft/src/headers
+diff --git a/common/arcboot.c b/common/arcboot.c
+index 91ade8b..0a2d43d 100644
+--- a/common/arcboot.c
++++ b/common/arcboot.c
+@@ -1,45 +1,8 @@
+-/*
+- * arcboot - Signature Verification
+- *
+- * A simple application which call phase0b to validate the signature
+- * of a blob of data.
+- *
+- * Both the protected data and the signature of the protected data can be
+- * changed, but the public key should be locked into the device.
+- *
+- * test_phase0b_data     - blob of protected data
+- * test_phase0b_data_len - size of the blob
+- * test_phase0b_sig      - signature of the blob
+- * test_phase0b_sig_len  - signature size
+- * test_public_key       - public key
+- * test_public_key_len   - public key size
+- */
+-
+ #include <stdio.h>
+-#include "sb.h"
++#include "soc.h"
++#include "arcboot.h"
+ 
+-unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
+-uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
+-unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
+-uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
+-unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
+-uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
+-
+-int main(void)
++int arcboot_main(void)
+ {
+-	int st, err;
+-	unsigned char block_buf[512];
+-
+-	XSTACK_INIT();
+-
+-	/* Phase0b uses the public key (test_public_key) to validate signature (test_phase0b_sig)
+-	 * of the data blob (test_phase0b_data) */
+-	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
+-			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
+-
+-	//printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
+-	if (err || !st) {
+-		return -1;
+-	}
+ 	return 0;
+ }
+diff --git a/common/arcboot_rom.c b/common/arcboot_rom.c
+index 91ade8b..a8e14bc 100644
+--- a/common/arcboot_rom.c
++++ b/common/arcboot_rom.c
+@@ -16,19 +16,63 @@
+  */
+ 
+ #include <stdio.h>
++#include "soc.h"
+ #include "sb.h"
++#include "arcboot.h"
+ 
+-unsigned char __attribute__ ((section(".test_phase0b_data"))) test_phase0b_data[16384];
+-uint32_t __attribute__ ((section(".test_phase0b_data_len"))) test_phase0b_data_len;
+-unsigned char __attribute__ ((section(".test_phase0b_sig"))) test_phase0b_sig[2048];
+-uint32_t __attribute__ ((section(".test_phase0b_sig_len"))) test_phase0b_sig_len;
+-unsigned char __attribute__ ((section(".test_public_key"))) test_public_key[2048];
+-uint32_t __attribute__ ((section(".test_public_key_len"))) test_public_key_len;
++unsigned char __attribute__ ((section(".fw_sram"))) fw_sram[FW_SIZE];
+ 
+-int main(void)
++int arcboot_dma_copy_image(uint32_t image_size)
++{
++	uint32_t reg_spi_dma_ctrl_s =  0;
++	uint32_t reg_spi_dma_status_s = 0;
++	uint32_t tmp = 0;
++	uint32_t next_image_add = 0;
++
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
++
++	image_size = flash_readl(FLASH_IMAGE_1_OFFSET +
++				 FLASH_IMAGE_PREBOOT_OFFSET);
++	regmap_writel(image_size, mmPSOC_SECURITY_SW_STATUS_0);
++
++	next_image_add = image_size % SPI_FLASH_BLOCK_SIZE;
++	regmap_writel(next_image_add, mmPSOC_SECURITY_SW_STATUS_1);
++
++	next_image_add += image_size;
++	regmap_writel(next_image_add, mmPSOC_SECURITY_SW_STATUS_2);
++
++	image_size = flash_readl(FLASH_IMAGE_1_OFFSET + next_image_add);
++	regmap_writel(tmp, mmPSOC_SECURITY_SW_STATUS_4);
++
++	reg_spi_dma_ctrl_s = image_size << 18;
++	reg_spi_dma_ctrl_s = 0; // addr
++	reg_spi_dma_ctrl_s = 1 << 1; //sram
++	reg_spi_dma_ctrl_s = 1; // en
++
++	regmap_writel(reg_spi_dma_ctrl_s, mmPSOC_GLOBAL_CONF_SPI_DMA_CTRL);
++	do {
++		tmp = regmap_readl(mmPSOC_SECURITY_SW_STATUS_0) + 1;
++		regmap_writel(tmp, mmPSOC_SECURITY_SW_STATUS_0);
++		reg_spi_dma_status_s =
++		 regmap_readl(mmPSOC_GLOBAL_CONF_SPI_DMA_STATUS);
++		regmap_writel(reg_spi_dma_status_s,
++				  mmPSOC_SECURITY_SW_STATUS_1);
++	} while (reg_spi_dma_status_s & 0x3);
++	return 0;
++}
++
++int arcboot_verify_image(uint32_t image_size)
+ {
+ 	int st, err;
+ 	unsigned char block_buf[512];
++	uint16_t test_phase0b_data_len = image_size - SIG_SIZE;
++
++	unsigned char *test_phase0b_data = &fw_sram[BLOB_START];
++	unsigned char *test_phase0b_sig = &fw_sram[test_phase0b_data_len];
++	unsigned char *test_public_key = test_phase0b_sig - KEY_SIZE;
++	uint32_t test_phase0b_sig_len = SIG_SIZE;
++	uint32_t test_public_key_len = KEY_SIZE;
+ 
+ 	XSTACK_INIT();
+ 
+@@ -37,9 +81,23 @@
+ 	err = elp_secureboot_phase0b(sb_proxy_read, test_phase0b_data, test_phase0b_data_len, test_public_key, test_public_key_len,
+ 			test_phase0b_sig, test_phase0b_sig_len, &st, block_buf, sizeof block_buf);
+ 
+-	//printf("SB Phase0b Test: %s\n", (err || !st) ? "FAILED" : "PASSED");
+ 	if (err || !st) {
+-		return -1;
++		regmap_writel(0x800, mmPSOC_SECURITY_STATUS);
++		regmap_writel(err, mmPSOC_SECURITY_SW_STATUS_0);
++		regmap_writel(st, mmPSOC_SECURITY_SW_STATUS_1);
+ 	}
++
++	regmap_writel(1, mmPSOC_SECURITY_STATUS);
++	return 0;
++}
++
++int arcboot_rom_main(void)
++{
++	uint32_t image_size = 0;
++
++	image_size = ((uint32_t *)fw_sram)[0];
++	//arcboot_dma_copy_image(image_size);
++	arcboot_verify_image(image_size);
++
+ 	return 0;
+ }
+diff --git a/common/crt0.S b/common/crt0.S
+index 63f3ae6..31fa6b6 100644
+--- a/common/crt0.S
++++ b/common/crt0.S
+@@ -59,7 +59,7 @@
+ .Lend_cdata:
+ 
+ 	;; branch to main
+-	bl.d @main
++	bl.d @arcboot_main
+ 	mov fp, 0		; initialize frame pointer
+ 				; r0 contains exit code
+ 	j @_exit_halt
+diff --git a/common/crt0_rom.S b/common/crt0_rom.S
+index e431ed8..e247fcd 100644
+--- a/common/crt0_rom.S
++++ b/common/crt0_rom.S
+@@ -96,7 +96,7 @@
+ .Lend_cdata:
+ 
+ 	;; branch to main
+-	bl.d @main
++	bl.d @arcboot_rom_main
+ 	mov fp, 0		; initialize frame pointer
+ 				; r0 contains exit code
+ 	j @_exit_halt
+diff --git a/goya2_arc/soc.h b/goya2_arc/soc.h
+new file mode 100644
+index 0000000..e58c587
+--- /dev/null
++++ b/goya2_arc/soc.h
+@@ -0,0 +1,12 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _SOC_H_
++#define _SOC_H_
++#include <goya2_regs.h>
++
++#endif /* _SOC_H_ */
+\ No newline at end of file
+diff --git a/include/arcboot.h b/include/arcboot.h
+new file mode 100644
+index 0000000..8320116
+--- /dev/null
++++ b/include/arcboot.h
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _ARCBOOT_H_
++#define _ARCBOOT_H_
++
++#define BIT(nr)					(1 << (nr))
++#define ARRAY_SIZE(x)				(sizeof(x) / sizeof((x)[0]))
++
++#define FW_SIZE					65535
++#define SIG_SIZE				384
++#define KEY_SIZE				384
++#define BLOB_START				4
++
++#define SPI_FLASH_BLOCK_SIZE			1024
++
++#define SDRAM_BASE				0x30000000
++#define HL_FLASH_OFFSET				0xA000000
++#define HL_SBROM_OFFSET				0xB040000
++#define HL_FWSRAM_OFFSET			0xB050000
++
++
++#define HL_FLASH_BASE				(SDRAM_BASE + HL_FLASH_OFFSET)
++#define HL_SBROM_BASE				(SDRAM_BASE + HL_SBROM_OFFSET)
++#define HL_FWSRAM_BASE				(SDRAM_BASE + HL_FWSRAM_OFFSET)
++#define HL_CFG_BASE				0xFC000000
++
++//SPI FLASH CONST
++#define FLASH_IMAGE_1_OFFSET			0x00000
++#define FLASH_IMAGE_2_OFFSET			0x20000
++
++#define FLASH_IMAGE_PREBOOT_OFFSET		0x10000
++#define FLASH_IMAGE_PCIE_FW_OFFSET		0x18000
++
++
++typedef unsigned char u8;
++typedef unsigned int u32;
++typedef unsigned long long u64;
++
++static inline void base_writeb(u8 val, u32 offset)
++{
++	*((volatile u32 *)(offset)) = (u32)val;
++}
++
++static inline u32 base_readl(u32 offset)
++{
++	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
++
++	return reg;
++}
++
++static inline u8 regmap_readb(u32 offset)
++{
++	u32 reg = base_readl(HL_CFG_BASE + offset);
++
++	return (u8)(reg & 0xFF);
++}
++
++static inline void regmap_writeb(u8 val, u32 offset)
++{
++	base_writeb((u32)val, HL_CFG_BASE + offset);
++}
++
++static inline u32 regmap_readl(u32 offset)
++{
++	u32 reg = base_readl(HL_CFG_BASE + offset);
++
++	return reg;
++}
++
++static inline void regmap_writel(u32 val, u32 offset)
++{
++	base_writeb(val, HL_CFG_BASE + offset);
++}
++
++static inline u32 rom_readl(u32 offset)
++{
++	u32 reg = base_readl(HL_SBROM_BASE + offset);
++
++	return reg;
++}
++
++static inline u32 flash_readl(u32 offset)
++{
++	u32 reg = base_readl(HL_FLASH_BASE + offset);
++
++	return reg;
++}
++
++static inline u32 fw_sram_readl(u32 offset)
++{
++	u32 reg = base_readl(HL_FWSRAM_BASE + offset);
++
++	return reg;
++}
++
++static inline void fw_sram_writel(u32 val, u32 offset)
++{
++	base_writeb(val, HL_FWSRAM_BASE + offset);
++}
++
++#endif /* _ARCBOOT_H_ */
