@@ -1,0 +1,919 @@
+From 55c6b1b7e25338a811d8db3c07087ccf91f1b048 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 04 Mar 2021 20:44:37 +0200
+Subject: [PATCH] [SW-31170] greco_arc_gnu: add greco_arc_gnu support
+
+Since goya2_arc_gnu is renamed to greco_arc_gnu, this patch add changes
+to rename folders, files, function names from goya2 to greco. The
+removal of greco folder and files will be added in subsequent patch.
+
+Change-Id: I6355ff466401f9636e9d9fdae5e85679951b9cfb
+---
+
+diff --git a/greco_arc_gnu/Makefile b/greco_arc_gnu/Makefile
+new file mode 100644
+index 0000000..31c01e0
+--- /dev/null
++++ b/greco_arc_gnu/Makefile
+@@ -0,0 +1,5 @@
++FW_SIZE := 0x8000
++
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/pll.c)
++PREBOOT_SRCS_C += $(shell ls preboot/thermal_v2.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/security.c)
+diff --git a/greco_arc_gnu/asic.c b/greco_arc_gnu/asic.c
+new file mode 100644
+index 0000000..fcc3647
+--- /dev/null
++++ b/greco_arc_gnu/asic.c
+@@ -0,0 +1,77 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <psoc_gpio0_regs.h>
++#include <dcon0_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon0_hbw_rtr_if1_rtr_h3_regs.h>
++#include <dcon1_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon1_hbw_rtr_if1_rtr_h3_regs.h>
++#include <dcon2_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon2_hbw_rtr_if1_rtr_h3_regs.h>
++#include <dcon3_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon3_hbw_rtr_if1_rtr_h3_regs.h>
++
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++u32 hl_skip_pcie_init(void)
++{
++	/* Use DumpSel[2] to skip PCIe initialization */
++	return regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L) & BIT(10);
++}
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return hl_pll_get_freq(mmPSOC_PCI_PLL_CTRL_BASE, HL_PLL_DIV3);
++}
++
++void hl_uart_init(void)
++{
++	u32 uart_clk_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_8);	/* UART0 RXD */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_9);	/* UART0 TXD */
++	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
++}
++
++/* configure yellow LED(GPIO2) in output mode and turn on(active low) */
++void preboot_led_on(void)
++{
++	u32 val = BIT(2);
++
++	/* configure GPIO in output mode */
++	regmap_writel(val, mmPSOC_GPIO0_OUTENSET);
++
++	/* Turn ON LED (pin is active low) */
++	val = regmap_readl(mmPSOC_GPIO0_DATAOUT);
++	val &= ~BIT(2);
++	regmap_writel(val, mmPSOC_GPIO0_DATAOUT);
++}
++
++/* initialize sram scrambling before u-boot is downloaded */
++static void sram_scrambling_init(void)
++{
++	regmap_writel(1, mmDCON0_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON0_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON1_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON1_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON2_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON2_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON3_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON3_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++}
++
++void hl_ram_init(void)
++{
++	sram_scrambling_init();
++}
+diff --git a/greco_arc_gnu/common.c b/greco_arc_gnu/common.c
+new file mode 100644
+index 0000000..0008810
+--- /dev/null
++++ b/greco_arc_gnu/common.c
+@@ -0,0 +1,245 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdint.h>
++
++#include <pcie_phy_regs.h>
++#include <psoc_global_conf_regs.h>
++#include <psoc_gpio1_regs.h>
++#include <psoc_qspi_regs.h>
++#include <psoc_efuse_regs.h>
++#include <psoc_arc0_cfg_regs.h>
++#include <psoc_arc0_cfg_masks.h>
++#include <pcie_aux_regs.h>
++#include <pcie_wrap_regs.h>
++#include <pcie_core_regs.h>
++#include <pcie_dbi_regs.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <cpu_timestamp_regs.h>
++
++#include <cpu_timestamp_regs.h>
++
++#include <hl_boot_if.h>				/* requires stdint.h */
++#include <greco/greco_reg_map.h>
++#include <common/pci_ids.h>
++//#include <greco_blocks_linux_driver.h>
++
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include <string.h>
++#include <preboot/fit.h>
++#include "common.h"
++
++#include <dcon0_tstd_masks.h>
++#include <dcon0_tstd_regs.h>
++#include "preboot/thermal.h"
++
++#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
++
++#define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
++#define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
++
++u32 get_efuse_read_reg(void)
++{
++	return mmPSOC_EFUSE_READ;
++}
++
++bool hl_is_debug_mode(enum hl_debug_hw_func func)
++{
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++	u32 strap_mask;
++
++	switch (func) {
++	case HL_DEBUG_HW_DBG_CARD:
++		strap_mask = BIT(11); /* Dump Select[3] */
++		break;
++	case HL_DEBUG_HW_PCIE:
++		strap_mask = BIT(10); /* Dump Select[2] */
++		break;
++	case HL_DEBUG_HW_DRAM:
++		strap_mask = BIT(8); /* Dump Select[0] */
++		break;
++	case HL_DEBUG_HW_I2C:
++		strap_mask = BIT(9); /* Dump Select[1] */
++		break;
++	default:
++		preboot_puts_hex("Unknown H/W function ", func, false);
++		return 0;
++	}
++
++	return boot_strap & strap_mask;
++}
++
++static void preboot_init_pcie_phy_fw_update(void)
++{
++	/* Configure FW update size */
++	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
++
++	/*
++	 * PHY FW FSM EN and Direct FW write mechanism enable
++	 * FW FSM assumes that the data is present in the SRAM
++	 * The FSM will wait for SRAM init done before updating
++	 * the SRAM contents
++	 */
++	regmap_writel(9, mmPCIE_WRAP_PHY_FW_FSM);
++
++	/* Take the PHY out of reset */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++}
++
++__weak void preboot_init_pcie_phy(void)
++{
++	/* Reset PCIe PHY */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++	/*
++	 * Set PCIe PHY CR Para I/F to CFG.
++	 * Select CR PARA I/F instead of JTAG
++	 */
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
++
++	/* Select indirect access to CR PARA I/F instead of PRBI */
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
++
++	/*
++	 * Use PHY configuration from SoC online
++	 * instead of default values
++	 */
++	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
++	preboot_init_pcie_phy_fw_update();
++}
++
++void preboot_delay(void) {}
++
++void preboot_putc_virt_uart(const char c)
++{
++	/*
++	 * update vUART to HOST
++	 * DATA: mmPCIE_WRAP_VUART_TX_DATA
++	 * STATUS: mmPCIE_WRAP_VUART_TX_STATUS
++	 */
++	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
++	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
++}
++
++unsigned int get_cs_pad_sel(void)
++{
++	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
++}
++
++void preboot_sync_btl(void) {}
++
++void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset)
++{
++	*mask = BIT(19 % 16);
++	*data_offset = mmPSOC_GPIO1_DATAOUT;
++	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
++}
++
++void spi_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_QSPI_CTRLR0;
++}
++
++void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
++{
++	/* Prepare the ARC SRAM address */
++	u32 arc_dst = ((u32)dst & 0xFFFFFFF) | BIT(28);
++
++	memcpy((void *)arc_dst, buf, len);
++}
++
++int preboot_decompress_image(u64 dst, const void *buf, int len,
++			     const char *arch, const char *compression)
++{
++	preboot_puts("Compression is not supported\n");
++	return 1;
++}
++
++void preboot_start_image(u64 startaddr)
++{
++	void (*image_entry)(void);
++	u32 lsb, msb;
++
++	if (startaddr) {
++		lsb = (u32)startaddr;
++		msb = (u32)(startaddr >> 32);
++		/* Set CPU0 Reset address to U-Boot */
++		regmap_writel(lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_0);
++		regmap_writel(msb, mmCPU_CA53_CFG_RST_ADDR_MSB_0);
++
++		/* Wake up CPU0, after we put all CPUs in reset */
++		regmap_writel(0x0, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++		regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	}
++
++	/*
++	 * Set ARC0 in running state
++	 * 1. Set run bit in RUN_HALT_REQ register
++	 * 2. Wait for ACK from core in RUN_HALT_ACK register
++	 * 3. Clear run bit in RUN_HALT_REQ register
++	 */
++	regmap_writel(BIT(0), mmPSOC_ARC0_CFG_RUN_HALT_REQ);
++	while (!(regmap_readl(mmPSOC_ARC0_CFG_RUN_HALT_ACK) &
++				PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK))
++		;
++	regmap_writel(0x0, mmPSOC_ARC0_CFG_RUN_HALT_REQ);
++
++	/*
++	 * Jump to __reset of zephyr. After image_entry, control is not
++	 * expected to return here and continue.
++	 */
++	image_entry = (void *) (*(u32 *)ARC_ICCM_BASE);
++	image_entry();
++}
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	/* Not implemented - ARC BootROM copies and validates preboot */
++}
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmCPU_TIMESTAMP_CNTCR;
++}
++
++void pci_dev_specific_hot_rst(void)
++{
++	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++static struct hl_ts_cfg greco_hl_ts_data[] = {
++	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = false, .calib_offset = 10, .hl_tmp_data = { 0 }},
++	{.base = mmDCON0_TSTD_BASE, .alarm_a = 102, .alarm_b =  120,
++		.use_calib = false, .calib_offset = 9, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = false, .calib_offset = 8, .hl_tmp_data = { 0 }},
++	{.base = mmDCON2_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = false, .calib_offset = 7, .hl_tmp_data = { 0 }}
++};
++
++void hl_ts_data_init(void)
++{
++	greco_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	greco_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	greco_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	greco_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	memcpy(hl_ts_data, greco_hl_ts_data,
++			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
+diff --git a/greco_arc_gnu/common.h b/greco_arc_gnu/common.h
+new file mode 100644
+index 0000000..61cd863
+--- /dev/null
++++ b/greco_arc_gnu/common.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_GRECO_ARC_GNU_H_
++#define COMMON_GRECO_ARC_GNU_H_
++
++#include <goya2_blocks_linux_driver.h>
++
++#define SRAM_SIZE			0x8000000	/* 128MB */
++
++#define PPBOOT_SIZE			0x4000		/* 16KB */
++#define PREBOOT_SIZE			0xC000		/* 48KB */
++
++#define HL_FW_BOOT_PTRS_BASE		0x80000
++#define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
++
++#define PCIE_FW_SRAM_BASE	0x1BFF0000
++#define FW_SRAM_BASE		0x1B050000
++#define SP_SRAM_BASE		0x1BFE0000
++#define ARC_ICCM_BASE		0x1B020000
++#define SP_SRAM_PREBOOT_OFFSET	0x1000
++#define PPBOOT_TEXT_BASE	(FW_SRAM_BASE + 0xC)
++#define PREBOOT_TEXT_BASE	(SP_SRAM_BASE + SP_SRAM_PREBOOT_OFFSET + 0x8)
++
++/*
++ * TODO: this address is wrong, a good address must be set in order to use
++ * boot info API.
++ */
++#define BOOT_INFO_BASE		SP_SRAM_BASE
++
++#define FUSE_WORDS_PER_BANK	0x40
++#define I2C_SLAVE_ADDRESS	0x6A
++#define I2C_SLAVE_ADDRESS_DBG	I2C_SLAVE_ADDRESS
++#define I2C_SLAVE_DEFAULT_INTR_MASK	0x48FF
++
++#define RECOVERY_TEXT_BASE	(0x0 + 0x4)
++#define RECOVERY_SIZE		0x4000
++
++#define SDRAM_BASE		0x10000000
++#define FIT_IMG_BASE		0x10200000
++#define HL_SPI_BASE		0x1A000000
++#define HL_CFG_BASE		0xFC000000
++
++#endif /* COMMON_GRECO_ARC_GNU_H_ */
+diff --git a/greco_arc_gnu/onix.c b/greco_arc_gnu/onix.c
+new file mode 100644
+index 0000000..523a1ce
+--- /dev/null
++++ b/greco_arc_gnu/onix.c
+@@ -0,0 +1,50 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdbool.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include <cmd_module.h>
++
++#include <psoc_global_conf_regs.h>
++
++#define SYS_CLOCK_FREQUENCY	35000000ULL
++#define UART_CLOCK_FREQUENCY	SYS_CLOCK_FREQUENCY
++#define PLDM_UART_BAUDRATE	57600
++
++u32 hl_skip_pcie_init(void)
++{
++	return 1;
++}
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return SYS_CLOCK_FREQUENCY;
++}
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_8);	/* UART0 RXD */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_9);	/* UART0 TXD */
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
++}
++
++enum cmd_check_res dev_specific_module_pci_check(void)
++{
++	/*
++	 * FLR and Hot Reset Registers are not part of PSOC and hence
++	 * writing to them results in ERROR that is resetting the
++	 * ONIX. To avoid it, simply return with NOT FOUND
++	 */
++	return NOT_FOUND;
++}
++
++void preboot_init_pcie_phy(void) {}
++
++void hl_dev_ts_init(void) {}
+diff --git a/greco_arc_gnu/pldm.c b/greco_arc_gnu/pldm.c
+new file mode 100644
+index 0000000..99f94ef
+--- /dev/null
++++ b/greco_arc_gnu/pldm.c
+@@ -0,0 +1,69 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdbool.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include <psoc_pci_pll_ctrl_regs.h>
++#include <psoc_global_conf_regs.h>
++#include "common.h"
++
++#define SYS_CLOCK_FREQUENCY	155000ULL
++
++/*
++ * With Greco v88 PLDM image when PCI pll div3
++ * is bumped up tp 250 MHz actual clock goes
++ * to 12.9 KHz.
++ */
++#define UART_CLOCK_FREQUENCY	12900ULL
++
++/* Working BAUD rate on PLDM */
++#define PLDM_UART_BAUDRATE	300
++
++/*
++ * This cfg specific to PLDM bumps up uart freq
++ * to 250 MHz while keeping other div's on refclk
++ */
++static struct hl_pll_cfg greco_pll_cfg[] = {
++	{
++		.name = "PCI", .base = mmPSOC_PCI_PLL_CTRL_BASE,
++		.nr = 1, .nf = 60, .od = 2, .nb = 3,
++		.div_factor = { 0, 0, 4, 1 },
++		.div_sel = { HL_PLL_REF_CLK,
++			HL_PLL_REF_CLK,
++			HL_PLL_REF_CLK,
++			HL_PLL_DIV_PLL
++		},
++	}
++};
++
++u32 hl_skip_pcie_init(void)
++{
++	return 0;
++}
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return SYS_CLOCK_FREQUENCY;
++}
++
++void hl_dev_pll_init(void)
++{
++	/* Bump up UART frequency */
++	hl_pll_init(greco_pll_cfg, 1);
++}
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_8);	/* UART0 RXD */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_9);	/* UART0 TXD */
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
++}
++
++void preboot_init_pcie_phy(void) {}
+diff --git a/greco_arc_gnu/pll.c b/greco_arc_gnu/pll.c
+new file mode 100644
+index 0000000..f849dcd
+--- /dev/null
++++ b/greco_arc_gnu/pll.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <stddef.h>
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include "common.h"
++
++
++#define GRECO_PLL_CFG_DIV		0x104
++
++u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
++{
++	u32 div_sel, factor, offset;
++	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
++	u64 out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(u32);
++	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
++
++	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
++		reg = regmap_readl(pll_base + GRECO_PLL_CFG_DIV);
++		/* fbdiv : bits 0-11 */
++		fbdiv = EXTRACT_BITS(reg, 0, 12);
++		/* postdiv1 : bits 16-18 */
++		postdiv1 = EXTRACT_BITS(reg, 16, 3);
++		/* postdiv2 : bits 20-22 */
++		postdiv2 = EXTRACT_BITS(reg, 20, 3);
++		/* refdiv : bits 24-29 */
++		refdiv  = EXTRACT_BITS(reg, 24, 6);
++		out_freq = SYS_REF_CLOCK * fbdiv;
++		out_freq /= refdiv * postdiv1 * postdiv2;
++	}
++
++	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
++		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
++		out_freq /= factor + 1;
++	}
++
++	/*
++	 * TODO : The clock relaxation is not accounted here.
++	 * We might need to deal with it in the future.
++	 */
++
++	return out_freq;
++}
++
++#ifdef TARGET_IS_PLDM
++
++#define GRECO_PLL_CFG		0x100
++#define GRECO_PLL_CFG_EN	BIT(0)
++#define GRECO_PLL_CFG_LOCK	BIT(16)
++#define GRECO_PLL_DIV_SEL_DELAY	0x1E0
++
++
++void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++{
++	u32 reg = regmap_readl(cfg->base + GRECO_PLL_CFG);
++
++	if (true == reset)
++		reg |= GRECO_PLL_CFG_EN;
++	else
++		reg &= ~GRECO_PLL_CFG_EN;
++
++	regmap_writel(reg, cfg->base + GRECO_PLL_CFG);
++}
++
++int hl_pll_is_locked(struct hl_pll_cfg *cfg)
++{
++	return regmap_readl(cfg->base + GRECO_PLL_CFG) & GRECO_PLL_CFG_LOCK;
++}
++
++#define GRECO_PLL_POSTDIV1_SHIFT	16
++#define GRECO_PLL_POSTDIV2_SHIFT	20
++#define GRECO_PLL_REFDIV_SHIFT		24
++#define GRECO_PLL_MAX_WAIT_TIME		1
++
++void hl_pll_cfg(struct hl_pll_cfg *cfg)
++{
++	u32 reg = 0;
++
++	/* put the PLL into reset by writing 0 to CTRL_CFG.EN */
++	hl_pll_reset(cfg, false);
++
++	/* FBDIV - bit 0
++	 * POSTDIV1 - bit 16
++	 * POSTDIV2 - bit 20
++	 * REFDIV - bit 24
++	 */
++	reg = cfg->nr << GRECO_PLL_REFDIV_SHIFT |
++		cfg->nb << GRECO_PLL_POSTDIV2_SHIFT |
++		cfg->od << GRECO_PLL_POSTDIV1_SHIFT | cfg->nf;
++
++	regmap_writel(reg, cfg->base + GRECO_PLL_CFG_DIV);
++
++	/* after updating the coefficients we need to wait >=1us */
++	udelay(GRECO_PLL_MAX_WAIT_TIME);
++
++	/* enable the PLL by writing a value of 1 to CTRL_CFG.EN*/
++	hl_pll_reset(cfg, true);
++}
++
++void hl_pll_ack_int(struct hl_pll_cfg *cfg) { }
++
++void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg) { }
++
++void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg)
++{
++	/* TODO: implement resetting the clock relaxation */
++}
++
++void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg)
++{
++	regmap_writel(1, cfg->base + GRECO_PLL_DIV_SEL_DELAY);
++}
++
++#endif /* TARGET_IS_PLDM */
+diff --git a/greco_arc_gnu/preboot.lds.S b/greco_arc_gnu/preboot.lds.S
+new file mode 100644
+index 0000000..740f036
+--- /dev/null
++++ b/greco_arc_gnu/preboot.lds.S
+@@ -0,0 +1,40 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include "common.h"
++
++#ifdef __arc__
++MEMORY { .sram : ORIGIN = PREBOOT_TEXT_BASE, LENGTH = PREBOOT_SIZE }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++#endif
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		preboot/crt0_preboot.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.bss : {
++		. = ALIGN(8);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > .sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 4096 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/greco_arc_gnu/recovery.lds.S b/greco_arc_gnu/recovery.lds.S
+new file mode 100644
+index 0000000..7873942
+--- /dev/null
++++ b/greco_arc_gnu/recovery.lds.S
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++#ifdef __arc__
++MEMORY { .sram : ORIGIN = RECOVERY_TEXT_BASE, LENGTH = RECOVERY_SIZE }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++#endif
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(4);
++		crt0_recovery.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.bss : {
++		. = ALIGN(4);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > .sram
++
++	.stack : {
++		. = ALIGN(4);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/greco_arc_gnu/security.c b/greco_arc_gnu/security.c
+new file mode 100644
+index 0000000..a9ecd64
+--- /dev/null
++++ b/greco_arc_gnu/security.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <bitops.h>
++#include <preboot.h>
++#include <string.h>
++#include <uart.h>
++#include <sha256.h>
++#include <greco/greco_security.h>
++
++#define EFUSE_SYSCFG_ENABLE_VALIDATION_MASK	BIT(10)
++
++static u32 sp_sram_readl(u32 offset)
++{
++	u32 reg = *((volatile u32 *) (HL_SCRATCHPAD_SRAM_BASE + offset));
++	return reg;
++}
++
++bool preboot_security_is_enabled(void)
++{
++	u32 config_efuse;
++
++	config_efuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++	return (config_efuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
++}
++
++bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
++			 int pub_key_len, const void *pub_key_ext,
++			 int pub_key_ext_len)
++{
++	u32 key_revoke, key_base, hash_calculated, hash_stored;
++	u8 bytes_per_dword = sizeof(u32);
++	u8 value[SHA256_SUM_LEN];
++	u8 key[KEY_SIZE];
++	u8 i;
++
++	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
++		return false;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	if (key_revoke & BIT(key_idx)) {
++		preboot_puts_hex("Key revoked: ", key_idx, 0);
++		return false;
++	}
++
++	if (pub_key_len != (KEY_SIZE - KEY_EXT_SIZE)) {
++		preboot_puts_hex("Invalid pub key length: ", pub_key_len, 0);
++		return false;
++	}
++
++	if (pub_key_ext_len != KEY_EXT_SIZE) {
++		preboot_puts_hex("Invalid pub key ext length: ",
++				pub_key_ext_len, 0);
++		return false;
++	}
++
++	/* Concanate public key and public key extension */
++	memcpy(key, pub_key, pub_key_len);
++	memcpy((key + pub_key_len), pub_key_ext, pub_key_ext_len);
++
++	sha256_csum(key, pub_key_len + pub_key_ext_len, value);
++
++	key_base = (key_idx * bytes_per_dword * SECURITY_DWORD_PER_KEY)
++			+ SECURITY_EFUSE_KEYS_OFFSET;
++
++	for (i = 0; i < SECURITY_DWORD_PER_KEY; i++) {
++		memcpy(&hash_calculated, value + (i * bytes_per_dword),
++			bytes_per_dword);
++		hash_stored = sp_sram_readl(key_base + (i * bytes_per_dword));
++		if (hash_calculated != hash_stored)
++			return false;
++	}
++
++	return true;
++}
++
++bool preboot_security_svn_is_valid(int sec_ver)
++{
++	u8 sec_fw_ver, sec_valid_fw_ver;
++	u32 valid_fw_ver;
++
++	sec_fw_ver = SECURITY_FW_VERSION_TO_SECURITY_BYTE(sec_ver);
++	valid_fw_ver = sp_sram_readl(SECURITY_EFUSE_FW_VERSION_OFFSET);
++	sec_valid_fw_ver = SECURITY_FW_VERSION_TO_SECURITY_BYTE(valid_fw_ver);
++
++	if (sec_fw_ver < sec_valid_fw_ver)
++		preboot_puts_hex("Security version too low: ", sec_ver, 0);
++
++	return sec_fw_ver >= sec_valid_fw_ver;
++}
++
++bool preboot_security_key_montgomery_is_valid(void)
++{
++	return true;
++}
+diff --git a/greco_arc_gnu/tstd.h b/greco_arc_gnu/tstd.h
+new file mode 100644
+index 0000000..d0f4930
+--- /dev/null
++++ b/greco_arc_gnu/tstd.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ */
++
++#include <greco/greco_reg_map.h>
++#include <goya2_blocks_linux_driver.h>
++#include <dcon0_tstd_masks.h>
++#include <dcon0_tstd_regs.h>
++
++/*TODO: check if the same file can be used across targets of Greco */
++#define HL_TS_CMN_SDIF_WDATA_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_SHIFT
++#define HL_TS_CMN_SDIF_WDATA_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_MASK
++#define HL_TS_CMN_SDIF_ADDR_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_SHIFT
++#define HL_TS_CMN_SDIF_ADDR_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_MASK
++#define HL_TS_CMN_SDIF_WRN_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_SHIFT
++#define HL_TS_CMN_SDIF_WRN_MASK		DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_MASK
++#define HL_TS_CMN_SDIF_PROG_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_SHIFT
++#define HL_TS_CMN_SDIF_PROG_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_MASK
++#define HL_TS_CMN_SDIF_STATUS_BUSY_MASK	\
++	DCON0_TSTD_VM_CMN_SDIF_STATUS_SDIF_BUSY_MASK
++/*
++ * sample_data register width is 16 bits, as per MR74137 spec resolution is
++ * from 8 - 12 bits only.
++ */
++#define HL_TS_00_SDIF_DATA_SMPL_DATA_MASK 0xFFF
++#define HL_TS_CMN_CLK_SYNTH_LO_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_LO_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_MASK
++#define HL_TS_CMN_CLK_SYNTH_HI_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HI_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_MASK
++#define HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HOLD_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_MASK
++#define HL_TS_CMN_CLK_SYNTH_ENA_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_ENA_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_MASK
++
++#define HL_TS_CMN_SDIF_STATUS		(mmDCON0_TSTD_TS_CMN_SDIF_STATUS & 0xFF)
++#define HL_TS_CMN_SDIF			(mmDCON0_TSTD_TS_CMN_SDIF & 0xFF)
++#define HL_TS_00_SDIF_DATA		(mmDCON0_TSTD_TS_00_SDIF_DATA & 0xFF)
++#define HL_TS_CMN_CLK_SYNTH		(mmDCON0_TSTD_TS_CMN_CLK_SYNTH & 0xFF)
++#define HL_TS_00_ALARMA_CFG		(mmDCON0_TSTD_TS_00_ALARMA_CFG & 0xFF)
++#define HL_TS_00_ALARMB_CFG		(mmDCON0_TSTD_TS_00_ALARMB_CFG & 0xFF)

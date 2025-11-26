@@ -1,0 +1,215 @@
+From b5fe89b2e06c10310d09553f4f41521e7ac8be68 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 15 Jul 2021 09:22:40 +0300
+Subject: [PATCH] [SW-44497] gaudi2: ts configuration in preboot
+
+Ts initialization is required to read the temperature value
+in preboot.Thermal_v2 code is being integrated for gaudi2,
+along with the required platform specific changes.
+
+Ts is reset once preboot execution is complete.
+
+Change-Id: I1dff8aad534268ef3b73c910643a2f7d4e884d42
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 09ec9d3..fceaa4a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -17,7 +17,7 @@
+ CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)/$(SPECS_EMB_DEV)_reg_map.h
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c -fno-builtin
+-CFLAGS += -I ./include/ -I ./ -I ./lib/ -I ./lib/common/ -I ./$(HL_DEV_ARCH)/
++CFLAGS += -I ./include/ -I ./ -I ./lib/ -I ./lib/common/ -I ./$(HL_DEV_ARCH)/ -I ./$(HL_DEV_ARCH)/../common/
+ 
+ ifeq ($(HL_TARGET),pldm)
+ 	CFLAGS += -DTARGET_IS_PLDM
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+index 0578954..abc7211 100644
+--- a/arch/gaudi2/arc/Makefile
++++ b/arch/gaudi2/arc/Makefile
+@@ -4,5 +4,5 @@
+ LDFLAGS += -Wl,--just-symbols ../arcboot-custom/exports.elf
+ 
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/pll.c)
+-#PREBOOT_SRCS_C += $(shell ls lib/preboot/thermal_v2.c)
++PREBOOT_SRCS_C += $(shell ls lib/preboot/thermal_v2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 8743f2c..ec0a36a 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -396,14 +396,6 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+-/* TODO: Add a table for
+- * static struct hl_ts_cfg gaudi2_hl_ts_data[]
+- */
+-void hl_ts_data_init(void)
+-{
+-	/* TODO */
+-}
+-
+ static u32 ppboot_flash_image_offset(u8 image_ptr)
+ {
+ 	u8 flash_image_switch;
+diff --git a/arch/gaudi2/arc/tstd.h b/arch/gaudi2/arc/tstd.h
+deleted file mode 100644
+index 856027f..0000000
+--- a/arch/gaudi2/arc/tstd.h
++++ /dev/null
+@@ -1,9 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- */
+-
+-#include <gaudi2/gaudi2_reg_map.h>
+-#include <gaudi2_blocks_linux_driver.h>
+-
+-/* TODO */
+diff --git a/arch/gaudi2/arm/Makefile b/arch/gaudi2/arm/Makefile
+index 2f44d26..c56241b 100644
+--- a/arch/gaudi2/arm/Makefile
++++ b/arch/gaudi2/arm/Makefile
+@@ -1,5 +1,7 @@
+ FW_SIZE := 0x4400
+ PPBOOT_MAX_SIZE := 20480
+ 
++PREBOOT_SRCS_C += $(shell ls lib/preboot/thermal_v2.c)
++
+ CFLAGS += -mstrict-align
+ image_validation: image_validation_common
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index d11439c..648aa6f 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -41,6 +41,7 @@
+ #include <preboot/fit.h>
+ #include <boot_if.h>
+ #include <pci.h>
++#include "preboot/thermal.h"
+ 
+ #include "common.h"
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 16fd624..c9c2c2d 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -11,6 +11,14 @@
+ #include <cmd_module.h>
+ #include <psoc_global_conf_regs.h>
+ #include <gaudi2/gaudi2_reg_map.h>
++#include <psoc_reset_conf_regs.h>
++#include <psoc_reset_conf_masks.h>
++#include <gaudi2_blocks_linux_driver.h>
++#include <pll.h>
++#include <uart.h>
++#include "common.h"
++#include "preboot/thermal.h"
++#include <string.h>
+ 
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+ {
+@@ -51,3 +59,44 @@
+ 	regs->gic_host_ints_irq  = mmGIC_HOST_INTS_IRQ_POLL_REG;
+ 	regs->gic_host_soft_rst_irq = mmGIC_HOST_SOFT_RST_IRQ_POLL_REG;
+ }
++
++static struct hl_ts_cfg gaudi2_hl_ts_data[] = {
++	{.base = mmDCORE0_TSTDVS_BASE & ~HL_CFG_BASE, .alarm_a = 90, .alarm_b = 115,
++		.use_calib = false, .calib_offset = 9, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE1_TSTDVS_BASE & ~HL_CFG_BASE, .alarm_a = 90, .alarm_b =  115,
++		.use_calib = false, .calib_offset = 10, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE2_TSTDVS_BASE & ~HL_CFG_BASE, .alarm_a = 90, .alarm_b = 115,
++		.use_calib = false, .calib_offset = 7, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE3_TSTDVS_BASE & ~HL_CFG_BASE, .alarm_a = 90, .alarm_b = 115,
++		.use_calib = false, .calib_offset = 8, .hl_tmp_data = { 0 }}
++};
++
++void hl_ts_data_init(void)
++{
++	u32 pll_freq;
++	int i;
++
++	pll_freq = hl_pll_get_freq(mmDCORE0_XBAR_IF_PLL_CTRL_BASE & ~HL_CFG_BASE, HL_PLL_DIV3);
++
++	/* All TS instances use XBAR IF PLL, DIV3 clock */
++	for (i = 0; i < HL_ASIC_TS_MAX_COUNT; i++)
++		gaudi2_hl_ts_data[i].freq = pll_freq;
++
++	memcpy(hl_ts_data, gaudi2_hl_ts_data,
++			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
++
++void hl_ts_reset(void)
++{
++	preboot_puts("Performing RST of TS UNIT\n");
++	/* Perform unit reset for TS and TS_IF */
++	regmap_writel(PSOC_RESET_CONF_TS_UNIT_RST_EN_MASK,
++			mmPSOC_RESET_CONF_TS_UNIT_RST);
++	regmap_writel(PSOC_RESET_CONF_TS_IF_UNIT_RST_EN_MASK,
++			mmPSOC_RESET_CONF_TS_IF_UNIT_RST);
++	regmap_writel(1, mmPSOC_RESET_CONF_UNIT_RST_N);
++	udelay(1000);
++	regmap_writel(0, mmPSOC_RESET_CONF_TS_UNIT_RST);
++	regmap_writel(0, mmPSOC_RESET_CONF_TS_IF_UNIT_RST);
++	regmap_writel(1, mmPSOC_RESET_CONF_UNIT_RST_N);
++}
+diff --git a/arch/gaudi2/common/tstd.h b/arch/gaudi2/common/tstd.h
+new file mode 100644
+index 0000000..a84d333
+--- /dev/null
++++ b/arch/gaudi2/common/tstd.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <gaudi2/gaudi2_reg_map.h>
++#include <gaudi2_blocks_linux_driver.h>
++#include <dcore0_tstdvs_masks.h>
++#include <dcore0_tstdvs_regs.h>
++
++#define HL_TS_CMN_SDIF_WDATA_SHIFT	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_WDATA_SHIFT
++#define HL_TS_CMN_SDIF_WDATA_MASK	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_WDATA_MASK
++#define HL_TS_CMN_SDIF_ADDR_SHIFT	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_ADDR_SHIFT
++#define HL_TS_CMN_SDIF_ADDR_MASK	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_ADDR_MASK
++#define HL_TS_CMN_SDIF_WRN_SHIFT	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_WRN_SHIFT
++#define HL_TS_CMN_SDIF_WRN_MASK		DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_WRN_MASK
++#define HL_TS_CMN_SDIF_PROG_SHIFT	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_PROG_SHIFT
++#define HL_TS_CMN_SDIF_PROG_MASK	DCORE0_TSTDVS_TS_CMN_SDIF_SDIF_PROG_MASK
++#define HL_TS_CMN_SDIF_STATUS_BUSY_MASK	\
++	DCORE0_TSTDVS_TS_CMN_SDIF_STATUS_SDIF_BUSY_MASK
++/*
++ * sample_data register width is 16 bits, as per MR74137 spec resolution is
++ * from 8 - 12 bits only.
++ */
++#define HL_TS_00_SDIF_DATA_SMPL_DATA_MASK 0xFFF
++#define HL_TS_CMN_CLK_SYNTH_LO_SHIFT	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_LO_MASK	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_MASK
++#define HL_TS_CMN_CLK_SYNTH_HI_SHIFT	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HI_MASK	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_MASK
++#define HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HOLD_MASK	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_MASK
++#define HL_TS_CMN_CLK_SYNTH_ENA_SHIFT	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_ENA_MASK	\
++	DCORE0_TSTDVS_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_MASK
++
++#define HL_TS_CMN_SDIF_STATUS		(mmDCORE0_TSTDVS_TS_CMN_SDIF_STATUS & 0xFF)
++#define HL_TS_CMN_SDIF			(mmDCORE0_TSTDVS_TS_CMN_SDIF & 0xFF)
++#define HL_TS_00_SDIF_DATA		(mmDCORE0_TSTDVS_TS_00_SDIF_DATA & 0xFF)
++#define HL_TS_CMN_CLK_SYNTH		(mmDCORE0_TSTDVS_TS_CMN_CLK_SYNTH & 0xFF)
++#define HL_TS_00_ALARMA_CFG		(mmDCORE0_TSTDVS_TS_00_ALARMA_CFG & 0xFF)
++#define HL_TS_00_ALARMB_CFG		(mmDCORE0_TSTDVS_TS_00_ALARMB_CFG & 0xFF)

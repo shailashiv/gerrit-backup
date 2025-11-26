@@ -1,0 +1,140 @@
+From 6c79e08366e6ef40cac99fda1f54235009ee3920 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 30 Nov 2021 09:25:23 +0200
+Subject: [PATCH] [SW-36216] gaudi2: sec: update img validation bit
+
+For existing platforms a single efuse bit is commonly used for
+security enable and image validation. Gaudi2 has dedicated bits
+for security enable and image validation in efuse.
+
+In order to maintain backward compatibility the default implementation
+is redirected to security enable check.
+
+Change-Id: I042e1648e47b6fb9cd1cf88d34e34b68f697fd4f
+---
+
+diff --git a/arch/gaudi2/arc/security.c b/arch/gaudi2/arc/security.c
+index 121f2fe..36a6858 100644
+--- a/arch/gaudi2/arc/security.c
++++ b/arch/gaudi2/arc/security.c
+@@ -13,6 +13,7 @@
+ #include <gaudi2/gaudi2_security.h>
+ 
+ #define EFUSE_SYSCFG_ENABLE_VALIDATION_MASK	BIT(10)
++#define EFUSE_SYSCFG_SECURITY_EN_MASK		BIT(15)
+ 
+ static u32 sp_sram_readl(u32 offset)
+ {
+@@ -20,12 +21,21 @@
+ 	return reg;
+ }
+ 
++static bool preboot_sec_efuse_is_set(u32 mask)
++{
++	u32 config_efuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++
++	return !!(config_efuse & mask);
++}
++
+ bool preboot_security_is_enabled(void)
+ {
+-	u32 config_efuse;
++	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK);
++}
+ 
+-	config_efuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
+-	return (config_efuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
++bool preboot_img_validation_is_enabled(void)
++{
++	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+ 
+ bool preboot_security_key_is_revoked(int key_idx)
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 6438ff0..6cb3795 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -404,6 +404,7 @@
+ 
+ #define EFUSE_SECURITY_ENABLE_BIT		BIT(15)
+ #define EFUSE_SECURITY_WORD_OFFSET		0x3A
++#define EFUSE_SECURITY_IMG_VALIDATION_BIT	BIT(10)
+ 
+ static bool hl_is_security_strap_enabled(void)
+ {
+@@ -417,17 +418,27 @@
+ 	return false;
+ }
+ 
+-bool preboot_security_is_enabled(void)
++static bool preboot_sec_efuse_is_set(u32 mask)
+ {
+ 	u32 efuse_word;
+ 
++	/* If eFuse read failed, assume an attacker sabotage, enable security */
++	if (preboot_fuse_read(EFUSE_SECURITY_WORD_OFFSET, &efuse_word))
++		return true;
++
++	return !!(efuse_word & mask);
++}
++
++bool preboot_security_is_enabled(void)
++{
+ 	/* If security is enabled via boot strap pins */
+ 	if (hl_is_security_strap_enabled())
+ 		return true;
+ 
+-	/* If eFuse read failed, assume an attacker sabotage, security in on */
+-	if (preboot_fuse_read(EFUSE_SECURITY_WORD_OFFSET, &efuse_word))
+-		return true;
++	return preboot_sec_efuse_is_set(EFUSE_SECURITY_ENABLE_BIT);
++}
+ 
+-	return !!(efuse_word & EFUSE_SECURITY_ENABLE_BIT);
++bool preboot_img_validation_is_enabled(void)
++{
++	return preboot_sec_efuse_is_set(EFUSE_SECURITY_IMG_VALIDATION_BIT);
+ }
+diff --git a/include/security.h b/include/security.h
+index 0d1854a..571ba13 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -17,6 +17,7 @@
+ };
+ 
+ bool preboot_security_is_enabled(void);
++bool preboot_img_validation_is_enabled(void);
+ void preboot_security_init(void);
+ void preboot_security_dynamic_init(void);
+ void preboot_security_dynamic_vers_init(u64 ver_off, u32 size);
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 56d5d57..15da8d3 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -126,6 +126,17 @@
+ 	return false;
+ }
+ 
++/*
++ * Gaudi2 platform supports different bits in efuse for
++ * security enable and image validation. To maintain
++ * backward compatibility the default implementation
++ * redirects to the security enable check.
++ */
++__weak bool preboot_img_validation_is_enabled(void)
++{
++	return preboot_security_is_enabled();
++}
++
+ __weak bool preboot_security_key_is_revoked(int key_idx)
+ {
+ 	return false;
+@@ -600,7 +611,7 @@
+ static int fit_verify_security(const void *fit, int noffset,
+ 			       enum fit_sec_failure *res)
+ {
+-	if (!preboot_security_is_enabled())
++	if (!preboot_img_validation_is_enabled())
+ 		return 0;
+ 
+ 	if (!fit_svn_is_valid(fit)) {

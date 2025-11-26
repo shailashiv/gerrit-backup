@@ -1,0 +1,130 @@
+From a318ceeb970c79770b28acac9c327f488e450faa Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 25 Jul 2021 19:13:36 +0300
+Subject: [PATCH] [SW-50615] gaudi: close all nics areas when disabled
+
+When NICs are disabled, close the whole NICs area. Use dynamic security
+mechanizm to control the area open/close.
+
+Change-Id: I66176d765da59b9465f46da338e419fa7db6f637
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 292de74..e3cd21c 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1409,10 +1409,8 @@
+ 	max = mmPSOC_TIMESTAMP_BASE;
+ 	preboot_secure_lbw_rr(LBW_RR_PCIE_MSI_PSOC0, min, max);
+ 
+-	/* PSOC_GPIO0 up to NIC0_MAC_CORE_BASE: RR(LBW_RR_PSOC1_NIC0_MAC_CH) */
+-	min = mmPSOC_GPIO0_BASE - 1;
+-	max = mmNIC0_MAC_CORE_BASE;
+-	preboot_secure_lbw_rr(LBW_RR_PSOC1_NIC0_MAC_CH, min, max);
++	/* LBW_RR_PSOC1_NIC0_MAC_CH is being set to block all NICs */
++	preboot_security_dynamic_nics_set_en(false);
+ 
+ 	/* NIC0_TS up to NIC1_MAC_CORE_BASE: RR(LBW_RR_NIC0_TS_NIC1_MAC_CH) */
+ 	min = mmNIC0_TS_BASE - 1;
+@@ -1745,6 +1743,7 @@
+ 	IMG_END_TO_SRAM_END,
+ 	STM_SF_MEMMAP,
+ 	SPSRAM_IMAGE,
++	NICS_EN_DIS,
+ };
+ 
+ struct preboot_sec_dyn_pcie_rr_cfg {
+@@ -1788,6 +1787,11 @@
+ 		.rr = PCIE_DYN_RR_SPSRAM_IMG,
+ 		.min = FIT_IMG_SPSRAM_BASE - 1,
+ 		.max = FIT_IMG_SPSRAM_END,
++	},
++	[NICS_EN_DIS] = {
++		.rr = LBW_RR_PSOC1_NIC0_MAC_CH,
++		.min = mmPSOC_GPIO0_BASE - 1,
++		.max = 0,
+ 	},
+ };
+ 
+@@ -2103,3 +2107,16 @@
+ 	}
+ 
+ }
++
++void preboot_security_dynamic_nics_set_en(bool en)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	u64 max;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	cfg = &preboot_sec_dyn_cfg[NICS_EN_DIS];
++	max = en ? mmNIC0_MAC_CORE_BASE : mmTPC0_CFG_BASE;
++	preboot_secure_lbw_rr(cfg->rr, cfg->min, max);
++}
+diff --git a/include/security.h b/include/security.h
+index b130191..8a227dc 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -30,5 +30,6 @@
+ void preboot_security_hbm_pci_open_ro(void);
+ void preboot_security_sf_pci_set_ro(bool en);
+ void preboot_security_sram_pci_set_ro(bool en);
++void preboot_security_dynamic_nics_set_en(bool en);
+ 
+ #endif /* _HL_SECURITY_H_ */
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index cb6339a..498c093 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -570,12 +570,17 @@
+ {
+ 	int err;
+ 	const void *data = 0;
++	u32 nic_en_local;
+ 
+ 	err = fit_image_get_loadable_data(fit, &data, sizeof(u32));
+-	if (!err)
+-		preboot_nic_en(*(u32 *)data);
++	if (err)
++		return err;
+ 
+-	return err;
++	nic_en_local = *(u32 *)data;
++	preboot_nic_en(nic_en_local);
++	preboot_security_dynamic_nics_set_en(!!nic_en_local);
++
++	return 0;
+ }
+ 
+ __weak int rma_erase(void)
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index ca65e78..2271779 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -300,6 +300,8 @@
+ 	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
+ }
+ 
++__weak void preboot_security_dynamic_nics_set_en(bool en) {}
++
+ u32 err_sts_reg_val;
+ 
+ static void preboot_process_last_boot_info(void)
+@@ -331,8 +333,13 @@
+ 	}
+ 
+ 	if (!boot_info_get(HL_BOOT_INFO_NIC_EN, &nic_en_local,
+-			   sizeof(nic_en_local), &data_size))
++			   sizeof(nic_en_local), &data_size)) {
+ 		preboot_nic_en(nic_en_local);
++		preboot_security_dynamic_nics_set_en(!!nic_en_local);
++	} else {
++		/* NICs are enabled by default */
++		preboot_security_dynamic_nics_set_en(true);
++	}
+ 
+ 	/*
+ 	 * Preserve pci disable if exist, except for PRSTN, in which it is

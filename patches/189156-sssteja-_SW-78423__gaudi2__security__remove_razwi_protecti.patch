@@ -1,0 +1,65 @@
+From da73e7620777b6014d35659a9a413d7d9532cfc1 Mon Sep 17 00:00:00 2001
+From: Sai Surya Teja <sssteja@habana.ai>
+Date: Fri, 11 Mar 2022 11:52:17 +0200
+Subject: [PATCH] [SW-78423] gaudi2: security: remove razwi protection in psoc and noc rr
+
+This is a cherry-pick from https://gerrit.habana-labs.com/#/c/188001/
+Though this is a pure preboot change, this is still ported to ppboot
+to make sure the common files are aligned until we separate ppboot and
+preboot common files.
+
+As per the HBW spec, razwi section (0x1000007FF7FFF000 -
+0x1000007FF7FFFFFF) must not be protected by RR. This patch fixes this
+issue by configuring psoc and pcie rr to protect only till SP SRAM end
+and noc rr to protect till PCIE FW SRAM RSVD. Note: RAZWI section is
+above PCIE FW RSVD region which will not be protected.
+
+Also, pcie and psoc rr are configured to protect only till SP SRAM and
+opens PCIE FW SRAM due to a HW bug. To mitigate this, iATU excludes PCIE
+FW SRAM region and thus this blocks PCIE initiator transactions. PSOC
+initiator transactions towards this region would get block on NOC/RTR
+RRs.
+
+Change-Id: Ia07039ee70a64761e4b38d9a2b956627a1e6db42
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 91e5425..1c04a19 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -985,19 +985,29 @@
+ 	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
+ 
+ 	/* Block noc and psoc RR in preboot */
+-	rr_sel.noc = 1;
++	rr_sel.noc = 0;
+ 	rr_sel.psoc = 1;
+-
+ 	/*
+-	 * For noc and psoc rrs, need to protect from SPI_FLASH_END to DBG_SPACE_BASE
+-	 * SPI FLASH END to DBG_SPACE_BASE
++	 * SPI FLASH END to SP SRAM END
++	 * Includes the reserved space at end of SPSRAM.
++	 * 0x1000007FF7000000 - 0x1000007FF7FFF000
++	 */
++	min = SPI_FLASH_END;
++	max = SCRATCHPAD_SRAM_ADDR + SCRATCHPAD_SRAM_SIZE;
++	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, min, max, rr_sel);
++
++	rr_sel.noc = 1;
++	rr_sel.psoc = 0;
++	/*
++	 * For noc rrs, need to protect from SPI_FLASH_END to PCIE_FW_SRAM_RSVD_END
++	 * SPI FLASH END to PCIE_FW_SRAM_RSVD_END
+ 	 * Reusing the HL_SEC_HBW_ICCM0_TO_SP_SRAM rr idx to increase the protection range.
+ 	 * Using HL_SEC_HBW_ICCM0_TO_RAZWI which has same value as HL_SEC_HBW_ICCM0_TO_SP_SRAM
+ 	 * to be meaningful in code walk through.
+-	 * 0x1000007FF7000000 - 0x1000007FF8000000ull
++	 * 0x1000007FF7000000 - 0x1000007FF7FFF000ull
+ 	 */
+ 	min = SPI_FLASH_END;
+-	max = DBG_SPACE_BASE;
++	max = PCIE_FW_SRAM_RSVD_END;
+ 	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_RAZWI, min, max, rr_sel);
+ 
+ 	hl_secure_hbw_common(rr_sel);

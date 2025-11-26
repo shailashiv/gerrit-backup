@@ -1,0 +1,148 @@
+From b6a077dcf900f07ee4d5b536200fc7192e2dba28 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 17 Mar 2021 15:26:44 +0200
+Subject: [PATCH] [SW-34119] preboot: uart: using ring buffer for tx
+
+After Preboot initialization phase the uart tx ring buffer is
+initialized and from that moment all the uart tx transactions are
+buffered.
+
+Change-Id: I5e10fc02b59819ea263dc355e163f654652e35ec
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index ff63686..5f43866 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -93,8 +93,10 @@
+ void lkd_dev_specific_setup(void);
+ 
+ /* UART */
++void module_uart_setup(void);
+ enum cmd_check_res module_uart_check(void);
+ void module_uart_run(void);
++void module_uart_teardown(void);
+ 
+ /* I2C SLAVE */
+ void module_i2c_s_setup(void);
+diff --git a/common/uart.c b/common/uart.c
+index 51105f5..22068ec 100644
+--- a/common/uart.c
++++ b/common/uart.c
+@@ -31,8 +31,7 @@
+ 	tx_buf.initialized = true;
+ }
+ 
+-/* TODO: make preboot_uart_rbuf_push static in next commit */
+-void preboot_uart_rbuf_push(char ch)
++static void preboot_uart_rbuf_push(char ch)
+ {
+ 	unsigned int head = tx_buf.head + 1;
+ 
+@@ -71,6 +70,11 @@
+ 			;
+ 		preboot_uart_rbuf_pop();
+ 	}
++}
++
++bool preboot_uart_rbuf_empty(void)
++{
++	return tx_buf.head == tx_buf.tail;
+ }
+ 
+ static bool dbg_enabled; /* by default debug prints are disabled */
+@@ -113,8 +117,18 @@
+ 	return regmap_readl(mmPSOC_UART_0_DATA);
+ }
+ 
++bool preboot_uart_tx_full(void)
++{
++	return !!(regmap_readl(mmPSOC_UART_0_STATE) & UART_SR_TXFULL);
++}
++
+ void preboot_putc_raw(const char ch)
+ {
++	if (tx_buf.initialized) {
++		preboot_uart_rbuf_push(ch);
++		return;
++	}
++
+ 	while (regmap_readl(mmPSOC_UART_0_STATE) & UART_SR_TXFULL)
+ 		;
+ 	regmap_writel(ch, mmPSOC_UART_0_DATA);
+diff --git a/common/uart.h b/common/uart.h
+index bba76ee..b08f86d 100644
+--- a/common/uart.h
++++ b/common/uart.h
+@@ -20,11 +20,13 @@
+ void preboot_puts_hex_raw(const char *log, unsigned int val, bool pad);
+ void preboot_puts_hex(const char *log, unsigned int val, bool pad);
+ void preboot_puts_char(const char *str, unsigned char val);
++bool preboot_uart_tx_full(void);
+ int preboot_uart_tstc(void);
+ int preboot_uart_getc(void);
+ void preboot_uart_rbuf_init(void);
+ void preboot_uart_rbuf_pop(void);
+ void preboot_uart_rbuf_flush(void);
++bool preboot_uart_rbuf_empty(void);
+ 
+ /* enable/disable emitting debug prints to the log */
+ void preboot_set_dbg_prints_ena(bool enable_dbg);
+diff --git a/preboot/module_uart.c b/preboot/module_uart.c
+index 6062d18..aaae9a1 100644
+--- a/preboot/module_uart.c
++++ b/preboot/module_uart.c
+@@ -11,7 +11,8 @@
+ 
+ enum cmd_check_res module_uart_check(void)
+ {
+-	if (!preboot_uart_tstc())
++	if (!preboot_uart_tstc() &&
++	    (preboot_uart_tx_full() || preboot_uart_rbuf_empty()))
+ 		return NOT_FOUND;
+ 
+ 	return FOUND_SLOW_RETURN;
+@@ -62,9 +63,22 @@
+ {
+ 	int val = preboot_uart_getc();
+ 
++	if (!preboot_uart_tx_full())
++		preboot_uart_rbuf_pop();
++
+ 	if (val < 0)
+ 		return;
+ 
+ 	preboot_puts("Keyboard press received\n");
+ 	hl_parse_uart(val);
+ }
++
++void module_uart_setup(void)
++{
++	preboot_uart_rbuf_init();
++}
++
++void module_uart_teardown(void)
++{
++	preboot_uart_rbuf_flush();
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 134def9..fed02e5 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -65,13 +65,13 @@
+ 		.run_noreturn = module_lkd_run_noret,
+ 	},
+ 	{	/* UART module */
+-		.setup = noop,
++		.setup = module_uart_setup,
+ 		.check = module_uart_check,
+ 		.disable = noop,
+ 		.run = module_uart_run,
+ 		.enable = noop,
+ 		.run_fast = noop,
+-		.teardown = noop,
++		.teardown = module_uart_teardown,
+ 		.run_noreturn = noop,
+ 	},
+ 	{	/* I2C SLAVE module */

@@ -1,0 +1,92 @@
+From e67ffefce0d21795af534936e2e554a1360b11c4 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 25 Mar 2021 04:52:05 +0200
+Subject: [PATCH] [SW-34091] gaudi: add timeouts in while loops
+
+Preboot needs to reach command monitor loop without getting
+stuck in indifinite while loops to bring up i2c slave module.
+To achieve this there are two places this patch adds timeouts.
+-Wait for BTL sync which waits for boot manager execution
+ to finish. Timeout of half second.
+-Wait for PCIe phy external load complete. This wait is
+ required for applying synopsys WA and should happen in
+ 300 us. Overall timeout of 576us.
+
+Change-Id: Iddbdebd7c1586b89f2b6145a166480548649c7f0
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index dab2317..21c008b 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -129,6 +129,7 @@
+ 
+ void preboot_init_pcie(void)
+ {
++	u64 start;
+ 	u32 ven_id_dev_id = preboot_get_vendor_id_device_id();
+ 
+ 	preboot_init_pcie_phy();
+@@ -148,12 +149,23 @@
+ 	regmap_writel(0x01402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+ 	regmap_writel(0x04027041, mmPCIE_DBI_GEN3_EQ_CONTROL_OFF);
+ 
++	start = timestamp_get_us();
+ 	/* Wait for ext_ld_done before executing W/A */
+ 	while (regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0) &&
+-		regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1) &&
+-		regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2) &&
+-		regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3))
+-		;
++	       regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1) &&
++	       regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2) &&
++	       regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3)) {
++		/*
++		 * PCIe external load complete should take maximum of 300us
++		 * to complete. Including some grace period 576us of
++		 * timeout is used
++		 */
++		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for ext_ld_done!");
++			break;
++		}
++	}
++
+ 
+ 	/* Execute the Synopsys W/A */
+ 	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
+@@ -269,8 +281,18 @@
+  */
+ void preboot_sync_btl(void)
+ {
+-	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM))
+-		;
++	u64 start = timestamp_get_us();
++
++	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM)) {
++		/*
++		 * Boot manager is supposed to complete entire execution
++		 * of FSM, BTL primary/secondary at this point. Though
++		 * It should not take more than 100ms for it to finish
++		 * timeout of half second is used here.
++		 */
++		if (timeout_expired(start, BTL_SYNC_TIMEOUT_US))
++			break;
++	}
+ }
+ 
+ void hl_plat_early_init(void) {}
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 4ab14a4..b99b9cc 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -44,6 +44,9 @@
+ #define GAUDI_QM_CGM_NUM		2
+ 
+ #define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++#define BTL_SYNC_TIMEOUT_US		(USEC_PER_SEC / 2)
++#define PCIE_EXT_LD_TIMEOUT_US		576
++
+ 
+ #ifndef __ASSEMBLY__
+ #include <spi.h>

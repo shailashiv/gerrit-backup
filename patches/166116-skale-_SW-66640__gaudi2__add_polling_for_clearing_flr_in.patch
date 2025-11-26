@@ -1,0 +1,45 @@
+From 503a7083721119c5876aaa765c608decf6403997 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 12 Jan 2022 13:58:53 +0200
+Subject: [PATCH] [SW-66640] gaudi2: add polling for clearing flr int
+
+Currently as part of FLR interrupt processing flow, FLR interrupt
+is cleared at source in FLR_INT register followed by cleared in
+SPI_INTR_CLR register. However SPI_INTR for FLR doesn't get cleared
+as there is some latency in clearing FLR interrupt at source. To
+overcome this, this patch add polling for FLR_INT to be cleared with
+timeout of 10us after which interrupt is cleared in SPI_INTR_CLR
+register. This makes sure the FLR interrupt is cleared at source before
+clearing it in SPT_INTR register.
+
+Change-Id: Iacf1f2d125b4963d736a1bd6cda054371fa57574
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index e264963..65193e1 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -672,12 +672,23 @@
+ 	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+ }
+ 
++#define PCIE_FLR_CLR_TIMEOUT_US		10
+ void pci_dev_specific_flr(void)
+ {
++	u64 start;
++
+ 	regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
+ 	regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
+ 	regmap_writel(1, mmPCIE_AUX_FLR_INT);
+ 
++	start = timestamp_get_us();
++	while (regmap_readl(mmPCIE_AUX_FLR_INT)) {
++		if (timeout_expired(start, PCIE_FLR_CLR_TIMEOUT_US)) {
++			preboot_puts("FLR not cleared\n");
++			break;
++		}
++	}
++
+ 	/*
+ 	 * Clear PCIe SPI INTR. This is required to clear
+ 	 * FLR interrupt as recommended by HW team.

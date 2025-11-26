@@ -1,0 +1,157 @@
+From 052612c90671ce81bf2b56c705a8b3c075d4a7de Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Fri, 19 Apr 2019 13:12:18 +0300
+Subject: [PATCH] [SW-0] pll: Gaudi skip init on warm reset
+
+This is a SW workaround of PLL erratum which discovered during bring up
+
+Use mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2 to know if PLLs were already
+initialized. If they are, only set DIV_SELs.
+
+Change-Id: Ic6cac0b84e8433ff384e665d081573fee2d81c95
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 8f65864..97135f8 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -17,6 +17,19 @@
+ 	return regmap_readl(cfg->base + HL_PLL_DIV_SEL + offset);
+ }
+ 
++static void hl_pll_bypass_set(struct hl_pll_cfg *cfg, enum hl_pll_div_out out)
++{
++	int offset = out * sizeof(u32);
++
++	if (cfg->div_factor[out] == -1)
++		regmap_writel(HL_PLL_REF_CLK,
++				cfg->base + HL_PLL_DIV_SEL + offset);
++	else
++		regmap_writel(cfg->div_factor[out] ?
++				HL_PLL_DIV_PLL : HL_PLL_PLL_CLK,
++				cfg->base + HL_PLL_DIV_SEL + offset);
++}
++
+ static void hl_pll_udelay(unsigned int usec)
+ {
+ 	int pll_num;
+@@ -165,13 +178,17 @@
+ /**
+  * hl_pll_init - Initialize PLL registers
+  */
+-void hl_pll_init(void)
++int hl_pll_init(unsigned int *pll_partial_init)
+ {
+-	int i, pll_num;
++	int i, pll_num, sel;
+ 	struct hl_pll_cfg *hl_pll_cfg;
+ 	enum hl_pll_bypass_val bval;
+ 
+ 	pll_num = hl_pll_get_cfg(&hl_pll_cfg);
++	if (!pll_num)
++		return 1;
++
++	*pll_partial_init = hl_pll_partial_init_get();
+ 
+ 	for (i = 0; i < pll_num; i++) {
+ 		/* DIV0 is the undivided PLL output */
+@@ -181,6 +198,15 @@
+ 				bval != HL_PLL_DIV_REF)
+ 			continue;
+ 
+-		hl_pll_set(hl_pll_cfg + i);
++		if (*pll_partial_init)
++			for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++)
++				hl_pll_bypass_set(hl_pll_cfg + i, sel);
++		else
++			hl_pll_set(hl_pll_cfg + i);
+ 	}
++
++	if (!*pll_partial_init)
++		hl_pll_partial_init_set();
++
++	return 0;
+ }
+diff --git a/common/pll.h b/common/pll.h
+index d83e5c1..b8a9c5e 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -57,7 +57,9 @@
+ 	u32	div_factor[HL_PLL_DIV_SIZE];
+ };
+ 
+-void hl_pll_init(void);
++int hl_pll_init(unsigned int *pll_partial_init);
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg);
++int hl_pll_partial_init_get(void);
++void hl_pll_partial_init_set(void);
+ 
+ #endif /* _HL_PLL_H_ */
+diff --git a/common/preboot.c b/common/preboot.c
+index 3ba1436..84de797 100644
+--- a/common/preboot.c
++++ b/common/preboot.c
+@@ -153,7 +153,9 @@
+ 
+ void preboot_main(void)
+ {
++	int ret;
+ 	void (*spl_start)(void) = (void *)SPL_TEXT_BASE;
++	unsigned int pll_partial_init = 0;
+ 
+ 	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
+ 
+@@ -161,8 +163,19 @@
+ 	preboot_pcie_init();
+ 	preboot_delay();
+ 	preboot_sync_btl();
+-	hl_pll_init();
++	ret = hl_pll_init(&pll_partial_init);
+ 	hl_uart_init();
++
++	/* Now that UART is ready notify about PLL init */
++	if (ret)
++		preboot_puts("Skip PLLs setup [DIP switch is set]!\n");
++	else {
++		if (pll_partial_init)
++			preboot_puts("Partial PLLs setup [warm reset]!\n");
++		else
++			preboot_puts("Full PLLs setup [cold reset]!\n");
++	}
++
+ 	preboot_copy_spl();
+ 
+ 	spl_start();
+diff --git a/gaudi/gaudi.c b/gaudi/gaudi.c
+index 05db649..6ed791a 100644
+--- a/gaudi/gaudi.c
++++ b/gaudi/gaudi.c
+@@ -146,3 +146,13 @@
+ {
+ 	return SPI_BAUDR;
+ }
++
++int hl_pll_partial_init_get(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++}
++
++void hl_pll_partial_init_set(void)
++{
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++}
+diff --git a/goya/goya.c b/goya/goya.c
+index fde8fd9..4365e42 100644
+--- a/goya/goya.c
++++ b/goya/goya.c
+@@ -195,3 +195,10 @@
+ {
+ 	return 0x2;	/* Min divisor */
+ }
++
++int hl_pll_partial_init_get(void)
++{
++	return 0;
++}
++
++void hl_pll_partial_init_set(void) {}

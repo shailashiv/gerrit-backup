@@ -1,0 +1,136 @@
+From e92373cf029a0956b9681fee8bbdb1d72a4276b3 Mon Sep 17 00:00:00 2001
+From: Avinash Kumar <avikumar@habana.ai>
+Date: Fri, 23 Apr 2021 06:11:50 +0300
+Subject: [PATCH] [SW-39260] gaudi2: disable pcie ltr capability
+
+The Latency Tolerance Reporting capability is included
+and supported in the PCIe controller and was integrated
+into all projects. However, it seems that the controller
+will not send an LTR message when needed if the latency
+values are not configured in the PCIE_WRAP.
+
+This causes us to fail PCI-SIGs CV tests that are related
+to LTR: the controller reports LTR supported, but the
+rules for this feature are not applied.
+
+We agreed that the best solution would be to disable support
+for LTR as this capability is not used or needed.
+
+Change-Id: I00bcfe1cc2477cfeb7cfa9edb82b3e530cb10672
+Signed-off-by: Avinash Kumar <avikumar@habana.ai>
+---
+
+diff --git a/gaudi2_arc_gnu/common.c b/gaudi2_arc_gnu/common.c
+index b5b8750..f657bf9 100644
+--- a/gaudi2_arc_gnu/common.c
++++ b/gaudi2_arc_gnu/common.c
+@@ -16,6 +16,7 @@
+ #include <pcie_wrap_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
+ #include <psoc_reset_conf_regs.h>
+@@ -40,6 +41,8 @@
+ 
+ #define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ #define PRODUCT_ID_STR_SIZE	0x8
++#define PCIE_LTR_DISABLE		0
++#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+ 
+ /* TODO: Correct these for Gaudi2 */
+ #define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+@@ -132,6 +135,25 @@
+ 
+ }
+ 
++static void preboot_disable_pcie_ltr(void)
++{
++	u32 cap_hdr_cfg, dev_cap2_reg;
++
++	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
++	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
++	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
++		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
++	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++
++	/* Disable LTR support, set bit-11 to '0' */
++	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
++	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
++		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
++	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++}
++
+ void preboot_init_pcie(void)
+ {
+ 
+@@ -151,6 +173,9 @@
+ 	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+ 	udelay(20);
+ 
++	/* PCIe disable LTR */
++	preboot_disable_pcie_ltr();
++
+ 	/* Enable and Mask LTSSM (erratum 102) */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+diff --git a/gaudi2_arm/common.c b/gaudi2_arm/common.c
+index 603f74b..134503e 100644
+--- a/gaudi2_arm/common.c
++++ b/gaudi2_arm/common.c
+@@ -16,6 +16,7 @@
+ #include <pcie_phy_regs.h>
+ #include <pcie_phy_masks.h>
+ #include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
+ 
+ #include <cpu_timestamp_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+@@ -39,6 +40,8 @@
+ #include "common.h"
+ 
+ #define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
++#define PCIE_LTR_DISABLE		0
++#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+ 
+ #define ARC0_ICCM_BASE_ADDR		0x1000007FF7000000ull
+ #define ARC0_ICCM_SIZE			0x20000			/* 128KB */
+@@ -260,6 +263,25 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
++static void preboot_disable_pcie_ltr(void)
++{
++	u32 cap_hdr_cfg, dev_cap2_reg;
++
++	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
++	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
++	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
++		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
++	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++
++	/* Disable LTR support, set bit-11 to '0' */
++	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
++	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
++		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
++	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++}
++
+ void preboot_init_pcie(void)
+ {
+ 	preboot_init_pcie_phy();
+@@ -284,6 +306,9 @@
+ 	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+ 	udelay(20);
+ 
++	/* PCIe disable LTR */
++	preboot_disable_pcie_ltr();
++
+ 	/* Enable and Mask LTSSM (erratum 102) */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }

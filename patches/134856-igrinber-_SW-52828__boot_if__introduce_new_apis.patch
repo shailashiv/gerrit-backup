@@ -1,0 +1,585 @@
+From e5609bf2a3882c81676b2dfa777844c99efdc80d Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 04 Oct 2021 20:00:28 +0300
+Subject: [PATCH] [SW-52828] boot_if: introduce new apis
+
+Introduce U-Boot like error and device status APIs for use in Preboot.
+The new APIs are more clean and easy to use in simple cases.
+Switch most of the users to use it.
+
+Change-Id: I9d3eab110886e5c9a8dbf3b831b602ea51fb8c6c
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 8462b05..ebdb853 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -33,7 +33,7 @@
+ {
+ 	bool is_valid = true;
+ 	u32 idx;
+-	u64 boot_err;
++	enum cpu_boot_err boot_err;
+ 	char *msg;
+ 
+ 	idx = boot_desc_get_img_desc(image_pending, HL_FW_IMG_PREBOOT, desc);
+@@ -59,13 +59,13 @@
+ 	}
+ 	if (!is_valid) {
+ 		if (is_prime) {
+-			boot_err = BIT_ULL(CPU_BOOT_ERR_PRI_IMG_VER_FAIL);
++			boot_err = CPU_BOOT_ERR_PRI_IMG_VER_FAIL;
+ 			msg = "Primary";
+ 		} else {
+-			boot_err = BIT_ULL(CPU_BOOT_ERR_SEC_IMG_VER_FAIL);
++			boot_err = CPU_BOOT_ERR_SEC_IMG_VER_FAIL;
+ 			msg = "Secondary";
+ 		}
+-		cpu_boot_err_clrset(boot_err, true);
++		cpu_boot_err_set(boot_err);
+ 		preboot_puts_raw(msg);
+ 		preboot_puts(" is not a valid image.\n");
+ 	}
+@@ -208,7 +208,11 @@
+ 	bool is_debug_en;
+ 
+ 	is_debug_en = hl_is_jtag_enabled();
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_DEBUG_EN), is_debug_en);
++	if (is_debug_en)
++		cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_DEBUG_EN);
++	else
++		cpu_boot_dev_sts_clr(CPU_BOOT_DEV_STS_DEBUG_EN);
++
+ 	reg = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
+ 	if (is_debug_en)
+ 		reg |= BIT(12);
+@@ -250,7 +254,7 @@
+ 	if (__stack != STACK_CANARY_MAGIC_WORD) {
+ 		preboot_puts("The stack has overflowed\n");
+ 		preboot_puts_hex("Stack Canary value = ", __stack, false);
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR);
+ 	}
+ 
+ 	ppboot_check_stack_mon_dev_specific();
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 143349c..a70feb9 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -322,12 +322,12 @@
+ 		case HL_FW_FIT_BOOT_ERR_CORRUPTED:
+ 		case HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION:
+ 		case HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE:
+-			cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_FIT_CORRUPTED), true);
++			cpu_boot_err_set(CPU_BOOT_ERR_FIT_CORRUPTED);
+ 			break;
+ 		case HL_FW_FIT_BOOT_ERR_REVOKED_KEY:
+ 		case HL_FW_FIT_BOOT_ERR_SVN:
+ 		case HL_FW_FIT_BOOT_ERR_SIGNATURE:
+-			cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_SECURITY_FAIL), true);
++			cpu_boot_err_set(CPU_BOOT_ERR_SECURITY_FAIL);
+ 			break;
+ 		}
+ 
+@@ -393,9 +393,9 @@
+ 	cpu_boot_if_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+ 	/* Enable the errors communication */
+-	cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_ENABLED), true);
++	cpu_boot_err_set(CPU_BOOT_ERR_ENABLED);
+ 	/* Enable the device status communication */
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_ENABLED), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_ENABLED);
+ 
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+diff --git a/arch/gaudi/arm/asic.c b/arch/gaudi/arm/asic.c
+index f053a3e..3248bf7 100644
+--- a/arch/gaudi/arm/asic.c
++++ b/arch/gaudi/arm/asic.c
+@@ -249,7 +249,7 @@
+ 		base += TPC_QMAN_OFFSET;
+ 	}
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_CLK_GATE_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_CLK_GATE_EN);
+ }
+ 
+ void hl_ram_init(void)
+@@ -529,7 +529,7 @@
+ 		regmap_writel(1, base + mmDMA_IF_W_S_DOWN_CH1_RL_SRAM_EN);
+ 	}
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_RL_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_RL_EN);
+ }
+ 
+ #define HBM0_WR_VAL		0x33333333
+@@ -575,7 +575,7 @@
+ 		regmap_writel(mask, base + mmDMA_IF_W_S_HBM_CRED_EN_1);
+ 	}
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_HBM_CRED_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_HBM_CRED_EN);
+ }
+ 
+ void preboot_e2e_credits_init(void)
+@@ -726,7 +726,7 @@
+ 	regmap_writel(BIT(0), mmDMA_IF_W_S_DOWN_CH1_E2E_HBM_EN);
+ 	regmap_writel(BIT(0), mmDMA_IF_W_S_DOWN_CH1_E2E_PCI_EN);
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_E2E_CRED_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_E2E_CRED_EN);
+ }
+ 
+ #define TPC_PREFETCH_HMASK	0x7F
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index c484429..cc767e2 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -412,7 +412,7 @@
+ 
+ void hl_plat_early_init(void)
+ {
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ }
+ 
+ 
+@@ -450,7 +450,7 @@
+ 
+ void lkd_dev_specific_setup(void)
+ {
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_HARD_RST_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_HARD_RST_EN);
+ }
+ 
+ /* Hard coded each of the gaudi on-chip TS device properties */
+@@ -497,7 +497,7 @@
+ 		regmap_writel(cold_rst_data.data, mmCOLD_RST_DATA);
+ 	}
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_SP_SRAM_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_SP_SRAM_EN);
+ }
+ 
+ void preboot_dev_enable_caps(void)
+@@ -609,5 +609,5 @@
+ void ppboot_check_stack_mon_dev_specific(void)
+ {
+ 	if (__stack2 != STACK_CANARY_MAGIC_WORD)
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR);
+ }
+diff --git a/arch/gaudi/arm/rma_info.c b/arch/gaudi/arm/rma_info.c
+index 76fba4a..b1d92ad 100644
+--- a/arch/gaudi/arm/rma_info.c
++++ b/arch/gaudi/arm/rma_info.c
+@@ -208,7 +208,7 @@
+ 		err_sts_reg_val |= HL_ERROR_STATUS_FATAL_ERROR;
+ 		i2csi_update_smbus_alert(rma_header);
+ 		/* set boot error bit for RMA */
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_DEVICE_UNUSABLE_FAIL), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_DEVICE_UNUSABLE_FAIL);
+ 		preboot_puts_raw("RMA Fatal error(s): ");
+ 		preboot_rma_type_print(rma_header->rma_failure);
+ 		i2c_rma_failure = rma_header->rma_failure;
+diff --git a/arch/gaudi/arm/security.c b/arch/gaudi/arm/security.c
+index c5e7045..bb68623 100644
+--- a/arch/gaudi/arm/security.c
++++ b/arch/gaudi/arm/security.c
+@@ -1872,7 +1872,7 @@
+ {
+ 	bool is_sec_en;
+ 
+-	cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_SECURITY_NOT_RDY), true);
++	cpu_boot_err_set(CPU_BOOT_ERR_SECURITY_NOT_RDY);
+ 	preboot_puts("Security init started...\n");
+ 
+ 	is_sec_en = preboot_security_is_enabled();
+@@ -1902,9 +1902,12 @@
+ 	/* Store security info to be used by the booted image */
+ 	preboot_security_sp_sram_init();
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_SECURITY_EN), is_sec_en);
++	if (is_sec_en)
++		cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_SECURITY_EN);
++	else
++		cpu_boot_dev_sts_clr(CPU_BOOT_DEV_STS_SECURITY_EN);
+ 
+-	cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_SECURITY_NOT_RDY), false);
++	cpu_boot_err_clr(CPU_BOOT_ERR_SECURITY_NOT_RDY);
+ 	preboot_puts("Security init finished.\n");
+ }
+ 
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 0ded012..aca4c25 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -117,12 +117,12 @@
+ 		regmap_writel(cold_rst_data.data, mmCOLD_RST_DATA);
+ 	}
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_SP_SRAM_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_SP_SRAM_EN);
+ }
+ 
+ void hl_plat_early_init(void)
+ {
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ 
+ 	gaudi2_axi_drain_ena();
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 486c205..294658a 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -586,7 +586,7 @@
+ 	u32 retry = ARC_HALT_ACK_RETRIES;
+ 	u32 halt_mask, halt_ack_mask;
+ 	u32 rst_offset;
+-	u64 cpu_boot_err_val;
++	enum cpu_boot_err cpu_boot_err_val;
+ 
+ 	if (id) {
+ 		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+@@ -617,9 +617,9 @@
+ 			if (!retry) {
+ 				preboot_puts_hex("No ack from ARC", id, false);
+ 				cpu_boot_err_val = (!id) ?
+-					BIT_ULL(CPU_BOOT_ERR_ARC0_HALT_ACK_NOT_RCVD) :
+-					BIT_ULL(CPU_BOOT_ERR_ARC1_HALT_ACK_NOT_RCVD);
+-				cpu_boot_err_clrset(cpu_boot_err_val, true);
++					CPU_BOOT_ERR_ARC0_HALT_ACK_NOT_RCVD :
++					CPU_BOOT_ERR_ARC1_HALT_ACK_NOT_RCVD;
++				cpu_boot_err_set(cpu_boot_err_val);
+ 				break;
+ 			}
+ 		}
+@@ -641,7 +641,7 @@
+ 	u32 run_ack_offset, run_req_offset;
+ 	u32 run_ack_mask;
+ 	u64 start;
+-	u64 cpu_boot_err_val;
++	enum cpu_boot_err cpu_boot_err_val;
+ 
+ 	if (id) {
+ 		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+@@ -665,9 +665,9 @@
+ 			preboot_puts_hex("No running state ack from ARC ",
+ 					id, false);
+ 			cpu_boot_err_val = (!id) ?
+-				BIT_ULL(CPU_BOOT_ERR_ARC0_RUN_ACK_NOT_RCVD) :
+-				BIT_ULL(CPU_BOOT_ERR_ARC1_RUN_ACK_NOT_RCVD);
+-			cpu_boot_err_clrset(cpu_boot_err_val, true);
++				CPU_BOOT_ERR_ARC0_RUN_ACK_NOT_RCVD :
++				CPU_BOOT_ERR_ARC1_RUN_ACK_NOT_RCVD;
++			cpu_boot_err_set(cpu_boot_err_val);
+ 			break;
+ 		}
+ 	}
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index c70e95d..69b5e49 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -144,7 +144,7 @@
+ 
+ 	init_secondary();
+ 
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ 
+ 	/*
+ 	 * Upon MANUAL, WATCHDOG, SW ALL, PRSTN, FLR and FW reset
+diff --git a/arch/greco/arm/common.c b/arch/greco/arm/common.c
+index a751e45..7412344 100644
+--- a/arch/greco/arm/common.c
++++ b/arch/greco/arm/common.c
+@@ -143,7 +143,7 @@
+ {
+ 	axi_enable_drain();
+ 	axi_enable_pcie_drain();
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ }
+ 
+ void ppboot_log_waiting_for_pcie(void)
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 0ec096b..127ff93 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -159,7 +159,7 @@
+ 	u32 run_ack_offset, run_req_offset;
+ 	u32 run_ack_mask;
+ 	u64 start;
+-	u64 cpu_boot_err_val;
++	enum cpu_boot_err cpu_boot_err_val;
+ 
+ 	if (id) {
+ 		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+@@ -183,9 +183,9 @@
+ 			preboot_puts_hex("No running state ack from ARC ",
+ 					id, false);
+ 			cpu_boot_err_val = (!id) ?
+-				BIT_ULL(CPU_BOOT_ERR_ARC0_RUN_ACK_NOT_RCVD) :
+-				BIT_ULL(CPU_BOOT_ERR_ARC1_RUN_ACK_NOT_RCVD);
+-			cpu_boot_err_clrset(cpu_boot_err_val, true);
++				CPU_BOOT_ERR_ARC0_RUN_ACK_NOT_RCVD :
++				CPU_BOOT_ERR_ARC1_RUN_ACK_NOT_RCVD;
++			cpu_boot_err_set(cpu_boot_err_val);
+ 			break;
+ 		}
+ 	}
+@@ -294,7 +294,7 @@
+ 
+ void lkd_dev_specific_setup(void)
+ {
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_HARD_RST_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_HARD_RST_EN);
+ }
+ 
+ void preboot_disable_pcie_ltr(void)
+@@ -513,7 +513,7 @@
+ 	u32 retry = ARC_HALT_ACK_RETRIES;
+ 	u32 halt_mask, halt_ack_mask;
+ 	u32 rst_offset;
+-	u64 cpu_boot_err_val;
++	enum cpu_boot_err cpu_boot_err_val;
+ 
+ 	if (id) {
+ 		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+@@ -545,9 +545,9 @@
+ 			if (!retry) {
+ 				preboot_puts_hex("No ack from ARC", id, false);
+ 				cpu_boot_err_val = (!id) ?
+-					BIT_ULL(CPU_BOOT_ERR_ARC0_HALT_ACK_NOT_RCVD) :
+-					BIT_ULL(CPU_BOOT_ERR_ARC1_HALT_ACK_NOT_RCVD);
+-				cpu_boot_err_clrset(cpu_boot_err_val, true);
++					CPU_BOOT_ERR_ARC0_HALT_ACK_NOT_RCVD :
++					CPU_BOOT_ERR_ARC1_HALT_ACK_NOT_RCVD;
++				cpu_boot_err_set(cpu_boot_err_val);
+ 				break;
+ 			}
+ 		}
+diff --git a/include/boot_if.h b/include/boot_if.h
+index b3b821f..fbadf0e 100644
+--- a/include/boot_if.h
++++ b/include/boot_if.h
+@@ -20,9 +20,15 @@
+ void cpu_boot_if_fix_ro_regs(void);
+ void cpu_boot_sts_set(u32 val);	/* boot progress status */
+ 
++void cpu_boot_err_set(enum cpu_boot_err val);
++void cpu_boot_err_clr(enum cpu_boot_err val);
++int cpu_boot_err_get(enum cpu_boot_err val);
++void cpu_boot_dev_sts_set(enum cpu_boot_dev_sts val);
++void cpu_boot_dev_sts_clr(enum cpu_boot_dev_sts val);
++int cpu_boot_dev_sts_get(enum cpu_boot_dev_sts val);
++
+ /* err/dev status low level functions */
+ void cpu_boot_err_clrset(u64 mask, bool set);
+-bool cpu_boot_err_get(u64 mask);
+ void cpu_boot_dev_sts_clrset(u64 mask, bool set);
+ u64 cpu_boot_dev_sts_get_all(void);
+ 
+diff --git a/lib/common/boot_if.c b/lib/common/boot_if.c
+index fd570fc..6106ae0 100644
+--- a/lib/common/boot_if.c
++++ b/lib/common/boot_if.c
+@@ -11,6 +11,7 @@
+ 
+ #include <preboot.h>
+ #include <hl_boot_if.h>			/* requires stdint.h */
++#include <bitops.h>
+ 
+ #define REG_WIDTH	32
+ 
+@@ -75,7 +76,7 @@
+ 	regmap_writel(cpu_boot_if.status_val, cpu_boot_if.status);
+ }
+ 
+-static void cpu_boot_reg_clrset(u32 reg, u32 mask, bool set)
++static void cpu_boot_reg_do_clrset(u32 reg, u32 mask, bool set)
+ {
+ 	u32 *shadow;
+ 
+@@ -99,20 +100,14 @@
+ 
+ void cpu_boot_err_clrset(u64 mask, bool set)
+ {
+-	cpu_boot_reg_clrset(cpu_boot_if.err[0], (u32)mask, set);
+-	cpu_boot_reg_clrset(cpu_boot_if.err[1], (u32)(mask >> REG_WIDTH), set);
+-}
+-
+-bool cpu_boot_err_get(u64 mask)
+-{
+-	return !!((cpu_boot_if.err_val[0] & (u32)mask) |
+-		  (cpu_boot_if.err_val[1] & (u32)(mask >> REG_WIDTH)));
++	cpu_boot_reg_do_clrset(cpu_boot_if.err[0], (u32)mask, set);
++	cpu_boot_reg_do_clrset(cpu_boot_if.err[1], (u32)(mask >> REG_WIDTH), set);
+ }
+ 
+ void cpu_boot_dev_sts_clrset(u64 mask, bool set)
+ {
+-	cpu_boot_reg_clrset(cpu_boot_if.dev_sts[0], (u32)mask, set);
+-	cpu_boot_reg_clrset(cpu_boot_if.dev_sts[1], (u32)(mask >> REG_WIDTH), set);
++	cpu_boot_reg_do_clrset(cpu_boot_if.dev_sts[0], (u32)mask, set);
++	cpu_boot_reg_do_clrset(cpu_boot_if.dev_sts[1], (u32)(mask >> REG_WIDTH), set);
+ }
+ 
+ void cpu_boot_rsp_set(enum cpu_msg_status sts)
+@@ -131,3 +126,77 @@
+ 
+ 	return val << REG_WIDTH | cpu_boot_if.dev_sts_val[0];
+ }
++
++static void cpu_boot_reg_clrset(u32 *reg_table, u32 val, bool set)
++{
++	int shift;
++	u32 reg;
++
++	reg = reg_table[val / REG_WIDTH];
++	shift = val % REG_WIDTH;
++
++	cpu_boot_reg_do_clrset(reg, BIT(shift), set);
++}
++
++static void cpu_boot_err_do_clrset(enum cpu_boot_err val, bool set)
++{
++	if (val < 0 || val >= CPU_BOOT_ERR_LAST)
++		return;
++
++	cpu_boot_reg_clrset(cpu_boot_if.err, val, set);
++}
++
++void cpu_boot_err_set(enum cpu_boot_err val)
++{
++	cpu_boot_err_do_clrset(val, true);
++}
++
++void cpu_boot_err_clr(enum cpu_boot_err val)
++{
++	cpu_boot_err_do_clrset(val, false);
++}
++
++static int cpu_boot_get(u32 *regs, int val)
++{
++	int shift;
++	u32 reg;
++
++	reg = regs[val / REG_WIDTH];
++	shift = val % REG_WIDTH;
++
++	return !!(regmap_readl(reg) & BIT(shift));
++}
++
++int cpu_boot_err_get(enum cpu_boot_err val)
++{
++	if (val < 0 || val >= CPU_BOOT_ERR_LAST)
++		return -1;
++
++	return cpu_boot_get(cpu_boot_if.err, val);
++}
++
++static void cpu_boot_dev_sts_do_clrset(enum cpu_boot_dev_sts val, bool set)
++{
++	if (val < 0 || val >= CPU_BOOT_DEV_STS_LAST)
++		return;
++
++	cpu_boot_reg_clrset(cpu_boot_if.dev_sts, val, set);
++}
++
++void cpu_boot_dev_sts_set(enum cpu_boot_dev_sts val)
++{
++	cpu_boot_dev_sts_do_clrset(val, true);
++}
++
++void cpu_boot_dev_sts_clr(enum cpu_boot_dev_sts val)
++{
++	cpu_boot_dev_sts_do_clrset(val, false);
++}
++
++int cpu_boot_dev_sts_get(enum cpu_boot_dev_sts val)
++{
++	if (val < 0 || val >= CPU_BOOT_DEV_STS_LAST)
++		return -1;
++
++	return cpu_boot_get(cpu_boot_if.dev_sts, val);
++}
+diff --git a/lib/common/efuse.c b/lib/common/efuse.c
+index be9f900..80118e7 100644
+--- a/lib/common/efuse.c
++++ b/lib/common/efuse.c
+@@ -59,14 +59,14 @@
+ 	u32 read_val;
+ 
+ 	if (word >= FUSE_WORDS_PER_BANK) {
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_EFUSE_FAIL), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_EFUSE_FAIL);
+ 		preboot_puts("Invalid efuse word offset\n");
+ 		return -1;
+ 	}
+ 
+ 	ret = preboot_fuse_init();
+ 	if (ret == -2) {
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_EFUSE_FAIL), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_EFUSE_FAIL);
+ 		preboot_puts("Efuse not initialized\n");
+ 		return ret;
+ 	}
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 49855cc..0a06725 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -972,12 +972,12 @@
+ 	case FIT_LOAD_BAD_LOAD_ADDR:
+ 	case FIT_LOAD_NOT_RUNNABLE:
+ 	case FIT_LOAD_CORRUPTED:
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_FIT_CORRUPTED), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_FIT_CORRUPTED);
+ 		preboot_error_inform(HL_FW_ERR_FIT, err);
+ 		preboot_puts("FIT loading failed, Retrying...\n");
+ 		break;
+ 	case FIT_LOAD_SEC_FAILED:
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_SECURITY_FAIL), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_SECURITY_FAIL);
+ 		preboot_error_inform(HL_FW_ERR_SECURITY,
+ 				     fwupd_sec_convert_min_error(sec_res));
+ 		preboot_puts("FIT security validation failed, Retrying...\n");
+diff --git a/lib/preboot/memory.c b/lib/preboot/memory.c
+index 38f44b7..6825e8c 100644
+--- a/lib/preboot/memory.c
++++ b/lib/preboot/memory.c
+@@ -74,7 +74,7 @@
+ {
+ 	bool retval = false;
+ 
+-	if (cpu_boot_err_get(BIT_ULL(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR))) {
++	if (cpu_boot_err_get(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR)) {
+ 		preboot_puts("Critical firmware error occurred\n");
+ 		preboot_puts("Please fix the code to avoid that\n");
+ 		retval = true;
+@@ -84,7 +84,7 @@
+ 		preboot_puts("Preboot stack has oveflowed and killed the poor canary :(\n");
+ 		preboot_puts_hex("Canary value = ", __stack, false);
+ 		preboot_puts("Please fix the code to avoid stack overflow.\n");
+-		cpu_boot_err_clrset(BIT_ULL(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR), true);
++		cpu_boot_err_set(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR);
+ 		retval = true;
+ 	}
+ 
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 700e03c..c61d47f 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -38,7 +38,7 @@
+ 
+ void module_lkd_enable(void)
+ {
+-	cpu_boot_dev_sts_clrset(BIT_ULL(CPU_BOOT_DEV_STS_FW_LD_COM_EN), true);
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_LD_COM_EN);
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
+ }
+ 

@@ -1,0 +1,209 @@
+From f4477bef02c990de680db81c58858dbe1ff5f668 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 10 Jan 2021 10:17:39 +0200
+Subject: [PATCH] [SW-20244] preboot: adding dynamic debug ability
+
+developer can enable debug print by typing 'dbg' in preboot.
+restoring slave i2c debug prints removed in
+commit 01b8cc43fec9 ("[SW-19168] cmd: i2c: remove prints")
+
+Change-Id: If3a6eab0a8a9748d273c717301513fdd78e9959e
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 89e648e..50fb987 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -165,8 +165,10 @@
+ 	stat = i2cslave_dw_read_clear_intrbits_slave();
+ 
+ 	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
+-	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)) {
++		preboot_puts_dbg("I2C SLAVE: read request received\n");
+ 		return FOUND_SLOW_RETURN;
++	}
+ 
+ 	if (i2cslave_indirect_is_process_op()) {
+ 		if (i2cslave_indirect_op_is_fast())
+@@ -267,6 +269,7 @@
+ 
+ 	i2cs_data.seq = seq;
+ 	i2cs_data.buf.data = data;
++	preboot_puts_dbg("I2C SLAVE: write request processed\n");
+ }
+ 
+ static inline u8 i2cslave_consume_handler(void)
+@@ -300,6 +303,7 @@
+ 	u8 data = i2cslave_consume_handler();
+ 
+ 	i2cslave_produce_hw(data);
++	preboot_puts_dbg("I2C SLAVE: read request processed\n");
+ }
+ 
+ void module_i2c_s_run(void)
+diff --git a/common/uart.c b/common/uart.c
+index 5a8990b..1062fac 100644
+--- a/common/uart.c
++++ b/common/uart.c
+@@ -16,6 +16,23 @@
+ #define STR_UINT_SZ			8
+ #define BITS_IN_SINGLE_CHAR		4
+ 
++static bool dbg_enabled; /* by default debug prints are disabled */
++
++void preboot_set_dbg_prints_ena(bool enable_dbg)
++{
++	dbg_enabled = enable_dbg;
++	preboot_puts_raw("debug prints ");
++	if (dbg_enabled)
++		preboot_puts("enabled\n");
++	else
++		preboot_puts("disabled\n");
++}
++
++bool preboot_get_dbg_prints_ena(void)
++{
++	return dbg_enabled;
++}
++
+ void preboot_uart_init(unsigned int val)
+ {
+ 	regmap_writel(0x0, mmPSOC_UART_0_CTRL);
+diff --git a/common/uart.h b/common/uart.h
+index 2bc45f0..598f059 100644
+--- a/common/uart.h
++++ b/common/uart.h
+@@ -23,4 +23,33 @@
+ int preboot_uart_tstc(void);
+ int preboot_uart_getc(void);
+ 
++/* enable/disable emitting debug prints to the log */
++void preboot_set_dbg_prints_ena(bool enable_dbg);
++bool preboot_get_dbg_prints_ena(void);
++
++/*
++ * printing functions for debug prints that can be omitted from the log.
++ * the implementation is in the header in order to minimize the size of
++ * the binary
++ */
++
++static inline void preboot_puts_dbg(const char *str)
++{
++	if (preboot_get_dbg_prints_ena())
++		preboot_puts(str);
++}
++
++static inline void preboot_puts_raw_dbg(const char *str)
++{
++	if (preboot_get_dbg_prints_ena())
++		preboot_puts_raw(str);
++}
++
++static inline void preboot_puts_hex_dbg(const char *log,
++					unsigned int val, bool pad)
++{
++	if (preboot_get_dbg_prints_ena())
++		preboot_puts_hex(log, val, pad);
++}
++
+ #endif /* _HL_UART_H_ */
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index bae5406..e055903 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -61,24 +61,17 @@
+ 
+ #define GAUDI_MEZZ_ID_MASK	0x7 /* We use only 3 bits out of 5 */
+ #define GAUDI_MEZZ_ID_SHIFT	22
+-#define ESC_KEY			0x1b
+-void hl_parse_uart(int val)
++
++void hl_esc_key_handle(void)
+ {
+ 	u8 mezz_id;
+ 	u32 strap;
+ 
+ 	strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
+ 	mezz_id = (strap >> GAUDI_MEZZ_ID_SHIFT) & GAUDI_MEZZ_ID_MASK;
+-
+-	switch (val) {
+-	case ESC_KEY:
+-		preboot_puts_raw("OAM[");
+-		preboot_puth_raw(mezz_id, false);
+-		preboot_puts("] Gaudi!\n");
+-		break;
+-	default:
+-		break;
+-	}
++	preboot_puts_raw("OAM[");
++	preboot_puth_raw(mezz_id, false);
++	preboot_puts("] Gaudi!\n");
+ }
+ 
+ #define GAUDI_FUSE_TABLE_SIZE	4
+diff --git a/include/preboot.h b/include/preboot.h
+index d674bda..c2308bd 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -97,6 +97,7 @@
+ bool hl_is_jtag_enabled(void);
+ void hl_enter_recovery(void);
+ void hl_dev_reset(void);
++void hl_esc_key_handle(void);
+ 
+ void preboot_pcie_wait_for_link(void);
+ void preboot_delay(void);
+diff --git a/preboot/module_uart.c b/preboot/module_uart.c
+index 339b448..340a140 100644
+--- a/preboot/module_uart.c
++++ b/preboot/module_uart.c
+@@ -19,7 +19,46 @@
+ 	return FOUND_FAST_RETURN;
+ }
+ 
+-__weak void hl_parse_uart(int val) {}
++__weak void hl_esc_key_handle(void) {}
++
++#define ESC_KEY			0x1b
++
++void hl_parse_uart(int val)
++{
++	static u8 dbg_count;
++	bool dbg_ena;
++
++	switch (val) {
++	case ESC_KEY:
++		hl_esc_key_handle();
++		dbg_count = 0;
++		break;
++	case 'd':
++		dbg_count = 1;
++		break;
++	case 'b':
++		if (dbg_count == 1)
++			dbg_count = 2;
++		else
++			dbg_count = 0;
++
++		break;
++	case 'g':
++		/* typing "dbg" will enable/disable debug prints
++		 * to the console
++		 */
++		if (dbg_count == 2) {
++			dbg_ena = preboot_get_dbg_prints_ena();
++			preboot_set_dbg_prints_ena(!dbg_ena);
++		}
++
++		dbg_count = 0;
++		break;
++	default:
++		dbg_count = 0;
++		break;
++	}
++}
+ 
+ void module_uart_run(void)
+ {

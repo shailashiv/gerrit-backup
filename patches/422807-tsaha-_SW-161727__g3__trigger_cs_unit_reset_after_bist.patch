@@ -1,0 +1,127 @@
+From 39d1f576dfd031bcf6ebc6927a563d50d34a610c Mon Sep 17 00:00:00 2001
+From: Tamal <tasaha@habana.ai>
+Date: Thu, 04 Jul 2024 09:19:12 +0300
+Subject: [PATCH] [SW-161727] g3: trigger cs unit reset after bist
+
+This patch adds die0 CS unit reset after die 0 SRAM
+BIST execution at ppboot stage.
+
+This patch adds 20 micro second delay after DFT register
+read, write operations during BIST.
+
+This patch enables BIST execution after reset except
+FW all reset.
+
+Change-Id: I5de3a0be6404a294209c0e2f594b87e4d4204acc
+Signed-off-by: Tamal <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 3d76e32..200e134 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -31,6 +31,8 @@
+ #include <cpu_if_special_masks.h>
+ #include <cache_special_regs.h>
+ #include <cache_special_masks.h>
++#include <psoc_reset_conf_regs.h>
++#include <psoc_reset_conf_masks.h>
+ 
+ static struct hl_ras_sram_bist_data bist_data;
+ static u32 *hl_gaudi3_sram_mbist_data_start_address;
+@@ -53,7 +55,7 @@
+ 	} else {
+ 		bist_data.bist_result = SRAM_MBIST_ALL_PASS;
+ 		/* TODO: update "skip" by "pass" after memcpy engine timeout resolved */
+-		preboot_puts("Die 0 cache memories MBIST Skip\n");
++		preboot_puts("Die 0 cache memories MBIST Pass\n");
+ 	}
+ 
+ 	/*
+@@ -121,7 +123,8 @@
+ 		else
+ 			cpy_size = remain_size;
+ 
+-		gaudi3_hbw_memcpy(0, mem_base, cpy_size, GAUDI3_HBW_MEM_INIT);
++		if (gaudi3_hbw_memcpy(0, mem_base, cpy_size, GAUDI3_HBW_MEM_INIT) != 0)
++			break;
+ 
+ 		remain_size -= cpy_size;
+ 		mem_base += cpy_size;
+@@ -190,6 +193,22 @@
+ 	gaudi3_mask_sram_ecc(false);
+ }
+ 
++static void gaudi3_die0_cs_reset(void)
++{
++	/* Perform unit reset for CS */
++	regmap_writel(PSOC_RESET_CONF_CS_UNIT_RST_EN_M, D0_PSOC_RESET_CONF_REG(mmPSOC_RESET_CONF_CS_UNIT_RST));
++	/* At this point reset is asserted */
++	regmap_writel(PSOC_RESET_CONF_UNIT_RST_N_IND_M, D0_PSOC_RESET_CONF_REG(mmPSOC_RESET_CONF_UNIT_RST_N));
++
++	/* This delay for how long reset is asserted. Can be 1ms. */
++	udelay(1000);
++
++	/* At this point reset is deasserted and CS init starts. */
++	regmap_writel(0, D0_PSOC_RESET_CONF_REG(mmPSOC_RESET_CONF_CS_UNIT_RST));
++	regmap_writel(0, D0_PSOC_RESET_CONF_REG(mmPSOC_RESET_CONF_UNIT_RST_N));
++	udelay(1000);
++}
++
+ void hl_sram_self_repair(void)
+ {
+ 	struct gaudi3_cold_rst_data cold_rst_data;
+@@ -215,6 +234,7 @@
+ 	}
+ 
+ 	gaudi3_sram_self_repair(sram_loadaddr);
++	gaudi3_die0_cs_reset();
+ 	gaudi3_sram_ecc_init();
+ 	preboot_puts("bist done for 48MB SRAM/CACHE\n");
+ }
+diff --git a/arch/gaudi3/arc/mbist.c b/arch/gaudi3/arc/mbist.c
+index 201a5e2..8570534 100644
+--- a/arch/gaudi3/arc/mbist.c
++++ b/arch/gaudi3/arc/mbist.c
+@@ -21,7 +21,8 @@
+ 	 * IST_WAIT(uint32_t pclk_cycles) = usleep(pclk_cycles * PCLK_PERIOD_IN_USEC);
+ 	 */
+ 
+-	(pclk % 10) ? udelay((pclk / 10) + 1) : udelay(pclk / 10);
++	//(pclk % 10) ? udelay((pclk / 10) + 1) : udelay(pclk / 10);
++	udelay((pclk / 1) + 20 + 10000);
+ }
+ 
+ int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
+@@ -38,9 +39,6 @@
+ 		preboot_puts("mbist self repair version mismatch\n");
+ 		return -1;  /* version mismatch */
+ 	}
+-
+-	/* TODO: Remove following line after memcpy engine timeout resolved */
+-	return 0;
+ 
+ 	read_id = data[i];
+ 	++i;
+@@ -59,11 +57,13 @@
+ 			}
+ 
+ 			regmap_writel(data[i], ist_addr);
++			udelay(20);
+ 			++i;
+ 
+ 			if (op == IST_OPC_WRITE_X_COMPARE) {
+ 				++read_id;
+ 				rdval = regmap_readl(ist_addr) & data[i];
++				udelay(20);
+ 				++i;
+ 				expval = data[i];
+ 				++i;
+@@ -85,6 +85,7 @@
+ 			} else if (op == IST_OPC_WRITE_BIN_COMPARE) {
+ 				++read_id;
+ 				rdval = regmap_readl(ist_addr);
++				udelay(20);
+ 				expval = data[i];
+ 				++i;
+ 

@@ -1,0 +1,166 @@
+From 065107ee413eb8626110b95f1b2bb4c33b9fc81d Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 14 Jul 2021 14:12:39 +0300
+Subject: [PATCH] [SW-47213] pll: splitting clk select functions
+
+Future patch requires switching a single pll output to ref_clk and
+back to pll / div setting.
+In order to avoid code duplication, splitting the functions that are
+managing clk select for the whole pll and creating functions for
+single clk output selection.
+
+Change-Id: Ifdb3ec3b53cba373cc7d2641fde6d66d6a39c6e4
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi/pll.c b/arch/gaudi/pll.c
+index 07520f7..3b4e426 100644
+--- a/arch/gaudi/pll.c
++++ b/arch/gaudi/pll.c
+@@ -130,5 +130,5 @@
+ 	hl_pll_init(gaudi_pll_cfg, ARRAY_SIZE(gaudi_pll_cfg));
+ 
+ 	for (i = 0; i < ARRAY_SIZE(gaudi_pll_ref_cfg); i++)
+-		hl_pll_clk_switch_to_ref(&gaudi_pll_ref_cfg[i]);
++		hl_pll_switch_to_ref(&gaudi_pll_ref_cfg[i]);
+ }
+diff --git a/common/pll.c b/common/pll.c
+index 54de937..c8a7e3f 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -178,58 +178,64 @@
+ 	udelay(HL_PLL_MAX_WAIT_TIME);
+ }
+ 
+-void hl_pll_clk_switch_to_ref(struct hl_pll_cfg *cfg)
++void hl_pll_clk_switch_to_ref(u32 pll_base, int div_num)
++{
++	u32 reg = pll_base + HL_PLL_DIV_SEL + (div_num * sizeof(u32));
++
++	switch (regmap_readl(reg)) {
++	case HL_PLL_DIV_PLL:
++		/* first change DIV_REF, then DIV_PLL */
++		regmap_writel(HL_PLL_DIV_REF, reg);
++		udelay(1);
++		/* no break */
++	case HL_PLL_PLL_CLK:
++	case HL_PLL_DIV_REF:
++		regmap_writel(HL_PLL_REF_CLK, reg);
++		break;
++	case HL_PLL_REF_CLK:
++	default:
++		break;
++	}
++}
++
++void hl_pll_switch_to_ref(struct hl_pll_cfg *cfg)
+ {
+ 	int sel;
+-	u32 reg;
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-
+-		switch (regmap_readl(reg)) {
+-		case HL_PLL_DIV_PLL:
+-			/* first change DIV_REF, then DIV_PLL */
+-			regmap_writel(HL_PLL_DIV_REF, reg);
+-			udelay(1);
+-			/* no break */
+-		case HL_PLL_PLL_CLK:
+-		case HL_PLL_DIV_REF:
+-			regmap_writel(HL_PLL_REF_CLK, reg);
+-			break;
+-		case HL_PLL_REF_CLK:
+-		default:
+-			break;
+-		}
++		hl_pll_clk_switch_to_ref(cfg->base, sel);
+ 	}
+ 
+ 	/* just to be on a safe side, wait for bypass to propagate */
+ 	udelay(1);
+ }
+ 
+-static void hl_pll_clk_switch_to_pll(struct hl_pll_cfg *cfg)
++void hl_pll_clk_switch_to_pll(u32 pll_base, int div_num, int div_sel)
++{
++	u32 reg = pll_base + HL_PLL_DIV_SEL + (div_num * sizeof(u32));
++
++	switch (div_sel) {
++	case HL_PLL_DIV_PLL:
++		/* first change DIV_REF, then DIV_PLL */
++		regmap_writel(HL_PLL_DIV_REF, reg);
++		udelay(1);
++		/* no break */
++	case HL_PLL_DIV_REF:
++	case HL_PLL_PLL_CLK:
++		regmap_writel(div_sel, reg);
++		break;
++	case HL_PLL_REF_CLK:
++	default:
++		break;
++	}
++}
++
++static void hl_pll_switch_to_pll(struct hl_pll_cfg *cfg)
+ {
+ 	int sel;
+-	u32 reg;
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-		switch (cfg->div_sel[sel]) {
+-		case HL_PLL_DIV_REF:
+-			regmap_writel(HL_PLL_DIV_REF, reg);
+-			break;
+-		case HL_PLL_PLL_CLK:
+-			regmap_writel(HL_PLL_PLL_CLK, reg);
+-			break;
+-		case HL_PLL_DIV_PLL:
+-			/* first change DIV_REF, then DIV_PLL */
+-			regmap_writel(HL_PLL_DIV_REF, reg);
+-			udelay(1);
+-			regmap_writel(HL_PLL_DIV_PLL, reg);
+-			break;
+-		case HL_PLL_REF_CLK:
+-		default:
+-			break;
+-		}
++		hl_pll_clk_switch_to_pll(cfg->base, sel, cfg->div_sel[sel]);
+ 	}
+ 
+ 	/* just to be on a safe side, wait for bypass to propagate */
+@@ -289,7 +295,7 @@
+ 
+ 	hl_pll_set_div_sel_delay(cfg);
+ 
+-	hl_pll_clk_switch_to_ref(cfg);
++	hl_pll_switch_to_ref(cfg);
+ 	hl_pll_clk_relax_reset(cfg);
+ 
+ 	hl_pll_cfg(cfg);
+@@ -312,7 +318,7 @@
+ 	hl_pll_ack_int(cfg);
+ 
+ 	if (is_locked)
+-		hl_pll_clk_switch_to_pll(cfg);
++		hl_pll_switch_to_pll(cfg);
+ }
+ 
+ /**
+diff --git a/common/pll.h b/common/pll.h
+index 9ff8560..ce6d348 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -52,7 +52,9 @@
+ 
+ void hl_dev_pll_init(void);
+ void hl_pll_init(struct hl_pll_cfg *hl_pll_cfg, int size);
+-void hl_pll_clk_switch_to_ref(struct hl_pll_cfg *cfg);
++void hl_pll_clk_switch_to_pll(u32 pll_base, int div_num, int div_sel);
++void hl_pll_clk_switch_to_ref(u32 pll_base, int div_num);
++void hl_pll_switch_to_ref(struct hl_pll_cfg *cfg);
+ void udelay_init(void);
+ u64 hl_pll_timestamp_freq_get(void);
+ u32 hl_pll_timestamp_base_get(void);

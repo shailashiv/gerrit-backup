@@ -1,0 +1,153 @@
+From 60b102f0ff4cefbfcaa34228f7eae0e9dae051c9 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 26 Aug 2021 11:39:01 +0300
+Subject: [PATCH] [SW-46364] preboot: adding stack overflow monitor
+
+The Stack monitor is checking the magic word that is stored at the
+last address of the stack. If the value is not preserved during
+the execution, or stack overflow indication received from ppboot,
+fit image runnig by the LKD driver is prevented.
+FW upgrade module continue to function normally so system can
+be upgraded to a fixed version.
+
+Change-Id: Ic7381e12f736cfe388ca02943cb0d11846c19fe6
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 5ee5748..022f063 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -384,6 +384,7 @@
+ 	u64 ver_off = (uintptr_t)preboot_vers;
+ 	bool is_sec_en;
+ 
++	preboot_init_stack_monitor();
+ 	/* Initialize internal if variables */
+ 	cpu_boot_if_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+diff --git a/include/boot_if.h b/include/boot_if.h
+index 11d688d..935c7e3 100644
+--- a/include/boot_if.h
++++ b/include/boot_if.h
+@@ -17,6 +17,7 @@
+ void cpu_boot_cmd_clr_before_wfe(void);
+ void cpu_boot_sts_set(u32 val);
+ void cpu_boot_err_clrset(u32 mask, bool set);
++bool cpu_boot_err_get(u32 mask);
+ void cpu_boot_dev_sts_clrset(u32 mask, bool set);
+ void cpu_boot_rsp_set(enum cpu_msg_status sts);
+ u64 cpu_boot_dev_sts_get_all(void);
+diff --git a/include/memory.h b/include/memory.h
+index d5ec4e6..46fc41a 100644
+--- a/include/memory.h
++++ b/include/memory.h
+@@ -34,6 +34,7 @@
+ };
+ 
+ int preboot_get_mem_region(enum mem_region region, struct mem_desc *desc);
+-
++void preboot_init_stack_monitor(void);
++bool preboot_check_stack_monitor(void);
+ 
+ #endif /* _MEMORY_H_ */
+diff --git a/lib/common/boot_if.c b/lib/common/boot_if.c
+index 5fc43b1..2d063af 100644
+--- a/lib/common/boot_if.c
++++ b/lib/common/boot_if.c
+@@ -85,6 +85,11 @@
+ 	cpu_boot_reg_clrset(mmCPU_BOOT_ERR0, mask, set);
+ }
+ 
++bool cpu_boot_err_get(u32 mask)
++{
++	return !!(cpu_boot_err & mask);
++}
++
+ /* We support only STS0 for now */
+ void cpu_boot_dev_sts_clrset(u32 mask, bool set)
+ {
+diff --git a/lib/preboot/memory.c b/lib/preboot/memory.c
+index 2caa977..07bc63f 100644
+--- a/lib/preboot/memory.c
++++ b/lib/preboot/memory.c
+@@ -7,6 +7,9 @@
+ 
+ #include <preboot.h>
+ #include <memory.h>
++#include <boot_if.h>
++
++#include "uart.h"
+ 
+ static struct mem_desc mem_desc[MEM_NOENT] = {
+ 	[MEM_GP] = {
+@@ -60,3 +63,29 @@
+ 
+ 	return 0;
+ }
++
++void preboot_init_stack_monitor(void)
++{
++	__stack = STACK_CANARY_MAGIC_WORD;
++}
++
++bool preboot_check_stack_monitor(void)
++{
++	bool retval = false;
++
++	if (cpu_boot_err_get(CPU_BOOT_ERR0_BOOT_FW_CRIT_ERR)) {
++		preboot_puts("Critical firmware error occurred\n");
++		preboot_puts("Please fix the code to avoid that\n");
++		retval = true;
++	}
++
++	if (__stack != STACK_CANARY_MAGIC_WORD) {
++		preboot_puts("Preboot stack has oveflowed and killed the poor canary :(\n");
++		preboot_puts_hex("Canary value = ", __stack, false);
++		preboot_puts("Please fix the code to avoid stack overflow.\n");
++		cpu_boot_err_clrset(CPU_BOOT_ERR0_BOOT_FW_CRIT_ERR, true);
++		retval = true;
++	}
++
++	return retval;
++}
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 7946254..407ad69 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -14,6 +14,7 @@
+ #include <crc32.h>
+ #include <memory.h>
+ #include <fit_load_type.h>
++#include <memory.h>
+ 
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
+@@ -328,9 +329,6 @@
+ 	case COMMS_DATA_RDY:
+ 		cmd_str = cmd_str ?: "data_rdy";
+ 		/* no break */
+-	case COMMS_EXEC:
+-		cmd_str = cmd_str ?: "exec";
+-		/* no break */
+ 	case COMMS_RST_DEV:
+ 		cmd_str = cmd_str ?: "rst_dev";
+ 		module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
+@@ -346,6 +344,17 @@
+ 		}
+ 
+ 		break;
++	case COMMS_EXEC:
++		cmd_str = "exec";
++		if (preboot_check_stack_monitor()) {
++			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
++			err_str = "EXEC denied - critical fw error detected";
++			sts.exec_res = NOT_FOUND;
++		} else {
++			module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
++		}
++
++		break;
+ 	case COMMS_SKIP_BMC:
+ 		cmd_str = "skip_bmc";
+ 		/* no break */

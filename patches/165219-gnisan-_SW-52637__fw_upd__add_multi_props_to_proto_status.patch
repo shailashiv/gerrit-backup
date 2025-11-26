@@ -1,0 +1,120 @@
+From 1cdba242dd24f744b10894b35cdea115273dc0e2 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 03 Jan 2022 14:10:43 +0200
+Subject: [PATCH] [SW-52637] fw_upd: add multi props to proto_status
+
+Add a way to send multiple props via proto_status response
+
+Change-Id: I4c435f46e807be4e52c165d27c42e4205fb54805
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+(cherry picked from commit 5c870a473286eb2798c511fbb52301cc23b75939)
+---
+
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index 67d0973..033d3e4 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -22,9 +22,6 @@
+ #include "pll.h"
+ #include "fit.h"
+ 
+-#define FIT_RSP_MARGIN_SIZE_IN_KB	0x400	/* 1KB */
+-#define FIT_DFL_RSP_SIZE_IN_KB		0x1000	/* 4KB */
+-
+ #define WFC_TIMEOUT_MS			500
+ #define TIMEOUT_US			1000
+ 
+@@ -50,8 +47,20 @@
+ 	enum mem_region mregion;
+ };
+ 
++struct fwupd_resp_prop {
++	const char *name;
++	const void *data;
++	u32 size;
++};
++
++enum fwupd_resp_prop_type {
++	RESP_PROP_STATUS,
++	RESP_PROP_NUM
++};
++
+ static struct fwupd_state state;
+ static struct fwupd_state i2c_state;
++static struct fwupd_resp_prop resp_props[RESP_PROP_NUM];
+ 
+ u32 fwupd_cmd_readl(void)
+ {
+@@ -114,17 +123,13 @@
+ 	status->sub_err = serr;
+ }
+ 
+-static int fwupd_create_resp(void *res_fit, const int load_type,
+-		const char *prop_name, const void *prop_data,
+-		int *prop_data_sz)
++static int fwupd_create_resp(void *res_fit, u32 avail_sz, const int load_type,
++			     const struct fwupd_resp_prop *props, int prop_cnt, u32 *out_sz)
+ {
+-	int err;
++	int err, i;
+ 	unsigned int sz;
+ 
+-	sz = ((*prop_data_sz + FIT_RSP_MARGIN_SIZE_IN_KB) > FIT_DFL_RSP_SIZE_IN_KB) ?
+-		(*prop_data_sz + FIT_RSP_MARGIN_SIZE_IN_KB) : FIT_DFL_RSP_SIZE_IN_KB;
+-
+-	err = fit_init_resp(res_fit, sz);
++	err = fit_init_resp(res_fit, avail_sz);
+ 	if (err)
+ 		goto fit_init_err;
+ 
+@@ -132,15 +137,17 @@
+ 	if (err)
+ 		goto fit_init_err;
+ 
+-	err = fdt_property(res_fit, prop_name, prop_data, *prop_data_sz);
+-	if (err)
+-		goto fit_init_err;
++	for (i = 0; i < prop_cnt; i++) {
++		err = fdt_property(res_fit, props[i].name, props[i].data, props[i].size);
++		if (err)
++			goto fit_init_err;
++	}
+ 
+ 	err = fit_fin_resp(res_fit, &sz);
+ 	if (err)
+ 		goto fit_init_err;
+ 
+-	*prop_data_sz = sz;
++	*out_sz = sz;
+ 
+ fit_init_err:
+ 	return err;
+@@ -166,10 +173,15 @@
+ 				     struct hl_upd_proto_status *ret_status)
+ {
+ 	struct hl_upd_proto_status status;
++	struct fwupd_resp_prop *resp_prop;
+ 	struct mem_desc mdesc;
+ 	u32 sts_err, sts_serr;
+-	int size = sizeof(status);
+ 	int err;
++
++	resp_prop = &resp_props[RESP_PROP_STATUS];
++	resp_prop->name = HL_FIT_PROTO_STATUS_PROP;
++	resp_prop->data = &status;
++	resp_prop->size = sizeof(status);
+ 
+ 	err = preboot_get_mem_region(state->mregion, &mdesc);
+ 	if (err) {
+@@ -186,9 +198,8 @@
+ 	preboot_error_read_and_clr(&sts_err, &sts_serr);
+ 	fwupd_get_proto_status(&status, sts_err, sts_serr);
+ 
+-	err = fwupd_create_resp(state->map_offset, FIT_LOAD_TYPE_PROTO_STATUS,
+-				HL_FIT_PROTO_STATUS_PROP, &status, &size);
+-	state->map_size = size;
++	err = fwupd_create_resp(state->map_offset, mdesc.size, FIT_LOAD_TYPE_PROTO_STATUS,
++				resp_props, ARRAY_SIZE(resp_props), &state->map_size);
+ 
+ 	if (err)
+ 		preboot_puts("Failed to create status FIT image\n");

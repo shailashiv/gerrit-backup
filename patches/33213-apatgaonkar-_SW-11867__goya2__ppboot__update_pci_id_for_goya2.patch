@@ -1,0 +1,121 @@
+From f463ef207fe533794aad5a624ef9045b078fa4ea Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 22 Apr 2020 06:08:12 +0300
+Subject: [PATCH] [SW-11867] goya2: ppboot: update pci id for goya2
+
+PCI device id for goya2 needs to be updated based on
+efuse setting of product id.
+product id string HL1120* => PCI id 0x0020
+product id string HL1170* => PCI id 0x0030
+
+Change-Id: I98d22101f3d2a5f069ed5235823d7dbf34d4b1a8
+---
+
+diff --git a/Makefile b/Makefile
+index 0f0ee70..3b9b8f8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,7 @@
+ CC = $(CROSS_COMPILE)gcc
+ OBJCOPY = $(CROSS_COMPILE)objcopy
+ SPECS_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++CFLAGS += -I$(dir $(BR2_EXTERNAL))/specs
+ CFLAGS += -I$(dir $(BR2_EXTERNAL))/specs/$(SPECS_DEV)/asic_reg
+ CFLAGS += -I$(dir $(BR2_EXTERNAL))/embedded/specs
+ CFLAGS += -include $(dir $(BR2_EXTERNAL))/embedded/specs/$(SPECS_DEV)/$(SPECS_DEV)_reg_map.h
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index cf89b84..eeb8dc6 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -18,16 +18,19 @@
+ 
+ #include <hl_boot_if.h>
+ #include <goya2/goya2_reg_map.h>
++#include <pci_ids.h>
+ 
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <efuse.h>
+ #include <string.h>
+ 
+ #include "common.h"
+ 
+ #define BTL_COUNTER_MAX		BIT(22)
+ #define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
++#define PRODUCT_ID_STR_SIZE	0x8
+ 
+ static void preboot_init_pcie_phy_fw_update(void)
+ {
+@@ -71,17 +74,67 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
+-static void preboot_init_pcie(void)
++static u32 preboot_pcie_device_id_get(void)
+ {
+-	preboot_init_pcie_phy();
++	u32 device_id;
++	int ret;
++	char product_str[PRODUCT_ID_STR_SIZE];
++
++	/* Default device id for addin card */
++	device_id = PCI_IDS_GOYA2_ADDIN;
++
++	/*
++	 * Efuse stores "product id + rev" as 7 chars of which
++	 * product id is initial 6 chars.
++	 * e.g. for goya2 addin card efuse stores "HL1170A"
++	 * where "HL1170" is product id and rev is "A".
++	 * These 7 chars are read as two 32-bit uint reads
++	 * and stored in product_str.
++	 */
++	ret = preboot_fuse_read(EFUSE_PRODUCT_ID_OFFSET,
++				(u32 *)&product_str[0]);
++	if (!ret)
++		return device_id;
++
++	ret = preboot_fuse_read(EFUSE_PRODUCT_ID_OFFSET + 1,
++				(u32 *)&product_str[4]);
++	if (!ret)
++		return device_id;
++
++	/* Remove product revision */
++	product_str[PRODUCT_ID_STR_SIZE - 2] = '\0';
++
++	if (strcmp(product_str, "HL1120") == 0)
++		device_id = PCI_IDS_GOYA2_M2;
++
++	return device_id;
++}
++
++static void preboot_pcie_device_id_vendor_id_set(void)
++{
++	u32 device_id, device_id_vendor_id;
++
++	device_id = preboot_pcie_device_id_get();
++
++	device_id_vendor_id = (device_id << 16) | PCI_VENDOR_ID_HABANALABS;
+ 
+ 	/* Update Vendor ID */
+-	regmap_writel(0x10001DA3, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++	regmap_writel(device_id_vendor_id,
++		      mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+ 
+ 	/* Update subsystem Vendor ID */
+-	regmap_writel(0x10001DA3,
++	regmap_writel(device_id_vendor_id,
+ 		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+ 
++}
++
++static void preboot_init_pcie(void)
++{
++
++	preboot_init_pcie_phy();
++
++	preboot_pcie_device_id_vendor_id_set();
++
+ 	/* Disable the EQ REDO */
+ 	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+ 

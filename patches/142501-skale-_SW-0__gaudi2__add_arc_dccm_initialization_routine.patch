@@ -1,0 +1,176 @@
+From 74b5e847e39a57b5b6d9495d17fd57b8b723afa8 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 02 Nov 2021 11:51:01 +0200
+Subject: [PATCH] [SW-0] gaudi2: add arc dccm initialization routine
+
+In order to avoid fake DCCM memory exceptions caused due to
+uninitialized DCCM reads, this patch add support for DCCM
+initialization using memcopy module. In BTL based flow, ARC0 & ARC1
+DCCM initialization is done as part of platform init and in secureboot
+flow ARC0 DCCM initialization is done as part of init_secondary routine.
+Note that in secureboot flow, ARC1 DCCM initialization is done as part
+of arcboot ROM init code.
+
+Since udelay is used as part of DCCM init code the init_secondary
+function in secureboot flow is moved after udelay_init.
+
+Change-Id: I691c10eacb5118e8975502b1ac3f854d5202f927
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c6e4dfd..293383f 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -94,6 +94,9 @@
+ 	 */
+ 	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
+ 	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
++
++	/* Clear DCCM memory */
++	init_arc_dccm(0);
+ }
+ 
+ void hl_plat_early_init(void)
+@@ -105,8 +108,6 @@
+ 
+ 	/* set reset source */
+ 	hl_reset_src_init();
+-
+-	init_secondary();
+ 
+ 	/* This W/A is to be done before pcie link is established */
+ 	set_pci_msix_pba_offset_val();
+@@ -289,6 +290,9 @@
+ {
+ 	u32 *secondary_iccm_addr = (u32 *) ARC0_ICCM_BASE;
+ 
++	/* Initialize ARC0 to run pcie initialization code */
++	init_secondary();
++
+ 	/* init dev id as soon as possible, while waiting for prstn */
+ 	preboot_device_id_init();
+ 
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index 60b243a..5163eed 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -45,14 +45,6 @@
+ 
+ #define ARM_VP_ADDR_MASK	0x3FFFFFFFFF
+ //#define GENERAL_CFG_MSB_ADDR	0x1000007F00000000ull
+-#define ARC0_ICCM_FULL_BASE	0x1000007FF7000000ull
+-#define ARC0_ICCM_SIZE		0x20000			/* 128KB */
+-#define ARC0_DCCM_FULL_BASE	0x1000007FF7020000ull
+-#define ARC0_DCCM_SIZE		0x8000			/* 32KB */
+-#define ARC1_ICCM_FULL_BASE	0x1000007FF7040000ull
+-#define ARC1_ICCM_SIZE		0x20000			/* 128KB */
+-#define ARC1_DCCM_FULL_BASE	0x1000007FF7060000ull
+-#define ARC1_DCCM_SIZE		0x8000			/* 32KB */
+ 
+ #define ARC0_MEM_SIZE (ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE (ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 1ac9c09..52bfafb 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -169,6 +169,10 @@
+ 	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
+ 	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC1_CFG_RST_VEC_ADDR);
+ 	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC1_CFG_ARC_RST);
++
++	/* Clear DCCM memory */
++	init_arc_dccm(0);
++	init_arc_dccm(1);
+ }
+ 
+ void hl_plat_init(void)
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index fbe173e..0682523 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -990,6 +990,54 @@
+ 	regmap_writel(0x1, rst_offset);
+ }
+ 
++#define HL_INIT_ARC_DCCM_RETRIES	50
++void init_arc_dccm(u8 id)
++{
++	u32 retry = HL_INIT_ARC_DCCM_RETRIES;
++	u32 addr_h, addr_l, size;
++	u32 mem_cfg, cpy_sts;
++
++	if (id) {
++		addr_l = (u32)ARC1_DCCM_FULL_BASE;
++		addr_h = (u32)(ARC1_DCCM_FULL_BASE >> 32);
++		size = ARC1_DCCM_SIZE;
++	} else {
++		addr_l = (u32)ARC0_DCCM_FULL_BASE;
++		addr_h = (u32)(ARC0_DCCM_FULL_BASE >> 32);
++		size = ARC0_DCCM_SIZE;
++	}
++
++	/* Use memblock to initialize dccm memory */
++	regmap_writel(addr_l, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel(addr_h, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
++
++	/* set size of in granuality of 16 bytes */
++	size = size >> 4;
++	mem_cfg |= (size & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
++	mem_cfg |= (0x1 << PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT);
++
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	while (1) {
++		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts)
++			break;
++
++		retry--;
++		if (!retry) {
++			preboot_puts_hex("Init DCCM timed-out for arc", id, false);
++			break;
++		}
++		/* TODO: replace udelay with timeout_expired function */
++		udelay(100000);
++	}
++}
++
+ /*
+  * Set ARC in running state
+  * 1. Set run bit in RUN_HALT_REQ register
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index cef7d0f..156b9e7 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -36,6 +36,15 @@
+ 	#define HMMU_HIF_ENABLED_MASK 0xFFFF
+ #endif
+ 
++#define ARC0_ICCM_FULL_BASE			0x1000007FF7000000ull
++#define ARC0_ICCM_SIZE				0x20000			/* 128KB */
++#define ARC0_DCCM_FULL_BASE			0x1000007FF7020000ull
++#define ARC0_DCCM_SIZE				0x8000			/* 32KB */
++#define ARC1_ICCM_FULL_BASE			0x1000007FF7040000ull
++#define ARC1_ICCM_SIZE				0x20000			/* 128KB */
++#define ARC1_DCCM_FULL_BASE			0x1000007FF7060000ull
++#define ARC1_DCCM_SIZE				0x8000			/* 32KB */
++
+ #define NUM_OF_DCORES			4
+ #define NUM_OF_EDMA_PER_DCORE		2
+ #define NUM_OF_HIF_PER_DCORE		4
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index 812c06d..2479020 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -14,5 +14,6 @@
+ void halt_n_reset_arc(u8 id);
+ void run_arc(u8 id);
+ void preboot_pcie_monitoring(void);
++void init_arc_dccm(u8 id);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */

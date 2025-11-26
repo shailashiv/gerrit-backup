@@ -1,0 +1,149 @@
+From 5e3d0639cc906b078d865b5471d05f82b8cf274a Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 09 Jun 2020 08:23:25 +0300
+Subject: [PATCH] [SW-11875] goya2: ppboot: Verify preboot image
+
+Currently, preboot image if verified and downloaded by arcboot for
+goya2_arc target. This patch adds support for goya2_arc target to
+verify and download preboot image using arcboot functions in ppboot.
+
+Change-Id: Ifb02ebc60d81c311cdd224faf97b224dae604854
+---
+
+diff --git a/goya2_arc/common.c b/goya2_arc/common.c
+index a6e5e56..83ebb69 100644
+--- a/goya2_arc/common.c
++++ b/goya2_arc/common.c
+@@ -18,6 +18,7 @@
+ #include <hl_boot_if.h>
+ #include <goya2/goya2_reg_map.h>
+ #include <pci_ids.h>
++#include <arcboot_export.h>
+ 
+ #include <preboot.h>
+ #include <pll.h>
+@@ -277,7 +278,10 @@
+ 
+ void image_start(u64 loadaddr)
+ {
++	u32 lsb = (u32) loadaddr;
++	void (*image_entry)(void) = (void *) lsb;
+ 
++	image_entry();
+ }
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+@@ -289,3 +293,72 @@
+ {
+ 	return mmCPU_TIMESTAMP_CNTCR;
+ }
++
++static u32 ppboot_flash_image_offset(u8 image_ptr)
++{
++	u8 flash_image_switch;
++
++	flash_image_switch = spi_flash_readl(FLASH_IMAGE_SWITCH_OFFSET);
++	if (flash_image_switch != 0) {
++		if (image_ptr != ARCBOOT_SECONDARY)
++			image_ptr = ARCBOOT_SECONDARY;
++		else
++			image_ptr = ARCBOOT_PRIMARY;
++	}
++
++	if (image_ptr == ARCBOOT_SECONDARY)
++		return spi_flash_readl(FLASH_SECONDARY_OFFSET);
++	else
++		return spi_flash_readl(FLASH_PRIMARY_OFFSET);
++}
++
++static int ppboot_bringup_preboot(u8 image_ptr)
++{
++	u32 flash_offset;
++	u16 image_size;
++
++	flash_offset = ppboot_flash_image_offset(image_ptr);
++	image_size = (u16) spi_flash_readl(flash_offset);
++
++	/*
++	 * Copy preboot image from flash to Scratchpad SRAM.
++	 * Note that the offset to be provided to perform DMA must be
++	 * in granuality of 4B. ie. In order to write at
++	 * 0x7FFBFE1000ULL, the address to be passed is 0x7FFBFE0400ULL
++	 * instead of 0x7FFBFE1000ULL (right shift offest 0x1000 by 2).
++	 */
++	dma_copy_image(image_size, flash_offset,
++		       (HL_SP_SRAM_BASE + (SP_SRAM_PREBOOT_OFFSET >> 2)),
++		       SPI_DMA_DST_HBW);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	image_size -= SECUREBOOT_IMG_HEAD_FOOTER;
++	if (secureboot_verify_image(image_size,
++			(SP_SRAM_BASE + SP_SRAM_PREBOOT_OFFSET + IMG_LEN_SIZE))
++			== SECUREBOOT_VERIFY_FAILED)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	return ARCBOOT_BRINGUP_OK;
++}
++
++u64 copy_preboot(void)
++{
++	u32 config_fuse;
++	int ret;
++
++	if (ppboot_bringup_preboot(ARCBOOT_PRIMARY) != ARCBOOT_BRINGUP_OK) {
++		if (ppboot_bringup_preboot(ARCBOOT_SECONDARY) !=
++			ARCBOOT_BRINGUP_OK) {
++			/* if debug I/F is enabled then fall back on I2C_S */
++			ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET,
++						&config_fuse);
++			if ((!ret)  && ((config_fuse ==
++				EFUSE_SYSCFG_DISABLE_TWI_IF_MASK) == 0)) {
++				security_i2c_s_enable();
++			}
++		}
++	}
++
++	return PREBOOT_TEXT_BASE;
++}
+diff --git a/goya2_arc/common.h b/goya2_arc/common.h
+index 20157cb..9894c42 100644
+--- a/goya2_arc/common.h
++++ b/goya2_arc/common.h
+@@ -10,8 +10,11 @@
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+ 
++#define HL_SP_SRAM_BASE		0x7FFBFE0000ULL
+ #define PCIE_FW_SRAM_BASE	0x1BFF0000
+ #define FW_SRAM_BASE		0x1B050000
++#define SP_SRAM_BASE		0x1BFE0000
++#define SP_SRAM_PREBOOT_OFFSET	0x1000
+ #define PPBOOT_TEXT_BASE	(FW_SRAM_BASE + 0xC)
+ #define PREBOOT_TEXT_BASE	0x8
+ 
+diff --git a/include/preboot.h b/include/preboot.h
+index a309418..99d00b1 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -50,6 +50,7 @@
+ 
+ typedef unsigned char u8;
+ typedef unsigned int u32;
++typedef unsigned short int u16;
+ typedef signed int s32;
+ typedef unsigned long long u64;
+ 
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+index f034450..6f84dab 100644
+--- a/ppboot/ppboot.c
++++ b/ppboot/ppboot.c
+@@ -40,7 +40,7 @@
+ 	return image_pending;
+ }
+ 
+-static u64 copy_preboot(void)
++__attribute__((weak)) u64 copy_preboot(void)
+ {
+ 	char *name = "PREBOOT";
+ 	struct boot_desc desc;

@@ -1,0 +1,153 @@
+From 202b7d9d81b8324d5294034f1d447f76fb0632d6 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Fri, 03 Mar 2023 05:57:40 +0200
+Subject: [PATCH] [SW-125999] gaudi2: add support for merging old boot info
+
+The boot info finalize do not merge the existing boot info
+and this results in losing the older boot info data. This
+patch adds support for merging the existing boot info and
+also it copies the bootinfo data from preserved memory
+during init and copies the data to preserved memory before
+loading agent.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I2fd42373e188670ecb89789aca5dacb24585bd8e
+---
+
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index f71ae57..8bcff31 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -109,6 +109,8 @@
+ 
+ 	hl_uart_init();
+ 
++	preboot_boot_info_init();
++
+ 	preboot_cond_arc0_reset();
+ 
+ 	spi_flash_init();
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index ab027cd..2efd514 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -53,6 +53,8 @@
+ #include <device.h>
+ #include <tpm_auth.h>
+ #include <gaudi2_bootrom.h>
++#include <hl_boot_desc.h>
++#include <boot_info.h>
+ 
+ #define PRODUCT_ID_STR_SIZE			0x8
+ 
+@@ -993,3 +995,51 @@
+ 
+ 	tpm_pcr_extend(TPM2_PPBOOT_PCR_IDX, hash);
+ }
++
++struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx)
++{
++	struct hl_boot_info_ptrs *ptrs;
++	struct hl_boot_info_desc *desc;
++	uint32_t *offsets;
++
++	ptrs = (struct hl_boot_info_ptrs *)BOOT_INFO_BASE;
++
++	if (ptrs->magic != HL_BOOT_INFO_MAGIC)
++		return NULL;
++
++	/* Offsets array comes right after the ptrs struct */
++	offsets = (uint32_t *)(ptrs + 1);
++
++	desc = (void *)(uintptr_t)(BOOT_INFO_BASE + offsets[idx]);
++
++	return desc;
++}
++
++int hl_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
++{
++	return boot_info_get(type, data, max_size, copy_size);
++}
++
++int hl_boot_info_set(u32 type, void *data, u32 size)
++{
++	return boot_info_set(type, data, size);
++}
++
++void boot_info_copy_to_perst_mem(void)
++{
++	memcpy32_rev((void *)BOOT_INFO_PERSISTENT, (void *)BOOT_INFO_BASE, BOOT_INFO_SIZE);
++}
++
++void boot_info_copy_from_perst_mem(void)
++{
++	memcpy32_rev((void *)BOOT_INFO_BASE, (void *)BOOT_INFO_PERSISTENT, BOOT_INFO_SIZE);
++}
++
++void preboot_boot_info_init(void)
++{
++	/* copy boot info from persistent memory to SPSRAM */
++	boot_info_copy_from_perst_mem();
++	/* boot info finalize does not merge old data hence copy and set it explicitly */
++	if (boot_info_sync_data())
++		preboot_puts("Failed to merge old boot info\n");
++}
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index f5a6fe2..f78935a 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -75,6 +75,9 @@
+ 
+ #define BOOT_INFO_OFFSET	0x5000
+ #define BOOT_INFO_BASE		(SP_SRAM_BASE + BOOT_INFO_OFFSET)
++#define BOOT_INFO_SIZE		0x4000
++/* Persistent memory is in ARC1 ICCM */
++#define BOOT_INFO_PERSISTENT	0x1C000
+ 
+ /* In order not to conflict with ARC BOOTROM's usage of DCCM,
+  * Let PPBoot start from the offset of 0x4030, for using DCCM
+diff --git a/include/boot_info.h b/include/boot_info.h
+index f3f09b4..9917ae1 100644
+--- a/include/boot_info.h
++++ b/include/boot_info.h
+@@ -21,5 +21,6 @@
+ struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx);
+ int hl_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
+ int hl_boot_info_set(u32 type, void *data, u32 size);
++void boot_info_copy_to_perst_mem(void);
+ 
+ #endif /* _BOOT_INFO_H_ */
+diff --git a/include/preboot.h b/include/preboot.h
+index 798a0f1..68b32b7 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -266,6 +266,7 @@
+ void hl_pif_clear_sts(u32 status_bit);
+ void preboot_security_sp_sram_init(void);
+ u32 hl_get_pll_div_fix(void);
++void preboot_boot_info_init(void);
+ 
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/lib/common/boot_info.c b/lib/common/boot_info.c
+index 9055d1d..3a16c4e 100644
+--- a/lib/common/boot_info.c
++++ b/lib/common/boot_info.c
+@@ -71,6 +71,8 @@
+ 	return memcmp(&crc32_res, &desc->crc32, CRC32_NUM_BYTES);
+ }
+ 
++__weak void boot_info_copy_to_perst_mem(void) {}
++
+ void boot_info_finalize(void)
+ {
+ 	struct hl_boot_info_desc *desc;
+@@ -135,6 +137,8 @@
+ 	dst = offset2ptr(0, BOOT_INFO_BASE);
+ 	for (i = 0; i < sizeof(boot_info.ptrs) / sizeof(u32); i++)
+ 		dst[i] = boot_info.data[i];
++
++	boot_info_copy_to_perst_mem();
+ }
+ 
+ int boot_info_set(u32 type, const void *data, u32 size)

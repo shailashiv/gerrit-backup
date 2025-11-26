@@ -1,0 +1,146 @@
+From 01c253160cb69a73661c4cf3e5c692814b10d9b4 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Wed, 12 Mar 2025 10:58:44 +0200
+Subject: [PATCH] [SW-190031] boot_desc: use emb_lib_cmn funcs
+
+Remove boot_desc_img_desc_is_valid and is_legacy_boot_descs
+local funcs and use the same funcs from emb_lib_cmn
+
+Change-Id: If585255e35b8a9fae39ae1daad1f3e42f7633c7d
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0e8c427..182008c 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1378,36 +1378,6 @@
+ 	return hl_fuse_read(mmPSOC_EFUSE_BASE, word, val);
+ }
+ 
+-/*
+- * The legacy boot descriptors meta structure contains two fields - next & mod.
+- * those fields are of size 32 bits, and their content is "0000" & "1111" respectively
+- */
+-
+-#define BOOT_PTRS_NEXT_MAGIC	0x31313131
+-#define BOOT_PTRS_MOD_MAGIC	0x30303030
+-
+-bool _is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs)
+-{
+-	int i;
+-	uint32_t *magic = &boot_ptrs->next;
+-
+-	for (i = 0; i < 2; i++) {
+-		if (magic[i] != BOOT_PTRS_NEXT_MAGIC &&
+-		    magic[i] != BOOT_PTRS_MOD_MAGIC)
+-			return false;
+-	}
+-
+-	return true;
+-}
+-
+-bool _dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+-{
+-	if (img_desc->idx >= 2)
+-		return false;
+-
+-	return true;
+-}
+-
+ u32 _dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
+ 			  struct boot_desc *desc)
+ {
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 07e92bd..16b6c09 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1682,14 +1682,6 @@
+ 		}
+ }
+ 
+-bool _dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+-{
+-	if (img_desc->idx >= 2)
+-		return false;
+-
+-	return true;
+-}
+-
+ u32 _dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
+ 			  struct boot_desc *desc)
+ {
+diff --git a/include/boot_desc.h b/include/boot_desc.h
+index 182e71e..d4cc3b3 100644
+--- a/include/boot_desc.h
++++ b/include/boot_desc.h
+@@ -56,7 +56,6 @@
+ 			   enum hl_fw_img_type type, struct boot_desc *desc);
+ u32 _boot_desc_get_img_desc_by_idx(unsigned int idx, struct boot_desc *desc);
+ 
+-bool _is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs);
+ bool _dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc);
+ u32 _dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
+ 			  struct boot_desc *desc);
+diff --git a/lib/common/boot_desc.c b/lib/common/boot_desc.c
+index 04a511e..2615a65 100644
+--- a/lib/common/boot_desc.c
++++ b/lib/common/boot_desc.c
+@@ -26,21 +26,6 @@
+ static u8 desc_buf[BOOT_DESC_MAX_IMGS * IMG_DESC_SZ];
+ static bool desc_initialized;
+ 
+-__weak bool _dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc) { return true; }
+-
+-static bool _boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+-{
+-	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
+-
+-	if ((img_desc->magic.val & 0xFFFFFF00) != HL_FW_IMG_DESC_MAGIC)
+-		return false;
+-
+-	if (img_desc->desc_ver == 0 || img_desc->desc_ver == ~0)
+-		return false;
+-
+-	return _dev_spec_img_desc_is_valid(img_desc);
+-}
+-
+ __weak int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size) { return 1; }
+ 
+ #ifdef READ_BOOT_DESC_FROM_BOOTINFO
+@@ -81,7 +66,7 @@
+ 
+ 	for (i = 0; i < boot_ptrs.count; i++) {
+ 		desc_ptr = (struct hl_fw_img_desc *)(desc_buf + i * boot_ptrs.img_desc_sz);
+-		if (!_boot_desc_img_desc_is_valid(desc_ptr)) {
++		if (!boot_desc_img_desc_is_valid(desc_ptr)) {
+ 			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+ 			return 0;
+ 		}
+@@ -93,8 +78,6 @@
+ }
+ 
+ #else
+-
+-__weak bool _is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs) { return false; }
+ 
+ #define LEGACY_IMAGE_DESCRIPTOR_SIZE	220
+ 
+@@ -120,7 +103,7 @@
+ 		return 0;
+ 
+ 	/* legacy descriptors don't have size field. so constant value is used */
+-	if (_is_legacy_boot_descs(&boot_ptrs))
++	if (is_legacy_boot_descs(&boot_ptrs))
+ 		boot_ptrs.img_desc_sz = LEGACY_IMAGE_DESCRIPTOR_SIZE;
+ 
+ 	if (boot_ptrs.count * boot_ptrs.img_desc_sz > sizeof(desc_buf)) {
+@@ -140,7 +123,7 @@
+ 		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
+ 		buff_ptr = desc_buf + i * boot_ptrs.img_desc_sz;
+ 		spi_flash_copy(buff_ptr, spi_off, boot_ptrs.img_desc_sz, "IMG DESC");
+-		if (!_boot_desc_img_desc_is_valid((struct hl_fw_img_desc *)buff_ptr)) {
++		if (!boot_desc_img_desc_is_valid((struct hl_fw_img_desc *)buff_ptr)) {
+ 			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+ 			return 0;
+ 		}

@@ -1,0 +1,102 @@
+From 25d4ebd0c600892475a2b65a8d745f4af489bde5 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Wed, 25 Nov 2020 20:20:55 +0200
+Subject: [PATCH] [SW-14663] ppboot: split preboot chksum per device
+
+Split verification of preboot checksum according
+to device. The previous assumption that all devices
+can call sha256 functions has been wrong and required
+refactoring: For gaudi and legacy goya2 ppboot shall
+verify preboot chksum, but for goya1 (which has tighter
+limitations of timing and size), no verification is done.
+For goya2 ROM, the verification is done, but not
+here.
+
+Change-Id: I269b7913babfc1ad22d8f74e7a15bf2dbec5fb6b
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+(cherry picked from commit cb77b4e6df92b0367a2e6c04c88154d4a3d0d13b)
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 413c123..d2af790 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -7,10 +7,13 @@
+ 
+ #include <psoc_global_conf_regs.h>
+ 
++#include <string.h>
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ #include <efuse.h>
++#include <sha256.h>
++#include <boot_desc.h>
+ 
+ #include "common.h"
+ 
+@@ -144,3 +147,13 @@
+ 	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
+ 	return !(boot_strap & BOOTSTRAP_JTAG_EN);
+ }
++
++bool ppboot_is_valid_img_desc(struct boot_desc *desc)
++{
++	u8 hash[SHA256_SUM_LEN];
++
++	sha256_csum((void *)desc->loadaddr, desc->img_size, hash);
++
++	return !memcmp(hash, desc->chksum, ARRAY_SIZE(hash));
++}
++
+diff --git a/goya2/asic.c b/goya2/asic.c
+index 972527c..8499ff4 100644
+--- a/goya2/asic.c
++++ b/goya2/asic.c
+@@ -8,9 +8,12 @@
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_gpio0_regs.h>
+ 
++#include <string.h>
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <sha256.h>
++#include <boot_desc.h>
+ 
+ #include "common.h"
+ 
+@@ -62,3 +65,13 @@
+ 	val &= ~BIT(2);
+ 	regmap_writel(val, mmPSOC_GPIO0_DATAOUT);
+ }
++
++bool ppboot_is_valid_img_desc(struct boot_desc *desc)
++{
++	u8 hash[SHA256_SUM_LEN];
++
++	sha256_csum((void *)(uintptr_t)desc->loadaddr, desc->img_size, hash);
++
++	return !memcmp(hash, desc->chksum, ARRAY_SIZE(hash));
++}
++
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+index 7a040db..b0bdd2c 100644
+--- a/ppboot/ppboot.c
++++ b/ppboot/ppboot.c
+@@ -20,13 +20,9 @@
+ #include "pll.h"
+ #include <boot_if.h>
+ 
+-static bool ppboot_is_valid_img_desc(struct boot_desc *desc)
++__weak bool ppboot_is_valid_img_desc(struct boot_desc *desc)
+ {
+-	u8 hash[SHA256_SUM_LEN];
+-
+-	sha256_csum((void *)(uintptr_t)desc->loadaddr, desc->img_size, hash);
+-
+-	return !memcmp(hash, desc->chksum, ARRAY_SIZE(hash));
++	return 0;
+ }
+ 
+ static bool ppboot_try_candidate_img(enum fw_post_reset_cmd image_pending,

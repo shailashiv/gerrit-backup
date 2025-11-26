@@ -1,0 +1,170 @@
+From 014ef0f16d3cd992daa5b12fb96ad88fbd4a3618 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 28 Dec 2020 10:52:16 +0200
+Subject: [PATCH] [SW-27979] i2c indirect: add memcpy op
+
+Add support for memcpy op. To be used by hl-fw-loader OOB.
+This allows the BMC to read and write memory section out of SRAM without
+the need of PCI link which does not exist for BMC.
+
+The memcpy op consists of 2 different opcodes:
+- memcpy control
+- memcpy data
+
+The memcpy ctrl op is the sequence initiator, with this commnad the
+master start to read/write (according to opcode field).
+Following this command, the master is expected to request memcpy data
+opcode as many times as needed. Each memcpy data request will read/write
+256 bytes max. The next memcpy data request will set the offset to the
+next 256 bytes. This is true even if the memcpy data call was partial.
+The last request size may be lower than 256 bytes as it's the leftover.
+
+Change-Id: I2b8505a6262e6cd5d94ce5194d2f2e55bacf1c99
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 7976d27..5975023 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -16,7 +16,9 @@
+ 
+ #define SUPPORTED_OPCODES_MASK	(BIT(HL_I2CI_REQ_OP_DEVICE_STATUS) | \
+ 				BIT(HL_I2CI_REQ_OP_CONFIG_ACCESS) | \
+-				BIT(HL_I2CI_REQ_OP_FW_LOADER))
++				BIT(HL_I2CI_REQ_OP_FW_LOADER) | \
++				BIT(HL_I2CI_REQ_OP_MEMCPY_CTRL) | \
++				BIT(HL_I2CI_REQ_OP_MEMCPY_DATA))
+ 
+ struct i2csi_wdata_chunk_context {
+ 	u16 offset; /* Chunk offset within the request */
+@@ -51,6 +53,9 @@
+ };
+ 
+ static struct hl_i2ci_config_access op_config;
++
++static u32 op_memcpy_offset;
++static struct hl_i2ci_memcpy_ctrl op_memcpy __aligned(8);
+ 
+ static void i2csi_req_config_access(void)
+ {
+@@ -88,6 +93,67 @@
+ 	else
+ 		i2cslave_fit_set_checked();
+ 
++}
++
++static void i2csi_req_memcpy_ctrl(void)
++{
++	if (op_memcpy.address < SDRAM_BASE)
++		goto memcpy_ctrl_fail;
++
++	if (op_memcpy.address > SDRAM_BASE + SRAM_SIZE)
++		goto memcpy_ctrl_fail;
++
++	if (op_memcpy.size > SRAM_SIZE)
++		goto memcpy_ctrl_fail;
++
++	op_memcpy.status = HL_I2CI_MEMCPY_STS_PASS;
++	return;
++
++memcpy_ctrl_fail:
++	op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
++	preboot_puts("I2C indirect memcpy failed\n");
++}
++
++static void i2csi_req_memcpy_iterate(void)
++{
++	u32 bytes_left;
++
++	switch (op_memcpy.status) {
++	case HL_I2CI_MEMCPY_STS_FAIL:
++	case HL_I2CI_MEMCPY_STS_PASS:
++		op_memcpy_offset = 0;
++		break;
++	case HL_I2CI_MEMCPY_STS_IN_PROGRESS:
++		bytes_left = op_memcpy.size - op_memcpy_offset;
++
++		if (bytes_left > HL_I2CI_MEMCPY_REQ_MAX) {
++			op_memcpy_offset += HL_I2CI_MEMCPY_REQ_MAX;
++		} else {
++			op_memcpy.status = HL_I2CI_MEMCPY_STS_PASS;
++			op_memcpy_offset = 0;
++		}
++
++		break;
++	}
++}
++
++static u8 *i2csi_req_memcpy_rw(u16 *length)
++{
++	u32 bytes_left;
++
++	bytes_left = op_memcpy.size - op_memcpy_offset;
++	if (bytes_left > HL_I2CI_MEMCPY_REQ_MAX)
++		*length = HL_I2CI_MEMCPY_REQ_MAX;
++	else
++		*length = bytes_left;
++
++	if (op_memcpy.status == HL_I2CI_MEMCPY_STS_FAIL) {
++		i2csi_req.sts.err = HL_I2CI_REQ_ERR_PROCESS;
++		return NULL;
++	}
++
++	op_memcpy.status = HL_I2CI_MEMCPY_STS_IN_PROGRESS;
++	return (u8 *)(uintptr_t)(op_memcpy.address + op_memcpy_offset);
+ }
+ 
+ static inline u8 *i2csi_req_buffer_get_writable(u16 rsize, u8 *data,
+@@ -149,6 +215,19 @@
+ 		i2csi_req.wd.length = size;
+ 		return (u8 *)FIT_IMG_BASE + (i2csi_req.wd.hdr.offset *
+ 			(HL_I2CI_REQ_MAX_RQDL - i2csi_req.wd.hdr.ic * 4));
++
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++		upper_bound = offsetof(struct hl_i2ci_memcpy_ctrl, status);
++
++		return i2csi_req_buffer_get_writable(size, (u8 *)&op_memcpy,
++						     0, upper_bound);
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		i2csi_req_memcpy_iterate();
++
++		if (op_memcpy.command != HL_I2CI_MEMCPY_CMD_WRITE)
++			op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
++
++		return i2csi_req_memcpy_rw(&i2csi_req.wd.length);
+ 	default:
+ 		/* Data will be consumed from HW but not stored anywhere */
+ 		i2csi_req.wd.length = size;
+@@ -167,6 +246,18 @@
+ 		i2csi_req.rd.data = (u8 *)&op_config;
+ 		i2csi_req.rd.length = sizeof(op_config);
+ 		break;
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++		i2csi_req.rd.data = (u8 *)&op_memcpy;
++		i2csi_req.rd.length = sizeof(op_memcpy);
++		break;
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		i2csi_req_memcpy_iterate();
++
++		if (op_memcpy.command != HL_I2CI_MEMCPY_CMD_READ)
++			op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
++
++		i2csi_req.rd.data = i2csi_req_memcpy_rw(&i2csi_req.rd.length);
++		break;
+ 	default:
+ 		if ((BIT(i2csi_req.wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+ 			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
+@@ -185,6 +276,12 @@
+ 	case HL_I2CI_REQ_OP_FW_LOADER:
+ 		i2csi_req_load_fw();
+ 		break;
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++		i2csi_req_memcpy_ctrl();
++		break;
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		/* Do nothing */
++		break;
+ 	default:
+ 		if ((BIT(i2csi_req.wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+ 			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;

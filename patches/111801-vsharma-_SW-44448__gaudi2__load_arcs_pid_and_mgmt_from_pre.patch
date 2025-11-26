@@ -1,0 +1,359 @@
+From 1cd3b2ae1c6a789a0afea29b8b95956783c4e225 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Thu, 15 Jul 2021 21:12:27 +0300
+Subject: [PATCH] [SW-44448] gaudi2: load arcs pid and mgmt from preboot
+
+This patch adds support to load and run arc pid and arc mgmt images
+received from gaudi2-boot-fit.itb via host/lkd.
+Images are copied to respective iccm/dccm area via memcpy io block from
+sp sram.
+
+Change-Id: I8c75ebaf82c5f4253be2c403c8673075fdc3b347
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 55be6b0..cc06e1c 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -79,76 +79,37 @@
+ 		;
+ }
+ 
+-static void init_arc(void)
++/*
++ * initialize scratch SRAM to avoid ECC exceptions
++ * ECC errors are observed due to byte copy to SP
++ * memory which turns to be read-modify-write transaction
++ */
++void preboot_sp_sram_init(void)
+ {
+-	/* TODO: Halt and reset ARCs once zephyr support is added */
+-	return;
++	u32 init_sts;
++	u64 start;
+ 
+-	HALT_N_RESET_ARC(0);
+-	HALT_N_RESET_ARC(1);
++	regmap_writel(PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_START_MASK,
++			mmPSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL);
++	start = timestamp_get_us();
+ 
+-	/*
+-	 * Program Reset vector address for ARC0 and ARC1 to ICCM 0x0
+-	 * location where vector table first entry will be available and
+-	 * then bring ARC0 and ARC1 out of reset. ARCs when out of reset
+-	 * is by default in halt state.
+-	 */
+-	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
+-	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
+-	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC1_CFG_RST_VEC_ADDR);
+-	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC1_CFG_ARC_RST);
+-
+-}
+-
+-void hl_plat_init(void)
+-{
+-	/* need to configure arb_timeout val before PLL is locked */
+-	set_slv_cfg_reg_val();
+-}
+-
+-static void init_sp_sram(void)
+-{
+-	u32 mem_cfg, cpy_sts;
+-	u8 retry = HL_INIT_SP_SRAM_RETRIES;
+-
+-	/* Use memblock to initialize scratchpad memory */
+-	regmap_writel((u32)HL_SP_SRAM_BASE,
+-			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
+-	regmap_writel((u32)(HL_SP_SRAM_BASE >> 32),
+-			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
+-
+-	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
+-	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
+-	/* set size of 64k in granuality of 16 bytes */
+-	mem_cfg |= (0x1000 & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
+-	mem_cfg |= (0x1 << PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT);
+-
+-	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
+-
+-	/* Enable copy and wait for completion */
+-	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
+ 	while (1) {
+-		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
+-		if (cpy_sts)
++		init_sts = regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL);
++		if (init_sts & PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_DONE_MASK)
+ 			break;
+-		/*
+-		 * Do not wait indefinitely on copy status
+-		 * Wait for 5 seconds (50 retries with 100 milli-
+-		 * seconds sleep), else bailout.
++
++		/* If init does not happen in 5 seconds
++		 * timeout and return
+ 		 */
+-		retry--;
+-		if (!retry) {
+-			preboot_puts("Timed-out waiting for SP SRAM copy\n");
++		if (timeout_expired(start, SP_SRAM_INIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for sp sram init\n");
+ 			break;
+ 		}
+-		udelay(100000);
+ 	}
+-
+ }
+ 
+ void hl_plat_early_init(void)
+ {
+-	init_arc();
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_IATU_CONF_EN, true);
+ 
+ 	/* This W/A is to be done before pcie link is established */
+@@ -168,37 +129,200 @@
+ 	image_entry();
+ }
+ 
++static void run_arc(u8 id)
++{
++	u32 run_ack_offset, run_req_offset;
++	u32 run_ack_mask;
++	u64 start;
++
++	if (id) {
++		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	} else {
++		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	}
++
++	/* Set ARC in running state */
++	regmap_writel(BIT(0), run_req_offset);
++
++	start = timestamp_get_us();
++	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
++
++		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
++			preboot_puts_hex("No running state ack from ARC ",
++					id, false);
++			break;
++		}
++	}
++
++	regmap_writel(0x0, run_req_offset);
++
++}
++
++static void halt_n_reset_arc(u8 id)
++{
++	u32 val, halt_ack_offset, halt_req_offset;
++	u32 halt_mask, halt_ack_mask;
++	u32 rst_offset;
++	u64 start;
++
++	if (id) {
++		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
++		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++
++	} else {
++		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
++		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++	}
++
++	val = regmap_readl(halt_ack_offset);
++	if (val & halt_mask) {
++		preboot_puts_hex("Skipping halt for ARC", id, false);
++	} else {
++		/* Halt ARC */
++		regmap_writel(BIT(1), halt_req_offset);
++		start = timestamp_get_us();
++		while (1) {
++			val = regmap_readl(halt_ack_offset);
++			if (val & halt_ack_mask)
++				break;
++			/* If copy does not happen in 5 seconds
++			 * timeout and return
++			 */
++			if (timeout_expired(start, ARC_HALT_ACK_TIMEOUT_US)) {
++				preboot_puts_hex("No ack from ARC", id, false);
++				break;
++			}
++		}
++		regmap_writel(0x0, halt_req_offset);
++	}
++
++	/* Reset ARC */
++	regmap_writel(0x1, rst_offset);
++}
++
++static void init_arc(void)
++{
++	halt_n_reset_arc(0);
++	halt_n_reset_arc(1);
++
++	/*
++	 * Program Reset vector address for ARC0 and ARC1 to ICCM 0x0
++	 * location where vector table first entry will be available and
++	 * then bring ARC0 and ARC1 out of reset. ARCs when out of reset
++	 * is by default in halt state.
++	 */
++	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
++	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
++	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC1_CFG_RST_VEC_ADDR);
++	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC1_CFG_ARC_RST);
++}
++
++void hl_plat_init(void)
++{
++	/* need to configure arb_timeout val before PLL is locked */
++	set_slv_cfg_reg_val();
++
++	init_arc();
++}
++
+ void preboot_start_image(u64 startaddr)
+ {
++	/* Set ARC0 and ARC1 in running state */
++	run_arc(0);
++	run_arc(1);
+ 	/*
+ 	 * After image_entry, control is not expected to return
+ 	 * here and continue.
+ 	 */
+ 	image_start(startaddr);
+-
+-
+-	/* Set ARC0 and ARC1 in running state */
+-	/*
+-	 * TODO: Move run arc above image start once zephyr
+-	 * support is added
+-	 */
+-	RUN_ARC(0);
+-	RUN_ARC(1);
+ }
+ 
+-static void fit_copy_arc_image(u64 dst, const void *buf, int len)
++static void sp_sram_to_arc_mem_cpy(u64 dst, u32 len)
+ {
+-	/* TODO: copy images once zephyr support is added */
+-	return;
++	u32 mem_cfg, cpy_sts;
++	u64 start;
++
++	/* Set source and destination address in memcopy block */
++	regmap_writel((u32)dst, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((u32)(dst >> 32), mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++	regmap_writel((u32)HL_SP_SRAM_BASE_FULL,
++			mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_L);
++	regmap_writel((u32)(HL_SP_SRAM_BASE_FULL >> 32),
++			mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_H);
++
++
++	/* Align length to 16 bytes */
++	if (len % 16)
++		len += (16 - (len % 16));
++
++	/* Set length in memcopy register in granuality of 16 bytes */
++	len = len >> 4;
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_MASK);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
++	mem_cfg |= (len & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	start = timestamp_get_us();
++	while (1) {
++		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts)
++			break;
++		/* If copy does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, MEM_CPY_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for mem_cpy\n");
++			break;
++		}
++	}
++}
++
++static void fit_copy_arc_image(u64 dst, const void *buf, int length)
++{
++	u32 len;
++	u8 j = 0;
++	const void *copy_loc;
+ 
+ 	/*
+-	 * initialize scratch SRAM to avoid ECC exceptions
+-	 * ECC errors are observed due to byte copy to SP
+-	 * memory which turns to be read-modify-write transaction
++	 * Since in gaudi2 iccm size is 128K and SP sram is 64K, if image len
++	 * is more than HL_SP_SRAM_SIZE then split and copy
+ 	 */
+-	init_sp_sram();
++	do {
++		len = (length / HL_SP_SRAM_SIZE) ?
++			HL_SP_SRAM_SIZE : (length % HL_SP_SRAM_SIZE);
++		copy_loc = (void *)((u8 *)(buf) + (j * HL_SP_SRAM_SIZE));
++		dst += (j * HL_SP_SRAM_SIZE);
+ 
+-	/* TODO: Add later */
++		/*
++		 * Copy FIT arc image to scratchpad SRAM base. This is required
++		 * for using memcopy block as memcopy requires source and
++		 * destination addressess to be 16 bytes aligned.
++		 */
++		memcpy((void *)HL_SP_SRAM_BASE, copy_loc, len);
++
++		/*
++		 * Copy from scratchpad SRAM to ICCM/DCCM using memcopy block.
++		 */
++		sp_sram_to_arc_mem_cpy(dst, len);
++
++		length -= len;
++		j++;
++	} while (length > 0);
+ }
+ 
+ void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+diff --git a/arch/gaudi2/arm/common.h b/arch/gaudi2/arm/common.h
+index be13756..bc5a569 100644
+--- a/arch/gaudi2/arm/common.h
++++ b/arch/gaudi2/arm/common.h
+@@ -43,7 +43,9 @@
+  */
+ #define HL_CFG_BASE			0x3FF8000000ull
+ 
+-#define HL_SP_SRAM_BASE			0x7FF7FE0000ULL
++#define HL_SP_SRAM_BASE			0x3FF7FE0000ULL
++#define HL_SP_SRAM_BASE_FULL		0x1000007FF7FE0000ULL
++#define HL_SP_SRAM_INIT_CTRL		0x1000007FFCC4BD80ULL
+ #define HL_SP_SRAM_SIZE			0x10000
+ #define FUSE_WORDS_PER_BANK		0x40
+ #define I2C_SLAVE_ADDRESS		0x6A
+@@ -109,7 +111,11 @@
+ 
+ #define I2C_SLAVE_DEFAULT_INTR_MASK			0x48FF
+ 
+-#define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
++#define FW_WORD_NUM					0x2000/* FW_SIZE / 2 */
+ 
++#define ARC_RUN_ACK_TIMEOUT_US				100
++#define ARC_HALT_ACK_TIMEOUT_US				100
++#define MEM_CPY_TIMEOUT_US				(5 * USEC_PER_SEC)
++#define SP_SRAM_INIT_TIMEOUT_US				(5 * USEC_PER_SEC)
+ #endif /* COMMON_GAUDI2_ARM_H_ */
+ 

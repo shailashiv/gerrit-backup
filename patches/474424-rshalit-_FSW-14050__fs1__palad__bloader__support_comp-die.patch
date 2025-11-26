@@ -1,0 +1,162 @@
+From 409e5bbfd0c616edd6badb51d8f42b7e6dfb9d1b Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Mon, 03 Mar 2025 16:43:16 +0200
+Subject: [PATCH] [FSW-14050] fs1: palad: bloader: support comp-die
+
+COMP-DIE and IO-DIE are basically different:
+in COMP-DIE FW-MEM contains: MNG ARC and RST ARC,
+while IO0-DIE contains also: MISC and PID ARCs.
+Hence, bootloader for each behaves slightly different:
+io-die bloader: copy preboot from misc to spsram
+comp-die bloader: copy preboot from mng to spsram
+
+Change-Id: I9c5bb4dd16d533fa24e2e70a436bfe164a642e8d
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/app/palad_bloader/Makefile b/app/palad_bloader/Makefile
+index a45cc0a..81b76fd 100644
+--- a/app/palad_bloader/Makefile
++++ b/app/palad_bloader/Makefile
+@@ -22,13 +22,12 @@
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ 
+-DIE_TYPE_IO = 5
+-DIE_TYPE_COMP = 10
++
+ 
+ CFLAGS_IO = $(CFLAGS)
+-CFLAGS_IO += -DDIE_TYPE=$(DIE_TYPE_IO)
++CFLAGS_IO += -DDIE_TYPE_IO
+ CFLAGS_COMP += $(CFLAGS)
+-CFLAGS_COMP += -DDIE_TYPE=$(DIE_TYPE_COMP)
++CFLAGS_COMP += -DDIE_TYPE_COMP
+ 
+ SFLAGS_IO := $(CFLAGS_IO) -D__ASSEMBLY__
+ SFLAGS_COMP := $(CFLAGS_COMP) -D__ASSEMBLY__
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+index 29da419..ff5221e 100644
+--- a/arch/fs1/arc/palad.c
++++ b/arch/fs1/arc/palad.c
+@@ -75,12 +75,32 @@
+ 	return (factor + 1) & 0xFFFE;
+ }
+ 
++#if defined(DIE_TYPE_IO)
++uint32_t hl_get_die_id(void)
++{
++	return FS1_IO_DIE_0;
++}
++#else
++uint32_t hl_get_die_id(void)
++{
++	return FS1_COMPUTE_DIE_0;
++}
++#endif
++
+ void hl_uart_init(void)
+ {
++	uint32_t uart0_rxd = mmPSOC_PAD_CONF_PAD_SEL_49;
++	uint32_t uart0_txd = mmPSOC_PAD_CONF_PAD_SEL_50;
++
++	if (hl_get_die_id() == FS1_COMPUTE_DIE_0) {
++		uart0_rxd = mmPSOC_PAD_CONF_PAD_SEL_33;
++		uart0_txd = mmPSOC_PAD_CONF_PAD_SEL_34;
++	}
++
+ 	regmap_writel(1, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE +
+-			 mmPSOC_PAD_CONF_PAD_SEL_49);				/* UART0 RXD */
++		      uart0_rxd);	/* UART0 RXD */
+ 	regmap_writel(1, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE +
+-			 mmPSOC_PAD_CONF_PAD_SEL_50);				/* UART0 TXD */
++		      uart0_txd);	/* UART0 TXD */
+ 	preboot_uart_init(UART_CLOCK_FREQUENCY / PALAD_UART_BAUDRATE);
+ }
+ 
+@@ -343,21 +363,59 @@
+  */
+ void btldr_parc_prepare(void)
+ {
+-	regmap_writel(0, mmIO_0_CFG_HALF_0_PSOC_ARC_MISC_ARC_BASE + mmARC_ARC_RST);
++	uint32_t base = (hl_get_die_id() == FS1_COMPUTE_DIE_0) ?
++				mmCOMPUTE_0_CFG_PSOC_ARC_RST_ARC_BASE :
++				mmIO_0_CFG_HALF_0_PSOC_ARC_MISC_ARC_BASE;
++
++	regmap_writel(0, base + mmARC_ARC_RST);
+ }
++
++#define COMP_PREBOOT_MAX_SZ SZ_128K
++
++struct img_attr {
++	uint64_t base;
++	uint32_t size;
++};
++
++struct img_attr io_img_attr = {
++	.base = IO0_MISC_ICCM_FULL_BASE,
++	.size = IO_MISC_ICCM_SIZE,
++};
++
++struct img_attr comp_img_attr = {
++	.base = COMP0_MNG_ICCM_FULL_BASE,
++	.size = COMP_PREBOOT_MAX_SZ,
++};
++
++struct img_attr ext_io_img_attr = {
++	.base = IO0_MISC_DCCM_FULL_BASE,
++	.size = IO_MISC_DCCM_SIZE,
++};
++
++struct img_attr ext_comp_img_attr = {
++	.base = COMP0_RST_ICCM_BASE,
++	.size = COMP_RST_ICCM_SIZE,
++};
+ 
+ static void btldr_copy_preboot_app(void)
+ {
+ 	int err;
+ 	u32 val;
++	uint32_t die = hl_get_die_id();
++
++	struct img_attr img_attr = (die == FS1_COMPUTE_DIE_0) ?
++			comp_img_attr : io_img_attr;
++	struct img_attr ext_img_attr = (die == FS1_COMPUTE_DIE_0) ?
++			ext_comp_img_attr : ext_io_img_attr;
+ 
+ 	/*
+-	 * Clean copy of the application is stored in MISC ICCM. In case the application binary
+-	 * exceeds MISC ICCM size (256kb), the rest is stored in MISC DCCM.
+-	 * An efuse bit is controlling whether the application binary is larger than MISC ICCM size.
++	 * Clean copy of the application is stored in MISC ICCM for IO-DIE
++	 * (or in MNG ICCM for COMP-DIE). In case the application binary
++	 * exceeds MISC ICCM size (256kb), the rest is stored in MISC DCCM for IO-DIE
++	 * (or in RST ICCM for COMP-DIE).
++	 * An efuse bit is controlling whether the application binary is larger than available.
+ 	 */
+-	hw_mem_copy(IO0_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, IO_MISC_ICCM_SIZE, false,
+-		     false);
++	hw_mem_copy(img_attr.base, PREBOOT_TEXT_BASE_FULL, img_attr.size, false, false);
+ 
+ 	err = preboot_fuse_read(IO_EFUSE_PALAD_CFG_0_OFFSET, &val);
+ 	if (err)
+@@ -368,8 +426,8 @@
+ 	if (!val)
+ 		return;
+ 
+-	hw_mem_copy(IO0_MISC_DCCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL + IO_MISC_ICCM_SIZE,
+-		     IO_MISC_DCCM_SIZE, false, false);
++	hw_mem_copy(ext_img_attr.base, PREBOOT_TEXT_BASE_FULL + img_attr.size,
++		    ext_img_attr.size, false, false);
+ }
+ 
+ static void btldr_copy_bootinfo(void)
+@@ -399,6 +457,8 @@
+ void btldr_copy_data(void)
+ {
+ 	btldr_copy_preboot_app();
++	if (hl_get_die_id() == FS1_COMPUTE_DIE_0)
++		return;
+ 	btldr_copy_bootinfo();
+ }
+ 

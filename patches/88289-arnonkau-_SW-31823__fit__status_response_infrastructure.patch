@@ -1,0 +1,232 @@
+From 5ebfa3b323b719902f35570e97b89342f6f7d357 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sun, 18 Apr 2021 13:52:32 +0300
+Subject: [PATCH] [SW-31823] fit: status response infrastructure
+
+Till now the preboot handled fit as input only,
+there is a need to have the ability of sending
+fit as a back response.
+
+The first use of this interface is the handling of the proto_status
+
+Change-Id: I0cfb86ca2846c23428cbdf0d336a8aae2c5fd298
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index f6142ef..4718cab 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -638,6 +638,47 @@
+ 	return 0;
+ }
+ 
++int fit_init_resp(void *fit, size_t sz)
++{
++	int err;
++
++	err = fdt_create(fit, sz);
++	if (err)
++		return err;
++
++	err = fdt_finish_reservemap(fit);
++	if (err)
++		return err;
++
++	err = fdt_begin_node(fit, "");
++	if (err)
++		return err;
++
++	return 0;
++}
++
++int fit_fin_resp(void *fit, unsigned int *res_size)
++{
++	int err;
++
++	if (!fdt_size_dt_strings(fit)) {
++		*res_size = 0;
++		return 0; /* Empty response */
++	}
++
++	err = fdt_end_node(fit);
++	if (err)
++		return err;
++
++	err = fdt_finish(fit);
++	if (err)
++		return err;
++
++	*res_size = fdt_totalsize(fit);
++
++	return err;
++}
++
+ static int fit_copy_image(u64 dst, const void *buf, int len, const char *arch,
+ 			  const char *cmpr)
+ {
+diff --git a/preboot/fit.h b/preboot/fit.h
+index e350f4f..528bedd 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -8,19 +8,12 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
+-/*
+- * FIXME: the included libfdt.h doesn't declared those functions
+- * which defined in the lib object, and can be used
+- */
+-
+-int fdt_property(void *fdt, const char *name, const void *val, int len);
+-int fdt_property_u32(void *fdt, const char *name, u32 val);
+-
+ int fit_load_images(void);
+ void fit_run_image(void);
+ int fit_validate_size(int len);
+ int fit_get_load_type(u32 *load_type);
+ int fit_image_get_loadable_data(const void *fit, const void **data,
+ 				size_t size);
+-
++int fit_init_resp(void *fit, size_t sz);
++int fit_fin_resp(void *fit, unsigned int *res_size);
+ #endif /* _HL_FIT_H_ */
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 1e40057..edf5508 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -4,11 +4,13 @@
+  * All Rights Reserved.
+  */
+ 
++#include <libfdt.h>
+ #include <stdint.h>
+ #include <inttypes.h>
+ #include <string.h>
+ 
+ #include <psoc_global_conf_regs.h>
++#include <boot_if.h>
+ #include <hl_fw_if.h>
+ #include <preboot.h>
+ #include <fit_load_type.h>
+@@ -19,8 +21,14 @@
+ #include "pll.h"
+ #include "fit.h"
+ 
+-#define WFC_TIMEOUT_MS		500
+-#define TIMEOUT_US		1000
++#define FIT_RSP_MARGIN_SIZE_IN_KB	0x400 /* 1KB */
++#define FIT_DFL_RSP_SIZE_IN_KB		0x1000 /* 4KB */
++
++#define WFC_TIMEOUT_MS			500
++#define TIMEOUT_US			1000
++
++#define HL_FIT_LOAD_TYPE_PROP		"load-type"
++#define HL_FIT_PROTO_STATUS_PROP	"protocol-status"
+ 
+ static bool is_fit_checked;
+ static unsigned int map_size;
+@@ -61,6 +69,7 @@
+ 	case HL_UPD_MAP_SPSRAM:
+ 	case HL_UPD_RUN_SRAM:
+ 	case HL_UPD_RUN_SPSRAM:
++	case HL_UPD_GET_PROTO_STATUS:
+ 		return FOUND_SLOW_RETURN;
+ 	default:
+ 		return NOT_FOUND;
+@@ -250,6 +259,84 @@
+ 		preboot_security_dynamic_img_spsram_open();
+ }
+ 
++static int fwupd_create_resp(void *res_fit, const int load_type,
++		const char *prop_name, const void *prop_data,
++		int *prop_data_sz)
++{
++	int err;
++	unsigned int sz = 4 * 1024;
++
++	sz = ((*prop_data_sz + FIT_RSP_MARGIN_SIZE_IN_KB) > FIT_DFL_RSP_SIZE_IN_KB) ?
++		(*prop_data_sz + FIT_RSP_MARGIN_SIZE_IN_KB) : FIT_DFL_RSP_SIZE_IN_KB;
++
++	err = fit_init_resp(res_fit, sz);
++	if (err)
++		goto fit_init_err;
++
++	err = fdt_property_u32(res_fit, HL_FIT_LOAD_TYPE_PROP, load_type);
++	if (err)
++		goto fit_init_err;
++
++	err = fdt_property(res_fit, prop_name, prop_data, *prop_data_sz);
++	if (err)
++		goto fit_init_err;
++
++	err = fit_fin_resp(res_fit, &sz);
++	if (err)
++		goto fit_init_err;
++
++	*prop_data_sz = sz;
++
++fit_init_err:
++	return err;
++}
++
++static void fwupd_get_proto_status(struct hl_upd_proto_status *status, int err, int serr)
++{
++	status->version = HL_UPD_PROTO_VERSION;
++	status->compat_mask = cpu_boot_dev_sts_get_all();
++	status->fw_comp = HL_FW_COMP_PREBOOT;
++	status->err = err;
++	status->sub_err = serr;
++}
++
++static int fwupd_prepare_proto_status(void *res_fit, int rsp_err, int rsp_sub_err)
++{
++	struct hl_upd_proto_status status;
++	int size = sizeof(status);
++
++	fwupd_get_proto_status(&status, rsp_err, rsp_sub_err);
++
++	return fwupd_create_resp(res_fit, FIT_LOAD_TYPE_PROTO_STATUS,
++		HL_FIT_PROTO_STATUS_PROP, &status, &size);
++}
++
++static void module_fwupd_proto_status(void)
++{
++	int err;
++	enum hl_upd_sts sts;
++	void *offset;
++
++	module_fwupd_send_status(HL_UPD_STS_ACK, 0);
++	offset = (void *)preboot_shm_get_offset();
++	err = fwupd_prepare_proto_status(offset, 0, 0);
++	if (err)
++		goto fwupd_proto_sts_err;
++	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
++	if (err)
++		goto fwupd_proto_sts_wfc;
++
++	module_fwupd_send_status(HL_UPD_STS_OK, offset);
++	return;
++
++fwupd_proto_sts_wfc:
++	sts = HL_UPD_STS_TIMEOUT_ERR;
++	preboot_puts("Timeout error\n");
++
++fwupd_proto_sts_err:
++	module_fwupd_send_status(sts, 0);
++}
++
+ void module_fwupd_run(void)
+ {
+ 	struct hl_upd_command cmd;
+@@ -286,6 +373,10 @@
+ 		preboot_puts("FW UPD RUN SPSRAM received\n");
+ 		module_fwupd_run_cmd(cmd.cmd);
+ 		break;
++	case HL_UPD_GET_PROTO_STATUS:
++		preboot_puts("FW UPD PROTO STATUS received\n");
++		module_fwupd_proto_status();
++		break;
+ 	default:
+ 		break;
+ 	}

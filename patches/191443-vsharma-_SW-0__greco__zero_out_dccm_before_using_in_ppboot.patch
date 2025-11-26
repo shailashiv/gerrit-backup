@@ -1,0 +1,101 @@
+From 310a98fe5505a1574d5f599b9f19684ea8d1cbbc Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Mon, 21 Mar 2022 18:05:41 +0200
+Subject: [PATCH] [SW-0] greco: zero out dccm before using in ppboot
+
+This patch zero out dccm before using it in ppboot.
+This is used for stack,bss and data sections.
+Undefined behaviour and exception was seen in ppboot
+during pdu power cycle in arcboot flow. This resolve
+that issue.
+Also it change's size of dccm to be used to 7K.
+
+Change-Id: I219d5557a09874c7a395ef270b47e28ffa9dc324
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 514c82c..4cc1f4d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -11,6 +11,7 @@
+ HL_DEV_ARCH_COMMON := arch/$(BASE_DEV_NAME)/common
+ ifeq ($(BASE_DEV_NAME),greco)
+ 	BASE_DEV_NAME := goya2
++	CFLAGS += -DDCCM_INIT
+ endif
+ 
+ CFLAGS += -I$(SPECS_DIR)
+diff --git a/app/ppboot/crt0_ppboot.S b/app/ppboot/crt0_ppboot.S
+index dc5c8d4..d9d7025 100644
+--- a/app/ppboot/crt0_ppboot.S
++++ b/app/ppboot/crt0_ppboot.S
+@@ -25,6 +25,20 @@
+ 	bset r0, r0, 0x13
+ 	kflag r0
+ 
++#if defined(__arc__) && defined(DCCM_INIT)
++	mov r2, @_dccm_begin	; r2 = start of the ppboot dccm section
++	sub r3, @_dccm_end, r2	; r3 = size of the ppboot dccm section in bytes
++	; set up the loop counter register to the size (in words) of the dccm section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov r4, 0x0
++	; loop to zero out the dccm.  Enter loop only if lp_count != 0
++	lpnz	3f
++	st.ab r4, [r2, 4]	; zero out the word
++	nop
++3:
++#else
+ 	/* Clear BSS */
+ 	mov	r5, __bss_start
+ 	sub	r6, __bss_end, r5
+@@ -32,6 +46,8 @@
+ 	lpnz	1f
+ 	st.ab	0, [r5, 4]
+ 1:
++#endif
++
+ 	/* copy data and sdata sections */
+ 	mov_s	r1, @_erodata		; r1 = end of the text/ro section
+ 	mov_s	r2, @_data
+diff --git a/arch/greco/arc_elf32/common.h b/arch/greco/arc_elf32/common.h
+index efe1830..ada859f 100644
+--- a/arch/greco/arc_elf32/common.h
++++ b/arch/greco/arc_elf32/common.h
+@@ -29,10 +29,10 @@
+ #define FW_WORD_NUM		0x2A00	/* FW_SIZE / 2 */
+ 
+ /* In order not to conflict with ARC BOOTROM's usage of DCCM,
+- * Let PPBoot start from the offset of 8544 bytes, for using DCCM
++ * Let PPBoot start from the offset of 9K bytes, for using DCCM
+  * for its own BSS and Stack.
+  */
+-#define PPBOOT_DCCM_BASE	0x1B032160
++#define PPBOOT_DCCM_BASE	0x1B032400
+ 
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+diff --git a/arch/greco/arc_elf32/ppboot.lds.S b/arch/greco/arc_elf32/ppboot.lds.S
+index d0cf832..b59a99b 100644
+--- a/arch/greco/arc_elf32/ppboot.lds.S
++++ b/arch/greco/arc_elf32/ppboot.lds.S
+@@ -13,7 +13,7 @@
+ MEMORY
+ {
+ 	.sram 	: ORIGIN = PPBOOT_TEXT_BASE, LENGTH = PPBOOT_SIZE
+-	DCCM	: ORIGIN = PPBOOT_DCCM_BASE, LENGTH = 8K
++	DCCM	: ORIGIN = PPBOOT_DCCM_BASE, LENGTH = 7K
+ }
+ 
+ REGION_ALIAS("REGION_DATA",	DCCM)
+@@ -26,6 +26,8 @@
+ ENTRY(_start)
+ SECTIONS
+ {
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+ 	.text : {
+ 		. = ALIGN(8);
+ 		app/ppboot/crt0_ppboot.o (.text*)

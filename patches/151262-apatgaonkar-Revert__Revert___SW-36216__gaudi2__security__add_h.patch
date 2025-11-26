@@ -1,0 +1,297 @@
+From f04d64f9cf44fe0b34bbdb4e47dc462d607c4659 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Mon, 29 Nov 2021 06:22:03 +0200
+Subject: [PATCH] Revert "Revert "[SW-36216] gaudi2: security: add hbw rr apis""
+
+This reverts commit e62c9de2e05186028cbfefe5b626d6b5ecb10fc1.
+
+Change-Id: I6b40981ff111d2ebbc6f874eb16b5bb6a5462684
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 82c59bd..7cea4bf 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -20,15 +20,19 @@
+ #include <pcie_lbw_rr_mstr_if_rr_shrd_lbw_regs.h>
+ #include <jt_mstr_if_rr_shrd_lbw_regs.h>
+ #include <sft0_lbw_rtr_if_mstr_if_rr_shrd_lbw_regs.h>
++#include <pcie_mstr_rr_mstr_if_rr_shrd_hbw_regs.h>
++#include <dcore0_rtr0_mstr_if_rr_shrd_hbw_regs.h>
++#include <jt_mstr_if_rr_shrd_hbw_regs.h>
++#include <sft0_hbw_rtr_if0_mstr_if_rr_shrd_hbw_regs.h>
+ 
+ /*
++ * instances_num : Number of instances of RR to program.
++ * instances_dist : Distance between consecutive instances.
+  * type : full/short
+  * min_<type>_breg : base register for RR min register.
+  * max_<type>_breg : base register for RR max register.
+  * hit_wr_breg : base register for hit write.
+  * hit_wr_breg : base register for hit read.
+- * instances_num : Number of instances of RR to program.
+- * instances_dist : Distance between consecutive instances.
+  */
+ struct hl_sec_rrs_cfg {
+ 	int instances_num;
+@@ -58,6 +62,27 @@
+ 	u8 pad;
+ };
+ 
++struct hbw_rr_addr {
++	u32 lo;
++	u32 hi;
++};
++
++struct hl_sec_rrs_cfg_hbw {
++	int instances_num;
++	u32 instances_dist;
++	struct hbw_rr_addr min_short;
++	struct hbw_rr_addr max_short;
++	struct hbw_rr_addr min_full;
++	struct hbw_rr_addr max_full;
++	u32 hit_wr_breg;
++	u32 hit_rd_breg;
++};
++
++struct hit_regs {
++	u32 hit_wr;
++	u32 hit_rd;
++};
++
+ /*
+  * Single instance of range register. Helper structure
+  * to generalize implementation between short and full.
+@@ -68,8 +93,16 @@
+ 	u32 data_max;
+ 	u32 reg_min;
+ 	u32 reg_max;
+-	u32 hit_wr;
+-	u32 hit_rd;
++	struct hit_regs hit;
++};
++
++struct hbw_rr_reg {
++	u32 rr_idx_calc;
++	u64 data_min;
++	u64 data_max;
++	struct hbw_rr_addr reg_min;
++	struct hbw_rr_addr reg_max;
++	struct hit_regs hit;
+ };
+ 
+ enum hl_sec_engine_type {
+@@ -101,11 +134,31 @@
+ 	HL_SEC_LBW_MAX_RR_IDX = 18,
+ };
+ 
++/*
++ * There are 10(0..9 rr idx) RRs for HBW
++ * NOTE: All the RRs for HBW are of 4KB granularity
++ *
++ * 1) 6(0..5 rr idx) Regions with 39 bit addressing
++ * API: hl_secure_hbw_rr(rr idx, min addr, max addr, rr sel)
++ *
++ * 2) 2(6..7 rr idx) Regions with 50 bit addressing.
++ * API: hl_secure_hbw_rr(rr idx, min addr, max addr, rr sel)
++ *
++ * 3) 2(8..9 rr idx) Regions with 50 bit addressing, to block only write.
++ * API: hl_secure_hbw_rr(rr idx, min addr, max addr,  rr sel)
++ *
++ * rr idx type : gaudi2_sec_if_hbw_rrs
++ */
++enum gaudi2_sec_if_hbw_rrs {
++	HL_SEC_HBW_MAX_RR_IDX = 10,
++};
++
+ #define DCORE_DIST	0x200000
+ #define SFT_DIST	0x10000
+ #define IF_RTR_DIST	0x8000
+ #define PCIE_INST_NUM	1
+ #define PSOC_INST_NUM	3 /* JTAG, SMI, I2C */
++#define PSOC_INST_DIST	0x1000
+ #define SFT_INST_NUM	PCIE_INST_NUM
+ #define SHIFT_4K_POS	12
+ 
+@@ -152,8 +205,70 @@
+ 	}
+ };
+ 
++#define HBW_SFT_DIST		0x4000
++#define HBW_SFT_INST_NUM	2
++
++static struct hl_sec_rrs_cfg_hbw hl_sec_hbw_rrs_tbl[] = {
++	[HL_SEC_ENGINE_IF_RTR] = {
++		.instances_num = NUM_OF_RTR_PER_DCORE,
++		.instances_dist = IF_RTR_DIST,
++		.min_short.lo = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
++		.min_short.hi = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
++		.max_short.lo = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
++		.max_short.hi = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_HI_0,
++		.min_full.lo = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
++	},
++	[HL_SEC_ENGINE_PCIE] = {
++		.instances_num = PCIE_INST_NUM,
++		.instances_dist = 0,
++		.min_short.lo = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
++		.min_short.hi = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
++		.max_short.lo = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
++		.max_short.hi = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_HI_0,
++		.min_full.lo = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
++	},
++	[HL_SEC_ENGINE_PSOC] = {
++		.instances_num = PSOC_INST_NUM,
++		.instances_dist = PSOC_INST_DIST,
++		.min_short.lo = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
++		.min_short.hi = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
++		.max_short.lo = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
++		.max_short.hi = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_HI_0,
++		.min_full.lo = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
++	},
++	[HL_SEC_ENGINE_SFT] = {
++		.instances_num = HBW_SFT_INST_NUM,
++		.instances_dist = HBW_SFT_DIST,
++		.min_short.lo = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
++		.min_short.hi = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
++		.max_short.lo = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
++		.max_short.hi = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_HI_0,
++		.min_full.lo = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
++	},
++};
++
+ static void hl_secure_update_hit_reg(int rr_idx, int inst_dist,
+-		struct lbw_rr_reg *rr_reg, bool write_only)
++		struct hit_regs *rr_reg, bool write_only)
+ {
+ 	u32 rr_dest, hit;
+ 
+@@ -180,7 +295,7 @@
+ 	rr_dest = rr_base + rr_reg->reg_max;
+ 	regmap_writel(rr_reg->data_max, rr_dest);
+ 
+-	hl_secure_update_hit_reg(rr_idx, inst_offset, rr_reg, false);
++	hl_secure_update_hit_reg(rr_idx, inst_offset, &rr_reg->hit, false);
+ }
+ 
+ #define MAX_LBW_SHORT_RR	14
+@@ -209,8 +324,8 @@
+ 
+ 	rr_reg.reg_min += dist;
+ 	rr_reg.reg_max += dist;
+-	rr_reg.hit_wr = cfg->hit_wr_breg + dist;
+-	rr_reg.hit_rd = cfg->hit_rd_breg + dist;
++	rr_reg.hit.hit_wr = cfg->hit_wr_breg + dist;
++	rr_reg.hit.hit_rd = cfg->hit_rd_breg + dist;
+ 
+ 	for (i = 0; i < cfg->instances_num; i++)
+ 		hl_secure_update_rr_reg(rr_idx, cfg->instances_dist * i, &rr_reg);
+@@ -391,6 +506,89 @@
+ 	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
+ }
+ 
++#define BITS_IN_REG			32
++#define GAUDI2_HBW_SHORT_MASK		0xF
++#define GAUDI2_MAX_HBW_SHORT_RR		6
++#define GAUDI2_HBW_WRITE_ONLY_RR_IDX	8
++
++static void hl_secure_update_rr_reg_hbw(int rr_idx, u32 inst_offset,
++		struct hbw_rr_reg *rr_reg)
++{
++	u32 rr_base, rr_dest;
++	u32 data_max_hi = ((u32)(rr_reg->data_max >> BITS_IN_REG));
++	u32 data_min_hi = ((u32)(rr_reg->data_min >> BITS_IN_REG));
++	bool write_only = rr_idx >= GAUDI2_HBW_WRITE_ONLY_RR_IDX;
++
++	if (rr_idx < GAUDI2_MAX_HBW_SHORT_RR) {
++		data_max_hi &= GAUDI2_HBW_SHORT_MASK;
++		data_min_hi &= GAUDI2_HBW_SHORT_MASK;
++	}
++
++	rr_base = rr_reg->rr_idx_calc * sizeof(u32) + inst_offset;
++	rr_dest = rr_base + rr_reg->reg_min.lo;
++	regmap_writel((u32)rr_reg->data_min, rr_dest);
++	rr_dest = rr_base + rr_reg->reg_min.hi;
++	regmap_writel(data_min_hi, rr_dest);
++	rr_dest = rr_base + rr_reg->reg_max.lo;
++	regmap_writel((u32)rr_reg->data_max, rr_dest);
++	rr_dest = rr_base + rr_reg->reg_max.hi;
++	regmap_writel(data_max_hi, rr_dest);
++
++	hl_secure_update_hit_reg(rr_idx, inst_offset, &rr_reg->hit, write_only);
++}
++
++static void hl_secure_hbw_rr_gen(int rr_idx, u64 min, u64 max,
++		int dist, enum hl_sec_engine_type type)
++{
++	int i;
++	struct hbw_rr_reg rr_reg;
++	struct hl_sec_rrs_cfg_hbw *cfg = &hl_sec_hbw_rrs_tbl[type];
++
++	rr_reg.data_min = min >> SHIFT_4K_POS;
++	rr_reg.data_max = max >> SHIFT_4K_POS;
++
++	if (rr_idx < GAUDI2_MAX_HBW_SHORT_RR) {
++		rr_reg.rr_idx_calc = rr_idx;
++		rr_reg.reg_min = cfg->min_short;
++		rr_reg.reg_max = cfg->max_short;
++	} else {
++		rr_reg.rr_idx_calc = rr_idx - GAUDI2_MAX_HBW_SHORT_RR;
++		rr_reg.reg_min = cfg->min_full;
++		rr_reg.reg_max = cfg->max_full;
++	}
++
++	rr_reg.reg_min.lo += dist;
++	rr_reg.reg_min.hi += dist;
++	rr_reg.reg_max.lo += dist;
++	rr_reg.reg_max.hi += dist;
++	rr_reg.hit.hit_wr = cfg->hit_wr_breg + dist;
++	rr_reg.hit.hit_rd = cfg->hit_rd_breg + dist;
++
++	for (i = 0; i < cfg->instances_num; i++)
++		hl_secure_update_rr_reg_hbw(rr_idx, cfg->instances_dist * i, &rr_reg);
++}
++
++__unused static void hl_secure_hbw_rr(int rr_idx, u64 min, u64 max, struct hl_rr_eng_select rr_sel)
++{
++	int i;
++
++	if (rr_sel.noc) {
++		for (i = 0; i < NUM_OF_DCORES; i++) {
++			hl_secure_hbw_rr_gen(rr_idx, min, max, DCORE_DIST * i,
++					HL_SEC_ENGINE_IF_RTR);
++
++			hl_secure_hbw_rr_gen(rr_idx, min, max, SFT_DIST * i,
++					HL_SEC_ENGINE_SFT);
++		}
++	}
++
++	if (rr_sel.pcie)
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_ENGINE_PCIE);
++
++	if (rr_sel.psoc)
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_ENGINE_PSOC);
++}
++
+ void ppboot_security_init(void)
+ {
+ 	/* Initialize only if security is enabled */

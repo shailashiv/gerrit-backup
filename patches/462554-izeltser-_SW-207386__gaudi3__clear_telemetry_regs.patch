@@ -1,0 +1,62 @@
+From 7aa2ad84b7ae726514559d92a0553150f5d10cc7 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 17 Nov 2024 10:25:46 +0200
+Subject: [PATCH] [SW-207386] gaudi3: clear telemetry regs
+
+Telemetry uses PCIe Core Spare registers for config and status.
+for safe operation those registers should be cleared before host
+access is enabled. For reset types that reset the PCIe blocks,
+such as cold/warm reboot, this is not necessary.
+In addition, to be on the safe side, it's also best to verify prstn
+is not set, otherwise the PCIe blocks are held in reset.
+
+Change-Id: I1b1f03318ae6725e4a374014a970dda02545ac17
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 622185f..638ca07 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -35,6 +35,7 @@
+ #include <pcie_wrap_mctp_regs.h>
+ #include <arc_regs.h>
+ #include <pll_ctrl_regs.h>
++#include <pcie_core_special_regs.h>
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <gaudi3_reg_map.h>
+ #include <pcie_dbi_masks.h>
+@@ -379,6 +380,25 @@
+ 
+ }
+ 
++static void clear_telemetry_regs(void)
++{
++	unsigned int rst_src, prstn;
++
++	/*
++	 * Telemetry uses PCIe Core Spare registers for config and status. for safe operation those
++	 * registers should be cleared before host access is enabled. For reset types that reset
++	 * the PCIe blocks, such as cold/warm reboot, this is not necessary.
++	 */
++	rst_src = hl_rst_src_get();
++	if ((rst_src != HL_COLD_RST) && (rst_src != HL_PRSTN_RST)) {
++		prstn = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN));
++		if (prstn) {
++			regmap_writel(0, mmINBAND_TELEMETRY_CONFIG);
++			regmap_writel(0, mmINBAND_TELEMETRY_STATUS);
++		}
++	}
++}
++
+ void hl_plat_early_init(void)
+ {
+ 	hl_psoc_drain_init();
+@@ -387,6 +407,7 @@
+ 	hl_dev_cpu_pll_init();
+ 	hl_init_cpu_ids();
+ 	d2d_spi_clk_init();
++	clear_telemetry_regs();
+ }
+ 
+ #define AGG_SEI_PARC_INT_IDX_STS			BIT(25)

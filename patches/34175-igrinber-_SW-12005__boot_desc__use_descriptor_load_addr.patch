@@ -1,0 +1,232 @@
+From 58047ddcfb1f846bd4eb8223c3cdded933159157 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 30 Apr 2020 20:16:52 +0300
+Subject: [PATCH] [SW-12005] boot_desc: use descriptor load addr
+
+Now that the descriptor has its image load address inside, we can start
+using it.
+Replace usage of the hard coded load address and use the one provided by
+the image descriptor.
+Since previousely the differences between Goya2 ARC and ARM were handled
+in compile time (the PREBOOT_TEXT_BASE was defined per architecture),
+and now we read the address in runtime, we split the handling of it
+among architecture/platform specific files.
+
+Note: the split duplicates some code, but makes this work in runtime on
+      all platforms.
+
+TODO: introduce architecture specific paths, so we will not need to
+      duplicate the code among platforms.
+
+Change-Id: Iab07f732299ecf335b6bf7e6d3664159637c2490
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index 9905d3e..723c396 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -44,6 +44,8 @@
+ 	desc->spi_offset = next_image_base_offset(next_img_off, name) +
+ 						HL_SPI_LEGACY_PREBOOT_OFF;
+ 	desc->img_size = PREBOOT_SIZE;
++	desc->loadaddr = PREBOOT_TEXT_BASE;
++
+ 	return image_pending;
+ }
+ 
+@@ -63,7 +65,7 @@
+ 	return preboot_image_offset_legacy(image_pending, desc);
+ }
+ 
+-static void copy_preboot(void)
++static u64 copy_preboot(void)
+ {
+ 	char *name = "PREBOOT";
+ 	struct boot_desc desc;
+@@ -79,8 +81,8 @@
+ 	preboot_puts_hex_raw(", size: ", desc.img_size, false);
+ 	preboot_puts(")\n");
+ 
+-	spi_copy((void *)PREBOOT_TEXT_BASE,
+-		 desc.spi_offset, desc.img_size, name);
++	ppboot_cp_preboot(desc.loadaddr, desc.spi_offset, desc.img_size, name);
++	return desc.loadaddr;
+ }
+ 
+ static void rst_src_dump(void)
+@@ -168,7 +170,7 @@
+ 
+ void ppboot_main(void)
+ {
+-	void (*preboot_start)(void) = (void *)PREBOOT_TEXT_BASE;
++	u64 loadaddr;
+ 
+ 	hl_plat_init();
+ 	hl_init_pcie_phy_fw();
+@@ -189,7 +191,7 @@
+ 		return;
+ 
+ 	preboot_delay();
+-	copy_preboot();
++	loadaddr = copy_preboot();
+ 
+-	preboot_start();
++	preboot_start(loadaddr);
+ }
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 033b588..9c81bc0 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -102,6 +102,8 @@
+ 		preboot_puts_hex(" - found! using index: ", idx, false);
+ 		desc->spi_offset = img_desc[i].offset[idx];
+ 		desc->img_size = img_desc[i].size[idx];
++		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
++					img_desc[i].load_low[idx];
+ 		return idx;
+ 	}
+ 
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 3c8c19d..ef52ef0 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -16,6 +16,7 @@
+ struct boot_desc {
+ 	u32 spi_offset;
+ 	u32 img_size;
++	u64 loadaddr;
+ };
+ 
+ /*
+diff --git a/gaudi/common.c b/gaudi/common.c
+index aa50342..1e85fcc 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -18,6 +18,8 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <string.h>
++#include <spi.h>
+ 
+ #include "common.h"
+ 
+@@ -208,3 +210,19 @@
+ 	/* we are waiting for link, so do not waste too much time on log */
+ 	preboot_puts("5\n");
+ }
++
++void preboot_start(u64 loadaddr)
++{
++	void (*preboot_start)(void) = (void *)loadaddr;
++
++	preboot_start();
++}
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	preboot_puts_hex_raw("Preboot loadaddr: ",
++			     (u32)(loadaddr >> 32), false);
++	preboot_puth((u32)loadaddr, false);
++
++	spi_copy((void *)loadaddr, offset, size, name);
++}
+diff --git a/goya/common.c b/goya/common.c
+index 45ee006..e6b09ac 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -15,6 +15,8 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <string.h>
++#include <spi.h>
+ 
+ #include "common.h"
+ 
+@@ -165,3 +167,19 @@
+ }
+ 
+ void hl_plat_init(void) {}
++
++void preboot_start(u64 loadaddr)
++{
++	void (*preboot_start)(void) = (void *)loadaddr;
++
++	preboot_start();
++}
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	preboot_puts_hex_raw("Preboot loadaddr: ",
++			     (u32)(loadaddr >> 32), false);
++	preboot_puth((u32)loadaddr, false);
++
++	spi_copy((void *)loadaddr, offset, size, name);
++}
+diff --git a/goya2/common.c b/goya2/common.c
+index c845b5c..2aa541b 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -20,6 +20,8 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <string.h>
++#include <spi.h>
+ 
+ #include "common.h"
+ 
+@@ -222,3 +224,19 @@
+ {
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
++
++void preboot_start(u64 loadaddr)
++{
++	void (*preboot_start)(void) = (void *)loadaddr;
++
++	preboot_start();
++}
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	preboot_puts_hex_raw("Preboot loadaddr: ",
++			     (u32)(loadaddr >> 32), false);
++	preboot_puth((u32)loadaddr, false);
++
++	spi_copy((void *)loadaddr, offset, size, name);
++}
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index 2b74037..77a7f29 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -238,3 +238,13 @@
+ 	while (1)
+ 		;
+ }
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	/* Not implemented - ARC BootROM copies and validates preboot */
++}
++
++void preboot_start(u64 loadaddr)
++{
++	/* Not implemented - ARC BootROM validates and starts preboot */
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 3025fd7..8d3a7f2 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -91,6 +91,9 @@
+ void preboot_putc_virt_uart(const char c);
+ void preboot_sync_btl(void);
+ 
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
++void preboot_start(u64 loadaddr);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */

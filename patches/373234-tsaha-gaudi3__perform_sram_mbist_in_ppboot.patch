@@ -1,0 +1,289 @@
+From d50325b3840e7f494c5bc6f5fa8ef0ce6f37e59e Mon Sep 17 00:00:00 2001
+From: Tamal Saha <tasaha@habana.ai>
+Date: Fri, 08 Dec 2023 10:38:31 +0200
+Subject: [PATCH] gaudi3: perform sram_mbist in ppboot
+
+This patch incorporates sram_mbist data copying
+from spi flash to fwsram and execute sram mbist
+at ppboot stage after pcie link is up and before
+preboot is loaded.
+
+die_sram_mbist_data.txt file is shared by dft team
+and covers sram mbist test of all caches (cse_up/dn)
+for all dcores at ppboot stage for die 0.
+
+Entire die 1 mbist for caches will be performed
+at preboot stage. Same mbist tables used for die0,
+will be used for die1 as well.
+
+At preboot stage, another mbist table, shared by
+dft team, is used. Entire die 0 mbist for other
+engine srams will be performed, when we exclude
+psoc, cpu, pcie and caches. That mbist table
+will be part of preboot image.
+
+PPboot SRAM MBIST  is kept under GAUDI3_SRAM_MBIST_ENABLE
+flag and this flag is disabled now.
+
+Change-Id: I2c578ce620fb910813bf40dffcc87416693ac341
+Signed-off-by: Tamal Saha <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 8e74f0f..cbde106 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -11,4 +11,6 @@
+ 
+ CFLAGS += -DPHY_FW_SIZE=$(PHY_FW_SIZE)
+ 
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/mbist.c)
++
+ image_validation: image_validation_common
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 5c5e3ad..6e7fc20 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -20,6 +20,105 @@
+ #include <hl.h>
+ #include <pif_ts.h>
+ #include <hl_pif_arc_if.h>
++#include "boot_desc.h"
++#include <common.h>
++
++/* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
++#define GAUDI3_SRAM_MBIST_DISABLED	1
++#define HL_SRAM_MBIST_FAIL_ARR_SIZE	16
++
++/* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
++#ifdef GAUDI3_SRAM_MBIST_DISABLED
++void hl_sram_self_repair(void) { }
++#else
++static u32 *hl_gaudi3_sram_mbist_data_start_address;
++static u32 hl_sram_mbist_fail_arr[HL_SRAM_MBIST_FAIL_ARR_SIZE];
++
++static int gaudi3_sram_self_repair_mismatch_execution(u32 ist_addr,
++			u32 *fail_buffer, u32 fail_limit)
++{
++	u32 fail_index = 0;
++	int status = hl_ppboot_sram_self_repair_mismatch_logic(ist_addr,
++				hl_gaudi3_sram_mbist_data_start_address,
++				fail_buffer, fail_limit, &fail_index);
++
++	if (fail_index < (fail_limit * 2))
++		fail_buffer[fail_index] = 0;
++
++	return status;
++}
++
++static void gaudi3_sram_self_repair(u64 sram_loadaddr)
++{
++	hl_gaudi3_sram_mbist_data_start_address = (u32 *) ((u32)((sram_loadaddr &
++				ARC_ADDR_MASK) | FW_MEM_REGION_BASE));
++
++	gaudi3_sram_self_repair_mismatch_execution((u32)mmD0_PSOC_DFT_APB_BASE,
++		hl_sram_mbist_fail_arr, HL_SRAM_MBIST_FAIL_ARR_SIZE);
++}
++
++static bool ppboot_try_sram_mbist_data_img(struct boot_desc *desc)
++{
++	bool is_valid = true;
++	u32 idx;
++
++	idx = boot_desc_get_img_desc(FLOPS_UPD_NOOP, HL_FW_IMG_SRAM_MBIST_DATA, desc);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return false;
++
++	preboot_puts_hex_raw(" (offset: ", desc->spi_offset, false);
++	preboot_puts_hex_raw(", size: ", desc->img_size, false);
++	preboot_puts(")\n");
++
++	ppboot_cp_preboot(desc->loadaddr, desc->spi_offset,
++		desc->img_size, "SRAM_MBIST_DATA");
++
++	if (desc->desc_ver > 1) {
++		is_valid = ppboot_is_valid_img_desc_ex((void *)desc);
++
++		if (!is_valid)
++			preboot_puts("Checksum is not valid.\n");
++	}
++
++	return is_valid;
++}
++
++static bool ppboot_load_sram_mbist_data_img(u64 *loadaddr)
++{
++	struct boot_desc desc;
++	bool ret;
++
++	/* Initialize load address with illegal value */
++	if (!boot_desc_init()) {
++		preboot_puts_raw("Not a valid boot desc.");
++		return false;
++	}
++
++	ret = ppboot_try_sram_mbist_data_img(&desc);
++	if (ret) {
++		*loadaddr = desc.loadaddr;
++		return true;
++	}
++
++	return false;
++}
++
++void hl_sram_self_repair(void)
++{
++
++	u64 sram_loadaddr;
++	bool ret;
++
++	ret = ppboot_load_sram_mbist_data_img(&sram_loadaddr);
++	if (!ret) {
++		preboot_puts("SRAM MBIST image loading failed\n");
++		return;
++	}
++
++	gaudi3_sram_self_repair(sram_loadaddr);
++	preboot_puts("bist done for 96MB SRAM/CACHE\n");
++}
++#endif
+ 
+ u32 hl_skip_pcie_init(void)
+ {
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 1780113..01ee8eb 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -771,6 +771,11 @@
+ 	return hl_dev_is_valid_img_desc(desc);
+ }
+ 
++bool ppboot_is_valid_img_desc_ex(void *desc)
++{
++	return hl_dev_is_valid_img_desc((struct boot_desc *)desc);
++}
++
+ int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
+ {
+ 	return boot_info_get_no_merge(type, data, max_size, copy_size);
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 63c02e4..455ad9c 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -12,7 +12,7 @@
+ #include <parc_global_conf_masks.h>
+ #include <gaudi3_fw_if.h>
+ 
+-#define BOOT_DESC_MAX_IMGS	7
++#define BOOT_DESC_MAX_IMGS	8
+ #define READ_BOOT_DESC_FROM_BOOTINFO
+ 
+ #define HL_W_BARRIER_TIMEOUT_US	100000
+@@ -53,5 +53,8 @@
+ void pif_arc_init_pcie(void);
+ void hl_pcie_clear_boot_termination(void);
+ void gaudi3_print_cpu_pll(void);
++int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
++	u32 *fail_buffer, u32 fail_limit, u32 *fail_index);
++bool ppboot_is_valid_img_desc_ex(void *desc);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/mbist.c b/arch/gaudi3/arc/mbist.c
+new file mode 100644
+index 0000000..2ecadc5
+--- /dev/null
++++ b/arch/gaudi3/arc/mbist.c
+@@ -0,0 +1,93 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++#include <baremetal.h>
++#include <hl.h>
++#include <pll.h>
++
++#define IST_OPC_WRITE_NO_COMPARE	0
++#define IST_OPC_WRITE_BIN_COMPARE	1
++#define IST_OPC_WRITE_X_COMPARE		2
++#define IST_OPC_WAIT			3
++
++static inline void gaudi3_mbist_wait(u32 pclk)
++{
++	/* TODO: Validate in HW, then enable it */
++	/* udelay((pclk >> 6) + (pclk >> 5)); */
++}
++
++int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
++		u32 *fail_buffer, u32 fail_limit, u32 *fail_index)
++{
++	int status = 0;
++	u32 rdval, expval, failmask;
++	u32 i = 1, readID;
++
++	if (data[0] != 1)
++		return -1;  /* version mismatch */
++
++	readID = data[i];
++	++i;
++
++	while (data[i] != 0) {
++		u32 repeat;
++		u32 opw = data[i];
++		u32 op = (opw & 0x3);
++
++		++i;
++		for (repeat = (opw >> 2); repeat != 0; --repeat) {
++			if (op == IST_OPC_WAIT) {
++				gaudi3_mbist_wait(data[i]);
++				++i;
++				continue;
++			}
++
++			regmap_writel(data[i], ist_addr);
++			++i;
++
++			if (op == IST_OPC_WRITE_X_COMPARE) {
++				++readID;
++				rdval = regmap_readl(ist_addr) & data[i];
++				++i;
++				expval = data[i];
++				++i;
++
++				if (rdval != expval) {
++					status = 1;
++					if (*fail_index < (fail_limit * 2)) {
++						failmask = rdval ^ expval;
++						fail_buffer[*fail_index] = readID;
++						(*fail_index)++;
++						fail_buffer[*fail_index] = failmask;
++						(*fail_index)++;
++					}
++				}
++
++			} else if (op == IST_OPC_WRITE_BIN_COMPARE) {
++				++readID;
++				rdval = regmap_readl(ist_addr);
++				expval = data[i];
++				++i;
++
++				if (rdval != expval) {
++					status = 1;
++					if (*fail_index < (fail_limit * 2)) {
++						failmask = rdval ^ expval;
++						fail_buffer[*fail_index] = readID;
++						(*fail_index)++;
++						fail_buffer[*fail_index] = failmask;
++						(*fail_index)++;
++					}
++				}
++
++			} else {
++				/* no compare */
++			}
++		}
++	}
++
++	return status;
++}
++

@@ -1,0 +1,213 @@
+From ee991b470c3a1ce600c3338df684b56fe572c51c Mon Sep 17 00:00:00 2001
+From: ylevavi <yehuda.levavi@tandemg.com>
+Date: Sun, 07 Nov 2021 14:34:28 +0200
+Subject: [PATCH] Revert "[SW-42060] preboot: efuse: add write"
+
+This reverts commit 29f2c6043a32ad9b19e6d4bbd3dbe79a767e492a.
+
+Change-Id: I473c59e52e5ad48ef1d08e03986d0946157092ed
+Signed-off-by: ylevavi <yehuda.levavi@tandemg.com>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index e4c5751..16128c4 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -446,13 +446,3 @@
+ {
+ 	return gaudi2_translate_addr(addr);
+ }
+-
+-void hl_efuse_write_en(bool enable)
+-{
+-	/*
+-	 * TODO: add:
+-	 * i2c read bus 1 reg 0x7
+-	 * turn on bit 2
+-	 * i2c write bus 1 reg 0x7
+-	 */
+-}
+diff --git a/lib/common/efuse.c b/lib/common/efuse.c
+index 58137c1..80118e7 100644
+--- a/lib/common/efuse.c
++++ b/lib/common/efuse.c
+@@ -15,7 +15,7 @@
+ #include "preboot.h"
+ #include "uart.h"
+ #include <spi.h>
+-#include "pll.h" /* udelay, mdelay */
++#include "pll.h"
+ 
+ /*
+  * fuse box is divided into half for redundancy
+@@ -24,25 +24,7 @@
+  */
+ #define FUSE_TIMEOUT_US		100000
+ #define FUSE_DELAY_US		20
+-#define FUSE_WRITE_DELAY_MS	1
+ #define FUSE_RETRIES		(FUSE_TIMEOUT_US / FUSE_DELAY_US)
+-#define FUSE_NUM_BANK		2
+-
+-#define INIT_EFUSE_STEP		0x00A0D000
+-#define READ_ENABLE		0x00000FFF
+-#define READ_DISABLE		0x0
+-#define PD_DOWN_STEP		0x0020D000
+-#define PS_UP_STEP		0x0060D000
+-#define CSB_DOWN_STEP		0x0060C000
+-#define PGENB_DOWN_STEP		0x00604000
+-#define LOAD_DOWN_STEP		0x00420000
+-#define STROBE_UP_STEP		0x00422000
+-#define STROBE_DOWN_STEP	0x00420000
+-#define LOAD_UP_STEP		0x00404000
+-#define PGENB_UP_STEP		0x0040C000
+-#define CSB_UP_STEP		0x0040D000
+-#define PS_DOWN_STEP		0x0000D000
+-#define PD_UP_STEP		0x0080D000
+ 
+ static int efuse_init;
+ 
+@@ -71,16 +53,9 @@
+ 	return 0;
+ }
+ 
+-static int preboot_fuse_read_bank(u32 bank, u32 word)
+-{
+-	int offset = (((FUSE_WORDS_PER_BANK * bank) + word) * sizeof(u32));
+-
+-	return regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
+-}
+-
+ __weak int preboot_fuse_read(u32 word, u32 *val)
+ {
+-	int ret;
++	int offset, ret;
+ 	u32 read_val;
+ 
+ 	if (word >= FUSE_WORDS_PER_BANK) {
+@@ -96,107 +71,15 @@
+ 		return ret;
+ 	}
+ 
+-	read_val = preboot_fuse_read_bank(0, word);
+-	read_val |= preboot_fuse_read_bank(1, word);
++	/* read value from bank0 */
++	offset = (word * sizeof(u32));
++	read_val = regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((FUSE_WORDS_PER_BANK + word) * sizeof(u32));
++	read_val |= regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
+ 
+ 	*val = read_val;
+-
+-	return 0;
+-}
+-
+-__weak bool hl_is_efuse_prog_available(void)
+-{
+-	return false;
+-}
+-
+-void __weak hl_efuse_write_en(bool enable) {}
+-
+-static void fuse_grop_word(u32 bank, u32 word, u32 val)
+-{
+-	uint32_t addr;
+-
+-	word += (FUSE_WORDS_PER_BANK * bank);
+-	regmap_writel(INIT_EFUSE_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(READ_ENABLE, mmPSOC_EFUSE_MANUAL_READ_EN);
+-	regmap_writel(PD_DOWN_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	mdelay(FUSE_WRITE_DELAY_MS);
+-	regmap_writel(PS_UP_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	mdelay(FUSE_WRITE_DELAY_MS);
+-	regmap_writel(CSB_DOWN_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(PGENB_DOWN_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(LOAD_DOWN_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	for (u32 bit = 0; bit < 32; bit++) {
+-		if ((1 << bit) & val) {
+-			addr = (bit << 7) + word;
+-			regmap_writel(LOAD_DOWN_STEP + addr,
+-				      mmPSOC_EFUSE_MANUAL_READ);
+-			regmap_writel(STROBE_UP_STEP + addr,
+-				      mmPSOC_EFUSE_MANUAL_READ);
+-			regmap_writel(STROBE_DOWN_STEP + addr,
+-				      mmPSOC_EFUSE_MANUAL_READ);
+-		}
+-	}
+-	regmap_writel(LOAD_UP_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(PGENB_UP_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(CSB_UP_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	mdelay(FUSE_WRITE_DELAY_MS);
+-	regmap_writel(PS_DOWN_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(PD_UP_STEP, mmPSOC_EFUSE_MANUAL_READ);
+-	regmap_writel(READ_DISABLE, mmPSOC_EFUSE_MANUAL_READ_EN);
+-}
+-
+-static int fuse_prog(u32 bank, u32 word, u32 val)
+-{
+-	u32 cur_val;
+-
+-	if (bank >= FUSE_NUM_BANK) {
+-		preboot_puts("Efuse: illegal bank\n");
+-		return -1;
+-	}
+-
+-	if (word > FUSE_WORDS_PER_BANK) {
+-		preboot_puts("Efuse: illegal address\n");
+-		return -1;
+-	}
+-
+-	/* Write only non fused bits, so check first for the fused bits */
+-	cur_val = preboot_fuse_read_bank(bank, word);
+-
+-	val &= ~cur_val;
+-	if (!val) /* nothing to write */
+-		return 0;
+-
+-	hl_efuse_write_en(true);
+-	fuse_grop_word(bank, word, val);
+-	hl_efuse_write_en(false);
+-
+-	return 0;
+-}
+-
+-__weak int preboot_fuse_write(u32 word, u32 val)
+-{
+-	int ret0, ret1;
+-
+-	ret0 = hl_is_efuse_prog_available();
+-	if (!ret0) {
+-		preboot_puts("Efuse prog is unavailable\n");
+-		return -1;
+-	}
+-
+-	if (word >= FUSE_WORDS_PER_BANK) {
+-		preboot_puts("Invalid efuse word offset\n");
+-		return -1;
+-	}
+-
+-	/* write value to bank0 */
+-	ret0 = fuse_prog(0, word, val);
+-
+-	/* write value to bank1 */
+-	ret1 = fuse_prog(1, word, val);
+-	if (ret0 || ret1) {
+-		preboot_puts("Failed to write to efuse\n");
+-		return -1;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/lib/common/efuse.h b/lib/common/efuse.h
+index c855923..b3b1f61 100644
+--- a/lib/common/efuse.h
++++ b/lib/common/efuse.h
+@@ -16,7 +16,6 @@
+ 
+ int preboot_fuse_init(void);
+ int preboot_fuse_read(u32 word, u32 *val);
+-int preboot_fuse_write(u32 word, u32 val);
+ u32 get_efuse_read_reg(void);
+ 
+ #endif /* _EFUSE_H_ */

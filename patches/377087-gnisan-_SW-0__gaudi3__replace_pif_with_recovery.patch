@@ -1,0 +1,292 @@
+From df2ffc3a165955cb45136a54b6846d8cf6895331 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 11 Dec 2023 14:33:54 +0200
+Subject: [PATCH] [SW-0] gaudi3: replace pif with recovery
+
+This is a temporary W/A for the PCIe controller problem we currently
+observe.
+
+Change-Id: Iadf5dfe3a9776905fee7b3ee6bb68cbb2e3c3aca
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 7ddf4bd..bc58a25 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -11,8 +11,10 @@
+ #include <qspi_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_aux_masks.h>
++#include <pcie_phy_masks.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
++#include <common/pci_ids.h>
+ #include <psoc_reset_conf_regs.h>
+ #include <efuse_regs.h>
+ #include <uart_regs.h>
+@@ -1125,17 +1127,256 @@
+ 	hl_pif_report_sts(PIF_STAT_PCIE_INIT_DONE);
+ }
+ 
++#define PCIE_RECOVERY
++
++#ifdef PCIE_RECOVERY
++static void disable_pif_isolation(void)
++{
++#ifdef NODIE1
++	if (arcboot_rom_global.die_id)
++		regmap_writel(0x0, mmD0_PSOC_BOOT_CONF_D1_PIF_ISO);
++	else
++#endif
++		regmap_writel(0x0, D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_D0_PIF_ISO));
++}
++
++static void disable_pcie_error_resp(void)
++{
++	/* Disable PCIe error responses (both HBW and LBW) */
++	regmap_writel(0x1, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PCIE_RSP_OK_0));
++	regmap_writel(0x1, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PCIE_RSP_OK_1));
++}
++
++#define PCIE_PRSTN_ASSERT			0
++#define PRSTN_MASK_IND_MASK			GLOBAL_CONF_PRSTN_MASK_IND_M
++
++static void pcie_loop_while_prstn(uint8_t assert)
++{
++	uint8_t pcie_prstn;
++
++	do {
++		pcie_prstn = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN));
++		pcie_prstn &= PRSTN_MASK_IND_MASK;
++	} while (pcie_prstn == assert);
++}
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_0));
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_1));
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_2));
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_3));
++}
++
++#define PHY_SRAM_INIT_UDELAY			100000 /* 100ms */
++void pcie_wait_for_sram_init_done(void)
++{
++	uint32_t sram_init_done0, sram_init_done1, sram_init_done2, sram_init_done3;
++	uint64_t start = timestamp_get_us();
++
++	/*
++	 * As per HW team, internal sram initialization can take several ms.
++	 * timeout should be added in 10-100ms.
++	 */
++	while (1) {
++		sram_init_done0 = regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0));
++		sram_init_done1 = regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1));
++		sram_init_done2 = regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2));
++		sram_init_done3 = regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3));
++
++		if ((sram_init_done0 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M) &&
++			(sram_init_done1 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M) &&
++			(sram_init_done2 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M) &&
++			(sram_init_done3 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M))
++			break;
++
++		if (timeout_expired(start, PHY_SRAM_INIT_UDELAY)) {
++	//		arcboot_rom_status_update(
++	//			PROGRESS_ARCBOOT_ROM_PCIE_PHY_SRAM_INIT_TIMEDOUT);
++			break;
++		}
++	}
++}
++
++#define PHY_CR_PARA_CMD_DATA		0x2
++#define PHY_CR_PARA_CMD_ADDR		0x5149
++#define PHY_CR_PARA_STS_UDELAY		10000 /* 10ms */
++void pcie_wa_snps_dcc(void)
++{
++	uint64_t start;
++	uint32_t val;
++
++	regmap_writel(PCIE_PHY_CR_PARA_CFG_SEL_M, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_CFG));
++
++	regmap_writel(PCIE_PHY_CR_PARA_CTRL_WR_EN_M, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_CTRL));
++	val = ((PHY_CR_PARA_CMD_DATA << PCIE_PHY_CR_PARA_CMD_DATA_S) | PHY_CR_PARA_CMD_ADDR);
++	regmap_writel(val, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_CMD));
++
++	start = timestamp_get_us();
++	/* Wait until status is cleared */
++	while (1) {
++		val = regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_STS));
++		if (!val)
++			break;
++
++		if (timeout_expired(start, PHY_CR_PARA_STS_UDELAY)) {
++			//arcboot_rom_status_update(
++			//	PROGRESS_ARCBOOT_ROM_PCIE_PHY_PARA_STS_CLR_TIMEDOUT);
++			break;
++		}
++	}
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_PHY_SRAM_EXT_LD_DONE));
++}
++
++void pcie_set_pcie_device_vendor_id(void)
++{
++	uint32_t id;
++	enum hl_pci_ids pcie_dev_id;
++
++#ifdef NODIE1
++	if (!arcboot_rom_global.die_id) {
++		if (!arcboot_rom_global.sku)
++			/* Dual die mode. Default pcie dev id can be used */
++			return;
++
++		pcie_dev_id = PCI_IDS_GAUDI3_SINGLE_DIE;
++	} else {
++		pcie_dev_id = PCI_IDS_GAUDI3_DIE1;
++	}
++#else
++	pcie_dev_id = PCI_IDS_GAUDI3;
++#endif
++
++	id = ((PCI_VENDOR_ID_HABANALABS <<
++		PCIE_DBI_DEVICE_ID_VENDOR_ID_REG_PCI_TYPE0_VENDOR_ID_S) |
++		(pcie_dev_id <<
++		PCIE_DBI_DEVICE_ID_VENDOR_ID_REG_PCI_TYPE0_DEVICE_ID_S));
++
++	regmap_writel(id, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG));
++}
++
++void pcie_config_boot_termination(void)
++{
++	regmap_writel(PCIE_AUX_BOOT_TERM_CLR_CLR_M, D0_PCIE_AUX_REG(mmPCIE_AUX_BOOT_TERM_CLR));
++}
++
++
++
++#define mmLTSSM_EN			D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN)
++#define LTSSM_EN_IND_MASK		PCIE_AUX_LTSSM_EN_IND_M
++#define mmPCIE_PHY_RST_N		D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PCIE_PHY_RST_N)
++#define mmLINK_CAPABILITIES_REG		D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_LINK_CAPABILITIES_REG)
++#define mmLINK_CONTROL2_LINK_STATUS2_REG	D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG)
++
++#define LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_MASK	\
++				PCIE_DBI_LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_M
++#define LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_SHIFT	\
++				PCIE_DBI_LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_S
++#define LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_MASK	\
++			PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_M
++#define LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_SHIFT	\
++			PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_S
++void pcie_config(void)
++{
++	uint32_t link_ctrl;
++	uint8_t ltssm_en;
++
++	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
++
++	ltssm_en = regmap_readl(mmLTSSM_EN) &
++				LTSSM_EN_IND_MASK;
++
++	if (!ltssm_en) {
++		regmap_writel(0, mmPCIE_PHY_RST_N);
++
++		pcie_phy_para_sel_set();
++
++#ifdef NOSRIS
++		if (get_sris_mode_from_strap()) {
++			regmap_writel(1, mmPIPE_RX_SRIS_MODE_EN);
++			pcie_phy_set_lane_refclk_mode();
++			pcie_phy_set_pll_short_lock();
++			regmap_writel(1, mmAPP_SRIS_MODE);
++		}
++
++		if (get_srns_mode_from_strap()) {
++			pcie_phy_set_lane_refclk_mode();
++			pcie_phy_set_pll_short_lock();
++		}
++#endif
++
++#ifdef NOSSC
++		pcie_phy_ssc_en_set(); //?
++#endif
++		regmap_writel(1, mmPCIE_PHY_RST_N);
++
++		pcie_wait_for_sram_init_done();
++
++		pcie_wa_snps_dcc(); //?
++
++		pcie_phy_set_sram_ext_ld_done();
++
++		pcie_set_pcie_device_vendor_id();
++
++		if (true) { //(arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0) {
++	//		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_PCIE_LINK_LIMIT_GEN1);
++			/* limit PCIe link gen to 1 */
++			link_ctrl = regmap_readl(mmLINK_CAPABILITIES_REG);
++			link_ctrl &=
++				~LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_MASK;
++			link_ctrl |= (1 << LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_SHIFT);
++			regmap_writel(link_ctrl, mmLINK_CAPABILITIES_REG);
++
++			link_ctrl = regmap_readl(mmLINK_CONTROL2_LINK_STATUS2_REG);
++			link_ctrl &=
++				~LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_MASK;
++			link_ctrl |= (1 <<
++				LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_SHIFT);
++			regmap_writel(link_ctrl, mmLINK_CONTROL2_LINK_STATUS2_REG);
++		}
++
++		/* Configure IATU */
++#ifdef NOIATU
++		pcie_config_iatu();
++#endif
++		pcie_config_boot_termination();
++
++		/* enable flr handling by HW state machine */
++		//enable_flr_handling_fsm();
++
++		//pcie_disable_hot_rst_hw_sm();
++
++		regmap_writel(0x3, mmLTSSM_EN);
++	} else {
++		pcie_config_boot_termination();
++	}
++}
++
++
++#endif
++
++
+ void preboot_pcie_wait_for_link(void)
+ {
+-	struct cpu_load_data load_data = {
+-		.cpu_cfg_base = mmD0_PIF_ARC_BASE,
+-		.img_type[PIF_ARC_ICCM_IDX] = HL_FW_IMG_D0_PIF_ICCM,
+-		.img_type[PIF_ARC_DCCM_IDX] = HL_FW_IMG_D0_PIF_DCCM,
+-		.inter_buffer_addr = ARC1_ICCM_FULL_BASE,
+-		.die_id = GAUDI3_MASTER_DIE_ID,
+-	};
++	if (0) {
++		struct cpu_load_data load_data = {
++			.cpu_cfg_base = mmD0_PIF_ARC_BASE,
++			.img_type[PIF_ARC_ICCM_IDX] = HL_FW_IMG_D0_PIF_ICCM,
++			.img_type[PIF_ARC_DCCM_IDX] = HL_FW_IMG_D0_PIF_DCCM,
++			.inter_buffer_addr = ARC1_ICCM_FULL_BASE,
++			.die_id = GAUDI3_MASTER_DIE_ID,
++		};
+ 
+-	ppboot_load_and_run_pif_arc(&load_data);
++		ppboot_load_and_run_pif_arc(&load_data);
++	} else {
++		disable_pif_isolation();
++		disable_pcie_error_resp();
++		pcie_config();
++	}
+ }
+ 
+ u32 hl_get_pll_div_fix(void) { return 1; }

@@ -1,0 +1,120 @@
+From a48c39ccdf0769c06662a164ac5e0ea3f7b57c52 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 24 May 2021 19:54:37 +0300
+Subject: [PATCH] [SW-43025] fwupd: fixup i2c timeout on run
+
+Since we moved to use internal API instead of registers for the I2C
+indirect FW_UPD processes, we also need to cope with the need to sync
+before executing the loaded image.
+This is design bug in the FW_UPD protocol - when SRAM_RUN is replied
+with status OK, Preboot is not syncing with the host/BMC that it got the
+status and thus procedes to executing the image.
+While in PCI this is not a problem as it is read independently by the
+host, the I2C sufferes as it need an I2C indirect module for handing
+the status over. Without a special sync code, the I2C module does not
+get to run and serve the status OK.
+This means that the status is not served anymore and in turn results in
+timeout on the BMC hl-fw-loader.
+To fix the timeout - add special sync code which is invoked on RUN_OK
+status and delays the NO_RETURN execution by 200ms for the BMC to read
+the status value.
+After the timer expiration, the NO_RETURN command is executed and we
+load the provided FIT which should take over the communication.
+200ms was chosen as a relatively large and safe value.
+Since this is not a time short critical execution path, we can use that
+large value.
+
+Change-Id: I6a841a091c2428a17d597b2a061477cb68444a00
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index bb2ca43..a842b76 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -37,12 +37,15 @@
+ 	struct hl_upd_command cmd;
+ 	struct hl_upd_command wfc_cmd;
+ 	enum cmd_check_res exec_res;
++	enum cmd_check_res sync_exec_res;
+ 	u32 cmd_reg;
+ 	u32 sts_reg;
++	u64 noret_delay;
+ 	void (*sts_writel)(u32 val);
+ 	u32 (*cmd_readl)(void);
+ 	bool is_disabled;
+ 	bool use_security;
++	bool synced_no_return;
+ };
+ 
+ static struct fwupd_state state;
+@@ -71,6 +74,20 @@
+ bool i2c_fwupd_owned(u32 offset)
+ {
+ 	return offset == mmUPD_CMD || offset == mmUPD_STS;
++}
++
++#define FWUPD_NORET_DELAY_US	200000
++
++static void fwupd_sync_exec(struct fwupd_state *state)
++{
++	if (state->sync_exec_res == NOT_FOUND || !state->noret_delay)
++		return;
++
++	if (timeout_expired(state->noret_delay, FWUPD_NORET_DELAY_US)) {
++		preboot_puts("firing no ret now!\n");
++		state->exec_res = state->sync_exec_res;
++		state->sync_exec_res = NOT_FOUND;
++	}
+ }
+ 
+ /* This function is for reading status by other modules */
+@@ -255,6 +272,7 @@
+ 	i2c_state.cmd_readl = i2c_fwupd_cmd_readl;
+ 	i2c_state.sts_writel = i2c_fwupd_sts_writel;
+ 	i2c_state.use_security = false;
++	i2c_state.synced_no_return = true;
+ 	module_fwupd_send_status(&i2c_state, HL_UPD_STS_RST_OK, NULL);
+ }
+ 
+@@ -301,6 +319,7 @@
+ 	if (state->sending_error_flag && preboot_error_is_pending())
+ 		return FOUND_SLOW_RETURN;
+ 
++	fwupd_sync_exec(state);
+ 	if (state->exec_res != NOT_FOUND)
+ 		return state->exec_res;
+ 
+@@ -354,9 +373,11 @@
+ 	state->cmd.val = 0;	/* NOOP */
+ 	state->wfc_cmd.val = 0;	/* NOOP */
+ 	state->exec_res = NOT_FOUND;
++	state->sync_exec_res = NOT_FOUND;
+ 	state->map_size = 0;
+ 	state->map_offset = NULL;
+ 	state->sending_error_flag = false;
++	state->noret_delay = 0;
+ }
+ 
+ static void module_fwupd_reset_state_secure(struct fwupd_state *state)
+@@ -524,9 +545,18 @@
+ {
+ 	int err;
+ 
+-	err = fit_load_images(fit);
++	state->exec_res = NOT_FOUND;
+ 
+-	state->exec_res = err ? NOT_FOUND : FOUND_NO_RETURN;
++	err = fit_load_images(fit);
++	if (err)
++		return err;
++
++	if (state->synced_no_return) {
++		state->sync_exec_res = FOUND_NO_RETURN;
++		state->noret_delay = timestamp_get_us();
++	} else {
++		state->exec_res = FOUND_NO_RETURN;
++	}
+ 
+ 	return err;
+ }

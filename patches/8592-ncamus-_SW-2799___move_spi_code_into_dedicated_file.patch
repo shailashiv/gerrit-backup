@@ -1,0 +1,494 @@
+From 571645b2a0fb4fcbe845b621dc5c09862e26af4d Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Mon, 04 Feb 2019 06:29:30 +0200
+Subject: [PATCH] [SW-2799]: move spi code into dedicated file
+
+This is making preboot.c more readable
+
+Change-Id: I7d939cfa21d8c5d5d8c95c144059d802531d7003
+---
+
+diff --git a/preboot.c b/preboot.c
+index 5476e47..3e7d202 100644
+--- a/preboot.c
++++ b/preboot.c
+@@ -5,10 +5,8 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
+-#include <config.h>
+ #include <common.h>
+ #include <linux/io.h>
+-#include <linux/sizes.h>
+ #include <mach/hl_regs.h>
+ #include <mach/hl_fw_if.h>
+ #include "auto_generated.h"
+@@ -16,36 +14,10 @@
+ #include <stdbool.h>
+ #include "pll.h"
+ #include "uart.h"
++#include "spi.h"
+ 
+ #define SYS_REF_CLOCK			50000000
+ #define BTL_COUNTER_MAX			BIT(22)
+-#define mmPSOC_SPI_CTRLR0		(HL_CFG_BASE + 0xC43000)
+-#define mmPSOC_SPI_SSIENR		(HL_CFG_BASE + 0xC43008)
+-#define mmPSOC_SPI_SER			(HL_CFG_BASE + 0xC43010)
+-#define mmPSOC_SPI_BAUDR		(HL_CFG_BASE + 0xC43014)
+-#define mmPSOC_SPI_TXFTLR		(HL_CFG_BASE + 0xC43018)
+-#define mmPSOC_SPI_RXFTLR		(HL_CFG_BASE + 0xC4301C)
+-#define mmPSOC_SPI_TXFLR		(HL_CFG_BASE + 0xC43020)
+-#define mmPSOC_SPI_RXFLR		(HL_CFG_BASE + 0xC43024)
+-#define mmPSOC_SPI_IMR			(HL_CFG_BASE + 0xC4302C)
+-#define mmPSOC_SPI_DR0			(HL_CFG_BASE + 0xC43060)
+-#define SPL_SIZE			SZ_64K
+-#define CMD_WRITE_STATUS		0x01
+-#define CMD_READ			0x03
+-#define CMD_WRITE_DISABLE		0x04
+-#define CMD_READ_STATUS			0x05
+-#define CMD_WRITE_ENABLE		0x06
+-#define CMD_READ_CONF			0x15
+-#define READ_STATUS_WIP			BIT(0)
+-#define READ_STATUS_BP0			BIT(2)
+-#define READ_STATUS_BP1			BIT(3)
+-#define READ_STATUS_BP2			BIT(4)
+-#define READ_STATUS_BP3			BIT(5)
+-#define READ_STATUS_SRWD		BIT(7)
+-#define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | READ_STATUS_BP2 | READ_STATUS_BP3)
+-#define PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
+-#define frame_size_bits(b)		((b) << 16)
+-
+ #define VERSION_MAX_LEN	128
+ 
+ #define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+@@ -100,182 +72,14 @@
+ 	writel((image_base_offset + uboot_offset), mmPSOC_GLOBAL_CONF_SCRATCHPAD_30);
+ }
+ 
+-/*
+- * SSI device Chip Select (CS0) is muxed with GPIO53
+- * Using this we can realy do SSI bus claim/release
+- * GPIO53 is set through mmPSOC_GPIO3 where each
+- * mmPSOC_GPIO serve 16 GPIOs
+- * Note: CS0 is active low
+- */
+-static void spi_ssi_cs0_init(void)
+-{
+-	unsigned int reg, mask = BIT_MASK(53 % 16);
+-
+-	reg  = readl(mmPSOC_GPIO3_DATAOUT);
+-	reg  &= ~mask;
+-	writel(reg,  mmPSOC_GPIO3_DATAOUT);
+-
+-	reg = readl(mmPSOC_GPIO3_OUTENSET);
+-	reg |=  mask;
+-	writel(reg, mmPSOC_GPIO3_OUTENSET);
+-}
+-
+-static void spi_claim_bus(void)
+-{
+-	writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_53);
+-}
+-
+-static void spi_release_bus(void)
+-{
+-	writel(0, mmPSOC_GLOBAL_CONF_PAD_SEL_53);
+-}
+-
+-static inline void spi_dev_update_frame_size(unsigned int len)
+-{
+-	writel(0, mmPSOC_SPI_SSIENR);
+-	writel(frame_size_bits((len * 8) - 1), mmPSOC_SPI_CTRLR0);
+-	writel(1, mmPSOC_SPI_SSIENR);
+-}
+-
+-static inline int spi_fifo_is_empty(unsigned long level_reg)
+-{
+-	return !readl(level_reg);
+-}
+-
+-static void spi_dev_dword_cmd(unsigned int cmd, unsigned int *val)
+-{
+-	unsigned int tmp;
+-
+-	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
+-	writel(cmd, mmPSOC_SPI_DR0);
+-
+-	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
+-	tmp = readl(mmPSOC_SPI_DR0);
+-
+-	if (val)
+-		*val = tmp;
+-}
+-
+-static void spi_special_cmd(unsigned int cmd, unsigned char *val)
+-{
+-	unsigned char tmp;
+-
+-	spi_dev_update_frame_size(sizeof(tmp));
+-
+-	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
+-	writeb(cmd, mmPSOC_SPI_DR0);
+-
+-	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
+-	tmp = readb(mmPSOC_SPI_DR0);
+-
+-	if (val)
+-		*val = tmp;
+-}
+-
+-/* Hold chip select (CS) during transaction */
+-static void spi_char_cmd_csel(unsigned char cmd, unsigned char *val)
+-{
+-	spi_claim_bus();
+-
+-	spi_special_cmd(cmd, NULL);
+-	if (val)
+-		spi_special_cmd(0, val);
+-
+-	spi_release_bus();
+-}
+-
+-static void spi_special_cmd_csel(unsigned int cmd, unsigned char *val, size_t size)
+-{
+-	int i;
+-
+-	spi_claim_bus();
+-
+-	spi_dev_update_frame_size(sizeof(*val));
+-
+-	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
+-	writeb(cmd, mmPSOC_SPI_DR0);
+-	for (i=0; i<size; i++) {
+-		while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
+-		writeb(val[i], mmPSOC_SPI_DR0);
+-	}
+-
+-	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
+-	readb(mmPSOC_SPI_DR0);
+-	for (i=0; i<size; i++) {
+-		while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
+-		readb(mmPSOC_SPI_DR0);
+-	}
+-
+-	spi_release_bus();
+-}
+-
+-static void spi_common_write(unsigned int cmd, unsigned char *buf, size_t size)
+-{
+-	unsigned char sr;
+-
+-	spi_char_cmd_csel(CMD_WRITE_ENABLE, NULL);
+-	spi_special_cmd_csel(cmd, buf, size);
+-	do
+-		spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-	while (sr & READ_STATUS_WIP);
+-	spi_char_cmd_csel(CMD_WRITE_DISABLE, NULL);
+-}
+-
+-static unsigned char spi_prot(void)
+-{
+-	unsigned char sr, cr, data[2];
+-
+-	spi_char_cmd_csel(CMD_READ_CONF, &cr);
+-	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-	sr |= PROT_MASK;
+-	data[0] = sr;
+-	data[1] = cr;
+-	spi_common_write(CMD_WRITE_STATUS, data, sizeof(data));
+-	return sr;
+-}
+-
+-static void spi_read_spl(unsigned int offset)
+-{
+-	void *dst = (void*)CONFIG_SPL_TEXT_BASE;
+-	unsigned int cmd = (CMD_READ << 24) | offset;
+-	int i;
+-
+-	spi_claim_bus();
+-	spi_dev_update_frame_size(sizeof(cmd));
+-	spi_dev_dword_cmd(cmd, NULL);
+-	for (i=0; i < SPL_SIZE; i += sizeof(unsigned int))
+-		spi_dev_dword_cmd(0, dst + i);
+-	spi_dev_dword_cmd(0, NULL);
+-	spi_release_bus();
+-}
+-
+-static void spi_init(void)
+-{
+-	spi_ssi_cs0_init();
+-	writel(0x00000000, mmPSOC_SPI_SSIENR);
+-	writel(0x00000002, mmPSOC_SPI_BAUDR);	/* Min divisor */
+-	writel(0x00000000, mmPSOC_SPI_RXFTLR);
+-	writel(0x00000000, mmPSOC_SPI_TXFTLR);
+-	writel(0x0000003F, mmPSOC_SPI_IMR);	/* Disable Interrupts */
+-	writel(0x00000001, mmPSOC_SPI_SER);
+-	writel(0x00000001, mmPSOC_SPI_SSIENR);
+-}
+ 
+ static void preboot_copy_spl(void)
+ {
+ 	unsigned int  spl_offset;
+-	unsigned char sr;
+ 
+ 	preboot_copy_prepare(&spl_offset);
+ 
+-	spi_init();
+-	spi_read_spl(spl_offset);
+-	sr = spi_prot();
+-	preboot_puts("SPL copying from flash is completed\n");
+-	if ((sr & PROT_MASK) == PROT_MASK)
+-		preboot_puts("Flash may be protected, depend on WP# signal\n");
+-	else
+-		preboot_puts("Flash is not protected\n");
++	spi_copy_spl(spl_offset);
+ }
+ 
+ #ifdef DEV_IS_GOYA
+diff --git a/spi.c b/spi.c
+new file mode 100644
+index 0000000..c0f803a
+--- /dev/null
++++ b/spi.c
+@@ -0,0 +1,217 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <config.h>
++#include <linux/io.h>
++#include <linux/sizes.h>
++#include <linux/bitops.h>
++#include <mach/hl_regs.h>
++
++#include "uart.h"
++
++#define mmPSOC_SPI_CTRLR0		(HL_CFG_BASE + 0xC43000)
++#define mmPSOC_SPI_SSIENR		(HL_CFG_BASE + 0xC43008)
++#define mmPSOC_SPI_SER			(HL_CFG_BASE + 0xC43010)
++#define mmPSOC_SPI_BAUDR		(HL_CFG_BASE + 0xC43014)
++#define mmPSOC_SPI_TXFTLR		(HL_CFG_BASE + 0xC43018)
++#define mmPSOC_SPI_RXFTLR		(HL_CFG_BASE + 0xC4301C)
++#define mmPSOC_SPI_TXFLR		(HL_CFG_BASE + 0xC43020)
++#define mmPSOC_SPI_RXFLR		(HL_CFG_BASE + 0xC43024)
++#define mmPSOC_SPI_IMR			(HL_CFG_BASE + 0xC4302C)
++#define mmPSOC_SPI_DR0			(HL_CFG_BASE + 0xC43060)
++#define SPL_SIZE			SZ_64K
++#define CMD_WRITE_STATUS		0x01
++#define CMD_READ			0x03
++#define CMD_WRITE_DISABLE		0x04
++#define CMD_READ_STATUS			0x05
++#define CMD_WRITE_ENABLE		0x06
++#define CMD_READ_CONF			0x15
++#define READ_STATUS_WIP			BIT(0)
++#define READ_STATUS_BP0			BIT(2)
++#define READ_STATUS_BP1			BIT(3)
++#define READ_STATUS_BP2			BIT(4)
++#define READ_STATUS_BP3			BIT(5)
++#define READ_STATUS_SRWD		BIT(7)
++#define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | READ_STATUS_BP2 | READ_STATUS_BP3)
++#define PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
++#define frame_size_bits(b)		((b) << 16)
++
++/*
++ * SSI device Chip Select (CS0) is muxed with GPIO53
++ * Using this we can realy do SSI bus claim/release
++ * GPIO53 is set through mmPSOC_GPIO3 where each
++ * mmPSOC_GPIO serve 16 GPIOs
++ * Note: CS0 is active low
++ */
++static void spi_ssi_cs0_init(void)
++{
++	unsigned int reg, mask = BIT_MASK(53 % 16);
++
++	reg  = readl(mmPSOC_GPIO3_DATAOUT);
++	reg  &= ~mask;
++	writel(reg,  mmPSOC_GPIO3_DATAOUT);
++
++	reg = readl(mmPSOC_GPIO3_OUTENSET);
++	reg |=  mask;
++	writel(reg, mmPSOC_GPIO3_OUTENSET);
++}
++
++static void spi_claim_bus(void)
++{
++	writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_53);
++}
++
++static void spi_release_bus(void)
++{
++	writel(0, mmPSOC_GLOBAL_CONF_PAD_SEL_53);
++}
++
++static inline void spi_dev_update_frame_size(unsigned int len)
++{
++	writel(0, mmPSOC_SPI_SSIENR);
++	writel(frame_size_bits((len * 8) - 1), mmPSOC_SPI_CTRLR0);
++	writel(1, mmPSOC_SPI_SSIENR);
++}
++
++static inline int spi_fifo_is_empty(unsigned long level_reg)
++{
++	return !readl(level_reg);
++}
++
++static void spi_dev_dword_cmd(unsigned int cmd, unsigned int *val)
++{
++	unsigned int tmp;
++
++	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
++	writel(cmd, mmPSOC_SPI_DR0);
++
++	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
++	tmp = readl(mmPSOC_SPI_DR0);
++
++	if (val)
++		*val = tmp;
++}
++
++static void spi_special_cmd(unsigned int cmd, unsigned char *val)
++{
++	unsigned char tmp;
++
++	spi_dev_update_frame_size(sizeof(tmp));
++
++	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
++	writeb(cmd, mmPSOC_SPI_DR0);
++
++	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
++	tmp = readb(mmPSOC_SPI_DR0);
++
++	if (val)
++		*val = tmp;
++}
++
++/* Hold chip select (CS) during transaction */
++static void spi_char_cmd_csel(unsigned char cmd, unsigned char *val)
++{
++	spi_claim_bus();
++
++	spi_special_cmd(cmd, NULL);
++	if (val)
++		spi_special_cmd(0, val);
++
++	spi_release_bus();
++}
++
++static void spi_special_cmd_csel(unsigned int cmd, unsigned char *val, size_t size)
++{
++	int i;
++
++	spi_claim_bus();
++
++	spi_dev_update_frame_size(sizeof(*val));
++
++	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
++	writeb(cmd, mmPSOC_SPI_DR0);
++	for (i=0; i<size; i++) {
++		while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR));
++		writeb(val[i], mmPSOC_SPI_DR0);
++	}
++
++	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
++	readb(mmPSOC_SPI_DR0);
++	for (i=0; i<size; i++) {
++		while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR));
++		readb(mmPSOC_SPI_DR0);
++	}
++
++	spi_release_bus();
++}
++
++static void spi_common_write(unsigned int cmd, unsigned char *buf, size_t size)
++{
++	unsigned char sr;
++
++	spi_char_cmd_csel(CMD_WRITE_ENABLE, NULL);
++	spi_special_cmd_csel(cmd, buf, size);
++	do
++		spi_char_cmd_csel(CMD_READ_STATUS, &sr);
++	while (sr & READ_STATUS_WIP);
++	spi_char_cmd_csel(CMD_WRITE_DISABLE, NULL);
++}
++
++static unsigned char spi_prot(void)
++{
++	unsigned char sr, cr, data[2];
++
++	spi_char_cmd_csel(CMD_READ_CONF, &cr);
++	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
++	sr |= PROT_MASK;
++	data[0] = sr;
++	data[1] = cr;
++	spi_common_write(CMD_WRITE_STATUS, data, sizeof(data));
++	return sr;
++}
++
++static void spi_read_spl(unsigned int offset)
++{
++	void *dst = (void*)CONFIG_SPL_TEXT_BASE;
++	unsigned int cmd = (CMD_READ << 24) | offset;
++	int i;
++
++	spi_claim_bus();
++	spi_dev_update_frame_size(sizeof(cmd));
++	spi_dev_dword_cmd(cmd, NULL);
++	for (i=0; i < SPL_SIZE; i += sizeof(unsigned int))
++		spi_dev_dword_cmd(0, dst + i);
++	spi_dev_dword_cmd(0, NULL);
++	spi_release_bus();
++}
++
++static void spi_init(void)
++{
++	spi_ssi_cs0_init();
++	writel(0x00000000, mmPSOC_SPI_SSIENR);
++	writel(0x00000002, mmPSOC_SPI_BAUDR);	/* Min divisor */
++	writel(0x00000000, mmPSOC_SPI_RXFTLR);
++	writel(0x00000000, mmPSOC_SPI_TXFTLR);
++	writel(0x0000003F, mmPSOC_SPI_IMR);	/* Disable Interrupts */
++	writel(0x00000001, mmPSOC_SPI_SER);
++	writel(0x00000001, mmPSOC_SPI_SSIENR);
++}
++
++void spi_copy_spl(unsigned int spl_offset)
++{
++	unsigned char sr;
++
++	spi_init();
++	spi_read_spl(spl_offset);
++	sr = spi_prot();
++	preboot_puts("SPL copying from flash is completed\n");
++	if ((sr & PROT_MASK) == PROT_MASK)
++		preboot_puts("Flash may be protected, depend on WP# signal\n");
++	else
++		preboot_puts("Flash is not protected\n");
++
++}
+diff --git a/spi.h b/spi.h
+new file mode 100644
+index 0000000..10b8964
+--- /dev/null
++++ b/spi.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _HL_SPI_H_
++#define _HL_SPI_H_
++
++
++#ifdef DEV_IS_GOYA
++void spi_copy_spl(unsigned int spl_offset);
++#else
++static inline void spi_copy_spl(unsigned int spl_offset) {}
++#endif
++
++#endif /* _HL_SPI_H_ */

@@ -1,0 +1,100 @@
+From 10cda304e9ead20b72b918805091dae0bd471670 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 04 Sep 2020 12:31:40 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: set + protect mme role
+
+Implement MME role setting to user level and protect the configuration and
+protection bits.
+The RRs protection will be added in a separate commits - thus this is a
+partial protection of the MME domains.
+
+Change-Id: Id05a87f30e40a50af45d63a4319b0cf0e5e97075
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index e3c29d2..df06671 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -12,12 +12,18 @@
+ #include <cpu_if_regs.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_wrap_regs.h>
++#include <mme0_acc_regs.h>
++#include <mme0_sbab_regs.h>
++#include <mme0_ctrl_regs.h>
+ #include <sif_rtr_ctrl_7_regs.h>
+ #include <psoc_global_conf_regs.h>
+ 
+ #include <cpu_if_masks.h>
+ #include <psoc_global_conf_masks.h>
+ #include <pcie_wrap_masks.h>
++#include <mme0_acc_masks.h>
++#include <mme0_sbab_masks.h>
++#include <mme0_ctrl_masks.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
+@@ -249,6 +255,15 @@
+ 	}
+ }
+ 
++static void set_prot_bits_priv_int_conf(u64 page_base)
++{
++	/* Calculate the private protection bits base register */
++	u32 base = PRIV_PROT_REG(page_base & ~HL_CFG_BASE);
++
++	/* Protect the private and internal registers */
++	set_prot_bits_range_all(base, SNGL_REG_PROT_SIZE * 2);
++}
++
+ static void preboot_secure_cpu(void)
+ {
+ 	u32 prot_base, base = mmCPU_CA53_CFG_BASE & ~HL_CFG_BASE;
+@@ -433,6 +448,38 @@
+ 	/* TODO: use RRs to protect: DBI, CORE, AUX, PHY */
+ }
+ 
++#define MMES_NUM	4
++#define MMES_DIST	0x80000
++static void preboot_secure_mme(void)
++{
++	u32 reg;
++	int i;
++
++	/* Set MME engines level to user */
++	for (i = 0; i < MMES_NUM; i++) {
++		/* Set ACC to user */
++		reg = mmMME0_ACC_PROT + MMES_DIST * i;
++		regmap_writel(PROT_OVR_USER, reg);
++		/* Protect the ACC configuration */
++		regmap_writel(PROT_BIT(mmMME0_ACC_PROT), PRIV_PROT_REG(reg));
++		set_prot_bits_priv_int_conf(mmMME0_ACC_BASE + MMES_DIST * i);
++
++		/* Set SBAB to user */
++		reg = mmMME0_SBAB_PROT + MMES_DIST * i;
++		regmap_writel(PROT_OVR_USER, reg);
++		/* Protect the SBAB configuration */
++		regmap_writel(PROT_BIT(mmMME0_SBAB_PROT), PRIV_PROT_REG(reg));
++		set_prot_bits_priv_int_conf(mmMME0_SBAB_BASE + MMES_DIST * i);
++
++		/* Set CTRL to user */
++		reg = mmMME0_CTRL_PROT + MMES_DIST * i;
++		regmap_writel(PROT_OVR_USER, reg);
++		/* Protect the CTRL configuration */
++		regmap_writel(PROT_BIT(mmMME0_CTRL_PROT), PRIV_PROT_REG(reg));
++		set_prot_bits_priv_int_conf(mmMME0_CTRL_BASE + MMES_DIST * i);
++	}
++}
++
+ static void preboot_security_pci_disable(void)
+ {
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
+@@ -481,6 +528,7 @@
+ 	preboot_secure_cpu();
+ 	preboot_secure_psoc();
+ 	preboot_secure_pci();
++	preboot_secure_mme();
+ 
+ 	/* TODO: implement the rest of security enablement */
+ 

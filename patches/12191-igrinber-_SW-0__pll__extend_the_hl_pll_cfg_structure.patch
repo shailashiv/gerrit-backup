@@ -1,0 +1,284 @@
+From 365cdd585f616df73d439fa418531ac33490a185 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 05 May 2019 19:54:01 +0300
+Subject: [PATCH] [SW-0] pll: extend the hl_pll_cfg structure
+
+Add div_sel[] array for storing the clock selectors configuration.
+This separates the clock selector values from the divider factor
+values.
+This is needed as a preparation for extending the clock selector
+configuration values with a kind of "do not touch" value (which is
+different from regular bypass).
+The "do not touch" value is needed for proper implementation of the
+IF/MESH W/A in Gaudi and is also improves the configuration
+flexibility for future cases.
+
+Change-Id: I8aee118ecbc5c9be5dc550208aedcd204c73fa58
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index c55082b..d62da81 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -93,10 +93,9 @@
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+ 		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+ 
+-		/* -1 means always bypass */
+-		if (cfg->div_factor[sel] == -1 || bypass)
++		if (cfg->div_sel[sel] == HL_PLL_REF_CLK || bypass)
+ 			regmap_writel(HL_PLL_REF_CLK, reg);
+-		else if (cfg->div_factor[sel] == 0)
++		else if (cfg->div_sel[sel] == HL_PLL_PLL_CLK)
+ 			regmap_writel(HL_PLL_PLL_CLK, reg);
+ 		else { /* first change DIV_REF, then DIV_PLL */
+ 			regmap_writel(HL_PLL_DIV_REF, reg);
+@@ -115,7 +114,7 @@
+ 	u64 div_base;
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		if (cfg->div_factor[sel] == -1)
++		if (cfg->div_sel[sel] == HL_PLL_REF_CLK)
+ 			continue;
+ 
+ 		div_base = cfg->base + (sel * sizeof(u32));
+diff --git a/common/pll.h b/common/pll.h
+index edea940..5f4f4cb 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -53,6 +53,7 @@
+ 	u32	od;
+ 	u32	nb;
+ 	u32	div_factor[HL_PLL_DIV_SIZE];
++	int	div_sel[HL_PLL_DIV_SIZE];
+ };
+ 
+ enum hl_pll_bypass_val hl_pll_bypass_get(u64 pll_base,
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index babd0c5..b093674 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -17,76 +17,166 @@
+ 	{
+ 		.name = "CPU", .base = mmPSOC_CPU_PLL_BASE,
+ 		.nr = 0, .nf = 47, .od = 1, .nb = 23, /* 1200 */
+-		.div_factor = { 0, 1, 47, -1 }
++		.div_factor = { 0, 1, 47, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "DMA_W", .base = mmDMA_W_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+-		.div_factor = { 0, 1, -1, -1 }
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "IF_W", .base = mmIF_W_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+-		.div_factor = { 0, -1, 2, 7 }
++		.div_factor = { 0, -1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "IF_E", .base = mmIF_E_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+-		.div_factor = { 0, -1, 2, 7 }
++		.div_factor = { 0, -1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "DMA_E", .base = mmDMA_E_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+-		.div_factor = { 0, 1, -1, -1 }
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "MESH_W", .base = mmMESH_W_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+-		.div_factor = { 0, -1, 2, 7 }
++		.div_factor = { 0, -1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "SRAM_W", .base = mmSRAM_W_PLL_BASE,
+ 		.nr = 0, .nf = 35, .od = 1, .nb = 17, /* 900 */
+-		.div_factor = { 0, -1, -1, -1 }
++		.div_factor = { 0, -1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "MESH_E", .base = mmMESH_E_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+-		.div_factor = { 0, -1, 2, 7 }
++		.div_factor = { 0, -1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "SRAM_E", .base = mmSRAM_E_PLL_BASE,
+ 		.nr = 0, .nf = 35, .od = 1, .nb = 17, /* 900 */
+-		.div_factor = { 0, -1, -1, -1 }
++		.div_factor = { 0, -1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "MME", .base = mmPSOC_MME_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+-		.div_factor = { 0, 1, 2, 7 }
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "PCI", .base = mmPSOC_PCI_PLL_BASE,
+ //		.nr = 0, .nf = 37, .od = 1, .nb = 18, /* 950 */
+ 		.nr = 4, .nf = 331, .od = 3, .nb = 165, //DAY 1 (830MHz)
+-		.div_factor = { 0, 0, 4, 9 }
++		.div_factor = { 0, 0, 4, 9 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "TPC", .base = mmPSOC_TPC_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+-		.div_factor = { 0, 1, 2, 7 }
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "HBM", .base = mmPSOC_HBM_PLL_BASE,
+ 		.nr = 0, .nf = 37, .od = 1, .nb = 18, /* 950 MHz */
+-		.div_factor = { 0, 1, -1, -1 }
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "NIC0", .base = mmNIC0_PLL_BASE,
+ 		.nr = 24, .nf = 1665, .od = 3, .nb = 832, /* 833 MHz */
+-		.div_factor = { 0, 4, 8, -1 }
++		.div_factor = { 0, 4, 8, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "NIC1", .base = mmNIC1_PLL_BASE,
+ 		.nr = 24, .nf = 1665, .od = 3, .nb = 832, /* 833 MHz */
+-		.div_factor = { 0, 4, 8, -1 }
++		.div_factor = { 0, 4, 8, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "NIC2_HBM", .base = mmNIC2_HBM_PLL_BASE,
+ 		.nr = 0, .nf = 37, .od = 1, .nb = 18, /* 950 MHz */
+-		.div_factor = { 0, 1, -1, -1 }
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "NIC2_MME", .base = mmNIC2_MME_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+-		.div_factor = { 0, 1, 2, 7 }
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "NIC2_TPC", .base = mmNIC2_TPC_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+-		.div_factor = { 0, 1, 2, 7 }
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	},
+ };
+ 
+diff --git a/goya/asic.c b/goya/asic.c
+index b034ada..185c9e5 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -17,15 +17,30 @@
+ 	{
+ 		.name = "CPU", .base = mmCPU_PLL_BASE,
+ 		.nr = 2, .nf = 159, .od = 1, .nb = 79,
+-		.div_factor = { 0, -1, 1, -1 }
++		.div_factor = { 0, -1, 1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
+ 	}, {
+ 		.name = "IC", .base = mmIC_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 15, .nb = 31,
+-		.div_factor = { 0, 1, 1, 2 }
++		.div_factor = { 0, 1, 1, 2 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	}, {
+ 		.name = "MME", .base = mmPSOC_MME_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 15, .nb = 31,
+-		.div_factor = { 0, 1, 2, 8 }
++		.div_factor = { 0, 1, 2, 8 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
+ 	},
+ };
+ 

@@ -1,0 +1,121 @@
+From 1aaf16d69bc27f2699fe520c39c754129282a7c9 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 10 Nov 2022 13:05:21 +0200
+Subject: [PATCH] [SW-105079] gaudi3: add device specific pll functions
+
+In order to speed up firmware flow on pldm (rom to preboot)
+network pll needs to be configured in ppboot so that the DMA
+and preboot execution become faster. This patch adds device
+specific pll functions for gaudi3 which will be called
+from common pll routine.
+
+Change-Id: I758b11acefc61a127b99f770e89f228620e2f0b4
+---
+
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index e73cf9d..93f3306 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -1,3 +1,5 @@
++include $(HL_DEV_ARCH_COMMON)/Makefile
++
+ FW_SIZE := 0x8000
+ PPBOOT_MAX_SIZE := 16384
+ PREBOOT_BIN_MAX_SIZE := 130048
+diff --git a/arch/gaudi3/common/Makefile b/arch/gaudi3/common/Makefile
+new file mode 100644
+index 0000000..91d2dff
+--- /dev/null
++++ b/arch/gaudi3/common/Makefile
+@@ -0,0 +1,4 @@
++
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+diff --git a/arch/gaudi3/common/pll.c b/arch/gaudi3/common/pll.c
+index 4602251..6d4966b 100644
+--- a/arch/gaudi3/common/pll.c
++++ b/arch/gaudi3/common/pll.c
+@@ -2,7 +2,78 @@
+ /*
+  * Copyright (C) 2022 HabanaLabs Ltd.
+  */
+-/*
+- * TODO: Add gaudi3 specific pll implementation
+- * Added empty source for gaudi3 eROM compilation .
+- */
++#include <gaudi3_blocks_linux_driver.h>
++
++#include <stddef.h>
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include "common.h"
++
++#define GAUDI3_PLL_CFG_DIV		0x4
++#define GAUDI3_PLL_VCO_CTRL		0xA4
++#define GAUDI3_PLL_CFG			0x0
++#define GAUDI3_PLL_CFG_EN		(BIT(8) | BIT(0))
++#define GAUDI3_PLL_CFG_LOCK		BIT(16)
++#define GAUDI3_PLL_DIV_SEL_DELAY	0x28
++
++void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++{
++	u32 reg = regmap_readl(cfg->base + GAUDI3_PLL_CFG);
++
++	if (reset)
++		reg &= ~GAUDI3_PLL_CFG_EN;
++	else
++		reg |= GAUDI3_PLL_CFG_EN;
++
++	regmap_writel(reg, cfg->base + GAUDI3_PLL_CFG);
++}
++
++int hl_pll_is_locked(struct hl_pll_cfg *cfg)
++{
++	return regmap_readl(cfg->base + GAUDI3_PLL_CFG) & GAUDI3_PLL_CFG_LOCK;
++}
++
++#define GAUDI3_PLL_POSTDIV1_SHIFT	16
++#define GAUDI3_PLL_POSTDIV2_SHIFT	20
++#define GAUDI3_PLL_REFDIV_SHIFT		24
++#define GAUDI3_PLL_MAX_WAIT_TIME	5
++#define GAUDI3_PLL_VCO_CTRL_VCOSEL	0x3
++
++void hl_pll_cfg(struct hl_pll_cfg *cfg)
++{
++	u32 reg = 0;
++
++	/* put the PLL into reset by writing 0 to CTRL_CFG.EN and CTRL_CFG.FOUTPOSTDIVEN */
++	hl_pll_reset(cfg, true);
++
++	/* FBDIV - bit 0
++	 * POSTDIV1 - bit 16
++	 * POSTDIV2 - bit 20
++	 * REFDIV - bit 24
++	 */
++	reg = cfg->nr << GAUDI3_PLL_REFDIV_SHIFT |
++		cfg->nb << GAUDI3_PLL_POSTDIV2_SHIFT |
++		cfg->od << GAUDI3_PLL_POSTDIV1_SHIFT | cfg->nf;
++
++	regmap_writel(reg, cfg->base + GAUDI3_PLL_CFG_DIV);
++	regmap_writel(GAUDI3_PLL_VCO_CTRL_VCOSEL, cfg->base + GAUDI3_PLL_VCO_CTRL);
++
++	/* after updating the coefficients we need to wait >=1us */
++	udelay(GAUDI3_PLL_MAX_WAIT_TIME);
++
++	/* enable the PLL by writing a value of 1 to CTRL_CFG.EN and CTRL_CFG.FOUTPOSTDIVEN */
++	hl_pll_reset(cfg, false);
++}
++
++void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg) {}
++
++void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg) {}
++
++void hl_pll_ack_int(struct hl_pll_cfg *cfg) {}
++
++void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg)
++{
++	regmap_writel(1, cfg->base + GAUDI3_PLL_DIV_SEL_DELAY);
++}
++

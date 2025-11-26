@@ -1,0 +1,269 @@
+From c78e6623edfa27441b1a2648307943679a933bd4 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Wed, 06 Jan 2021 08:24:28 +0200
+Subject: [PATCH] [SW-20154] preboot: extended rom support
+
+Gaudi2 has a new SW component called extended rom,
+which runs at the same time as ROM. There are 3
+APIs that can be executed from ROM based on efuse
+settings. Each of these API is a part of its own
+individual binary.ROM code executes the erom
+functions that are part of the extended rom residing
+on flash. This patch adds basic support for the creation
+of 3 new binaries called erom_pcie.bin, erom_recovery.bin
+and erom_tpm.bin that can be built and generated
+independent of the ROM.
+
+efuse settings to trigger the erom APIs"
+	1)erom_pcie-> efuse bit 13 (logic low)
+	2)erom_recovery-> efuse bit 13 (logic low)
+	3)erom_tpm-> efuse bit 11 (logic high)
+
+These binaries are indexed using a separate 'image
+pointer' binary.
+
+Change-Id: Ifd1131a7a22498018716c2bbad99f5bd4268d17a
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/ext_rom/Makefile b/ext_rom/Makefile
+new file mode 100644
+index 0000000..effcaaa
+--- /dev/null
++++ b/ext_rom/Makefile
+@@ -0,0 +1,42 @@
++CC = $(CROSS_COMPILE)gcc
++OBJCOPY = $(CROSS_COMPILE)objcopy
++SPECS_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++CFLAGS += -I$(SPECS_EMBEDDED_DIR)
++CFLAGS += -I$(SPECS_DIR)/$(SPECS_DEV)/asic_reg
++CFLAGS += -Wall -Werror
++CFLAGS += -g -c
++CFLAGS += -I ./../include/ -I ./../ -I ./../common/ -I ./../$(HL_DEV)/
++
++CFLAGS += -Os -fdata-sections -ffunction-sections
++SFLAGS := $(CFLAGS) -D__ASSEMBLY__
++
++EROM_LD_SCRIPT := common_erom.lds
++LDFLAGS := -g -nostdlib -static
++LDFLAGS += -Wl,--gc-sections
++LDLIBS := -lgcc
++
++EROM_APP_S := $(shell ls crt0_common_erom.S)
++EROM_APP_OBJECTS := $(EROM_APP_S:.S=.o)
++SOURCE_OBJECTS := erom_%.o
++SOURCE_OBJECTS += $(EROM_APP_OBJECTS)
++
++.PHONY: all
++all: erom_recovery erom_pcie erom_tpm
++
++erom_%: $(SOURCE_OBJECTS) $(EROM_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(EROM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(LDLIBS) -Wl,--end-group
++	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
++
++%.lds: %.lds.S
++	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
++
++%.o: %.c
++	@$(CC) $(CFLAGS) -o $@ $<
++
++%.o: %.S
++	@$(CC) $(SFLAGS) -o $@ $<
++
++clean:
++	rm -f *.o
++
++.PHONY: clean
+diff --git a/ext_rom/common.h b/ext_rom/common.h
+new file mode 100644
+index 0000000..7a3d474
+--- /dev/null
++++ b/ext_rom/common.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_EXT_ROM_H_
++#define COMMON_EXT_ROM_H_
++
++#define EXT_ROM_START		(0)
++#define EXT_ROM_TEXT_LENGTH	(32*1024)
++/* No header bytes. Hence the text base is same as erom start address */
++#define EXT_ROM_TEXT_BASE	(EXT_ROM_START)
++
++#endif /* COMMON_EXT_ROM_H_ */
+diff --git a/ext_rom/common_erom.lds.S b/ext_rom/common_erom.lds.S
+new file mode 100644
+index 0000000..d053882
+--- /dev/null
++++ b/ext_rom/common_erom.lds.S
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++MEMORY { .sram : ORIGIN = EXT_ROM_TEXT_BASE, LENGTH = EXT_ROM_TEXT_LENGTH }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : ALIGN(4) {
++		crt0_common_erom.o (.text*)
++		* (.text*)
++	} > .sram
++
++	.bss : {
++		. = ALIGN(8);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > .sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/ext_rom/crt0_common_erom.S b/ext_rom/crt0_common_erom.S
+new file mode 100644
+index 0000000..ed589c7
+--- /dev/null
++++ b/ext_rom/crt0_common_erom.S
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++/*
++ * This is ext_rom pcie code entry point
++ * Clearing bss,setting lr and jumping to C code
++ */
++.globl  _start
++_start:
++
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global lf2flt
++lf2flt:
++
++	/*
++	 * Arcboot ROM stack is utilized as the context
++	 * needs to switch back to ROM code
++	 */
++
++	/* Clear BSS */
++	mov     r5, __bss_start
++	sub     r6, __bss_end, r5
++	lsr.f   lp_count, r6, 2
++	lpnz    1f
++	st.ab   0, [r5, 4]
++1:
++	push_s  blink
++	bl      erom_main_function
++	pop_s   blink
++	j_s     [blink]
+diff --git a/ext_rom/erom_pcie.c b/ext_rom/erom_pcie.c
+new file mode 100644
+index 0000000..0f0818c
+--- /dev/null
++++ b/ext_rom/erom_pcie.c
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stdint.h>
++#include <psoc_global_conf_regs.h>
++#include <hl_fw_if.h>
++#include <hl_boot_if.h>
++
++#define ADDR_SW_STATUS_2_REG	0xFCC60208
++
++void erom_pcie_config(void)
++{
++	/* Updating the SW status 2 register */
++	*(uint32_t *)(ADDR_SW_STATUS_2_REG) = 1;
++}
++
++void erom_main_function(void)
++{
++	erom_pcie_config();
++}
++
+diff --git a/ext_rom/erom_recovery.c b/ext_rom/erom_recovery.c
+new file mode 100644
+index 0000000..5fc6ae0
+--- /dev/null
++++ b/ext_rom/erom_recovery.c
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stdint.h>
++#include <psoc_global_conf_regs.h>
++#include <hl_fw_if.h>
++#include <hl_boot_if.h>
++
++#define ADDR_SW_STATUS_3_REG	0xFCC6020C
++
++void erom_recovery(void)
++{
++	/* Updating the SW status 3 register */
++	*(uint32_t *)(ADDR_SW_STATUS_3_REG) = 1;
++}
++
++void erom_main_function(void)
++{
++	erom_recovery();
++}
+diff --git a/ext_rom/erom_tpm.c b/ext_rom/erom_tpm.c
+new file mode 100644
+index 0000000..d2a2e50
+--- /dev/null
++++ b/ext_rom/erom_tpm.c
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stdint.h>
++#include <psoc_global_conf_regs.h>
++#include <hl_fw_if.h>
++#include <hl_boot_if.h>
++
++#define ADDR_SW_STATUS_4_REG	0xFCC60210
++
++void erom_tpm(void)
++{
++	/* Updating the SW status 4 register */
++	*(uint32_t *)(ADDR_SW_STATUS_4_REG) = 1;
++}
++
++void erom_main_function(void)
++{
++	erom_tpm();
++}

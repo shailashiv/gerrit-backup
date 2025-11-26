@@ -1,0 +1,59 @@
+From 40cb6906dbd867fae90086164533b1068bc756d1 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Wed, 20 Nov 2019 20:53:05 +0200
+Subject: [PATCH] [SW-6506] hl: ppboot: load preboot according to written in flash
+
+Do not use the BTL ID since it is not true anymore when ppboot and
+preboot are separated. use the preboot according to stable or midifiable
+if any
+This will insure we use the preboot we just burnt on flash
+
+Change-Id: I2ce16fd000dbd637e738443c2327c9b81cebac47
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index 60abcd5..bd258ef 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -8,6 +8,7 @@
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <cpu_ca53_cfg_regs.h>
++#include <hl_fw_if.h>
+ #include <hl_boot_if.h>
+ 
+ #include "common.h"
+@@ -15,15 +16,28 @@
+ #include "uart.h"
+ #include "spi.h"
+ 
+-/* Taking preboot from where ppboot (btl) is used */
++/* Stable ID can be 0 or 1, if not defined return primary offset (0) */
++static u32 next_image_offset(u32 offset, char *name)
++{
++	u32 id;
++
++	spi_copy(&id, offset, sizeof(id), name);
++	id = (id & 0xFF) - '1';
++
++	return (id == 0) ? HL_SPI_PRIMARY_BASE : HL_SPI_SECONDARY_BASE;
++}
++
+ static u32 preboot_image_offset(void)
+ {
+-	u32 ppboot_id = regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_31);
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++	u32 image_pending = regmap_readl(upd_pending_reg);
+ 
+-	if (ppboot_id == '2')
+-		return HL_SPI_SECONDARY_BASE;
++	/* Check for normal boot */
++	if (image_pending != FLOPS_UPD_PENDING)
++		return next_image_offset(HL_SPI_NEXT_IMAGE_OFF, "NEXT");
+ 
+-	return HL_SPI_PRIMARY_BASE;
++	/* There is an update pending */
++	return next_image_offset(HL_SPI_MODIFI_IMAGE_OFF, "MODIFIABLE");
+ }
+ 
+ static void copy_preboot(void)

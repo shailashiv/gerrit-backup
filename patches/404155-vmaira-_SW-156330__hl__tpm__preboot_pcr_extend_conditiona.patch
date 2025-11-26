@@ -1,0 +1,194 @@
+From 76b2d6a96230002b318cc89d1872e17c394af729 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Mon, 18 Mar 2024 07:46:37 +0200
+Subject: [PATCH] [SW-156330] hl: tpm: preboot pcr extend conditional on tpm startup status
+
+This patch ensures that preboot TPM PCR extension is only
+performed after verifying TPM init and startup are successful,
+preventing unintended TPM PCR extension in case of startup
+failure.
+
+Change-Id: I956e2826d88ae0d8898605796d6ee3d7fd196f9e
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index cdc3f5d..2944043 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -74,7 +74,7 @@
+ 	return is_valid;
+ }
+ 
+-__weak void preboot_tpm_extend(struct boot_desc *desc) {}
++__weak void preboot_tpm_extend(uint8_t *hash) {}
+ 
+ __weak bool ppboot_load_preboot_img(u64 *loadaddr)
+ {
+@@ -91,7 +91,7 @@
+ 	ret = ppboot_try_candidate_img(image_pending, &desc, true);
+ 	if (ret) {
+ 		*loadaddr = desc.loadaddr;
+-		preboot_tpm_extend(&desc);
++		preboot_tpm_extend(desc.chksum);
+ 		return true;
+ 	}
+ 
+@@ -101,7 +101,7 @@
+ 	ret = ppboot_try_candidate_img(image_pending, &desc, false);
+ 	if (ret) {
+ 		*loadaddr = desc.loadaddr;
+-		preboot_tpm_extend(&desc);
++		preboot_tpm_extend(desc.chksum);
+ 		return true;
+ 	}
+ 
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 58ea82f..74e9c3d 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -396,3 +396,8 @@
+ {
+ 	return TPM2_PPBOOT_PCR_IDX;
+ }
++
++uint8_t get_preboot_pcr_index(void)
++{
++	return TPM2_PREBOOT_PCR_IDX;
++}
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 19a9a3b..23233ce 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -331,6 +331,8 @@
+ 	return 0;
+ }
+ 
++__weak void preboot_tpm_extend(uint8_t *hash) {}
++
+ static int ppboot_bringup_preboot(u8 image_ptr)
+ {
+ 	u32 image_size, payload_size, copy_size;
+@@ -424,8 +426,7 @@
+ 	else
+ 		memcpy(hash, footer_offset + PREBOOT_HASH_MAGIC_SIZE, SHA384_SUM_LEN);
+ 
+-	if (tpm_pcr_extend(TPM2_PREBOOT_PCR_IDX, hash))
+-		preboot_puts("PPBOOT: pcr extend failed\n");
++	preboot_tpm_extend(hash);
+ 
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+@@ -943,6 +944,11 @@
+ 	return TPM2_PPBOOT_PCR_IDX;
+ }
+ 
++uint8_t get_preboot_pcr_index(void)
++{
++	return TPM2_PREBOOT_PCR_IDX;
++}
++
+ struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx)
+ {
+ 	struct hl_boot_info_ptrs *ptrs;
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c9c4019..5e35cf7 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1483,6 +1483,11 @@
+ 	return TPM2_PPBOOT_PCR_IDX;
+ }
+ 
++uint8_t get_preboot_pcr_index(void)
++{
++	return TPM2_PREBOOT_PCR_IDX;
++}
++
+ static bool get_ppboot_img_desc(struct boot_desc *desc)
+ {
+ 	u32 idx;
+@@ -1517,15 +1522,6 @@
+ 
+ 	memcpy(hash, desc.chksum, SHA384_SUM_LEN);
+ 	return is_valid;
+-}
+-
+-void preboot_tpm_extend(struct boot_desc *desc)
+-{
+-	if (!tpm_is_supported())
+-		return;
+-
+-	if (tpm_pcr_extend(TPM2_PREBOOT_PCR_IDX, desc->chksum))
+-		preboot_puts("PPBOOT: preboot pcr extend failed\n");
+ }
+ 
+ void preboot_boot_info_init(void)
+diff --git a/lib/common/tpm.c b/lib/common/tpm.c
+index 9115560..3d64564 100644
+--- a/lib/common/tpm.c
++++ b/lib/common/tpm.c
+@@ -17,6 +17,8 @@
+ #define SIG_SIZE		384
+ #define CRC32_SIZE		4
+ 
++static bool tpm_startup_done;
++
+ __weak bool tpm_is_supported(void) { return false; }
+ 
+ __weak int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
+@@ -40,9 +42,30 @@
+ 
+ __weak void hl_lbw_early_write_resp_enable(bool enable) {};
+ 
++
++__weak uint8_t get_preboot_pcr_index(void)
++{
++	return 1;
++}
++
+ __weak uint8_t get_ppboot_pcr_index(void)
+ {
+ 	return 0;
++}
++
++void preboot_tpm_extend(uint8_t *hash)
++{
++	uint8_t preboot_pcr_idx;
++
++	if (!tpm_is_supported())
++		return;
++
++	if (tpm_startup_done == true) {
++		preboot_pcr_idx = get_preboot_pcr_index();
++
++		if (tpm_pcr_extend(preboot_pcr_idx, hash))
++			preboot_puts("PPBOOT: preboot pcr extend failed\n");
++	}
+ }
+ 
+ void ppboot_tpm_extend(void)
+@@ -55,16 +78,23 @@
+ 		return;
+ 
+ 	/* return if erom has already done ppboot tpm extend */
+-	if (is_ppboot_tpm_extend_done())
++	if (is_ppboot_tpm_extend_done()) {
++		tpm_startup_done = true;
+ 		return;
++	}
+ 
+ 	hl_lbw_early_write_resp_enable(false);
++
++	tpm_startup_done = false;
++
+ 	if (tpm_init(true))
+ 		goto enable_early_write_resp;
+ 
+ 	if (tpm_startup())
+ 		goto enable_early_write_resp;
+ 
++	tpm_startup_done = true;
++
+ 	is_valid = get_ppboot_img_hash(hash);
+ 	if (!is_valid)
+ 		goto enable_early_write_resp;

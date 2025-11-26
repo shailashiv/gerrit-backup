@@ -1,0 +1,62 @@
+From 0cd7db75d6e2df2795bea9190a730765e514ef3c Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 24 Mar 2022 14:14:34 +0200
+Subject: [PATCH] [SW-69581] gaudi3: support multi sector preboot copy
+
+Preboot application can occupy multiple sectors of flash (up to 3
+for gaudi3).
+This patch adds support for copying the binary from multiple sectors
+of flash. The provided implementation is temporary and lacking crc
+verification.
+Once the Arcboot binary is finalized, this implementation should
+be replaced with the dma_copy_image_v2() function from Arcboot rom.
+At the moment using this function is problematic because arcboot code
+is not part of Onix nor PLDM images.
+
+Opened Jira ticket SW-80466 for replacing the implementation once
+arcboot rom is finalized.
+
+Change-Id: I1474714fbae2434ed3431dde8683dd1edeb4f944
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index edddffe..534b076 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -60,13 +60,34 @@
+ 	regmap_writel(1, mmVUART1_TX_STATUS);
+ }
+ 
++/* TODO: replace ppboot_cp_preboot() implementation with dma_copy_image_v2() from arcboot */
++
++#define CRC32_SIZE		4
++#define MAX_SECTOR_SIZE		0xFFF0
++#define MAX_SECTOR_SIZE_CRC	(MAX_SECTOR_SIZE + CRC32_SIZE)
++#define OFFSET_64KB		0x10000
++
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	u32 laddr = (u32)loadaddr;
++	u32 remain_size, cp_size;
++	u32 cp_chunks;
++	u8 i;
+ 
+ 	preboot_puts_hex("Preboot loadaddr: ", laddr, false);
+ 
+-	spi_flash_copy((void *)laddr, offset, size, name);
++	cp_chunks = size / MAX_SECTOR_SIZE_CRC;
++	if (size % MAX_SECTOR_SIZE_CRC)
++		cp_chunks++;
++
++	remain_size = size;
++
++	for (i = 0; i < cp_chunks; i++) {
++		cp_size = remain_size > MAX_SECTOR_SIZE_CRC ? MAX_SECTOR_SIZE_CRC : remain_size;
++		spi_flash_copy(((void *)laddr + (MAX_SECTOR_SIZE * i)), (offset + (OFFSET_64KB * i)),
++				cp_size, name);
++		remain_size -= cp_size;
++	}
+ }
+ 
+ u32 hl_rst_src_get(void)

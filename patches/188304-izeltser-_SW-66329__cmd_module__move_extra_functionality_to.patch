@@ -1,0 +1,82 @@
+From a02c3e93f5aa251dfddafc103cb06f5ebbe64231 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sat, 12 Mar 2022 17:01:32 +0200
+Subject: [PATCH] [SW-66329] cmd_module: move extra functionality to weak func
+
+Cmd_module implements a generic infrastructure for handling multiple
+modules in a "init/poll/run" loop.
+Some functionality was added later to the main loop and has somewhat,
+unrelated nature, but it's required for some devices.
+Also there is printing function before entering the main loop.
+All mentioned above makes it impossible using the cmd module as a
+truly generic infra.
+In order to fix this, and enable usage of the cmd module by all CPUs,
+the device specific extra functionality, and the printing function,
+were moved to weak functions. so if a CPU doesn't have an output
+printing port, or it doesn't need any extra functionality in the
+main loop, it can simply implement empty functions.
+
+Change-Id: I32ae2ae660d1177083aac644114f06aaa5e514b1
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/lib/common/cmd_module.c b/lib/common/cmd_module.c
+index aaa6b48..586d2b9 100644
+--- a/lib/common/cmd_module.c
++++ b/lib/common/cmd_module.c
+@@ -35,6 +35,22 @@
+ 	}
+ }
+ 
++__weak void module_print_waiting_msg(void)
++{
++	preboot_puts("Waiting for commands...\n");
++	preboot_uart_rbuf_flush();
++}
++
++__weak void module_run_uncond_each_loop(void)
++{
++	/* TODO: This is temporary and to be removed after GAUDI2 PO */
++	check_razwi_intr();
++
++	i2c_debug_mode_handling();
++
++	cpu_boot_if_fix_ro_regs();
++}
++
+ void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size)
+ {
+ 	int i = 0, j = 0;
+@@ -43,18 +59,11 @@
+ 	for (j = 0; j < size; j++)
+ 		cmd_ops[j].setup();
+ 
+-	preboot_puts("Waiting for commands...\n");
+-	preboot_uart_rbuf_flush();
++	module_print_waiting_msg();
+ 
+ 	i = 0;
+ 	while (1) {
+-
+-		/* TODO: This is temporary and to be removed after GAUDI2 PO */
+-		check_razwi_intr();
+-
+-		i2c_debug_mode_handling();
+-
+-		cpu_boot_if_fix_ro_regs();
++		module_run_uncond_each_loop();
+ 
+ 		res = cmd_ops[i].check();
+ 		switch (res) {
+diff --git a/lib/common/cmd_module.h b/lib/common/cmd_module.h
+index f3db716..e9b138e 100644
+--- a/lib/common/cmd_module.h
++++ b/lib/common/cmd_module.h
+@@ -126,4 +126,7 @@
+ void module_i2c_s_run_noret(void);
+ 
+ void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
++void module_run_uncond_each_loop(void);
++void module_print_waiting_msg(void);
++
+ #endif /* _HL_CMD_MODULE_H_ */

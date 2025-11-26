@@ -1,0 +1,364 @@
+From 67a1903de32753e2c7228daa1868f18a361c7b98 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 05 Aug 2021 14:18:32 +0300
+Subject: [PATCH] [SW-50880] greco: arc: run pcie initialization on arc0
+
+This patch add support to perform PCIe initialization on secondary
+CPU ARC0 and let primary CPU ARC1 continue with preboot. Upon successful
+initialization of PCIe, secondary CPU ARC0 will go in sleep mode or halt
+mode which will be indication in preboot for PCIe is initialized.
+
+Change-Id: I81fe98f80f6fee515a0f1fda12b2200dd4535ef5
+---
+
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index 99963d8..2d9cfcb 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -113,3 +113,39 @@
+ {
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
+ }
++
++bool is_pcie_initialized(void)
++{
++	u32 secondary_sts;
++
++	secondary_sts = regmap_readl(mmPSOC_ARC0_CFG_RUN_HALT_ACK);
++
++	/*
++	 * Secondary CPU is put to sleep once PCIe initialization
++	 * is done So notify PCIe is initialized if secondary CPU
++	 * (ARC0) is in sleep state or in halt state.
++	 */
++	if ((secondary_sts & PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_SLEEP_R_MASK) ||
++		(secondary_sts & PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK))
++		return true;
++	else
++		return false;
++}
++
++void preboot_secondary_cpu_stop(void)
++{
++	u32 *secondary_iccm_addr = (u32 *) ARC0_ICCM_BASE;
++
++	/*
++	 * Secondary CPU will be in sleep once pcie initialization
++	 * is done, clean 0th location of ICCM, halt and reset ARC0
++	 * so that it can ready to load and run zephyr images received
++	 * via FIT.
++	 */
++	*secondary_iccm_addr = 0x0;
++
++	halt_n_reset_arc(0);
++
++	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
++	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
++}
+diff --git a/arch/greco/arc/common.h b/arch/greco/arc/common.h
+index fe0ebdf..6694722 100644
+--- a/arch/greco/arc/common.h
++++ b/arch/greco/arc/common.h
+@@ -44,6 +44,7 @@
+ 
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
++#define ARC0_ICCM_BASE		0x1B000000
+ 
+ #define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ 
+@@ -51,4 +52,7 @@
+ #define SW_ALL_RST_M_MSK		0xFFFFFFFF
+ #define SW_ALL_RST_H_MSK		0x7FFFFF
+ 
++#define ARC_RST_VALUE			0x110
++#define ARC_RST_VEC_ADDR		0x0
++
+ #endif /* COMMON_GRECO_ARC_GNU_H_ */
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index fec9fac..f89a631 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -250,3 +250,69 @@
+ 	*loadaddr = copy_preboot();
+ 	return true;
+ }
++
++static void preboot_pcie_monitoring(void)
++{
++	/* Wait for PRSTn */
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
++		;
++
++	/* Only after PRSTn is de-asserted */
++	preboot_pcie_enable();
++
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh;
++
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++		if (prstn && smlh && rdlh)
++			break;
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++
++	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++void secondary_main(void)
++{
++	preboot_pcie_monitoring();
++
++	/* Put secondary CPU in sleep state until further notice */
++	while (1)
++		__asm__ __volatile__("sleep\n\t" : : );
++}
++
++void preboot_pcie_wait_for_link(void)
++{
++	u32 *secondary_iccm_addr = (u32 *) ARC0_ICCM_BASE;
++
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
++	/*
++	 * update secondary entry address to 0th location of ICCM
++	 * ARC once put in running state will jump to address
++	 * specified in 0th location of ICCM
++	 */
++	*secondary_iccm_addr = (u32) &secondary_entry;
++	run_arc(0);
++}
+diff --git a/arch/greco/arc_elf32/common.h b/arch/greco/arc_elf32/common.h
+index 2dbb617..b8fe030 100644
+--- a/arch/greco/arc_elf32/common.h
++++ b/arch/greco/arc_elf32/common.h
+@@ -31,10 +31,11 @@
+  * Let PPBoot start from the offset of 8544 bytes, for using DCCM
+  * for its own BSS and Stack.
+  */
+-#define PPBOOT_DCCM_BASE	0x80002160
++#define PPBOOT_DCCM_BASE	0x1B032160
+ 
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
++#define ARC0_ICCM_BASE		0x1B000000
+ 
+ #define FUSE_WORDS_PER_BANK	0x40
+ #define I2C_SLAVE_ADDRESS	0x6A
+@@ -52,4 +53,8 @@
+ 
+ #define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ 
++#ifndef __ASSEMBLY__
++extern void secondary_entry(void);
++#endif
++
+ #endif /* COMMON_GRECO_ARC_H_ */
+diff --git a/arch/greco/arc_elf32/secondary.S b/arch/greco/arc_elf32/secondary.S
+new file mode 100644
+index 0000000..d5a32b0
+--- /dev/null
++++ b/arch/greco/arc_elf32/secondary.S
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++.global secondary_entry
++secondary_entry:
++	mov	sp, 0x1b010400	/* stack top set to secondary CPU DCCM 1k offset */
++	mov	fp, sp
++	bl	secondary_main
+diff --git a/arch/greco/arm/common.c b/arch/greco/arm/common.c
+index e8f8fc1..14017f6 100644
+--- a/arch/greco/arm/common.c
++++ b/arch/greco/arm/common.c
+@@ -235,3 +235,68 @@
+ {
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
+ }
++
++void preboot_pcie_wait_for_link(void)
++{
++	u64 start = timestamp_get_us();
++
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
++	/* Wait for PRSTn */
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
++		/* If PRSTn does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PRSTn!\n");
++			return;
++		}
++	}
++
++	/* Only after PRSTn is de-asserted */
++	preboot_pcie_enable();
++
++	preboot_puts("Waiting for PCIe UP status\n");
++
++	/* Reset start timer */
++	start = timestamp_get_us();
++
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh;
++
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++		if (prstn && smlh && rdlh) {
++			preboot_puts("PCIe link is UP!\n");
++			break;
++		}
++
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PCIe link UP!\n");
++			break;
++		}
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++
++	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
+diff --git a/arch/greco/arm/common.h b/arch/greco/arm/common.h
+index d21e2e4..48d91f5 100644
+--- a/arch/greco/arm/common.h
++++ b/arch/greco/arm/common.h
+@@ -56,4 +56,5 @@
+ #define SW_ALL_RST_M_MSK		0xFFFFFFFF
+ #define SW_ALL_RST_H_MSK		0x7FFFFF
+ 
++#define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
+ #endif /* COMMON_GRECO_H_ */
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index b4c4a85..63a98bc 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -67,9 +67,7 @@
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_EXT_LD_TIMEOUT_US		576
+ 
+-#define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
+ #define ARC_HALT_ACK_RETRIES		100
+-
+ 
+ bool hl_is_debug_mode(enum hl_debug_hw_func func)
+ {
+@@ -514,71 +512,6 @@
+ 	preboot_disable_pcie_ltr();
+ 
+ 	/* Enable and Mask LTSSM (erratum 102) */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+-void preboot_pcie_wait_for_link(void)
+-{
+-	u64 start = timestamp_get_us();
+-
+-	/* init dev id as soon as possible, while waiting for prstn */
+-	preboot_device_id_init();
+-
+-	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
+-		/* If PRSTn does not happen in 5 seconds
+-		 * timeout and return
+-		 */
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PRSTn!\n");
+-			return;
+-		}
+-	}
+-
+-	/* Only after PRSTn is de-asserted */
+-	preboot_pcie_enable();
+-
+-	preboot_puts("Waiting for PCIe UP status\n");
+-
+-	/* Reset start timer */
+-	start = timestamp_get_us();
+-
+-	while (1) {
+-		unsigned int prstn, ltssm, smlh, rdlh;
+-
+-		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+-		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+-		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+-
+-		if (prstn && smlh && rdlh) {
+-			preboot_puts("PCIe link is UP!\n");
+-			break;
+-		}
+-
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PCIe link UP!\n");
+-			break;
+-		}
+-
+-		/*
+-		 * Some host assert prstn during link up while moving to GEN3
+-		 * This cause BAR size to be reset
+-		 * We stop link up process by disabling ltssm
+-		 * till BAR is reconfigured
+-		 */
+-		if (!prstn && ltssm) {
+-			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-
+-		if (prstn && !ltssm) {
+-			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-	}
+-
+-	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 

@@ -1,0 +1,63 @@
+From c26003274badeeeb03c91652b7cc2007333bb0db Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Thu, 18 Feb 2021 22:08:38 +0200
+Subject: [PATCH] [SW-32519] i2c: security: clear "fit ready" event
+
+When a fw loader imitate the LKD and send a "fit ready" command
+to the preboot.
+Preboot goes into a loop and loose its i2c connectivity.
+That happen only when the fit image is corrupted.
+
+Use a flag that differentiate between a checked FIT and a verified FIT.
+Allows ignoring an uncleared FIT_RDY, and by that prevent unnecessary
+i2c disable-enable loop.
+
+Change-Id: Icfed63f1d8d7a6c7c4581b513b28278aa07bd558
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 68f618e..496dbe1 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -16,6 +16,7 @@
+ 
+ struct lkd_status {
+ 	bool is_fit_checked;
++	bool is_fit_ready_ignored;
+ 	u32 msg_reg_val;
+ };
+ 
+@@ -62,6 +63,9 @@
+ 		preboot_disable_iatu_access();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
++		if (sts.is_fit_ready_ignored)
++			return NOT_FOUND;
++
+ 		res = FOUND_SLOW_RETURN;
+ 		/* Tell LKD we got the message */
+ 		cpu_boot_rsp_set(CPU_MSG_OK);
+@@ -85,6 +89,14 @@
+ 		res = NOT_FOUND;
+ 	}
+ 
++	/*
++	 * Allows handling of any future FIT_RDY
++	 * command. Cause it means that the current command is any
++	 * but FIT_RDY. In this case there is no danger of a repeat
++	 * FIT_RDY command loop. It allows taking care of a FIT_RDY
++	 * at the FIT_RDY switch case and in the module run command
++	 */
++	sts.is_fit_ready_ignored = false;
+ 	return res;
+ }
+ 
+@@ -101,6 +113,7 @@
+ 
+ 	err = fit_load_images();
+ 	if (err) {
++		sts.is_fit_ready_ignored = true;
+ 		preboot_security_dynamic_img_open();
+ 		return;
+ 	}

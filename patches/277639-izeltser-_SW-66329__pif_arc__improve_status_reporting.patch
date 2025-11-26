@@ -1,0 +1,73 @@
+From 524ee7e2cd9065ccaff20727cee85f9bc8a4a8ee Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 28 Nov 2022 11:44:37 +0200
+Subject: [PATCH] [SW-66329] pif_arc: improve status reporting
+
+Status reporting is improved by clearing previously set status bits
+when a new FLR is triggered.
+In addition, some status bits are being cleared on the run to better
+reflect the functional state of the system.
+
+Change-Id: Ib0cf48a1e1ed5cd40fea5a926b7a3744bbc9d3be
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index cfaf5fb..400e13c 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -62,6 +62,15 @@
+ 	regmap_writel(reg_val, pif_arc.status_reg);
+ }
+ 
++static void flr_clear_status(u32 status_bit)
++{
++	u32 reg_val;
++
++	reg_val = regmap_readl(pif_arc.status_reg);
++	reg_val &= ~status_bit;
++	regmap_writel(reg_val, pif_arc.status_reg);
++}
++
+ bool is_pcie_initialized(void)
+ {
+ 	/* avoid reading psoc register after init phase */
+@@ -121,7 +130,7 @@
+ 	}
+ 
+ 	regmap_writel(0, pif_arc.psoc2pif_flr_done);
+-	flr_report_status(PIF_STAT_INT_RESET_DONE);
++	flr_clear_status(PIF_STAT_INT_RESET_ACTIVE);
+ }
+ 
+ #define PIF_ISOLATE_OUTBOUND	BIT(0)
+@@ -160,7 +169,7 @@
+ 	regval &= ~PIF_ISOLATE_OUTBOUND;
+ 	regmap_writel(regval, pif_arc.outbound_iso);
+ 
+-	flr_report_status(PIF_STAT_PCI_ACCESS_ENABLED);
++	flr_clear_status(PIF_STAT_PCI_ACCESS_DISABLED);
+ }
+ 
+ static void trigger_flr_reset(void)
+@@ -175,9 +184,19 @@
+ 	poll_flr_done();
+ }
+ 
++static void new_flr_sts_prepare(void)
++{
++	u32 clr_mask = PIF_STAT_FLR_EVENT_FINISH | PIF_STAT_SEC_DIE_READY |
++		       PIF_STAT_PCI_ACCESS_DISABLED | PIF_STAT_INT_RESET_ACTIVE |
++		       PIF_STAT_FLR_DONE_REPORTED;
++
++	flr_clear_status(clr_mask);
++	flr_report_status(PIF_STAT_FLR_EVENT_START);
++}
++
+ void pci_dev_specific_run(void)
+ {
+-	flr_report_status(PIF_STAT_FLR_EVENT_START);
++	new_flr_sts_prepare();
+ 	terminate_pci_access();
+ 	trigger_flr_reset();
+ 

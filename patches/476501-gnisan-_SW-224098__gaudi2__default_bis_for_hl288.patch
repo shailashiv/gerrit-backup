@@ -1,0 +1,75 @@
+From db58a2cb21543b32adb8d26c0a986a82a7769870 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 01 Apr 2025 18:13:24 +0300
+Subject: [PATCH] [SW-224098] gaudi2: default bis for hl288
+
+Since supermicro servers do not refresh PCI rev on host reboot, there is
+a problem with using fake security/bis as rev stays 1 instead of 4.
+
+In order to solve this, we set BIS (and rev 4) by default for HL-288
+card (as it is a China only card).
+This does not apply to fake bis/security so we may still have the
+flexibly to test different scenarios.
+
+Change-Id: I7dd44128741a44675887ebffef3361030b715fd8
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 182008c..8d8da75 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -533,6 +533,15 @@
+ 			return GAUDI2_BIS_REV_MAX - 1; /* assume the worst case */
+ 	} else {
+ 		fuse = preboot_get_hl_sec_fake_efuse();
++
++		/* HL-288 is China only card so BIS D is set by default,
++		 * unless fake security is enabled.
++		 * This is because SuperMicro servers reboot do not produce PRSTn,
++		 * and PCI id and rev is not being refreshed.
++		 * In case that this SuperMicro issue is resolved, we can remove this default.
++		 */
++		if (!preboot_fake_security_is_enabled() && is_card_type_pcie())
++			return GAUDI2_BIS_REV_D;
+ 	}
+ 
+ 	if (fuse->bis_d_compliant)
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 6fc87ea..14aef23 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -360,16 +360,25 @@
+ 	 * To avoid potential mismatch (cold reset done with fake sec enabled)
+ 	 * fake fuse contents are not read from SPI if fake sec is not enabled
+ 	 */
+-	if (preboot_fake_security_is_enabled() && preboot_hl_sec_fuse_cache.is_invalid) {
++	if (preboot_hl_sec_fuse_cache.is_invalid) {
+ 		fuse = &preboot_hl_sec_fuse_cache.fuse;
+-		/* Copy efuse security data */
+-		spi_flash_copy(&fuse->data, FAKE_SECURITY_FUSE_OFFSET + (EFUSE_SEC_OFFSET *
+-				sizeof(*val)), sizeof(*fuse), "FAKE SECURITY FUSE");
+ 
+-		/* Fake fuse data is stored in negative logic */
+-		for (i = 0; i < ARRAY_SIZE(fuse->data); i++) {
+-			val = &fuse->data[i];
+-			*val = ~(*val);
++		if (preboot_fake_security_is_enabled()) {
++			/* Copy efuse security data */
++			spi_flash_copy(&fuse->data, FAKE_SECURITY_FUSE_OFFSET + (EFUSE_SEC_OFFSET *
++						sizeof(*val)), sizeof(*fuse), "FAKE SECURITY FUSE");
++
++			/* Fake fuse data is stored in negative logic */
++			for (i = 0; i < ARRAY_SIZE(fuse->data); i++) {
++				val = &fuse->data[i];
++				*val = ~(*val);
++			}
++		} else if (is_card_type_pcie()) {
++			/* HL-288 is China only card so BIS D is set by default,
++			 * unless fake security is enabled
++			 */
++			fuse->bis_compliant = 1;
++			fuse->bis_d_compliant = 1;
+ 		}
+ 
+ 		preboot_hl_sec_fuse_cache.is_invalid = false;

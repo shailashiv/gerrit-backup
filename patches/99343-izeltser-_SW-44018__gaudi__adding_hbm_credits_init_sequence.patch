@@ -1,0 +1,105 @@
+From a0c7cb8cd289bf4778b614a62ad765f5c2e84971 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 31 May 2021 17:51:39 +0300
+Subject: [PATCH] [SW-44018] gaudi: adding hbm credits init sequence
+
+Porting hbm credits initialization logic from uboot to preboot.
+
+Change-Id: I1049e75827251caaaae715fa09095237b15541fc
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 5c51dca..97ac956 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -19,6 +19,7 @@
+ #include <dma_if_w_s_down_regs.h>
+ #include <dma_if_w_s_down_ch0_regs.h>
+ #include <dma_if_w_s_down_ch1_regs.h>
++#include <dma_if_w_s_regs.h>
+ 
+ #include <string.h>
+ #include <bitops.h>
+@@ -539,3 +540,49 @@
+ 
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_RL_EN, true);
+ }
++
++#define HBM0_WR_VAL		0x33333333
++#define HBM1_WR_VAL		0x55555555
++#define HBM1_WR_VAL_COMPACT	0x33333333
++#define HBM0_RD_VAL		0x77777777
++#define HBM1_RD_VAL		0xDDDDDDDD
++
++void preboot_hbm_credits_init(void)
++{
++	int i, ret;
++	u32 hbm1_wr, mask, base;
++	char dev_maj, dev_min;
++
++	ret = hl_fuse_get_dev_id(&dev_maj, &dev_min);
++
++	if (!ret) {
++		if ((dev_min == '1') && ((dev_maj == 'A') || (dev_maj == 'B')))
++			hbm1_wr = HBM1_WR_VAL;
++		else
++			hbm1_wr = HBM1_WR_VAL_COMPACT;
++	} else {
++		hbm1_wr = HBM1_WR_VAL_COMPACT;
++	}
++
++	/* The following values were determined by VLSI group. */
++	for (i = 0; i < GAUDI_HBM_NUM_DEVICES; i++) {
++		base = i * GAUDI_HBM_CH_DIST;
++		regmap_writel(HBM0_WR_VAL,
++			      base + mmDMA_IF_W_S_HBM0_WR_CRED_CNT);
++		regmap_writel(hbm1_wr, base + mmDMA_IF_W_S_HBM1_WR_CRED_CNT);
++		regmap_writel(HBM0_RD_VAL,
++			      base + mmDMA_IF_W_S_HBM0_RD_CRED_CNT);
++		regmap_writel(HBM1_RD_VAL,
++			      base + mmDMA_IF_W_S_HBM1_RD_CRED_CNT);
++	}
++
++	mask = BIT(0) | BIT(1);
++
++	for (i = 0; i < GAUDI_HBM_NUM_DEVICES; i++) {
++		base = i * GAUDI_HBM_CH_DIST;
++		regmap_writel(mask, base + mmDMA_IF_W_S_HBM_CRED_EN_0);
++		regmap_writel(mask, base + mmDMA_IF_W_S_HBM_CRED_EN_1);
++	}
++
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_HBM_CRED_EN, true);
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 56a0832..d945f8f 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -196,6 +196,7 @@
+ bool preboot_error_inform(u32 major, u32 minor);
+ bool preboot_error_is_pending(void);
+ 
++void preboot_hbm_credits_init(void);
+ void preboot_rate_limiter_init(void);
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 7e5cb79..fa51029 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -362,6 +362,7 @@
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_process_last_rma_info(void) {}
+ __weak void preboot_rate_limiter_init(void) {}
++__weak void preboot_hbm_credits_init(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -393,6 +394,7 @@
+ 	/* Get the VendorID before we lock the access to configuration space */
+ 	preboot_retrieve_device_id_from_pcie();
+ 
++	preboot_hbm_credits_init();
+ 	preboot_rate_limiter_init();
+ 
+ 	preboot_security_init();

@@ -1,0 +1,1246 @@
+From a936bc2114714cb994fb74af6d7e0f9a5515bcc8 Mon Sep 17 00:00:00 2001
+From: Dinesh Kumar Mirche <dmirche@habana.ai>
+Date: Mon, 10 Jun 2024 14:01:52 +0300
+Subject: [PATCH] [SW-179793] gaudi3: sec: enable security in erom
+
+This patch enables the security functionality for
+erom recovery. This patch configures the protections
+bits and range registers to protect the unauthorized
+access to registers during erom recovery.
+
+As many of these functions are used in preboot rtos
+also in future common code will be created for legacy
+preboot an preboot rtos.
+
+Change-Id: I82c37e1f58b0bf6b856196c20749d8054ccc9a91
+Signed-off-by: Dinesh Kumar Mirche <dmirche@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 26eb13b..a8e1e48 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -763,7 +763,7 @@
+ 	return num_crc;
+ }
+ 
+-static bool ppboot_sys_cfg_efuse_is_set(u32 mask)
++bool ppboot_sys_cfg_efuse_is_set(u32 mask)
+ {
+ 	struct hl_fw_sec_info hl_sec_info;
+ 
+diff --git a/arch/gaudi3/common/security.c b/arch/gaudi3/common/security.c
+index 1c3ba90..790f0c8 100644
+--- a/arch/gaudi3/common/security.c
++++ b/arch/gaudi3/common/security.c
+@@ -1,8 +1,1080 @@
+-// SPDX-License-Identifier:     GPL-2.0+
++// SPDX-License-Identifier: Apache-2.0
+ /*
+- * Copyright (C) 2022 HabanaLabs Ltd.
++ * Copyright 2024 HabanaLabs, Ltd.
+  */
++
++#include <stdio.h>
++#include <stddef.h>
++#include <types.h>
++#include <errno.h>
++#include <bitops.h>
++#include <baremetal.h>
++#include <string.h>
++#include <stdbool.h>
++#include <gaudi3_blocks_linux_driver.h>
++#include <mstr_if_rr_lbw_regs.h>
++#include <mstr_if_rr_lbw_masks.h>
++#include <rtr_ctrl_rr_lbw_masks.h>
++#include <mstr_if_rr_hbw_regs.h>
++#include <gaudi3_security.h>
++#include <gaudi3/gaudi3.h>
++#include <gaudi3_efuse.h>
++#include <hl_sec_if.h>
++#include <hl_fw_if.h>
++#include <boot_if.h>
++#include <uart.h>
++#include <hl_boot_if.h>
++#include <arcboot_export.h>
++#include <arcboot_export_dev.h>
++#include <intr_gen_regs.h>
++#include <mstr_if_xresp_lbw_masks.h>
++#include <pcie_wrap_regs.h>
++#include <pcie_wrap_masks.h>
++#include <hl_protbits_fw_if.h>
++#include <security.h>
++#include "security_defs.h"
++
++#define RR_HBW_PRIV_RANGE_MIN		0x0
++/* Below value is to keep HBW RRs configured at 16KB granularity */
++#define RR_HBW_PRIV_RANGE_MAX		0xFFFFFFFFFFFFC000
++/* Start of RSVD + SRAM + VIRTUAL MEM + FW MEM */
++#define RR_HBW_PRIV_START_HBW		0x0100000000000000
++/* End of RSVD + SRAM + VIRTUAL MEM + FW MEM */
++#define RR_HBW_PRIV_END_HBW		0x0300007FDFFFFFFF
++/* Start of RSVD */
++#define RR_HBW_PRIV_START_RSVD		0x0300008000000000
++/* End of RSVD */
++#define RR_HBW_PRIV_END_RSVD		0xFEFFFFFFFFFFFFFF
++
++#define RR_LBW_DBG_ARR_OFFSET		0x2312e700
++#define RR_HBW_DBG_ARR_OFFSET		0x2312edc0
++#define HL_CFG_BASE_FULL		0x300007FF0000000
++
+ /*
+- * TODO: Add gaudi3 specific security implementation
+- * Added empty source for gaudi3 eROM compilation .
++ * Capture lbw range register debug info.
++ * Below structure is aligned with struct lbw_rr_reg
+  */
++struct lbw_rr_reg_dbg {
++	uint8_t status: 1;  /* Range Register is enabled or disabled */
++	uint8_t sym: 1;     /* To indicate if RR instances for all dcore/hdcore */
++			    /* configured with same value */
++	uint8_t log_overflow: 1; /* if RR is programmed more than 4 times, set this bit */
++	uint8_t rsvd: 5;
++
++	uint8_t rr_index; /* Range Register number */
++	enum hl_sec_rr_sel rr_type; /* NOC(0x1), PSOC(0x2), PCIE(0x4: elbi, lbw, mstr) */
++	uint32_t data_min;
++	uint32_t data_max;
++};
++
++/*
++ * Capture hbw range register debug info.
++ * Below structure is aligned with struct hbw_rr_reg
++ */
++struct hbw_rr_reg_dbg {
++	uint8_t status: 1;  /* Range Register is enabled or disabled */
++	uint8_t sym: 1;     /* To indicate if RR instances for all dcore/hdcore */
++			    /* configured with same value */
++	uint8_t log_overflow: 1; /* if RR is programmed more than 4 times, set this bit */
++	uint8_t rsvd: 5;
++
++	uint8_t rr_index; /* Range Register number */
++	enum hl_sec_rr_sel rr_type; /* NOC(0x1), PSOC(0x2), PCIE(0x4) */
++	uint64_t data_min;
++	uint64_t data_max;
++};
++
++struct xbw_rr_reg_dbg {
++	union {
++		struct hbw_rr_reg_dbg *hbw_rr_reg_dbg_arr;
++		struct lbw_rr_reg_dbg *lbw_rr_reg_dbg_arr;
++	};
++};
++
++/* protection bits configurations to open some selective registers */
++static const uint32_t gaudi3_preboot_protbits_data0[] = { 0x400, 0x3 };
++static const uint32_t gaudi3_preboot_protbits_data1[] = { 0x3f, 0x40000000 };
++static const uint32_t gaudi3_preboot_protbits_data2[] = { 0x8 };
++
++static const struct hl_prot_bits_cfg gaudi3_preboot_prot_bits_cfg[] = {
++	{{ HL_BLOCK_TYPE_PSOC, mmD0_PSOC_GLOBAL_CONF_BASE, 1, 0, 0, 0x0, 0x0, 0x0 },
++	  .prot_map = 0x00000004,
++	  .data_map = 0x41,
++	  .data = gaudi3_preboot_protbits_data0,
++	  .data_size = ARRAY_SIZE(gaudi3_preboot_protbits_data0)
++	},
++	{{ HL_BLOCK_TYPE_PCIE, mmD0_PCIE_WRAP_BASE, 1, 0, 0, 0x0, 0x0, 0x0 },
++	  .prot_map = 0x0000000,
++	  .data_map = 0x8000004,
++	  .data = gaudi3_preboot_protbits_data1,
++	  .data_size = ARRAY_SIZE(gaudi3_preboot_protbits_data1)
++	},
++	{{ HL_BLOCK_TYPE_CPU, mmD0_CPU_IF_BASE, 1, 0, 0, 0x0, 0x0, 0x0 },
++	  .prot_map = 0x0000000,
++	  .data_map = 0x00000008,
++	  .data = gaudi3_preboot_protbits_data2,
++	  .data_size = ARRAY_SIZE(gaudi3_preboot_protbits_data2)
++	},
++};
++
++#define PSOC_MASTER_IF_OFFSET	(mmD0_SMI_MSTR_IF_RR_LBW_BASE - mmD0_JT_MSTR_IF_RR_LBW_BASE)
++#define PCIE_MASTER_IF_OFFSET	(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_BASE -\
++					mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE)
++
++static const struct hl_sec_rrs_cfg hl_sec_lbw_rrs_tbl[] = {
++	[HL_SEC_ENGINE_IF_RTR] = {
++		.instances_dist = RRTR_OFFSET,
++		.min_short_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmHD0_RRTR0_RTR_CTRL_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++
++	[HL_SEC_ENGINE_PSOC] = {
++		.instances_dist = PSOC_MASTER_IF_OFFSET,
++		.min_short_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmD0_JT_MSTR_IF_RR_LBW_BASE +
++				mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++
++	[HL_SEC_ENGINE_PCIE] = {
++		.instances_dist = PCIE_MASTER_IF_OFFSET,
++		.min_short_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_NW12_DEC] = {
++		.instances_dist = 0,
++		.min_short_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmD0_NRTR1_NW12_DEC1_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_NRTR] = {
++		.instances_dist = 0,
++		.min_short_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmD0_NRTR0_3CH_CTRL0_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_RIF_RTR] = {
++		.instances_dist = 0,
++		.min_short_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmHD0_RIF_RTR_CTRL_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_SYNC_MNGR] = {
++		.instances_dist = 0,
++		.min_short_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_HIT_AR,
++		.range_en_short_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_0,
++		.range_en_full_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_LBW_BASE +
++			mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_0,
++	},
++};
++
++static const struct hl_sec_rrs_cfg_hbw hl_sec_hbw_rrs_tbl[] = {
++	[HL_SEC_ENGINE_IF_RTR] = {
++		.instances_dist = RRTR_OFFSET,
++		.min_full.lo = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AR,
++		.range_en_full_breg = mmHD0_RRTR0_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_PSOC] = {
++		.instances_dist = PSOC_MASTER_IF_OFFSET,
++		.min_full.lo = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AR,
++		.range_en_full_breg = mmD0_JT_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_PCIE] = {
++		.instances_dist = PCIE_MASTER_IF_OFFSET,
++		.min_full.lo = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AR,
++		.range_en_full_breg = mmD0_PCIE_MSTR_RR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_NRTR] = {
++		.instances_dist = 0,
++		.min_full.lo = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AR,
++		.range_en_full_breg = mmD0_NRTR0_3CH_CTRL0_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_RIF_RTR] = {
++		.instances_dist = 0,
++		.min_full.lo = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AR,
++		.range_en_full_breg = mmHD0_RIF_RTR_CTRL_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_EN_0,
++	},
++	[HL_SEC_ENGINE_SYNC_MNGR] = {
++		.instances_dist = 0,
++		.min_full.lo = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_LO_0,
++		.min_full.hi = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MIN_HI_0,
++		.max_full.lo = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_LO_0,
++		.max_full.hi = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_MAX_HI_0,
++		.hit_wr_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_HIT_AR,
++		.range_en_full_breg = mmHD0_SYNC_MNGR_MSTR_IF_RR_HBW_BASE +
++			mmMSTR_IF_RR_HBW_PRIV_RANGE_EN_0,
++	},
++};
++
++struct hl_fw_sec_info sec_data;
++
++void get_security_info(void)
++{
++	arcboot_rom_get_sec_data(&sec_data);
++}
++
++bool is_hw_rr_config(void)
++{
++	return !!(sec_data.efuse_sys_cfg & EFUSE_SYSCFG_RR_MASK);
++}
++
++bool is_security_debug_disabled(void)
++{
++	return !!(sec_data.efuse_sys_cfg & EFUSE_SEC_DEBUG_DIS_MASK);
++}
++
++bool is_dual_die(void)
++{
++	return !!(sec_data.efuse_sys_cfg & EFUSE_SKU_VALUE_MASK);
++}
++
++void hl_secure_update_hit_reg(int rr_idx, int inst_dist,
++				struct hit_regs *rr_reg, bool write_only, int die)
++{
++	uint32_t rr_dest, hit;
++
++	/* Enable (hit) RR */
++	rr_dest = rr_reg->hit_wr + inst_dist;
++	if (die) {
++		hit = mirror_readl(rr_dest);
++		mirror_writel(hit | BIT(rr_idx), rr_dest);
++	} else {
++		hit = regmap_readl(rr_dest);
++		regmap_writel(hit | BIT(rr_idx), rr_dest);
++	}
++
++	if (write_only)
++		return;
++
++	rr_dest = rr_reg->hit_rd + inst_dist;
++	if (die) {
++		hit = mirror_readl(rr_dest);
++		mirror_writel(hit | BIT(rr_idx), rr_dest);
++	} else {
++		hit = regmap_readl(rr_dest);
++		regmap_writel(hit | BIT(rr_idx), rr_dest);
++	}
++}
++
++void hl_secure_range_enable(uint32_t rr_dest, bool write_only, int die)
++{
++	if (die)
++		mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++	else
++		regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++
++	if (write_only)
++		return;
++
++	if (die)
++		mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++	else
++		regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++}
++
++void hl_secure_range_disable(uint32_t rr_dest, bool write_only, int die)
++{
++	if (die)
++		mirror_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++	else
++		regmap_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++
++	if (write_only)
++		return;
++
++	if (die)
++		mirror_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++	else
++		regmap_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++}
++
++
++void hl_secure_update_rr_reg(int rr_idx, uint32_t inst_offset, struct lbw_rr_reg *rr_reg,
++									bool enable, int die)
++{
++	uint32_t rr_base, rr_dest;
++
++	rr_base = rr_reg->rr_idx_calc * sizeof(uint32_t) + inst_offset;
++	rr_dest = rr_base + rr_reg->reg_min;
++	if (die)
++		mirror_writel(rr_reg->data_min, rr_dest);
++	else
++		regmap_writel(rr_reg->data_min, rr_dest);
++
++	rr_dest = rr_base + rr_reg->reg_max;
++	if (die)
++		mirror_writel(rr_reg->data_max, rr_dest);
++	else
++		regmap_writel(rr_reg->data_max, rr_dest);
++
++	rr_dest = rr_base + rr_reg->range_en;
++	if (enable)
++		hl_secure_range_enable(rr_dest, false, die);
++	else
++		hl_secure_range_disable(rr_dest, false, die);
++
++	hl_secure_update_hit_reg(rr_idx, inst_offset, &rr_reg->hit, false, die);
++}
++
++/* shift bits to get partial address regions for 4KB granularity */
++#define HL_SEC_SHIFT_4K_POS	12
++
++static void hl_secure_lbw_rr_gen(int rr_idx, uint64_t min, uint64_t max, int dist, int inst_num,
++				enum hl_sec_engine_type type, bool cfg_all_inst, bool enable, int die)
++{
++	int i;
++	const struct hl_sec_rrs_cfg *cfg = &hl_sec_lbw_rrs_tbl[type];
++	struct lbw_rr_reg rr_reg;
++
++	rr_reg.data_min = (min & ~LBW_BASE);
++	rr_reg.data_max = (max & ~LBW_BASE);
++
++	if (rr_idx < HL_SEC_LBW_RR_FULL_0) {
++		rr_reg.rr_idx_calc = rr_idx;
++		rr_reg.data_min &= ~GEN_BIT_MASK(HL_SEC_SHIFT_4K_POS);
++		rr_reg.data_max &= ~GEN_BIT_MASK(HL_SEC_SHIFT_4K_POS);
++		rr_reg.reg_min = cfg->min_short_breg;
++		rr_reg.reg_max = cfg->max_short_breg;
++		rr_reg.range_en = cfg->range_en_short_breg;
++	} else {
++		rr_reg.rr_idx_calc = rr_idx - HL_SEC_LBW_RR_FULL_0;
++		rr_reg.reg_min = cfg->min_full_breg;
++		rr_reg.reg_max = cfg->max_full_breg;
++		rr_reg.range_en = cfg->range_en_full_breg;
++	}
++
++	rr_reg.reg_min += dist;
++	rr_reg.reg_max += dist;
++	rr_reg.hit.hit_wr = cfg->hit_wr_breg + dist;
++	rr_reg.hit.hit_rd = cfg->hit_rd_breg + dist;
++	rr_reg.range_en += dist;
++
++	/* Configure specific instance num if cfg_all_inst is false */
++	if (cfg_all_inst == false) {
++		hl_secure_update_rr_reg(rr_idx, cfg->instances_dist * inst_num, &rr_reg, enable, die);
++		return;
++	}
++
++	for (i = 0; i < inst_num; i++)
++		hl_secure_update_rr_reg(rr_idx, cfg->instances_dist * i, &rr_reg, enable, die);
++}
++
++#define HL_SEC_BITS_IN_REG			32
++/* shift bits to get address regions for 16KB granularity */
++#define HL_SEC_SHIFT_16K_POS			14
++
++static void hl_secure_update_rr_reg_hbw(int rr_idx, uint32_t inst_offset, struct hbw_rr_reg *rr_reg, int die)
++{
++	uint64_t rr_base, rr_dest;
++	uint32_t data_max_hi = ((uint32_t)(rr_reg->data_max >> HL_SEC_BITS_IN_REG));
++	uint32_t data_min_hi = ((uint32_t)(rr_reg->data_min >> HL_SEC_BITS_IN_REG));
++
++	rr_base = rr_reg->rr_idx_calc * sizeof(uint32_t) + inst_offset;
++	rr_dest = rr_base + rr_reg->reg_min.lo;
++	if (die)
++		mirror_writel(rr_reg->data_min, rr_dest);
++	else
++		regmap_writel(rr_reg->data_min, rr_dest);
++
++	rr_dest = rr_base + rr_reg->reg_min.hi;
++	if (die)
++		mirror_writel(data_min_hi, rr_dest);
++	else
++		regmap_writel(data_min_hi, rr_dest);
++
++	rr_dest = rr_base + rr_reg->reg_max.lo;
++	if (die)
++		mirror_writel(rr_reg->data_max, rr_dest);
++	else
++		regmap_writel(rr_reg->data_max, rr_dest);
++
++	rr_dest = rr_base + rr_reg->reg_max.hi;
++	if (die)
++		mirror_writel(data_max_hi, rr_dest);
++	else
++		regmap_writel(data_max_hi, rr_dest);
++
++	rr_dest = rr_base + rr_reg->range_en;
++	hl_secure_range_enable(rr_dest, false, die);
++
++	hl_secure_update_hit_reg(rr_idx, inst_offset, &rr_reg->hit, false, die);
++}
++
++static void hl_secure_hbw_rr_gen(int rr_idx, uint64_t min, uint64_t max, int dist,
++						int inst_num, enum hl_sec_engine_type type, int die)
++{
++	int i;
++	struct hbw_rr_reg rr_reg;
++	const struct hl_sec_rrs_cfg_hbw *cfg = &hl_sec_hbw_rrs_tbl[type];
++
++	/* Following masks is used for 16K granularity
++	 * As lower 32 bits takes address bits from 31:14
++	 */
++	rr_reg.data_min = (min & ~GEN_BIT_MASK(HL_SEC_SHIFT_16K_POS));
++	rr_reg.data_max = (max & ~GEN_BIT_MASK(HL_SEC_SHIFT_16K_POS));
++
++	rr_reg.rr_idx_calc = rr_idx;
++	rr_reg.reg_min = cfg->min_full;
++	rr_reg.reg_max = cfg->max_full;
++
++	rr_reg.reg_min.lo += dist;
++	rr_reg.reg_min.hi += dist;
++	rr_reg.reg_max.lo += dist;
++	rr_reg.reg_max.hi += dist;
++	rr_reg.hit.hit_wr = cfg->hit_wr_breg + dist;
++	rr_reg.hit.hit_rd = cfg->hit_rd_breg + dist;
++	rr_reg.range_en = cfg->range_en_full_breg + dist;
++
++	for (i = 0; i < inst_num; i++)
++		hl_secure_update_rr_reg_hbw(rr_idx, cfg->instances_dist * i, &rr_reg, die);
++}
++
++#define HL_SEC_LBW_RR_MAX_NUMBER	18
++#define HL_SEC_HBW_RR_MAX_NUMBER	8
++
++#define HL_SEC_BW_RR_REPEAT_NUM		4
++
++/* index to track LBW RR debug array */
++static unsigned int lbw_idx;
++
++/* index to track HBW RR debug array */
++static unsigned int hbw_idx;
++
++/* Array to count each RR programmed number of times */
++static uint8_t lbw_rr_dbg_arr[HL_SEC_LBW_RR_MAX_NUMBER];
++
++/* Array to count each RR programmed number of times */
++static uint8_t hbw_rr_dbg_arr[HL_SEC_HBW_RR_MAX_NUMBER];
++
++static bool hl_secure_xbw_rr_debug_update(void *rr_reg_dbg_arr,
++			int rr_idx, uint64_t min, uint64_t max, bool enable, bool lbw_n_rbw)
++{
++	uint32_t xbw_idx;
++	uint8_t *rr_dbg_arr;
++	uint32_t hl_sec_xbw_rr_limit;
++	struct xbw_rr_reg_dbg rr_reg_dbg;
++
++	if (lbw_n_rbw) {
++		rr_reg_dbg.lbw_rr_reg_dbg_arr = (struct lbw_rr_reg_dbg *)rr_reg_dbg_arr;
++		xbw_idx = lbw_idx;
++		rr_dbg_arr = lbw_rr_dbg_arr;
++		hl_sec_xbw_rr_limit = HL_SEC_LBW_RR_MAX_NUMBER * HL_SEC_BW_RR_REPEAT_NUM;
++	} else {
++		rr_reg_dbg.hbw_rr_reg_dbg_arr = (struct hbw_rr_reg_dbg *)rr_reg_dbg_arr;
++		xbw_idx = hbw_idx;
++		rr_dbg_arr = hbw_rr_dbg_arr;
++		hl_sec_xbw_rr_limit = HL_SEC_HBW_RR_MAX_NUMBER * HL_SEC_BW_RR_REPEAT_NUM;
++	}
++
++	/* if g_lbw_rr_reg_dbg_arr is full, skip logging to avoid overflow */
++	if (xbw_idx < hl_sec_xbw_rr_limit) {
++		/* An RR is configured 4 times already, set the flag */
++		if (rr_dbg_arr[rr_idx] >= HL_SEC_BW_RR_REPEAT_NUM) {
++			rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].log_overflow = 1;
++		}  else  { /* "else":- if still logging required, */
++			/* removing "else"  skip latest RR data update */
++			rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].status = enable;
++			rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].sym = 0;
++			rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].rr_index = rr_idx;
++			if (lbw_n_rbw) {
++				rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].data_min = (min & ~LBW_BASE);
++				rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].data_max = (max & ~LBW_BASE);
++			} else {
++				rr_reg_dbg.hbw_rr_reg_dbg_arr[xbw_idx].data_min = min;
++				rr_reg_dbg.hbw_rr_reg_dbg_arr[xbw_idx].data_max = max;
++			}
++		}
++
++		if (rr_dbg_arr[rr_idx] >= HL_SEC_BW_RR_REPEAT_NUM)
++			rr_reg_dbg.lbw_rr_reg_dbg_arr[xbw_idx].log_overflow = 1;
++		return true;
++
++	} else {
++		return false;
++	}
++}
++
++#define HL_SEC_PSOC_INST_NUM    3 /* JTAG, SMI, I2C */
++#define DIE1_HDCORE_OFFSET      (HDCORE_OFFSET * GAUDI3_NUM_HDCORES_PER_DIE)
++
++static inline void hl_secure_lbw_rr_type_debug_update(struct lbw_rr_reg_dbg *lbw_rr_reg_dbg_arr,
++							bool log_require, uint8_t rr_type_val)
++{
++	if (true == log_require)
++		lbw_rr_reg_dbg_arr[lbw_idx].rr_type |= rr_type_val;
++}
++
++void hl_secure_lbw_rr_common(struct hl_security_drv_data *data, int rr_idx, uint64_t min,
++			uint64_t max, struct hl_security_rr_engine_select rr_sel, bool enable)
++{
++	uint32_t die1_hdcore_offset, num_of_hdcores, hdcore, i, die;
++	/*
++	 * ROT and SEDMA is available in HD1, HD3, HD4 and HD6
++	 * Hence below array.
++	 */
++	uint32_t hdcore_rot_sedma[GAUDI3_NUM_HDCORES] = {0, 1, 0, 1, 1, 0, 1, 0};
++	bool log_require = false;
++	struct lbw_rr_reg_dbg *p_g_lbw_rr_reg_dbg_arr = (struct lbw_rr_reg_dbg *)
++							data->lbw_rr_dbg_offset;
++
++	/* Capture RR info in debug array */
++	if (!data->sec_dbg)
++		log_require = hl_secure_xbw_rr_debug_update(p_g_lbw_rr_reg_dbg_arr,
++							rr_idx, min, max, enable, true);
++	if (rr_sel.noc) {
++		/* update RR debug info for rr_type NOC */
++		hl_secure_lbw_rr_type_debug_update(p_g_lbw_rr_reg_dbg_arr,
++				log_require, HL_SEC_RR_SEL_NOC);
++
++		for (die = 0; die <= data->sku; die++) {
++			die1_hdcore_offset = (DIE1_HDCORE_OFFSET * die);
++			for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE; hdcore++)
++				hl_secure_lbw_rr_gen(rr_idx, min, max, ((HDCORE_OFFSET * hdcore) +
++						die1_hdcore_offset), GAUDI3_NUM_RRTR_PER_HDCORE,
++						HL_SEC_ENGINE_IF_RTR, true, enable, die);
++
++			hl_secure_lbw_rr_gen(rr_idx, min, max, (DIE_OFFSET * die), 0,
++					HL_SEC_ENGINE_NRTR, false, enable, die);
++		}
++
++		num_of_hdcores = (data->sku) ? GAUDI3_NUM_HDCORES : GAUDI3_NUM_HDCORES_PER_DIE;
++		for (hdcore = 0; hdcore < num_of_hdcores; hdcore++) {
++
++			/*
++			 * As we have only 2 ROT and 2 SEDMA per DCORE.
++			 * In case of dual die we need to configure only in HD1, HD3, HD4 and HD6.
++			 * and in case of single die we need to configure only in HD1, HD3.
++			 */
++			if (!hdcore_rot_sedma[hdcore])
++				continue;
++
++			die = (hdcore < GAUDI3_NUM_HDCORES_PER_DIE) ? 0 : 1;
++
++			hl_secure_lbw_rr_gen(rr_idx, min, max, (HDCORE_OFFSET * hdcore), 0,
++							HL_SEC_ENGINE_RIF_RTR, false, enable, die);
++		}
++	}
++	/*
++	 * JTAG, SMI, I2C MSTR_IFs used for blocking JTAG/I2C/SMI
++	 * PSOC traffics.
++	 */
++	if (rr_sel.psoc) {
++		/* update rr_type for PSOC */
++		hl_secure_lbw_rr_type_debug_update(p_g_lbw_rr_reg_dbg_arr,
++				log_require, HL_SEC_RR_SEL_PSOC);
++
++		for (die = 0; die <= data->sku; die++)
++			hl_secure_lbw_rr_gen(rr_idx, min, max, (DIE_OFFSET * die),
++					HL_SEC_PSOC_INST_NUM, HL_SEC_ENGINE_PSOC, true, enable, die);
++	}
++
++	if (rr_sel.pcie) {
++		/* update rr_type for PCIE elbi, lbw, mstr */
++		hl_secure_lbw_rr_type_debug_update(p_g_lbw_rr_reg_dbg_arr, log_require,
++				(HL_SEC_RR_SEL_PCIE | (0xff & (rr_sel.pcie << 3))));
++		/* pcie on die1 is not used, So configure for only die0 pcie */
++		for (i = 0; i < HL_SEC_PCIE_RR_MAX; i++) {
++			if (rr_sel.pcie & BIT(i))
++				hl_secure_lbw_rr_gen(rr_idx, min, max, 0, i,
++						HL_SEC_ENGINE_PCIE, false, enable, 0);
++		}
++		hl_secure_lbw_rr_gen(rr_idx, min, max, 0, 0, HL_SEC_ENGINE_NW12_DEC, false, enable, 0);
++	}
++
++	if (rr_sel.sync_mngr) {
++		for (die = 0; die <= data->sku; die++) {
++			die1_hdcore_offset = (DIE1_HDCORE_OFFSET * die);
++			for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE; hdcore++)
++				hl_secure_lbw_rr_gen(rr_idx, min, max, ((HDCORE_OFFSET * hdcore) +
++						die1_hdcore_offset), 0, HL_SEC_ENGINE_SYNC_MNGR,
++						false, enable, die);
++		}
++	}
++
++	if (true == log_require) {
++		lbw_idx++; /*Increment LBW RR configure logging debug buffer index */
++		lbw_rr_dbg_arr[rr_idx] += 1; /* counting each RR configured how many times */
++	}
++}
++
++static inline void hl_secure_hbw_rr_type_debug_update(struct hbw_rr_reg_dbg
++					*hbw_rr_reg_dbg_arr, bool log_require, uint8_t rr_type_val)
++{
++	if (true == log_require)
++		hbw_rr_reg_dbg_arr[hbw_idx].rr_type |= rr_type_val;
++}
++
++/* For pcie need to configure only PCIE_MSTR_RR_MSTR_IF for HBW */
++#define HL_SEC_HBW_PCIE_INST_NUM        1
++static void hl_secure_hbw_rr_common(struct hl_security_drv_data *data, int rr_idx, uint64_t min,
++				uint64_t max, struct hl_security_rr_engine_select rr_sel)
++{
++	uint32_t die1_hdcore_offset, num_of_hdcores, hdcore, die;
++	/*
++	 * ROT and SEDMA is available in HD1, HD3, HD4 and HD6
++	 * Hence below array.
++	 */
++	uint32_t hdcore_rot_sedma[GAUDI3_NUM_HDCORES] = {0, 1, 0, 1, 1, 0, 1, 0};
++	bool log_require = false;
++	struct hbw_rr_reg_dbg *p_g_hbw_rr_reg_dbg_arr = (struct hbw_rr_reg_dbg *)
++								data->hbw_rr_dbg_offset;
++
++
++	/* Capture RR info in debug array */
++	if (!data->sec_dbg)
++		log_require = hl_secure_xbw_rr_debug_update(p_g_hbw_rr_reg_dbg_arr,
++							rr_idx, min, max, 0, false);
++
++	if (rr_sel.noc) {
++		/* update RR debug info for rr_type NOC */
++		hl_secure_hbw_rr_type_debug_update(p_g_hbw_rr_reg_dbg_arr,
++				log_require, HL_SEC_RR_SEL_NOC);
++
++		for (die = 0; die <= data->sku; die++) {
++			die1_hdcore_offset = (DIE1_HDCORE_OFFSET * die);
++			for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE; hdcore++)
++				hl_secure_hbw_rr_gen(rr_idx, min, max, ((HDCORE_OFFSET * hdcore) +
++						die1_hdcore_offset), GAUDI3_NUM_RRTR_PER_HDCORE,
++						HL_SEC_ENGINE_IF_RTR, die);
++
++		}
++
++		num_of_hdcores = (data->sku) ? GAUDI3_NUM_HDCORES : GAUDI3_NUM_HDCORES_PER_DIE;
++		for (hdcore = 0; hdcore < num_of_hdcores; hdcore++) {
++
++			/*
++			 * As we have only 2 ROT and 2 SEDMA per DCORE.
++			 * In case of dual die we need to configure only in HD1, HD3, HD4 and HD6.
++			 * and in case of single die we need to configure only in HD1, HD3.
++			 */
++			if (!hdcore_rot_sedma[hdcore])
++				continue;
++
++			die = (hdcore < GAUDI3_NUM_HDCORES_PER_DIE) ? 0 : 1;
++
++			hl_secure_hbw_rr_gen(rr_idx, min, max, (HDCORE_OFFSET * hdcore), 1,
++									HL_SEC_ENGINE_RIF_RTR, die);
++		}
++	}
++
++	if (rr_sel.psoc) {
++		/* update RR debug info for rr_type PSOC */
++		hl_secure_hbw_rr_type_debug_update(p_g_hbw_rr_reg_dbg_arr,
++				log_require, HL_SEC_RR_SEL_PSOC);
++		for (die = 0; die <= data->sku; die++)
++			hl_secure_hbw_rr_gen(rr_idx, min, max, (DIE_OFFSET * die),
++					HL_SEC_PSOC_INST_NUM, HL_SEC_ENGINE_PSOC, die);
++	}
++
++	if (rr_sel.pcie) {
++		/* pcie on die1 is not used, So configure for only die0 pcie */
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_HBW_PCIE_INST_NUM,
++				HL_SEC_ENGINE_PCIE, 0);
++
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, 1, HL_SEC_ENGINE_NRTR, 0);
++	}
++
++	if (rr_sel.sync_mngr) {
++		for (die = 0; die <= data->sku; die++) {
++			die1_hdcore_offset = (DIE1_HDCORE_OFFSET * die);
++			for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE; hdcore++)
++				hl_secure_hbw_rr_gen(rr_idx, min, max, ((HDCORE_OFFSET * hdcore) +
++						die1_hdcore_offset), 1, HL_SEC_ENGINE_SYNC_MNGR, die);
++		}
++	}
++
++	if (true == log_require) {
++		hbw_idx++; /*Increment HBW RR configure logging debug buffer index */
++		hbw_rr_dbg_arr[rr_idx] += 1; /* counting each RR configured how many times */
++	}
++}
++
++static void preboot_secure_hbw(void)
++{
++	struct hl_security_rr_engine_select rr_sel;
++	uint64_t min, max;
++	struct hl_security_drv_data data;
++
++	get_security_info();
++	data.sku = !is_dual_die();
++	data.sec_dbg = is_security_debug_disabled();
++	data.hbw_rr_dbg_offset = RR_HBW_DBG_ARR_OFFSET;
++
++	memset(&rr_sel, 0, sizeof(struct hl_security_rr_engine_select));
++
++	if (!is_hw_rr_config()) {
++		/* Block noc and psoc RR in preboot */
++		rr_sel.psoc = 1;
++		rr_sel.noc = 1;
++		rr_sel.sync_mngr = 1;
++
++		min = RR_HBW_PRIV_RANGE_MIN;
++		max = RR_HBW_PRIV_RANGE_MAX;
++
++		hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_7, min, max, rr_sel);
++	}
++
++	rr_sel.pcie = HL_SECURITY_PCIE_MSTR_RR;
++	/*
++	 * To open PCIE OB(Top and Bottom) and close other regions
++	 * following sequence is used
++	 * 0x0000000000000000 - 0x00FFFFFFFFFFFFFF - open PCIE OB bottom
++	 * 0x0100000000000000 - 0x0300007FDFFFFFFF - close
++	 * 0x0300008000000000 - 0xFEFFFFFFFFFFFFFF - close
++	 * 0xFF00000000000000 - 0xFFFFFFFFFFFFC000 - open PCIE OB top
++	 */
++
++	min = RR_HBW_PRIV_START_HBW;
++	max = SRAM_BASE_ADDR - 1;
++	hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_0, min, max, rr_sel);
++
++	min = SRAM_BASE_ADDR + DRAM_MAX_SIZE;
++	max = RR_HBW_PRIV_END_RSVD;
++	hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_7, min, max, rr_sel);
++}
++
++static void preboot_secure_lbw(void)
++{
++	uint64_t min, max;
++	struct hl_security_rr_engine_select rr_sel;
++	struct hl_security_drv_data data;
++
++	get_security_info();
++	data.sku = !is_dual_die();
++	data.sec_dbg = is_security_debug_disabled();
++	data.lbw_rr_dbg_offset = RR_LBW_DBG_ARR_OFFSET;
++
++	memset(&rr_sel, 0, sizeof(struct hl_security_rr_engine_select));
++
++	if (!is_hw_rr_config()) {
++
++		rr_sel.noc = 1;
++		rr_sel.psoc = 1;
++		rr_sel.sync_mngr = 1;
++
++		/* LBW SPACE: 0x0300007FE0000000 - 0x0300007FFFFFFFFF */
++		min = LBW_BASE;
++		max = LBW_BASE + LBW_SIZE - 1;
++
++		/* This blocks the entire region of noc and psoc as done in arcboot for pcie */
++		hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_13, min, max, rr_sel, true);
++	}
++
++	rr_sel.noc = 0;
++	rr_sel.psoc = 0;
++	rr_sel.sync_mngr = 0;
++	rr_sel.pcie = HL_SECURITY_PCIE_MSTR_RR | HL_SECURITY_PCIE_LBW_RR;
++
++	/*
++	 * To open D0_PCIE_WRAP, D0_PSOC_GLOBAL_CONF, D0_CPU_IF regions and
++	 * INTR_GEN_MSG2WIRE_SW register.
++	 * Following sequence to be used to close other regions
++	 *
++	 * 0x0300007FE0000000 - 0x0300007FFC400FFF - close
++	 * 0x0300007FFC401000 - 0x0300007FFC401FFF - open PCIE_WRAP region
++	 * 0x0300007FFC402000 - 0x0300007FFC48AFFF - close
++	 * 0x0300007FFC48B000 - 0x0300007FFC48BFFF - open PSOC_GLOBAL_CONF region
++	 * 0x0300007FFC48C000 - 0x0300007FFC4D4008 - close
++	 * 0x0300007FFC4D400C - open mmMSG2WIRE_SH_HD_MSG_ADDR
++	 * 0x0300007FFC4D4010 - 0x0300007FFC740FFF - close
++	 * 0x0300007FFC741000 - 0x0300007FFC741FFF - open CPU_IF
++	 * 0x0300007FFC742000 - 0x0300007FFFFFFFFF - close
++	 *
++	 */
++
++	/*
++	 * As only 28:12 bits are taken into account in the MIN/MAX range
++	 * so this means 0 is programmed as min
++	 */
++	min = LBW_BASE;
++	max = HL_CFG_BASE_FULL + mmD0_PCIE_BMU_BASE + D0_PCIE_BMU_MAX_OFFSET - 1;
++	hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_0, min, max, rr_sel, true);
++
++	min = HL_CFG_BASE_FULL + mmD0_PCIE_DBI_SIG_BASE;
++	max = HL_CFG_BASE_FULL + mmD0_PSOC_EFUSE_BASE + D0_PSOC_EFUSE_MAX_OFFSET - 1;
++	hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_1, min, max, rr_sel, true);
++
++	min = HL_CFG_BASE_FULL + mmD0_PSOC_BTL_BASE;
++	max = HL_CFG_BASE_FULL + mmD0_PARC_INT_GEN_BASE + mmINTR_GEN_MSG2WIRE_SH_HD;
++	hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_2, min, max, rr_sel, true);
++
++	min = HL_CFG_BASE_FULL + mmD0_PARC_INT_GEN_BASE + mmINTR_GEN_MSG2WIRE_SW + 4;
++	max = HL_CFG_BASE_FULL + mmD0_SPDMA0_DUP_ENG_BASE - 1;
++	hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_3, min, max, rr_sel, true);
++
++	min = HL_CFG_BASE_FULL + mmD0_SPDMA0_DUP_MSTR_IF_AXADDR_LBW_BASE;
++	max = HL_CFG_BASE_FULL + mmD0_CPU_CA53_CFG_BASE + D0_CPU_CA53_CFG_MAX_OFFSET - 1;
++	hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_4, min, max, rr_sel, true);
++
++	min = HL_CFG_BASE_FULL + mmD0_CPU_TIMESTAMP_BASE;
++	max = LBW_BASE + LBW_SIZE - 1;
++	hl_secure_lbw_rr_common(&data, HL_SEC_LBW_RR_SHORT_13, min, max, rr_sel, true);
++
++}
++
++/*
++ * When security is enabled. There are some PCIE SEI interrupts at the start of
++ * preboot. So clearing those interrupts here
++ */
++static void preboot_clear_interrupts(void)
++{
++	/* clear RR RAZWI for PCIE_MSTR_IF */
++	regmap_writel(MSTR_IF_RR_LBW_AW_RAZWI_HAPPENED_CLR_VAL_M,
++		(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_BASE + mmMSTR_IF_RR_LBW_AW_RAZWI_HAPPENED_CLR));
++	regmap_writel(MSTR_IF_RR_LBW_AR_RAZWI_HAPPENED_CLR_VAL_M,
++		(mmD0_PCIE_MSTR_RR_MSTR_IF_RR_LBW_BASE + mmMSTR_IF_RR_LBW_AR_RAZWI_HAPPENED_CLR));
++
++	/* clear resp lbw interrupt */
++	regmap_writel((MSTR_IF_XRESP_LBW_INTR_CTRL_CLEAR_BRESP_ERR_M |
++			MSTR_IF_XRESP_LBW_INTR_CTRL_CLEAR_RRESP_ERR_M),
++				mmD0_PCIE_MSTR_RR_MSTR_IF_XRESP_LBW_BASE);
++
++	/* clear pfi axi split interrupt */
++	regmap_readl(mmD0_PCIE_WRAP_BASE + mmPCIE_WRAP_AXI_SPLIT_STATUS);
++	regmap_writel(PCIE_WRAP_AXI_SPLIT_STATUS_INTR_S,
++				(mmD0_PCIE_WRAP_BASE + mmPCIE_WRAP_AXI_SPLIT));
++
++	/* clear pcie sei indication, axi interrupt and clear pcie sei status */
++	regmap_writel(PCIE_WRAP_PCIE_IC_SEI_INTR_IND_AXI_ERR_INTR_S,
++			(mmD0_PCIE_WRAP_BASE + mmPCIE_WRAP_PCIE_IC_SEI_INTR_IND));
++	regmap_writel(PCIE_WRAP_AXI_INTR_IND_M, (mmD0_PCIE_WRAP_BASE + mmPCIE_WRAP_AXI_INTR));
++	regmap_readl(mmD0_PCIE_WRAP_BASE + mmPCIE_WRAP_PCIE_SEI_INTR_STATUS);
++
++	/* clear the interrupt at aggregator */
++	regmap_writel(regmap_readl(mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE),
++						mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE);
++}
++
++static int init_prot_bits_block(const struct hl_prot_bits_cfg *prot_bits_cfg,
++					uint32_t index, uint8_t major, uint8_t minor,
++					uint8_t sub_minor, enum hl_block_types block_type)
++{
++	const struct hl_prot_bits_cfg *cfg = &prot_bits_cfg[index];
++	uint8_t b_idx = 0, d_idx = 0;
++	uint32_t val;
++	uintptr_t addr, reg_addr;
++
++	addr = cfg->addr.base_addr + HL_GLBL_PRIV_REG_OFFSET + (major * cfg->addr.major_offset) +
++		(minor * cfg->addr.minor_offset) + (sub_minor * cfg->addr.sub_minor_offset);
++
++	/* Skip D1 configuration for single die SKU */
++	if (is_dual_die())
++		return 0;
++
++	while (b_idx != HL_PROT_BITS_REGS) {
++		reg_addr = addr + (b_idx * 4);
++		if (cfg->data_map & BIT(b_idx)) {
++			if (!cfg->data)
++				return -EINVAL;
++			if (d_idx >= cfg->data_size)
++				return -EINVAL;
++
++			val = cfg->data[d_idx];
++			d_idx++;
++		} else {
++			val = (cfg->prot_map & BIT(b_idx)) ?
++				HL_CNF_ALL_NON_PROT : HL_CNF_ALL_PROT;
++		}
++		regmap_writel(val, reg_addr);
++		b_idx++;
++	}
++
++	return 0;
++}
++
++static void preboot_prot_bits_init(void)
++{
++	uint8_t major_idx, minor_idx, sub_minor_idx;
++	uint16_t cfg_idx;
++	struct hl_prot_bits_addr block_addr;
++
++	for (cfg_idx = 0; cfg_idx < ARRAY_SIZE(gaudi3_preboot_prot_bits_cfg); cfg_idx++) {
++		block_addr = gaudi3_preboot_prot_bits_cfg[cfg_idx].addr;
++
++		for (major_idx = 0; major_idx < block_addr.major; major_idx++) {
++			minor_idx = 0;
++			do {
++				sub_minor_idx = 0;
++				do {
++					init_prot_bits_block(gaudi3_preboot_prot_bits_cfg,
++								cfg_idx, major_idx, minor_idx,
++								sub_minor_idx, block_addr.type);
++					sub_minor_idx++;
++				} while (sub_minor_idx < block_addr.sub_minor);
++				minor_idx++;
++			} while (minor_idx < block_addr.minor);
++		}
++	}
++}
++
++void preboot_security_init(void)
++{
++	if (ppboot_sys_cfg_efuse_is_set(EFUSE_SEC_EN_MASK)) {
++		preboot_prot_bits_init();
++		preboot_secure_lbw();
++		preboot_secure_hbw();
++		cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_SECURITY_EN);
++		preboot_clear_interrupts();
++		preboot_puts("Security enabled.");
++	} else {
++		preboot_puts("Security disabled.");
++	}
++}
+diff --git a/arch/gaudi3/common/security_defs.h b/arch/gaudi3/common/security_defs.h
+new file mode 100644
+index 0000000..927cd87
+--- /dev/null
++++ b/arch/gaudi3/common/security_defs.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0+
++ *
++ * Copyright 2024 HabanaLabs, Ltd.
++ */
++
++#ifndef _PREBOOT_SECURITY_DEF_H_
++#define _PREBOOT_SECURITY_DEF_H_
++
++#define GAUDI3_NUM_OF_DIES              2
++#define GAUDI3_NUM_DCORES_PER_DIE       2
++#define GAUDI3_NUM_RRTR_PER_HDCORE      8
++#define GAUDI3_NUM_MME_PER_DIE          4
++#define GAUDI3_NUM_CORES_PER_MME        2
++#define GAUDI3_NUM_MME_CORES_PER_DIE    (GAUDI3_NUM_MME_PER_DIE * GAUDI3_NUM_CORES_PER_MME)
++
++
++#define GEN_BIT_MASK(n)			(((uint64_t)1 << (n)) - 1)
++#define HDCORE_OFFSET			(mmHD1_ARC_FARM_ARC0_ACP_ENG_BASE - \
++					mmHD0_ARC_FARM_ARC0_ACP_ENG_BASE)
++#define RRTR_OFFSET			(mmHD0_RRTR1_BASE - mmHD0_RRTR0_BASE)
++
++#define DIE_OFFSET			(mmD1_PMMU_HBW_STLB_BASE - mmD0_PMMU_HBW_STLB_BASE)
++
++enum hl_security_pcie_rr_types {
++	HL_SECURITY_PCIE_ELBI_RR = BIT(0),
++	HL_SECURITY_PCIE_MSTR_RR = BIT(1),
++	HL_SECURITY_PCIE_LBW_RR = BIT(2)
++};
++
++enum hl_gaudi3_sku {
++	GAUDI3_SINGLE_DIE_SKU,
++	GAUDI3_DUAL_DIE_SKU,
++};
++
++struct gaudi3_redundancy_ctx {
++	uint8_t initialized;
++	uint8_t num_of_dies;
++	uint8_t num_active_hbm;
++	uint8_t hbm_fault_mask[GAUDI3_NUM_OF_DIES];
++	uint8_t vdec_fault_mask[GAUDI3_NUM_OF_DIES];
++	uint8_t rot_fault_mask[GAUDI3_NUM_OF_DIES];
++	uint8_t hbm_ena_mask;
++	uint8_t reserved0[6];
++	uint64_t tpc_fault_mask[GAUDI3_NUM_OF_DIES];
++	int8_t redundant_vdec[GAUDI3_NUM_OF_DIES];
++	int8_t redundant_hbm[GAUDI3_NUM_OF_DIES];
++	int8_t redundant_rot[GAUDI3_NUM_OF_DIES][GAUDI3_NUM_DCORES_PER_DIE];
++	int8_t redundant_tpc[GAUDI3_NUM_OF_DIES][GAUDI3_NUM_DCORES_PER_DIE];
++	int8_t redundant_mme_row[GAUDI3_NUM_OF_DIES][GAUDI3_NUM_MME_CORES_PER_DIE];
++	uint8_t reserved1[4];
++};
++
++struct gaudi3_enable_masks {
++	uint8_t hbm_enable_mask;
++};
++
++struct hl_isolation_cfg {
++	enum hl_gaudi3_sku sku;
++	struct gaudi3_redundancy_ctx redundancy_ctx;
++	struct gaudi3_enable_masks enable_masks;
++};
++
++struct hl_security_drv_data {
++	struct hl_isolation_cfg iso_cfg;
++	bool sec_dbg;
++	enum hl_sku_type sku;
++	struct hl_fw_sec_info sec_data;
++	uintptr_t lbw_rr_dbg_offset;
++	uintptr_t hbw_rr_dbg_offset;
++};
++
++struct hl_security_rr_engine_select {
++	/** NOC RR selection for security configuration */
++	uint8_t noc;
++	/** PCIE RR selection for security configuration */
++	uint8_t pcie;
++	/** PSOC RR selection for security configuration */
++	uint8_t psoc;
++	/** HMMU RR selection for security configuration */
++	uint8_t hmmu;
++	/** SYNC_MNGR RR selection for security configuration */
++	uint8_t sync_mngr;
++	/** Reserved for future use */
++	uint8_t reserved[11];
++};
++
++#endif  //_PREBOOT_SECURITY_DEF_H_
+diff --git a/include/baremetal.h b/include/baremetal.h
+index dacd0f4..df23f13 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -161,6 +161,17 @@
+ 
+ 	return reg;
+ }
++
++static inline void mirror_rmwritel(u32 addr, u32 data, u32 mask)
++{
++	u32 val;
++
++	val = mirror_readl(addr);
++	val &= ~mask;
++	val |= (data << (__builtin_ffsll(mask) - 1));
++
++	mirror_writel(val, addr);
++}
+ #endif
+ 
+ u32 hl_skip_pcie_init(void);
+diff --git a/include/security.h b/include/security.h
+index 676d881..0412f7b 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -33,5 +33,6 @@
+ void preboot_security_sf_pci_set_ro(bool en);
+ void preboot_security_sram_pci_set_ro(bool en);
+ bool preboot_security_fuse_override(void);
++bool ppboot_sys_cfg_efuse_is_set(u32 mask);
+ 
+ #endif /* _HL_SECURITY_H_ */

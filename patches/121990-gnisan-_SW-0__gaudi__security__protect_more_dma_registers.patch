@@ -1,0 +1,71 @@
+From 5598ce6ec901f847c5b0e0bea397ec31d6f75b6b Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 05 Aug 2021 19:04:42 +0300
+Subject: [PATCH] [SW-0] gaudi: security: protect more dma registers
+
+There are additional registers that need to be protected in the DMA
+area.
+Add those to the protection configuration.
+
+Change-Id: If1fd990b1d92cf8ed9820657b01e8492e2b96a3f
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi/security.c b/arch/gaudi/security.c
+index 542542c..cb8b2bd 100644
+--- a/arch/gaudi/security.c
++++ b/arch/gaudi/security.c
+@@ -31,6 +31,7 @@
+ #include <sif_rtr_ctrl_7_regs.h>
+ #include <dma_if_w_s_down_ch0_regs.h>
+ #include <dma_if_w_s_regs.h>
++#include <dma0_core_regs.h>
+ #include <sync_mngr_w_s_regs.h>
+ #include <gic_regs.h>
+ #include <mmu_up_regs.h>
+@@ -554,7 +555,7 @@
+ #define DMA_CHANNELS		8
+ static void preboot_secure_dma(void)
+ {
+-	u32 i, base, prot_base;
++	u32 i, base, prot_base, mask;
+ 
+ 	for (i = 0; i < DMA_ENGINES; i++) {
+ 		base = i * DMA_DIST;
+@@ -570,10 +571,33 @@
+ 
+ 	/* Protect open pages of DMA CORE */
+ 	for (i = 0; i < DMA_CHANNELS; i++) {
+-		base = i * DMA_DIST;
+-		set_prot_bits_priv_int_conf(mmDMA0_CORE_BASE + base);
++		base = (mmDMA0_CORE_BASE & ~HL_CFG_BASE) + i * DMA_DIST;
++
++		/* Offsets 0x0 - 0x200 not protected */
++
++		/* Offsets 0x200 - 0x280 */
++		prot_base = base + SNGL_REG_PROT_SIZE * 4;
++		mask = (PROT_BIT(mmDMA0_CORE_RD_DBGMEM_ADD) &
++			PROT_BIT(mmDMA0_CORE_RD_DBGMEM_DATA_WR) &
++			PROT_BIT(mmDMA0_CORE_RD_DBGMEM_DATA_RD) &
++			PROT_BIT(mmDMA0_CORE_RD_DBGMEM_CTRL) &
++			PROT_BIT(mmDMA0_CORE_RD_DBGMEM_RC) &
++			PROT_BIT(mmDMA0_CORE_DBG_HBW_AXI_AR_CNT) &
++			PROT_BIT(mmDMA0_CORE_DBG_HBW_AXI_AW_CNT) &
++			PROT_BIT(mmDMA0_CORE_DBG_LBW_AXI_AW_CNT) &
++			PROT_BIT(mmDMA0_CORE_DBG_DESC_CNT) &
++			PROT_BIT(mmDMA0_CORE_DBG_STS) &
++			PROT_BIT(mmDMA0_CORE_DBG_RD_DESC_ID) &
++			PROT_BIT(mmDMA0_CORE_DBG_WR_DESC_ID));
++		regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++		/* Offsets 0x280 - 0xF80 */
++		prot_base += SNGL_REG_PROT_SIZE;
++		set_prot_bits_range_all(prot_base,
++					PROT_SIZE_MAX - (prot_base - base));
++
+ 		/* Protect the QM */
+-		prot_base = base + (mmDMA0_QM_BASE & ~HL_CFG_BASE);
++		prot_base = (mmDMA0_QM_BASE & ~HL_CFG_BASE) + i * DMA_DIST;
+ 		preboot_secure_qm(prot_base);
+ 	}
+ }

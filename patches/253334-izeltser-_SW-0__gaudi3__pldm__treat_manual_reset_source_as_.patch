@@ -1,0 +1,68 @@
+From 1690f23caf51db2078600df2c3f6a5c233d25b56 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 11 Sep 2022 10:58:30 +0300
+Subject: [PATCH] [SW-0] gaudi3: pldm: treat manual reset source as cold
+
+In paladium emulator the full design reset signal sets the reset
+cause to "manual reset" when in fact the entire design is being
+reset same as in cold reset. In order to properly support PCI
+init that depends on the reset source, the "manual reset" source
+in paladium is treated as cold reset
+
+Change-Id: Ie9da0099c2451076df21b84626d725bc3468bf13
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index ecfbe2d..81a00ab 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -103,9 +103,13 @@
+ 		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
+ }
+ 
++__weak u32 gaudi3_rst_src_fixup(u32 rst_src) { return rst_src; }
++
+ u32 hl_rst_src_get(void)
+ {
+-	return regmap_readl(mmD0_PSOC_GLOBAL_CONF_RST_SRC);
++	u32 rst_src = regmap_readl(mmD0_PSOC_GLOBAL_CONF_RST_SRC);
++
++	return gaudi3_rst_src_fixup(rst_src);
+ }
+ 
+ void preboot_pcie_wait_for_link(void)
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index fd0b5e2..9c56d54 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -24,5 +24,6 @@
+ u32 hl_get_die_id(void);
+ bool hl_is_dual_die_sku(void);
+ u64 gaudi3_dma_addr_fixup(u64 loadaddr);
++u32 gaudi3_rst_src_fixup(u32 rst_src);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index 031b2eb..6c95de6 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -78,3 +78,18 @@
+ 		}
+ 	}
+ }
++
++/*
++ * In paladium emulator the full design reset signal sets the reset
++ * cause to "manual reset" when in fact the entire design is being
++ * reset same as in cold reset of the asic. In order to properly support PCI
++ * init that depends on the reset source, the "manual reset" source in
++ * paladium is treated as cold reset
++ */
++u32 gaudi3_rst_src_fixup(u32 rst_src)
++{
++	if (rst_src == HL_MANUAL_RST)
++		return HL_COLD_RST;
++
++	return rst_src;
++}

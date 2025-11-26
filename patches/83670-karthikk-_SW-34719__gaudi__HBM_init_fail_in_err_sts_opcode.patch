@@ -1,0 +1,86 @@
+From 92c58af69d72546bc06244cce390b0439add5f26 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 22 Mar 2021 07:44:24 +0200
+Subject: [PATCH] [SW-34719] gaudi: HBM init fail in err_sts opcode
+
+HBM init failure reason in opcode 11
+offset 136 (as per nvme mi 1.2 specification)
+needs to be updated from info descriptor
+table stored in flash during an hbm
+initialization error.
+
+This patch contains the changes to update
+the hbm init failure reason in preboot.
+
+Change-Id: I4795e433f1c9476e52701b2f7c9267a837fcbb83
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/gaudi/rma_info.c b/gaudi/rma_info.c
+index fd72ae0..629db1f 100644
+--- a/gaudi/rma_info.c
++++ b/gaudi/rma_info.c
+@@ -39,6 +39,7 @@
+ #define FLASH_SECTOR_MAGIC	0xAA55AA55
+ 
+ u8 err_sts_rma_buf[MAX_INFO_DESC_DATA]__aligned(4);
++static struct hbm_init_err rma_hbm_init_err;
+ 
+ struct flash_header {
+ 	union {
+@@ -182,6 +183,8 @@
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_DEVICE_UNUSABLE_FAIL, true);
+ 		preboot_puts_hex("Fatal error:", rma_header->rma_failure.data, 0);
+ 		i2c_rma_failure = rma_header->rma_failure;
++		if (rma_header->rma_failure.hbm_init)
++			rma_hbm_init_err = rma_header->hbm_init_err;
+ 	}
+ 
+ 	/* Clear out the data for buffer re-use */
+@@ -291,3 +294,13 @@
+ 	/* Clear out the data for buffer re-use */
+ 	memset(err_sts_rma_buf, 0, size);
+ }
++
++void rma_info_hbm_init_err_sts(struct hl_i2ci_error_status_hbm_init *op)
++{
++	op->internal_loopback_error = rma_hbm_init_err.internal_loopback;
++	op->lane_detection_error = rma_hbm_init_err.lane_detection;
++	op->no_interrupts_error = rma_hbm_init_err.no_interrupts;
++	op->ecc_initialization_error = rma_hbm_init_err.ecc_init_err;
++	op->mcbist_error = rma_hbm_init_err.mc_bist;
++	op->training_error = rma_hbm_init_err.training_error;
++}
+diff --git a/include/rma_info.h b/include/rma_info.h
+index dc1eca5..7d2f345 100644
+--- a/include/rma_info.h
++++ b/include/rma_info.h
+@@ -13,5 +13,6 @@
+ void rma_info_hbm_par_err_sts(struct hl_i2ci_error_status_hbm_parity *op);
+ void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op);
+ void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op);
++void rma_info_hbm_init_err_sts(struct hl_i2ci_error_status_hbm_init *op);
+ 
+ #endif /* _RMA_INFO_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 9267023..2a9ccab 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -302,6 +302,7 @@
+ __weak void rma_info_hbm_par_err_sts(struct hl_i2ci_error_status_hbm_parity *op) {}
+ __weak void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op) {}
+ __weak void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op) {}
++__weak void rma_info_hbm_init_err_sts(struct hl_i2ci_error_status_hbm_init *op) {}
+ 
+ static void i2csi_update_rma_entry(void)
+ {
+@@ -314,6 +315,9 @@
+ 
+ 		if (i2c_rma_failure.hbm_parity)
+ 			rma_info_hbm_par_err_sts(&op_err_status.fatal_hbm_parity);
++
++		if (i2c_rma_failure.hbm_init)
++			rma_info_hbm_init_err_sts(&op_err_status.fatal_hbm_init);
+ 	}
+ }
+ 

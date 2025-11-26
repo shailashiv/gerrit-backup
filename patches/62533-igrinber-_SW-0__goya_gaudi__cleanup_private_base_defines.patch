@@ -1,0 +1,234 @@
+From 6232e94c5f3918a0acc1864f54707b0630d2f50c Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 30 Nov 2020 01:59:34 +0200
+Subject: [PATCH] [SW-0] goya/gaudi: cleanup private base defines
+
+Goay and Gaudi has been using privately defined *_BASE defines which are
+conflicting with specs *_blocks.h header and thus it cannot be included.
+Resolve the conflicts in favor of the *_blocks.h header inclusion.
+This makes way for the new reset code in Gaudi and less pollution with
+private defines,
+
+Change-Id: Ia313d006222c030bb056fe38d73728a0e4410676
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 3f31b4f..f88879f 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <gaudi_blocks.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_wrap_regs.h>
+ 
+@@ -26,21 +27,24 @@
+ 
+ u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return hl_pll_get_freq(mmPSOC_CPU_PLL_BASE, HL_PLL_DIV1);
++	return hl_pll_get_freq(mmPSOC_CPU_PLL_BASE & ~HL_CFG_BASE, HL_PLL_DIV1);
+ }
+ 
+ void hl_uart_init(void)
+ {
+-	u32 pcie_div2_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV2);
++	u32 pcie_div2_freq, pll_base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE;
++
++	pcie_div2_freq = hl_pll_get_freq(pll_base, HL_PLL_DIV2);
+ 
+ 	preboot_uart_init(pcie_div2_freq / HL_UART_BAUDRATE);
+ }
+ 
+ u32 hl_spi_baudr_get(void)
+ {
+-	u32 factor;
+-	u32 pcie_div2_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV2);
++	u32 factor, pcie_div2_freq;
++	u32 pll_base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE;
+ 
++	pcie_div2_freq = hl_pll_get_freq(pll_base, HL_PLL_DIV2);
+ 	factor = pcie_div2_freq / HL_SPI_FLASH_MAX_FREQ;
+ 
+ 	return factor > 2 ? factor : 2;
+diff --git a/gaudi/common.c b/gaudi/common.c
+index f4a6169..3084393 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <gaudi_blocks.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+@@ -301,26 +302,26 @@
+ 
+ /* Hard coded each of the gaudi on-chip TS device properties */
+ static struct hl_ts_cfg gaudi_hl_ts_data[HL_ASIC_TS_MAX_COUNT] = {
+-	{.base = mmPSOC_TS_BASE, .alarm_a = 110, .alarm_b = 120,
++	{.base = mmPSOC_TS_BASE & ~HL_CFG_BASE, .alarm_a = 110, .alarm_b = 120,
+ 		.use_calib = true, .calib_offset = 11, .hl_tmp_data = { 0 }},
+-	{.base = mmNIC0_TS_BASE, .alarm_a = 110, .alarm_b =  120,
++	{.base = mmNIC0_TS_BASE & ~HL_CFG_BASE, .alarm_a = 110, .alarm_b = 120,
+ 		.use_calib = true, .calib_offset = 10, .hl_tmp_data = { 0 }},
+-	{.base = mmNIC1_TS_BASE, .alarm_a = 110, .alarm_b = 120,
++	{.base = mmNIC1_TS_BASE & ~HL_CFG_BASE, .alarm_a = 110, .alarm_b = 120,
+ 		.use_calib = true, .calib_offset = 9, .hl_tmp_data = { 0 }},
+-	{.base = mmNIC3_TS_BASE, .alarm_a = 110, .alarm_b = 120,
++	{.base = mmNIC3_TS_BASE & ~HL_CFG_BASE, .alarm_a = 110, .alarm_b = 120,
+ 		.use_calib = true, .calib_offset = 8, .hl_tmp_data = { 0 }}
+ };
+ 
+ void hl_ts_data_init(void)
+ {
+-	u32 i;
++	u32 i, pll_base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE;
+ 
+-	gaudi_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE,
+-							HL_PLL_DIV2);
++	gaudi_hl_ts_data[0].freq = hl_pll_get_freq(pll_base, HL_PLL_DIV2);
+ 
++	pll_base = mmPSOC_TPC_PLL_BASE & ~HL_CFG_BASE;
+ 	for (i = 1; i < HL_ASIC_TS_MAX_COUNT; i++)
+-		gaudi_hl_ts_data[i].freq = hl_pll_get_freq(mmPSOC_TPC_PLL_BASE,
+-						HL_PLL_DIV3);
++		gaudi_hl_ts_data[i].freq = hl_pll_get_freq(pll_base,
++							   HL_PLL_DIV3);
+ 	memcpy(hl_ts_data, gaudi_hl_ts_data,
+ 		sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+ }
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 2da4e04..779ce26 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -20,14 +20,6 @@
+ #define PPBOOT_TEXT_BASE		0x7FF0000000
+ #define PREBOOT_TEXT_BASE		(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
+-#define mmPSOC_CPU_PLL_BASE		0xC70000
+-#define mmPSOC_PCI_PLL_BASE		0xC72000
+-#define mmPSOC_TPC_PLL_BASE		0xC73000
+-#define mmPSOC_TS_BASE			0xC76000
+-#define mmNIC0_TS_BASE			0xCF8000
+-#define mmNIC1_TS_BASE			0xD38000
+-#define mmNIC3_TS_BASE			0xDB8000
+-
+ #define FUSE_WORDS_PER_BANK		64
+ #define I2C_SLAVE_ADDRESS		0x4f
+ #define I2C_SLAVE_ADDRESS_DBG		0x47
+diff --git a/goya/asic.c b/goya/asic.c
+index 958fd2b..0d2f2bd 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <goya_blocks.h>
+ #include <psoc_global_conf_regs.h>
+ 
+ #include <preboot.h>
+@@ -21,21 +22,24 @@
+ 
+ u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return hl_pll_get_freq(mmCPU_PLL_BASE, HL_PLL_DIV1);
++	return hl_pll_get_freq(mmCPU_PLL_BASE & ~HL_CFG_BASE, HL_PLL_DIV1);
+ }
+ 
+ void hl_uart_init(void)
+ {
+-	u32 uart_clk_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV1);
++	u32 uart_clk_freq, pll_base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE;
++
++	uart_clk_freq = hl_pll_get_freq(pll_base, HL_PLL_DIV1);
+ 
+ 	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
+ }
+ 
+ u32 hl_spi_baudr_get(void)
+ {
+-	u32 factor;
+-	u32 spi_clk_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV1);
++	u32 factor, spi_clk_freq;
++	u32 pll_base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE;
+ 
++	spi_clk_freq = hl_pll_get_freq(pll_base, HL_PLL_DIV1);
+ 	factor = spi_clk_freq / HL_SPI_FLASH_MAX_FREQ;
+ 
+ 	return factor > 2 ? factor : 2;
+diff --git a/goya/common.c b/goya/common.c
+index 967eb31..1cc3979 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <goya_blocks.h>
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_aux_regs.h>
+@@ -219,22 +220,30 @@
+ 
+ /* Hard coded each of the goya on-chip TS device properties */
+ struct hl_ts_cfg goya_hl_ts_data[GOYA_ASIC_TS_MAX_COUNT] = {
+-	{.base = mmNORTH_THERMAL_SENSOR_BASE, .alarm_a = 110, .alarm_b = 120,
++	{.base = mmNORTH_THERMAL_SENSOR_BASE & ~HL_CFG_BASE,
++		.alarm_a = 110, .alarm_b = 120,
+ 		.calib_offset = 8, .use_calib = true, .hl_tmp_data = { 0 }},
+-	{.base = mmPSOC_TS_BASE, .alarm_a = 110, .alarm_b =  120,
++	{.base = mmPSOC_TS_BASE & ~HL_CFG_BASE,
++		.alarm_a = 110, .alarm_b =  120,
+ 		.calib_offset = 9, .use_calib = true, .hl_tmp_data = { 0 }},
+-	{.base = mmTPC_THEMAL_SENSOR_BASE,  .alarm_a = 110, .alarm_b = 120,
++	{.base = mmTPC_THEMAL_SENSOR_BASE & ~HL_CFG_BASE,
++		.alarm_a = 110, .alarm_b = 120,
+ 		.calib_offset = 10, .use_calib = true, .hl_tmp_data = { 0 }},
+ };
+ 
+ void hl_ts_data_init(void)
+ {
+-	goya_hl_ts_data[0].freq = hl_pll_get_freq(mmCPU_PLL_BASE,
+-						HL_PLL_DIV2);
+-	goya_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE,
+-						HL_PLL_DIV1);
+-	goya_hl_ts_data[2].freq = hl_pll_get_freq(mmTPC_PLL_BASE,
+-						HL_PLL_DIV3);
++	u32 pll_base;
++
++	pll_base = mmCPU_PLL_BASE & ~HL_CFG_BASE;
++	goya_hl_ts_data[0].freq = hl_pll_get_freq(pll_base, HL_PLL_DIV2);
++
++	pll_base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE;
++	goya_hl_ts_data[1].freq = hl_pll_get_freq(pll_base, HL_PLL_DIV1);
++
++	pll_base = mmTPC_PLL_BASE & ~HL_CFG_BASE;
++	goya_hl_ts_data[2].freq = hl_pll_get_freq(pll_base, HL_PLL_DIV3);
++
+ 	memcpy(hl_ts_data, goya_hl_ts_data,
+ 		sizeof(struct hl_ts_cfg) * GOYA_ASIC_TS_MAX_COUNT);
+ }
+diff --git a/goya/common.h b/goya/common.h
+index 446fded..5bfcc1e 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -15,13 +15,6 @@
+ #define PPBOOT_TEXT_BASE	0x7FF0000000
+ #define PREBOOT_TEXT_BASE	(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
+-#define mmNORTH_THERMAL_SENSOR_BASE	0x4A0000
+-#define mmCPU_PLL_BASE			0x4A2000
+-#define mmPSOC_TS_BASE			0xC55000
+-#define mmPSOC_PCI_PLL_BASE		0xC72000
+-#define mmTPC_PLL_BASE			0xE01000
+-#define mmTPC_THEMAL_SENSOR_BASE	0xE02000
+-
+ #define FUSE_WORDS_PER_BANK	0x10
+ #define I2C_SLAVE_ADDRESS	0x4f
+ #define I2C_SLAVE_ADDRESS_DBG	0x47

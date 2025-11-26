@@ -1,0 +1,103 @@
+From 87f773038be5f41c9ed07c02a2195c812ad411ef Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 06 Apr 2021 09:56:22 +0300
+Subject: [PATCH] [SW-30456] ras: add watchdog info to error status
+
+Add watchdog info to error status indicating the last known reset cause.
+Same reset cause if passed along to Linux in case that Linux was able to
+boot.
+
+Only HW watchdog is available for now as further information depands on
+LKD support.
+
+Change-Id: Ic34fa934ab0c3c766cabb413cc56025b94f0b4d7
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 9f8c231..2e43694 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -230,6 +230,14 @@
+ 	}
+ }
+ 
++bool hl_is_watchdog_reset(void)
++{
++	u32 rst_src;
++
++	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	return rst_src == HL_WD_RST;
++}
++
+ void preboot_finalize_fw_info(void)
+ {
+ 	preboot_boot_info_set_fw_info();
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 2a9ccab..f21536f 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -371,6 +371,29 @@
+ 	}
+ }
+ 
++static void i2csi_err_status_set_wd(void)
++{
++	switch (fw_info.reset_cause) {
++	case HL_FW_RESET_CAUSE_HEARTBEAT:
++		op_err_status.wd.heartbeat = 1;
++		break;
++	case HL_FW_RESET_CAUSE_TDR:
++		op_err_status.wd.tdr = 1;
++		break;
++	case HL_FW_RESET_CAUSE_WATCHDOG:
++		op_err_status.wd.hw = 1;
++		break;
++	case HL_FW_RESET_CAUSE_UNKNOWN:
++	default:
++		op_err_status.wd.heartbeat = 0;
++		op_err_status.wd.tdr = 0;
++		op_err_status.wd.hw = 0;
++	}
++
++	/* Clear for next read */
++	fw_info.reset_cause = HL_FW_RESET_CAUSE_UNKNOWN;
++}
++
+ static inline void i2csi_req_process_read_opcode(void)
+ {
+ 	switch (req_wd.hdr.opcode) {
+@@ -407,6 +430,7 @@
+ 		break;
+ 	case HL_I2CI_REQ_OP_ERROR_STATUS:
+ 		i2csi_update_rma_entry();
++		i2csi_err_status_set_wd();
+ 		req_rd.data = (u8 *)&op_err_status;
+ 		req_rd.length = sizeof(op_err_status);
+ 		break;
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index a98d8dc..48836fa 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -257,6 +257,11 @@
+ 		      sizeof(preboot_en_caps));
+ }
+ 
++__weak bool hl_is_watchdog_reset(void)
++{
++	return false;
++}
++
+ void preboot_boot_info_set_fw_info(void)
+ {
+ 	fw_info.version = HL_FW_INFO_VERSION;
+@@ -362,5 +367,9 @@
+ 	crc32_init_lookup();
+ 	preboot_process_last_boot_info();
+ 	preboot_process_last_rma_info();
++
++	if (hl_is_watchdog_reset())
++		fw_info.reset_cause = HL_FW_RESET_CAUSE_WATCHDOG;
++
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }

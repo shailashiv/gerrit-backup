@@ -1,0 +1,124 @@
+From 5a614d6aa213860a66e52ef870ee4d7c4cf97477 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sun, 27 Jun 2021 16:20:37 +0300
+Subject: [PATCH] [SW-46763] sec: fwupd: open region for read only
+
+The FWUPD module is opening its memory region to the host in some cases
+when it sends status to the host. In this case there is no need to allow
+write access.
+
+Change-Id: Ife3615f4deb9073cf219256fabdc0df8b138548c
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 545d8e1..57b68f4 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1716,7 +1716,8 @@
+ 	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
+ }
+ 
+-void preboot_security_dynamic_img_sram_open(enum mem_region img_region)
++void preboot_security_dynamic_img_sram_open(enum mem_region img_region,
++					    enum preboot_mem_access_mode mode)
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
+ 	struct mem_desc mdesc;
+@@ -1752,7 +1753,17 @@
+ 	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
+ 
+ 	/* Finally open the image memory space */
+-	preboot_secure_pcie_rr(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
++	switch (mode) {
++	case ACCESS_RO:
++		preboot_secure_pcie_rr_rd(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
++		break;
++	case ACCESS_WR:
++		preboot_secure_pcie_rr_wr(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
++		break;
++	case ACCESS_RW:
++		preboot_secure_pcie_rr(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
++		break;
++	}
+ }
+ 
+ void preboot_security_dynamic_img_spsram_close(void)
+diff --git a/include/security.h b/include/security.h
+index bbf0740..b130191 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -10,12 +10,19 @@
+ #include <preboot.h>
+ #include <memory.h>
+ 
++enum preboot_mem_access_mode {
++	ACCESS_RO,
++	ACCESS_WR,
++	ACCESS_RW,
++};
++
+ bool preboot_security_is_enabled(void);
+ void preboot_security_init(void);
+ void preboot_security_dynamic_init(void);
+ void preboot_security_dynamic_vers_init(u64 ver_off, u32 size);
+ void preboot_security_dynamic_img_sram_close(void);
+-void preboot_security_dynamic_img_sram_open(enum mem_region img_region);
++void preboot_security_dynamic_img_sram_open(enum mem_region img_region,
++					    enum preboot_mem_access_mode mode);
+ void preboot_security_dynamic_img_spsram_close(void);
+ void preboot_security_dynamic_img_spsram_open(void);
+ void preboot_security_cleanup_before_run(void);
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 476774c..cb6339a 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -153,7 +153,8 @@
+ 	uintptr_t off = (uintptr_t)offset;
+ 
+ 	if (state->use_security && offset)
+-		preboot_security_dynamic_img_sram_open(state->mregion);
++		preboot_security_dynamic_img_sram_open(state->mregion,
++						       ACCESS_RO);
+ 
+ 	status.val = 0;
+ 	status.status = sts;
+@@ -436,7 +437,8 @@
+ 
+ 	if (state->use_security) {
+ 		if (cmd == HL_UPD_MAP_SRAM)
+-			preboot_security_dynamic_img_sram_open(state->mregion);
++			preboot_security_dynamic_img_sram_open(state->mregion,
++							       ACCESS_RW);
+ 		else
+ 			preboot_security_dynamic_img_spsram_open();
+ 	}
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index a966034..c52cbfc 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -481,7 +481,7 @@
+ 
+ 	*offset = (u32)mdesc.base;
+ 
+-	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
++	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI, ACCESS_RW);
+ 	if (sts.is_elbi_desc)
+ 		preboot_security_dynamic_img_spsram_open();
+ 
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index f7cb575..aa8210d 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -237,7 +237,10 @@
+ __weak void preboot_security_init(void) {}
+ __weak void preboot_security_dynamic_init(void) {}
+ __weak void preboot_security_dynamic_vers_init(u64 ver_off, u32 size) {}
+-__weak void preboot_security_dynamic_img_sram_open(enum mem_region img_reg) {}
++__weak void preboot_security_dynamic_img_sram_open(
++		enum mem_region img_reg,
++		enum preboot_mem_access_mode mode)
++{}
+ __weak void preboot_security_dynamic_img_sram_close(void) {}
+ __weak void preboot_security_dynamic_img_spsram_open(void) {}
+ __weak void preboot_security_dynamic_img_spsram_close(void) {}

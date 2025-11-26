@@ -1,0 +1,580 @@
+From aaca6da1da1bba09160afd2c0570c5c834bd0da0 Mon Sep 17 00:00:00 2001
+From: Alona SolntsevaX <asolntsevax@asolntsevax-vm-u20.habana-labs.com>
+Date: Tue, 08 Feb 2022 10:21:42 +0200
+Subject: [PATCH] [SW-73766] gaudi2: add tpm pcr extend
+
+Ppboot uses the signature of the preboot image, the 48 bytes of the 
+signature are used for tpm pcr extend call
+Erom tpm transfers signature of ppboot, Sha384 algo is used
+
+Change-Id: I24acfe011e478e16d0a49383126952c5030c0746
+Signed-off-by: Alona SolntsevaX <asolntsevax@asolntsevax-vm-u20.habana-labs.com>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index fd1fa95..b224300 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -26,6 +26,8 @@
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+ LDFLAGS += -Wl,--just-symbols $(PREBOOT_ROOT_DIR)/../arcboot-custom/exports.elf
++LDFLAGS_TPM := -g -static
++LDFLAGS_TPM += -Wl,--gc-sections
+ LDLIBS := -lgcc
+ 
+ EROM_APP_S := $(shell ls crt0_common_erom.S)
+@@ -79,9 +81,25 @@
+ 	$(HL_DEV_ARCH)/../common/security.o \
+ 	$(HL_DEV_ARCH)/../common/pll.o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+-	$(HL_DEV_ARCH)/$(HL_TARGET).o \
++	$(HL_DEV_ARCH)/$(HL_TARGET).o
+ 
+ EROM_RECOVERY_EXTRA_LIBS := "-lfdt"
++
++EROM_TPM_DEPS := \
++	$(PREBOOT_ROOT_DIR)/lib/common/uart.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/spi.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/spi_flash.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/pll.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/sha512.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/lib_common.o \
++	$(HL_DEV_ARCH_COMMON)/tpm2.o \
++	$(HL_DEV_ARCH_COMMON)/tpm_auth.o \
++	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
++	$(HL_DEV_ARCH)/../common/common.o \
++	$(HL_DEV_ARCH)/../common/pll.o \
++	$(HL_DEV_ARCH)/common.o
+ 
+ .PHONY: all
+ all: clean
+@@ -97,8 +115,8 @@
+ 	@$(CC) $(LDFLAGS) -T $(EROM_PCIE_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_PCIE_DEPS) $(LDLIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+-erom_tpm: erom_tpm.o $(EROM_APP_OBJECTS) $(EROM_TPM_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(EROM_TPM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(LDLIBS) -Wl,--end-group
++erom_tpm: erom_tpm.o $(EROM_APP_OBJECTS) $(EROM_TPM_DEPS) $(EROM_TPM_LD_SCRIPT)
++	@$(CC) $(LDFLAGS_TPM) -T $(EROM_TPM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_TPM_DEPS) $(LDLIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+ %.lds: %.lds.S
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+index 49e5bda..2afd4fc 100644
+--- a/app/ext_rom/erom_tpm.c
++++ b/app/ext_rom/erom_tpm.c
+@@ -6,15 +6,145 @@
+  */
+ 
+ #include <stdint.h>
++#include <preboot.h>
++#include <psoc_global_conf_regs.h>
++#include <psoc_security_regs.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_if.h>
++#include <arcboot_export.h>
++#include <spi_flash.h>
++#include <tpm2.h>
++#include <tpm_auth.h>
++#include <boot_if.h>
++#include <pll.h>
++#include <device.h>
++#include <gaudi2/gaudi2_security.h>
++#include <gaudi2/gaudi2_bootrom.h>
+ 
+-#define ADDR_SW_STATUS_4_REG	0xFCC60210
++#define ARCBOOT_PRIMARY			0
++#define ARCBOOT_SECONDARY		1
++#define ARCBOOT_STATUS_REG_SZ_BITS	32
++#define FLASH_64KB_PADD			65536
++#define FLASH_VALID_MASK		0x1FFFFF
++#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE	46080
++#define HL_FWSRAM_OFFSET		0x7FD0000
++
++#define HL_FWSRAM_BASE			(HL_SDRAM_BASE + \
++					 HL_FWSRAM_OFFSET)
++
++static int arcboot_rom_status_read(enum arcboot_rom_progress progress)
++{
++	uint32_t reg, offset;
++
++	offset = progress / ARCBOOT_STATUS_REG_SZ_BITS;
++	progress = progress % ARCBOOT_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl(mmPSOC_SECURITY_SW_STATUS_0 + offset * 4);
++	return reg & BIT(progress);
++}
++
++static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
++{
++	uint32_t flash_image_offset;
++	uint32_t flash_image_switch;
++
++	/* read if we need to switch order of primary/secondary image */
++	spi_flash_copy(&flash_image_switch, FLASH_IMAGE_SWITCH_OFFSET, 1, "EROM_TPM");
++	if (flash_image_switch != 0) {
++		if (image_ptr != ARCBOOT_SECONDARY)
++			image_ptr = ARCBOOT_SECONDARY;
++		else
++			image_ptr = ARCBOOT_PRIMARY;
++	}
++
++	if (image_ptr == ARCBOOT_SECONDARY)
++		spi_flash_copy(&flash_image_offset, FLASH_SECONDARY_OFFSET, 1, "EROM_TPM");
++	else
++		spi_flash_copy(&flash_image_offset, FLASH_PRIMARY_OFFSET, 1, "EROM_TPM");
++
++	return flash_image_offset;
++}
++
++static int erom_get_ppboot_data(uint32_t *offset, uint16_t *size)
++{
++	uint8_t image_ptr = ARCBOOT_SECONDARY + 1;
++	uint32_t flash_image_offset;
++	uint32_t flash_ppboot_pcie_offset;
++	uint32_t ppboot_pcie_offset;
++	uint32_t ppboot_pcie_size;
++
++	if (arcboot_rom_status_read(PROGRESS_BRINGUP_PCI_SEC))
++		image_ptr = ARCBOOT_SECONDARY;
++	else if (arcboot_rom_status_read(PROGRESS_BRINGUP_PCI_PRI))
++		image_ptr = ARCBOOT_PRIMARY;
++
++	if (image_ptr > ARCBOOT_SECONDARY) {
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return -1;
++	}
++
++	flash_image_offset = arcboot_flash_image_offset(image_ptr);
++	/* check if offset is within safe limits */
++	if ((flash_image_offset + FLASH_64KB_PADD) >= FLASH_VALID_MASK) {
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return -1;
++	}
++
++	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
++					      flash_image_offset);
++	spi_flash_copy(&ppboot_pcie_size, flash_ppboot_pcie_offset, 4, "EROM_TPM");
++	if (ppboot_pcie_size > SECUREBOOT_MAX_PPBOOT_IMG_SIZE ||
++	    ppboot_pcie_size <= SECUREBOOT_IMG_HEAD_FOOTER) {
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return -1;
++	}
++
++	/* check for safe limits */
++	if ((flash_ppboot_pcie_offset + ppboot_pcie_size) >= FLASH_VALID_MASK) {
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return -1;
++	}
++
++	/* remove headers and footers from image, this is the image to verify */
++	ppboot_pcie_size -= SECUREBOOT_IMG_HEAD_FOOTER;
++	/* offset of ppboot+pcie_fw image to verify, start from fw_version */
++	ppboot_pcie_offset = (HL_FWSRAM_BASE + IMG_LEN_SIZE);
++
++	*offset = ppboot_pcie_size;
++	*size = ppboot_pcie_offset;
++
++	return 0;
++}
++
++static void device_init(void)
++{
++	device_init_global_conf();
++	device_init_uart();
++	device_init_efuse();
++}
+ 
+ void erom_tpm(void)
+ {
+-	/* Updating the SW status 4 register */
+-	*(uint32_t *)(ADDR_SW_STATUS_4_REG) = 1;
++	uint32_t offset = 0;
++	uint16_t size = 0;
++
++	device_init();
++	udelay_init();
++	hl_dev_pll_init();
++	hl_uart_init();
++	cpu_boot_if_init();
++
++	if (tpm_init())
++		return;
++
++	if (tpm_startup())
++		return;
++
++	if (erom_get_ppboot_data(&offset, &size))
++		return;
++
++	if (tpm_hash_and_pcr_extend(TPM2_PPBOOT_PCR_IDX, offset, size))
++		return;
+ }
+ 
+ void erom_main_function(void)
+diff --git a/app/ext_rom/recovery_stubs.c b/app/ext_rom/recovery_stubs.c
+index 9fec1bd..f29a792 100644
+--- a/app/ext_rom/recovery_stubs.c
++++ b/app/ext_rom/recovery_stubs.c
+@@ -5,4 +5,10 @@
+  *
+  */
+ 
++#include <stdint.h>
++
+ void preboot_tpm_auth(void) {}
++int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
++{
++	return 0;
++}
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index ae97ffd..9c3c35f 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -30,6 +30,7 @@
+ #include <arcboot_export.h>
+ #include <preboot.h>
+ #include <pll.h>
++#include <sha.h>
+ #include <uart.h>
+ #include <efuse.h>
+ #include <string.h>
+@@ -43,6 +44,7 @@
+ #include <hl.h>
+ #include <address_space.h>
+ #include <gaudi2/gaudi2_security.h>
++#include <tpm2.h>
+ 
+ #define PRODUCT_ID_STR_SIZE			0x8
+ 
+@@ -287,6 +289,16 @@
+ 		return spi_flash_readl(FLASH_PREBOOT_PRIMARY_OFFSET);
+ }
+ 
++__weak int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
++{
++	return -1;
++}
++
++__weak int tpm_init(void)
++{
++	return -1;
++}
++
+ /* SPI DMA can transfer max of data (64KB-8) = 0xFFF8 + (additional CRC)
+  * But destination is 16 byte aligned. So, setting max as (64K-16) (excluding CRC)
+  */
+@@ -310,6 +322,7 @@
+ 	u32 flash_offset;
+ 	u32 num_cycles;
+ 	int ret;
++	uint8_t hash[SHA384_SUM_LEN];
+ 
+ 	flash_offset = ppboot_flash_image_offset(image_ptr);
+ 	image_size = spi_flash_readl(flash_offset);
+@@ -365,6 +378,17 @@
+ 			== SECUREBOOT_VERIFY_FAILED)
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
++	/* Hash is encrypted, and only first 48 bytes of it are used
++	 * Hash is read and not calculated because of ppboot image size
++	 * limitations
++	 */
++	if (!tpm_init()) {
++		memcpy(hash, (void *)(SDRAM_BASE + IMG_LEN_SIZE + image_size),
++		       SHA384_SUM_LEN);
++		if (tpm_pcr_extend(TPM2_PREBOOT_PCR_IDX, hash))
++			preboot_puts("PPBOOT: pcr extend failed\n");
++	}
++
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+ 
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index e7b623a..0450740 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -10,3 +10,5 @@
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/security.c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm2.c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm_auth.c)
+diff --git a/arch/gaudi2/common/tpm2.h b/arch/gaudi2/common/tpm2.h
+deleted file mode 100644
+index c0119bd..0000000
+--- a/arch/gaudi2/common/tpm2.h
++++ /dev/null
+@@ -1,68 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _HL_TPM2_H_
+-#define _HL_TPM2_H_
+-
+-#include <types.h>
+-#include <stdbool.h>
+-
+-/**
+- * TPM2 startup values.
+- *
+- * @TPM2_SU_CLEAR: reset the internal state.
+- * @TPM2_SU_STATE: restore saved state (if any).
+- */
+-enum tpm2_startup_types {
+-	TPM2_SU_CLEAR		= 0x0000,
+-	TPM2_SU_STATE		= 0x0001,
+-};
+-
+-/**
+- * TPM2 return codes.
+- */
+-enum tpm2_return_codes {
+-	TPM2_RC_SUCCESS		= 0x0000,
+-	TPM2_RC_BAD_TAG		= 0x001E,
+-	TPM2_RC_FMT1		= 0x0080,
+-	TPM2_RC_HASH		= TPM2_RC_FMT1 + 0x0003,
+-	TPM2_RC_VALUE		= TPM2_RC_FMT1 + 0x0004,
+-	TPM2_RC_SIZE		= TPM2_RC_FMT1 + 0x0015,
+-	TPM2_RC_BAD_AUTH	= TPM2_RC_FMT1 + 0x0022,
+-	TPM2_RC_HANDLE		= TPM2_RC_FMT1 + 0x000B,
+-	TPM2_RC_VER1		= 0x0100,
+-	TPM2_RC_INITIALIZE	= TPM2_RC_VER1 + 0x0000,
+-	TPM2_RC_FAILURE		= TPM2_RC_VER1 + 0x0001,
+-	TPM2_RC_DISABLED	= TPM2_RC_VER1 + 0x0020,
+-	TPM2_RC_AUTH_MISSING	= TPM2_RC_VER1 + 0x0025,
+-	TPM2_RC_COMMAND_CODE	= TPM2_RC_VER1 + 0x0043,
+-	TPM2_RC_AUTHSIZE	= TPM2_RC_VER1 + 0x0044,
+-	TPM2_RC_AUTH_CONTEXT	= TPM2_RC_VER1 + 0x0045,
+-	TPM2_RC_NEEDS_TEST	= TPM2_RC_VER1 + 0x0053,
+-	TPM2_RC_WARN		= 0x0900,
+-	TPM2_RC_TESTING		= TPM2_RC_WARN + 0x000A,
+-	TPM2_RC_REFERENCE_H0	= TPM2_RC_WARN + 0x0010,
+-	TPM2_RC_LOCKOUT		= TPM2_RC_WARN + 0x0021,
+-};
+-
+-int tpm2_init(void);
+-int tpm2_startup(enum tpm2_startup_types mode);
+-int tpm2_nv_read(u32 index, void *data, u32 count);
+-int tpm2_pcr_extend(u32 index, u32 algorithm, const u8 *digest, u32 digest_len);
+-
+-/* implemented per arch */
+-bool tpm_is_supported(void);
+-void spi_tpm_base_get(unsigned int *regs);
+-unsigned int get_cs_pad_sel_tpm(void);
+-unsigned int get_miso_pad_sel_tpm(void);
+-unsigned int get_mosi_pad_sel_tpm(void);
+-unsigned int get_sclk_out_pad_sel_tpm(void);
+-void spi_ssi_cs1_get(unsigned int *mask, unsigned int *data_offset,
+-		     unsigned int *out_en_offset);
+-void preboot_tpm_auth(void);
+-
+-#endif /* _HL_TPM2_H_ */
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index 452e1ee..16fc6e6 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -9,6 +9,8 @@
+ #include <boot_if.h>
+ #include <tpm2.h>
+ #include <uart.h>
++#include <sha.h>
++#include <boot_desc.h>
+ #include "lzo/unaligned.h"
+ 
+ #define TPM_NV_DEV_SN_ADDRESS	0x01c10100
+@@ -35,6 +37,57 @@
+ 	return 0;
+ }
+ 
++int tpm_init(void)
++{
++	int ret;
++
++	ret = tpm2_init();
++	if (ret) {
++		preboot_puts("TPM: tpm2_init failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	return ret;
++}
++
++int tpm_startup(void)
++{
++	int ret;
++
++	ret = tpm2_startup(TPM2_SU_CLEAR);
++	if (ret) {
++		preboot_puts("TPM: tpm2_startup failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	return ret;
++}
++
++int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
++{
++	int ret;
++
++	if (hash == NULL)
++		return -1;
++
++	ret = tpm2_pcr_extend(image_index, TPM2_ALG_SHA384, hash, TPM2_SHA384_DIGEST_SIZE);
++	if (ret) {
++		preboot_puts("preboot_pcr_extend: pcr extend failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	return ret;
++}
++
++int tpm_hash_and_pcr_extend(uint32_t image_index, uintptr_t image_ptr, uint32_t image_size)
++{
++	uint8_t hash[SHA_SUM_LEN] = { 0 };
++
++	sha_csum((void *)image_ptr, image_size, hash);
++
++	return tpm_pcr_extend(image_index, hash);
++}
++
+ void preboot_tpm_auth(void)
+ {
+ 	int ret;
+@@ -43,15 +96,10 @@
+ 
+ 	efuse_dev_id.tpm_data = 0x0;
+ 
+-	ret = tpm2_init();
+-	if (ret)
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	if (cpu_boot_err_get(CPU_BOOT_ERR_TPM_FAIL))
++		return;
+ 
+-	ret = tpm2_startup(TPM2_SU_CLEAR);
+-	if (ret) {
+-		preboot_puts_hex("TPM: startup failed. ret = ", ret, true);
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
++	tpm_init();
+ 
+ 	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
+ 	if (ret) {
+diff --git a/arch/gaudi2/common/tpm_auth.h b/arch/gaudi2/common/tpm_auth.h
+new file mode 100644
+index 0000000..3ccd57e
+--- /dev/null
++++ b/arch/gaudi2/common/tpm_auth.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _HL_TPM_AUTH_H_
++#define _HL_TPM_AUTH_H_
++
++int tpm_init(void);
++int tpm_startup(void);
++int tpm_hash_and_pcr_extend(uint32_t image_index, uintptr_t image_ptr, uint32_t image_size);
++int tpm_pcr_extend(uint32_t image_index, uint8_t *hash);
++
++#endif /* _HL_TPM_AUTH_H_ */
+diff --git a/include/tpm2.h b/include/tpm2.h
+new file mode 100644
+index 0000000..34c773e
+--- /dev/null
++++ b/include/tpm2.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _HL_TPM2_H_
++#define _HL_TPM2_H_
++
++#include <types.h>
++#include <stdbool.h>
++
++#define TPM2_SHA384_DIGEST_SIZE 48
++
++/**
++ * TPM2 startup values.
++ *
++ * @TPM2_SU_CLEAR: reset the internal state.
++ * @TPM2_SU_STATE: restore saved state (if any).
++ */
++enum tpm2_startup_types {
++	TPM2_SU_CLEAR		= 0x0000,
++	TPM2_SU_STATE		= 0x0001,
++};
++
++/**
++ * TPM2 return codes.
++ */
++enum tpm2_return_codes {
++	TPM2_RC_SUCCESS		= 0x0000,
++	TPM2_RC_BAD_TAG		= 0x001E,
++	TPM2_RC_FMT1		= 0x0080,
++	TPM2_RC_HASH		= TPM2_RC_FMT1 + 0x0003,
++	TPM2_RC_VALUE		= TPM2_RC_FMT1 + 0x0004,
++	TPM2_RC_SIZE		= TPM2_RC_FMT1 + 0x0015,
++	TPM2_RC_BAD_AUTH	= TPM2_RC_FMT1 + 0x0022,
++	TPM2_RC_HANDLE		= TPM2_RC_FMT1 + 0x000B,
++	TPM2_RC_VER1		= 0x0100,
++	TPM2_RC_INITIALIZE	= TPM2_RC_VER1 + 0x0000,
++	TPM2_RC_FAILURE		= TPM2_RC_VER1 + 0x0001,
++	TPM2_RC_DISABLED	= TPM2_RC_VER1 + 0x0020,
++	TPM2_RC_AUTH_MISSING	= TPM2_RC_VER1 + 0x0025,
++	TPM2_RC_COMMAND_CODE	= TPM2_RC_VER1 + 0x0043,
++	TPM2_RC_AUTHSIZE	= TPM2_RC_VER1 + 0x0044,
++	TPM2_RC_AUTH_CONTEXT	= TPM2_RC_VER1 + 0x0045,
++	TPM2_RC_NEEDS_TEST	= TPM2_RC_VER1 + 0x0053,
++	TPM2_RC_WARN		= 0x0900,
++	TPM2_RC_TESTING		= TPM2_RC_WARN + 0x000A,
++	TPM2_RC_REFERENCE_H0	= TPM2_RC_WARN + 0x0010,
++	TPM2_RC_LOCKOUT		= TPM2_RC_WARN + 0x0021,
++};
++
++/**
++ * TPM2 algorithms.
++ */
++enum tpm2_algorithms {
++	TPM2_ALG_SHA1           = 0x04,
++	TPM2_ALG_XOR            = 0x0A,
++	TPM2_ALG_SHA256         = 0x0B,
++	TPM2_ALG_SHA384         = 0x0C,
++	TPM2_ALG_SHA512         = 0x0D,
++	TPM2_ALG_NULL           = 0x10,
++	TPM2_ALG_SM3_256        = 0x12,
++};
++
++int tpm2_init(void);
++int tpm2_startup(enum tpm2_startup_types mode);
++int tpm2_nv_read(u32 index, void *data, u32 count);
++int tpm2_pcr_extend(u32 index, u32 algorithm, const u8 *digest, u32 digest_len);
++
++/* implemented per arch */
++bool tpm_is_supported(void);
++void spi_tpm_base_get(unsigned int *regs);
++unsigned int get_cs_pad_sel_tpm(void);
++unsigned int get_miso_pad_sel_tpm(void);
++unsigned int get_mosi_pad_sel_tpm(void);
++unsigned int get_sclk_out_pad_sel_tpm(void);
++void spi_ssi_cs1_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset);
++void preboot_tpm_auth(void);
++
++#endif /* _HL_TPM2_H_ */

@@ -1,0 +1,92 @@
+From e0fd07a2cf43b503e6e94d8399a94a1138366f0a Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Tue, 27 Feb 2024 11:34:51 +0200
+Subject: [PATCH] [SW-156330] gaudi3: reduce the spi frequency for gaudi3 tpm
+
+SPI baudrate get function is modified to allow configuration
+of different baudrates for different SPI controllers. This
+will be used to reduce the SPI frequency for TPM access
+on gaudi3 asic. On Gaudi3 asic connection to TPM passes
+through CPLD. Therefore, TPM communication is found to be
+functional only below freqencies less than 12.5MHz.
+
+Change-Id: I5ee7701b637f8036144299b6f686e1d553e9d38a
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 009be21..3d76e32 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -25,6 +25,7 @@
+ #include "boot_info.h"
+ #include <common.h>
+ #include <sram_bist.h>
++#include <tpm2.h>
+ 
+ #include <cpu_if_special_regs.h>
+ #include <cpu_if_special_masks.h>
+@@ -240,12 +241,18 @@
+ 	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
+ }
+ 
+-u32 hl_spi_baudr_get(void)
++u32 hl_dev_spi_baudr_get(u32 spi_base)
+ {
+-	u32 factor, pcie_div3_freq;
++	u32 factor, pcie_div3_freq, tpm_spi_base;
+ 
+ 	pcie_div3_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_BASE, HL_PLL_DIV3);
+-	factor = pcie_div3_freq / HL_SPI_FLASH_MAX_FREQ;
++
++	spi_tpm_base_get(&tpm_spi_base);
++
++	if (spi_base == tpm_spi_base)
++		factor = pcie_div3_freq / HL_SPI_TPM_MAX_FREQ;
++	else
++		factor = pcie_div3_freq / HL_SPI_FLASH_MAX_FREQ;
+ 
+ 	/* baud rate doesn't support odd number and must not be 0 */
+ 	factor = (factor < 2) ? 2 : factor;
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 3d807dd..c67f174 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -27,6 +27,12 @@
+ #define HL_PCIE_FW_SRAM_SIZE		SZ_64K
+ #define HL_MEMCPY_MAX_SIZE		SZ_512K
+ 
++/*
++ * In Gaudi3, connection to TPM passes through CPLD. Therefore,
++ * TPM communication works at a reduced frequency of 12.5MHz
++ */
++#define HL_SPI_TPM_MAX_FREQ		12500000
++
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+ 
+diff --git a/lib/common/spi.c b/lib/common/spi.c
+index cfd91ed..a8d9d84 100644
+--- a/lib/common/spi.c
++++ b/lib/common/spi.c
+@@ -424,6 +424,11 @@
+ 	spi_writel(ctx, 0, TXFTLR);
+ }
+ 
++__weak u32 hl_dev_spi_baudr_get(__unused u32 spi_base)
++{
++	return hl_spi_baudr_get();
++}
++
+ void spi_init(struct spi_ctx *ctx)
+ {
+ 	u32 baudr;
+@@ -434,7 +439,7 @@
+ 	if (spi_is_locked(ctx))
+ 		return;
+ 
+-	baudr = hl_spi_baudr_get();
++	baudr = hl_dev_spi_baudr_get(ctx->spi_base);
+ 	/* Validate that baudr is even */
+ 	baudr = (baudr + 1) & ~1;
+ 

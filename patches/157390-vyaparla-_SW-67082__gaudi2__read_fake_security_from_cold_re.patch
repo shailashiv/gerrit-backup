@@ -1,0 +1,103 @@
+From 5e8fb8a22ae745ae248e2543e377268c4c63b263 Mon Sep 17 00:00:00 2001
+From: Varun Kumar Reddy Yaparla <vyaparla@habana.ai>
+Date: Thu, 16 Dec 2021 08:54:37 +0200
+Subject: [PATCH] [SW-67082] gaudi2: read fake security from cold reset flops
+
+This change add support to read fake security from cold
+reset flops2 register which will be set by ARC mgmt when
+CPUCP_PACKET_FAKE_SECURITY_SET is received. This change
+is to read fake security in ppboot to change pci device
+id to secure id when fake security is set. Reading boot
+info in ppboot is costly, which may cause link up issue
+
+Change-Id: I88c0106f32101902f389f9515ee16f0e5d7ced0a
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index ba3ccdd..1f6e765 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -464,11 +464,6 @@
+ 	return preboot_fake_security_is_enabled();
+ }
+ 
+-bool preboot_sec_is_enabled_in_efuse(void)
+-{
+-	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK);
+-}
+-
+ bool preboot_img_validation_is_enabled(void)
+ {
+ 	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index f748692..192103c 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -442,11 +442,6 @@
+ 
+ }
+ 
+-bool preboot_sec_is_enabled_in_efuse(void)
+-{
+-	return preboot_sec_efuse_is_set(EFUSE_SECURITY_ENABLE_BIT);
+-}
+-
+ bool preboot_img_validation_is_enabled(void)
+ {
+ 	return preboot_sec_efuse_is_set(EFUSE_SECURITY_IMG_VALIDATION_BIT);
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 2b749f3..2dff75a 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -86,9 +86,6 @@
+ 	(_g) < (GPIOS_PER_BANK * 5) ? mmPSOC_GPIO4_BASE :	\
+ 	(_g) < (GPIOS_PER_BANK * 6) ? mmPSOC_GPIO5_BASE : 0; })
+ 
+-static u32 fake_security;
+-static bool is_fake_sec_read;
+-
+ static uint64_t hl_gpio_to_bank(int gpio)
+ {
+ 	return gpio < 0 ? 0 : GPIO2BANK(gpio);
+@@ -130,18 +127,11 @@
+ 
+ bool preboot_fake_security_is_enabled(void)
+ {
+-	u32 actual_sz;
++	struct gaudi2_cold_rst_data cold_rst_data;
+ 
+-	if (!is_fake_sec_read) {
+-		if (boot_info_get(HL_BOOT_INFO_FAKE_SECURITY, &fake_security,
+-					sizeof(fake_security), &actual_sz)) {
+-			preboot_puts("Preboot: Failed to read fake security boot info\n");
+-			fake_security = 0;
+-		}
+-		is_fake_sec_read = true;
+-	}
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
+ 
+-	return !!fake_security;
++	return cold_rst_data.fake_security_enable;
+ }
+ 
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+@@ -323,7 +313,7 @@
+ 	 * PCI_IDS_GAUDI2_SEC : 0x1030
+ 	 */
+ 	/* If security is enabled set the PCI ID accordingly*/
+-	if (preboot_sec_is_enabled_in_efuse())
++	if (preboot_security_is_enabled())
+ 		pci_dev_id = PCI_IDS_GAUDI2_SEC;
+ 
+ 	/* using vendor id as a magic number */
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index d2e3c70..35e2c12 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -196,6 +196,5 @@
+ };
+ 
+ void gaudi2_axi_drain_ena(void);
+-bool preboot_sec_is_enabled_in_efuse(void);
+ bool preboot_fake_security_is_enabled(void);
+ #endif /* ARCH_GAUDI2_COMMON_COMMON_H_ */

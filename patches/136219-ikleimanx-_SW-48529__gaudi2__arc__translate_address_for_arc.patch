@@ -1,0 +1,89 @@
+From 752bbdb0a862cdf45876a73ff01c5d23f33fb9c4 Mon Sep 17 00:00:00 2001
+From: Itai Kleiman <itai.kleiman@tandemg.com>
+Date: Sun, 10 Oct 2021 14:52:44 +0300
+Subject: [PATCH] [SW-48529] gaudi2: arc: translate address for arc
+
+translate addresses received by i2c in memcpy to 32 bit
+arc addresses.
+
+Change-Id: Id649e273eee05ef760eb27d669108863b7c1b6b9
+Signed-off-by: Itai Kleiman <itai.kleiman@tandemg.com>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 971e026..e0b0e1f 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -410,3 +410,31 @@
+ 	return false;
+ }
+ 
++static u64 gaudi2_translate_addr(u64 addr)
++{
++	if (addr >= ARC0_ICCM_FULL_BASE &&
++	    addr < (ARC1_DCCM_FULL_BASE + (u64)ARC1_DCCM_SIZE)) {
++		addr = (addr & ARC_ADDR_MASK) | BIT(29);
++		goto ret_addr;
++	}
++
++	if (addr >= ARM_SDRAM_BASE && addr < (ARM_SDRAM_BASE + (u64)ARM_SDRAM_SIZE)) {
++		addr = (addr & ARM_ADDR_MASK) | BIT(28);
++		goto ret_addr;
++	}
++
++	if (addr >= SDRAM_FULL_BASE && addr < (SDRAM_FULL_BASE + (u64)ARM_SDRAM_SIZE)) {
++		addr = (addr & ARC_ADDR_MASK) | BIT(28);
++		goto ret_addr;
++	}
++
++	preboot_puts_hex64("warn: no address translation: ", addr, true);
++
++ret_addr:
++	return addr;
++}
++
++u64 preboot_translate_addr(u64 addr)
++{
++	return gaudi2_translate_addr(addr);
++}
+diff --git a/include/memory.h b/include/memory.h
+index 46fc41a..9622de9 100644
+--- a/include/memory.h
++++ b/include/memory.h
+@@ -36,5 +36,6 @@
+ int preboot_get_mem_region(enum mem_region region, struct mem_desc *desc);
+ void preboot_init_stack_monitor(void);
+ bool preboot_check_stack_monitor(void);
++u64 preboot_axi2local_translate(u64 addr);
+ 
+ #endif /* _MEMORY_H_ */
+diff --git a/lib/preboot/i2cslave_indirect.c b/lib/preboot/i2cslave_indirect.c
+index d984610..cbc0c15 100644
+--- a/lib/preboot/i2cslave_indirect.c
++++ b/lib/preboot/i2cslave_indirect.c
+@@ -206,6 +206,7 @@
+ 
+ static void i2csi_req_memcpy_ctrl(void)
+ {
++	op_memcpy.address = preboot_axi2local_translate(op_memcpy.address);
+ 	if (op_memcpy.address < SDRAM_BASE)
+ 		goto memcpy_ctrl_fail;
+ 
+diff --git a/lib/preboot/memory.c b/lib/preboot/memory.c
+index 6825e8c..793f2b1 100644
+--- a/lib/preboot/memory.c
++++ b/lib/preboot/memory.c
+@@ -90,3 +90,13 @@
+ 
+ 	return retval;
+ }
++
++__weak u64 preboot_translate_addr(u64 addr)
++{
++	return addr;
++}
++
++u64 preboot_axi2local_translate(u64 addr)
++{
++	return preboot_translate_addr(addr);
++}

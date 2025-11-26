@@ -1,0 +1,303 @@
+From d070501f448e984fdf68d39c8361a21c700af8dd Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Fri, 23 Feb 2024 15:16:16 +0200
+Subject: [PATCH] [SW-137122] gaudi3: erom rec: cleaned up pci and flr handling
+
+In erom, we always bringup pcie link through ARC1 only. Here
+we won't run PIF ARC and it can't handle FLR RST. so we should
+not enable flr handling in PIF ARC.
+By default HW will handle the FLR.
+
+Since PIF ARC not running, is_pci_initialized should check
+smlh, rdlh registers. Moved pci dev specific functions to
+device specific files.
+
+Change-Id: I894283b420f6908162120aa1de1adaa3d4eb718b
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 3b4f662..7a0f9d3 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -726,6 +726,22 @@
+ 	}
+ }
+ 
++void pci_dev_specific_pll_init(void)
++{
++	unsigned int rst_src = hl_rst_src_get();
++
++	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
++		hl_dev_pci_pll_wa();
++}
++
++void pci_dev_specific_mem_enabled(void)
++{
++	unsigned int rst_src = hl_rst_src_get();
++
++	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
++		hl_pci_iatu_init();
++}
++
+ #define MSIX_PBA_OFFSET_REG_VAL	0x2002
+ 
+ void set_pci_msix_pba_offset_val(void)
+diff --git a/arch/gaudi3/common/pci.c b/arch/gaudi3/common/pci.c
+index 9b025c3..735e5ea 100644
+--- a/arch/gaudi3/common/pci.c
++++ b/arch/gaudi3/common/pci.c
+@@ -9,8 +9,8 @@
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <gaudi3_reg_map.h>
+ #include <gaudi3_fw_if.h>
+-#include <pif_arc_special_regs.h>
+-#include <hl_pif_arc_if.h>
++#include <pcie_aux_masks.h>
++#include <pcie_aux_regs.h>
+ #include <hl_pci_if.h>
+ #include <hl_boot_if.h>
+ #include <address_space.h>
+@@ -21,16 +21,24 @@
+ #include <pci.h>
+ #include <hl.h>
+ 
+-static u32 pif_prev_err;
++static bool pcie_initialized;
+ 
+ /* TODO: Move this functions to emb common modules */
+ bool is_pcie_initialized(void)
+ {
+-	u32 regval;
++	unsigned int prstn, smlh, rdlh;
+ 
+-	regval = regmap_readl(mmD0_PIF_ARC_STATUS);
+-	if (regval & PIF_STAT_PCIE_INIT_DONE)
++	if (pcie_initialized)
+ 		return true;
++
++	prstn = regmap_readl(global_conf.prstn_reg);
++	smlh = regmap_readl(pci.aux_rdlh_link_up_reg);
++	rdlh = regmap_readl(pci.aux_smlh_link_up_reg);
++
++	if (prstn && smlh && rdlh) {
++		pcie_initialized = true;
++		return true;
++	}
+ 
+ 	return false;
+ }
+@@ -41,91 +49,30 @@
+ }
+ 
+ /* TODO: Move this functions to emb common modules */
+-static void pif_arc_ctrl_reset(bool enable)
+-{
+-	u32 val = regmap_readl(mmD0_PIF_ARC_CONTROL);
+-
+-	if (enable)
+-		val |= PIF_CTRL_FLR_RST_EN;
+-	else
+-		val &= ~PIF_CTRL_FLR_RST_EN;
+-
+-	regmap_writel(val, mmD0_PIF_ARC_CONTROL);
+-}
+-
+-/* TODO: Move this functions to emb common modules */
+ void pci_dev_specific_setup(void)
+ {
+-	/* In Preboot no need to perform FLR - disable FLR reset */
+-	pif_arc_ctrl_reset(false);
+-
+ 	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ }
+ 
+-/* TODO: Move this functions to emb common modules */
+-bool pci_dev_specific_pif_err_pending(void)
++void pci_dev_flr_enable(bool enable)
+ {
+-	u32 regval = regmap_readl(mmD0_PIF_ARC_ERROR);
+-
+-	return !(regval == pif_prev_err);
++	/* By default FLR RST handled by HW */
+ }
+ 
+-/* TODO: Move this functions to emb common modules */
+-void hl_pif_report_err(u32 err_bit)
++void pci_dev_specific_flr(void)
+ {
+-	char *msg;
+-	enum pif_runtime_error err = err_bit;
+-
+-	switch (err) {
+-	case ERR_PCI_OUTBOUND_TIMEOUT:
+-		msg = "outbound transactions timeout";
+-		break;
+-	case ERR_FLR_HW_RESET_TIMEOUT:
+-		msg = "FLR HW reset timeout";
+-		break;
+-	case ERR_SEC_DIE_READY_TIMEOUT:
+-		msg = "slave die ready timeout";
+-		break;
+-	case ERR_TS_COUNTER_OVERFLOW:
+-		msg = "ts counter overflow";
+-		break;
+-	case ERR_CPU_EXCEPTION_HALT:
+-		msg = "ARC halt on exeption";
+-		break;
+-	case ERR_PHY_FW_LOAD_TIMEOUT:
+-		msg = "PHY FW update timeout";
+-		break;
+-	case ERR_PCI_LINK_UP_TIMEOUT:
+-		preboot_puts_raw("waiting for pci link for more than 500ms");
+-		return;
+-	default:
+-		preboot_puts_hex_raw("Unknown PIF err reported ", err, false);
+-		return;
+-	}
+-
+-	preboot_puts_raw("PIF err reported: ");
+-	preboot_puts(msg);
+-	preboot_puts("\n");
++	regmap_writel(PCIE_AUX_FLR_INT_IND_M, D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_INT));
+ }
+ 
+-void pci_dev_specific_pif_err_process(void)
++void pci_dev_specific_pll_init(void)
+ {
+-	unsigned int err_idx = 0;
+-	u32 regval, pending;
++	/* Nothing need to implemented for gaudi3 */
++}
+ 
+-	regval = regmap_readl(mmD0_PIF_ARC_ERROR);
+-	pending = regval ^ pif_prev_err;
+-	pending &= regval;
+-
+-	while (pending) {
+-		if (pending & BIT(0))
+-			hl_pif_report_err(err_idx);
+-
+-		pending >>= 1;
+-		err_idx++;
+-	}
+-
+-	pif_prev_err = regval;
++void pci_dev_specific_mem_enabled(void)
++{
++	hl_pci_bmu_init();
++	hl_pci_iatu_init();
+ }
+ 
+ struct hl_pci_inbound_region gaudi3_pci_inbound_regions[] = PCI_IATU_INBOUND_REGIONS_DATA;
+@@ -164,7 +111,7 @@
+ }
+ 
+ #define BMU_CFG_SRC_START_OFF		0x8
+-#define BMU_CFG_SRC_END_OFF		0x48
++#define BMU_CFG_SRC_END_OFF			0x48
+ #define BMU_CFG_DST_OFFS_R0_OFF		0x88
+ #define BMU_CFG_DST_OFFS_R1_OFF		0xC8
+ #define BMU_CFG_AWUSER_R0_OFF		0x108
+@@ -175,8 +122,8 @@
+ #define BMU_CFG_AXI_AW_CACHE_OFF	0x2A8
+ #define BMU_CFG_AXI_AR_PROT_OFF		0x2C8
+ #define BMU_CFG_AXI_AR_CACHE_OFF	0x2E8
+-#define BMU_CFG_ADDR_SHIFT		2
+-#define BMU_CFG_OFF_MASK		0xFFFFFFFFFCull /* GENMASK(39, 2) */
++#define BMU_CFG_ADDR_SHIFT			2
++#define BMU_CFG_OFF_MASK			0xFFFFFFFFFCull /* GENMASK(39, 2) */
+ 
+ static void hl_pci_set_bmu_cfg_region(struct hl_bmu_region *region)
+ {
+@@ -202,7 +149,7 @@
+ }
+ 
+ #define BMU_MEM_SRC_START_OFF		0x500
+-#define BMU_MEM_SRC_END_OFF		0x520
++#define BMU_MEM_SRC_END_OFF			0x520
+ #define BMU_MEM_DST_OFFS_OFF		0x540
+ #define BMU_MEM_AWUSER_R0_OFF		0x560
+ #define BMU_MEM_AWUSER_R1_OFF		0x580
+@@ -213,7 +160,7 @@
+ #define BMU_MEM_AXI_AR_PROT_OFF		0x640
+ #define BMU_MEM_AXI_AR_CACHE_OFF	0x650
+ #define BMU_MEM_DST_BASE_OFF		0x660
+-#define BMU_MEM_ADDR_SHIFT		20
++#define BMU_MEM_ADDR_SHIFT			20
+ #define BMU_MEM_DEST_BASE_SHIFT		48
+ #define BMU_MEM_SRC_MASK		0x3FFFF00000ull	  /* GENMASK(37, 20) */
+ #define BMU_MEM_DEST_MASK		0xFFFFFFF00000ull /* GENMASK(47, 20) */
+diff --git a/lib/common/cmd_module.h b/lib/common/cmd_module.h
+index 320cdc8..d7dacce 100644
+--- a/lib/common/cmd_module.h
++++ b/lib/common/cmd_module.h
+@@ -81,8 +81,10 @@
+ void pci_dev_specific_teardown(void);
+ void pci_dev_specific_hot_rst(void);
+ void pci_dev_specific_run(void);
+-bool pci_dev_specific_pif_err_pending(void);
+-void pci_dev_specific_pif_err_process(void);
++void pci_dev_specific_flr(void);
++void pci_dev_flr_enable(bool enable);
++void pci_dev_specific_pll_init(void);
++void pci_dev_specific_mem_enabled(void);
+ 
+ /* FWUPD */
+ void module_fwupd_setup(void);
+diff --git a/lib/common/module_pci.c b/lib/common/module_pci.c
+index 51e1d50..7e1c50d 100644
+--- a/lib/common/module_pci.c
++++ b/lib/common/module_pci.c
+@@ -132,10 +132,6 @@
+ 	if (!is_pcie_initialized()) {
+ 		pci_init_wait_dbg();
+ 
+-		/* process PIF ARC errors before link up, this is safe when prst_n is asserted */
+-		if (pci_dev_specific_pif_err_pending())
+-			pci_dev_specific_pif_err_process();
+-
+ 		return NOT_FOUND;
+ 	}
+ 
+@@ -160,11 +156,8 @@
+ 
+ __weak void pci_dev_specific_run(void)
+ {
+-	unsigned int rst_src = hl_rst_src_get();
+-
+ 	if (!pci_sts.pci_pll_initialized) {
+-		if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
+-			hl_dev_pci_pll_wa();
++		pci_dev_specific_pll_init();
+ 
+ 		pci_sts.pci_pll_initialized = true;
+ 	}
+@@ -176,12 +169,9 @@
+ }
+ 
+ __weak void pci_dev_specific_post_link_up(void) {}
+-__weak void hl_pci_bmu_init(void) {}
+ 
+ void module_pci_run_fast(void)
+ {
+-	unsigned int rst_src;
+-
+ 	if (pci_sts.flr_reg_val == 1) {
+ 		pci_dev_specific_flr();
+ 		preboot_puts("FLR received\n");
+@@ -207,12 +197,8 @@
+ 
+ 	if (pci_sts.mem_enabled_prev != pci_sts.mem_enabled) {
+ 		pci_sts.mem_enabled_prev = pci_sts.mem_enabled;
+-		rst_src = hl_rst_src_get();
+-		if (pci_sts.mem_enabled && ((rst_src == HL_COLD_RST) ||
+-					    (rst_src == HL_PRSTN_RST))) {
+-			hl_pci_bmu_init();
+-			hl_pci_iatu_init();
+-		}
++		if (pci_sts.mem_enabled)
++			pci_dev_specific_mem_enabled();
+ 
+ 		preboot_puts_raw("PCIe mem_en changed to: ");
+ 		preboot_puts_raw(pci_sts.mem_enabled ? "true" : "false");

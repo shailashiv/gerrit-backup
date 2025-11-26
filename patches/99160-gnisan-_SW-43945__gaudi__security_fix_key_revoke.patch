@@ -1,0 +1,98 @@
+From 96c66eb12ec53dba90bb382dc91e4bc44dfb8acb Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 31 May 2021 11:42:03 +0300
+Subject: [PATCH] [SW-43945] gaudi: security fix key revoke
+
+Fix key revoke process by setting HL_BOOT_INFO_KEY_IDX for external
+signature when loading FIT. Without it, the revoke process is broken.
+
+Change-Id: I4981275f5d2e94eee939d5c62aba1dff0763b973
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index b48ad57..cb40122 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1791,7 +1791,7 @@
+ }
+ 
+ int preboot_verify_img_sig(const void *img, size_t img_size,
+-			   enum fit_sec_failure *res)
++			   enum fit_sec_failure *res, u32 *key_idx)
+ {
+ 	struct hl_fit_sec_desc fit_sec;
+ 	const void *fit_sec_off;
+@@ -1865,6 +1865,8 @@
+ 		return 1;
+ 	}
+ 
++	*key_idx = fit_sec.key_num;
++
+ 	return 0;
+ }
+ 
+diff --git a/include/preboot.h b/include/preboot.h
+index 8a3e6c3..2766364 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -189,7 +189,7 @@
+ 
+ bool preboot_is_image_sig_supported(void);
+ int preboot_verify_img_sig(const void *fit, size_t img_size,
+-			   enum fit_sec_failure *res);
++			   enum fit_sec_failure *res, u32 *key_idx);
+ size_t preboot_get_img_sec_desc_size(void);
+ 
+ u32 preboot_error_read_and_clr(u32 *major, u32 *minor);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 44bb7e0..417e1b7 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -751,9 +751,23 @@
+ }
+ 
+ __weak int preboot_verify_img_sig(const void *fit, size_t img_size,
+-				  enum fit_sec_failure *res)
++				  enum fit_sec_failure *res, u32 *key_idx)
+ {
+-	return 0;
++	return 1;
++}
++
++static int fit_verify_image(const void *fit, size_t fit_size, int conf,
++			    enum fit_sec_failure *res)
++{
++	/*
++	 * for platforms with image security descriptor support, the signature
++	 * of the descriptor is validated. otherwise the fit internal signature
++	 * is validated.
++	 */
++	if (!preboot_is_image_sig_supported())
++		return fit_verify_security(fit, conf, res);
++
++	return preboot_verify_img_sig(fit, fit_size, res, &preboot_key_idx);
+ }
+ 
+ static enum fit_load_result fit_copy_images(const void *fit,
+@@ -778,18 +792,8 @@
+ 	if (!fit_load_is_runnable(fit, conf))
+ 		return FIT_LOAD_CORRUPTED;
+ 
+-	/*
+-	 * for platforms with image security descriptor support, the signature
+-	 * of the descriptor is validated. otherwise the fit internal signature
+-	 * is validated.
+-	 */
+-	if (preboot_is_image_sig_supported()) {
+-		if (preboot_verify_img_sig(fit, fit_size, res))
+-			return FIT_LOAD_SEC_FAILED;
+-	} else {
+-		if (fit_verify_security(fit, conf, res))
+-			return FIT_LOAD_SEC_FAILED;
+-	}
++	if (fit_verify_image(fit, fit_size, conf, res))
++		return FIT_LOAD_SEC_FAILED;
+ 
+ 	if (fit_pub_key_value_node_get(fit))
+ 		return FIT_LOAD_SEC_FAILED;

@@ -1,0 +1,96 @@
+From 9ee42b5fb1fd37d7d9b9f3d5a783c43b3d16b2cd Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Mon, 06 Apr 2020 22:37:12 +0300
+Subject: [PATCH] [SW-11053] gaudi: fix prstn reset after fw update
+
+After firmware update a reboot of host wouldn't bring-up the link.
+This is caused by cold flops not being cleared after firmware update
+finished. This would cause after first PRSTn reset not to initialize
+the PCIe, but clear the cold flop. Only after the second PRSTn the
+PCIe link would come up.
+
+Now we clear the cold flops after booting and not bringing up PCIe
+because link was already up.
+
+Change-Id: Ic084387133530c087338a0bd14ce72c73aa341a7
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index ea26897..3b34975 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -131,11 +131,13 @@
+ 	return false;
+ }
+ 
++__attribute__((weak)) u32 preboot_clr_flops_reset_cause(void) { return 0; }
+ __attribute__((weak)) void ppboot_log_waiting_for_pcie(void) {}
+ 
+ static void ppboot_pcie_init(void)
+ {
+ 	if (hl_pcie_link_up()) {
++		preboot_clr_flops_reset_cause();
+ 		preboot_puts("PCIe link is already UP!\n");
+ 		return;
+ 	}
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 5cb9397..585ab60 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -90,6 +90,15 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
++u32 preboot_clr_flops_reset_cause(void)
++{
++	u32 reset_cause;
++
++	reset_cause = regmap_readl(mmPREBOOT_PCIE_EN);
++	regmap_writel(0, mmPREBOOT_PCIE_EN);
++	return reset_cause;
++}
++
+ /*
+  * This logic copied from BTL PCIe section (#4)
+  * In BTL it is called when DIP switch for PCIe enable is set
+@@ -108,8 +117,7 @@
+ 		return;
+ 
+ 	/* During hard reset triggered by LKD keep PCIe intact */
+-	reset_cause = regmap_readl(mmPREBOOT_PCIE_EN);
+-	regmap_writel(0, mmPREBOOT_PCIE_EN);
++	reset_cause = preboot_clr_flops_reset_cause();
+ 	if (reset_cause == LKD_HARD_RESET_MAGIC)
+ 		return;
+ 
+diff --git a/goya2/common.c b/goya2/common.c
+index ad87908..60092f8 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -92,6 +92,15 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
++u32 preboot_clr_flops_reset_cause(void)
++{
++	u32 reset_cause;
++
++	reset_cause = regmap_readl(mmPREBOOT_PCIE_EN);
++	regmap_writel(0, mmPREBOOT_PCIE_EN);
++	return reset_cause;
++}
++
+ /*
+  * This logic copied from BTL PCIe section (#4)
+  * In BTL it is called when DIP switch for PCIe enable is set
+@@ -110,8 +119,7 @@
+ 		return;
+ 
+ 	/* During hard reset triggered by LKD keep PCIe intact */
+-	reset_cause = regmap_readl(mmPREBOOT_PCIE_EN);
+-	regmap_writel(0, mmPREBOOT_PCIE_EN);
++	reset_cause = preboot_clr_flops_reset_cause();
+ 	if (reset_cause == LKD_HARD_RESET_MAGIC)
+ 		return;
+ 

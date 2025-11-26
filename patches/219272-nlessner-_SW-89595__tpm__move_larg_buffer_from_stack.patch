@@ -1,0 +1,73 @@
+From 287a0f40c3f35f4ce49704187b8c17afa5b50444 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Thu, 09 Jun 2022 19:02:04 +0300
+Subject: [PATCH] [SW-89595] tpm: move larg buffer from stack
+
+Move large buffers from stack so it will not create an overflow and
+re-use response buffer to decrease stack usage.
+
+Change-Id: I5798e140346e06069b7ccc16132c22fb7d110b44
+---
+
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+index cedb167..3a1a379 100644
+--- a/arch/gaudi2/common/tpm2.c
++++ b/arch/gaudi2/common/tpm2.c
+@@ -165,6 +165,9 @@
+ 	HR_NV_INDEX		= TPM_HT_NV_INDEX << HR_SHIFT,
+ };
+ 
++/* Max tpm xfer buffer size + addr */
++static u8 tpm_xfer_buf[TPM_DEV_BUFSIZE + sizeof(u8)];
++static u8 response_buffer[COMMAND_BUFFER_SIZE];
+ static struct spi_ctx tpm_spi = {0};
+ static int locality;
+ 
+@@ -691,7 +694,6 @@
+ 	u64 start, stop;
+ 	unsigned int count, ordinal;
+ 	int ret = 0;
+-	u8 buf[TPM_DEV_BUFSIZE + sizeof(u8)];  /* Max buffer size + addr */
+ 
+ 	/* switch endianness: big->little */
+ 	count = get_unaligned_be32(sendbuf + TPM_CMD_COUNT_BYTE);
+@@ -713,11 +715,11 @@
+ 	start = timestamp_get_us();
+ 	stop = tpm_tis_calc_ordinal_duration(ordinal);
+ 	do {
+-		ret = tpm_spi_recv(buf, sizeof(buf));
++		ret = tpm_spi_recv(tpm_xfer_buf, sizeof(tpm_xfer_buf));
+ 		if (ret >= 0) {
+ 			if (ret > *recv_size)
+ 				return -1;
+-			memcpy(recvbuf, buf, ret);
++			memcpy(recvbuf, tpm_xfer_buf, ret);
+ 			*recv_size = ret;
+ 			ret = 0;
+ 			break;
+@@ -743,7 +745,6 @@
+ 			 void *response, size_t *size_ptr)
+ {
+ 	int err, ret;
+-	u8 response_buffer[COMMAND_BUFFER_SIZE];
+ 	size_t response_length;
+ 
+ 	if (response) {
+@@ -938,15 +939,14 @@
+ 		tpm_u16(0),			/* Offset */
+ 	};
+ 	size_t response_len = COMMAND_BUFFER_SIZE;
+-	u8 response[COMMAND_BUFFER_SIZE];
+ 	int ret;
+ 	u16 tag;
+ 	u32 size, code;
+ 
+-	ret = tpm_spi_sendrecv_command(command_v2, response, &response_len);
++	ret = tpm_spi_sendrecv_command(command_v2, response_buffer, &response_len);
+ 	if (ret)
+ 		return ret;
+-	if (tpm2_unpack_byte_string(response, response_len, "wdds", 0, &tag, 2,
++	if (tpm2_unpack_byte_string(response_buffer, response_len, "wdds", 0, &tag, 2,
+ 					&size, 6, &code, 16, data, count))
+ 		return TPM_LIB_ERROR;
+ 

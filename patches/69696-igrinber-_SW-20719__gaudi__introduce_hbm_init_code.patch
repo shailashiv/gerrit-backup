@@ -1,0 +1,1740 @@
+From dc6403e9b7d742eccda5236529578824d46b17cb Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 11 Jan 2021 23:05:09 +0200
+Subject: [PATCH] [SW-20719] gaudi: introduce hbm init code
+
+Add HBM initialization code as a part of requirement for cleaning the
+HBM memory after FLR/reset/on power up.
+The code is mainly copied from U-Boot, but multiple adjustments were
+made to lower the compiled binary size.
+The HBM frequency is set to a safe default of 800MHz.
+All the debug abilities were stripped.
+Error messages shortened or removed - depending on case.
+
+Change-Id: I195f382a83f2bcd08fbd5d1c3a2348046ec0543e
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/Makefile b/gaudi/Makefile
+index b2e96ac..b06b553 100644
+--- a/gaudi/Makefile
++++ b/gaudi/Makefile
+@@ -3,6 +3,7 @@
+ 
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/pll.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/security.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/hbm.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/reset.c)
+ 
+ image_validation: image_validation_common
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 2c77591..978dc06 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -221,3 +221,12 @@
+ 
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_CLK_GATE_EN, true);
+ }
++
++void hl_ram_init(void)
++{
++	preboot_puts_raw("HBM init ");
++	if (gaudi_hbm_init())
++		preboot_puts("failed!\n");
++	else
++		preboot_puts("finished\n");
++}
+diff --git a/gaudi/common.h b/gaudi/common.h
+index e9cfa4f..3577d00 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -51,6 +51,7 @@
+ /* Only BP2 == 0x4 - means 8 blocks - up to 512KB */
+ #define PROT_MASK			(READ_STATUS_BP2 | READ_STATUS_SRWD)
+ 
++int gaudi_hbm_init(void);
+ u32 preboot_get_vendor_id_device_id(void);
+ 
+ #endif /* __ASSEMBLY__ */
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+new file mode 100644
+index 0000000..fa4fbe0
+--- /dev/null
++++ b/gaudi/hbm.c
+@@ -0,0 +1,1676 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <stddef.h>
++
++#include <common/pci_ids.h>
++#include <gaudi_blocks.h>
++#include <psoc_global_conf_regs.h>
++
++#include <types.h>
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++#define GAUDI_HBM_CFG_BASE		(mmHBM0_BASE - HL_CFG_BASE)
++#define GAUDI_HBM_CFG_OFFSET		(mmHBM1_BASE - mmHBM0_BASE)
++
++#define GAUDI_HBM_DEVICES		4
++#define GAUDI_HBM_CHANNELS		8
++#define GAUDI_HBM_CENTER_CHANNEL	9
++#define GAUDI_MAX_TEMP_THRESHOLD	85
++
++#define GAUDI_HBM_CFG_TIMEOUT_US	1000000 /* 1s */
++#define GAUDI_HBM_ECC_CFG_TIMEOUT_US	(GAUDI_HBM_CFG_TIMEOUT_US * 2)
++
++#define STATIC_DLL_ACC			0x84
++#define STATIC_DLL_AWORD		0x4B
++#define STATIC_DLL_DWORD_RD_RISE	0x49
++#define STATIC_DLL_DWORD_RD_FALL	0x49
++#define STATIC_DLL_DWORD_WR		0x4E
++
++#define EXTEST_WDR_PTRNS_NUM		10
++#define EXTEST_WDR_REG_NUM		7
++#define EXTEST_WRITE_INST		1
++#define EXTEST_READ_INST		0
++
++#define SZ_16G				_AC(0x400000000, ULL)
++#define SZ_32G				_AC(0x800000000, ULL)
++
++#define RREG32(c)			regmap_readl(c)
++#define WREG32(c, v)			regmap_writel((v), (c))
++
++#define abs(x) ({						\
++		long ret;					\
++		if (sizeof(x) == sizeof(long)) {		\
++			long __x = (x);				\
++			ret = (__x < 0) ? -__x : __x;		\
++		} else {					\
++			int __x = (x);				\
++			ret = (__x < 0) ? -__x : __x;		\
++		}						\
++		ret;						\
++	})
++
++struct hbm {
++	u32 acc_initial;
++	u32 internal_lb_length_usec;
++	u8 ecc_enable;
++	u8 dbi_enable;
++	u8 inc;
++	u8 training_delay;
++	u8 hardware_training_repeat;
++};
++
++static struct hbm hbm_data = {
++	.acc_initial = 0x40,
++	.internal_lb_length_usec = 1,
++	.ecc_enable = 1,
++	.dbi_enable = 1,
++	.inc = 1,
++	/*
++	 * For cfg_clk = 50MHz -> 0x3, 100MHz -> 0x7, 200MHz -> 0xF
++	 * range 0x0-0x3F
++	 */
++	.training_delay = 7,
++	.hardware_training_repeat = 1, /* range 1-4 */
++};
++
++enum phy_state {
++	phy_state_bypass,
++	phy_state_dword,
++	phy_state_initial,
++	phy_state_aword
++};
++
++enum dram_state {
++	dram_state_training,
++	dram_state_bypass
++};
++
++enum cke_state {
++	cke_state_low,
++	cke_state_high
++};
++
++enum mc_state {
++	mc_state_bist,
++	mc_state_normal
++};
++
++enum loopback_state {
++	loopback_state_initial,
++	loopback_state_check
++};
++
++enum mc_bist_mode {
++	mc_bist_mode_once,
++	mc_bist_mode_overn
++};
++
++enum ieee1500_instruction {
++	ieee1500_bypass  = 0x00,
++	ieee1500_extest_rx = 0x01,
++	ieee1500_extest_tx = 0x02,
++	ieee1500_intest_rx = 0x03,
++	ieee1500_intest_tx = 0x04,
++	ieee1500_hbm_reset = 0x05,
++	ieee1500_mbist = 0x06,
++	ieee1500_soft_repair = 0x07,
++	ieee1500_hard_repair = 0x08,
++	ieee1500_dword_misr = 0x09,
++	ieee1500_aword_misr = 0x0a,
++	ieee1500_channel_id = 0x0b,
++	ieee1500_misr_mask = 0x0c,
++	ieee1500_aword_misr_config = 0x0d,
++	ieee1500_device_id = 0x0e,
++	ieee1500_temperature = 0x0f,
++	ieee1500_mode_register_dump_set = 0x10,
++	ieee1500_read_lfsr_compare_sticky = 0x11,
++	ieee1500_soft_lane_repair = 0x12,
++	ieee1500_hard_lane_repair = 0x13
++};
++
++static const u32 hbm_ch_mapping[GAUDI_HBM_CHANNELS] = { 0, 1, 4, 5, 2, 3, 6, 7 };
++
++static const u32 hbm_golden_registers[16 * GAUDI_HBM_CHANNELS] = {
++	/* ch 0 */
++	0xA78E9D39, 0x504FACAA, 0x504FACAA, 0xAC80D125,
++	0x70545889, 0x64A97E07, 0xF7437341, 0xA28EBFF5,
++	0xE3307AD3, 0x1F097DE3, 0x9F0EF987, 0x4A3C56E7,
++	0xA2CD139C, 0x48BB6953, 0xD9F398D5, 0x3B445A37,
++	/* ch 1 */
++	0x578E9D39, 0x504FACAA, 0x2F6B85DC, 0xAC80D125,
++	0x70545889, 0x64A97E07, 0xF7437341, 0xA28EBFF5,
++	0xE3307AD3, 0x1F097DE3, 0x9F0EF987, 0x4A3C56E7,
++	0xA2CD139C, 0x48BB6953, 0xD9F398D5, 0x34445A37,
++	/* ch 2 */
++	0xAC80D125, 0x70545889, 0x64A97E07, 0xF7437341,
++	0xA28EBFF5, 0xE3307AD3, 0x1F097DE3, 0x9F0EF987,
++	0x4A3C56E7, 0xA2CD139C, 0x48BB6953, 0xD9F398D5,
++	0x3B445A37, 0x578E9d39, 0x504FACAA, 0x2F6B85DC,
++	/* ch 3 */
++	0x5C80D125, 0x70545889, 0x64A97E07, 0xF7437341,
++	0xA28EBFF5, 0xE3307AD3, 0x1F097DE3, 0x9F0EF987,
++	0x4A3C56E7, 0xA2CD139C, 0x48BB6953, 0xD9F398D5,
++	0x3B445A37, 0x578E9d39, 0x504FACAA, 0x2F6B85DC,
++	/* ch 4 */
++	0xF7437341, 0xA28EBFF5, 0xE3307AD3, 0x1F097DE3,
++	0x9F0EF987, 0x4A3C56E7, 0xA2CD139C, 0x48BB6953,
++	0xD9F398D5, 0x3B445A37, 0x578E9d39, 0x504FACAA,
++	0x2F6B85DC, 0xAC80D125, 0x70545889, 0x64A97E07,
++	/* ch 5 */
++	0x17437341, 0xA28EBFF5, 0xE3307AD3, 0x1F097DE3,
++	0x9F0EF987, 0x4A3C56E7, 0xA2CD139C, 0x48BB6953,
++	0xD9F398D5, 0x3B445A37, 0x578E9d39, 0x504FACAA,
++	0x2F6B85DC, 0xAC80D125, 0x70545889, 0x64A97E07,
++	/* ch 6 */
++	0xFF097DE3, 0x9F0EF987, 0x4A3C56E7, 0xA2CD139C,
++	0x48BB6953, 0xD9F398D5, 0x3B445A37, 0x578E9d39,
++	0x504FACAA, 0x2F6B85DC, 0xAC80D125, 0x70545889,
++	0x64A97E07, 0xF7437341, 0xA28EBFF5, 0xE3307AD3,
++	/* ch 7 */
++	0x1F097DE3, 0x9F0EF987, 0x4A3C56E7, 0xA2CD139C,
++	0x48BB6953, 0xD9F398D5, 0x3B445A37, 0x578E9d39,
++	0x504FACAA, 0x2F6B85DC, 0xAC80D125, 0x70545889,
++	0x64A97E07, 0xF7437341, 0xA28EBFF5, 0xE3307AD3
++};
++
++static const u32 ieee_wdr_len_t[] = {
++	1, /* BYPASS */
++	215, /* EXTEST_RX */
++	215, /* EXTEST_TX */
++	0, /* INTEST_RX */
++	0, /* INTEST_TX */
++	1, /* HBM_RESET */
++	375, /* MBIST */
++	21, /* SOFT_REPAIR */
++	21, /* HARD_REPAIR */
++	320, /* DWORD_MISR */
++	30, /* AWORD_MISR */
++	1, /* CHANNEL_ID */
++	72, /* MISR_MASK */
++	8, /* AWORD_MISR_CONFIG */
++	82, /* DEVICE_ID */
++	8, /* TEMPERATURE */
++	128, /* MODE_REGISTER_DUMP_SET */
++	175, /* READ_LFSR_COMPARE_STICKY */
++	72, /* SOFT_LANE_REPAIR */
++	72 /* HARD_LANE_REPAIR */
++};
++
++static u32 acc[GAUDI_HBM_CHANNELS][5];
++static u32 aword[GAUDI_HBM_CHANNELS][4];
++static u32 dword_wr[GAUDI_HBM_CHANNELS][4][4];
++static u32 dword_rd[GAUDI_HBM_CHANNELS][4][4];
++
++static const u32 extest_wdr_pattern[EXTEST_WDR_PTRNS_NUM * EXTEST_WDR_REG_NUM] = {
++	/* pattern 0 */
++	0x55555555, 0x55555555, 0x55555555, 0x55555555,
++	0x55555555, 0x55555555, 0x00555555,
++	/* pattern 1 */
++	0x26626666, 0x66666666, 0x66662662, 0x66666666,
++	0x66626626, 0x66266666, 0x00666662,
++	/* pattern 2 */
++	0x387C7878, 0x78787878, 0x7878387C, 0x78787878,
++	0x787C7838, 0x78387878, 0x0078787C,
++	/* pattern 3 */
++	0x3F847F80, 0x7F807F80, 0x7F803F84, 0x7F807F80,
++	0x7F847FC0, 0x7FC07F80, 0x00007F84,
++	/* pattern 4 */
++	0x3FFB8000, 0x7FFF8000, 0x7FFFC004, 0x7FFF8000,
++	0x7FFB8040, 0x7FBF8000, 0x007F8004,
++	/* pattern 5 */
++	0xC0040000, 0x7FFFFFFF, 0x80004004, 0x7FFF7FFF,
++	0x80040040, 0x7FBFFFFF, 0x00000004,
++	/* pattern 6 */
++	0x40040000, 0x80000000, 0xFFFFBFFB, 0x7FFF7FFF,
++	0x00040040, 0x80400000, 0x007FFFFB,
++	/* pattern 7 */
++	0x40040000, 0x00000000, 0x00004004, 0x80008000,
++	0xFFFBFFBF, 0xFFBFFFFF, 0x007FFFFB,
++	/* pattern 8 */
++	0x40040000, 0x00000000, 0x00004004, 0x00008000,
++	0x00040040, 0x00400000, 0x00000004,
++	/* pattern 9 */
++	0xBFFBFFFF, 0xFFFFFFFF, 0xFFFFBFFB, 0xFFFF7FFF,
++	0xFFFBFFBF, 0xFFBFFFFF, 0x007FFFFB
++};
++
++static const u32 extest_wdr_rx_mask[EXTEST_WDR_REG_NUM] = {
++	0x9FFFFFFF, 0xFFFFFDFF, 0xFDFF9FFF, 0xFFF7FFFF,
++	0xDFF9FFFF, 0xFFFFFFFF, 0x000FDFF9
++};
++
++static const u32 extest_wdr_tx_mask[EXTEST_WDR_REG_NUM] = {
++	0xFFF9FFFF, 0xFFFFFFFF, 0xFFFFFFF9, 0xFFF80000,
++	0xFFFFFF9F, 0xFF9FFFFF, 0x000FFFFF
++};
++
++static void RMWREG32(u32 reg, u32 val, u32 mask)
++{
++	u32 tmp_ = RREG32(reg);
++
++	tmp_ &= ~mask;
++	tmp_ |= val << __ffs32(mask);
++
++	WREG32(reg, tmp_);
++}
++
++static u32 RREG32_MASK(u32 reg, u32 mask)
++{
++	return (RREG32(reg) & mask) >> __ffs32(mask);
++}
++
++static int hbm_poll_timeout(u32 cfg_addr, u32 ref_val, u64 tout_us, u32 *val)
++{
++	u64 current, start = timestamp_get_us();
++	u64 timeout = start + tout_us;
++	bool overlap = false;
++	u32 reg;
++
++	if (timeout < start)
++		overlap = true;
++
++	while (1) {
++		reg = regmap_readl(cfg_addr);
++		if (reg == ref_val)
++			return 0;
++
++		current = timestamp_get_us();
++		if (!overlap) {
++			if (current > timeout || current <= start)
++				break;
++		} else {
++			if (current > timeout && current < start)
++				break;
++		}
++	}
++
++	*val = reg;
++
++	return -1;
++}
++
++static void ieee1500_inst(int device, u32 ch,
++				enum ieee1500_instruction instruction,
++				bool write)
++{
++	/*
++	 * Write instructions - WDR registers (0x9100 - 0x9188) should be
++	 * written prior to calling this function.
++	 * Read instructions - WDR registers (0x9800 - 0x9F88) should be read
++	 * after calling this function.
++	 */
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 wir, op, status, err;
++
++	/* Configure WDR length */
++	WREG32(base + 0x9020, ieee_wdr_len_t[instruction] - 1);
++
++	/*
++	 * Configure WIR
++	 * {ch, instruction} - ch may be 0xF to indicate ALL channels
++	 */
++	wir = (instruction & 0xFF) | ((ch & 0xF) << 8);
++	WREG32(base + 0x9024, wir);
++
++	/* Send WIR and write/read WDR */
++	op = write ? 0x6 : 0x5;
++	WREG32(base + 0x9028, op);
++
++	/* Poll for MLB interrupt */
++	err = hbm_poll_timeout(base + 0x9034, op,
++			       GAUDI_HBM_CFG_TIMEOUT_US, &status);
++	if (err) {
++		preboot_puts_hex_raw("MLB interrupt poll failed, dev: ",
++				     device, false);
++		preboot_puts_hex_raw(", ch: ", ch, false);
++		preboot_puts_hex(", status: ", status, false);
++	}
++
++	/* Clear MLB interrupts */
++	WREG32(base + 0x9034, 0);
++}
++
++static int extest_rx(int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 received, expected, mask, addr, idx;
++	int pat, ch, i, err = 0;
++
++	/* Enable all outputs, except for HBM TX-only signals */
++	for (ch = 0 ; ch < GAUDI_HBM_CHANNELS ; ch++) {
++		WREG32(base + ch * 0x1000 + 0x920, 0x60000000);
++		WREG32(base + ch * 0x1000 + 0x924, 0x00000200);
++		WREG32(base + ch * 0x1000 + 0x928, 0x02006000);
++		WREG32(base + ch * 0x1000 + 0x92c, 0x00080000);
++		WREG32(base + ch * 0x1000 + 0x930, 0x20060000);
++		WREG32(base + ch * 0x1000 + 0x934, 0x00000000);
++		WREG32(base + ch * 0x1000 + 0x938, 0x00002006);
++	}
++
++	/* Patterns loop */
++	for (pat = 0; pat < 16; pat++) {
++		/* Configure output values */
++		if (pat <= 7) {
++			/* Configure all channels to same pattern */
++			for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++				for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++					addr = base + ch * 0x1000 + 0x940 +
++									(i * 4);
++					idx = pat * EXTEST_WDR_REG_NUM + i;
++					WREG32(addr, extest_wdr_pattern[idx]);
++				}
++			}
++		} else {
++			/* Configure all channels to Pattern 8 */
++			for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++				for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++					addr = base + ch * 0x1000 + 0x940 +
++									(i * 4);
++					idx = 8 * EXTEST_WDR_REG_NUM + i;
++					WREG32(addr, extest_wdr_pattern[idx]);
++				}
++			}
++			/* Reconfigure a selected channel to Pattern 9 */
++			for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++				addr = base + (pat - 8) * 0x1000 + 0x940 +
++									(i * 4);
++				idx = 9 * EXTEST_WDR_REG_NUM + i;
++				WREG32(addr, extest_wdr_pattern[idx]);
++			}
++		}
++
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			/* Perform EXTEST_RX command */
++			ieee1500_inst(device, hbm_ch_mapping[ch],
++				      ieee1500_extest_rx, EXTEST_READ_INST);
++
++			/* Compare results */
++			for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++				if (pat <= 7)
++					idx = pat * EXTEST_WDR_REG_NUM + i;
++				else if (ch == (pat - 8))
++					idx = 9 * EXTEST_WDR_REG_NUM + i;
++				else
++					idx = 8 * EXTEST_WDR_REG_NUM + i;
++
++				expected = extest_wdr_pattern[idx];
++
++				addr = base +
++					(GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
++					0x800 + (hbm_ch_mapping[ch] * 0x100) +
++					(i * 4);
++				received = RREG32(addr);
++
++				mask = extest_wdr_rx_mask[i];
++
++				if ((received & mask) != (expected & mask)) {
++					err++;
++					preboot_puts_hex_raw("mismatch: pattern ", pat, false);
++					preboot_puts_hex_raw(", ch ", ch, false);
++					preboot_puts_hex_raw(", WDR[", i * 32 + 31, false);
++					preboot_puts_hex_raw(":", i * 32, false);
++					preboot_puts_hex_raw("], expected ", expected, true);
++					preboot_puts_hex_raw(", received ", received, true);
++					preboot_puts_hex(", mask ", mask, true);
++				}
++			}
++		}
++	}
++
++	return err;
++}
++
++static int extest_tx(int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 received, expected, mask, addr, idx;
++	int pat, ch, i, err = 0;
++
++	/* Disable all outputs */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		for (i = 0; i < EXTEST_WDR_REG_NUM; i++)
++			WREG32(base + ch * 0x1000 + 0x920 + (i * 4),
++					0xFFFFFFFF);
++	}
++
++	/*
++	 * Patterns 0 - 7
++	 */
++
++	/* Patterns loop */
++	for (pat = 0; pat < 8; pat++) {
++		/* Configure WDR write values */
++		for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++			addr = base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
++					0x100 + (i*4);
++			idx = pat * EXTEST_WDR_REG_NUM + i;
++			WREG32(addr, extest_wdr_pattern[idx]);
++		}
++
++		/* Perform EXTEST_TX command to all channels */
++		ieee1500_inst(device, 0xF, ieee1500_extest_tx,
++			      EXTEST_WRITE_INST);
++
++		/* Compare results */
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++				if (pat <= 7)
++					idx = pat * EXTEST_WDR_REG_NUM + i;
++				else if (ch == (pat - 8))
++					idx = 9 * EXTEST_WDR_REG_NUM + i;
++				else
++					idx = 8 * EXTEST_WDR_REG_NUM + i;
++
++				expected = extest_wdr_pattern[idx];
++
++				received = RREG32(base + (ch * 0x1000) + 0x960
++								+ (i * 4));
++
++				mask = extest_wdr_tx_mask[i];
++
++				if ((received & mask) != (expected & mask))
++					err++;
++			}
++
++			/* Special case - pins TEMP[2:0] + CATTRIP */
++			if (ch == 0) {
++				received = RREG32(base + 0x8000 + 0x04c);
++				if (((received >> 2) & 1) !=
++						((expected  >>  20) & 1)) {
++					err++;
++				}
++
++				if (((received >> 1) & 1) !=
++						((expected >> 21) & 1)) {
++					err++;
++				}
++
++				if (((received >> 0) & 1) !=
++						((expected  >>  22) & 1)) {
++					err++;
++				}
++			}
++
++			if (ch == 1) {
++				received = RREG32(base + 0x8000 + 0x04c);
++				if (((received >> 3) & 1) !=
++						((expected >> 20) & 1)) {
++					err++;
++				}
++			}
++		}
++	}
++
++	/*
++	 * Patterns 8 - 15
++	 */
++
++	/* Patterns loop */
++	for (pat = 8; pat < 15; pat++) {
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			/* Configure WDR write values */
++			for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++				addr = base +
++					(GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
++					0x100 + (i*4);
++				if (ch == pat - 8)
++					idx = 9 * EXTEST_WDR_REG_NUM + i;
++				else
++					idx = 8 * EXTEST_WDR_REG_NUM + i;
++
++				WREG32(addr, extest_wdr_pattern[idx]);
++			}
++
++			/* Perfrom EXTEST_TX command to the selected channel */
++			ieee1500_inst(device, hbm_ch_mapping[ch],
++				      ieee1500_extest_tx, EXTEST_WRITE_INST);
++
++			/* Compare results */
++			for (i = 0; i < EXTEST_WDR_REG_NUM; i++) {
++				if (ch == pat - 8)
++					idx = 9 * EXTEST_WDR_REG_NUM + i;
++				else
++					idx = 8 * EXTEST_WDR_REG_NUM + i;
++
++				expected = extest_wdr_pattern[idx];
++
++				received = RREG32(base + (ch * 0x1000) + 0x960
++								+ (i * 4));
++
++				mask = extest_wdr_tx_mask[i];
++
++				if ((received & mask) != (expected & mask))
++					err++;
++			}
++
++			/* Special case - pins TEMP[2:0] + CATTRIP */
++			if (ch == 0) {
++				received = RREG32(base + 0x8000 + 0x04c);
++				if (((received >> 2) & 1) !=
++						((expected  >>  20) & 1)) {
++					err++;
++				}
++
++				if (((received >> 1) & 1) !=
++						((expected >> 21) & 1)) {
++					err++;
++				}
++
++				if (((received >> 0) & 1) !=
++						((expected  >>  22) & 1)) {
++					err++;
++				}
++			}
++
++			if (ch == 1) {
++				received = RREG32(base + 0x8000 + 0x04c);
++				if (((received >> 3) & 1) !=
++						((expected >> 20) & 1)) {
++					err++;
++				}
++			}
++		}
++	}
++
++	return err;
++}
++
++static void change_pll(u32 val)
++{
++	int i;
++	u32 div_base;
++	u32 nic_pll_base[] = { mmNIC0_PLL_BASE & ~HL_CFG_BASE,
++			       mmNIC1_PLL_BASE & ~HL_CFG_BASE };
++
++	for (i = 0; i < ARRAY_SIZE(nic_pll_base); i++) {
++		div_base = nic_pll_base[i] + (HL_PLL_DIV2 * sizeof(u32));
++
++		regmap_writel(HL_PLL_REF_CLK, div_base + HL_PLL_DIV_SEL);
++		udelay(1);
++		regmap_writel(val, div_base + HL_PLL_DIV_FACTOR);
++		regmap_writel(1, div_base + HL_PLL_DIV_FACTOR_CMD);
++		udelay(1);
++		regmap_writel(HL_PLL_DIV_REF, div_base + HL_PLL_DIV_SEL);
++		udelay(1);
++		regmap_writel(HL_PLL_DIV_PLL, div_base + HL_PLL_DIV_SEL);
++	}
++}
++
++static inline void reduce_pll(void)
++{
++	change_pll(15);
++}
++
++static inline void restore_pll(void)
++{
++	change_pll(8);
++}
++
++static void set_dll_val(u32 base, int ch, u32 reg, u32 val)
++{
++	u32 add16, add4, add1, address;
++	int i;
++
++	add16 = val >> 4;
++	add4 = (val % 16) >> 2;
++	add1 = (val % 16) % 4;
++
++	address = base + ch * 0x1000 + reg;
++
++	RMWREG32(address, 4, 0xFF);
++
++	for (i = 0; i < add16; i++)
++		RMWREG32(address, 3, 0xFF);
++
++	for (i = 0; i < add4; i++)
++		RMWREG32(address, 2, 0xFF);
++
++	for (i = 0; i < add1; i++)
++		RMWREG32(address, 1, 0xFF);
++}
++
++static void set_acc_dll(u32 base, int ch, int dw, u32 val)
++{
++	set_dll_val(base, ch, (dw + 4) * 0x100 + 0x14, val);
++}
++
++static void set_dword_read_dll(u32 base, int ch, int dw, u32 val)
++{
++	set_dll_val(base, ch, (dw + 5) * 0x100 + 0x18, val);
++	set_dll_val(base, ch, (dw + 5) * 0x100 + 0x1C, val);
++}
++
++static void set_dword_write_dll(u32 base, int ch, int dw, u32 val)
++{
++	set_dll_val(base, ch, (dw + 5) * 0x100 + 0x28, val);
++}
++
++static u32 aword_acc_window(u32 base, int ch)
++{
++	return RREG32_MASK(base + ch * 0x1000 + 0x414, 0x1FF0000);
++}
++
++static u32 dword_acc_window(u32 base, int ch, int dw)
++{
++	return RREG32_MASK(base + ch * 0x1000 + 0x100 * (dw + 5) + 0x14,
++				0x1FF0000);
++}
++
++static void copy_acc(u32 base)
++{
++	u32 val, add16, add4, add1;
++	int i, ch;
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch += 2) {
++		val = aword_acc_window(base, ch);
++
++		add16 = val >> 4;
++		add4 = (val % 16) >> 2;
++		add1 = (val % 16) % 4;
++
++		RMWREG32(base + (ch + 1) * 0x1000 + 0x414, 4, 0xFF);
++
++		for (i = 0; i < add16; i++)
++			RMWREG32(base + (ch + 1) * 0x1000 + 0x414, 3, 0xFF);
++
++		for (i = 0; i < add4; i++)
++			RMWREG32(base + (ch + 1) * 0x1000 + 0x414, 2, 0xFF);
++
++		for (i = 0; i < add1; i++)
++			RMWREG32(base + (ch + 1) * 0x1000 + 0x414, 1, 0xFF);
++	}
++}
++
++static void config_mlb_state(u32 base, int ch, enum phy_state next_state)
++{
++	enum phy_state curr_state =
++				RREG32_MASK(base + ch * 0x1000 + 0x200, 0xFF00);
++	int offset = next_state - curr_state;
++	int i;
++
++	if (!offset)
++		return;
++
++	/* mdelay(20); */
++
++	for (i = 0; i < abs(offset); i++)
++		RMWREG32(base + ch * 0x1000 + 0x200,
++				(offset > 0) ? 1 : 2, 0xFF);
++
++	/* mdelay(20); */
++}
++
++static void set_mode_reg_by_mlb(u32 base, int ch, u32 num, u32 op)
++{
++	u32 count = 0, i, one = 1, parity;
++	u32 value = (num << 8) | op;
++
++	for (i = 0; i < 12; i++)
++		if (value & (one << i))
++			count++;
++
++	parity = count & 1;
++
++	WREG32(base + ch * 0x1000 + 0x210, (parity << 16) | value);
++	WREG32(base + ch * 0x1000 + 0x214, 4);
++
++	mdelay(1);
++}
++
++static void config_dram_state(struct hbm *hbm, u32 base,
++					int ch, enum dram_state state)
++{
++	config_mlb_state(base, ch, phy_state_initial);
++
++	if (state == dram_state_training) {
++		/* CA Par=en, Wr Par=en, Rd Par=en, WDBI=en, RDBI=en */
++		set_mode_reg_by_mlb(base, ch, 0, 0x73);
++		/* drive strength=15mA, WR=16 */
++		set_mode_reg_by_mlb(base, ch, 1, 0x70);
++		/* RL=22, WL=7 */
++		set_mode_reg_by_mlb(base, ch, 2, 0xA6);
++		/* BL=4, BG=enable, tRAS=33 */
++		set_mode_reg_by_mlb(base, ch, 3, 0xE1);
++		/* PL=0, DM=disable, ECC=enable */
++		set_mode_reg_by_mlb(base, ch, 4, 0x03);
++		/* Vref=50% */
++		set_mode_reg_by_mlb(base, ch, 15, 0x00);
++
++		/* Adjust MLB for PL=0 */
++		RMWREG32(base + ch * 0x1000 + 0x204, 0x0, 0x300);
++	} else if (state == dram_state_bypass) {
++		/* CA Par=en, Wr Par=en, Rd Par=en, WDBI=en, RDBI=en */
++		set_mode_reg_by_mlb(base, ch, 0, 0x70 |
++					(hbm->dbi_enable << 1) |
++					(hbm->dbi_enable << 0));
++		/* drive strength=15mA, WR=16 */
++		set_mode_reg_by_mlb(base, ch, 1, 0x70);
++		/* RL=22, WL=7 */
++		set_mode_reg_by_mlb(base, ch, 2, 0xA6);
++		/* BL=4, BG=enable, tRAS=33 */
++		set_mode_reg_by_mlb(base, ch, 3, 0xE1);
++		/* PL=2, DM=disable, ECC=enable */
++		set_mode_reg_by_mlb(base, ch, 4, 0x8 |
++					(hbm->ecc_enable << 1) |
++					(hbm->ecc_enable << 0));
++		/* Vref=50% */
++		set_mode_reg_by_mlb(base, ch, 15, 0x00);
++
++		/* Adjust MLB for PL=2 */
++		RMWREG32(base + ch * 0x1000 + 0x204, 0x2, 0x300);
++	}
++}
++
++static void set_timing_params(int device, int ch)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++
++	/* Support only 800MHz */
++
++	/* trfc_sb_fix=128, r_r2w = 18 to support PL=2 */
++	WREG32(base + (ch * 0x1000) + 0x04C, 0x80030812);
++	/* r_trfc_sb=256, r_trrefd_norm=92, trrefd_min=8 */
++	WREG32(base + (ch * 0x1000) + 0x050, 0x205C0100);
++	/* tRTP_L=5, tWTP_L=22, tRP=12 */
++	WREG32(base + (ch * 0x1000) + 0x058, 0xC1605);
++	/* r_tcksre=r_tcksrx=14, trefi=97, txp=6, trfc=280 */
++	WREG32(base + (ch * 0x1000) + 0x05C, 0xEE616118);
++	/*
++	 * r_t_rddata_en=0x15, r_t_phy_wrlat=0x6, r_t_phy_wrdata=0x1,
++	 * r_rrq_switch_lvl_low=0x0
++	 */
++	WREG32(base + (ch * 0x1000) + 0x054, 0x10615);
++}
++
++static void config_mc_state(struct hbm *hbm, int device, int ch,
++				enum mc_state state)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++
++	if (state == mc_state_bist) {
++		RMWREG32(base + ch * 0x1000 + 0x004, 1, 0x1);
++		/* Adjust the refresh rate */
++		WREG32(base + (ch * 0x1000) + 0x050, 0x20360098);
++	} else if (state == mc_state_normal) {
++		/* Allow time for issuing REFab */
++		udelay(100);
++		RMWREG32(base + ch * 0x1000 + 0x004, 0, 0x1);
++		set_timing_params(device, ch);
++	}
++}
++
++static int mcbist_poll_completion(int sid, int dev)
++{
++	int err, ch, rc = 0;
++	u32 base, status;
++
++	base = GAUDI_HBM_CFG_BASE + dev * GAUDI_HBM_CFG_OFFSET;
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		err = hbm_poll_timeout(base + ch * 0x1000 + 0x11C, 0x03000000,
++				       GAUDI_HBM_ECC_CFG_TIMEOUT_US, &status);
++		if (!err)
++			continue;
++
++		rc = -1;
++	}
++
++	return rc;
++}
++
++static int mcbist_write_read_full(struct hbm *hbm, int unused)
++{
++	int device, ch, sid, acc_err = 0;
++	u32 base, pseudo_rand = 0x1, interleave = 0x0;
++	enum mc_bist_mode bist_mode = mc_bist_mode_once;
++
++	/* Clean transition from Functional mode to MCBIST mode */
++	for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++		base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			config_mlb_state(base, ch, phy_state_initial);
++			config_mc_state(hbm, device, ch, mc_state_bist);
++			config_mlb_state(base, ch, phy_state_bypass);
++		}
++	}
++
++	for (sid = 0; sid < 2; sid++) {
++		/* Configure MCBIST for all channels */
++		for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++			base = GAUDI_HBM_CFG_BASE +
++					device * GAUDI_HBM_CFG_OFFSET;
++
++			for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++				WREG32(base + ch * 0x1000 + 0x100, pseudo_rand |
++						(interleave << 1) |
++						(bist_mode << 2) |
++						(hbm->ecc_enable  << 3));
++				WREG32(base + ch * 0x1000 + 0x104,
++						(0x0 | sid << 28 | sid << 29));
++				WREG32(base + ch * 0x1000 + 0x108, 0x800000);
++				WREG32(base + ch * 0x1000 + 0x10c, 0x12345678);
++				WREG32(base + ch * 0x1000 + 0x110, 0x9ABCDEF0);
++				WREG32(base + ch * 0x1000 + 0x114, 0x5A5A5A5A);
++				WREG32(base + ch * 0x1000 + 0x118, 0xA5A5A5A5);
++			}
++		}
++
++		/* Start MCBIST */
++		for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++			base = GAUDI_HBM_CFG_BASE +
++					device * GAUDI_HBM_CFG_OFFSET;
++
++			for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++				WREG32(base + ch * 0x1000 + 0x11C, 0x3);
++		}
++
++		/* Poll for MCBIST completion */
++		for (device = 0; device < GAUDI_HBM_DEVICES; device++)
++			acc_err |= mcbist_poll_completion(sid, device);
++
++		if (acc_err)
++			break;
++	}
++
++	/* Clean transition from MCBIST mode to Functional mode */
++	for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++		base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			config_mlb_state(base, ch, phy_state_initial);
++			config_mc_state(hbm, device, ch, mc_state_normal);
++			config_mlb_state(base, ch, phy_state_bypass);
++		}
++	}
++
++	return acc_err;
++}
++
++static int do_loopback(struct hbm *hbm, u32 base, int ch,
++			enum loopback_state state)
++{
++	int i, j = ch * 16/*, cnt = 0*/;
++	u32 val;
++
++	if (state == loopback_state_initial) {
++		/* Internal Loopback mode */
++		RMWREG32(base + ch * 0x1000 + 0x370, 3, 0xFF);
++		for (i = 0; i < 16; i++)
++			WREG32(base + ch * 0x1000 + 0x380 + i * 4,
++					hbm_golden_registers[i + j]);
++		return 0;
++	}
++
++	if (state != loopback_state_check)
++		return -1;
++
++	WREG32(base + ch * 0x1000 + 0x294, 1);
++	WREG32(base + ch * 0x1000 + 0x294, 0);
++
++	RMWREG32(base + ch * 0x1000 + 0x378, 0xF, 0xFF);
++	RMWREG32(base + ch * 0x1000 + 0x374, 0xF, 0xFF);
++
++	val = RREG32(base + ch * 0x1000 + 0x37C);
++	if (val)
++		return -1;
++
++	return 0;
++}
++
++static int internal_loopback_test(struct hbm *hbm, int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	int ch, dw;
++
++	/* Add delay from previous SRX */
++	udelay(1);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		/* SRE */
++		WREG32(base + ch * 0x1000 + 0x214, 2);
++		/* ILB ctrl_rddv_sel */
++		WREG32(base + ch * 0x1000 + 0x298, 5);
++		/* Reset read FIFO */
++		WREG32(base + ch * 0x1000 + 0x294, 1);
++		WREG32(base + ch * 0x1000 + 0x294, 0);
++
++		do_loopback(hbm, base, ch, loopback_state_initial);
++
++		for (dw = 0; dw < 4; dw++)
++			set_dword_read_dll(base, ch, dw, 0);
++
++		for (dw = 0; dw < 4; dw++)
++			set_dword_write_dll(base, ch, dw, 0x50);
++
++		if (do_loopback(hbm, base, ch, loopback_state_check))
++			return 1;
++
++		WREG32(base + ch * 0x1000 + 0x378, 0);
++		WREG32(base + ch * 0x1000 + 0x370, 0);
++		/* functional ctrl_rddv_sel */
++		WREG32(base + ch * 0x1000 + 0x298, 4);
++		/* SRX */
++		WREG32(base + ch * 0x1000 + 0x214, 1);
++	}
++
++	return 0;
++}
++
++static void acc_training(struct hbm *hbm, int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 dll_inc, status;
++	int ch, dw, err;
++
++	if (hbm->inc == 16)
++		dll_inc = 3;
++	else if (hbm->inc == 4)
++		dll_inc = 2;
++	else
++		dll_inc = 1;
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		for (dw = 0; dw < 5; dw++)
++			set_acc_dll(base, ch, dw, hbm->acc_initial);
++
++		WREG32(base + ch * 0x1000 + 0x444,
++				(hbm->training_delay << 8) | dll_inc);
++	}
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch += 2) {
++		WREG32(base + ch * 0x1000 + 0x440, 0x1F);
++		WREG32(base + (ch + 1) * 0x1000 + 0x440, 0xF);
++	}
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		err = hbm_poll_timeout(base + ch * 0x1000 + 0x440, 0,
++				       GAUDI_HBM_CFG_TIMEOUT_US, &status);
++		if (err) {
++			preboot_puts("ACC done polling failed\n");
++			return;
++		}
++	}
++
++	copy_acc(base);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		if (!aword_acc_window(base, ch))
++			preboot_puts("aword acc_window can't be 0\n");
++
++		for (dw = 0; dw < 4; dw++)
++			if (!dword_acc_window(base, ch, dw))
++				preboot_puts("dword acc_window can't be 0\n");
++	}
++}
++
++static void check_training_result(struct hbm *hbm, int dev)
++{
++	int ch, dw, min_window_size = 50; /* percentage of UI */
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		for (dw = 0; dw < 5; dw++)
++			if (acc[ch][dw] <= hbm->acc_initial)
++				preboot_puts("HBM err: ACC UI size not obtained\n");
++
++		if (aword[ch][1] == 0 || aword[ch][2] == 0 ||
++			aword[ch][3] < ((acc[ch][0] * min_window_size) / 100))
++			preboot_puts("HBM err: valid AWORD window not found\n");
++
++		for (dw = 0; dw < 4; dw++) {
++			if (dword_wr[ch][dw][2] == 0 ||
++			    dword_wr[ch][dw][3] < ((acc[ch][dw + 1] * min_window_size) / 100))
++				preboot_puts("HBM err: valid DWORD Write window not found\n");
++
++			if (dword_rd[ch][dw][2] == 0 ||
++			    dword_rd[ch][dw][3] < ((acc[ch][dw + 1] * min_window_size) / 100))
++				preboot_puts("HBM err: valid DWORD Read window not found\n");
++		}
++	}
++}
++
++static void phy_init(int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 ctrl_rddv_sel = 4;
++	u32 rdatvld_dly;
++	u32 dev_id;
++	int ch;
++
++	/* bits [31:16] are the device id */
++	dev_id = preboot_get_vendor_id_device_id() >> 16;
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		switch (dev_id) {
++		case PCI_IDS_GAUDI_HL2000M:
++			if (ch == 0 || ch == 4) {
++				/* Release PHY RSTN (set bit 1) */
++				RMWREG32(base + ch * 0x1000 + 0x284, 1, 0x2);
++				mdelay(1);
++
++				/* non-deskew PLL settings 2Gbps */
++				WREG32(base + ch * 0x1000 + 0x2B8, 0x19180F3F);
++				WREG32(base + ch * 0x1000 + 0x2BC, 0x0000001B);
++
++				/* Release PLL power-down (clear bit 0) */
++				RMWREG32(base + ch * 0x1000 + 0x284, 0, 0x1);
++				mdelay(1);
++
++				/* Release PLL clock divider rstn */
++				WREG32(base + ch * 0x1000 + 0x288, 0x0000001);
++				mdelay(1);
++
++				/* Release PLL stable_n (clear bit 7) */
++				RMWREG32(base + ch * 0x1000 + 0x284, 0, 0x80);
++				mdelay(1);
++			}
++
++			/* Release MLB & PHASE FIFO RSTN (set bit 7) */
++			RMWREG32(base + ch * 0x1000 + 0x174, 1, 0x80);
++			mdelay(1);
++			/* PHASE FIFO start (set bit 15) */
++			RMWREG32(base + ch * 0x1000 + 0x174, 1, 0x8000);
++
++			if (ch == 0 || ch == 4) {
++				/* Release DLL power-down */
++				WREG32(base + ch * 0x1000 + 0x28C, 0x0000000);
++				mdelay(1);
++
++				/* Drive strength */
++				WREG32(base + ch * 0x1000 + 0x2A0, 0x681F0);
++				WREG32(base + ch * 0x1000 + 0x2A4, 0x6A1F0);
++			}
++			break;
++		default:
++			if (ch == 0 || ch == 4) {
++				/* PLL settings */
++				WREG32(base + ch * 0x1000 + 0x2B8, 0x0CD80303);
++				WREG32(base + ch * 0x1000 + 0x2BC, 0x0000001E);
++
++				/* PLL and DLL power up */
++				RMWREG32(base + ch * 0x1000 + 0x288, 0x1, 0x1);
++				mdelay(1);
++				RMWREG32(base + ch * 0x1000 + 0x284, 0x0, 0x1);
++				mdelay(1);
++				RMWREG32(base + ch * 0x1000 + 0x28C, 0x0, 0x1);
++				mdelay(1);
++
++				/* Drive strength */
++				WREG32(base + ch * 0x1000 + 0x2A0, 0x681F0);
++				WREG32(base + ch * 0x1000 + 0x2A4, 0x6A1F0);
++			}
++		}
++
++		/* Reset read FIFO */
++		RMWREG32(base + ch * 0x1000 + 0x294, 0x1, 0x1);
++		RMWREG32(base + ch * 0x1000 + 0x294, 0x0, 0x1);
++
++		/* DFI setting - PHY */
++		WREG32(base + ch * 0x1000 + 0x208, 0x140106);
++
++		/* DFI setting - MC:
++		 * r_t_rddata_en=0x15, r_t_phy_wrlat=0x6, r_t_phy_wrdata=0x1,
++		 * r_rrq_switch_lvl_low=0x0. TODO: remove later
++		 */
++		WREG32(base + (ch * 0x1000) + 0x054, 0x10615);
++
++		/* trfc_sb_fix=152, r_r2w = 18 to support PL=2
++		 * TODO: remove later
++		 */
++		WREG32(base + (ch * 0x1000) + 0x04C, 0xA0030812);
++
++		/* ctrl_rddv_sel */
++		WREG32(base + ch * 0x1000 + 0x298, ctrl_rddv_sel);
++
++		/* Enable HBM CK, set PL=0, set rdatvld_dly */
++		if (dev_id != PCI_IDS_GAUDI_HL2000M)
++			rdatvld_dly = ctrl_rddv_sel + 8;
++		else
++			rdatvld_dly = ctrl_rddv_sel + 10;
++
++		if (ch == 0 || ch == 1 || ch == 4 || ch == 5)
++			WREG32(base + ch * 0x1000 + 0x204,
++					0x1 | (rdatvld_dly << 16));
++		else if (ch == 2 || ch == 3 || ch == 6 || ch == 7)
++			WREG32(base + ch * 0x1000 + 0x204,
++					0x1 | ((rdatvld_dly + 1) << 16));
++
++		/* Enable ECC. TODO: remove later */
++		WREG32(base + (ch * 0x1000) + 0x000, 0x413000);
++	}
++}
++
++static void dram_rstn(int device, enum cke_state cke)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	int ch;
++
++	/* SRE (CKE low) */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		WREG32(base + ch * 0x1000 + 0x214, 0x2);
++
++	/* WRCK disable */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x18, 0x0);
++
++	/* WRSTn low */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x14, 0x0);
++
++	/* hbm_RESETn low */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x10, 0x0);
++
++	/* tINIT1=200us for initial power-up or tPW_RESET=1us with stable
++	 * power
++	 */
++	mdelay(1);
++
++	/* hbm_RESETn high */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x10, 0x1);
++
++	/* tINIT3: 500us from RESETn deassertion to WRSTn/CKE high */
++	mdelay(1);
++
++	/* WRCK divider */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x00, 0x1);
++
++	/* WRSTn high */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x14, 0x1);
++
++	/* WRCK enable */
++	WREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x18, 0x1);
++
++	/* IEEE1500 IO strength
++	 * RMWREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x40, 0xF, 0xF);
++	 */
++
++	/* tINIT4 / tWINIT1 */
++	udelay(1);
++
++	if (cke == cke_state_high) {
++		/* SRX (CKE high) */
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++			WREG32(base + ch * 0x1000 + 0x214, 0x1);
++
++		/* tINIT5 */
++		udelay(1);
++	}
++}
++
++static void init_mc(struct hbm *hbm, int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	int ch;
++
++	/* Cleanup: Reset HBM + MRS setup */
++	dram_rstn(device, cke_state_high);
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		config_dram_state(hbm, base, ch, dram_state_bypass);
++
++	/* Set dfi_init_complete */
++	WREG32(base + 0x9004, 1);
++
++	/* Enable DBI (MCCTL) */
++	if (hbm->dbi_enable) {
++		WREG32(base + 0x8004, 0xFFFFFFFF);
++		WREG32(base + 0x8008, 0xFFFFFFFF);
++		WREG32(base + 0x800C, 0xFFFFFFFF);
++		WREG32(base + 0x8010, 0xFFFFFFFF);
++		WREG32(base + 0x8014, 0xFFFFFFFF);
++		WREG32(base + 0x8018, 0xFFFFFFFF);
++		WREG32(base + 0x801C, 0xFFFFFFFF);
++		WREG32(base + 0x8020, 0xFFFFFFFF);
++	}
++
++	/* Enable CATTRIP interrupt */
++	WREG32(base + 0x8000 + 0x044, 0x8);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		/* Reset PHY read FIFO */
++		WREG32(base + (ch * 0x1000) + 0x294, 1);
++		WREG32(base + (ch * 0x1000) + 0x294, 0);
++
++		/* Pass control to MC */
++		config_mlb_state(base, ch, phy_state_bypass);
++		config_mc_state(hbm, device, ch, mc_state_normal);
++
++		/* Basic configuration */
++		WREG32(base + (ch * 0x1000) + 0x000,
++				0x21012010 | (hbm->ecc_enable << 22));
++
++		/* Enable interrupts. Clear them from leftovers from init. */
++		RMWREG32(base + (ch * 0x1000) + 0x060, 0x8, 0xF);
++		RMWREG32(base + (ch * 0x1000) + 0x070, 0x8, 0xF);
++		WREG32(base + (ch * 0x1000) + 0x06C, 0x1F1F);
++		WREG32(base + (ch * 0x1000) + 0x07C, 0x1F1F);
++		WREG32(base + (ch * 0x1000) + 0x068, 0x817);
++		WREG32(base + (ch * 0x1000) + 0x078, 0x817);
++		RMWREG32(base + (ch * 0x1000) + 0x060, 0x0, 0xF);
++		RMWREG32(base + (ch * 0x1000) + 0x070, 0x0, 0xF);
++	}
++}
++
++static void enable_traffic(int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	int ch;
++
++	/* Enable traffic */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		RMWREG32(base + (ch * 0x1000) + 0x000, 0x1, 0x8);
++		WREG32(base + (ch * 0x1000) + 0x004, 0xC0);
++	}
++}
++
++static void read_hardware_training_result(int device)
++{
++	int ch;
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		acc[ch][0] = RREG32_MASK(base + (ch * 0x1000) + 0x414,
++					0x1FF0000);
++		acc[ch][1] = RREG32_MASK(base + (ch * 0x1000) + 0x514,
++					0x1FF0000);
++		acc[ch][2] = RREG32_MASK(base + (ch * 0x1000) + 0x614,
++					0x1FF0000);
++		acc[ch][3] = RREG32_MASK(base + (ch * 0x1000) + 0x714,
++					0x1FF0000);
++		acc[ch][4] = RREG32_MASK(base + (ch * 0x1000) + 0x814,
++					0x1FF0000);
++
++		aword[ch][0] = RREG32_MASK(base + (ch * 0x1000) + 0x428,
++					0x1FF0000);
++		aword[ch][1] = RREG32_MASK(base + (ch * 0x1000) + 0x458, 0x1FF);
++		aword[ch][2] = RREG32_MASK(base + (ch * 0x1000) + 0x458,
++					0x1FF0000);
++		aword[ch][3] = aword[ch][2] - aword[ch][1] + 1;
++
++		dword_wr[ch][0][0] = RREG32_MASK(base + (ch * 0x1000) + 0x528,
++						0x1FF0000);
++		dword_wr[ch][0][1] = RREG32_MASK(base + (ch * 0x1000) + 0x470,
++						0x1FF);
++		dword_wr[ch][0][2] = RREG32_MASK(base + (ch * 0x1000) + 0x470,
++						0x1FF0000);
++		dword_wr[ch][0][3] = dword_wr[ch][0][2] -
++					dword_wr[ch][0][1] + 1;
++		dword_wr[ch][1][0] = RREG32_MASK(base + (ch * 0x1000) + 0x628,
++						0x1FF0000);
++		dword_wr[ch][1][1] = RREG32_MASK(base + (ch * 0x1000) + 0x474,
++						0x1FF);
++		dword_wr[ch][1][2] = RREG32_MASK(base + (ch * 0x1000) + 0x474,
++						0x1FF0000);
++		dword_wr[ch][1][3] = dword_wr[ch][1][2] -
++					dword_wr[ch][1][1] + 1;
++		dword_wr[ch][2][0] = RREG32_MASK(base + (ch * 0x1000) + 0x728,
++						0x1FF0000);
++		dword_wr[ch][2][1] = RREG32_MASK(base + (ch * 0x1000) + 0x478,
++						0x1FF);
++		dword_wr[ch][2][2] = RREG32_MASK(base + (ch * 0x1000) + 0x478,
++						0x1FF0000);
++		dword_wr[ch][2][3] = dword_wr[ch][2][2] -
++					dword_wr[ch][2][1] + 1;
++		dword_wr[ch][3][0] = RREG32_MASK(base + (ch * 0x1000) + 0x828,
++						0x1FF0000);
++		dword_wr[ch][3][1] = RREG32_MASK(base + (ch * 0x1000) + 0x47C,
++						0x1FF);
++		dword_wr[ch][3][2] = RREG32_MASK(base + (ch * 0x1000) + 0x47C,
++						0x1FF0000);
++		dword_wr[ch][3][3] = dword_wr[ch][3][2] -
++					dword_wr[ch][3][1] + 1;
++
++		dword_rd[ch][0][0] = RREG32_MASK(base + (ch * 0x1000) + 0x518,
++						0x1FF0000);
++		dword_rd[ch][0][1] = RREG32_MASK(base + (ch * 0x1000) + 0x490,
++						0x1FF);
++		dword_rd[ch][0][2] = RREG32_MASK(base + (ch * 0x1000) + 0x490,
++						0x1FF0000);
++		dword_rd[ch][0][3] = dword_rd[ch][0][2] -
++					dword_rd[ch][0][1] + 1;
++		dword_rd[ch][1][0] = RREG32_MASK(base + (ch * 0x1000) + 0x618,
++						0x1FF0000);
++		dword_rd[ch][1][1] = RREG32_MASK(base + (ch * 0x1000) + 0x494,
++						0x1FF);
++		dword_rd[ch][1][2] = RREG32_MASK(base + (ch * 0x1000) + 0x494,
++						0x1FF0000);
++		dword_rd[ch][1][3] = dword_rd[ch][1][2] -
++					dword_rd[ch][1][1] + 1;
++		dword_rd[ch][2][0] = RREG32_MASK(base + (ch * 0x1000) + 0x718,
++						0x1FF0000);
++		dword_rd[ch][2][1] = RREG32_MASK(base + (ch * 0x1000) + 0x498,
++						0x1FF);
++		dword_rd[ch][2][2] = RREG32_MASK(base + (ch * 0x1000) + 0x498,
++						0x1FF0000);
++		dword_rd[ch][2][3] = dword_rd[ch][2][2] -
++					dword_rd[ch][2][1] + 1;
++		dword_rd[ch][3][0] = RREG32_MASK(base + (ch * 0x1000) + 0x818,
++						0x1FF0000);
++		dword_rd[ch][3][1] = RREG32_MASK(base + (ch * 0x1000) + 0x49C,
++						0x1FF);
++		dword_rd[ch][3][2] = RREG32_MASK(base + (ch * 0x1000) + 0x49C,
++						0x1FF0000);
++		dword_rd[ch][3][3] = dword_rd[ch][3][2] -
++					dword_rd[ch][3][1] + 1;
++	}
++}
++
++static void hardware_training(struct hbm *hbm, int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 dll_inc, status;
++	int ch, err;
++
++	reduce_pll();
++
++	if (hbm->inc == 16)
++		dll_inc = 3;
++	else if (hbm->inc == 4)
++		dll_inc = 2;
++	else
++		dll_inc = 1;
++
++	/* Reset read FIFO */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		WREG32(base + ch * 0x1000 + 0x294, 1);
++		WREG32(base + ch * 0x1000 + 0x294, 0);
++	}
++
++	acc_training(hbm, device);
++
++	/* AWORD training */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		WREG32(base + ch * 0x1000 + 0x454,
++			((hbm->hardware_training_repeat - 1) << 16) |
++				(hbm->training_delay << 8) | dll_inc);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		WREG32(base + ch * 0x1000 + 0x450, 1);
++		err = hbm_poll_timeout(base + ch * 0x1000 + 0x450, 0,
++				       GAUDI_HBM_CFG_TIMEOUT_US, &status);
++		if (err) {
++			preboot_puts("AWORD write done test failed\n");
++			goto hw_train_out;
++		}
++	}
++
++	/* Cleanup: Reset HBM + MRS setup */
++	dram_rstn(device, cke_state_high);
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		config_dram_state(hbm, base, ch, dram_state_training);
++
++	/* DWORD read training */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		WREG32(base + ch * 0x1000 + 0x484,
++			((hbm->hardware_training_repeat - 1) << 16) |
++			(hbm->training_delay << 8) | dll_inc);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		WREG32(base + ch * 0x1000 + 0x480, 1);
++		err = hbm_poll_timeout(base + ch * 0x1000 + 0x480, 0,
++				       GAUDI_HBM_CFG_TIMEOUT_US, &status);
++		if (err) {
++			preboot_puts("DWORD read done test failed\n");
++			goto hw_train_out;
++		}
++	}
++
++	/* Cleanup: Reset HBM + MRS setup */
++	dram_rstn(device, cke_state_high);
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		config_dram_state(hbm, base, ch, dram_state_training);
++
++	/* DWORD write training */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		WREG32(base + ch * 0x1000 + 0x464,
++			((hbm->hardware_training_repeat - 1) << 16) |
++			(hbm->training_delay << 8) | dll_inc);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		WREG32(base + ch * 0x1000 + 0x460, 1);
++		err = hbm_poll_timeout(base + ch * 0x1000 + 0x460, 0,
++				       GAUDI_HBM_CFG_TIMEOUT_US, &status);
++		if (err) {
++			preboot_puts("DWORD write done test failed\n");
++			goto hw_train_out;
++		}
++	}
++
++hw_train_out:
++	read_hardware_training_result(device);
++
++	restore_pll();
++}
++
++static int init_ecc(struct hbm *hbm, int unused)
++{
++	u32 base;
++	u32 status;
++	int device, err, ch, sid;
++
++	/* Clean transition from Functional mode to MCBIST mode */
++	for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++		base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			config_mlb_state(base, ch, phy_state_initial);
++			config_mc_state(hbm, device, ch, mc_state_bist);
++			config_mlb_state(base, ch, phy_state_bypass);
++		}
++	}
++
++	/* Configure MCBIST engine for ECC init in all channels */
++	for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++		base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			WREG32(base + ch * 0x1000 + 0x100, 0x100);
++			WREG32(base + ch * 0x1000 + 0x108, 0x800000);
++			WREG32(base + ch * 0x1000 + 0x10c, 0x0);
++			WREG32(base + ch * 0x1000 + 0x110, 0x0);
++			WREG32(base + ch * 0x1000 + 0x114, 0xFFFFFFFF);
++			WREG32(base + ch * 0x1000 + 0x118, 0xFFFFFFFF);
++		}
++	}
++
++	for (sid = 0; sid < 2; sid++) {
++		/* Start MCBIST engine */
++		for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++			base = GAUDI_HBM_CFG_BASE +
++						device * GAUDI_HBM_CFG_OFFSET;
++			for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++				WREG32(base + ch * 0x1000 + 0x104,
++						(0x0 | sid << 28 | sid << 29));
++				WREG32(base + ch * 0x1000 + 0x11C, 0x3);
++			}
++		}
++
++		/* Poll for MCBIST completion */
++		for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++			base = GAUDI_HBM_CFG_BASE +
++						device * GAUDI_HBM_CFG_OFFSET;
++			for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++				err = hbm_poll_timeout(
++						base + ch * 0x1000 + 0x11C,
++						0x03000000,
++						GAUDI_HBM_ECC_CFG_TIMEOUT_US,
++						&status);
++				if (err) {
++					preboot_puts("ECC init failed\n");
++					config_mc_state(hbm, device, ch,
++							mc_state_normal);
++					return -1;
++				}
++			}
++		}
++	}
++
++	/* Clean transition from MCBIST mode to Functional mode */
++	for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++		base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++			config_mlb_state(base, ch, phy_state_initial);
++			config_mc_state(hbm, device, ch, mc_state_normal);
++			config_mlb_state(base, ch, phy_state_bypass);
++		}
++	}
++
++	return 0;
++}
++
++static int lane_detection(int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	int ch, rc;
++
++	/* Enter IODC mode */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		WREG32(base + ch * 0x1000 + 0x900, 1);
++
++	rc = extest_rx(device);
++	if (rc)
++		return rc;
++
++	rc = extest_tx(device);
++	if (rc)
++		return rc;
++
++	/* Exit IODC mode */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		WREG32(base + ch * 0x1000 + 0x900, 0);
++
++	return 0;
++}
++
++static void lane_remap(int device)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 reg_800, reg_804, reg_808;
++	u32 remap_info_dw01, remap_info_dw23, remap_info_aw;
++	int ch;
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		/* Read HBM lane repair eFuse information */
++		ieee1500_inst(device, ch, ieee1500_hard_lane_repair,
++			      EXTEST_READ_INST);
++		reg_800 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
++							0x800 + (ch * 0x100));
++		reg_804 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
++							0x804 + (ch * 0x100));
++		reg_808 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
++							0x808 + (ch * 0x100));
++
++		/* Configure MLB according to remapped lanes */
++		remap_info_dw01 = reg_800;
++		remap_info_aw   = reg_804 & 0xFF;
++		remap_info_dw23 = ((reg_804 & 0xFFFFFF00) >> 8) |
++						((reg_808 & 0xFF) << 24);
++		WREG32(base + (ch*0x1000) + 0x2F0, remap_info_dw01);
++		WREG32(base + (ch*0x1000) + 0x2F4, remap_info_dw23);
++		WREG32(base + (ch*0x1000) + 0x2F8, remap_info_aw);
++	}
++}
++
++static int temperature_read(int device)
++{
++	u32 base, rdata, ignore = 0;
++	bool invalid;
++
++	base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	ieee1500_inst(device, ignore, ieee1500_temperature, EXTEST_READ_INST);
++	rdata = RREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x800);
++	invalid = (rdata >> 7) & 1;
++
++	return invalid ? -1 : rdata & 0x7F;
++}
++
++static int temperature_check(int device)
++{
++	int temp = temperature_read(device);
++
++	if (temp < 0 || temp > GAUDI_MAX_TEMP_THRESHOLD)/* system power down? */
++		preboot_puts("HBM temp is invalid or high\n");
++
++	return temp;
++}
++
++static void hbm_reset(void)
++{
++	/* assert reset: set bits 33-36 (HBM) */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
++	regmap_writel(0x1E, mmPSOC_GLOBAL_CONF_UNIT_RST_N_H);
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++	udelay(250);
++	/* deassert reset */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_H);
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++}
++
++/**
++ * gaudi_hbm_init - Initialize HBM controller of the chip and HBM memories
++ *		    Scrub the memories.
++ *
++ * Return: 0 for success, 1 for failure
++ *
++ */
++int gaudi_hbm_init(void)
++{
++	struct hbm *hbm = &hbm_data;
++	int dev, err;
++
++	hbm_reset();
++
++	for (dev = 0; dev < GAUDI_HBM_DEVICES; dev++) {
++		/* Initialization */
++
++		/* PHY requires 100ns delay from mc_rstn */
++		udelay(1);
++
++		phy_init(dev);
++		dram_rstn(dev, cke_state_low);
++
++		/* Internal Loopback (bring-up only) */
++		if (internal_loopback_test(hbm, dev)) {
++			preboot_puts("HBM intern loopback failed\n");
++			return 1;
++		}
++
++		/* IO connectivity test (bring-up only) */
++		if (lane_detection(dev)) {
++			preboot_puts("HBM lane det failed\n");
++			return 1;
++		}
++		dram_rstn(dev, cke_state_low);
++
++		/* Lane remapping */
++		lane_remap(dev);
++
++		/* Training */
++		hardware_training(hbm, dev);
++		check_training_result(hbm, dev);
++
++		/* Initialize MC for functional operation */
++		init_mc(hbm, dev);
++	}
++
++	/* MC BIST (validate Training result) */
++	err = mcbist_write_read_full(hbm, 0);
++	if (err)
++		return 1;
++
++	/* If ECC enabled, perform ECC scrubbing */
++	if (hbm->ecc_enable)
++		if (init_ecc(hbm, 0))
++			return 1;
++
++	/* Temperature readout and Enable traffic */
++	for (dev = 0; dev < GAUDI_HBM_DEVICES; dev++) {
++		temperature_check(dev);
++		enable_traffic(dev);
++	}
++
++	return 0;
++}

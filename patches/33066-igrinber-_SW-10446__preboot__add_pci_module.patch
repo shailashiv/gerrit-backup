@@ -1,0 +1,104 @@
+From 14cf9b164f3e7fff1adf775bd23d5cc0c363ac92 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 21 Apr 2020 01:41:51 +0300
+Subject: [PATCH] [SW-10446] preboot: add pci module
+
+The PCI module is designed to handle the virtualized PCI events.
+Add handling of FLR and hot reset.
+
+Change-Id: I0c4c8d185719389ad595f2a04df0de9c63b376c8
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/preboot.c b/app/preboot.c
+index 8d2b331..8c3358b 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -26,6 +26,16 @@
+ 	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
+ 
+ static struct cmd_module_ops cmd_ops[] = {
++	{	/* PCI module */
++		.setup = noop,
++		.check = module_pci_check,
++		.disable = noop,
++		.run = noop,
++		.enable = noop,
++		.run_fast = module_pci_run,
++		.teardown = noop,
++		.run_noreturn = noop,
++	},
+ 	{	/* FW UPD module */
+ 		.setup = module_fwupd_setup,
+ 		.check = module_fwupd_check,
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 8250e63..7327c60 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -62,6 +62,10 @@
+ /* a dummy to fill in irrelevant entries */
+ static inline void noop(void) {}
+ 
++/* PCI */
++enum cmd_check_res module_pci_check(void);
++void module_pci_run(void);
++
+ /* FWUPD */
+ void module_fwupd_setup(void);
+ enum cmd_check_res module_fwupd_check(void);
+diff --git a/common/module_pci.c b/common/module_pci.c
+new file mode 100644
+index 0000000..1443d33
+--- /dev/null
++++ b/common/module_pci.c
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <pcie_aux_regs.h>
++#include <pcie_core_regs.h>
++
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++
++struct pci_status {
++	u32 flr_reg_val;
++	u32 hot_rst_reg_val;
++};
++
++static struct pci_status pci_sts = {
++	.flr_reg_val = ~1,
++	.hot_rst_reg_val = ~1,
++};
++
++enum cmd_check_res module_pci_check(void)
++{
++	pci_sts.flr_reg_val = regmap_readl(mmPCIE_AUX_FLR_INT);
++	pci_sts.hot_rst_reg_val = regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
++
++	if (pci_sts.flr_reg_val == 1 || pci_sts.hot_rst_reg_val == 1)
++		return FOUND_FAST_RETURN;
++
++	return NOT_FOUND;
++}
++
++void module_pci_run(void)
++{
++	if (pci_sts.flr_reg_val == 1) {
++		regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
++		regmap_writel(1, mmPCIE_AUX_FLR_INT);
++		regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
++		preboot_puts("FLR received\n");
++	}
++
++	if (pci_sts.hot_rst_reg_val == 1) {
++		regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
++		regmap_writel(1, mmPCIE_AUX_LTSSM_EN);
++		preboot_puts("HOT RST received\n");
++	}
++}

@@ -1,0 +1,71 @@
+From f2a90532aa34223b9b72ebb3d89ea782b3e09fd0 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 04 Sep 2020 12:31:40 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: add tpc protection
+
+Implement TPC role setting to user level and protect the configuration and
+protection bits.
+
+Change-Id: Id91c69adf5f276ac42849c7b74b6a8756b8c281b
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index df06671..7d87a63 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -15,6 +15,7 @@
+ #include <mme0_acc_regs.h>
+ #include <mme0_sbab_regs.h>
+ #include <mme0_ctrl_regs.h>
++#include <tpc0_cfg_regs.h>
+ #include <sif_rtr_ctrl_7_regs.h>
+ #include <psoc_global_conf_regs.h>
+ 
+@@ -24,6 +25,7 @@
+ #include <mme0_acc_masks.h>
+ #include <mme0_sbab_masks.h>
+ #include <mme0_ctrl_masks.h>
++#include <tpc0_cfg_masks.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
+@@ -480,6 +482,30 @@
+ 	}
+ }
+ 
++#define TPCS_NUM	8
++#define TPCS_DIST	0x40000
++static void preboot_secure_tpc(void)
++{
++	u32 mask, reg;
++	int i;
++
++	/* Set TPC engines level to user */
++	mask = PROT_OVR_USER << TPC0_CFG_PROT_ARPROT_SHIFT |
++		PROT_OVR_USER << TPC0_CFG_PROT_AWPROT_SHIFT;
++	for (i = 0; i < TPCS_NUM; i++) {
++		reg = mmTPC0_CFG_PROT + TPCS_DIST * i;
++		regmap_writel(mask, reg);
++
++		/* Protect the TPC configuration */
++		regmap_writel(PROT_BIT(mmTPC0_CFG_PROT), PRIV_PROT_REG(reg));
++		set_prot_bits_priv_int_conf(mmTPC0_CFG_BASE + TPCS_DIST * i);
++
++		/* Protect the E2E Creds */
++		reg = mmTPC0_E2E_CRED_BASE & ~HL_CFG_BASE;
++		set_prot_bits_range_all(reg + TPCS_DIST * i, PROT_SIZE_MAX);
++	}
++}
++
+ static void preboot_security_pci_disable(void)
+ {
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
+@@ -529,6 +555,7 @@
+ 	preboot_secure_psoc();
+ 	preboot_secure_pci();
+ 	preboot_secure_mme();
++	preboot_secure_tpc();
+ 
+ 	/* TODO: implement the rest of security enablement */
+ 

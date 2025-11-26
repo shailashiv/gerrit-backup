@@ -1,0 +1,52 @@
+From 9a130b18da4bba7c7afe1c0faa54aca65a688732 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 31 Jan 2021 14:05:04 +0200
+Subject: [PATCH] [SW-30453] i2c indirect: fix rdata crc for trivial
+
+When reading outside for opcode bound, a trivial value of 0 is returned.
+This value needs to be digested in CRC.
+In addition, CRC must come after RSDL as opposed to after the readable
+data (struct).
+
+Change-Id: I8ece92623b25467092f09685e616d33382ef20a3
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index a0407e3..871edd7 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -546,6 +546,7 @@
+ u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq)
+ {
+ 	register int idx = cmd + read_seq - HL_INDIRECT_REQ_RDATA_DATA;
++	u8 zero = 0;
+ 
+ 	/* Header */
+ 	if (idx < HL_I2CI_REQ_RDATA_LEN)
+@@ -559,15 +560,21 @@
+ 	if (idx < req_rd.length)
+ 		return req_rd.data[idx];
+ 
+-	if (req_wd.hdr.ic) {
++	if (req_wd.hdr.ic && idx < req_rd.hdr.rsdl + 4) {
+ 		if (idx == req_rd.length)
+ 			req_rd.crc = crc32(req_rd.crc, req_rd.data,
+ 					   req_rd.length);
+ 
++		/* CRC trivial read 0 for reading of out bound */
++		if (idx < req_rd.hdr.rsdl)
++			req_rd.crc = crc32(req_rd.crc, &zero, 1);
++
+ 		/* CRC */
+-		idx -= req_rd.length;
+-		if (idx < sizeof(req_rd.req_crc_data))
+-			return req_rd.req_crc_data[idx];
++		if (idx >= req_rd.hdr.rsdl && idx < req_rd.hdr.rsdl + 4) {
++			idx -= req_rd.hdr.rsdl;
++			if (idx < sizeof(req_rd.req_crc_data))
++				return req_rd.req_crc_data[idx];
++		}
+ 	}
+ 
+ 	return 0;

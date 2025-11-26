@@ -1,0 +1,287 @@
+From 5d90053829e9533bbcebd03e7d4e2af9b1114b85 Mon Sep 17 00:00:00 2001
+From: Pardha Kesapragada <pkesapragada@habana.ai>
+Date: Wed, 17 Mar 2021 10:15:05 +0200
+Subject: [PATCH] [SW-0] gaudi2_arm: pcie link bringup changes
+
+Make PCIE linkup related configuration changes
+in the legacy mode. These changes have been made
+according to the same sequence as bootrom
+
+Change-Id: I761ed567ccc0510b2cc4a2bcf50f0e911e1873cc
+Signed-off-by: Pardha Kesapragada <pkesapragada@habana.ai>
+---
+
+diff --git a/gaudi2_arm/asic.c b/gaudi2_arm/asic.c
+index a7e7715..5cb88a4 100644
+--- a/gaudi2_arm/asic.c
++++ b/gaudi2_arm/asic.c
+@@ -21,7 +21,7 @@
+ u32 hl_skip_pcie_init(void)
+ {
+ 	/* TODO: Use DumpSel[*] to skip PCIe initialization */
+-	return 1;
++	return 0;
+ }
+ 
+ u64 hl_pll_timestamp_freq_get(void)
+diff --git a/gaudi2_arm/common.c b/gaudi2_arm/common.c
+index c586458..34044d3 100644
+--- a/gaudi2_arm/common.c
++++ b/gaudi2_arm/common.c
+@@ -48,6 +48,9 @@
+ #define ARC1_DCCM_BASE_ADDR		0x1000007FF7060000ull
+ #define ARC1_DCCM_SIZE			0x8000			/* 32KB */
+ 
++#define DUMP_SEL_SRNS_MASK		0x1
++#define DUMP_SEL_SSC_MASK		0x2
++
+ bool hl_is_debug_mode(enum hl_debug_hw_func func)
+ {
+ 	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+@@ -80,109 +83,138 @@
+ 		regmap_writel(value, addr);
+ }
+ 
+-static void pcie_wa_snps_case_01038891(void)
++static void pcie_wait_for_sram_init_done(void)
+ {
+-	u32 boot_strap_l, boot_strap_h;
+-	u8 separate_reference = 0;
+-	u32 reg = 0, val;
+-	u8 ssc_en = 0;
++	uint8_t sram_init_done = 0;
+ 
+-	boot_strap_h = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H);
+-	boot_strap_l = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H);
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++	} while (sram_init_done != 1);
+ 
+-	if (boot_strap_h & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H_SRIS_MODE_MASK) {
+-		regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
+-		regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
+-	}
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++	} while (sram_init_done != 1);
+ 
+-	/* SRIS mode enable */
+-	if (boot_strap_h & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H_SRIS_MODE_MASK)
+-		separate_reference = 1;
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2);
++	} while (sram_init_done != 1);
+ 
+-	/* SRNS mode enable */
+-	if ((boot_strap_l &
+-			PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK) == 0)
+-		separate_reference = 1;
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3);
++	} while (sram_init_done != 1);
++}
+ 
+-	/* spread spectum clock enable */
+-	if (boot_strap_l & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK)
+-		ssc_en = 1;
++static void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmPCIE_PHY_PHY_SRAM_EXT_LD_DONE);
++}
+ 
+-	/* TODO: Check fuse to see if SNPS WA needs to be enabled  */
++static void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
+ 
+-	if (ssc_en) {
+-		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
+-				mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
+-		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
+-				mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
+-		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_PEAK,
+-				mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
+-		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE,
+-				mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
+-		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_PEAK,
+-				mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
+-		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE,
+-				mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
+-	}
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++		mmPCIE_PHY_PHYX_MPLLB_SSC_EN_3, 0x1);
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++		mmPCIE_PHY_PHYX_MPLLA_SSC_EN_3, 0x1);
++}
+ 
+-	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
+-			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++static void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
++{
++	uint32_t reg;
+ 
+ 	if (separate_reference) {
+-		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR;
+-
+-		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_SHIFT);
+-		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_SHIFT);
+-		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
+-
+-		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
+-		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
+-		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++		reg = 0xA0;
++		regmap_writel(0x00250025,
++			mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x00250025,
++			mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+ 	} else {
+-		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER;
+-
+-		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
+-		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
+-		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++		reg = 0x50;
++		regmap_writel(0x00530053,
++			mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x01C301C3,
++			mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+ 	}
+ 
+ 	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER,
+-			mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
+-	pcie_update_reg_range(mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
+-		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
++	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++}
+ 
++static void pcie_phy_set_ext_tx_rx_ctrl(void) {}
++static void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+ 
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
++static uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
++{
++	uint32_t dump_sel = (boot_strap &
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
++
++	/* dumpsel[0] is SRNS */
++	return (dump_sel & DUMP_SEL_SRNS_MASK);
++}
++
++static uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
++{
++	uint32_t dump_sel = (boot_strap &
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
++
++	/* dumpsel[1] is SSC EN */
++	return !!(dump_sel & DUMP_SEL_SSC_MASK);
++}
++
++uint8_t get_sris_mode_from_strap(void)
++{
++	uint32_t boot_strap;
++
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H);
++
++	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H_SRIS_MODE_MASK);
++}
++
++static void pcie_wa_snps_case_01038891(void)
++{
++	uint8_t separate_reference = 0;
++	uint8_t ssc_en = 0, srns = 0;
++	uint32_t boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++	separate_reference = get_sris_mode_from_strap();
++	if (separate_reference) {
++		regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++		regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
++	}
++	/* SRNS mode enable */
++	srns = get_srns_mode_from_strap(boot_strap);
++
++	if (!srns)
++		separate_reference = 1;
++
++	/* spread spectum clock enable */
++	ssc_en = get_ssc_en_from_strap(boot_strap);
++
++	/* TODO: Check fuse to see if SNPS WA needs to be enabled  */
++	if (ssc_en) {
++		pcie_phy_set_mpll_a_b_ssc_enable();
++
++		regmap_writel(0x5000, mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
++		regmap_writel(0x19CE,
++				mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
++		regmap_writel(0x6666, mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
++		regmap_writel(0x2108,
++				mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
++	}
++
++	pcie_phy_set_ext_tx_rx_ctrl();
++	pcie_phy_set_mpll_a_b_mul_bw(separate_reference);
++
++	pcie_phy_set_protocol0_ext_tx_rx();
+ 
+ 	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
+ }
+@@ -215,6 +247,8 @@
+ 	 */
+ 	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+ 	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
+ 
+ 	/* Execute synopsys workaround (01038891) */
+ 	pcie_wa_snps_case_01038891();
+@@ -240,9 +274,9 @@
+ 	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+ 
+ 	/* Wait for init_done before executing W/A */
+-	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0) &&
+-		regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1)))
+-		;
++	pcie_wait_for_sram_init_done();
++
++	pcie_phy_set_sram_ext_ld_done();
+ 
+ 	/* Execute the Synopsys W/A */
+ 	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);

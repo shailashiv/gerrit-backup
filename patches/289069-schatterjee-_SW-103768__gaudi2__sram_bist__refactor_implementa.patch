@@ -1,0 +1,110 @@
+From 43101d7ba51d9464b1ed2cf67025506e74a71154 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Fri, 23 Dec 2022 11:48:21 +0200
+Subject: [PATCH] [SW-103768] gaudi2: sram bist: refactor implementation flow
+
+This patch refactors the sram bist implementation. Earlier
+the flow was to run BIRA for all rings, then BISR for all rings
+and finally to run BIST for all rings.
+
+Now it is modified to run loop over all rings to run BIRA, BISR
+and BIST in sequence for a partciular ring.
+
+This will be extended further to skip running BISR and BIST
+for a particular ring of BIRA is OK.
+
+Change-Id: I6f541a30fd8527e1d061a67410e04eb86cf597d3
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 3d0acab..58f0cda 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -240,36 +240,51 @@
+ 	regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
+ }
+ 
+-#define GAUDI2_DFX_SHIFT_VAL		5
+-static void gaudi2_sram_self_repair(enum gaudi2_sram_self_repair_op op)
++static int sram_op_specific_pattern(enum gaudi2_sram_self_repair_op op, uint8_t dfx, uint8_t ring)
+ {
+-	unsigned int ring;
++	int ret;
++
++	gaudi2_sram_id_sel();
++	gaudi2_sram_ring_sel(dfx_value_table[dfx], ring);
++
++	ret = gaudi2_sram_ring_pattern(op);
++
++	return ret;
++}
++
++#define GAUDI2_DFX_SHIFT_VAL		5
++static void gaudi2_sram_self_repair(void)
++{
++	unsigned int ring_index;
+ 	int ret;
+ 	u8 val, num;
++	uint8_t dfx, ring;
+ 
+ 	gaudi2_sram_beginning_pattern();
+ 
+-	for (ring = 0; ring < GAUDI2_SRAM_RINGS_NUM; ring++) {
+-		gaudi2_sram_id_sel();
+-		gaudi2_sram_ring_sel(dfx_value_table[gaudi2_sram_rings[ring].dfx],
+-								gaudi2_sram_rings[ring].ring);
+-		ret = gaudi2_sram_ring_pattern(op);
++	for (ring_index = 0; ring_index < GAUDI2_SRAM_RINGS_NUM; ring_index++) {
++		dfx = gaudi2_sram_rings[ring_index].dfx;
++		ring = gaudi2_sram_rings[ring_index].ring;
++		val = (dfx << GAUDI2_DFX_SHIFT_VAL) | ring;
++
++		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BIRA, dfx, ring);
+ 		if (ret > 0) {
+-			val = (gaudi2_sram_rings[ring].dfx << GAUDI2_DFX_SHIFT_VAL) |
+-								gaudi2_sram_rings[ring].ring;
+-			if (op == SRAM_SELF_REPAIR_OP_BIRA) {
+-				num = bist_data->num_prebist_failed_rings;
+-				bist_data->pre_bist_failed_rings[num] = val;
+-				bist_data->num_prebist_failed_rings++;
+-				preboot_puts_hex("bira failed val: ", val, 0);
+-			} else if (op == SRAM_SELF_REPAIR_OP_BIST) {
+-				num = bist_data->num_postbist_failed_rings;
+-				bist_data->post_bist_failed_rings[num] = val;
+-				bist_data->num_postbist_failed_rings++;
+-				preboot_puts_hex("bist failed val: ", val, 0);
+-			} else {
+-				preboot_puts_hex("bisr failed val: ", val, 0);
+-			}
++			num = bist_data->num_prebist_failed_rings;
++			bist_data->pre_bist_failed_rings[num] = val;
++			bist_data->num_prebist_failed_rings++;
++			preboot_puts_hex("bira failed val: ", val, 0);
++		}
++
++		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BISR, dfx, ring);
++		if (ret > 0)
++			preboot_puts_hex("bisr failed val: ", val, 0);
++
++		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BIST, dfx, ring);
++		if (ret > 0) {
++			num = bist_data->num_postbist_failed_rings;
++			bist_data->post_bist_failed_rings[num] = val;
++			bist_data->num_postbist_failed_rings++;
++			preboot_puts_hex("bist failed val: ", val, 0);
+ 		}
+ 	}
+ }
+@@ -441,9 +456,8 @@
+ 		return;
+ 	}
+ 
+-	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BIRA);
+-	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BISR);
+-	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BIST);
++	gaudi2_sram_self_repair();
++
+ 	/* Get back to normal from DFT mode */
+ 	regmap_writel(DFT_APB_CONTROL_DEFAULT_VAL, mmPSOC_GLOBAL_CONF_DFT_APB_CONTROL);
+ 	gaudi2_sram_ecc_init();

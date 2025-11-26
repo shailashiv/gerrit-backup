@@ -1,0 +1,156 @@
+From 3097068939de7a3a0cc4c2e7d17840cc72c74d36 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Wed, 15 Apr 2020 14:02:30 +0300
+Subject: [PATCH] [SW-10446] fit: add needed sources for pcie loading
+
+Preboot will get u-boot over PCIe (FIT) and not from SPI
+
+Change-Id: Ib832a55f2f1cbdb36f7087adaf7dd8d70350e18e
+---
+
+diff --git a/Makefile b/Makefile
+index 13235a1..c7b3b6a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -22,6 +22,7 @@
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+ LDLIBS := -lgcc
++PREBOOT_LDLIBS = $(LDLIBS) -lfdt
+ 
+ include $(HL_DEV)/Makefile
+ 
+@@ -47,7 +48,7 @@
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
+ 
+ preboot: $(PREBOOT_OBJECTS) $(PREBOOT_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PREBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
++	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PREBOOT_OBJECTS) $(PREBOOT_LDLIBS) -Wl,--end-group
+ 
+ ppboot: $(PPBOOT_OBJECTS) $(PPBOOT_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(PPBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PPBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
+diff --git a/common/fit.c b/common/fit.c
+new file mode 100644
+index 0000000..67d6b07
+--- /dev/null
++++ b/common/fit.c
+@@ -0,0 +1,99 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <libfdt.h>
++#include "common.h"
++#include "uart.h"
++
++#define FIT_IMAGES_PATH		"/images"
++#define FIT_CONFS_PATH		"/configurations"
++
++#define FIT_CONF_NAME		"preboot-conf"
++#define FIT_DESC_PROP		"description"
++#define FIT_LOADABLE_PROP	"loadables"
++#define FIT_DATA_PROP		"data"
++
++static const char *fit_loadables_name(const void *fit, int noffset, int id)
++{
++	return fdt_stringlist_get(fit, noffset, FIT_LOADABLE_PROP, id, NULL);
++}
++
++static int fit_find_config_node(const void *fit)
++{
++	int conf, node;
++	int dflt_conf_node = -1;
++
++	conf = fdt_path_offset(fit, FIT_CONFS_PATH);
++	if (conf < 0) {
++		preboot_puts("Cannot find configuration node\n");
++		return -1;
++	}
++
++	for (node = fdt_first_subnode(fit, conf); node >= 0; node = fdt_next_subnode(fit, node)) {
++		const char *node_name = fdt_get_name(fit, node, NULL);
++
++		if (strcmp(FIT_CONF_NAME, node_name) == 0) {
++			dflt_conf_node = node;
++			break;
++		}
++	}
++
++	return dflt_conf_node;
++}
++
++static int fit_loadables_node_get(const void *fit, int id)
++{
++	int images, conf = fit_find_config_node(fit);
++	const char *uname = fit_loadables_name(fit, conf, id);
++
++	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	return fdt_subnode_offset(fit, images, uname);
++}
++
++int fit_check_format(const void *fit)
++{
++	if (fdt_check_header(fit)) {
++		preboot_puts("FIT header check failed\n");
++		return 0;
++	}
++
++	/* mandatory / node 'description' property */
++	if (fdt_getprop(fit, 0, FIT_DESC_PROP, NULL) == NULL) {
++		preboot_puts("Wrong FIT format: no description\n");
++		return 0;
++	}
++
++	/* mandatory subimages parent '/images' node */
++	if (fdt_path_offset(fit, FIT_IMAGES_PATH) < 0) {
++		preboot_puts("Wrong FIT format: no images parent node\n");
++		return 0;
++	}
++
++	return 1;
++}
++
++int fit_load_uboot(const void *fit, void *dst)
++{
++	int node, len;
++	const u8 *buf;
++
++	node = fit_loadables_node_get(fit, 0);
++	if (node < 0) {
++		preboot_puts("Wrong FIT format: no uboot node\n");
++		return 1;
++	}
++
++	buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
++	if (!buf) {
++		preboot_puts("Wrong FIT format: uboot data empty\n");
++		return 1;
++	}
++
++	memcpy(dst, buf, len);
++
++	return 0;
++}
+diff --git a/common/fit.h b/common/fit.h
+new file mode 100644
+index 0000000..2311f9d
+--- /dev/null
++++ b/common/fit.h
+@@ -0,0 +1,14 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _HL_FIT_H_
++#define _HL_FIT_H_
++
++int fit_load_uboot(const void *fit, void *dst);
++int fit_check_format(const void *fit);
++
++#endif /* _HL_FIT_H_ */

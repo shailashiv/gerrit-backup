@@ -1,0 +1,234 @@
+From d3317a78ef89671678e623d269a4b69a37ac71de Mon Sep 17 00:00:00 2001
+From: Alona Solntseva <alona.solntseva@tandemg.com>
+Date: Wed, 09 Feb 2022 18:03:48 +0200
+Subject: [PATCH] [SW-67906] erom: separate erom images text base
+
+Create a separate ld script for each erom image to allow text base
+separation
+TPM amd PCIe erom images can use the same offset, because they will
+never both be in use in the same time.
+
+Change-Id: I230140ce2d441c4f750a36451400d1976713982b
+Signed-off-by: Alona Solntseva <alona.solntseva@tandemg.com>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 8ec76f4..0b97d4c 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -18,7 +18,9 @@
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+ 
+-EROM_LD_SCRIPT := common_erom.lds
++EROM_TPM_LD_SCRIPT := tpm_erom.lds
++EROM_PCIE_LD_SCRIPT := pcie_erom.lds
++EROM_RECOVERY_LD_SCRIPT := recovery_erom.lds
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+ LDLIBS := -lgcc
+@@ -62,16 +64,16 @@
+ .PHONY: all
+ all: erom_recovery erom_pcie erom_tpm
+ 
+-erom_recovery: erom_recovery.o $(EROM_RECOVERY_DEPS) $(EROM_APP_OBJECTS) $(EROM_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(EROM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_RECOVERY_DEPS) $(LDLIBS) $(EROM_RECOVERY_EXTRA_LIBS) -Wl,--end-group
++erom_recovery: erom_recovery.o $(EROM_RECOVERY_DEPS) $(EROM_APP_OBJECTS) $(EROM_RECOVERY_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(EROM_RECOVERY_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_RECOVERY_DEPS) $(LDLIBS) $(EROM_RECOVERY_EXTRA_LIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+-erom_pcie: erom_pcie.o $(EROM_APP_OBJECTS) $(EROM_PCIE_DEPS) $(EROM_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(EROM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_PCIE_DEPS) $(LDLIBS) -Wl,--end-group
++erom_pcie: erom_pcie.o $(EROM_APP_OBJECTS) $(EROM_PCIE_DEPS) $(EROM_PCIE_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(EROM_PCIE_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_PCIE_DEPS) $(LDLIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+-erom_tpm: erom_tpm.o $(EROM_APP_OBJECTS) $(EROM_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(EROM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(LDLIBS) -Wl,--end-group
++erom_tpm: erom_tpm.o $(EROM_APP_OBJECTS) $(EROM_TPM_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(EROM_TPM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(LDLIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+ %.lds: %.lds.S
+diff --git a/app/ext_rom/common.h b/app/ext_rom/common.h
+index dbbbf51..09e8222 100644
+--- a/app/ext_rom/common.h
++++ b/app/ext_rom/common.h
+@@ -9,6 +9,8 @@
+ #define EXT_ROM_START		(0x27FE2000)
+ #define EXT_ROM_TEXT_LENGTH	(70*1024)
+ /* No header bytes. Hence the text base is same as erom start address */
+-#define EXT_ROM_TEXT_BASE	(EXT_ROM_START)
++#define EXT_ROM_PCIE_TEXT_BASE		(EXT_ROM_START)
++#define EXT_ROM_RECOVERY_TEXT_BASE	(EXT_ROM_START + 0x2000)
++#define EXT_ROM_TPM_TEXT_BASE		(EXT_ROM_START)
+ 
+ #endif /* COMMON_EXT_ROM_H_ */
+diff --git a/app/ext_rom/common_erom.lds.S b/app/ext_rom/common_erom.lds.S
+deleted file mode 100644
+index d053882..0000000
+--- a/app/ext_rom/common_erom.lds.S
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0+ */
+-/*
+- * Copyright 2021 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include "common.h"
+-
+-MEMORY { .sram : ORIGIN = EXT_ROM_TEXT_BASE, LENGTH = EXT_ROM_TEXT_LENGTH }
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-ENTRY(_start)
+-SECTIONS
+-{
+-	.text : ALIGN(4) {
+-		crt0_common_erom.o (.text*)
+-		* (.text*)
+-	} > .sram
+-
+-	.bss : {
+-		. = ALIGN(8);
+-		__bss_start = . ;
+-		*(.bss*)
+-		__bss_end = . ;
+-	} > .sram
+-
+-	.stack : {
+-		. = ALIGN(8);
+-		__stack = . ;
+-		. = . + 512 ;
+-		__stack_top = . ;
+-	} > .sram
+-
+-	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+-}
+diff --git a/app/ext_rom/pcie_erom.lds.S b/app/ext_rom/pcie_erom.lds.S
+new file mode 100644
+index 0000000..fac5de6
+--- /dev/null
++++ b/app/ext_rom/pcie_erom.lds.S
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++MEMORY { .sram : ORIGIN = EXT_ROM_PCIE_TEXT_BASE, LENGTH = EXT_ROM_TEXT_LENGTH }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : ALIGN(4) {
++		crt0_common_erom.o (.text*)
++		* (.text*)
++	} > .sram
++
++	.bss : {
++		. = ALIGN(8);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > .sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/app/ext_rom/recovery_erom.lds.S b/app/ext_rom/recovery_erom.lds.S
+new file mode 100644
+index 0000000..8585216
+--- /dev/null
++++ b/app/ext_rom/recovery_erom.lds.S
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++MEMORY { .sram : ORIGIN = EXT_ROM_RECOVERY_TEXT_BASE, LENGTH = EXT_ROM_TEXT_LENGTH }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : ALIGN(4) {
++		crt0_common_erom.o (.text*)
++		* (.text*)
++	} > .sram
++
++	.bss : {
++		. = ALIGN(8);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > .sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/app/ext_rom/tpm_erom.lds.S b/app/ext_rom/tpm_erom.lds.S
+new file mode 100644
+index 0000000..5b8c438
+--- /dev/null
++++ b/app/ext_rom/tpm_erom.lds.S
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++MEMORY { .sram : ORIGIN = EXT_ROM_TPM_TEXT_BASE, LENGTH = EXT_ROM_TEXT_LENGTH }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : ALIGN(4) {
++		crt0_common_erom.o (.text*)
++		* (.text*)
++	} > .sram
++
++	.bss : {
++		. = ALIGN(8);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > .sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}

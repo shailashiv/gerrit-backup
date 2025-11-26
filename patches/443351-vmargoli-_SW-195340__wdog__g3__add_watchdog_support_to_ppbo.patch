@@ -1,0 +1,262 @@
+From b3549555a0652d446ef9f9ba68a1787668c61e68 Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Thu, 22 Aug 2024 15:16:07 +0300
+Subject: [PATCH] [SW-195340] wdog: g3: add watchdog support to ppboot
+
+Add baremetal implementation of watchdog driver and
+watchdog support to ppboot
+
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+Change-Id: Id27eef5533712f7fbcc8045fcd5f2d32e7015c70
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 4c84846..4dfca9c 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -21,6 +21,7 @@
+ #include <pci.h>
+ #include <efuse.h>
+ #include <hl.h>
++#include <watchdog_timer.h>
+ 
+ struct device_ca53_cfg ca53_cfg;
+ 
+@@ -317,10 +318,19 @@
+ __weak void ppboot_boot_info_init(void) {}
+ __weak void hl_check_pcie_link_up_by_erom(void) {}
+ 
++__weak int wdog_init(void) {return -1; }
++__weak int wdog_setup(void) {return -1; }
++__weak int wdog_disable(void) {return -1; }
++__weak int wdog_install_timeout(uint32_t max_ms) {return -1; }
++__weak int wdog_feed(void) {return -1; }
++
++#define PPBOOT_WD_TIMEOUT_MS		30000
++
+ void ppboot_main(void)
+ {
+ 	u64 loadaddr;
+ 	bool ret;
++	bool wd_initialized = false;
+ 
+ 	ppboot_init_stack_monitor();
+ 	/************time critical section**************/
+@@ -329,6 +339,12 @@
+ 	/* Set ARCs to privileged mode */
+ 	ppboot_secure_arc();
+ 	sram_set_extension();
++
++	if (hl_rst_src_get() != HL_WD_RST && wdog_init() == 0) {
++		wd_initialized = true;
++		wdog_install_timeout(PPBOOT_WD_TIMEOUT_MS);
++		wdog_setup();
++	}
+ 
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+@@ -359,6 +375,13 @@
+ 	/**********time critical section end************/
+ 	ppboot_pcie_drain_init();
+ 	hl_check_pcie_link_up_by_erom();
++
++	if (!wd_initialized && wdog_init() == 0) {
++		wd_initialized = true;
++		wdog_install_timeout(PPBOOT_WD_TIMEOUT_MS);
++		wdog_setup();
++	}
++
+ 	ppboot_version();
+ 	rst_src_dump();
+ 
+@@ -373,10 +396,18 @@
+ 
+ 	ppboot_init_fw_info();
+ 
++	if (wd_initialized)
++		wdog_feed();
++
+ 	ret = ppboot_load_preboot_img(&loadaddr);
+ 	ppboot_check_stack_monitor();
+ 	preboot_puts("Ppboot resigned\n\r\n");
+-	if (ret)
++	if (ret) {
++		if (wd_initialized)
++			wdog_feed();
++
+ 		image_start(loadaddr);
++	}
++
+ 	hl_enter_recovery();
+ }
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index e67207f..75872bb 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -21,6 +21,9 @@
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/mbist.c)
+ PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/$(HL_TARGET).c)
+ PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/common.c)
++ifeq ($(HL_TARGET),asic)
++	PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/watchdog_timer.c)
++endif
+ 
+ PALAD_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/$(HL_TARGET).c)
+ PALAD_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/common.c)
+diff --git a/arch/gaudi3/common/watchdog_timer.c b/arch/gaudi3/common/watchdog_timer.c
+new file mode 100644
+index 0000000..cdaa714
+--- /dev/null
++++ b/arch/gaudi3/common/watchdog_timer.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: Apache-2.0+
++/*
++ * Copyright 2024 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++/*
++ * This is adoptation of zephyr watchdog driver
++ *  wdt_cmsdk_apb.c for baremetal environment
++ */
++
++#include <stdint.h>
++#include <gaudi3_blocks.h>
++
++struct wdog {
++	/* offset: 0x000 (r/w) watchdog load register */
++	volatile uint32_t  load;
++	/* offset: 0x004 (r/ ) watchdog value register */
++	volatile uint32_t  value;
++	/* offset: 0x008 (r/w) watchdog control register */
++	volatile uint32_t  ctrl;
++	/* offset: 0x00c ( /w) watchdog clear interrupt register */
++	volatile uint32_t  intclr;
++	/* offset: 0x010 (r/ ) watchdog raw interrupt status register */
++	volatile uint32_t  rawintstat;
++	/* offset: 0x014 (r/ ) watchdog interrupt status register */
++	volatile uint32_t  maskintstat;
++	volatile uint32_t  reserved0[762];
++	/* offset: 0xc00 (r/w) watchdog lock register */
++	volatile uint32_t  lock;
++	volatile uint32_t  reserved1[191];
++	/* offset: 0xf00 (r/w) watchdog integration test control register */
++	volatile uint32_t  itcr;
++	/* offset: 0xf04 ( /w) watchdog integration test output set register */
++	volatile uint32_t  itop;
++};
++
++#define WDOG_LOAD		(0xFFFFFFFF << 0)
++#define WDOG_RELOAD		(0xE4E1C00 << 0)
++#define WDOG_VALUE		(0xFFFFFFFF << 0)
++#define WDOG_CTRL_RESEN		(0x1 << 1)
++#define WDOG_CTRL_INTEN		(0x1 << 0)
++#define WDOG_INTCLR		(0x1 << 0)
++#define WDOG_RAWINTSTAT		(0x1 << 0)
++#define WDOG_MASKINTSTAT	(0x1 << 0)
++#define WDOG_LOCK		(0x1 << 0)
++#define WDOG_INTEGTESTEN	(0x1 << 0)
++#define WDOG_INTEGTESTOUTSET	(0x1 << 1)
++
++#define REF_CLK_FREQUENCY	50000000
++
++/*
++ * Value written to the LOCK register to lock or unlock the write access
++ * to all of the registers of the watchdog (except the LOCK register)
++ */
++#define WDOG_UNLOCK_VALUE	(0x1ACCE551)
++#define WDOG_LOCK_VALUE		(0x2BDDF662)
++
++#define WDOG_STRUCT ((volatile struct wdog *)(mmD0_PSOC_WDOG_BASE))
++
++/* watchdog reload value in sec */
++static unsigned int reload_s = WDOG_RELOAD;
++
++static void wdog_unlock(void)
++{
++	volatile struct wdog *wdog = WDOG_STRUCT;
++
++	wdog->lock = WDOG_UNLOCK_VALUE;
++}
++
++int wdog_setup(void)
++{
++	volatile struct wdog *wdog = WDOG_STRUCT;
++
++	/* Start the watchdog counter with INTEN bit */
++	wdog->ctrl = (WDOG_CTRL_RESEN | WDOG_CTRL_INTEN);
++	return 0;
++}
++
++int wdog_disable(void)
++{
++	volatile struct wdog *wdog = WDOG_STRUCT;
++
++	/* Stop the watchdog counter with INTEN bit */
++	wdog->ctrl = ~(WDOG_CTRL_RESEN | WDOG_CTRL_INTEN);
++	return 0;
++}
++
++int wdog_install_timeout(uint32_t max_ms)
++{
++	volatile struct wdog *wdog = WDOG_STRUCT;
++
++	/* Reload value:
++	 * The watchdog timer is driven by the clock, which can have
++	 * higher values e.g running at 35000000/50000000 Hz.
++	 * Also timeout given in max is in millisecs this can lead to
++	 * overflow on multiplication as max reload value can be
++	 * 4294967295 (0xffffffff), this can lead to wrong configuration of
++	 * reload value
++	 * Also below formula is wrong as reload value needs to be converted
++	 * into ticks, as at each tick loaded value decrement.
++	 * Since clk freq is ticks per second, and user provided input
++	 * is in millisecs, divide by 1000 to be in same units
++	 */
++	reload_s = max_ms * (REF_CLK_FREQUENCY / 1000);
++	wdog->load = reload_s;
++	return 0;
++}
++
++int wdog_feed(void)
++{
++	volatile struct wdog *wdog = WDOG_STRUCT;
++
++	wdog->intclr = WDOG_INTCLR;
++	wdog->load = reload_s;
++
++	return 0;
++}
++
++int wdog_init(void)
++{
++	volatile struct wdog *wdog = WDOG_STRUCT;
++
++	wdog_unlock();
++	wdog->load = reload_s;
++	return 0;
++}
+diff --git a/include/watchdog_timer.h b/include/watchdog_timer.h
+new file mode 100644
+index 0000000..2541d00
+--- /dev/null
++++ b/include/watchdog_timer.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef WD_TIMER_H
++#define WD_TIMER_H
++
++int wdog_init(void);
++int wdog_is_initialized(void);
++int wdog_setup(void);
++int wdog_disable(void);
++int wdog_install_timeout(uint32_t max_ms);
++int wdog_feed(void);
++
++#endif

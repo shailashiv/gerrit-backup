@@ -1,0 +1,145 @@
+From a3a3a9277ab03ba83ef234696cb881e3295ffa51 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 03 May 2021 12:58:08 +0300
+Subject: [PATCH] [SW-30993] gaudi: hbm: lane repair info per device
+
+In preparation to hbm lane repair, keep repair data per device/channel
+as it going to be used in soft repair. No functional changes.
+
+Change-Id: I2876c5a7fc6be81d19d5438f59f8e3ace4276636
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index 74b0e69..07900b8 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -237,7 +237,7 @@
+ static u32 aword[GAUDI_HBM_CHANNELS][4];
+ static u32 dword_wr[GAUDI_HBM_CHANNELS][4][4];
+ static u32 dword_rd[GAUDI_HBM_CHANNELS][4][4];
+-static struct ch_lane_repair_info hlr_info[GAUDI_HBM_CHANNELS];
++static struct ch_lane_repair_info hlr_info[GAUDI_HBM_DEVICES][GAUDI_HBM_CHANNELS];
+ 
+ static const u32 extest_wdr_pattern[EXTEST_WDR_PTRNS_NUM * EXTEST_WDR_REG_NUM] = {
+ 	/* pattern 0 */
+@@ -368,8 +368,9 @@
+ 	WREG32(base + 0x9034, 0);
+ }
+ 
+-int get_lane_skip_info(int ch, struct extest_skip_info lane_skip_info_arr[])
++int get_lane_skip_info(int device, int ch, struct extest_skip_info lane_skip_info_arr[])
+ {
++	struct ch_lane_repair_info *hlr = &hlr_info[device][ch];
+ 	u32 pc_code, dw_code;
+ 	u32 byte_code, adj_byte_code;
+ 	int pc_idx, dw_idx, byte_idx;
+@@ -382,13 +383,13 @@
+ 			0, 1, 2, 3, 4, 7, 8, 9, 10, 11
+ 	};
+ 
+-	if (!hlr_info[ch].status)
++	if (!hlr->status)
+ 		return 0;
+ 
+ 	info_arr_idx = 0;
+ 
+ 	for (pc_idx = 0; pc_idx < PC_PER_CH; pc_idx++) {
+-		pc_code = (pc_idx == 0) ? hlr_info[ch].dw01_code : hlr_info[ch].dw23_code;
++		pc_code = (pc_idx == 0) ? hlr->dw01_code : hlr->dw23_code;
+ 		for (dw_idx = 0; dw_idx < DWORDS_PER_PC; dw_idx++) {
+ 			dw_code = (pc_code >> (dw_idx * HLR_DWORD_CODE_SHIFT)) & 0xFFFF;
+ 			/* Looping over byte-paires inside a DWORD */
+@@ -433,7 +434,7 @@
+ 
+ 	/* Enable all outputs, except for HBM TX-only signals */
+ 	for (ch = 0 ; ch < GAUDI_HBM_CHANNELS ; ch++) {
+-		num_repaired_lanes[ch] = get_lane_skip_info(ch, &lane_skip_info[ch][0]);
++		num_repaired_lanes[ch] = get_lane_skip_info(device, ch, &lane_skip_info[ch][0]);
+ 
+ 		/* Enable all outputs, except for HBM TX-only signals */
+ 		WREG32(base + ch * 0x1000 + 0x920, 0x60000000);
+@@ -542,7 +543,7 @@
+ 			WREG32(base + ch * 0x1000 + 0x920 + (i * 4),
+ 					0xFFFFFFFF);
+ 
+-		num_repaired_lanes[ch] = get_lane_skip_info(ch, &lane_skip_info[ch][0]);
++		num_repaired_lanes[ch] = get_lane_skip_info(device, ch, &lane_skip_info[ch][0]);
+ 
+ 		/* Skip repaired lanes */
+ 		for (j = 0; j < num_repaired_lanes[ch]; j++)
+@@ -1675,6 +1676,7 @@
+ 
+ static void lane_remap(int device)
+ {
++	struct ch_lane_repair_info *hlr;
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 reg_800, reg_804, reg_808;
+ 	u32 dw01_repair_code, dw23_repair_code, aw_repair_code;
+@@ -1682,13 +1684,15 @@
+ 
+ 	/* Clearing HLR information for all channels */
+ 	for (mc_ch = 0; mc_ch < GAUDI_HBM_CHANNELS; mc_ch++) {
+-		hlr_info[mc_ch].count.pc0 = 0;
+-		hlr_info[mc_ch].count.pc1 = 0;
+-		hlr_info[mc_ch].count.aw = 0;
+-		hlr_info[mc_ch].status = false;
++		hlr = &hlr_info[device][mc_ch];
++		hlr->count.pc0 = 0;
++		hlr->count.pc1 = 0;
++		hlr->count.aw = 0;
++		hlr->status = false;
+ 	}
+ 
+ 	for (mc_ch = 0; mc_ch < GAUDI_HBM_CHANNELS; mc_ch++) {
++		hlr = &hlr_info[device][mc_ch];
+ 		/* Read HBM lane repair eFuse information */
+ 		ieee1500_inst(device, hbm_ch_mapping[mc_ch],
+ 			      ieee1500_hard_lane_repair, EXTEST_READ_INST);
+@@ -1706,35 +1710,35 @@
+ 
+ 		/* Configure MLB according to remapped lanes */
+ 		if (dw01_repair_code != 0xFFFFFFFF) {
+-			hlr_info[mc_ch].dw01_code = dw01_repair_code;
+-			hlr_info[mc_ch].count.pc0 = 1;
++			hlr->dw01_code = dw01_repair_code;
++			hlr->count.pc0 = 1;
+ 			if (((dw01_repair_code & 0xFFFF) != 0xFFFF) &&
+ 			    (((dw01_repair_code >> 16) & 0xFFFF) != 0xFFFF))
+-				hlr_info[mc_ch].count.pc0 = 2;
++				hlr->count.pc0 = 2;
+ 
+-			hlr_info[mc_ch].status = true;
++			hlr->status = true;
+ 
+ 			WREG32(base + (mc_ch * 0x1000) + 0x2F0,
+ 			       dw01_repair_code);
+ 		}
+ 
+ 		if (dw23_repair_code != 0xFFFFFFFF) {
+-			hlr_info[mc_ch].dw23_code = dw23_repair_code;
+-			hlr_info[mc_ch].count.pc1 = 1;
++			hlr->dw23_code = dw23_repair_code;
++			hlr->count.pc1 = 1;
+ 			if (((dw23_repair_code & 0xFFFF) != 0xFFFF) &&
+ 			    (((dw23_repair_code >> 16) & 0xFFFF) != 0xFFFF))
+-				hlr_info[mc_ch].count.pc1 = 2;
++				hlr->count.pc1 = 2;
+ 
+-			hlr_info[mc_ch].status = true;
++			hlr->status = true;
+ 
+ 			WREG32(base + (mc_ch * 0x1000) + 0x2F4,
+ 			       dw23_repair_code);
+ 		}
+ 
+ 		if (aw_repair_code != 0xFF) {
+-			hlr_info[mc_ch].aw_code = aw_repair_code;
+-			hlr_info[mc_ch].count.aw = 1;
+-			hlr_info[mc_ch].status = true;
++			hlr->aw_code = aw_repair_code;
++			hlr->count.aw = 1;
++			hlr->status = true;
+ 
+ 			WREG32(base + (mc_ch * 0x1000) + 0x2F8,
+ 			       aw_repair_code);

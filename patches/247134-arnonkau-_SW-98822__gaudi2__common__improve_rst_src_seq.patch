@@ -1,0 +1,82 @@
+From c1b5f9325bfe6c4eb30971317dcdce3f7b6723b2 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Mon, 22 Aug 2022 14:27:38 +0300
+Subject: [PATCH] [SW-98822] gaudi2: common: improve rst src seq
+
+A SoC bug was discovered, The bug will not be fixed in H9 (and not in H6).
+
+Sharpen the reset pulse signal, making sure the signal gets its right
+shape. Marginal detecting error.
+
+Regardless the fact that GPIOs are not getting reset during any reset
+operation, excluding the cold reset; The IOMUX gets reset and if the
+pin was configured, prior to reset, to a mode function different than
+function 0, its mode returns to default during reset.
+Done by making sure the pulse set low for ~1us, raised for ~5us, and
+set low again after that.
+
+NOTE: udelay can be used only after it was initialized. Initialized by
+      udelay_init.
+
+Change-Id: I03c245bf56ae272793972b80bbf5b503aa3248e7
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 38dd827..48fcf0e 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -284,17 +284,16 @@
+ 	device_init();
+ 	/* Set ARCs to privileged mode */
+ 	ppboot_secure_arc();
+-
+-	/* Initialize internal if variables */
+-	cpu_boot_if_init();
+-	hl_plat_early_init();
+-	hl_init_pcie_phy_fw();
+-	hl_jtag_init();
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+ 	 * so the udelay init is done once before we start.
+ 	 */
+ 	udelay_init();
++	/* Initialize internal if variables */
++	cpu_boot_if_init();
++	hl_plat_early_init();
++	hl_init_pcie_phy_fw();
++	hl_jtag_init();
+ 
+ 	preboot_sync_btl();
+ 	hl_uart_init();
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 1957c80..8663138 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1143,9 +1143,12 @@
+ 	CPLD_RST_ECC_SERR_DERR,
+ };
+ 
+-#define GAUDI2_RST_SRC_0_GPIO	66 /* GP_66 */
+-#define GAUDI2_RST_SRC_1_GPIO	67 /* GP_67 */
+-#define GAUDI2_RST_SRC_CLR_GPIO	68 /* GP_68 */
++#define GAUDI2_RST_SRC_0_GPIO		66 /* GP_66 */
++#define GAUDI2_RST_SRC_1_GPIO		67 /* GP_67 */
++#define GAUDI2_RST_SRC_CLR_GPIO		68 /* GP_68 */
++#define GAUDI2_RESET_SETUP_TIME_USECS	1
++#define GAUDI2_RESET_HOLD_TIME_USECS	5
++
+ static uint32_t gaudi2_get_cpld_rst_event(void)
+ {
+ 	uint32_t rst_src_0, rst_src_1, cpld_rst_src;
+@@ -1156,7 +1159,10 @@
+ 
+ 	/* clear CPLD reset src event */
+ 	gaudi2_gpio_write(GAUDI2_RST_SRC_CLR_GPIO, 0x0);
++	udelay(GAUDI2_RESET_SETUP_TIME_USECS);
+ 	gaudi2_gpio_write(GAUDI2_RST_SRC_CLR_GPIO, 0x1);
++	udelay(GAUDI2_RESET_HOLD_TIME_USECS);
++	gaudi2_gpio_write(GAUDI2_RST_SRC_CLR_GPIO, 0x0);
+ 
+ 	return cpld_rst_src;
+ }

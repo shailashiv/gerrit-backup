@@ -1,0 +1,155 @@
+From 0180483f7e041e04812ecb0475670dfa219d2a25 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Fri, 18 Feb 2022 22:51:15 +0200
+Subject: [PATCH] [SW-75066] gaudi2: ppboot: non-fix preboot size
+
+Support preboot img size with any number of sectors, instead
+of assuming that image size is less then 128KB, as it is
+expected that preboot image size will get increased above 128KB.
+The approach for copying from flash to sram, is similar to the
+one done before, only that it uses a loop iteration according
+to number of sectors, which is depends on image size,
+(instead of assuming limited number of 1 or 2 sectors).
+
+Change-Id: Ib6f81de9ec5160aa43ce4e5df969b7c8ce9a40b0
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c32cc72..060170d 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -293,84 +293,69 @@
+ #define MAX_DMA_SIZE		0xFFF0
+ #define CRC_SIZE		4
+ #define OFFSET_64KB		0x10000
++
++static int ppboot_dma_copy(uint16_t image_size, uint32_t flash_offset,
++			   uint64_t dest_offset, uint8_t fw_sram_dst)
++{
++	dma_copy_image(image_size, flash_offset, dest_offset, fw_sram_dst);
++	if (dma_wait_finish() == DMA_CRC_ERROR)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	return 0;
++}
++
+ static int ppboot_bringup_preboot(u8 image_ptr)
+ {
+ 	u32 image_size, payload_size, copy_size;
+ 	u32 flash_offset;
++	u32 num_cycles;
++	int ret;
+ 
+ 	flash_offset = ppboot_flash_image_offset(image_ptr);
+ 	image_size = spi_flash_readl(flash_offset);
++	num_cycles = (image_size/(MAX_DMA_SIZE + CRC_SIZE)) + 1;
++	payload_size = image_size - (num_cycles * CRC_SIZE);
+ 
+-	if (image_size <= (MAX_DMA_SIZE + CRC_SIZE)) {
+-		/*
+-		 * Copy preboot image from flash to SRAM.
+-		 * Note that the offset above base address to perform DMA
+-		 * must be passed in granuality of 4 bytes.
+-		 */
+-		dma_copy_image(image_size, flash_offset, SDRAM_FULL_BASE, SPI_DMA_DST_HBW);
++	/*
++	 * when image_size >= 64KB, preboot binary is divided into 2 chunks
++	 * image_size = payload_size + 2*4 (for 2 CRCs)
++	 * bin_part1: (MAX_DMA_SIZE) + CRC              @flash offs 0x0
++	 * bin_part2: (payload_size - MAX_DMA_SIZE) + CRC    @flash offs 0x10000
++	 *
++	 * Approach:
++	 * 1) copy bin_part1 from flash_offs=0 to SRAM_offs=0 (size1 = MAX_DMA_SIZE + CRC)
++	 * 2) copy bin_part2 from flash_offs=0x10000 to ICCM_offs=0..
++	 *   (size2 = payload_size - MAX_DMA_SIZE + CRC)
++	 * 3) memcpy from ICCM_offs = 0 to SRAM_offs=MAX_DMA_SIZE
++	 *   (size3 = payload_size - MAX_DMA_SIZE)
++	 *
++	 * Reasons for this approach:
++	 * 1) SPI DMA transfer destination start and end offset shouldn't
++	 *   include 64KB boundary.
++	 * 2) Flash offset to SPI DMA must be 1KB granuality
++	 * 3) CRC word wont be copied from flash to SRAM
++	 * 4) SPI DMA transfer size (excluding CRC) must be 16 byte aligned.
++	 */
++	copy_size = (num_cycles == 1) ? image_size : (MAX_DMA_SIZE + CRC_SIZE);
++	ret = ppboot_dma_copy(copy_size, flash_offset, SDRAM_FULL_BASE, SPI_DMA_DST_HBW);
++	if (ret)
++		return ret;
+ 
+-		if (dma_wait_finish() == DMA_CRC_ERROR) {
+-			preboot_puts("DMA_CRC_ERROR\n");
+-			return ARCBOOT_BRINGUP_ERROR;
+-		}
++	for (int i = 1; i < num_cycles; i++) {
++		copy_size = (i == (num_cycles-1)) ? (payload_size - MAX_DMA_SIZE*i + CRC_SIZE) :
++				(MAX_DMA_SIZE + CRC_SIZE);
+ 
+-	} else if (image_size <= (2 * (MAX_DMA_SIZE + CRC_SIZE))) {
+-		/*
+-		 * when image_size >= 64KB, preboot binary is divided into 2 chunks
+-		 * image_size = payload_size + 2*4 (for 2 CRCs)
+-		 * bin_part1: (MAX_DMA_SIZE) + CRC              @flash offs 0x0
+-		 * bin_part2: (payload_size - MAX_DMA_SIZE) + CRC    @flash offs 0x10000
+-		 *
+-		 * Approach:
+-		 * 1) copy bin_part1 from flash_offs=0 to SRAM_offs=0 (size1 = MAX_DMA_SIZE + CRC)
+-		 * 2) copy bin_part2 from flash_offs=0x10000 to ICCM_offs=0..
+-		 *   (size2 = payload_size - MAX_DMA_SIZE + CRC)
+-		 * 3) memcpy from ICCM_offs = 0 to SRAM_offs=MAX_DMA_SIZE
+-		 *   (size3 = payload_size - MAX_DMA_SIZE)
+-		 *
+-		 * Reasons for this approach:
+-		 * 1) SPI DMA transfer destination start and end offset shouldn't
+-		 *   include 64KB boundary.
+-		 * 2) Flash offset to SPI DMA must be 1KB granuality
+-		 * 3) CRC word wont be copied from flash to SRAM
+-		 * 4) SPI DMA transfer size (excluding CRC) must be 16 byte aligned.
+-		 */
+-		payload_size = image_size - (2 * CRC_SIZE);
+-
+-		/* copy bin_part1 from flash_offs=0 to SRAM_offs=0   (size1 = MAX_DMA_SIZE + CRC) */
+-		copy_size = (MAX_DMA_SIZE + CRC_SIZE);
+-		dma_copy_image(copy_size, flash_offset, SDRAM_FULL_BASE, SPI_DMA_DST_HBW);
+-		if (dma_wait_finish() == DMA_CRC_ERROR) {
+-			preboot_puts("DMA_CRC_ERROR\n");
+-			return ARCBOOT_BRINGUP_ERROR;
+-		}
+-
+-		/*
+-		 * copy bin_part2 from flash_offs=0x10000 to ICCM_offs=0
+-		 * (size2 = payload_size - MAX_DMA_SIZE + CRC)
+-		 */
+-		copy_size = payload_size - MAX_DMA_SIZE + CRC_SIZE;
+-		dma_copy_image(copy_size, (flash_offset + OFFSET_64KB),
++		ret = ppboot_dma_copy(copy_size, (flash_offset + OFFSET_64KB * i),
+ 					ARC1_ICCM_FULL_BASE, SPI_DMA_DST_HBW);
+-		if (dma_wait_finish() == DMA_CRC_ERROR) {
+-			preboot_puts("DMA_CRC_ERROR\n");
++		if (ret)
+ 			return ARCBOOT_BRINGUP_ERROR;
+-		}
+-
+-		/*
+-		 * memcpy from ICCM_offs=0 to SRAM_offs=MAX_DMA_SIZE
+-		 * (size3 = payload_size - MAX_DMA_SIZE)
+-		 */
+-		copy_size = payload_size - MAX_DMA_SIZE;
+-		memcpy((void *)(SDRAM_BASE + MAX_DMA_SIZE), (void *)ARC_ICCM_BASE, copy_size);
+-
+-		/* remove extra CRC from image size to align with security validation below */
+-		image_size -= CRC_SIZE;
+-	} else {
+-		preboot_puts_hex("Invalid size: ", image_size, false);
+-		return ARCBOOT_BRINGUP_ERROR;
++		memcpy((void *)(SDRAM_BASE + MAX_DMA_SIZE * i),
++		       (void *)ARC_ICCM_BASE, copy_size - CRC_SIZE);
+ 	}
+ 
++	if (num_cycles)
++		image_size -= (CRC_SIZE * (num_cycles-1));
++
+ 	image_size -= SECUREBOOT_IMG_HEAD_FOOTER;
+ 	if (secureboot_verify_image(image_size,
+ 			(SDRAM_BASE + IMG_LEN_SIZE))

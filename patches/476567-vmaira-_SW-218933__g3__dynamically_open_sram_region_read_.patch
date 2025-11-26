@@ -1,0 +1,57 @@
+From fc14d9c07cb3a0de5331ca989fa6b629a3637c25 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 02 Apr 2025 12:54:45 +0300
+Subject: [PATCH] [SW-218933] g3: dynamically open sram region read only perm
+
+When the host requests the proto status, the device allocates memory in
+SRAM, dynamically opens the region with read-write (RW) permission, and
+places the proto status response (FW version) there for the host to read.
+The region is then closed when the host sends the `rst_state` command.
+However, if the host fails to send the `rst_state` command, a portion of
+the SRAM region remains accessible with RW permission, posing a security
+risk.
+
+To mitigate this, this patch modifies the code to open the SRAM region
+with read-only (RO) permission instead of RW, ensuring that the host can
+read the proto response without unintended write access.
+
+Change-Id: Ic25fb35353f9360a31f07816cf63c6c1390a05b1
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi3/common/security.c b/arch/gaudi3/common/security.c
+index 7e4cabf..bb73a61 100644
+--- a/arch/gaudi3/common/security.c
++++ b/arch/gaudi3/common/security.c
+@@ -1064,7 +1064,7 @@
+ 
+ #define IMAGE_OFFSET_MASK	0xFFFFFF
+ void preboot_security_dynamic_img_sram_open(enum mem_region img_region,
+-				__unused enum preboot_mem_access_mode mode)
++				enum preboot_mem_access_mode mode)
+ {
+ 	struct mem_desc mdesc;
+ 	uint64_t img_max, image_base_full;
+@@ -1104,6 +1104,9 @@
+ 	 */
+ 	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_7, img_max, RR_HBW_PRIV_END_RSVD, HL_SEC_RD_WR_PROT);
+ 
++	if (mode == ACCESS_RO)
++		hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_5, image_base_full, img_max, HL_SEC_WR_PROT);
++
+ 	/*
+ 	 * In gaudi3 when RR are programmed max address is included.
+ 	 * Hence to open proper range for image size, max should be 16K page
+@@ -1124,6 +1127,12 @@
+ 	max = RR_HBW_PRIV_END_HBW;
+ 	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_0, min, max, HL_SEC_RD_WR_PROT);
+ 
++	/*
++	 * Since RR_0 already closes the SRAM region, remove the RO protection added when
++	 * dynamically opening it to the host
++	 */
++	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_5, 0, 0, HL_SEC_RD_WR_PROT);
++
+ 	min = RR_HBW_PRIV_START_RSVD;
+ 	max = RR_HBW_PRIV_END_RSVD;
+ 	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_7, min, max, HL_SEC_RD_WR_PROT);

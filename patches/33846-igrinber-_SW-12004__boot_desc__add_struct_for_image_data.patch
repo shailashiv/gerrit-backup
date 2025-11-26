@@ -1,0 +1,153 @@
+From 82274c4a8fe79aed0cb9ae6853184f8ee4cf2de4 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 28 Apr 2020 13:56:25 +0300
+Subject: [PATCH] [SW-12004] boot_desc: add struct for image data
+
+Instead of passing offsets around, introduce internal struct boot_desc.
+For now it contains only the offset of the image in the SPI flash.
+It is needed as a preparation for switching to dynamic image size and
+load address.
+To reflect the change appropriately, rename the boot_desc_get_offset()
+function to boot_desc_get_img_desc() and change is parameter list and
+return value semantics.
+
+Change-Id: Ie935b34b57e40b7fe01d43330d27fc08e55dbbfd
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index cc4b961..538a68f 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -30,7 +30,7 @@
+ }
+ 
+ static enum fw_post_reset_cmd preboot_image_offset_legacy(u32 image_pending,
+-							  u32 *offset)
++							struct boot_desc *desc)
+ {
+ 	u32 next_img_off = HL_SPI_NEXT_IMAGE_OFF;
+ 	char *name = "NEXT";
+@@ -41,34 +41,32 @@
+ 		name = "MODIFIABLE";
+ 	}
+ 
+-	*offset = next_image_base_offset(next_img_off, name) +
++	desc->spi_offset = next_image_base_offset(next_img_off, name) +
+ 						HL_SPI_LEGACY_PREBOOT_OFF;
+ 	return image_pending;
+ }
+ 
+-static enum fw_post_reset_cmd preboot_image_offset(u32 *offset)
++static enum fw_post_reset_cmd preboot_image_offset(struct boot_desc *desc)
+ {
+ 	u32 image_pending = regmap_readl(mmUPD_PENDING_STS);
+-	u32 off, idx;
++	u32 idx;
+ 
+ 	if (boot_desc_init()) {
+-		off = boot_desc_get_offset(image_pending,
+-					   HL_FW_IMG_PREBOOT, &idx);
+-		if (off != HL_FW_IMG_NOT_FOUND) {
+-			*offset = off;
++		idx = boot_desc_get_img_desc(image_pending,
++					     HL_FW_IMG_PREBOOT, desc);
++		if (idx != HL_FW_IMG_NOT_FOUND)
+ 			return image_pending;
+-		}
+ 	}
+ 
+ 	preboot_puts("No boot descriptors detected, falling back to legacy\n");
+-	return preboot_image_offset_legacy(image_pending, offset);
++	return preboot_image_offset_legacy(image_pending, desc);
+ }
+ 
+ static void copy_preboot(void)
+ {
+ 	char *name = "PREBOOT";
+-	u32 img_offset;
+-	enum fw_post_reset_cmd upd_pending = preboot_image_offset(&img_offset);
++	struct boot_desc desc;
++	enum fw_post_reset_cmd upd_pending = preboot_image_offset(&desc);
+ 
+ 	preboot_puts_raw("Preparing to run Preboot ");
+ 	if (upd_pending != FLOPS_UPD_PENDING)
+@@ -76,10 +74,11 @@
+ 	else
+ 		preboot_puts_raw("candidate");
+ 
+-	preboot_puts_hex_raw(" (offset: ", img_offset, false);
++	preboot_puts_hex_raw(" (offset: ", desc.spi_offset, false);
+ 	preboot_puts(")\n");
+ 
+-	spi_copy((void *)PREBOOT_TEXT_BASE, img_offset, PREBOOT_SIZE, name);
++	spi_copy((void *)PREBOOT_TEXT_BASE,
++		 desc.spi_offset, PREBOOT_SIZE, name);
+ }
+ 
+ static void rst_src_dump(void)
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 0b080b5..96e5745 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -85,8 +85,8 @@
+ 	return count;
+ }
+ 
+-u32 boot_desc_get_offset(enum fw_post_reset_cmd upd_status,
+-			 enum hl_fw_img_type type, u32 *ridx)
++u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
++			   enum hl_fw_img_type type, struct boot_desc *desc)
+ {
+ 	int i, idx;
+ 
+@@ -100,8 +100,8 @@
+ 			idx = (idx + 1) % 2;
+ 
+ 		preboot_puts_hex(" - found! using index: ", idx, false);
+-		*ridx = idx;
+-		return img_desc[i].offset[idx];
++		desc->spi_offset = img_desc[i].offset[idx];
++		return idx;
+ 	}
+ 
+ 	preboot_puts(" - not found!\n");
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index e323e05..c6485a6 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -13,6 +13,10 @@
+ 
+ #define HL_FW_IMG_NOT_FOUND	((u32)-1)
+ 
++struct boot_desc {
++	u32 spi_offset;
++};
++
+ /*
+  * boot_desc_init() - read and initialize the boot image pointers structures
+  *
+@@ -21,18 +25,18 @@
+ int boot_desc_init(void);
+ 
+ /*
+- * boot_desc_get_offset() - get the offset of the requested image
++ * boot_desc_get_img_desc() - get the struct boot_desc of the requested image
+  *
+  * @upd_status	- FLOPS_UPD_PENDING - for modifiable image offset,
+  *		  other values - for stable image offset
+  * @type	- the image type to look for
+- * @idx		- pointer for the new index
++ * @desc	- pointer to the struct boot_desc for placing the image data
+  *
+  * Returns:
+- * On success: the offset to the requested image
++ * On success: the index of the image to load
+  * On failure: (u32)-1 (no image by the requested type)
+  */
+-u32 boot_desc_get_offset(enum fw_post_reset_cmd upd_status,
+-			 enum hl_fw_img_type type, u32 *idx);
++u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
++			   enum hl_fw_img_type type, struct boot_desc *desc);
+ 
+ #endif /* _BOOT_DESC_H_ */

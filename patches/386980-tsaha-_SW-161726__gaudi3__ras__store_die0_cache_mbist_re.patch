@@ -1,0 +1,196 @@
+From 3b321ee58a5024cd826f7e5b2e196f6c4aa26bfc Mon Sep 17 00:00:00 2001
+From: Tamal Saha <tasaha@habana.ai>
+Date: Tue, 30 Jan 2024 03:18:59 +0200
+Subject: [PATCH] [SW-161726] gaudi3: ras: store die0 cache mbist results
+
+Added support to store die0 cache mbist results in
+boot info at ppboot stage. In preboot these data would
+be read, modified and stored in boot_info.
+
+Change-Id: Ifcab22702e18508a8a52b96642fedef555b11034
+Signed-off-by: Tamal Saha <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 7079d4d..5386d90 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -20,8 +20,11 @@
+ #include <hl.h>
+ #include <pif_ts.h>
+ #include <hl_pif_arc_if.h>
++#include <arcboot_export_dev.h>
+ #include "boot_desc.h"
++#include "boot_info.h"
+ #include <common.h>
++#include <sram_bist.h>
+ 
+ #include <cpu_if_special_regs.h>
+ #include <cpu_if_special_masks.h>
+@@ -30,36 +33,40 @@
+ 
+ /* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
+ #define GAUDI3_SRAM_MBIST_DISABLED	1
+-#define HL_SRAM_MBIST_FAIL_ARR_SIZE	16
+ 
+ /* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
+ #ifdef GAUDI3_SRAM_MBIST_DISABLED
+ void hl_sram_self_repair(void) { }
+ #else
++static struct hl_ras_sram_bist_data bist_data;
+ static u32 *hl_gaudi3_sram_mbist_data_start_address;
+-static u32 hl_sram_mbist_fail_arr[HL_SRAM_MBIST_FAIL_ARR_SIZE * SRAM_BIST_NUM_ENTRIES_PER_FAILURE];
+-
+-static int gaudi3_sram_self_repair_mismatch_execution(u32 ist_addr,
+-			u32 *fail_buffer, u32 fail_limit)
+-{
+-	u32 fail_index = 0;
+-	int status = hl_ppboot_sram_self_repair_mismatch_logic(ist_addr,
+-				hl_gaudi3_sram_mbist_data_start_address,
+-				fail_buffer, fail_limit, &fail_index);
+-
+-	if (fail_index < (fail_limit * 2))
+-		fail_buffer[fail_index] = 0;
+-
+-	return status;
+-}
+ 
+ static void gaudi3_sram_self_repair(u64 sram_loadaddr)
+ {
++	int status;
++
+ 	hl_gaudi3_sram_mbist_data_start_address = (u32 *) ((u32)((sram_loadaddr &
+ 				ARC_ADDR_MASK) | FW_MEM_REGION_BASE));
+ 
+-	gaudi3_sram_self_repair_mismatch_execution((u32)mmD0_PSOC_DFT_APB_BASE,
+-		hl_sram_mbist_fail_arr, HL_SRAM_MBIST_FAIL_ARR_SIZE);
++	status = hl_ppboot_sram_self_repair_mismatch_logic((u32)mmD0_PSOC_DFT_APB_BASE,
++		hl_gaudi3_sram_mbist_data_start_address, &bist_data.mbist_fail_engine_arr[0],
++		SRAM_MBIST_FAIL_CNTRL_MAX_COUNT);
++
++	bist_data.magic_number = SRAM_BIST_MAGIC;
++	if (status) {
++		bist_data.bist_result = SRAM_MBIST_DIE0_CACHE_FAIL;
++		preboot_puts("Die 0 cache memories MBIST fail\n");
++	} else {
++		bist_data.bist_result = SRAM_MBIST_ALL_PASS;
++		preboot_puts("Die 0 cache memories MBIST Pass\n");
++	}
++
++	/*
++	 * Store Ppboot MBIST result in boot info
++	 */
++	if (boot_info_set_no_merge(HL_BOOT_INFO_SRAM_BIST_RESULT, (void *)&bist_data,
++				 sizeof(struct hl_ras_sram_bist_data)))
++		preboot_puts("BOOT_INFO: Failed to set sram mbist result\n");
+ }
+ 
+ static bool ppboot_try_sram_mbist_data_img(struct boot_desc *desc)
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 449b89e..d6983ab 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -11,10 +11,10 @@
+ #include <parc_global_conf_regs.h>
+ #include <parc_global_conf_masks.h>
+ #include <gaudi3_fw_if.h>
++#include <sram_bist.h>
+ 
+ #define BOOT_DESC_MAX_IMGS			8
+ #define READ_BOOT_DESC_FROM_BOOTINFO
+-#define SRAM_BIST_NUM_ENTRIES_PER_FAILURE	2
+ 
+ #define HL_W_BARRIER_TIMEOUT_US	100000
+ #define HL_ARC_W_BARRIER()									\
+@@ -65,7 +65,7 @@
+ void hl_pcie_clear_boot_termination(void);
+ void gaudi3_print_cpu_pll(void);
+ int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
+-	u32 *fail_buffer, u32 fail_limit, u32 *fail_index);
++	struct mbist_fail_engine_info *fail_buffer, u32 fail_limit);
+ bool ppboot_is_valid_img_desc_ex(void *desc);
+ bool is_spi_gw_enabled(void);
+ 
+diff --git a/arch/gaudi3/arc/mbist.c b/arch/gaudi3/arc/mbist.c
+index 5f11317..279691b 100644
+--- a/arch/gaudi3/arc/mbist.c
++++ b/arch/gaudi3/arc/mbist.c
+@@ -6,6 +6,7 @@
+ #include <baremetal.h>
+ #include <hl.h>
+ #include <pll.h>
++#include <sram_bist.h>
+ 
+ #define IST_OPC_WRITE_NO_COMPARE	0
+ #define IST_OPC_WRITE_BIN_COMPARE	1
+@@ -19,16 +20,17 @@
+ }
+ 
+ int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
+-		u32 *fail_buffer, u32 fail_limit, u32 *fail_index)
++		struct mbist_fail_engine_info *fail_buffer, u32 fail_limit)
+ {
+ 	int status = 0;
+ 	u32 rdval, expval, failmask;
+-	u32 i = 1, readID;
++	u32 i = 1, read_id;
++	u32 fail_index = 0;
+ 
+ 	if (data[0] != 1)
+ 		return -1;  /* version mismatch */
+ 
+-	readID = data[i];
++	read_id = data[i];
+ 	++i;
+ 
+ 	while (data[i] != 0) {
+@@ -48,7 +50,7 @@
+ 			++i;
+ 
+ 			if (op == IST_OPC_WRITE_X_COMPARE) {
+-				++readID;
++				++read_id;
+ 				rdval = regmap_readl(ist_addr) & data[i];
+ 				++i;
+ 				expval = data[i];
+@@ -56,31 +58,27 @@
+ 
+ 				if (rdval != expval) {
+ 					status = 1;
+-					if (*fail_index < (fail_limit *
+-							SRAM_BIST_NUM_ENTRIES_PER_FAILURE)) {
++					if (fail_index < (fail_limit)) {
+ 						failmask = rdval ^ expval;
+-						fail_buffer[*fail_index] = readID;
+-						(*fail_index)++;
+-						fail_buffer[*fail_index] = failmask;
+-						(*fail_index)++;
++						fail_buffer[fail_index].mbist_read_id = read_id;
++						fail_buffer[fail_index].mbist_failmask = failmask;
++						fail_index++;
+ 					}
+ 				}
+ 
+ 			} else if (op == IST_OPC_WRITE_BIN_COMPARE) {
+-				++readID;
++				++read_id;
+ 				rdval = regmap_readl(ist_addr);
+ 				expval = data[i];
+ 				++i;
+ 
+ 				if (rdval != expval) {
+ 					status = 1;
+-					if (*fail_index < (fail_limit *
+-							SRAM_BIST_NUM_ENTRIES_PER_FAILURE)) {
++					if (fail_index < (fail_limit)) {
+ 						failmask = rdval ^ expval;
+-						fail_buffer[*fail_index] = readID;
+-						(*fail_index)++;
+-						fail_buffer[*fail_index] = failmask;
+-						(*fail_index)++;
++						fail_buffer[fail_index].mbist_read_id = read_id;
++						fail_buffer[fail_index].mbist_failmask = failmask;
++						fail_index++;
+ 					}
+ 				}
+ 

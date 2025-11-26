@@ -1,0 +1,58 @@
+From 42ac11be12654879db956a5b8ed1dd3e0580415c Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Fri, 23 Dec 2022 13:59:38 +0200
+Subject: [PATCH] [SW-103768] gaudi2: bist: run bisr only if bira fails
+
+This patch adds logic to skip running soft repair if BIRA
+is ok for that ring. This is to avoid false positives
+observed on few devices where for certain ring(s) bira passed
+but bist failed. Running BISR on a ring may potentially override
+hard repair/BIHR data and that would result in BIST failure
+after BISR. This patch modifies the flow to run BISR and subsequently
+BIST only if BIRA fails for a ring.
+
+Change-Id: Ie0bdaee9b52259fff500e9ae57b7c59350242a5e
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 58f0cda..3163731 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -174,10 +174,7 @@
+ 	}
+ 
+ 	regmap_writel(GAUDI2_RING_PATTERN_VAL5, mmPSOC_DFT_APB_WORD0);
+-	if (op == SRAM_SELF_REPAIR_OP_BIST)
+-		regmap_writel(GAUDI2_RING_PATTERN_VAL6, mmPSOC_DFT_APB_WORD1);
+-	else
+-		regmap_writel(GAUDI2_RING_PATTERN_VAL7, mmPSOC_DFT_APB_WORD1);
++	regmap_writel(GAUDI2_RING_PATTERN_VAL6, mmPSOC_DFT_APB_WORD1);
+ 
+ 	expected_ones = 0b00000000000000000000001010000000;
+ 	expected_zeros = 0b00000000000000000000000101110000;
+@@ -185,7 +182,14 @@
+ 	if (err)
+ 		ret = 1;
+ 
+-	if (op == SRAM_SELF_REPAIR_OP_BIST) {
++	/*
++	 * BYPASS step needs to be run in following 2 cases:
++	 *  - if BIRA passed then BISR and BIST steps would be skipped, so need to run BYPASS
++	 *      after BIRA.
++	 *  - In other cases, BISR and BIST would run, so need to run BYPASS after BIST.
++	 */
++
++	if (op == SRAM_SELF_REPAIR_OP_BIST || (op == SRAM_SELF_REPAIR_OP_BIRA && (ret == 0))) {
+ 		regmap_writel(GAUDI2_RING_PATTERN_VAL1, mmPSOC_DFT_APB_WORD0);
+ 		regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
+ 		udelay(DELAY_5K_USEC);
+@@ -273,6 +277,8 @@
+ 			bist_data->pre_bist_failed_rings[num] = val;
+ 			bist_data->num_prebist_failed_rings++;
+ 			preboot_puts_hex("bira failed val: ", val, 0);
++		} else { /* if BIRA did not fail then skip running BISR and BIST */
++			continue;
+ 		}
+ 
+ 		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BISR, dfx, ring);

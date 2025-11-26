@@ -1,0 +1,141 @@
+From 9108dce3d2e69e32ab4c2cfb183cc4a92beabf3e Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 09 Mar 2021 09:58:57 +0200
+Subject: [PATCH] [SW-30456] i2c indirect: security: last boot error
+
+Add a way to report last boot attempt failed by u-boot to BMC
+
+Change-Id: I7a2e8233cc5eafeee529f684eddbc47d15b11b48
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 8655c22..0310f30 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -14,6 +14,7 @@
+ #include <hl_i2c_indirect.h>
+ #include <hl_i2c_slave_events.h>
+ #include <crc32.h>
++#include <hl_fw_if.h>
+ #include "fit.h"
+ 
+ #define SUPPORTED_OPCODES_MASK	( \
+@@ -22,7 +23,8 @@
+ 				BIT(HL_I2CI_REQ_OP_CONFIG_ACCESS) | \
+ 				BIT(HL_I2CI_REQ_OP_FW_LOADER) | \
+ 				BIT(HL_I2CI_REQ_OP_MEMCPY_CTRL) | \
+-				BIT(HL_I2CI_REQ_OP_MEMCPY_DATA) \
++				BIT(HL_I2CI_REQ_OP_MEMCPY_DATA) | \
++				BIT(HL_I2CI_REQ_OP_ERROR_STATUS) \
+ 				)
+ 
+ struct i2csi_wdata_chunk_context {
+@@ -96,6 +98,8 @@
+ 
+ static u32 op_memcpy_offset;
+ static struct hl_i2ci_memcpy_ctrl op_memcpy __aligned(8);
++
++static struct hl_i2ci_error_status op_err_status;
+ 
+ static struct hl_i2ci_ctrl_cmd ctrl_cmd;
+ static struct hl_i2ci_ctrl_sts ctrl_sts;
+@@ -346,6 +350,10 @@
+ 			op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
+ 
+ 		req_rd.data = i2csi_req_memcpy_rw(&req_rd.length);
++		break;
++	case HL_I2CI_REQ_OP_ERROR_STATUS:
++		req_rd.data = (u8 *)&op_err_status;
++		req_rd.length = sizeof(op_err_status);
+ 		break;
+ 	default:
+ 		if ((BIT(req_wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+@@ -785,3 +793,46 @@
+ 	return ctrl_sts.status == HL_I2CI_CTRL_STS_BUSY &&
+ 		ctrl_cmd.opcode == HL_I2CI_CTRL_OP_RESET_DEVICE;
+ }
++
++void i2csi_set_boot_err(enum hl_fw_fit_boot_error err, bool is_linux_boot_fail)
++{
++	struct hl_i2ci_error_status_fit_failure *fit_fail;
++	struct hl_i2ci_agent_signature_failure *sig_fail;
++	bool is_update_sig_os = false;
++
++	fit_fail = &op_err_status.fit_failure;
++	sig_fail = &op_err_status.security.agent_failure;
++
++	switch (err) {
++	case HL_FW_FIT_BOOT_ERR_NONE:
++		break;
++	case HL_FW_FIT_BOOT_ERR_CORRUPTED:
++		fit_fail->invalid_image_format = 1;
++		break;
++	case HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION:
++		fit_fail->fw_upgrade_target_address_violation = 1;
++		break;
++	case HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE:
++		fit_fail->fit_not_runable = 1;
++		break;
++	case HL_FW_FIT_BOOT_ERR_REVOKED_KEY:
++		sig_fail->revoked_pub_key = 1;
++		is_update_sig_os = true;
++		break;
++	case HL_FW_FIT_BOOT_ERR_SVN:
++		sig_fail->svn_failure = 1;
++		is_update_sig_os = true;
++		break;
++	case HL_FW_FIT_BOOT_ERR_SIGNATURE:
++		sig_fail->signature_failure = 1;
++		is_update_sig_os = true;
++		break;
++	}
++
++	if (is_update_sig_os) {
++		if (is_linux_boot_fail)
++			sig_fail->linux_failure = 1;
++		else
++			sig_fail->uboot_failure = 1;
++	}
++}
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+index 6e32cb3..2ad5023 100644
+--- a/preboot/i2cslave_indirect.h
++++ b/preboot/i2cslave_indirect.h
+@@ -8,6 +8,8 @@
+ #ifndef _I2CSLAVE_INDIRECT_H_
+ #define _I2CSLAVE_INDIRECT_H_
+ 
++#include <hl_fw_if.h>
++
+ u8 i2csi_req_handle_sts(u8 cmd);
+ u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
+ u32 i2csi_req_handle_wdata(u8 cmd, u8 **data, u8 cnt);
+@@ -20,5 +22,7 @@
+ bool i2csi_req_is_process_op(void);
+ bool i2csi_req_op_is_fast(void);
+ bool i2csi_ctrl_is_rst_dev(void);
++void i2csi_set_boot_err(enum hl_fw_fit_boot_error err,
++			bool is_linux_boot_fail);
+ 
+ #endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index aca9ab2..583ca4a 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -25,6 +25,7 @@
+ #include "uart.h"
+ #include "pll.h"
+ #include "cmd_module.h"
++#include "i2cslave_indirect.h"
+ 
+ static u64 preboot_en_caps;
+ 
+@@ -275,6 +276,7 @@
+ 			break;
+ 		}
+ 
++		i2csi_set_boot_err(boot_err, true);
+ 		return;
+ 	}
+ }

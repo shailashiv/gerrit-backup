@@ -1,0 +1,158 @@
+From 2fb648584afc9bc45a0b37a718ce3e8879c2dfb0 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Tue, 30 Mar 2021 09:04:37 +0300
+Subject: [PATCH] [SW-36011] gaudi: handle nic en load type fit
+
+Add handling of nic enable load type fit.
+This fit is given through secured transport layer (ELBI),
+and used for overriding value of nic enable ports.
+The information is also preserved in case of reset from
+LKD.
+NIC enable is required as a secured mechanism for updating
+and overriding internal NIC enable configuration with the
+value given from KVM.
+
+Change-Id: I9706be32b1daacb55780533f625b5e07f58a4cee
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 6d92b97..4856a5e 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -39,6 +39,7 @@
+ #include <boot_info.h>
+ #include <hl_fw_if.h>
+ #include <security.h>
++#include <hl_boot_desc.h>
+ 
+ #include "common.h"
+ 
+@@ -460,3 +461,12 @@
+ {
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
+ }
++
++static u32 nic_en;
++
++void preboot_nic_en(u32 nic_en_)
++{
++	nic_en = nic_en_;
++	preboot_puts_hex("nic_en ", nic_en, true);
++	boot_info_set(HL_BOOT_INFO_NIC_EN, &nic_en, sizeof(nic_en));
++}
+diff --git a/preboot/fit.c b/preboot/fit.c
+index ac65a8b..5d9af76 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -915,3 +915,73 @@
+ 
+ 	return 0;
+ }
++
++static int fit_image_get_data(const void *fit, int noffset,
++		       const void **data, size_t *size)
++{
++	int len;
++
++	*data = fdt_getprop(fit, noffset, FIT_DATA_PROP, &len);
++	if (*data == NULL) {
++		*size = 0;
++		return -1;
++	}
++
++	*size = len;
++	return 0;
++}
++
++static int fit_image_get_node(const void *fit, const char *image_uname)
++{
++	int noffset, images_noffset;
++
++	images_noffset = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	if (images_noffset < 0) {
++		preboot_puts("Can't find images parent node");
++		return images_noffset;
++	}
++
++	noffset = fdt_subnode_offset(fit, images_noffset, image_uname);
++	if (noffset < 0)
++		preboot_puts("Can't get node offset for image unit name");
++
++	return noffset;
++}
++
++static int fit_conf_get_prop_node_index(const void *fit, int noffset,
++				 const char *prop_name, int index)
++{
++	const char *uname;
++	int len;
++
++	/* get image unit name from configuration property */
++	uname = fdt_stringlist_get(fit, noffset, prop_name, index, &len);
++	if (uname == NULL)
++		return len;
++
++	return fit_image_get_node(fit, uname);
++}
++
++int fit_image_get_loadable_data(const void *fit, const void **data,
++				size_t size)
++{
++	size_t actual_size;
++	int err, node, conf;
++
++	conf = fit_find_config_node(fit);
++	if (conf < 0)
++		return 1;
++
++	node = fit_conf_get_prop_node_index(fit, conf, FIT_LOADABLE_PROP, 0);
++	if (node < 0)
++		return 1;
++
++	err = fit_image_get_data(fit, node, data, &actual_size);
++	if (err)
++		return err;
++
++	if (actual_size != size)
++		return 1;
++
++	return 0;
++}
+diff --git a/preboot/fit.h b/preboot/fit.h
+index ef6f2b9..3a71c93 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -14,5 +14,7 @@
+ void fit_run_image(void);
+ int fit_validate_size(int len);
+ int fit_get_load_type(u32 *load_type);
++int fit_image_get_loadable_data(const void *fit, const void **data,
++				size_t size);
+ 
+ #endif /* _HL_FIT_H_ */
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index e41451b..168fe5d 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -134,10 +134,18 @@
+ 	module_fwupd_send_status(sts, 0);
+ }
+ 
++__weak void preboot_nic_en(u32 nic_en) {}
++
+ static int module_fwupd_load_type_nic_en(void *fit)
+ {
+-	/* TODO handle nic en here */
+-	return 0;
++	int err;
++	const void *data = 0;
++
++	err = fit_image_get_loadable_data(fit, &data, sizeof(u32));
++	if (!err)
++		preboot_nic_en(*(u32 *)data);
++
++	return err;
+ }
+ 
+ static int module_fwupd_load_type_run(void)

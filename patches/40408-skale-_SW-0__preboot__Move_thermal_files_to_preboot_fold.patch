@@ -1,0 +1,1358 @@
+From 482105600e6d9ba220214fb952e6e94087bd2057 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 18 Jun 2020 09:54:59 +0300
+Subject: [PATCH] [SW-0] preboot: Move thermal files to preboot folder
+
+Since thermal files in common folder is used only by preboot, move
+these files to preboot folder from common folder.
+
+Change-Id: I5dd6f5a8d0e989a1e40c64d5c4c30bb37455700e
+---
+
+diff --git a/Makefile b/Makefile
+index 2c0bc22..6ac61aa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,27 +23,19 @@
+ LDLIBS := -lgcc
+ PREBOOT_LDLIBS = $(LDLIBS) -lfdt
+ 
+-PREBOOT_SRCS_C := $(shell ls common/*.c)
+-PREBOOT_SRCS_C := $(filter-out common/thermal_v2.c, $(PREBOOT_SRCS_C))
+-PPBOOT_SRCS_C := $(shell ls common/*.c)
+-PPBOOT_SRCS_C := $(filter-out common/thermal_v2.c, $(PPBOOT_SRCS_C))
+-
+ include $(HL_DEV)/Makefile
+ 
++PREBOOT_SRCS_C := $(shell ls common/*.c)
+ PREBOOT_SRCS_C += $(shell ls preboot/*.c)
++PREBOOT_SRCS_C := $(filter-out preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+ PREBOOT_APP_S := $(shell ls preboot/crt0_preboot.S)
++PPBOOT_SRCS_C := $(shell ls common/*.c)
+ PPBOOT_SRCS_C += $(shell ls ppboot/*.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+ PPBOOT_APP_S := $(shell ls ppboot/crt0_ppboot.S)
+-
+-PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+-PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
+-PPBOOT_OBJECTS := $(PPBOOT_SRCS_C:.c=.o)
+-PPBOOT_OBJECTS += $(PPBOOT_APP_S:.S=.o)
+-AUTO_GENERATED_FILE := auto_generated.h
+ 
+ BINDIR = bin
+ PPBOOT_TARGET = $(BINDIR)/ppboot.bin
+@@ -56,10 +48,18 @@
+ 	LDFLAGS += -Wl,--just-symbols ../arcboot-custom/exports.elf
+ else ifeq ($(HL_DEV),goya2_arc_gnu)
+ 	BINARIES = $(PREBOOT_TARGET)
++	PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/pll.c)
++	PREBOOT_SRCS_C += $(shell ls preboot/thermal_v2.c)
+ else
+ 	BINARIES = $(PPBOOT_TARGET) $(PREBOOT_TARGET) $(PCI_PHY_FW_TARGET)
+ endif
+ 
++PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
++PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
++PPBOOT_OBJECTS := $(PPBOOT_SRCS_C:.c=.o)
++PPBOOT_OBJECTS += $(PPBOOT_APP_S:.S=.o)
++AUTO_GENERATED_FILE := auto_generated.h
++
+ all: bin $(BINARIES) buildversion-habanalabs
+ 
+ $(BINDIR)/%.bin: %
+diff --git a/common/thermal.c b/common/thermal.c
+deleted file mode 100644
+index f6711d7..0000000
+--- a/common/thermal.c
++++ /dev/null
+@@ -1,273 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-#include <stdbool.h>
+-#include <preboot.h>
+-#include <pll.h>
+-#include <thermal.h>
+-#include <efuse.h>
+-#include <thermal.h>
+-#include <string.h>
+-#include <uart.h>
+-
+-#define HL_TS_SDIF_DATA_OFFSET	0x44
+-#define HL_TS_CLK_SYNTH		0x010
+-#define HL_TS_SDIF		0x020
+-#define HL_TS0_ALARMA_CFG	0x144
+-#define HL_TS0_ALARMB_CFG	0x164
+-#define C_TO_MC			1000
+-
+-#define TS_CALIB_A_G_COEFF      4805
+-#define TS_CALIB_B_H_COEFF      21980
+-#define TS_CALIB_J_COEFF        1
+-#define TS_CALIB_DIV_COEFF      4094
+-#define TS_CALIB_FCLK_COEFF     106
+-#define TS_CALIB_OPMODE_COEFF   0x0
+-
+-#define TS_UNCALIB_A_G_COEFF    6500
+-#define TS_UNCALIB_B_H_COEFF    20710
+-#define TS_UNCALIB_J_COEFF      16
+-#define TS_UNCALIB_DIV_COEFF    4094
+-#define TS_UNCALIB_FCLK_COEFF   5
+-#define TS_UNCALIB_OPMODE_COEFF 0x1
+-
+-struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
+-
+-__attribute__((weak)) void hl_ts_clk_set(u32 addr, unsigned int clk)
+-{
+-	unsigned int synth_clk;
+-	unsigned int val;
+-
+-	synth_clk = ((clk / 6000000) / 2) - 1;
+-
+-	val = synth_clk;
+-	val |= synth_clk << 8;
+-	val |= 0x101 << 16;
+-	regmap_writel(val, addr + HL_TS_CLK_SYNTH);
+-
+-}
+-
+-__attribute__((weak)) void hl_ts_sdif_set(u32 addr, bool use_calib)
+-{
+-	udelay(100);
+-	/* program sensor power up delay */
+-	regmap_writel(0x8d0000ff, addr + HL_TS_SDIF);
+-	udelay(100);
+-	/* configure sensor mode */
+-	regmap_writel(0x89000000, addr + HL_TS_SDIF);
+-	udelay(100);
+-	/* power up sensor in continuous mode*/
+-	regmap_writel(0x88000108, addr + HL_TS_SDIF);
+-}
+-
+-/* convert 12-bit HL_TMP register value to milliCelsius */
+-__attribute__((weak)) long hl_tmp_temp_reg_to_mC(int val, int ts)
+-{
+-	long tmp = (val & 0xfff);
+-	u32 coef_a_g, coef_b_h, coef_j, coef_div, fclk;
+-
+-	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
+-	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
+-	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
+-	coef_j = hl_ts_data[ts].hl_tmp_data.coef_j;
+-	fclk = hl_ts_data[ts].hl_tmp_data.fclk;
+-
+-	tmp = coef_a_g + ((coef_b_h * (((tmp * 1000) / coef_div) -
+-					500)) / 1000) - coef_j * fclk;
+-
+-	/*
+-	 * result of equation has to be multiplied
+-	 * by 1000, since coefficients are multiplied by 100 an extra
+-	 * multiplication of 10 is required.
+-	 */
+-	tmp *= 10;
+-
+-	return tmp;
+-}
+-
+-/* convert milliCelsius to 12-bit HL_TMP register value */
+-__attribute__((weak)) u32 hl_tmp_mC_to_temp_reg(long val, int ts)
+-{
+-	u32 reg_val;
+-	u32 coef_a_g, coef_b_h, coef_j, coef_div, fclk;
+-
+-	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
+-	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
+-	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
+-	coef_j = hl_ts_data[ts].hl_tmp_data.coef_j;
+-	fclk = hl_ts_data[ts].hl_tmp_data.fclk;
+-
+-	reg_val = ((coef_div * ((val / 10) -
+-			coef_a_g + (coef_j * fclk) +
+-			(coef_b_h / 2))) / coef_b_h);
+-
+-	return reg_val & 0xfff;
+-}
+-
+-/* twos complement to u32 without changing result sign
+- * since the temperature formula uses the positive value of
+- * the conversion.
+- */
+-static inline s32 twos_complement_to_s32(u32 val)
+-{
+-	return  val & 0x8000 ? ((~val & 0xFFFF) + 1) * (-1) : val;
+-}
+-
+-/* Extract A and B coefficients from efuse
+- *
+- * A:
+- * N_bin_twos_comp = efuse_read & 0x0000FFFF
+- * N_bin = twos_comp(N_bin_twos_comp, 16) #twos complement to int
+- * A_North = (N_bin * (-1)) / 1000.0
+- * A = A + A_North
+- *
+- * B:
+- * N_bin_twos_comp = (efuse_read >> (2) * 8) & 0x0000FFFF
+- * N_bin = twos_comp(N_bin_twos_comp, 16) #twos complement to int
+- * B_North = (N_bin * (-1)) / 1000.0
+- * B = B + B_North
+- */
+-static inline void hl_tmp_extract_A_B(u32 calib_data, int ts)
+-{
+-	s32 efuse_a_coeff = calib_data & 0xFFFF;
+-	s32 efuse_b_coeff = (calib_data >> 16) & 0xFFFF;
+-
+-	/* convert from two's complement to int */
+-	efuse_a_coeff = twos_complement_to_s32(efuse_a_coeff);
+-	efuse_b_coeff = twos_complement_to_s32(efuse_b_coeff);
+-
+-	/* A and B extracted has to be divided by 1000,
+-	 * but since defined coefficients are multiplied by 100
+-	 * for accuracy purposes, the coeff extracted are divided
+-	 * only by 10 to match defined coefficients resolution.
+-	 */
+-	hl_ts_data[ts].hl_tmp_data.coef_a_g += efuse_a_coeff / 10;
+-	hl_ts_data[ts].hl_tmp_data.coef_b_h += efuse_b_coeff / 10;
+-}
+-
+-__attribute__((weak)) int get_alarma_offset(void)
+-{
+-	return HL_TS0_ALARMA_CFG;
+-}
+-
+-__attribute__((weak)) int get_alarmb_offset(void)
+-{
+-	return HL_TS0_ALARMB_CFG;
+-}
+-
+-static inline void hl_ts_alarm_set(u32 ts_num)
+-{
+-	long reg;
+-	int alarm_mc;
+-
+-	alarm_mc = hl_ts_data[ts_num].alarm_a * C_TO_MC;
+-	reg = hl_tmp_mC_to_temp_reg(alarm_mc, ts_num);
+-	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarma_offset());
+-
+-	alarm_mc = hl_ts_data[ts_num].alarm_b * C_TO_MC;
+-	reg = hl_tmp_mC_to_temp_reg(alarm_mc, ts_num);
+-	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarmb_offset());
+-}
+-
+-__attribute__((weak)) void hl_set_calib_coeff(int ts, bool calib_enabled,
+-		struct hl_tmp_opmode_info *calib_data)
+-{
+-	if (calib_enabled) {
+-		calib_data->coef_a_g = TS_CALIB_A_G_COEFF;
+-		calib_data->coef_b_h = TS_CALIB_B_H_COEFF;
+-		calib_data->coef_j = TS_CALIB_J_COEFF;
+-		calib_data->coef_div = TS_CALIB_DIV_COEFF;
+-		calib_data->fclk = TS_CALIB_FCLK_COEFF;
+-		calib_data->opmode = TS_CALIB_OPMODE_COEFF;
+-	} else {
+-		calib_data->coef_a_g = TS_UNCALIB_A_G_COEFF;
+-		calib_data->coef_b_h = TS_UNCALIB_B_H_COEFF;
+-		calib_data->coef_j = TS_UNCALIB_J_COEFF;
+-		calib_data->coef_div = TS_UNCALIB_DIV_COEFF;
+-		calib_data->fclk = TS_UNCALIB_FCLK_COEFF;
+-		calib_data->opmode = TS_UNCALIB_OPMODE_COEFF;
+-	}
+-
+-}
+-
+-__attribute__((weak)) int hl_ts_get_count(void)
+-{
+-	return HL_ASIC_TS_MAX_COUNT;
+-}
+-
+-__attribute__((weak)) int get_sdif_offset(void)
+-{
+-	return HL_TS_SDIF;
+-}
+-
+-__attribute__((weak)) int hl_ts_pvt_init(int ts)
+-{
+-	return 0;
+-}
+-
+-__attribute__((weak)) void hl_ts_data_init(void)
+-{
+-	memset(hl_ts_data, 0, sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+-}
+-
+-__attribute__((weak)) void hl_dev_ts_init(void)
+-{
+-	u32 efuse_word, ts;
+-
+-	hl_ts_data_init();
+-
+-	for (ts = 0; ts < hl_ts_get_count(); ts++) {
+-
+-		if (hl_ts_pvt_init(ts))
+-			continue;
+-
+-		if (!hl_ts_data[ts].use_calib)
+-			hl_set_calib_coeff(ts, false,
+-						&hl_ts_data[ts].hl_tmp_data);
+-
+-		else {
+-			preboot_fuse_read(hl_ts_data[ts].calib_offset,
+-						&efuse_word);
+-
+-			/* Calculate new A and B coeff using efuse offsets */
+-			hl_tmp_extract_A_B(efuse_word, ts);
+-			hl_set_calib_coeff(ts, true,
+-						&hl_ts_data[ts].hl_tmp_data);
+-		}
+-
+-		hl_ts_alarm_set(ts);
+-		hl_ts_clk_set(hl_ts_data[ts].base, hl_ts_data[ts].freq);
+-		hl_ts_sdif_set(hl_ts_data[ts].base, hl_ts_data[ts].use_calib);
+-
+-	}
+-}
+-
+-void hl_ts_init(void)
+-{
+-	hl_dev_ts_init();
+-}
+-
+-__attribute__((weak)) int get_sdif_data_offset(void)
+-{
+-	return HL_TS_SDIF_DATA_OFFSET;
+-}
+-
+-int hl_ts_get_max_temp(void)
+-{
+-	int tmp, max_tmp = 0;
+-	int ts_num, ts;
+-
+-	ts_num = hl_ts_get_count();
+-	for (ts = 0; ts < ts_num; ts++) {
+-		tmp = regmap_readl(hl_ts_data[ts].base +
+-					get_sdif_data_offset());
+-		tmp = hl_tmp_temp_reg_to_mC(tmp, ts);
+-		if (max_tmp < tmp)
+-			max_tmp = tmp;
+-	}
+-
+-	return max_tmp;
+-}
+diff --git a/common/thermal.h b/common/thermal.h
+deleted file mode 100644
+index c5a281c..0000000
+--- a/common/thermal.h
++++ /dev/null
+@@ -1,42 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+ */
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _HL_THERMAL_H_
+-#define _HL_THERMAL_H_
+-
+-#include <preboot.h>
+-#include <stdbool.h>
+-
+-#define HL_ASIC_TS_MAX_COUNT    4
+-
+-struct hl_tmp_opmode_info {
+-	/* temp Formula coefficients */
+-	u32 coef_a_g;   /* G for uncalibrated, A for calibrated */
+-	u32 coef_b_h;   /* H for uncalibrated, B for calibrated */
+-	u32 coef_j;
+-	u32 coef_div;
+-	u32 fclk;
+-
+-	/* sensor operation mode config */
+-	unsigned int opmode;
+-};
+-
+-struct hl_ts_cfg {
+-	u32 base;
+-	u64 freq;
+-	u32 alarm_a;
+-	u32 alarm_b;
+-	u32 calib_offset;
+-	bool use_calib;
+-	struct hl_tmp_opmode_info hl_tmp_data;
+-};
+-
+-extern struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
+-
+-int hl_ts_get_max_temp(void);
+-
+-#endif /* _HL_THERMAL_H_ */
+diff --git a/common/thermal_v2.c b/common/thermal_v2.c
+deleted file mode 100644
+index d25f468..0000000
+--- a/common/thermal_v2.c
++++ /dev/null
+@@ -1,289 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <goya2/goya2_reg_map.h>
+-#include <goya2_blocks_linux_driver.h>
+-#include <dcon0_tstd_masks.h>
+-#include <dcon0_tstd_regs.h>
+-
+-#include <preboot.h>
+-#include <pll.h>
+-#include <uart.h>
+-#include <thermal.h>
+-#include <string.h>
+-
+-#include "common.h"
+-
+-#define HL_TS_CMN_SDIF_WDATA_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_SHIFT
+-#define HL_TS_CMN_SDIF_WDATA_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_MASK
+-#define HL_TS_CMN_SDIF_ADDR_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_SHIFT
+-#define HL_TS_CMN_SDIF_ADDR_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_MASK
+-#define HL_TS_CMN_SDIF_WRN_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_SHIFT
+-#define HL_TS_CMN_SDIF_WRN_MASK		DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_MASK
+-#define HL_TS_CMN_SDIF_PROG_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_SHIFT
+-#define HL_TS_CMN_SDIF_PROG_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_MASK
+-#define HL_TS_CMN_SDIF_STATUS_BUSY_MASK	\
+-	DCON0_TSTD_VM_CMN_SDIF_STATUS_SDIF_BUSY_MASK
+-/*
+- * sample_data register width is 16 bits, as per MR74137 spec resolution is
+- * from 8 - 12 bits only.
+- */
+-#define HL_TS_00_SDIF_DATA_SMPL_DATA_MASK 0xFFF
+-#define HL_TS_CMN_CLK_SYNTH_LO_SHIFT	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_SHIFT
+-#define HL_TS_CMN_CLK_SYNTH_LO_MASK	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_MASK
+-#define HL_TS_CMN_CLK_SYNTH_HI_SHIFT	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_SHIFT
+-#define HL_TS_CMN_CLK_SYNTH_HI_MASK	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_MASK
+-#define HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_SHIFT
+-#define HL_TS_CMN_CLK_SYNTH_HOLD_MASK	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_MASK
+-#define HL_TS_CMN_CLK_SYNTH_ENA_SHIFT	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_SHIFT
+-#define HL_TS_CMN_CLK_SYNTH_ENA_MASK	\
+-	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_MASK
+-
+-#define HL_TS_CMN_SDIF_STATUS		(mmDCON0_TSTD_TS_CMN_SDIF_STATUS & 0xFF)
+-#define HL_TS_CMN_SDIF			(mmDCON0_TSTD_TS_CMN_SDIF & 0xFF)
+-#define HL_TS_00_SDIF_DATA		(mmDCON0_TSTD_TS_00_SDIF_DATA & 0xFF)
+-#define HL_TS_CMN_CLK_SYNTH		(mmDCON0_TSTD_TS_CMN_CLK_SYNTH & 0xFF)
+-#define HL_TS_00_ALARMA_CFG		(mmDCON0_TSTD_TS_00_ALARMA_CFG & 0xFF)
+-#define HL_TS_00_ALARMB_CFG		(mmDCON0_TSTD_TS_00_ALARMB_CFG & 0xFF)
+-
+-#define HL_TS_IP_CTRL				0x00
+-#define HL_TS_IP_CTRL_AUTO_CONT_MODE		0x108
+-#define HL_TS_IP_CFG				0x01
+-#define HL_TS_IP_TMR				0x05
+-#define HL_TS_IP_TMR_DELAY			0xff
+-
+-/*
+- * Synthetic clock should be between 4MHz and 8MHz (Use 6MHz)
+- * TODO: confirm clock rate.
+- */
+-#define HL_TMP_CLK_RATE				6000000
+-
+-/*
+- * Note that coefficients are multiplied by 100 for better
+- * accuracy in result.
+- */
+-#define TS_CALIB_A_G_COEFF			5740
+-#define TS_CALIB_B_H_COEFF			24940
+-#define TS_CALIB_DIV_COEFF			4096
+-#define TS_UNCALIB_A_G_COEFF			6567
+-#define TS_UNCALIB_B_H_COEFF			25410
+-#define TS_UNCALIB_DIV_COEFF			4096
+-
+-#define HL_PVT_COMP_ID				0x00
+-#define HL_PVT_COMP_ID_VALUE			0x9b487060
+-#define HL_PVT_TM_SCRATCH			0x0c
+-#define HL_PVT_TM_SCRATCH_PATTERN		0xAAAAAAAA
+-#define HL_TS_PVT_INIT_FAILED			0x1
+-
+-/* Hard coded each of the goya2 on-chip TS device properties */
+-static struct hl_ts_cfg goya2_hl_ts_data[] = {
+-	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
+-		.use_calib = true, .calib_offset = 10, .hl_tmp_data = { 0 }},
+-	{.base = mmDCON0_TSTD_BASE, .alarm_a = 102, .alarm_b =  120,
+-		.use_calib = true, .calib_offset = 9, .hl_tmp_data = { 0 }},
+-	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
+-		.use_calib = true, .calib_offset = 8, .hl_tmp_data = { 0 }},
+-	{.base = mmDCON2_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
+-		.use_calib = true, .calib_offset = 7, .hl_tmp_data = { 0 }}
+-};
+-
+-void hl_ts_data_init(void)
+-{
+-	goya2_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	goya2_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	goya2_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	goya2_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	memcpy(hl_ts_data, goya2_hl_ts_data,
+-			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+-}
+-
+-void hl_set_calib_coeff(int ts, bool calib_enabled,
+-		struct hl_tmp_opmode_info *calib_data)
+-{
+-	if (calib_enabled) {
+-		calib_data->coef_a_g = TS_CALIB_A_G_COEFF;
+-		calib_data->coef_b_h = TS_CALIB_B_H_COEFF;
+-		calib_data->coef_div = TS_CALIB_DIV_COEFF;
+-		calib_data->opmode = true;
+-	} else {
+-		calib_data->coef_a_g = TS_UNCALIB_A_G_COEFF;
+-		calib_data->coef_b_h = TS_UNCALIB_B_H_COEFF;
+-		calib_data->coef_div = TS_UNCALIB_DIV_COEFF;
+-		calib_data->opmode = false;
+-	}
+-}
+-
+-static bool hl_tmp_is_sdif_free(u32 addr)
+-{
+-	unsigned int regval;
+-	int retry = 5;
+-
+-	do {
+-		regval = regmap_readl(addr + HL_TS_CMN_SDIF_STATUS);
+-		if ((regval & HL_TS_CMN_SDIF_STATUS_BUSY_MASK) == 0)
+-			return true;
+-
+-		retry--;
+-		udelay(100);
+-	} while (retry != 0);
+-
+-	return false;
+-}
+-
+-static inline void sdif_write(u32 reg_add, u32 wdata, u8 addr,
+-		bool wrn, bool prog)
+-{
+-
+-	u32 regval = (wdata << HL_TS_CMN_SDIF_WDATA_SHIFT)
+-		& HL_TS_CMN_SDIF_WDATA_MASK;
+-	regval |= (addr << HL_TS_CMN_SDIF_ADDR_SHIFT)
+-		& HL_TS_CMN_SDIF_ADDR_MASK;
+-	regval |= (wrn << HL_TS_CMN_SDIF_WRN_SHIFT)
+-		& HL_TS_CMN_SDIF_WRN_MASK;
+-	regval |= (prog << HL_TS_CMN_SDIF_PROG_SHIFT)
+-		& HL_TS_CMN_SDIF_PROG_MASK;
+-
+-	regmap_writel(regval, reg_add + HL_TS_CMN_SDIF);
+-}
+-
+-void hl_ts_sdif_set(u32 addr, bool use_calib)
+-{
+-	/* program sensor power up delay */
+-	if (hl_tmp_is_sdif_free(addr))
+-		sdif_write(addr, HL_TS_IP_TMR_DELAY, HL_TS_IP_TMR, 1, 1);
+-
+-	/* configure sensor mode */
+-	if (hl_tmp_is_sdif_free(addr))
+-		sdif_write(addr, use_calib, HL_TS_IP_CFG, 1, 1);
+-
+-	/* power up sensor in continuous mode */
+-	if (hl_tmp_is_sdif_free(addr))
+-		sdif_write(addr, HL_TS_IP_CTRL_AUTO_CONT_MODE, HL_TS_IP_CTRL,
+-				1, 1);
+-}
+-
+-void hl_ts_clk_set(u32 addr, unsigned int clk)
+-{
+-	unsigned int synth_clk;
+-	unsigned int val;
+-
+-	synth_clk = ((clk / HL_TMP_CLK_RATE) / 2) - 1;
+-
+-	val = (synth_clk << HL_TS_CMN_CLK_SYNTH_LO_SHIFT)
+-		& HL_TS_CMN_CLK_SYNTH_LO_MASK;
+-	val |= (synth_clk << HL_TS_CMN_CLK_SYNTH_HI_SHIFT)
+-		& HL_TS_CMN_CLK_SYNTH_HI_MASK;
+-	val |= (1 << HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT)
+-		& HL_TS_CMN_CLK_SYNTH_HOLD_MASK;
+-	val |= (1 << HL_TS_CMN_CLK_SYNTH_ENA_SHIFT)
+-		& HL_TS_CMN_CLK_SYNTH_ENA_MASK;
+-
+-	regmap_writel(val, addr + + HL_TS_CMN_CLK_SYNTH);
+-}
+-
+-/*
+- * convert 12-bit HL_TMP register value to milliCelsius
+- *
+- * Mode 1: output conversion (calibrated)
+- * Temp = A + B * Eqbs
+- *
+- * Mode 2: output conversion (uncalibrated)
+- * Temp = G + H * Eqbs
+- *
+- * Eqbs = Nbs / cal5 - 0.5
+- *
+- */
+-
+-long hl_tmp_temp_reg_to_mC(int val, int ts)
+-{
+-	long tmp = (val & HL_TS_00_SDIF_DATA_SMPL_DATA_MASK);
+-	u32 coef_a_g, coef_b_h, coef_div;
+-
+-	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
+-	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
+-	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
+-
+-	tmp = coef_a_g + ((coef_b_h * (((tmp * 1000) / coef_div) -
+-					500)) / 1000);
+-
+-	/*
+-	 * result of equation has to be multiplied
+-	 * by 1000, since coefficients are multiplied by 100 an extra
+-	 * multiplication of 10 is required.
+-	 */
+-	tmp *= 10;
+-
+-	return tmp;
+-}
+-
+-/* convert milliCelsius to 12-bit HL_TMP register value */
+-u32 hl_tmp_mC_to_temp_reg(long val, int ts)
+-{
+-	u32 reg_val;
+-	u32 coef_a_g, coef_b_h, coef_div;
+-
+-	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
+-	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
+-	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
+-
+-	reg_val = ((coef_div * ((val / 10) -
+-					coef_a_g + (coef_b_h / 2))) / coef_b_h);
+-
+-	return reg_val & HL_TS_00_SDIF_DATA_SMPL_DATA_MASK;
+-}
+-
+-int get_alarma_offset(void)
+-{
+-	return HL_TS_00_ALARMA_CFG;
+-}
+-
+-int get_alarmb_offset(void)
+-{
+-	return HL_TS_00_ALARMB_CFG;
+-}
+-
+-int get_sdif_data_offset(void)
+-{
+-	return HL_TS_00_SDIF_DATA;
+-}
+-
+-int get_sdif_offset(void)
+-{
+-	return HL_TS_CMN_SDIF;
+-}
+-
+-int hl_ts_pvt_init(int ts)
+-{
+-	unsigned int regval;
+-
+-	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_COMP_ID);
+-	if (regval !=  HL_PVT_COMP_ID_VALUE)
+-		return HL_TS_PVT_INIT_FAILED;
+-
+-	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH);
+-	if (regval !=  0x0)
+-		return HL_TS_PVT_INIT_FAILED;
+-
+-	regmap_writel(HL_PVT_TM_SCRATCH_PATTERN,
+-			(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH));
+-	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH);
+-	if (regval !=  HL_PVT_TM_SCRATCH_PATTERN)
+-		return HL_TS_PVT_INIT_FAILED;
+-
+-	return 0;
+-}
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 6f0f564..58e1516 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -23,7 +23,7 @@
+ #include <string.h>
+ #include <ppboot/spi.h>
+ #include <preboot/fit.h>
+-#include <thermal.h>
++#include <preboot/thermal.h>
+ 
+ #include "common.h"
+ 
+diff --git a/goya/common.c b/goya/common.c
+index ecc8d62..3a18a80 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -20,7 +20,7 @@
+ #include <string.h>
+ #include <ppboot/spi.h>
+ #include <preboot/fit.h>
+-#include <thermal.h>
++#include <preboot/thermal.h>
+ #include <string.h>
+ 
+ #include "common.h"
+diff --git a/goya2_arc_gnu/Makefile b/goya2_arc_gnu/Makefile
+index bdefa90..eacfb1c 100644
+--- a/goya2_arc_gnu/Makefile
++++ b/goya2_arc_gnu/Makefile
+@@ -1,4 +1 @@
+ FW_SIZE := 0x8000
+-
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/pll.c)
+-PREBOOT_SRCS_C += $(shell ls common/thermal_v2.c)
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index b8dea9c..67a5dcb 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -12,8 +12,8 @@
+ #include <hl_fw_if.h>
+ #include <pcie_dbi_regs.h>
+ #include <preboot.h>
+-#include <thermal.h>
+ 
++#include "thermal.h"
+ #include "cmd_module.h"
+ #include "pll.h"
+ #include "uart.h"
+diff --git a/preboot/thermal.c b/preboot/thermal.c
+new file mode 100644
+index 0000000..3cfadf3
+--- /dev/null
++++ b/preboot/thermal.c
+@@ -0,0 +1,273 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <stdbool.h>
++#include <preboot.h>
++#include <pll.h>
++#include <efuse.h>
++#include <string.h>
++#include <uart.h>
++
++#include "thermal.h"
++
++#define HL_TS_SDIF_DATA_OFFSET	0x44
++#define HL_TS_CLK_SYNTH		0x010
++#define HL_TS_SDIF		0x020
++#define HL_TS0_ALARMA_CFG	0x144
++#define HL_TS0_ALARMB_CFG	0x164
++#define C_TO_MC			1000
++
++#define TS_CALIB_A_G_COEFF      4805
++#define TS_CALIB_B_H_COEFF      21980
++#define TS_CALIB_J_COEFF        1
++#define TS_CALIB_DIV_COEFF      4094
++#define TS_CALIB_FCLK_COEFF     106
++#define TS_CALIB_OPMODE_COEFF   0x0
++
++#define TS_UNCALIB_A_G_COEFF    6500
++#define TS_UNCALIB_B_H_COEFF    20710
++#define TS_UNCALIB_J_COEFF      16
++#define TS_UNCALIB_DIV_COEFF    4094
++#define TS_UNCALIB_FCLK_COEFF   5
++#define TS_UNCALIB_OPMODE_COEFF 0x1
++
++struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
++
++__attribute__((weak)) void hl_ts_clk_set(u32 addr, unsigned int clk)
++{
++	unsigned int synth_clk;
++	unsigned int val;
++
++	synth_clk = ((clk / 6000000) / 2) - 1;
++
++	val = synth_clk;
++	val |= synth_clk << 8;
++	val |= 0x101 << 16;
++	regmap_writel(val, addr + HL_TS_CLK_SYNTH);
++
++}
++
++__attribute__((weak)) void hl_ts_sdif_set(u32 addr, bool use_calib)
++{
++	udelay(100);
++	/* program sensor power up delay */
++	regmap_writel(0x8d0000ff, addr + HL_TS_SDIF);
++	udelay(100);
++	/* configure sensor mode */
++	regmap_writel(0x89000000, addr + HL_TS_SDIF);
++	udelay(100);
++	/* power up sensor in continuous mode*/
++	regmap_writel(0x88000108, addr + HL_TS_SDIF);
++}
++
++/* convert 12-bit HL_TMP register value to milliCelsius */
++__attribute__((weak)) long hl_tmp_temp_reg_to_mC(int val, int ts)
++{
++	long tmp = (val & 0xfff);
++	u32 coef_a_g, coef_b_h, coef_j, coef_div, fclk;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++	coef_j = hl_ts_data[ts].hl_tmp_data.coef_j;
++	fclk = hl_ts_data[ts].hl_tmp_data.fclk;
++
++	tmp = coef_a_g + ((coef_b_h * (((tmp * 1000) / coef_div) -
++					500)) / 1000) - coef_j * fclk;
++
++	/*
++	 * result of equation has to be multiplied
++	 * by 1000, since coefficients are multiplied by 100 an extra
++	 * multiplication of 10 is required.
++	 */
++	tmp *= 10;
++
++	return tmp;
++}
++
++/* convert milliCelsius to 12-bit HL_TMP register value */
++__attribute__((weak)) u32 hl_tmp_mC_to_temp_reg(long val, int ts)
++{
++	u32 reg_val;
++	u32 coef_a_g, coef_b_h, coef_j, coef_div, fclk;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++	coef_j = hl_ts_data[ts].hl_tmp_data.coef_j;
++	fclk = hl_ts_data[ts].hl_tmp_data.fclk;
++
++	reg_val = ((coef_div * ((val / 10) -
++			coef_a_g + (coef_j * fclk) +
++			(coef_b_h / 2))) / coef_b_h);
++
++	return reg_val & 0xfff;
++}
++
++/* twos complement to u32 without changing result sign
++ * since the temperature formula uses the positive value of
++ * the conversion.
++ */
++static inline s32 twos_complement_to_s32(u32 val)
++{
++	return  val & 0x8000 ? ((~val & 0xFFFF) + 1) * (-1) : val;
++}
++
++/* Extract A and B coefficients from efuse
++ *
++ * A:
++ * N_bin_twos_comp = efuse_read & 0x0000FFFF
++ * N_bin = twos_comp(N_bin_twos_comp, 16) #twos complement to int
++ * A_North = (N_bin * (-1)) / 1000.0
++ * A = A + A_North
++ *
++ * B:
++ * N_bin_twos_comp = (efuse_read >> (2) * 8) & 0x0000FFFF
++ * N_bin = twos_comp(N_bin_twos_comp, 16) #twos complement to int
++ * B_North = (N_bin * (-1)) / 1000.0
++ * B = B + B_North
++ */
++static inline void hl_tmp_extract_A_B(u32 calib_data, int ts)
++{
++	s32 efuse_a_coeff = calib_data & 0xFFFF;
++	s32 efuse_b_coeff = (calib_data >> 16) & 0xFFFF;
++
++	/* convert from two's complement to int */
++	efuse_a_coeff = twos_complement_to_s32(efuse_a_coeff);
++	efuse_b_coeff = twos_complement_to_s32(efuse_b_coeff);
++
++	/* A and B extracted has to be divided by 1000,
++	 * but since defined coefficients are multiplied by 100
++	 * for accuracy purposes, the coeff extracted are divided
++	 * only by 10 to match defined coefficients resolution.
++	 */
++	hl_ts_data[ts].hl_tmp_data.coef_a_g += efuse_a_coeff / 10;
++	hl_ts_data[ts].hl_tmp_data.coef_b_h += efuse_b_coeff / 10;
++}
++
++__attribute__((weak)) int get_alarma_offset(void)
++{
++	return HL_TS0_ALARMA_CFG;
++}
++
++__attribute__((weak)) int get_alarmb_offset(void)
++{
++	return HL_TS0_ALARMB_CFG;
++}
++
++static inline void hl_ts_alarm_set(u32 ts_num)
++{
++	long reg;
++	int alarm_mc;
++
++	alarm_mc = hl_ts_data[ts_num].alarm_a * C_TO_MC;
++	reg = hl_tmp_mC_to_temp_reg(alarm_mc, ts_num);
++	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarma_offset());
++
++	alarm_mc = hl_ts_data[ts_num].alarm_b * C_TO_MC;
++	reg = hl_tmp_mC_to_temp_reg(alarm_mc, ts_num);
++	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarmb_offset());
++}
++
++__attribute__((weak)) void hl_set_calib_coeff(int ts, bool calib_enabled,
++		struct hl_tmp_opmode_info *calib_data)
++{
++	if (calib_enabled) {
++		calib_data->coef_a_g = TS_CALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_CALIB_B_H_COEFF;
++		calib_data->coef_j = TS_CALIB_J_COEFF;
++		calib_data->coef_div = TS_CALIB_DIV_COEFF;
++		calib_data->fclk = TS_CALIB_FCLK_COEFF;
++		calib_data->opmode = TS_CALIB_OPMODE_COEFF;
++	} else {
++		calib_data->coef_a_g = TS_UNCALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_UNCALIB_B_H_COEFF;
++		calib_data->coef_j = TS_UNCALIB_J_COEFF;
++		calib_data->coef_div = TS_UNCALIB_DIV_COEFF;
++		calib_data->fclk = TS_UNCALIB_FCLK_COEFF;
++		calib_data->opmode = TS_UNCALIB_OPMODE_COEFF;
++	}
++
++}
++
++__attribute__((weak)) int hl_ts_get_count(void)
++{
++	return HL_ASIC_TS_MAX_COUNT;
++}
++
++__attribute__((weak)) int get_sdif_offset(void)
++{
++	return HL_TS_SDIF;
++}
++
++__attribute__((weak)) int hl_ts_pvt_init(int ts)
++{
++	return 0;
++}
++
++__attribute__((weak)) void hl_ts_data_init(void)
++{
++	memset(hl_ts_data, 0, sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
++
++__attribute__((weak)) void hl_dev_ts_init(void)
++{
++	u32 efuse_word, ts;
++
++	hl_ts_data_init();
++
++	for (ts = 0; ts < hl_ts_get_count(); ts++) {
++
++		if (hl_ts_pvt_init(ts))
++			continue;
++
++		if (!hl_ts_data[ts].use_calib)
++			hl_set_calib_coeff(ts, false,
++						&hl_ts_data[ts].hl_tmp_data);
++
++		else {
++			preboot_fuse_read(hl_ts_data[ts].calib_offset,
++						&efuse_word);
++
++			/* Calculate new A and B coeff using efuse offsets */
++			hl_tmp_extract_A_B(efuse_word, ts);
++			hl_set_calib_coeff(ts, true,
++						&hl_ts_data[ts].hl_tmp_data);
++		}
++
++		hl_ts_alarm_set(ts);
++		hl_ts_clk_set(hl_ts_data[ts].base, hl_ts_data[ts].freq);
++		hl_ts_sdif_set(hl_ts_data[ts].base, hl_ts_data[ts].use_calib);
++
++	}
++}
++
++void hl_ts_init(void)
++{
++	hl_dev_ts_init();
++}
++
++__attribute__((weak)) int get_sdif_data_offset(void)
++{
++	return HL_TS_SDIF_DATA_OFFSET;
++}
++
++int hl_ts_get_max_temp(void)
++{
++	int tmp, max_tmp = 0;
++	int ts_num, ts;
++
++	ts_num = hl_ts_get_count();
++	for (ts = 0; ts < ts_num; ts++) {
++		tmp = regmap_readl(hl_ts_data[ts].base +
++					get_sdif_data_offset());
++		tmp = hl_tmp_temp_reg_to_mC(tmp, ts);
++		if (max_tmp < tmp)
++			max_tmp = tmp;
++	}
++
++	return max_tmp;
++}
+diff --git a/preboot/thermal.h b/preboot/thermal.h
+new file mode 100644
+index 0000000..c5a281c
+--- /dev/null
++++ b/preboot/thermal.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _HL_THERMAL_H_
++#define _HL_THERMAL_H_
++
++#include <preboot.h>
++#include <stdbool.h>
++
++#define HL_ASIC_TS_MAX_COUNT    4
++
++struct hl_tmp_opmode_info {
++	/* temp Formula coefficients */
++	u32 coef_a_g;   /* G for uncalibrated, A for calibrated */
++	u32 coef_b_h;   /* H for uncalibrated, B for calibrated */
++	u32 coef_j;
++	u32 coef_div;
++	u32 fclk;
++
++	/* sensor operation mode config */
++	unsigned int opmode;
++};
++
++struct hl_ts_cfg {
++	u32 base;
++	u64 freq;
++	u32 alarm_a;
++	u32 alarm_b;
++	u32 calib_offset;
++	bool use_calib;
++	struct hl_tmp_opmode_info hl_tmp_data;
++};
++
++extern struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
++
++int hl_ts_get_max_temp(void);
++
++#endif /* _HL_THERMAL_H_ */
+diff --git a/preboot/thermal_v2.c b/preboot/thermal_v2.c
+new file mode 100644
+index 0000000..913a422
+--- /dev/null
++++ b/preboot/thermal_v2.c
+@@ -0,0 +1,289 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <goya2/goya2_reg_map.h>
++#include <goya2_blocks_linux_driver.h>
++#include <dcon0_tstd_masks.h>
++#include <dcon0_tstd_regs.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include <string.h>
++
++#include "thermal.h"
++#include "common.h"
++
++#define HL_TS_CMN_SDIF_WDATA_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_SHIFT
++#define HL_TS_CMN_SDIF_WDATA_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_MASK
++#define HL_TS_CMN_SDIF_ADDR_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_SHIFT
++#define HL_TS_CMN_SDIF_ADDR_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_MASK
++#define HL_TS_CMN_SDIF_WRN_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_SHIFT
++#define HL_TS_CMN_SDIF_WRN_MASK		DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_MASK
++#define HL_TS_CMN_SDIF_PROG_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_SHIFT
++#define HL_TS_CMN_SDIF_PROG_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_MASK
++#define HL_TS_CMN_SDIF_STATUS_BUSY_MASK	\
++	DCON0_TSTD_VM_CMN_SDIF_STATUS_SDIF_BUSY_MASK
++/*
++ * sample_data register width is 16 bits, as per MR74137 spec resolution is
++ * from 8 - 12 bits only.
++ */
++#define HL_TS_00_SDIF_DATA_SMPL_DATA_MASK 0xFFF
++#define HL_TS_CMN_CLK_SYNTH_LO_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_LO_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_MASK
++#define HL_TS_CMN_CLK_SYNTH_HI_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HI_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_MASK
++#define HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HOLD_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_MASK
++#define HL_TS_CMN_CLK_SYNTH_ENA_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_ENA_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_MASK
++
++#define HL_TS_CMN_SDIF_STATUS		(mmDCON0_TSTD_TS_CMN_SDIF_STATUS & 0xFF)
++#define HL_TS_CMN_SDIF			(mmDCON0_TSTD_TS_CMN_SDIF & 0xFF)
++#define HL_TS_00_SDIF_DATA		(mmDCON0_TSTD_TS_00_SDIF_DATA & 0xFF)
++#define HL_TS_CMN_CLK_SYNTH		(mmDCON0_TSTD_TS_CMN_CLK_SYNTH & 0xFF)
++#define HL_TS_00_ALARMA_CFG		(mmDCON0_TSTD_TS_00_ALARMA_CFG & 0xFF)
++#define HL_TS_00_ALARMB_CFG		(mmDCON0_TSTD_TS_00_ALARMB_CFG & 0xFF)
++
++#define HL_TS_IP_CTRL				0x00
++#define HL_TS_IP_CTRL_AUTO_CONT_MODE		0x108
++#define HL_TS_IP_CFG				0x01
++#define HL_TS_IP_TMR				0x05
++#define HL_TS_IP_TMR_DELAY			0xff
++
++/*
++ * Synthetic clock should be between 4MHz and 8MHz (Use 6MHz)
++ * TODO: confirm clock rate.
++ */
++#define HL_TMP_CLK_RATE				6000000
++
++/*
++ * Note that coefficients are multiplied by 100 for better
++ * accuracy in result.
++ */
++#define TS_CALIB_A_G_COEFF			5740
++#define TS_CALIB_B_H_COEFF			24940
++#define TS_CALIB_DIV_COEFF			4096
++#define TS_UNCALIB_A_G_COEFF			6567
++#define TS_UNCALIB_B_H_COEFF			25410
++#define TS_UNCALIB_DIV_COEFF			4096
++
++#define HL_PVT_COMP_ID				0x00
++#define HL_PVT_COMP_ID_VALUE			0x9b487060
++#define HL_PVT_TM_SCRATCH			0x0c
++#define HL_PVT_TM_SCRATCH_PATTERN		0xAAAAAAAA
++#define HL_TS_PVT_INIT_FAILED			0x1
++
++/* Hard coded each of the goya2 on-chip TS device properties */
++static struct hl_ts_cfg goya2_hl_ts_data[] = {
++	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 10, .hl_tmp_data = { 0 }},
++	{.base = mmDCON0_TSTD_BASE, .alarm_a = 102, .alarm_b =  120,
++		.use_calib = true, .calib_offset = 9, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 8, .hl_tmp_data = { 0 }},
++	{.base = mmDCON2_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 7, .hl_tmp_data = { 0 }}
++};
++
++void hl_ts_data_init(void)
++{
++	goya2_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	goya2_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	goya2_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	goya2_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	memcpy(hl_ts_data, goya2_hl_ts_data,
++			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
++
++void hl_set_calib_coeff(int ts, bool calib_enabled,
++		struct hl_tmp_opmode_info *calib_data)
++{
++	if (calib_enabled) {
++		calib_data->coef_a_g = TS_CALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_CALIB_B_H_COEFF;
++		calib_data->coef_div = TS_CALIB_DIV_COEFF;
++		calib_data->opmode = true;
++	} else {
++		calib_data->coef_a_g = TS_UNCALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_UNCALIB_B_H_COEFF;
++		calib_data->coef_div = TS_UNCALIB_DIV_COEFF;
++		calib_data->opmode = false;
++	}
++}
++
++static bool hl_tmp_is_sdif_free(u32 addr)
++{
++	unsigned int regval;
++	int retry = 5;
++
++	do {
++		regval = regmap_readl(addr + HL_TS_CMN_SDIF_STATUS);
++		if ((regval & HL_TS_CMN_SDIF_STATUS_BUSY_MASK) == 0)
++			return true;
++
++		retry--;
++		udelay(100);
++	} while (retry != 0);
++
++	return false;
++}
++
++static inline void sdif_write(u32 reg_add, u32 wdata, u8 addr,
++		bool wrn, bool prog)
++{
++
++	u32 regval = (wdata << HL_TS_CMN_SDIF_WDATA_SHIFT)
++		& HL_TS_CMN_SDIF_WDATA_MASK;
++	regval |= (addr << HL_TS_CMN_SDIF_ADDR_SHIFT)
++		& HL_TS_CMN_SDIF_ADDR_MASK;
++	regval |= (wrn << HL_TS_CMN_SDIF_WRN_SHIFT)
++		& HL_TS_CMN_SDIF_WRN_MASK;
++	regval |= (prog << HL_TS_CMN_SDIF_PROG_SHIFT)
++		& HL_TS_CMN_SDIF_PROG_MASK;
++
++	regmap_writel(regval, reg_add + HL_TS_CMN_SDIF);
++}
++
++void hl_ts_sdif_set(u32 addr, bool use_calib)
++{
++	/* program sensor power up delay */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, HL_TS_IP_TMR_DELAY, HL_TS_IP_TMR, 1, 1);
++
++	/* configure sensor mode */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, use_calib, HL_TS_IP_CFG, 1, 1);
++
++	/* power up sensor in continuous mode */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, HL_TS_IP_CTRL_AUTO_CONT_MODE, HL_TS_IP_CTRL,
++				1, 1);
++}
++
++void hl_ts_clk_set(u32 addr, unsigned int clk)
++{
++	unsigned int synth_clk;
++	unsigned int val;
++
++	synth_clk = ((clk / HL_TMP_CLK_RATE) / 2) - 1;
++
++	val = (synth_clk << HL_TS_CMN_CLK_SYNTH_LO_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_LO_MASK;
++	val |= (synth_clk << HL_TS_CMN_CLK_SYNTH_HI_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_HI_MASK;
++	val |= (1 << HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_HOLD_MASK;
++	val |= (1 << HL_TS_CMN_CLK_SYNTH_ENA_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_ENA_MASK;
++
++	regmap_writel(val, addr + + HL_TS_CMN_CLK_SYNTH);
++}
++
++/*
++ * convert 12-bit HL_TMP register value to milliCelsius
++ *
++ * Mode 1: output conversion (calibrated)
++ * Temp = A + B * Eqbs
++ *
++ * Mode 2: output conversion (uncalibrated)
++ * Temp = G + H * Eqbs
++ *
++ * Eqbs = Nbs / cal5 - 0.5
++ *
++ */
++
++long hl_tmp_temp_reg_to_mC(int val, int ts)
++{
++	long tmp = (val & HL_TS_00_SDIF_DATA_SMPL_DATA_MASK);
++	u32 coef_a_g, coef_b_h, coef_div;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++
++	tmp = coef_a_g + ((coef_b_h * (((tmp * 1000) / coef_div) -
++					500)) / 1000);
++
++	/*
++	 * result of equation has to be multiplied
++	 * by 1000, since coefficients are multiplied by 100 an extra
++	 * multiplication of 10 is required.
++	 */
++	tmp *= 10;
++
++	return tmp;
++}
++
++/* convert milliCelsius to 12-bit HL_TMP register value */
++u32 hl_tmp_mC_to_temp_reg(long val, int ts)
++{
++	u32 reg_val;
++	u32 coef_a_g, coef_b_h, coef_div;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++
++	reg_val = ((coef_div * ((val / 10) -
++					coef_a_g + (coef_b_h / 2))) / coef_b_h);
++
++	return reg_val & HL_TS_00_SDIF_DATA_SMPL_DATA_MASK;
++}
++
++int get_alarma_offset(void)
++{
++	return HL_TS_00_ALARMA_CFG;
++}
++
++int get_alarmb_offset(void)
++{
++	return HL_TS_00_ALARMB_CFG;
++}
++
++int get_sdif_data_offset(void)
++{
++	return HL_TS_00_SDIF_DATA;
++}
++
++int get_sdif_offset(void)
++{
++	return HL_TS_CMN_SDIF;
++}
++
++int hl_ts_pvt_init(int ts)
++{
++	unsigned int regval;
++
++	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_COMP_ID);
++	if (regval !=  HL_PVT_COMP_ID_VALUE)
++		return HL_TS_PVT_INIT_FAILED;
++
++	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH);
++	if (regval !=  0x0)
++		return HL_TS_PVT_INIT_FAILED;
++
++	regmap_writel(HL_PVT_TM_SCRATCH_PATTERN,
++			(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH));
++	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH);
++	if (regval !=  HL_PVT_TM_SCRATCH_PATTERN)
++		return HL_TS_PVT_INIT_FAILED;
++
++	return 0;
++}

@@ -1,0 +1,171 @@
+From d48d9bf32f3259eb59160979db79b30c9995935a Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Mon, 16 Jan 2023 12:16:39 +0200
+Subject: [PATCH] [SW-117389] ppboot: gaudi2: store ppboot hash into tpm
+
+If cpld resets tpm and pcie link has to be brought up
+the tpm init in erom tpm is taking approx 50ms and
+firmware wont be able to get pcie link up within
+anticipated time. hence adding tpm init in ppboot post
+invoking arc0 to start pcie initialization and before
+enabling pcie and i2c memory access. The i2c slave
+configuration is done in preboot.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I3d5cadaecd8f1f88473b37b1bff6737779bc7a29
+---
+
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+index 18a3b7d..5193f00 100644
+--- a/app/ext_rom/erom_tpm.c
++++ b/app/ext_rom/erom_tpm.c
+@@ -25,22 +25,6 @@
+ #include <sha512.h>
+ #include <string.h>
+ 
+-#define ARCBOOT_PRIMARY			0
+-#define ARCBOOT_SECONDARY		1
+-#define ARCBOOT_STATUS_REG_SZ_BITS	32
+-#define FLASH_64KB_PADD			65536
+-#define FLASH_VALID_MASK		0x1FFFFF
+-#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE	46080
+-#define HL_FWSRAM_OFFSET		0x3FD0000
+-#define HL_GEN_MEM_BASE			0x24000000
+-
+-#define HL_FWSRAM_BASE			(HL_GEN_MEM_BASE + \
+-					 HL_FWSRAM_OFFSET)
+-
+-#define PPBOOT_SHA_MAGIC		0x1cca566a
+-#define PPBOOT_HASH_MAGIC_SIZE		4
+-#define PPBOOT_SHA384_FOOTER		SHA384_SUM_LEN
+-
+ static void erom_get_ppboot_data(uint8_t **offset)
+ {
+ 	uint32_t ppboot_pcie_size;
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index c52abdc..630834b 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -305,6 +305,7 @@
+ __weak void ppboot_init_fw_info(void) {}
+ __weak void ppboot_plls_init(void) {}
+ __weak void hl_pcie_enable_elbi_access(void) {}
++__weak void ppboot_tpm_extend(void) {}
+ 
+ void ppboot_main(void)
+ {
+@@ -335,6 +336,7 @@
+ 	spi_flash_prot_early();
+ 	ppboot_security_init();
+ 	hl_pcie_init();
++	ppboot_tpm_extend();
+ 	if (link_is_up)
+ 		hl_pcie_enable_elbi_access();
+ 	ppboot_time_critical_section_end();
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 2914a05..0ce45d1 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -21,6 +21,7 @@
+ #include <pcie_dbi_masks.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <psoc_reset_conf_regs.h>
++#include <psoc_security_regs.h>
+ 
+ #include <stdint.h>
+ #include <hl_boot_if.h>		/* requires stdint.h */
+@@ -50,6 +51,8 @@
+ #include <tpm2.h>
+ #include <errno.h>
+ #include <device.h>
++#include <tpm_auth.h>
++#include <gaudi2_bootrom.h>
+ 
+ #define PRODUCT_ID_STR_SIZE			0x8
+ 
+@@ -922,3 +925,56 @@
+ {
+ 	security_enable_jtag_if();
+ }
++
++static void gaudi2_get_ppboot_data(uint8_t **offset)
++{
++	uint32_t ppboot_pcie_size;
++
++	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
++
++	ppboot_pcie_size -= SIG_SIZE;
++	ppboot_pcie_size -= CRC32_SIZE;
++	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
++	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
++	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
++
++	*offset = (uint8_t *)(HL_FWSRAM_BASE + ppboot_pcie_size);
++}
++
++static bool is_ppboot_tpm_extend_done(void)
++{
++	uint32_t reg = regmap_readl(mmPSOC_SECURITY_SW_STATUS_1);
++	uint32_t mask = (PROGRESS_ARCBOOT_EROM_TPM_FINISH & 0x1F);
++
++	return !!(reg & BIT(mask));
++}
++
++void ppboot_tpm_extend(void)
++{
++	uint8_t *data;
++	uint32_t magic;
++	uint8_t hash[SHA384_SUM_LEN] = { 0 };
++
++	/* return if erom has already done ppboot tpm extend */
++	if (is_ppboot_tpm_extend_done())
++		return;
++
++	if (tpm_init(true))
++		return;
++
++	if (tpm_startup())
++		return;
++
++	gaudi2_get_ppboot_data(&data);
++
++	memcpy(&magic, data, PPBOOT_HASH_MAGIC_SIZE);
++
++	if (magic != PPBOOT_SHA_MAGIC) {
++		preboot_puts("no ppboot sha magic found\n");
++		return;
++	}
++
++	memcpy(hash, data + PPBOOT_HASH_MAGIC_SIZE, SHA384_SUM_LEN);
++
++	tpm_pcr_extend(TPM2_PPBOOT_PCR_IDX, hash);
++}
+diff --git a/arch/gaudi2/common/tpm_auth.h b/arch/gaudi2/common/tpm_auth.h
+index 30de525..df6dfc0 100644
+--- a/arch/gaudi2/common/tpm_auth.h
++++ b/arch/gaudi2/common/tpm_auth.h
+@@ -8,6 +8,24 @@
+ #ifndef _HL_TPM_AUTH_H_
+ #define _HL_TPM_AUTH_H_
+ 
++#include <sizes.h>
++
++#define ARCBOOT_PRIMARY			0
++#define ARCBOOT_SECONDARY		1
++#define ARCBOOT_STATUS_REG_SZ_BITS	32
++#define FLASH_64KB_PADD			SZ_64K
++#define FLASH_VALID_MASK		(SZ_2M - 1)
++#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE	46080
++#define HL_FWSRAM_OFFSET		0x3FD0000
++#define HL_GEN_MEM_BASE			0x24000000
++
++#define HL_FWSRAM_BASE			(HL_GEN_MEM_BASE + \
++					 HL_FWSRAM_OFFSET)
++
++#define PPBOOT_SHA_MAGIC		0x1cca566a
++#define PPBOOT_HASH_MAGIC_SIZE		4
++#define PPBOOT_SHA384_FOOTER		SHA384_SUM_LEN
++
+ int tpm_init(bool print);
+ int tpm_startup(void);
+ int tpm_pcr_extend(uint32_t image_index, uint8_t *hash);

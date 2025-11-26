@@ -1,0 +1,151 @@
+From 8a8103a3b5f74f6e90b275fffba04cd536f40390 Mon Sep 17 00:00:00 2001
+From: Christine Gharzuzi <cgharzuzi@habana.ai>
+Date: Thu, 08 Dec 2022 15:57:33 +0200
+Subject: [PATCH] [SW-102640] gaudi3: set ppboot ver in bootinfo
+
+Gaudi3 ppboot uses arcboot boot info API which
+doesn't support data merge, meaning, that as long
+as ppboot doesn't add data to boot info there are
+no issues, however, as part of support for ppboot version
+in generic packet, the ppboot version has to be added
+to boot info.
+
+This commit add implementation for bootinfo 'set' which
+fetches boot info data from spsram and thus when
+boot_info_finalize_no_merge() is called, the existing data
+will be merged.
+
+Change-Id: Ic623f053477e865400968905db04ff2e09acf547
+Signed-off-by: Christine Gharzuzi <cgharzuzi@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index bf2cc26..3f62e54 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -238,10 +238,12 @@
+ __weak void ppboot_pcie_drain_init(void) {}
+ 
+ __weak void hl_plat_init(void) {}
++__weak void ppboot_send_version(void) {}
+ 
+ static inline void ppboot_version(void)
+ {
+ 	preboot_puts("Ppboot " VERSION_STR "\n");
++	ppboot_send_version();
+ }
+ 
+ __weak void hl_enter_recovery(void)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 3ab8b92..0dae29b 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -81,6 +81,97 @@
+ 	u8 img_idx;
+ };
+ 
++static struct hl_boot_info_desc *hl_boot_info_get_desc(int idx)
++{
++	struct hl_boot_info_desc *desc = NULL;
++	struct hl_boot_info_ptrs *ptrs;
++	u32 *offsets;
++
++	ptrs = (struct hl_boot_info_ptrs *)BOOT_INFO_BASE;
++	offsets = (uint32_t *)(BOOT_INFO_BASE + ptrs->offsets_arr_off);
++
++	/* check boundaries */
++	if (BOOT_INFO_BASE + offsets[idx] < BOOT_INFO_BASE + HL_SP_SRAM_SIZE)
++		desc = (void *)(uintptr_t)(BOOT_INFO_BASE + offsets[idx]);
++
++	return desc;
++}
++
++static int hl_boot_info_get_num_descs(void)
++{
++	struct hl_boot_info_ptrs *ptrs =
++		(struct hl_boot_info_ptrs *)BOOT_INFO_BASE;
++
++	if (ptrs->magic != HL_BOOT_INFO_MAGIC) {
++		preboot_puts("Failed to read boot info root node (bad magic)");
++		return 0;
++	}
++
++	return ptrs->count;
++}
++
++/*
++ * Gaudi3 ppboot uses bootinfo API from arcboot which doesn't support merge of existing boot info
++ * data, so prior to using boot_info_finalize_no_merge(), the bootinfo data on spsram memory needs
++ * to be fetched to the 'boot_info' structure by calling boot_info_set_no_merge() for all existing
++ * descs.
++ */
++static int ppboot_boot_info_set(u32 type, void *data, u32 size)
++{
++	struct mem_desc mem_region_desc;
++	struct hl_boot_info_desc *desc;
++	u32 desc_count = hl_boot_info_get_num_descs();
++	uintptr_t mem_base, mem_base_end;
++	u32 i, actual_size, ret = 0;
++
++	if (preboot_get_mem_region(MEM_GP, &mem_region_desc)) {
++		preboot_puts("boot_info_set: failed to get mem region MEM_GP\n");
++		return 1;
++	}
++
++	mem_base = mem_region_desc.base;
++	mem_base_end = mem_base + mem_region_desc.size;
++	for (i = 0; i < desc_count; i++) {
++		desc = hl_boot_info_get_desc(i);
++		if (!desc) {
++			preboot_puts_hex("boot_info_set: failed to get pointer to desc index ", i,
++					 false);
++			continue;
++		}
++
++		/* copy boot info memory into GP mem region */
++		if (mem_base + desc->size > mem_base_end) {
++			preboot_puts("boot_info_set: not enough space for bootinfo\n");
++			ret = 1;
++			goto merge_and_exit;
++		}
++
++		if (boot_info_get_no_merge(desc->type, (void *)mem_base, desc->size,
++					   &actual_size)) {
++			preboot_puts_hex("boot_info_set: failed to get type ", desc->type,
++					 false);
++			continue;
++		}
++
++		if (boot_info_set_no_merge(desc->type, (void *)mem_base, desc->size)) {
++			preboot_puts_hex("boot_info_set: bootinfo set failure for type ",
++					 desc->type, false);
++			continue;
++		}
++
++		mem_base += desc->size;
++	}
++
++	if (boot_info_set_no_merge(HL_BOOT_INFO_PPBOOT_VERSION, data, size)) {
++		preboot_puts("boot_info_set: failed to set HL_BOOT_INFO_PPBOOT_VERSION\n");
++		return 1;
++	}
++
++merge_and_exit:
++	boot_info_finalize_no_merge();
++	return ret;
++}
++
+ u32 hl_pll_timestamp_base_get(void)
+ {
+ 	return mmD0_PSOC_TIMESTAMP_CNTCR;
+@@ -1108,3 +1199,10 @@
+ 	if (err)
+ 		preboot_puts_hex("failed to copy phy fw to pcie sram, err 0x", err, false);
+ }
++
++void ppboot_send_version(void)
++{
++	if (ppboot_boot_info_set(HL_BOOT_INFO_PPBOOT_VERSION, (void *)PREBOOT_VER,
++				 sizeof(PREBOOT_VER)))
++		preboot_puts("BOOT_INFO: Failed to set ppboot version\n");
++}

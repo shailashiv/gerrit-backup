@@ -1,0 +1,78 @@
+From 92ccf7277bfceb3ab3f28e3cc601968b472897ab Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Wed, 06 Nov 2019 16:59:39 +0200
+Subject: [PATCH] [SW-0] gaudi: pci_pll: skip WA for metal fix asic fixup
+
+Till now as part of pll workaround the PCI pll was initialized at PCIe
+image of BTL
+Once we unset DIP switch of PCIe enable it needs to be done on preboot
+Otherwise PLL is at ref clock and we will end up with non accessiable
+SPI flash
+
+Change-Id: Id1ae03bda893dae7652bfcab0e7d0b9c4599855b
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 7e570ae..c6a4eaf 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -10,6 +10,9 @@
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_pci_pll_regs.h>
+ 
++#include <hl_boot_if.h>
++#include <gaudi/gaudi_reg_map.h>
++
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+@@ -269,9 +272,18 @@
+ 	return regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2) == 1;
+ }
+ 
+-static bool gaudi_pcie_strap_is_unset(void)
++static bool gaudi_pcie_pll_need_wa(void)
+ {
+ 	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
++	u32 reset_cause = regmap_readl(mmPREBOOT_PCIE_EN); /* hard reset */
++
++	if (gaudi_reset_soc_done())
++		return false;
++
++	if (reset_cause == LKD_HARD_RESET_MAGIC) {
++		regmap_writel(0, mmPREBOOT_PCIE_EN);
++		return false;
++	}
+ 
+ 	/* Check if already done by BTL */
+ 	return !(boot_strap & 0x2);
+@@ -281,7 +293,7 @@
+ {
+ 	switch (cfg->base) {
+ 	case mmPSOC_PCI_PLL_BASE:
+-		return gaudi_pcie_strap_is_unset();
++		return gaudi_pcie_pll_need_wa();
+ 	case mmPSOC_CPU_PLL_BASE:
+ 		return false;
+ 	case mmNIC2_HBM_PLL_BASE:
+@@ -299,7 +311,7 @@
+ {
+ 	int i, j;
+ 
+-	if (!gaudi_pcie_strap_is_unset())
++	if (!gaudi_pcie_pll_need_wa())
+ 		return;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(gaudi_pll_cfg); i++) {
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 6463c75..b85f8f8 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -109,7 +109,6 @@
+ 
+ 	/* During hard reset triggered by LKD keep PCIe intact */
+ 	reset_cause = regmap_readl(mmPREBOOT_PCIE_EN);
+-	regmap_writel(0, mmPREBOOT_PCIE_EN);
+ 	if (reset_cause == LKD_HARD_RESET_MAGIC)
+ 		return;
+ 

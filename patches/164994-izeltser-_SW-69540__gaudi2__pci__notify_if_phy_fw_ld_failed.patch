@@ -1,0 +1,66 @@
+From 7480396528f44de1df213c71d49fd30d6bc8ca05 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 09 Jan 2022 15:14:48 +0200
+Subject: [PATCH] [SW-69540] gaudi2: pci: notify if phy fw ld failed
+
+If pci phy fw load done indication is low for an excessive amount
+of time (10mSec), user message is printed.
+Before, there was no indication for failure, aside from absence
+of pci link, which made the failure investigation quite difficult.
+This message might help in future investigations.
+
+Change-Id: I83d45a15cacdd128cf256827b653897ef5d6db2f
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0d4acf2..052378a 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -354,32 +354,24 @@
+ 		regmap_writel(value, addr);
+ }
+ 
++#define PCIE_EXT_LD_TIMEOUT_US	10000
++
+ static void pcie_wait_for_sram_ext_ld_done(void)
+ {
+-	uint8_t sram_ext_ld_done = 0;
++	u64 start = timestamp_get_us();
++	bool usr_notify = true;
+ 
+-	do {
+-		sram_ext_ld_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
+-	} while (sram_ext_ld_done != 1);
++	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0) &&
++	       regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1) &&
++	       regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2) &&
++	       regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3))) {
+ 
+-	sram_ext_ld_done = 0;
+-	do {
+-		sram_ext_ld_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
+-	} while (sram_ext_ld_done != 1);
+-
+-	sram_ext_ld_done = 0;
+-	do {
+-		sram_ext_ld_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2);
+-	} while (sram_ext_ld_done != 1);
+-
+-	sram_ext_ld_done = 0;
+-	do {
+-		sram_ext_ld_done =
+-			regmap_readl(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3);
+-	} while (sram_ext_ld_done != 1);
++		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US) &&
++		    usr_notify) {
++			preboot_puts("ext_ld_done is low > 10mSec\n");
++			usr_notify = false;
++		}
++	}
+ }
+ 
+ static void pcie_phy_set_mpll_a_b_ssc_enable(void)

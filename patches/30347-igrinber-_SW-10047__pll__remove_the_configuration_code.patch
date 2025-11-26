@@ -1,0 +1,299 @@
+From 386c36e9e2b6003b6ab90a759510c51d959b7afe Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 19 Mar 2020 14:22:44 +0200
+Subject: [PATCH] [SW-10047] pll: remove the configuration code
+
+Remove all the PLL configuration code. Keep only the parts that are in
+use.
+This is an additional preparation for narrowing down the SPI flash code
+and functionality size.
+
+Change-Id: I2fed6ec650704f27800a16737d1be21c3f8f74a1
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/preboot.c b/app/preboot.c
+index 75a6330..70b0f02 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -141,11 +141,14 @@
+ 
+ 	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
+ 
++	/*
++	 * Note: we assume CPU frequency is not changed while CPU is running,
++	 * so the udelay init is done once before we start.
++	 */
++	hl_pll_udelay_init();
++
+ 	hl_uart_init();
+ 	preboot_version();
+-	hl_pll_init();
+-	/* reinit uart after PLLs configured */
+-	hl_uart_init();
+ 	preboot_copy_uboot();
+ 
+ 	uboot_start();
+diff --git a/common/pll.c b/common/pll.c
+index 610a1f1..56b772f 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -5,15 +5,13 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
+-#include <stdbool.h>
+-
+ #include "preboot.h"
+ #include "uart.h"
+ #include "pll.h"
+ 
+ static u64 cycles_per_usec = BYPASS_CYCLES_PER_USEC;
+ 
+-static inline void hl_pll_udelay_init(void)
++void hl_pll_udelay_init(void)
+ {
+ 	cycles_per_usec = hl_pll_get_cpu_cycles_per_usec();
+ }
+@@ -24,159 +22,6 @@
+ 
+ 	while (cnt--)
+ 		;
+-}
+-
+-static inline void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
+-{
+-	regmap_writel(reset, cfg->base + HL_PLL_RST);
+-}
+-
+-static inline int hl_pll_is_locked(struct hl_pll_cfg *cfg)
+-{
+-	return regmap_readl(cfg->base + HL_PLL_CFG) & HL_PLL_CFG_LOCK;
+-}
+-
+-static inline void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg)
+-{
+-	u32 reg = regmap_readl(cfg->base + HL_PLL_CFG);
+-
+-	regmap_writel(reg & ~HL_PLL_CFG_LOCK, cfg->base + HL_PLL_CFG);
+-}
+-
+-static void hl_pll_cfg(struct hl_pll_cfg *cfg)
+-{
+-	hl_pll_reset(cfg, true);
+-
+-	regmap_writel(cfg->nr, cfg->base + HL_PLL_NR);
+-	regmap_writel(cfg->nf, cfg->base + HL_PLL_NF);
+-	regmap_writel(cfg->od, cfg->base + HL_PLL_OD);
+-	regmap_writel(cfg->nb, cfg->base + HL_PLL_NB);
+-	regmap_writel(0x11, cfg->base + HL_PLL_DATA_CHNG);
+-
+-	/* after updating the coefficients we need to wait >=5us */
+-	hl_pll_udelay(HL_PLL_MAX_WAIT_TIME);
+-
+-	hl_pll_reset(cfg, false);
+-
+-	/* Wait >500 (10us) reference cycles until PLL re-locks. */
+-	hl_pll_udelay(HL_PLL_MAX_WAIT_TIME);
+-}
+-
+-static void hl_pll_clk_switch_to_ref(struct hl_pll_cfg *cfg)
+-{
+-	int sel;
+-	u32 reg;
+-
+-	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-		switch (regmap_readl(reg)) {
+-		case HL_PLL_DIV_PLL:
+-			/* first change DIV_REF, then DIV_PLL */
+-			regmap_writel(HL_PLL_DIV_REF, reg);
+-			hl_pll_udelay(1);
+-			/* no break */
+-		case HL_PLL_PLL_CLK:
+-		case HL_PLL_DIV_REF:
+-			regmap_writel(HL_PLL_REF_CLK, reg);
+-			break;
+-		case HL_PLL_REF_CLK:
+-		default:
+-			break;
+-		}
+-	}
+-
+-	/* just to be on a safe side, wait for bypass to propagate */
+-	hl_pll_udelay(1);
+-}
+-
+-static void hl_pll_clk_switch_to_pll(struct hl_pll_cfg *cfg)
+-{
+-	int sel;
+-	u32 reg;
+-
+-	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-		switch (cfg->div_sel[sel]) {
+-		case HL_PLL_DIV_REF:
+-			regmap_writel(HL_PLL_DIV_REF, reg);
+-			break;
+-		case HL_PLL_PLL_CLK:
+-			regmap_writel(HL_PLL_PLL_CLK, reg);
+-			break;
+-		case HL_PLL_DIV_PLL:
+-			/* first change DIV_REF, then DIV_PLL */
+-			regmap_writel(HL_PLL_DIV_REF, reg);
+-			hl_pll_udelay(1);
+-			regmap_writel(HL_PLL_DIV_PLL, reg);
+-			break;
+-		case HL_PLL_REF_CLK:
+-		default:
+-			break;
+-		}
+-	}
+-
+-	/* just to be on a safe side, wait for bypass to propagate */
+-	hl_pll_udelay(1);
+-}
+-
+-static void hl_pll_div_init(struct hl_pll_cfg *cfg)
+-{
+-	int sel;
+-	u32 div_base;
+-
+-	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		if (cfg->div_sel[sel] == HL_PLL_REF_CLK ||
+-		    cfg->div_factor[sel] < 0)
+-			continue;
+-
+-		div_base = cfg->base + (sel * sizeof(u32));
+-
+-		regmap_writel(cfg->div_factor[sel],
+-				div_base + HL_PLL_DIV_FACTOR);
+-		regmap_writel(1, div_base + HL_PLL_DIV_FACTOR_CMD);
+-		regmap_writel(1, div_base + HL_PLL_DIV_EN);
+-	}
+-
+-	/* just to be on a safe side, wait for DIV init to propagate */
+-	hl_pll_udelay(1);
+-}
+-
+-static void hl_pll_wait_for_lock(struct hl_pll_cfg *cfg)
+-{
+-	int tout = HL_PLL_LOCK_TOUT;
+-
+-	while (!hl_pll_is_locked(cfg) && tout--)
+-		hl_pll_udelay(1);
+-
+-	if (tout < 0) {
+-		preboot_puts_raw("PLL: Timeout waiting for ");
+-		preboot_puts_raw(cfg->name);
+-		preboot_puts_raw(" PLL lock...\n\r");
+-	}
+-}
+-
+-static inline void hl_pll_ack_int(struct hl_pll_cfg *cfg)
+-{
+-	regmap_writel(1, cfg->base + HL_PLL_LOCK_INTR);
+-}
+-
+-static void hl_pll_set(struct hl_pll_cfg *cfg)
+-{
+-	hl_pll_clk_switch_to_ref(cfg);
+-
+-	hl_pll_cfg(cfg);
+-
+-	hl_pll_div_init(cfg);
+-
+-	/* to be on a safe side, poll on the PLL lock status bit */
+-	hl_pll_wait_for_lock(cfg);
+-
+-	/* w/a the h/w erratum: lock status bit isn't getting cleared */
+-	hl_pll_clear_lock_status(cfg);
+-
+-	hl_pll_ack_int(cfg);
+-
+-	hl_pll_clk_switch_to_pll(cfg);
+ }
+ 
+ u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+@@ -205,34 +50,4 @@
+ 	 */
+ 
+ 	return out_freq;
+-}
+-
+-__attribute__((weak))
+-bool hl_pll_is_configurable(struct hl_pll_cfg *cfg) { return true; }
+-
+-__attribute__((weak))
+-int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg) { return 0; }
+-
+-/**
+- * hl_pll_init - Initialize PLL registers
+- */
+-void hl_pll_init(void)
+-{
+-	int i, pll_num;
+-	struct hl_pll_cfg *hl_pll_cfg;
+-
+-	/*
+-	 * Note: we assume CPU frequency is not changed while CPU is running,
+-	 * so the udelay init is done once before we start.
+-	 */
+-	hl_pll_udelay_init();
+-
+-	pll_num = hl_pll_get_cfg(&hl_pll_cfg);
+-
+-	for (i = 0; i < pll_num; i++) {
+-		if (!hl_pll_is_configurable(hl_pll_cfg + i))
+-			continue;
+-
+-		hl_pll_set(hl_pll_cfg + i);
+-	}
+ }
+diff --git a/common/pll.h b/common/pll.h
+index 33dd8b4..c95bee1 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -8,8 +8,6 @@
+ #ifndef _HL_PLL_H_
+ #define _HL_PLL_H_
+ 
+-#include <stdbool.h>
+-
+ #define HL_PLL_NR		0x100
+ #define HL_PLL_NF		0x104
+ #define HL_PLL_OD		0x108
+@@ -24,9 +22,6 @@
+ #define HL_PLL_DIV_SEL		0x280
+ #define HL_PLL_DIV_EN		0x2a0
+ #define HL_PLL_CLK_GATER	0x300
+-
+-#define HL_PLL_MAX_WAIT_TIME	20	/* 20 us */
+-#define HL_PLL_LOCK_TOUT	5000	/* 5 ms */
+ 
+ #define SYS_REF_CLOCK		50000000ULL
+ #define USEC_PER_SEC		1000000
+@@ -48,22 +43,9 @@
+ 	HL_PLL_DIV_SIZE,
+ };
+ 
+-struct hl_pll_cfg {
+-	char	*name;
+-	u32	base;
+-	u32	nr;
+-	u32	nf;
+-	u32	od;
+-	u32	nb;
+-	int	div_factor[HL_PLL_DIV_SIZE];
+-	int	div_sel[HL_PLL_DIV_SIZE];
+-};
+-
+-void hl_pll_init(void);
+-int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg);
++void hl_pll_udelay_init(void);
+ u64 hl_pll_get_cpu_cycles_per_usec(void);
+ u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div);
+-bool hl_pll_is_configurable(struct hl_pll_cfg *cfg);
+ void hl_pll_udelay(unsigned int usec);
+ 
+ #endif /* _HL_PLL_H_ */

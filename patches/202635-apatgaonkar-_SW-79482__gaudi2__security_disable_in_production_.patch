@@ -1,0 +1,85 @@
+From 15afa30b7129b7e0ffb4743e6ae68557cc4a314c Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Mon, 25 Apr 2022 07:32:41 +0300
+Subject: [PATCH] [SW-79482] gaudi2: security disable in production for rma
+
+To support RMA debug in production, firmware needs support of
+disabling security and image validation across the flow. This
+scenario will be called fake unsecurity and detected based on
+following GPIOs:
+GPIO_77 = '1'
+GPIO_78 = '1'
+GPIO_57 = '0'
+
+Change-Id: I84bd8df9abd463de6dbbdcf18a41366f05a4aabc
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 379b051..cc00d26 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -808,8 +808,29 @@
+ 	return !!(config_efuse & mask);
+ }
+ 
++#define GAUDI2_MANF_MODE_GPIO		57
++#define GAUDI2_MOD_ID_3_GPIO		77
++#define GAUDI2_MOD_ID_4_GPIO		78
++
++static bool preboot_security_fuse_override(void)
++{
++	u32 manf_mode, module_id_3, module_id_4;
++
++	module_id_3 = gaudi2_gpio_read(GAUDI2_MOD_ID_3_GPIO);
++	module_id_4 = gaudi2_gpio_read(GAUDI2_MOD_ID_4_GPIO);
++	manf_mode = gaudi2_gpio_read(GAUDI2_MANF_MODE_GPIO);
++
++	if (!manf_mode && !!module_id_3 && !!module_id_4)
++		return true;
++
++	return false;
++}
++
+ bool preboot_security_is_enabled(void)
+ {
++	if (preboot_security_fuse_override())
++		return false;
++
+ 	if (preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK))
+ 		return true;
+ 
+@@ -818,6 +839,9 @@
+ 
+ bool preboot_img_validation_is_enabled(void)
+ {
++	if (preboot_security_fuse_override())
++		return false;
++
+ 	if (preboot_sec_efuse_is_set(EFUSE_SYSCFG_ENABLE_VALIDATION_MASK))
+ 		return true;
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index cd84b6d..93ea7c5 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -98,7 +98,7 @@
+ 	return gpio < 0 ? 0 : GPIO2BANK(gpio);
+ }
+ 
+-static uint32_t gaudi2_gpio_read(uint32_t gpio_pin)
++uint32_t gaudi2_gpio_read(uint32_t gpio_pin)
+ {
+ 	uint32_t val;
+ 	uint32_t gpio_pin_offset = gpio_pin % GPIOS_PER_BANK;
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 509fd3f..732d8a0 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -201,6 +201,7 @@
+ };
+ 
+ void gaudi2_axi_drain_ena(void);
++uint32_t gaudi2_gpio_read(uint32_t gpio_pin);
+ bool preboot_fake_security_is_enabled(void);
+ bool preboot_fake_security_is_sig_validation_enabled(void);
+ uint8_t get_sris_mode_from_strap(void);

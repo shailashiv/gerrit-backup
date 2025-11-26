@@ -1,0 +1,255 @@
+From bbf1bc778a0a79c3e1396b4f449f9dc804051a92 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 31 Oct 2024 10:36:17 +0200
+Subject: [PATCH] [FSW-2071] fs1: add auto image loading sequence
+
+Images can be loaded automatically from flash by using data from the
+image manifest. To enable that some additional parameters were added
+to the manifest, such as memory address & size, cpu details, and
+image flags.
+
+Images are loaded by iterating the descriptors in the flash manifest
+until action is required (based on flags and reset cause)
+1. if not current CPU, prepare the CPU by release of CPU reset
+2. if mem init required, init memory
+3. if mem load required, copy the image to memory and validate sha
+4. if cpu execution required, and not current CPU, set reset vector and
+   run CPU.
+   if cpu execution required, and current CPU, return address
+
+Based on that sequence, the image that is running on the same CPU and
+replacing the Ppboot must be positioned last in the manifest, after all
+the other loadables.
+
+Change-Id: I46275fe0b86857b37ca60d57fd37057efaf99258
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 4664fc6..24f9acf 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -75,7 +75,7 @@
+ 
+ __weak void preboot_tpm_extend(uint8_t *hash) {}
+ 
+-__weak bool ppboot_load_preboot_img(u64 *loadaddr)
++__weak bool ppboot_load_next_img(u64 *loadaddr)
+ {
+ 	struct boot_desc desc;
+ 	bool ret;
+@@ -372,7 +372,7 @@
+ 
+ 	ppboot_init_fw_info();
+ 
+-	ret = ppboot_load_preboot_img(&loadaddr);
++	ret = ppboot_load_next_img(&loadaddr);
+ 	ppboot_check_stack_monitor();
+ 	preboot_puts("Ppboot resigned\n\r\n");
+ 	if (ret)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index ca3055b..866ba06 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -33,6 +33,7 @@
+ #include <tran_chk_lbw_masks.h>
+ #include <pmmu_pcie_wrap_regs.h>
+ #include <pcie_fw_sram_regs.h>
++#include <farm_arc_aux_regs.h>
+ #include <fs1_blocks_linux_driver.h>
+ #include <fs1_security.h>
+ #include <string.h>
+@@ -604,3 +605,180 @@
+ {
+ 	hl_pcie_phy_fw_copy();
+ }
++
++static bool image_is_load_req(struct desc_flags flags, u32 rst_src)
++{
++	switch (rst_src) {
++	case HL_COLD_RST:
++	case HL_MANUAL_RST:
++		if (flags.cold_load)
++			return true;
++		break;
++	case HL_PRSTN_RST:
++		if (flags.warm_load)
++			return true;
++		break;
++	default:
++		if (flags.sw_rst_load)
++			return true;
++	}
++
++	return false;
++}
++
++static bool image_is_exec_req(struct desc_flags flags, u32 rst_src)
++{
++	switch (rst_src) {
++	case HL_COLD_RST:
++	case HL_MANUAL_RST:
++		if (flags.cold_exec)
++			return true;
++		break;
++	case HL_PRSTN_RST:
++		if (flags.warm_exec)
++			return true;
++		break;
++	default:
++		if (flags.sw_rst_exec)
++			return true;
++	}
++
++	return false;
++}
++
++#define PSOC_CPU_RUN_MASK	0x1
++#define PSOC_CPU_HALT_MASK	0x2
++
++static void image_load_cpu_prep(struct boot_desc *desc, u32 rst_src)
++{
++	struct desc_flags flags;
++
++	flags.img_flags = desc->flags;
++
++	/* if current CPU, do nothing */
++	if (desc->cpu_cfg_base == mmIO_0_CFG_HALF_0_PSOC_ARC_MNG_ARC_BASE)
++		return;
++
++	if (!image_is_load_req(flags, rst_src) && !image_is_exec_req(flags, rst_src))
++		return;
++
++	/* if not current CPU, release CPU reset and stop CPU */
++	if (flags.cpu_type == CPU_TYPE_PSOC) {
++		regmap_writel(0, desc->cpu_cfg_base + mmARC_ARC_RST);
++		regmap_writel(PSOC_CPU_HALT_MASK, desc->cpu_cfg_base + mmARC_RUN_HALT_REQ);
++	} else {
++		regmap_writel(0, desc->cpu_cfg_base + mmFARM_ARC_AUX_ARC_RST);
++		regmap_writel(1, desc->cpu_cfg_base + mmFARM_ARC_AUX_HALT_REQ);
++	}
++}
++
++static void image_load_mem_init(struct boot_desc *desc, u32 rst_src)
++{
++	struct desc_flags flags;
++
++	flags.img_flags = desc->flags;
++	if (image_is_load_req(flags, rst_src) && flags.mem_init)
++		fs1_mem_init(desc->mem_base, desc->mem_size, false);
++}
++
++static void image_load_mem_load(struct boot_desc *desc, u32 rst_src)
++{
++	char *image_name = NULL;
++	char *preboot_str = "Preboot";
++	struct desc_flags flags;
++
++	flags.img_flags = desc->flags;
++
++	if (!image_is_load_req(flags, rst_src))
++		return;
++
++	if (desc->cpu_cfg_base == mmIO_0_CFG_HALF_0_PSOC_ARC_MNG_ARC_BASE)
++		image_name = preboot_str;
++
++	ppboot_cp_image(desc->loadaddr, desc->spi_offset, desc->img_size, image_name);
++}
++
++#define CPU_RST_VECTOR_SHIFT	10
++
++static u32 image_load_get_rst_vector(struct boot_desc *desc)
++{
++	u32 arc_addr = fs1_translate_arc_addr(desc->loadaddr);
++	u32 rst_vec;
++
++	/*
++	 * reset vector specified in the first 4 bytes of the image, meaning in the beginning of
++	 * loadaddr location.
++	 */
++	rst_vec = *(u32 *)arc_addr;
++
++	return rst_vec >> CPU_RST_VECTOR_SHIFT;
++}
++
++static bool image_load_cpu_exec(struct boot_desc *desc, u32 rst_src)
++{
++	u32 rst_vector;
++	struct desc_flags flags;
++
++	flags.img_flags = desc->flags;
++
++	if (!image_is_exec_req(flags, rst_src))
++		return false;
++
++	/* if executing on current CPU nothing more to do here */
++	if (desc->cpu_cfg_base == mmIO_0_CFG_HALF_0_PSOC_ARC_MNG_ARC_BASE)
++		return true;
++
++	rst_vector = image_load_get_rst_vector(desc);
++	if (flags.cpu_type == CPU_TYPE_PSOC) {
++		regmap_writel(rst_vector, desc->cpu_cfg_base + mmARC_RST_VEC_ADDR);
++		regmap_writel(PSOC_CPU_RUN_MASK, desc->cpu_cfg_base + mmARC_RUN_HALT_REQ);
++	} else {
++		regmap_writel(rst_vector, desc->cpu_cfg_base + mmFARM_ARC_AUX_RST_VEC_ADDR);
++		regmap_writel(1, desc->cpu_cfg_base + mmFARM_ARC_AUX_RUN_REQ);
++	}
++
++	return false;
++}
++
++/*
++ * Load images from flash in an automated manner, based on manifest image parameters.
++ * Loop on descriptors until action is required (based on flags and reset cause)
++ * 1. if not current CPU, prepare the CPU by release of CPU reset
++ * 2. if mem init required, init memory
++ * 3. if mem load required, copy the image to memory and validate sha
++ * 4. if cpu execution required, and not current CPU, set reset vector and run CPU.
++ *    if cpu execution required, and current CPU, return address
++ */
++bool ppboot_load_next_img(u64 *loadaddr)
++{
++	struct boot_desc desc;
++	int bootdesc_cnt, i;
++	u32 rst_src, err;
++	bool no_return;
++
++	bootdesc_cnt = boot_desc_init();
++	if (!bootdesc_cnt) {
++		preboot_puts_raw("No valid flash manifest");
++		return false;
++	}
++
++	for (i = 0; i < bootdesc_cnt; i++) {
++		err = boot_desc_get_img_desc_by_idx(i, &desc);
++		if (err) {
++			preboot_puts_hex("Failed to get boot descriptor no. ", i, false);
++			continue;
++		}
++
++		rst_src = hl_rst_src_get();
++		image_load_cpu_prep(&desc, rst_src);
++		image_load_mem_init(&desc, rst_src);
++		image_load_mem_load(&desc, rst_src);
++		no_return = image_load_cpu_exec(&desc, rst_src);
++		if (no_return) {
++			*loadaddr = desc.loadaddr;
++			return true;
++		}
++	}
++
++	return false;
++}
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 4b56223..48a7a27 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -455,7 +455,7 @@
+ 	regmap_writel(value, mmPSOC_GLOBAL_CONF_SPI_DMA_BAUDR);
+ }
+ 
+-bool ppboot_load_preboot_img(u64 *loadaddr)
++bool ppboot_load_next_img(u64 *loadaddr)
+ {
+ 	/*
+ 	 * Preboot is copied and executed from SRAM.

@@ -1,0 +1,143 @@
+From 68118fc0b7074cb002e3577fd5d67caf0c1df521 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Wed, 05 May 2021 15:19:25 +0300
+Subject: [PATCH] [SW-40142] gaudi: hbm: row repair flow
+
+Add row repair flow as part of MCBIST hook
+function, same as done in u-boot, but without
+any logic related to ecc and RMA tables in flash.
+
+Change-Id: I1c6a932c07ab24a3d31f65f63a3850c528c8fba7
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index 5c62a9f..b1ac0ea 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -79,6 +79,7 @@
+ #define RBUS_LANES_NUM			6
+ 
+ #define MAX_LANE_REPAIR_ITERATIONS	5
++#define MAX_ROW_REPLACEMENT_ITERATIONS	32
+ 
+ struct hbm {
+ 	u32 acc_initial;
+@@ -89,6 +90,7 @@
+ 	u8 training_delay;
+ 	u8 hardware_training_repeat;
+ 	u8 lane_repair_iter[GAUDI_HBM_DEVICES];
++	u8 row_replacement_iter[GAUDI_HBM_DEVICES];
+ };
+ 
+ static struct hbm hbm_data = {
+@@ -1376,12 +1378,107 @@
+ 	return !started;
+ }
+ 
++static int hbm_dma_ch_to_map_ch(int dev, int dma_ch)
++{
++	int ret = 0;
++	/* mapping from PC in bus to mapped phy channel */
++	int dma_ch_to_map_ch[GAUDI_HBM_CHANNELS] = {
++		4, 5, 6, 7, 0, 1, 2, 3,
++	};
++
++	if ((dma_ch >= 0 && dma_ch < GAUDI_HBM_CHANNELS) &&
++	    (dev >= 0 && dev < GAUDI_HBM_DEVICES)) {
++		if (dev == 1 || dev == 2)
++			ret = dma_ch_to_map_ch[dma_ch];
++		else
++			ret = dma_ch;
++	} else {
++		preboot_puts("hbm_pc: Illegal input");
++		return -1;
++	}
++
++	return ret;
++}
++
++#define HBM_SID_BITMASK			0x1
++#define HBM_ROW_REP_WAIT_TIME		1000
++#define HBM_ROW_SOFT_REP_DQ_BIT		18
++#define HBM_ROW_SOFT_REP_SID_BIT	19
++#define HBM_ROW_SOFT_REP_EN_BIT		20
++
++void gaudi_hbm_row_repair(int dev, int dma_pc, int sid, u32 bank, u32 page)
++{
++	u32 write_wdr_addr, base, hbm_ch, row;
++	int ch;
++
++	if (dma_pc < 0 || dma_pc >= (GAUDI_HBM_CHANNELS * PC_PER_CH)) {
++		preboot_puts("ERROR : hbm_row_repair: Illegal pc value\n");
++		return;
++	}
++
++	if (dev < 0 || dev >= GAUDI_HBM_DEVICES) {
++		preboot_puts("ERROR : hbm_row_repair: Illegal HBM device\n");
++		return;
++	}
++
++	row = bank << 14 | page;
++
++	if (dma_pc % 2)
++		row = row | BIT(HBM_ROW_SOFT_REP_DQ_BIT);
++	else
++		row = row & ~BIT(HBM_ROW_SOFT_REP_DQ_BIT);
++
++	if (sid)
++		row = row | BIT(HBM_ROW_SOFT_REP_SID_BIT);
++	else
++		row = row & ~BIT(HBM_ROW_SOFT_REP_SID_BIT);
++
++	row = row | BIT(HBM_ROW_SOFT_REP_EN_BIT);
++	base = GAUDI_HBM_CFG_BASE + dev * GAUDI_HBM_CFG_OFFSET;
++	write_wdr_addr = base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) + 0x100;
++	ch = hbm_dma_ch_to_map_ch(dev, (dma_pc / 2));
++	hbm_ch = hbm_ch_mapping[ch];
++
++	/* enter self refresh */
++	RMWREG32(base + 0x4, 1, 1 << 16);
++	WREG32(write_wdr_addr, row);
++	ieee1500_inst(dev, hbm_ch, ieee1500_soft_repair, EXTEST_WRITE_INST);
++
++	/*
++	 * WRCK is ~44ns. So the minimal delay is 44*300 = 13.5usec.
++	 * See MCBIST samsung doc page 21. increase to 1msec for safety.
++	 */
++	udelay(HBM_ROW_REP_WAIT_TIME);
++
++	/* Exit self refresh */
++	RMWREG32(base + 0x4, 1, 1 << 17);
++
++	/* WRSTN assert */
++	RMWREG32(base + GAUDI_HBM_CENTER_CHANNEL * 0x1000 + 0x14, 0x0, 0x1);
++}
++
+ static int hbm_pc_row_repair(int sid, int device, int ch, int pc,
+ 			     struct mcbist_err_start_addr addr)
+ {
+-	/* TODO: implement row repair here */
++	int dma_ch;
++	struct hbm *hbm = &hbm_data;
+ 
+-	return -1;
++	preboot_puts("perform row repair");
++
++	if (hbm->row_replacement_iter[device] == MAX_ROW_REPLACEMENT_ITERATIONS) {
++		preboot_puts("Max row replacement iteration reached\n");
++		return 1;
++	}
++
++	hbm->row_replacement_iter[device]++;
++
++	/* same function is used also for conversion from mapped-ch(phy) to dma-ch */
++	dma_ch = hbm_dma_ch_to_map_ch(device, ch);
++
++	gaudi_hbm_row_repair(device, (dma_ch * 2) + 1, sid,
++			     (addr.bg << 2) | addr.bank, addr.row);
++
++	return 0;
+ }
+ 
+ static int hbm_channel_row_repair(int sid, int device, int ch,

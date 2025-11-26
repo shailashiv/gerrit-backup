@@ -1,0 +1,101 @@
+From 7f111751e756762e0f0d1b2704b66c425bf5644e Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 03 Jan 2021 23:07:50 +0200
+Subject: [PATCH] [SW-28128] gaudi: security: generalize lbw rr func
+
+Generalize the LBW RRs configuration function, so it can be reused later
+for DMA_IF and the SOB RRs closure.
+This is done by extracting the data into a new data structure array and
+keeping only the behavior inside the function.
+The data can be accessed by using the new enum describing the data type.
+
+Change-Id: I54b23c82e718bf60166e52df487f5df81dc6d692
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index ab9ebf0..e233878 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1051,36 +1051,71 @@
+ 	preboot_secure_pcie_rr_rd(rr, min64, max64);
+ }
+ 
+-static void preboot_secure_lbw_rr(int rr, u64 min64, u64 max64)
++struct preboot_sec_lbw_rrs_cfg {
++	int instances_num;
++	u32 instances_dist;
++	u32 min_wr_breg;
++	u32 max_wr_breg;
++	u32 min_rd_breg;
++	u32 max_rd_breg;
++	u32 hit_wr_breg;
++	u32 hit_rd_breg;
++};
++
++enum preboot_sec_lbw_rr_type {
++	IF_RTR,
++};
++
++struct preboot_sec_lbw_rrs_cfg preboot_sec_lbw_rrs_cfg[] = {
++	[IF_RTR] = {
++		.instances_num = IF_RTRS_NUM,
++		.instances_dist = IF_RTRS_DIST,
++		.min_wr_breg = mmSIF_RTR_0_LBW_RANGE_PRIV_MIN_AW_0,
++		.max_wr_breg = mmSIF_RTR_0_LBW_RANGE_PRIV_MAX_AW_0,
++		.min_rd_breg = mmSIF_RTR_0_LBW_RANGE_PRIV_MIN_AR_0,
++		.max_rd_breg = mmSIF_RTR_0_LBW_RANGE_PRIV_MAX_AR_0,
++		.hit_wr_breg = mmSIF_RTR_0_LBW_RANGE_PRIV_HIT_AW,
++		.hit_rd_breg = mmSIF_RTR_0_LBW_RANGE_PRIV_HIT_AR,
++	},
++};
++
++static void preboot_secure_lbw_rr_gen(int rr, u64 min64, u64 max64,
++				      enum preboot_sec_lbw_rr_type type)
+ {
+ 	int i;
+ 	u32 min = min64 & ~HL_CFG_BASE;
+ 	u32 max = max64 & ~HL_CFG_BASE;
+ 	u32 rr_base, rr_dest, hit;
++	struct preboot_sec_lbw_rrs_cfg *cfg = &preboot_sec_lbw_rrs_cfg[type];
+ 
+-	for (i = 0; i < IF_RTRS_NUM; i++) {
+-		rr_base = rr * sizeof(u32) + IF_RTRS_DIST * i;
+-		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MIN_AW_0;
++	for (i = 0; i < cfg->instances_num; i++) {
++		rr_base = rr * sizeof(u32) + cfg->instances_dist * i;
++		rr_dest = rr_base + cfg->min_wr_breg;
+ 		regmap_writel(min, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MAX_AW_0;
++		rr_dest = rr_base + cfg->max_wr_breg;
+ 		regmap_writel(max, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MIN_AR_0;
++		rr_dest = rr_base + cfg->min_rd_breg;
+ 		regmap_writel(min, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MAX_AR_0;
++		rr_dest = rr_base + cfg->max_rd_breg;
+ 		regmap_writel(max, rr_dest);
+ 
+ 		/* Enable (hit) RR */
+-		rr_base = IF_RTRS_DIST * i;
+-		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_HIT_AW;
++		rr_base = cfg->instances_dist * i;
++		rr_dest = rr_base + cfg->hit_wr_breg;
+ 		hit = regmap_readl(rr_dest);
+ 		regmap_writel(hit | BIT(rr), rr_dest);
+ 
+-		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_HIT_AR;
++		rr_dest = rr_base + cfg->hit_rd_breg;
+ 		hit = regmap_readl(rr_dest);
+ 		regmap_writel(hit | BIT(rr), rr_dest);
+ 	}
+ }
+ 
++static void preboot_secure_lbw_rr(int rr, u64 min, u64 max)
++{
++	preboot_secure_lbw_rr_gen(rr, min, max, IF_RTR);
++}
++
+ #define SYNC_MNGR_DIST		0x20000
+ #define SYNC_MNGR_SIZE		0x10000
+ 

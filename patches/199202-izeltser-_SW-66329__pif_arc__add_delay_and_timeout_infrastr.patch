@@ -1,0 +1,209 @@
+From b938d642896b8db2c7d7b476426cf1dfa4ce44c0 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 11 Apr 2022 19:01:42 +0300
+Subject: [PATCH] [SW-66329] pif_arc: add delay and timeout infrastructure
+
+PIF ARC is not allowed to use the PSOC timestamp counter during
+runtime. Instead it has a dedicated 32bit timestamp counter,
+which can be used for implementing delays and monitor timeouts.
+This patch adds the infrastructure functions for arming the PIF
+timestamp counter, and using it for delays and timeouts.
+Since we want to avoid division operation in PIF ARC, all the
+functions are using ticks instead of time units.
+Also, since the PIF timestamp counter doesn't wrap around when
+reaching the max value, the delay and timeout functions are limited
+by the max value of the counter and error bit will be set in case
+the max value is reached.
+In case user has enabled auto re-arm functionality, delay function
+can be used for long durations, and software will manage the reset
+of the ts counter every time the upper limit is reached.
+
+Change-Id: I85d514b14562ef228659cc7800154d958810b71d
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/lib/common/pif_ts.c b/lib/common/pif_ts.c
+new file mode 100644
+index 0000000..4ca7369
+--- /dev/null
++++ b/lib/common/pif_ts.c
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <preboot.h>
++#include <device.h>
++#include <bitops.h>
++
++static bool pif_ts_rearm_allowed = true;
++
++#define PIF_TS_CNT_ENABLE	BIT(0)
++
++void pif_ts_counter_arm(void)
++{
++	regmap_writel(0, pif_arc.timestamp_cnt);
++	regmap_writel(PIF_TS_CNT_ENABLE, pif_arc.timestamp_ctrl);
++}
++
++static u32 pif_ts_get(void)
++{
++	return regmap_readl(pif_arc.timestamp_cnt);
++}
++
++/* lightweight and approximate implementation for 1GHz TS clock */
++#define DIV_SHIFT_1024	10
++
++__weak u32 pif_ts_ticks_to_us(u32 ticks)
++{
++	return (ticks >> DIV_SHIFT_1024);
++}
++
++__weak u64 pif_ts_us_to_ticks(u32 usec)
++{
++	return (u64)usec << DIV_SHIFT_1024;
++}
++
++u32 pif_ts_get_us(void)
++{
++	u32 ticks = pif_ts_get();
++
++	return pif_ts_ticks_to_us(ticks);
++}
++
++/* pif timestamp counter doesn't roll over when max value is reached */
++#define PIF_TIMESTAMP_MAX_VAL	0xFFFFFFFF
++
++void pif_ts_delay(u32 usec)
++{
++	u32 start, current, cycle;
++	u64 end;
++
++	start = pif_ts_get();
++
++	end = (u64)start + pif_ts_us_to_ticks(usec);
++
++	while (1) {
++		current = pif_ts_get();
++		if (current == PIF_TIMESTAMP_MAX_VAL) {
++			if (pif_ts_rearm_allowed) {
++				cycle = PIF_TIMESTAMP_MAX_VAL - start;
++				if (end <= cycle)
++					break;
++				pif_ts_counter_arm();
++				end -= cycle;
++				start = 0;
++				continue;
++			} else {
++				/* TODO: set error bit */
++				break;
++			}
++		}
++
++		if (current > end)
++			break;
++	}
++}
++
++bool pif_ts_timeout_expired(u32 start_usec, u32 delay_usec)
++{
++	u32 current, timeout;
++
++	/* no overflow must be verified by the user, see header documentation */
++	timeout = start_usec + delay_usec;
++
++	current = pif_ts_get();
++	if (current == PIF_TIMESTAMP_MAX_VAL)
++		/* TODO: set error bit */
++		return true;
++
++	if (current > pif_ts_us_to_ticks(timeout))
++		return true;
++
++	return false;
++}
++
++void pif_ts_rearm_enable(bool ena_dis)
++{
++	pif_ts_rearm_allowed = ena_dis;
++}
++
++bool pif_ts_is_rearm_enable(void)
++{
++	return pif_ts_rearm_allowed;
++}
++
++bool pif_ts_is_timeout_possible(u32 start_usec, u32 delay_usec)
++{
++	if (pif_ts_us_to_ticks(start_usec + delay_usec) > PIF_TIMESTAMP_MAX_VAL)
++		return false;
++
++	return true;
++}
+diff --git a/lib/common/pif_ts.h b/lib/common/pif_ts.h
+new file mode 100644
+index 0000000..9a44ec1
+--- /dev/null
++++ b/lib/common/pif_ts.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef _HL_PIF_TS_H_
++#define _HL_PIF_TS_H_
++
++#include <types.h>
++
++/* Reset and enable the pif timestamp counter */
++void pif_ts_counter_arm(void);
++
++/* Read the time passed since last ts counter reset, in microseconds */
++u32 pif_ts_get_us(void);
++
++/*
++ * Conversion functions from counter ticks to microseconds and back.
++ * Default lightweight approximate implementaion is provided for 1GHz
++ * clock.
++ * For any other clock rate user is expected to provide conversions
++ * functions implementation.
++ */
++u32 pif_ts_ticks_to_us(u32 ticks);
++u64 pif_ts_us_to_ticks(u32 usec);
++
++/*
++ * Enable/Disable TS counter automatic re-arm (reset) during delay function.
++ * Pif TS counter is 32bits wide, and it doesn't wraparound when top limit
++ * is reached. If long delay time is required, re-arm should be enabled
++ * with caution, since that might interfere with some global timeout meassurement
++ */
++void pif_ts_rearm_enable(bool ena_dis);
++
++/* Check if auto re-arming the pif TS counter during delay function is enabled */
++bool pif_ts_is_rearm_enable(void);
++
++/* delay execution for specified time (in microseconds) */
++void pif_ts_delay(u32 usec);
++
++/*
++ * Check if it's possible to meassure delay_usec timeout from start_usec
++ * point, without reaching the pif ts counter limit value.
++ * Pif TS counter is 32bits wide, and it doesn't wraparound when top limit
++ * is reached.
++ */
++bool pif_ts_is_timeout_possible(u32 start_usec, u32 delay_usec);
++
++/*
++ * Check if timeout was reached, meassuring from a given start point.
++ * User must be aware of the limitation of the pif TS counter(32bit wide and no wraparound),
++ * and make sure the upper limit of the counter is not reached during the timeout messurement.
++ * In a case of a doubt pif_ts_is_timeout_possible() can be called to verify that
++ * the conditions for safe timeout meassurement are met.
++ */
++bool pif_ts_timeout_expired(u32 start_usec, u32 delay_usec);
++
++#endif /* _HL_PIF_TS_H_ */

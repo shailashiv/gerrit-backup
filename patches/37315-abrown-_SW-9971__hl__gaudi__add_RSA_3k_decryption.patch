@@ -1,0 +1,637 @@
+From 095dd5a0e43da88715c5cd9650e3751d44516953 Mon Sep 17 00:00:00 2001
+From: Arie Brown <abrown@habana.ai>
+Date: Mon, 25 May 2020 21:25:56 +0300
+Subject: [PATCH] [SW-9971] hl: gaudi: add RSA 3k decryption
+
+as part of chain of trust we need the ability to decrypte
+with rsa 3k.
+the focus on this stage is on the gaudi security.
+
+Change-Id: I78203365843f6df5ef75a0bda08a608be78ff5d9
+Signed-off-by: Arie Brown <abrown@habana.ai>
+---
+
+diff --git a/common/fit.c b/common/fit.c
+index 1b468d6..d3588c8 100644
+--- a/common/fit.c
++++ b/common/fit.c
+@@ -9,6 +9,8 @@
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
++#include "fit_rsa.h"
++
+ 
+ #define FIT_IMAGES_PATH		"/images"
+ #define FIT_CONFS_PATH		"/configurations"
+@@ -18,6 +20,19 @@
+ #define FIT_LOADABLE_PROP	"loadables"
+ #define FIT_DATA_PROP		"data"
+ #define FIT_LOADADDR_PROP	"loadaddr"
++
++#define FIT_SIG_NODENAME	"signature"
++#define FIT_VALUE_PROP		"value"
++#define FIT_ALGO_PROP		"algo"
++#define FIT_KEY_NAME_HINT	"key-name-hint"
++#define FIT_HL_PUBKEY_LEN_PROP  "hl-pub-key-len"
++
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
++
++__attribute__((weak)) int fit_need_image_verification(void)
++{
++	return 0;
++}
+ 
+ static const char *fit_loadables_name(const void *fit, int noffset, int id)
+ {
+@@ -78,9 +93,176 @@
+ 	return 1;
+ }
+ 
++static int fit_get_int(const void *fit, int node, const char *prop_name,
++		       int default_val)
++{
++	const int *cell;
++	int len;
++
++	cell = fdt_getprop(fit, node, prop_name, &len);
++	if (cell && len >= sizeof(int))
++		return fdt32_to_cpu(cell[0]);
++
++	return default_val;
++}
++
++static int get_algo_prop(const void *fit, int noffset, const u8 **algo_prop)
++{
++	int algo_prop_len;
++
++	*algo_prop = fdt_getprop(fit, noffset, FIT_ALGO_PROP, &algo_prop_len);
++	if (!(*algo_prop)) {
++		preboot_puts("Wrong FIT format: algo property\n");
++		return 1;
++	}
++	if (algo_prop_len != sizeof(FIT_ALGO_PROP_EXPECTED_VALUE)) {
++		preboot_puts("Wrong FIT format: algo len\n");
++		return 1;
++	}
++	if (memcmp((char *)*algo_prop, FIT_ALGO_PROP_EXPECTED_VALUE,
++			sizeof(FIT_ALGO_PROP_EXPECTED_VALUE))) {
++		preboot_puts("Wrong FIT format: hash-algo not supported\n");
++		preboot_puts((char *)algo_prop);
++		preboot_puts("\n");
++		return 1;
++	}
++	return 0;
++}
++
++static int get_sig_hash(const void *fit, int noffset, const u8 **hash_value,
++			int *hash_value_len)
++{
++	*hash_value = fdt_getprop(fit, noffset, FIT_VALUE_PROP, hash_value_len);
++	if (!(*hash_value)) {
++		preboot_puts("Wrong FIT format: missing sig hash value\n");
++		return 1;
++	}
++	return 0;
++}
++
++static int get_key_name(const void *fit, int noffset, const char **key_name)
++{
++	int key_name_len;
++
++	*key_name = fdt_getprop(fit, noffset, FIT_KEY_NAME_HINT, &key_name_len);
++	if (!(*key_name)) {
++		preboot_puts("Wrong FIT format: key name\n");
++		return 1;
++	}
++	return 0;
++}
++
++static int get_pub_key_node(const void *pub_key_fit, const char *key_name)
++{
++	int sig_node;
++	char key_node_name[64] = "key-";
++
++	memcpy(key_node_name+strlen(key_node_name), key_name, strlen(key_name));
++
++	sig_node = fdt_subnode_offset(pub_key_fit, 0, FIT_SIG_NODENAME);
++
++	return fdt_subnode_offset(pub_key_fit, sig_node, key_node_name);
++}
++
++static int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++			    struct rsa_key_prop *prop)
++{
++	int pub_key_node = 0;
++	int length;
++
++	if (fdt_check_header(pub_key_fit)) {
++		preboot_puts("FITkey header check failed\n");
++		return 1;
++	}
++	pub_key_node = get_pub_key_node(pub_key_fit, key_name);
++	if (pub_key_node < 0) {
++		preboot_puts("Wrong FITkey format: no key node\n");
++		return 1;
++	}
++	prop->num_bits =
++		fit_get_int(pub_key_fit, pub_key_node, "rsa,num-bits", 0);
++	prop->n0inv =
++		fit_get_int(pub_key_fit, pub_key_node, "rsa,n0-inverse", 0);
++	prop->public_exponent =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,exponent", &length);
++	if (!prop->public_exponent || length < sizeof(uint64_t))
++		prop->public_exponent = NULL;
++	prop->modulus =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,modulus", NULL);
++	prop->rr =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,r-squared", NULL);
++
++	if (!prop->num_bits || !prop->modulus) {
++		preboot_puts("FIT: missing RSA Key\n");
++		return 1;
++	}
++
++	return 0;
++}
++
++/* based on :
++ * int fit_config_check_sig(const void *fit, int noffset, int required_keynode,
++ * char **err_msgp)
++ * from u-boot: u-boot/common/image-sig.c
++ */
++int fit_check_sig(const void *fit, int noffset, const u8 *data, int data_len,
++		  int pub_key_len)
++{
++	const u8 *algo_prop = NULL;
++	const u8 *hash_value = NULL;
++	const char *key_name = NULL;
++	const void *pub_key_fit = NULL;
++	int hash_len = 0;
++	struct rsa_key_prop prop;
++
++	if (get_algo_prop(fit, noffset, &algo_prop))
++		return 1;
++
++	if (get_sig_hash(fit, noffset, &hash_value, &hash_len))
++		return 1;
++
++	if (get_key_name(fit, noffset, &key_name))
++		return 1;
++
++	pub_key_fit = data + data_len - pub_key_len;
++	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
++		return 1;
++
++	return rsa_verify(data, data_len, hash_value, hash_len, &prop);
++}
++
++int fit_verify_image(const void *fit, int node, const u8 *buf, int *len)
++{
++	int sig_sub_node;
++	int pub_key_len;
++	int buf_len = *len;
++	int ret = 1;
++
++	sig_sub_node = fdt_subnode_offset(fit, node, FIT_SIG_NODENAME);
++	if (sig_sub_node < 0) {
++		preboot_puts("Wrong FIT format: missing signature\n");
++		return 1;
++	}
++
++	pub_key_len = fit_get_int(fit, 0, FIT_HL_PUBKEY_LEN_PROP, 0);
++	if (pub_key_len == 0) {
++		preboot_puts("Wrong FIT format: public key length invalid\n");
++		return 1;
++	}
++	if (!fit_check_sig(fit, sig_sub_node, buf, buf_len, pub_key_len)) {
++		preboot_puts("fit_check_sig OK\n");
++		ret = 0;
++	} else {
++		preboot_puts("fit_check_sig failed\n");
++		ret = 1;
++	}
++	*len = *len - pub_key_len;
++	return ret;
++}
++
+ int fit_load_image(const void *fit, u64 *dest)
+ {
+-	int node, len;
++	int node, len, copy_image = 1;
+ 	const u8 *buf;
+ 	const u32 *loadaddr;
+ 	u64 dst = 0;
+@@ -106,8 +288,12 @@
+ 		return 1;
+ 	}
+ 
+-	fit_copy_image(dst, buf, len);
+-	*dest = dst;
++	if (fit_need_image_verification())
++		copy_image = !fit_verify_image(fit, node, buf, &len);
+ 
++	if (copy_image) {
++		fit_copy_image(dst, buf, len);
++		*dest = dst;
++	}
+ 	return 0;
+ }
+diff --git a/common/fit_rsa.c b/common/fit_rsa.c
+new file mode 100644
+index 0000000..dcc199d
+--- /dev/null
++++ b/common/fit_rsa.c
+@@ -0,0 +1,352 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ */
++
++#include <libfdt.h>
++#include "common.h"
++#include "sha256.h"
++#include "uart.h"
++#include "fit_rsa.h"
++
++struct rsa_public_key {
++	u32 len;	/* len of modulus[] in number of u32 */
++	u32 n0inv;	/* -1 / modulus[0] mod 2^32 */
++	u32 *modulus;	/* modulus as little endian array */
++	u32 *rr;	/* R^2 as little endian array */
++	u64 exponent;	/* public exponent */
++};
++
++#define CHECKSUM_LENGTH		(SHA256_SUM_LEN)
++#define CHECKSUM_DER_LENGTH	(SHA256_DER_LEN)
++#define CHECKSUM_DER_PREFIX	(sha256_der_prefix)
++
++
++#define RSA4096_BITS		(4096)
++#define RSA4096_BYTES		(RSA4096_BITS / 8)
++#define RSA3072_BITS		(3072)
++#define RSA3072_BYTES		(RSA3072_BITS / 8)
++#define CRYPTO_RSA_LENGTH	(RSA3072_BYTES)
++#define RSA_DEFAULT_PUBEXP	(65537)
++
++#if (CHECKSUM_LENGTH > CRYPTO_RSA_LENGTH)
++#error "CHECKSUM_LENGTH > CRYPTO_RSA_LENGTH"
++#endif
++
++#define get_unaligned_be32(a) fdt32_to_cpu(*(u32 *)a)
++#define put_unaligned_be32(a, b) (*(u32 *)(b) = cpu_to_fdt32(a))
++
++
++/**
++ * is_public_exponent_bit_set() - Check if a bit in the public exponent is set
++ *
++ * @key:	RSA key
++ * @pos:	The bit position to check
++ */
++static int is_public_exponent_bit_set(const struct rsa_public_key *key,
++				      int pos)
++{
++	return key->exponent & (1ULL << pos);
++}
++
++/**
++ * subtract_modulus() - subtract modulus from the given value
++ *
++ * @key:	Key containing modulus to subtract
++ * @num:	Number to subtract modulus from, as little endian word array
++ */
++static void subtract_modulus(const struct rsa_public_key *key, u32 num[])
++{
++	long long acc = 0;
++	u32 i;
++
++	for (i = 0; i < key->len; i++) {
++		acc += (u64)num[i] - key->modulus[i];
++		num[i] = (u32)acc;
++		acc >>= 32;
++	}
++}
++
++
++/**
++ * greater_equal_modulus() - check if a value is >= modulus
++ *
++ * @key:	Key containing modulus to check
++ * @num:	Number to check against modulus, as little endian word array
++ * @return 0 if num < modulus, 1 if num >= modulus
++ */
++static int greater_equal_modulus(const struct rsa_public_key *key,
++				 u32 num[])
++{
++	int i;
++
++	for (i = (int)key->len - 1; i >= 0; i--) {
++		if (num[i] < key->modulus[i])
++			return 0;
++		if (num[i] > key->modulus[i])
++			return 1;
++	}
++
++	return 1;	/* equal */
++}
++
++/**
++ * num_pub_exponent_bits() - Number of bits in the public exponent
++ *
++ * @key:	RSA key
++ * @num_bits:	Storage for the number of public exponent bits
++ */
++static int num_public_exponent_bits(const struct rsa_public_key *key,
++				    int *num_bits)
++{
++	u64 exponent;
++	int exponent_bits;
++	const u32 max_bits = (sizeof(exponent) * 8);
++
++	exponent = key->exponent;
++	exponent_bits = 0;
++
++	if (!exponent) {
++		*num_bits = exponent_bits;
++		return 0;
++	}
++
++	for (exponent_bits = 1; exponent_bits < max_bits + 1; ++exponent_bits)
++		if (!(exponent >>= 1)) {
++			*num_bits = exponent_bits;
++			return 0;
++		}
++
++	return 1;
++}
++
++/**
++ * montgomery_mul_add_step() - Perform montgomery multiply-add step
++ *
++ * Operation: montgomery result[] += a * b[] / n0inv % modulus
++ *
++ * @key:	RSA key
++ * @result:	Place to put result, as little endian word array
++ * @a:		Multiplier
++ * @b:		Multiplicand, as little endian word array
++ */
++static void montgomery_mul_add_step(const struct rsa_public_key *key,
++				    u32 result[], const u32 a, const u32 b[])
++{
++	u64 acc_a, acc_b;
++	u32 d0;
++	u32 i;
++
++	acc_a = (u64)a * b[0] + result[0];
++	d0 = (u32)acc_a * key->n0inv;
++	acc_b = (u64)d0 * key->modulus[0] + (u32)acc_a;
++	for (i = 1; i < key->len; i++) {
++		acc_a = (acc_a >> 32) + (u64)a * b[i] + result[i];
++		acc_b = (acc_b >> 32) + (u64)d0 * key->modulus[i] +
++				(u32)acc_a;
++		result[i - 1] = (u32)acc_b;
++	}
++
++	acc_a = (acc_a >> 32) + (acc_b >> 32);
++
++	result[i - 1] = (u32)acc_a;
++
++	if (acc_a >> 32)
++		subtract_modulus(key, result);
++}
++
++/**
++ * montgomery_mul() - Perform montgomery mutitply
++ *
++ * Operation: montgomery result[] = a[] * b[] / n0inv % modulus
++ *
++ * @key:	RSA key
++ * @result:	Place to put result, as little endian word array
++ * @a:		Multiplier, as little endian word array
++ * @b:		Multiplicand, as little endian word array
++ */
++static void montgomery_mul(const struct rsa_public_key *key,
++			   u32 result[], u32 a[], const u32 b[])
++{
++	u32 i;
++
++	for (i = 0; i < key->len; ++i)
++		result[i] = 0;
++	for (i = 0; i < key->len; ++i)
++		montgomery_mul_add_step(key, result, a[i], b);
++}
++
++static int pow_mod(const struct rsa_public_key *key, u32 *out, u32 *in)
++{
++	u32 *result, *ptr;
++	u32 i;
++	int j, k;
++
++	u32 val[key->len], acc[key->len], tmp[key->len];
++	u32 a_scaled[key->len];
++
++	result = tmp;	/* Re-use location. */
++
++	/* Convert from big endian byte array to little endian word array. */
++	for (i = 0, ptr = in + key->len - 1; i < key->len; i++, ptr--)
++		val[i] = get_unaligned_be32(ptr);
++
++	if (num_public_exponent_bits(key, &k) != 0) {
++		preboot_puts("num_public_exponent_bits failed!\n");
++		return 1;
++	}
++
++	if (k < 2) {
++		preboot_puts("Public exponent is too short\n");
++		return 1;
++	}
++
++	if (!is_public_exponent_bit_set(key, 0)) {
++		preboot_puts("LSB of RSA public exponent must be set.\n");
++		return 1;
++	}
++
++	/* the bit at e[k-1] is 1 by definition, so start with: C := M */
++	montgomery_mul(key, acc, val, key->rr); /* acc = a * RR / R mod n */
++	/* retain scaled version for intermediate use */
++	memcpy(a_scaled, acc, key->len * sizeof(a_scaled[0]));
++
++	for (j = k - 2; j > 0; --j) {
++		montgomery_mul(key, tmp, acc, acc); /* tmp = acc^2 / R mod n */
++
++		if (is_public_exponent_bit_set(key, j)) {
++			/* acc = tmp * val / R mod n */
++			montgomery_mul(key, acc, tmp, a_scaled);
++		} else {
++			/* e[j] == 0, copy tmp back to acc for next operation */
++			memcpy(acc, tmp, key->len * sizeof(acc[0]));
++		}
++	}
++
++	/* the bit at e[0] is always 1 */
++	montgomery_mul(key, tmp, acc, acc); /* tmp = acc^2 / R mod n */
++	montgomery_mul(key, acc, tmp, val); /* acc = tmp * a / R mod M */
++	memcpy(result, acc, key->len * sizeof(result[0]));
++
++	/* Make sure result < mod; result is at most 1x mod too large. */
++	if (greater_equal_modulus(key, result))
++		subtract_modulus(key, result);
++
++	/* Convert to bigendian byte array */
++	for (i = key->len - 1, ptr = out; (int)i >= 0; i--, ptr++)
++		put_unaligned_be32(result[i], ptr);
++	return 0;
++}
++
++static void rsa_convert_big_endian(u32 *dst, const u32 *src, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++)
++		dst[i] = fdt32_to_cpu(src[len - 1 - i]);
++}
++
++int rsa_mod_exp_sw(const u8 *sig, struct rsa_key_prop *prop, u32 *out)
++{
++	struct rsa_public_key key;
++	int ret;
++
++	key.n0inv = prop->n0inv;
++	key.len = prop->num_bits / (sizeof(u32) * 8);
++	if (prop->public_exponent)
++		key.exponent = fdt64_to_cpu(*(prop->public_exponent));
++	else
++		key.exponent = RSA_DEFAULT_PUBEXP;
++
++	u32 key1[key.len], key2[key.len];
++
++	key.modulus = key1;
++	key.rr = key2;
++
++	rsa_convert_big_endian(key.modulus, (u32 *)prop->modulus, key.len);
++	rsa_convert_big_endian(key.rr, (u32 *)prop->rr, key.len);
++
++	ret = pow_mod(&key, out, (u32 *)sig);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int rsa_verify_padding(const u8 *msg, const int pad_len)
++{
++	int ff_len;
++	int ret;
++
++	/* first byte must be 0x00 */
++	ret = *msg++;
++	/* second byte must be 0x01 */
++	ret |= *msg++ ^ 0x01;
++	/* next ff_len bytes must be 0xff */
++	ff_len = pad_len - CHECKSUM_DER_LENGTH - 3;
++	ret |= *msg ^ 0xff;
++	ret |= memcmp(msg, msg+1, ff_len-1);
++	msg += ff_len;
++	/* next byte must be 0x00 */
++	ret |= *msg++;
++	/* next der_len bytes must match der_prefix */
++	ret |= memcmp(msg, CHECKSUM_DER_PREFIX, CHECKSUM_DER_LENGTH);
++
++	return ret;
++}
++
++int padding_pkcs_15_verify(u8 *msg, int msg_len, const u8 *hash)
++{
++	int pad_len = msg_len - CHECKSUM_LENGTH;
++
++	if (rsa_verify_padding(msg, pad_len)) {
++		preboot_puts("RSAVerify(): rsa_verify_padding failed!\n");
++		return 1;
++	}
++
++	/* Check hash. */
++	if (memcmp((u8 *)msg + pad_len, hash, msg_len - pad_len)) {
++		preboot_puts("RSAVerify(): Hash check failed!\n");
++		return 1;
++	}
++
++	return 0;
++}
++
++static int rsa_verify_key(struct rsa_key_prop *prop, const u8 *sig,
++			  const u32 sig_len, const u8 *hash, const u32 key_len)
++{
++	u32 buf[sig_len>>2];
++
++	if (rsa_mod_exp_sw(sig, prop, buf)) {
++		preboot_puts("rsa_mod_exp_sw failed\n");
++		return 1;
++	}
++
++	if (padding_pkcs_15_verify((u8 *)buf, key_len, hash))
++		return 1;
++
++	return 0;
++}
++
++/* based on int rsa_verify(struct image_sign_info *info,
++ *		const struct image_region region[], int region_count,
++ *		uint8_t *sig, uint sig_len)
++ * from: u-boot/lib/rsa/rsa-verify.c
++ */
++int rsa_verify(const u8 *data, int data_len, const u8 *sig, u32 sig_len,
++	       struct rsa_key_prop *prop)
++{
++	u8 hash[CRYPTO_RSA_LENGTH];
++	int ret;
++
++	if (sig_len != (prop->num_bits >> 3)) {
++		preboot_puts("sig_len != (prop->num_bits / 8)\n");
++		return 1;
++	}
++
++	sha256_csum(data, data_len, hash);
++
++	ret = rsa_verify_key(prop, sig, sig_len, hash, CRYPTO_RSA_LENGTH);
++	return ret;
++}
+diff --git a/common/fit_rsa.h b/common/fit_rsa.h
+new file mode 100644
+index 0000000..7dd6c23
+--- /dev/null
++++ b/common/fit_rsa.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_FIT_RSA_H_
++#define COMMON_FIT_RSA_H_
++
++struct rsa_key_prop {
++	const void *rr;			/* R^2 can be treated as byte array */
++	const void *modulus;		/* modulus as byte array */
++	const u64 *public_exponent;	/* public exponent as byte array */
++	u32 n0inv;			/* -1 / modulus[0] mod 2^32 */
++	int num_bits;			/* Key length in bits */
++};
++
++
++int rsa_verify(const u8 *data, int data_len,
++	       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop);
++
++#endif /* COMMON_FIT_RSA_H_ */
+diff --git a/gaudi/preboot.lds.S b/gaudi/preboot.lds.S
+index b244777..70f70db 100644
+--- a/gaudi/preboot.lds.S
++++ b/gaudi/preboot.lds.S
+@@ -30,7 +30,7 @@
+ 	.stack : {
+ 		. = ALIGN(8);
+ 		__stack = . ;
+-		. = . + 512 ;
++		. = . + 4096 ;
+ 		__stack_top = . ;
+ 	} > .sram
+ 

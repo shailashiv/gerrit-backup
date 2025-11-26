@@ -1,0 +1,278 @@
+From e11ed0addf306da119ec56239ea8d303527ef884 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 23 May 2021 21:50:57 +0300
+Subject: [PATCH] [SW-43160] gaudi: offload pci link monitor to cpu1
+
+PCI link may appear at any stage, not just on boot. It needs to be
+monitored and handled swiftly or else the link remains broken.
+Preboot contains a good number of routines which may cause a delay to
+pci link monitor polling module since they shared the same core.
+
+This patch utilizes the secondary ARM core for PCI link monitoring. This
+way is can be done in parallel with the rest of preboot logic.
+
+In addition, PCI link handling (HW WA) was removed from CPU0 PCI module.
+
+Change-Id: I513550aaedf78e0a2d0bbb847931bd24b0915025
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index ca936b8..465b8a8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -47,6 +47,7 @@
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+ PPBOOT_APP_S := $(shell ls ppboot/crt0_ppboot.S)
++PPBOOT_APP_S += $(shell ls $(HL_DEV)/*.S | grep -v lds)
+ 
+ BINDIR = bin
+ PPBOOT_TARGET = $(BINDIR)/ppboot.bin
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 3dab885..dc8d701 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -27,6 +27,8 @@
+ #include <gaudi/gaudi_reg_map.h>
+ #include <gaudi/gaudi_fw_if.h>
+ #include <common/pci_ids.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <cpu_ca53_cfg_masks.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+@@ -46,6 +48,10 @@
+ #include "common.h"
+ 
+ #define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
++
++#define CPU1_RST_CTRL							\
++	((BIT(1) << CPU_CA53_CFG_ARM_RST_CONTROL_NCPUPORESET_SHIFT) |	\
++	 (BIT(1) << CPU_CA53_CFG_ARM_RST_CONTROL_NCORERESET_SHIFT))
+ 
+ bool hl_is_debug_mode(enum hl_debug_hw_func func)
+ {
+@@ -225,27 +231,14 @@
+ 	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+ 	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+ }
+-
+-void preboot_pcie_wait_for_link(void)
++static void preboot_pcie_monitoring(void)
+ {
+-	u64 start = timestamp_get_us();
+-
+ 	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
+-		/* If PRSTn does not happen in 5 seconds
+-		 * timeout and return
+-		 */
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PRSTn!\n");
+-			return;
+-		}
+-	}
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
++		;
+ 
+ 	/* Only after PRSTn is de-asserted */
+ 	preboot_pcie_enable();
+-
+-	/* Reset start timer */
+-	start = timestamp_get_us();
+ 
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+@@ -255,15 +248,8 @@
+ 		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+ 
+-		if (prstn && smlh && rdlh) {
+-			preboot_puts("PCIe link is UP!\n");
++		if (prstn && smlh && rdlh)
+ 			break;
+-		}
+-
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PCIe link UP!\n");
+-			break;
+-		}
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+@@ -286,6 +272,46 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
++void preboot_secondary_cpu_stop(void)
++{
++	u32 rst_ctrl = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++
++	rst_ctrl &= ~CPU1_RST_CTRL; /* Reset CPU1 */
++	regmap_writel(rst_ctrl, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
++void secondary_main(void)
++{
++	preboot_pcie_monitoring();
++
++	/* Hang in WFE until further notice */
++	while (1)
++		wfe();
++}
++
++void preboot_pcie_wait_for_link(void)
++{
++	u32 rst_addr_lsb, rst_addr_msb, rst_ctrl;
++
++	/*
++	 * Call preboot_security_is_enabled() before offloading PCI work to
++	 * CPU1 is needed because we don't want CPU1 to init fuse or access OTP
++	 * while CPU0 is running and may attempt access the same resource.
++	 * Performing this call fills the fuse/OTP cache so a secondary call
++	 * will only read from cache.
++	 */
++	(void)preboot_security_is_enabled();
++
++	rst_addr_lsb = (u32)(uintptr_t)secondary_entry;
++	rst_addr_msb = (u32)(uintptr_t)(((uintptr_t)secondary_entry) >> 32);
++	regmap_writel(rst_addr_lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_1);
++	regmap_writel(rst_addr_msb, mmCPU_CA53_CFG_RST_ADDR_MSB_1);
++
++	rst_ctrl = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	rst_ctrl |= CPU1_RST_CTRL; /* Take CPU1 out of reset */
++	regmap_writel(rst_ctrl, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
+ void preboot_delay(void) {}
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA	0xC01F60
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 4b79513..00411be 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -47,7 +47,6 @@
+ #define GAUDI_DMA_CHANNELS_NUM		8
+ #define GAUDI_QM_CGM_NUM		2
+ 
+-#define PCIE_WAIT_TIMEOUT_US		(60 * USEC_PER_SEC)
+ #define BTL_SYNC_TIMEOUT_US		(USEC_PER_SEC / 2)
+ #define PCIE_EXT_LD_TIMEOUT_US		576
+ 
+@@ -63,6 +62,8 @@
+ /* Only BP2 == 0x4 - means 8 blocks - up to 512KB */
+ #define PROT_MASK			(READ_STATUS_BP2 | READ_STATUS_SRWD)
+ 
++extern void secondary_entry(void);
++
+ int gaudi_hbm_init(void);
+ u32 preboot_get_vendor_id_device_id(void);
+ 
+diff --git a/gaudi/ppboot.lds.S b/gaudi/ppboot.lds.S
+index 1e5be88..7d72989 100644
+--- a/gaudi/ppboot.lds.S
++++ b/gaudi/ppboot.lds.S
+@@ -34,5 +34,12 @@
+ 		__stack_top = . ;
+ 	} > .sram
+ 
++	.stack2 : {
++		. = ALIGN(8);
++		__stack2 = . ;
++		. = . + 512 ;
++		__stack_top2 = . ;
++	} > .sram
++
+ 	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+ }
+diff --git a/gaudi/secondary.S b/gaudi/secondary.S
+new file mode 100644
+index 0000000..9ea8492
+--- /dev/null
++++ b/gaudi/secondary.S
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2017-2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++.global secondary_entry
++secondary_entry:
++	ldr	x0, =__stack_top2
++	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
++	mov	x29, sp		/* Set FP (x29) */
++	bl	secondary_main
+diff --git a/goya/common.c b/goya/common.c
+index 684fef7..9e7d889 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -114,10 +114,6 @@
+ 	}
+ }
+ 
+-void preboot_pcie_exec_hw_wa(void)
+-{
+-}
+-
+ /*
+  * Handle PCIe erratum: make sure reset_n de-asserted only after perst
+  * Assume PRSTn tied with cold reset
+diff --git a/preboot/fit.c b/preboot/fit.c
+index b61bb1f..4e2f52f 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -966,6 +966,7 @@
+ 
+ __weak void preboot_finalize_fw_info(void) {}
+ __weak void preboot_finalize_rma_tables(void) {}
++__weak void preboot_secondary_cpu_stop(void) {}
+ 
+ void fit_run_image(void)
+ {
+@@ -984,6 +985,7 @@
+ 	preboot_finalize_fw_info();
+ 	preboot_finalize_rma_tables();
+ 	preboot_finalize_enabled_caps();
++	preboot_secondary_cpu_stop();
+ 	boot_info_finalize();
+ 	preboot_start_image(startaddr);
+ }
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 16b09b4..e481a00 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -30,15 +30,9 @@
+ 	.hot_rst_reg_val = ~1,
+ 	.smlh_link_reg_val = 1,
+ 	.rdlh_link_reg_val = 1,
+-	.link_is_up = true,
++	.link_is_up = false,
+ 	.mem_enabled_prev = false,
+ };
+-
+-__weak void preboot_pcie_exec_hw_wa(void)
+-{
+-	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+ 
+ __weak void pci_dev_specific_setup(void) {}
+ __weak void pci_dev_specific_teardown(void) {}
+@@ -114,12 +108,10 @@
+ 	    pci_sts.link_is_up) {
+ 		pci_sts.link_is_up = !pci_sts.link_is_up;
+ 		preboot_puts_raw("PCIe link is ");
+-		if (pci_sts.link_is_up) {
++		if (pci_sts.link_is_up)
+ 			preboot_puts("up\n");
+-			preboot_pcie_exec_hw_wa();
+-		} else {
++		else
+ 			preboot_puts("down\n");
+-		}
+ 	}
+ 
+ 	if (pci_sts.mem_enabled_prev != pci_sts.mem_enabled) {

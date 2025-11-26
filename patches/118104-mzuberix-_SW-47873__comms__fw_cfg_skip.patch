@@ -1,0 +1,123 @@
+From ed9c76b70fd8d6eb01f04e92607b593dfb3d3c01 Mon Sep 17 00:00:00 2001
+From: Moria Zuberi <moria.zuberi@tandemg.com>
+Date: Sun, 08 Aug 2021 11:30:38 +0300
+Subject: [PATCH] [SW-47873] comms: fw cfg skip
+
+Support comms message from LKD to skip fw configuration
+and pass the message to u-boot.
+We pass the message to u-boot through preboot because
+because by the time u-boot is up for communication, it is
+already too late and the FW cfg has already happened, so
+we must handle the message at preboot.
+
+Change-Id: Ie5ad3dc4ccee42627e753ccc52010f19314cc3b6
+Signed-off-by: Moria Zuberi <moria.zuberi@tandemg.com>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 5ee5748..dc6d97d 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -52,6 +52,7 @@
+ 
+ static struct hl_rsp_err pending_error;
+ static u64 preboot_en_caps;
++static u8 fw_cfg_skip;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+ 	{	/* PCI module */
+@@ -483,3 +484,16 @@
+ 	return 1;
+ }
+ 
++void preboot_set_fw_cfg_skip(u8 skip)
++{
++	fw_cfg_skip = skip;
++}
++
++void preboot_finalize_uboot_override(void)
++{
++	if (fw_cfg_skip)
++		boot_info_set(HL_BOOT_INFO_FW_CFG_SKIP,
++			      &fw_cfg_skip,
++			      sizeof(fw_cfg_skip));
++
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 886d5e0..18ee402 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -111,6 +111,11 @@
+ 		.use_calib = false, .calib_offset = 8, .hl_tmp_data = { 0 }}
+ };
+ 
++bool hl_fw_cfg_skip_support(void)
++{
++	return true;
++}
++
+ void hl_ts_data_init(void)
+ {
+ 	u32 pll_freq;
+diff --git a/include/preboot.h b/include/preboot.h
+index 08ca78a..c5a50d8 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -212,6 +212,8 @@
+ void preboot_init_pcie_phy(void);
+ void preboot_engines_init(void);
+ void preboot_clear_wd_gpio(void);
++void preboot_set_fw_cfg_skip(u8 skip);
++void preboot_finalize_uboot_override(void);
+ 
+ void ppboot_init_stack_mon_dev_specific(void);
+ void ppboot_check_stack_mon_dev_specific(void);
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index e60bd1d..0fcaae0 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -1010,6 +1010,7 @@
+ 	preboot_finalize_rma_tables();
+ 	preboot_finalize_fw_upd_closure();
+ 	preboot_finalize_enabled_caps();
++	preboot_finalize_uboot_override();
+ 	boot_info_finalize();
+ 	preboot_start_image(startaddr);
+ }
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 7946254..37804cc 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -95,6 +95,20 @@
+ 	return err;
+ }
+ 
++__weak bool hl_fw_cfg_skip_support(void) { return false; }
++
++static int module_lkd_msg_fw_cfg_skip(struct lkd_fw_comms_msg *mcomms)
++{
++	if (!hl_fw_cfg_skip_support() && preboot_security_is_enabled()) {
++		preboot_puts("fw_cfg_skip is not supported/enabled\n");
++		return -1;
++	}
++
++	preboot_set_fw_cfg_skip(mcomms->fw_cfg_skip);
++
++	return 0;
++}
++
+ static int module_lkd_msg_process(struct lkd_fw_comms_msg *mcomms)
+ {
+ 	int err = 1;
+@@ -102,7 +116,10 @@
+ 	switch (mcomms->header.type) {
+ 	case HL_COMMS_RESET_CAUSE_TYPE:
+ 		err = module_lkd_msg_reset_cause(mcomms);
+-		/* no break */
++		break;
++	case HL_COMMS_FW_CFG_SKIP_TYPE:
++		err = module_lkd_msg_fw_cfg_skip(mcomms);
++		break;
+ 	default:
+ 		break;
+ 	}

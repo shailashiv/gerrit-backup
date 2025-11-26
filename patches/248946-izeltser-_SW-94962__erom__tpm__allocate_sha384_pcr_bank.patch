@@ -1,0 +1,170 @@
+From dfa095b75de2e3b9ce2d0495049673162d56b0f5 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 28 Aug 2022 15:47:08 +0300
+Subject: [PATCH] [SW-94962] erom: tpm: allocate sha384 pcr bank
+
+by default SHA384 PCR bank is not allocated in the TPM version we are
+using.
+In order to make sure this bank is usable before extending it, the
+PCR capabilities are being read on startup, and the PCR bank is
+allocated if needed.
+
+Change-Id: I35b04b1447ce36d69bc96fc5480f6e8ececf4d89
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+index a691aa5..fd32f44 100644
+--- a/arch/gaudi2/common/tpm2.c
++++ b/arch/gaudi2/common/tpm2.c
+@@ -53,6 +53,7 @@
+ 	TPM2_CC_CLEAR		= 0x0126,
+ 	TPM2_CC_CLEARCONTROL	= 0x0127,
+ 	TPM2_CC_HIERCHANGEAUTH	= 0x0129,
++	TPM2_CC_PCR_ALLOCATE	= 0x012B,
+ 	TPM2_CC_PCR_SETAUTHPOL	= 0x012C,
+ 	TPM2_CC_DAM_RESET	= 0x0139,
+ 	TPM2_CC_DAM_PARAMETERS	= 0x013A,
+@@ -993,6 +994,76 @@
+ 	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
+ }
+ 
++#define TPM2_GET_CAPAB_CMD_SIZE	22
++
++int tpm2_get_capability(u32 capability, u32 property, void *data, size_t *data_len)
++{
++	const u8 command_v2[TPM2_GET_CAPAB_CMD_SIZE] = {
++		tpm_u16(TPM2_ST_NO_SESSIONS),		/* TAG */
++		tpm_u32(TPM2_GET_CAPAB_CMD_SIZE),	/* Length */
++		tpm_u32(TPM2_CC_GET_CAPABILITY),	/* Command code */
++
++		tpm_u32(capability),			/* Capability */
++		tpm_u32(property),			/* Property */
++		tpm_u32(1),				/* Property count */
++	};
++	size_t response_len = COMMAND_BUFFER_SIZE;
++	int ret;
++	/*
++	 * In the response buffer, the properties are located after the:
++	 * tag (u16), response size (u32), response code (u32),
++	 * YES/NO flag (u8), TPM_CAP (u32).
++	 */
++	const size_t properties_off = sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint32_t) +
++				      sizeof(uint8_t) + sizeof(uint32_t);
++
++	ret = tpm_spi_sendrecv_command(command_v2, response_buffer, &response_len);
++	if (ret)
++		return TPM_LIB_ERROR;
++
++	response_len -= properties_off;
++	memcpy(data, &response_buffer[properties_off], response_len);
++
++	if (data_len)
++		*data_len = response_len;
++
++	return ret;
++}
++
++int tpm2_pcr384_allocate(void)
++{
++	uint8_t command_v2[COMMAND_BUFFER_SIZE] = {
++		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
++		tpm_u32(10 + 4 + 13 + 16),	/* Length */
++		tpm_u32(TPM2_CC_PCR_ALLOCATE),	/* Command code */
++
++		/* handles 4 bytes */
++		tpm_u32(TPM2_RH_PLATFORM),	/* Primary platform seed */
++
++		/* session header 13 bytes */
++		tpm_u32(9),			/* Header size */
++		tpm_u32(TPM2_RS_PW),		/* Password authorisation */
++		tpm_u16(0),			/* nonce_size */
++		0,				/* session_attrs */
++		tpm_u16(0),			/* auth_size */
++
++		/* TPML_PCR_SELECTION  16 bytes*/
++		tpm_u32(2),			/* num of PCR banks */
++		/* deallocate SHA1 bank*/
++		tpm_u16(TPM2_ALG_SHA1),		/* alg */
++		3,				/* Size of PCR mask */
++		tpm_u16(0x0),			/* 24 PCRs mask */
++		0x0,
++		/* allocate SHA384 bank */
++		tpm_u16(TPM2_ALG_SHA384),	/* alg */
++		3,				/* Size of PCR mask */
++		tpm_u16(0xFFFF),		/* 24 PCRs mask */
++		0xFF,
++	};
++
++	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++}
++
+ static int tpm_tis_wait_init(int loc)
+ {
+ 	unsigned long start, stop;
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index a7e49fa..8aebf28 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -69,8 +69,14 @@
+ 	return ret;
+ }
+ 
++#define TPM2_CAP_PCRS		5
++#define TPM2_CAP_SIZE		32
++#define BANK1_ALG_OFFSET	5
++#define BANK2_ALG_OFFSET	11
++
+ int tpm_startup(void)
+ {
++	u8 capabilities[TPM2_CAP_SIZE];
+ 	int ret;
+ 
+ 	if (tpm_is_enabled() != 0)
+@@ -80,6 +86,33 @@
+ 	if (ret) {
+ 		preboot_puts("TPM: tpm2_startup failed\n");
+ 		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return ret;
++	}
++
++	ret = tpm2_get_capability(TPM2_CAP_PCRS, 0, capabilities, NULL);
++	if (ret) {
++		preboot_puts("TPM: tpm2_getcap failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	/* check if sha384 bank is allocated */
++	if ((capabilities[BANK1_ALG_OFFSET] == TPM2_ALG_SHA384) ||
++	    (capabilities[BANK2_ALG_OFFSET] == TPM2_ALG_SHA384))
++		return ret;
++
++	ret = tpm2_pcr384_allocate();
++	if (ret) {
++		preboot_puts("TPM: failed to alloc sha384 bank\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return ret;
++	}
++
++	/* TODO: reset the TPM by togglind the CPLD request gpio (SW-102141) */
++
++	ret = tpm2_startup(TPM2_SU_CLEAR);
++	if (ret) {
++		preboot_puts("TPM: tpm2_startup failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+ 	}
+ 
+ 	return ret;
+diff --git a/include/tpm2.h b/include/tpm2.h
+index 5f0b5c8..74c12e1 100644
+--- a/include/tpm2.h
++++ b/include/tpm2.h
+@@ -68,6 +68,8 @@
+ int tpm2_startup(enum tpm2_startup_types mode);
+ int tpm2_nv_read(u32 index, void *data, u32 count);
+ int tpm2_pcr_extend(u32 index, u32 algorithm, const u8 *digest, u32 digest_len);
++int tpm2_get_capability(u32 capability, u32 property, void *data, size_t *data_len);
++int tpm2_pcr384_allocate(void);
+ 
+ /* implemented per arch */
+ bool tpm_is_supported(void);

@@ -1,0 +1,512 @@
+From 5cb9b2a28f0a419ee69e2ba16fc9c3b3d1df0c5b Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 28 Aug 2022 17:40:07 +0300
+Subject: [PATCH] [SW-100612] pll: update get freq implementation
+
+The implementation of pll get freq function for gaudi2 gaudi3 and
+greco is identical, the only difference is register offsets within
+the PLL block. To avoid code duplication, the implementation of
+pll get freq for those devices is moved to common code, and pll
+device struct is created to handle the register offsets.
+
+The obsolete implementation for legacy devices (goya, gaudi) is moved
+to device specific code.
+
+Change-Id: Ic5578b71875365e6b173105a7689d4d8eb2386e4
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ext_rom/erom_pcie.c b/app/ext_rom/erom_pcie.c
+index 237a354..f60526b 100644
+--- a/app/ext_rom/erom_pcie.c
++++ b/app/ext_rom/erom_pcie.c
+@@ -47,6 +47,7 @@
+ 	device_init_global_conf();
+ 	device_init_uart();
+ 	device_init_pci();
++	device_init_pll(); /* used for uart and delay */
+ }
+ 
+ __weak void init_prstn(void) {}
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index 4a3975a..e0cb065 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -77,6 +77,7 @@
+ 	device_init_uart();
+ 	device_init_pci();
+ 	device_init_i2c_s();
++	device_init_pll();
+ }
+ 
+ void erom_main_function(void)
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+index e5dea28..b2a7607 100644
+--- a/app/ext_rom/erom_tpm.c
++++ b/app/ext_rom/erom_tpm.c
+@@ -123,6 +123,7 @@
+ 	device_init_global_conf();
+ 	device_init_uart();
+ 	device_init_efuse();
++	device_init_pll(); /* used for uart and delay */
+ }
+ 
+ __weak void ppboot_secure_arc(void) {}
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 34cbf92..38dd827 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -268,6 +268,7 @@
+ 	device_init_pci();
+ 	device_init_global_conf();
+ 	device_init_ca53_cfg();
++	device_init_pll(); /* used for uart and delay */
+ }
+ 
+ __weak void ppboot_security_init(void) {}
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 9d563c9..af38fed 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -446,6 +446,7 @@
+ 	device_init_pci();
+ 	device_init_i2c_s();
+ 	device_init_global_conf();
++	device_init_pll();
+ }
+ 
+ __weak void hl_set_reset_cause(uint32_t reset_cause) {}
+diff --git a/app/recovery/recovery.c b/app/recovery/recovery.c
+index 82c2781..f63aad5 100644
+--- a/app/recovery/recovery.c
++++ b/app/recovery/recovery.c
+@@ -29,6 +29,7 @@
+ 	device_init_uart();
+ 	device_init_i2c_s();
+ 	device_init_global_conf();
++	device_init_pll(); /* used for uart and delay */
+ }
+ 
+ void recovery_main(void)
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index ce5bae9..a0b5e94 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -729,3 +729,28 @@
+ {
+ 	ca53_cfg.arm_rst_control_reg = mmCPU_CA53_CFG_ARM_RST_CONTROL;
+ }
++
++void device_init_pll(void) {} /* device_pll struct is not used for gaudi */
++
++u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
++{
++	u32 nr, nf, od, div_sel, factor, offset;
++	u64 out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(u32);
++	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
++
++	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
++		nr = regmap_readl(pll_base + HL_PLL_NR) + 1;
++		nf = regmap_readl(pll_base + HL_PLL_NF) + 1;
++		od = regmap_readl(pll_base + HL_PLL_OD) + 1;
++		out_freq = (SYS_REF_CLOCK * nf) / (nr * od);
++	}
++
++	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
++		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
++		out_freq /= factor + 1;
++	}
++
++	return out_freq;
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 179a7af..1957c80 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -51,6 +51,7 @@
+ #include <psoc_uart_0_regs.h>
+ #include <pcie_elbi_rr_mstr_if_rr_shrd_lbw_regs.h>
+ #include <gic_regs.h>
++#include <psoc_cpu_pll_ctrl_regs.h>
+ 
+ #include "hl.h"
+ #include "common.h"
+@@ -1314,6 +1315,13 @@
+ 	global_conf.mmfuse_ver_off_map = 0; /* unused */
+ }
+ 
++void device_init_pll(void)
++{
++	pll.div_sel_offset = mmPSOC_CPU_PLL_CTRL_DIV_SEL_0 - mmPSOC_CPU_PLL_CTRL_BASE;
++	pll.cfg_div_offset = mmPSOC_CPU_PLL_CTRL_CFG_DIV - mmPSOC_CPU_PLL_CTRL_BASE;
++	pll.div_factor_offset = mmPSOC_CPU_PLL_CTRL_DIV_FACTOR_0 - mmPSOC_CPU_PLL_CTRL_BASE;
++}
++
+ void device_init_ca53_cfg(void)
+ {
+ 	ca53_cfg.arm_rst_control_reg = mmCPU_CA53_CFG_ARM_RST_CONTROL;
+diff --git a/arch/gaudi2/common/pll.c b/arch/gaudi2/common/pll.c
+index 6775eca..8dc85b8 100644
+--- a/arch/gaudi2/common/pll.c
++++ b/arch/gaudi2/common/pll.c
+@@ -13,43 +13,6 @@
+ 
+ 
+ #define GAUDI2_PLL_CFG_DIV		0x104
+-
+-u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+-{
+-	u32 div_sel, factor, offset;
+-	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
+-	u64 out_freq = SYS_REF_CLOCK;
+-
+-	offset = div * sizeof(u32);
+-	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
+-
+-	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
+-		reg = regmap_readl(pll_base + GAUDI2_PLL_CFG_DIV);
+-		/* fbdiv : bits 0-11 */
+-		fbdiv = EXTRACT_BITS(reg, 0, 12);
+-		/* postdiv1 : bits 16-18 */
+-		postdiv1 = EXTRACT_BITS(reg, 16, 3);
+-		/* postdiv2 : bits 20-22 */
+-		postdiv2 = EXTRACT_BITS(reg, 20, 3);
+-		/* refdiv : bits 24-29 */
+-		refdiv  = EXTRACT_BITS(reg, 24, 6);
+-		out_freq = SYS_REF_CLOCK * fbdiv;
+-		out_freq /= refdiv * postdiv1 * postdiv2;
+-	}
+-
+-	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
+-		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
+-		out_freq /= factor + 1;
+-	}
+-
+-	/*
+-	 * TODO : The clock relaxation is not accounted here.
+-	 * We might need to deal with it in the future.
+-	 */
+-
+-	return out_freq;
+-}
+-
+ #define GAUDI2_PLL_CFG			0x100
+ #define GAUDI2_PLL_CFG_EN		(BIT(8) | BIT(0))
+ #define GAUDI2_PLL_CFG_LOCK		BIT(16)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 96ce9da..eff8cae 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -22,11 +22,13 @@
+ #include <d0_parc_local_cfg_regs.h>
+ #include <d0_pif_arc_regs.h>
+ #include <d0_pif_arc_special_regs.h>
++#include <d0_g4_pci_pll_ctrl_regs.h>
+ #include <d1_pcie_aux_regs.h>
+ #include <d1_pcie_core_regs.h>
+ #include <d1_pcie_dbi_sig_regs.h>
+ #include <d1_pif_arc_regs.h>
+ #include <d1_pif_arc_special_regs.h>
++#include <gaudi3_blocks_linux_driver.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+ 
+@@ -398,6 +400,13 @@
+ 	}
+ }
+ 
++void device_init_pll(void)
++{
++	pll.div_sel_offset = mmD0_G4_PCI_PLL_CTRL_DIV_SEL_0 - mmD0_G4_PCI_PLL_CTRL_BASE;
++	pll.cfg_div_offset = mmD0_G4_PCI_PLL_CTRL_CFG_DIV - mmD0_G4_PCI_PLL_CTRL_BASE;
++	pll.div_factor_offset = mmD0_G4_PCI_PLL_CTRL_DIV_FACTOR_0 - mmD0_G4_PCI_PLL_CTRL_BASE;
++}
++
+ void lkd_dev_specific_setup(void)
+ {
+ 	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_HARD_RST_EN);
+diff --git a/arch/goya/arm/common.c b/arch/goya/arm/common.c
+index 1d6d07c..f5d27de 100644
+--- a/arch/goya/arm/common.c
++++ b/arch/goya/arm/common.c
+@@ -388,3 +388,28 @@
+ {
+ 	ca53_cfg.arm_rst_control_reg = mmCPU_CA53_CFG_ARM_RST_CONTROL;
+ }
++
++void device_init_pll(void) {} /* device_pll struct is not used for goya */
++
++u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
++{
++	u32 nr, nf, od, div_sel, factor, offset;
++	u64 out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(u32);
++	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
++
++	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
++		nr = regmap_readl(pll_base + HL_PLL_NR) + 1;
++		nf = regmap_readl(pll_base + HL_PLL_NF) + 1;
++		od = regmap_readl(pll_base + HL_PLL_OD) + 1;
++		out_freq = (SYS_REF_CLOCK * nf) / (nr * od);
++	}
++
++	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
++		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
++		out_freq /= factor + 1;
++	}
++
++	return out_freq;
++}
+diff --git a/arch/greco/arc/pll.c b/arch/greco/arc/pll.c
+index 8699ebd..078cf45 100644
+--- a/arch/greco/arc/pll.c
++++ b/arch/greco/arc/pll.c
+@@ -12,44 +12,7 @@
+ #include "common.h"
+ 
+ 
+-#define GRECO_PLL_CFG_DIV		0x104
+-
+-u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+-{
+-	u32 div_sel, factor, offset;
+-	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
+-	u64 out_freq = SYS_REF_CLOCK;
+-
+-	offset = div * sizeof(u32);
+-	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
+-
+-	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
+-		reg = regmap_readl(pll_base + GRECO_PLL_CFG_DIV);
+-		/* fbdiv : bits 0-11 */
+-		fbdiv = EXTRACT_BITS(reg, 0, 12);
+-		/* postdiv1 : bits 16-18 */
+-		postdiv1 = EXTRACT_BITS(reg, 16, 3);
+-		/* postdiv2 : bits 20-22 */
+-		postdiv2 = EXTRACT_BITS(reg, 20, 3);
+-		/* refdiv : bits 24-29 */
+-		refdiv  = EXTRACT_BITS(reg, 24, 6);
+-		out_freq = SYS_REF_CLOCK * fbdiv;
+-		out_freq /= refdiv * postdiv1 * postdiv2;
+-	}
+-
+-	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
+-		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
+-		out_freq /= factor + 1;
+-	}
+-
+-	/*
+-	 * TODO : The clock relaxation is not accounted here.
+-	 * We might need to deal with it in the future.
+-	 */
+-
+-	return out_freq;
+-}
+-
++#define GRECO_PLL_CFG_DIV	0x104
+ #define GRECO_PLL_CFG		0x100
+ #define GRECO_PLL_CFG_EN	(BIT(0) | BIT(8))
+ #define GRECO_PLL_CFG_LOCK	BIT(16)
+diff --git a/arch/greco/arc_elf32/pll.c b/arch/greco/arc_elf32/pll.c
+deleted file mode 100644
+index 0eb4af1..0000000
+--- a/arch/greco/arc_elf32/pll.c
++++ /dev/null
+@@ -1,51 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <stddef.h>
+-#include <bitops.h>
+-#include <preboot.h>
+-#include <pll.h>
+-#include "common.h"
+-
+-
+-#define GRECO_PLL_CFG_DIV		0x104
+-
+-u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+-{
+-	u32 div_sel, factor, offset;
+-	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
+-	u64 out_freq = SYS_REF_CLOCK;
+-
+-	offset = div * sizeof(u32);
+-	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
+-
+-	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
+-		reg = regmap_readl(pll_base + GRECO_PLL_CFG_DIV);
+-		/* fbdiv : bits 0-11 */
+-		fbdiv = EXTRACT_BITS(reg, 0, 12);
+-		/* postdiv1 : bits 16-18 */
+-		postdiv1 = EXTRACT_BITS(reg, 16, 3);
+-		/* postdiv2 : bits 20-22 */
+-		postdiv2 = EXTRACT_BITS(reg, 20, 3);
+-		/* refdiv : bits 24-29 */
+-		refdiv  = EXTRACT_BITS(reg, 24, 6);
+-		out_freq = SYS_REF_CLOCK * fbdiv;
+-		out_freq /= refdiv * postdiv1 * postdiv2;
+-	}
+-
+-	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
+-		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
+-		out_freq /= factor + 1;
+-	}
+-
+-	/*
+-	 * TODO : The clock relaxation is not accounted here.
+-	 * We might need to deal with it in the future.
+-	 */
+-
+-	return out_freq;
+-}
+-
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 263552d..ca7a241 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -57,6 +57,7 @@
+ #include <pcie_elbi_rr_mstr_if_rr_shrd_lbw_regs.h>
+ #include <dcon0_lbw_rtr_if_mstr_if_rr_prvt_lbw_regs.h>
+ #include <dcon0_lbw_rtr_if_mstr_if_rr_shrd_lbw_regs.h>
++#include <psoc_pci_pll_ctrl_regs.h>
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+ #define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
+@@ -817,6 +818,13 @@
+ 	ca53_cfg.arm_rst_control_reg = mmCPU_CA53_CFG_ARM_RST_CONTROL;
+ }
+ 
++void device_init_pll(void)
++{
++	pll.div_sel_offset = mmPSOC_PCI_PLL_CTRL_DIV_SEL_0 - mmPSOC_PCI_PLL_CTRL_BASE;
++	pll.cfg_div_offset = mmPSOC_PCI_PLL_CTRL_CFG_DIV - mmPSOC_PCI_PLL_CTRL_BASE;
++	pll.div_factor_offset = mmPSOC_PCI_PLL_CTRL_DIV_FACTOR_0 - mmPSOC_PCI_PLL_CTRL_BASE;
++}
++
+ #define ARC_MEM_INIT_TIMEOUT_US		(5 * USEC_PER_SEC)
+ #define MEM_CPY_16B_DIVIDER		4
+ void init_arc_mem(u8 id, u64 addr, u32 size)
+diff --git a/include/device.h b/include/device.h
+index ad87763..e6fe6c5 100644
+--- a/include/device.h
++++ b/include/device.h
+@@ -100,6 +100,12 @@
+ 	u32 status_reg;
+ };
+ 
++struct device_pll {
++	u32 div_sel_offset;
++	u32 cfg_div_offset;
++	u32 div_factor_offset;
++};
++
+ extern struct device_efuse efuse;
+ extern struct device_uart uart;
+ extern struct device_pci pci;
+@@ -107,6 +113,7 @@
+ extern struct device_global_conf global_conf;
+ extern struct device_ca53_cfg ca53_cfg;
+ extern struct device_pif_arc pif_arc;
++extern struct device_pll pll;
+ 
+ void device_init_efuse(void);
+ void device_init_uart(void);
+@@ -115,3 +122,4 @@
+ void device_init_global_conf(void);
+ void device_init_ca53_cfg(void);
+ void device_init_pif_arc(void);
++void device_init_pll(void);
+diff --git a/lib/common/pll.c b/lib/common/pll.c
+index c8a7e3f..690eca3 100644
+--- a/lib/common/pll.c
++++ b/lib/common/pll.c
+@@ -8,10 +8,9 @@
+ #include "preboot.h"
+ #include "uart.h"
+ #include "pll.h"
++#include <device.h>
++#include <bitops.h>
+ 
+-#define HL_PLL_NR		0x100
+-#define HL_PLL_NF		0x104
+-#define HL_PLL_OD		0x108
+ #define HL_PLL_NB		0x10c
+ #define HL_PLL_CFG		0x110
+ #define HL_PLL_CFG_LOCK		(1 << 4)
+@@ -28,6 +27,8 @@
+ #define TIMESTAMP_CNTFID0	0x20
+ 
+ #define MIN_CYCLES_PER_ITER	5
++
++struct device_pll pll;
+ 
+ static u32 timestamp_base;
+ static u64 cycles_per_usec = BYPASS_CYCLES_PER_USEC;
+@@ -109,25 +110,38 @@
+ 
+ __weak u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+ {
+-	u32 nr, nf, od, div_sel, factor, offset;
++	u32 div_sel, factor, offset;
++	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
+ 	u64 out_freq = SYS_REF_CLOCK;
+ 
+ 	offset = div * sizeof(u32);
+-	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
++	div_sel = regmap_readl(pll_base + pll.div_sel_offset + offset);
+ 
+ 	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
+-		nr = regmap_readl(pll_base + HL_PLL_NR) + 1;
+-		nf = regmap_readl(pll_base + HL_PLL_NF) + 1;
+-		od = regmap_readl(pll_base + HL_PLL_OD) + 1;
+-		out_freq = (SYS_REF_CLOCK * nf) / (nr * od);
++		reg = regmap_readl(pll_base + pll.cfg_div_offset);
++		/* fbdiv : bits 0-11 */
++		fbdiv = EXTRACT_BITS(reg, 0, 12);
++		/* postdiv1 : bits 16-18 */
++		postdiv1 = EXTRACT_BITS(reg, 16, 3);
++		/* postdiv2 : bits 20-22 */
++		postdiv2 = EXTRACT_BITS(reg, 20, 3);
++		/* refdiv : bits 24-29 */
++		refdiv  = EXTRACT_BITS(reg, 24, 6);
++		out_freq = SYS_REF_CLOCK * fbdiv;
++		out_freq /= refdiv * postdiv1 * postdiv2;
+ 	}
+ 
+ 	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
+-		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
++		factor = regmap_readl(pll_base + pll.div_factor_offset + offset);
+ 		out_freq /= factor + 1;
+ 	}
+ 
+-	return out_freq;
++	/*
++	 * TODO : The clock relaxation is not accounted here.
++	 * We might need to deal with it in the future.
++	 */
++
++	return (u32)out_freq;
+ }
+ 
+ __weak void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
+diff --git a/lib/common/pll.h b/lib/common/pll.h
+index 8acc84b..3c67dd2 100644
+--- a/lib/common/pll.h
++++ b/lib/common/pll.h
+@@ -12,6 +12,9 @@
+ #include <stdbool.h>
+ #include <types.h>
+ 
++#define HL_PLL_NR		0x100
++#define HL_PLL_NF		0x104
++#define HL_PLL_OD		0x108
+ #define HL_PLL_DIV_FACTOR	0x200
+ #define HL_PLL_DIV_FACTOR_CMD	0x220
+ #define HL_PLL_DIV_SEL		0x280

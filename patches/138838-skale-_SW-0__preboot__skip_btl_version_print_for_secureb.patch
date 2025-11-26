@@ -1,0 +1,126 @@
+From 55d776cd4ad96cea8e5a358eea8792059b8c3841 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 21 Oct 2021 10:30:20 +0300
+Subject: [PATCH] [SW-0] preboot: skip btl version print for secureboot flow
+
+Currenlty, BTL version is printed in preboot for both btl and
+secureboot flow. However in secureboot flow, BTL version is printed
+as 0. This patch add changes to skip BTL version print for
+secureboot flow by reading bootstrap register.
+
+Due to hybrid mode used for greco, flow is identified in software
+rather than reading boot_strap register.
+
+Change-Id: Idb12a2ac801a8df8b36394569e2cc9184230905f
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index ad83a3c..adcbedd 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -133,6 +133,11 @@
+ 	return preboot_vers[ver];
+ }
+ 
++__weak bool hl_is_btl_flow(void)
++{
++	return true;
++}
++
+ static void preboot_version(void)
+ {
+ 	unsigned long offset = (unsigned long) preboot_vers[PREBOOT_BTL_VER];
+@@ -140,8 +145,10 @@
+ 	int i, btl_ver_sz;
+ 
+ 	preboot_puts("\n");
+-	preboot_puts_raw(preboot_vers[PREBOOT_BTL_VER]);
+-	preboot_puth(btlver, true);
++	if (hl_is_btl_flow()) {
++		preboot_puts_raw(preboot_vers[PREBOOT_BTL_VER]);
++		preboot_puth(btlver, true);
++	}
+ 	preboot_puts_raw(preboot_ver_str);
+ 	preboot_puts("\n");
+ 
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index 91dad3a..7a52c4e 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -9,6 +9,7 @@
+ 
+ #include <gaudi_blocks.h>
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <psoc_efuse_regs.h>
+ #include <psoc_gpio1_regs.h>
+ #include <pcie_aux_regs.h>
+@@ -622,3 +623,10 @@
+ {
+ 	return HL_BOOT_INFO_VERSION;
+ }
++
++bool hl_is_btl_flow(void)
++{
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
++
++	return boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_BTL_EN_MASK;
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 17d45db..669e275 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1114,3 +1114,10 @@
+ 		break;
+ 	}
+ }
++
++bool hl_is_btl_flow(void)
++{
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++	return boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK;
++}
+diff --git a/arch/goya/arm/common.c b/arch/goya/arm/common.c
+index af6b7f0..2acacba 100644
+--- a/arch/goya/arm/common.c
++++ b/arch/goya/arm/common.c
+@@ -8,6 +8,7 @@
+ #include <goya_blocks.h>
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <psoc_efuse_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+@@ -279,3 +280,10 @@
+ {
+ 	return PCI_IDS_GOYA;
+ }
++
++bool hl_is_btl_flow(void)
++{
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
++
++	return boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_BTL_EN_MASK;
++}
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index 1c108f7..5db1b08 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -149,3 +149,15 @@
+ 	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
+ 	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
+ }
++
++bool hl_is_btl_flow(void)
++{
++	/*
++	 * Due to DCCM ECC issue in arcboot rom, hybrid mode is enabled
++	 * for greco where execution starts from BTL and BTL starts
++	 * ROM flow on ARC1. Due to this, BTL_EN bit is set but still
++	 * ROM flow is executed. So aviod reading bootstrap register
++	 * here to and returning false for ARC flow.
++	 */
++	return false;
++}

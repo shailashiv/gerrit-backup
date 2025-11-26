@@ -1,0 +1,146 @@
+From 6fcf789abae02056d2ffdec33724dc0b78885f5a Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 30 Sep 2021 19:20:00 +0300
+Subject: [PATCH] [SW-52828] boot_if: prepare internals to multi reg
+
+Prepare the internal implementation for the multiple registers use for
+both the errors and device status bits.
+This make the implementation more close to what we have in U-Boot.
+Still internal API (Preboot wide) changes are required before we can
+fully switch to multi-register error and device status bits.
+
+Change-Id: I884e42713527eba99ad58fffa6237979fb34bb45
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/lib/common/boot_if.c b/lib/common/boot_if.c
+index 2d063af..bfc8866 100644
+--- a/lib/common/boot_if.c
++++ b/lib/common/boot_if.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
++ * Copyright 2016-2021 HabanaLabs, Ltd.
+  * All Rights Reserved.
+  */
+ 
+@@ -13,10 +13,23 @@
+ #include <hl_boot_if.h>			/* requires stdint.h */
+ 
+ /* TODO: add support for both registers of status and error */
+-/* Shadow the status and error registers */
+-static u32 cpu_boot_dev_sts;
+-static u32 cpu_boot_err;
+-static u32 cpu_boot_progress;
++struct cpu_boot_if {
++	u32 status;	/* boot progress status register offset */
++	u32 response;
++	u32 err;
++	u32 dev_sts;
++	/* Shadow the status and error registers */
++	u32 dev_sts_val;
++	u32 err_val;
++	u32 status_val;	/* boot progress status value */
++};
++
++static struct cpu_boot_if cpu_boot_if = {
++	.status = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS,
++	.response = mmCPU_CMD_STATUS_TO_HOST,
++	.err = mmCPU_BOOT_ERR0,
++	.dev_sts = mmCPU_BOOT_DEV_STS0,
++};
+ 
+ /*
+  * The cpu_boot_cmd_clr_before_wfe() function should NOT be used in general as
+@@ -40,37 +53,33 @@
+ 
+ void cpu_boot_sts_set(u32 val)
+ {
+-	cpu_boot_progress = val;
+-	regmap_writel(val, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
++	cpu_boot_if.status_val = val;
++	regmap_writel(val, cpu_boot_if.status);
+ }
+ 
+ void cpu_boot_if_init(void)
+ {
+-	cpu_boot_dev_sts = regmap_readl(mmCPU_BOOT_DEV_STS0);
+-	cpu_boot_err = regmap_readl(mmCPU_BOOT_ERR0);
++	cpu_boot_if.dev_sts_val = regmap_readl(cpu_boot_if.dev_sts);
++	cpu_boot_if.err_val = regmap_readl(cpu_boot_if.err);
+ }
+ 
+ void cpu_boot_if_fix_ro_regs(void)
+ {
+-	regmap_writel(cpu_boot_dev_sts, mmCPU_BOOT_DEV_STS0);
+-	regmap_writel(cpu_boot_err, mmCPU_BOOT_ERR0);
+-	regmap_writel(cpu_boot_progress, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
++	regmap_writel(cpu_boot_if.dev_sts_val, cpu_boot_if.dev_sts);
++	regmap_writel(cpu_boot_if.err_val, cpu_boot_if.err);
++	regmap_writel(cpu_boot_if.status_val, cpu_boot_if.status);
+ }
+ 
+ static void cpu_boot_reg_clrset(u32 reg, u32 mask, bool set)
+ {
+ 	u32 *shadow;
+ 
+-	switch (reg) {
+-	case mmCPU_BOOT_DEV_STS0:
+-		shadow = &cpu_boot_dev_sts;
+-		break;
+-	case mmCPU_BOOT_ERR0:
+-		shadow = &cpu_boot_err;
+-		break;
+-	default:
++	if (reg == cpu_boot_if.dev_sts)
++		shadow = &cpu_boot_if.dev_sts_val;
++	else if (reg == cpu_boot_if.err)
++		shadow = &cpu_boot_if.err_val;
++	else
+ 		return;
+-	}
+ 
+ 	*shadow &= ~mask;
+ 	if (set)
+@@ -82,34 +91,33 @@
+ /* We support only ERR0 for now */
+ void cpu_boot_err_clrset(u32 mask, bool set)
+ {
+-	cpu_boot_reg_clrset(mmCPU_BOOT_ERR0, mask, set);
++	cpu_boot_reg_clrset(cpu_boot_if.err, mask, set);
+ }
+ 
+ bool cpu_boot_err_get(u32 mask)
+ {
+-	return !!(cpu_boot_err & mask);
++	return !!(cpu_boot_if.err_val & mask);
+ }
+ 
+ /* We support only STS0 for now */
+ void cpu_boot_dev_sts_clrset(u32 mask, bool set)
+ {
+-	cpu_boot_reg_clrset(mmCPU_BOOT_DEV_STS0, mask, set);
++	cpu_boot_reg_clrset(cpu_boot_if.dev_sts, mask, set);
+ }
+ 
+ void cpu_boot_rsp_set(enum cpu_msg_status sts)
+ {
+-	regmap_writel(sts, mmCPU_CMD_STATUS_TO_HOST);
++	regmap_writel(sts, cpu_boot_if.response);
+ }
+ 
+ void cpu_comms_sts_set(struct comms_status *sts)
+ {
+-	regmap_writel(sts->val, mmCPU_CMD_STATUS_TO_HOST);
++	regmap_writel(sts->val, cpu_boot_if.response);
+ }
+ 
+-/* TODO: add support for real 64 bits */
+ u64 cpu_boot_dev_sts_get_all(void)
+ {
+-	u64 val = cpu_boot_dev_sts;
++	u64 val = cpu_boot_if.dev_sts_val;
+ 
+ 	return val;
+ }

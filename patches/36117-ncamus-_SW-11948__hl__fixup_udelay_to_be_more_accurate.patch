@@ -1,0 +1,406 @@
+From cfbcb66c88f1392bd0bd38e9a6ade1bc63c29202 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Mon, 18 May 2020 06:06:52 +0300
+Subject: [PATCH] [SW-11948] hl: fixup udelay to be more accurate
+
+Due to inaccuracy of udelay() PCI link establishment not optimal
+It means that instead of Gen3 it was Gen2 or even Gen1
+
+Having proper delay fixup timing issues between root complex and end
+point which cause degradation in link capability
+
+Change-Id: I966e1a8be6f8f00d1d32ef6c5a1a1cb74f042096
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 9891c4b..0890c80 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -21,21 +21,65 @@
+ #define HL_PLL_DIV_FACTOR_CMD	0x220
+ #define HL_PLL_CLK_GATER	0x300
+ 
++#define TIMESTAMP_CNTCR		0x00
++#define TIMESTAMP_CNTSR		0x04
++#define TIMESTAMP_CNTCVL	0x08
++#define TIMESTAMP_CNTCVU	0x0C
++#define TIMESTAMP_CNTFID0	0x20
++
+ #define MIN_CYCLES_PER_ITER	5
+ 
++static u32 timestamp_base;
+ static u64 cycles_per_usec = BYPASS_CYCLES_PER_USEC;
+ 
+ void udelay_init(void)
+ {
+-	cycles_per_usec = hl_pll_get_cpu_cycles_per_usec();
++	u32 timestamp_freq = hl_pll_timestamp_freq_get();
++
++	timestamp_base = hl_pll_timestamp_base_get();
++	cycles_per_usec = timestamp_freq / USEC_PER_SEC;
++
++	/* timer init */
++	regmap_writel(timestamp_freq, timestamp_base + TIMESTAMP_CNTFID0);
++	regmap_writel(0x3, timestamp_base + TIMESTAMP_CNTCR); /* EN | HDBG */
++}
++
++static u64 udelay_timestamp_get(void)
++{
++	u32 low, up1, up2;
++
++	up1 = regmap_readl(timestamp_base + TIMESTAMP_CNTCVU);
++	low = regmap_readl(timestamp_base + TIMESTAMP_CNTCVL);
++	up2 = regmap_readl(timestamp_base + TIMESTAMP_CNTCVU);
++	/* In case of overlap read low part again */
++	if (up1 != up2)
++		low = regmap_readl(timestamp_base + TIMESTAMP_CNTCVL);
++
++	return ((u64)up2 << 32) + low;
+ }
+ 
+ void udelay(unsigned int usec)
+ {
+-	volatile u64 cnt = (cycles_per_usec * usec) / MIN_CYCLES_PER_ITER;
++	u64 start, current, end = cycles_per_usec * usec;
++	bool overlap = false;
+ 
+-	while (cnt--)
+-		;
++	start = udelay_timestamp_get();
++	end += start;
++
++	if (end < start)
++		overlap = true;
++
++	while (1) {
++		current = udelay_timestamp_get();
++		if (!overlap) {
++			/* Check also for unplanned overlap */
++			if (current > end || current <= start)
++				break;
++		} else {
++			if (current > end && current < start)
++				break;
++		}
++	}
+ }
+ 
+ __attribute__((weak)) u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+diff --git a/common/pll.h b/common/pll.h
+index bf69361..03ef1e9 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -31,7 +31,8 @@
+ };
+ 
+ void udelay_init(void);
+-u64 hl_pll_get_cpu_cycles_per_usec(void);
++u64 hl_pll_timestamp_freq_get(void);
++u32 hl_pll_timestamp_base_get(void);
+ u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div);
+ void udelay(unsigned int usec);
+ 
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 9a28adb..6dd1393 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -19,11 +19,9 @@
+ 	return regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS) & BIT(19);
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	u32 cpu_div0_freq = hl_pll_get_freq(mmPSOC_CPU_PLL_BASE, HL_PLL_DIV0);
+-
+-	return cpu_div0_freq / USEC_PER_SEC;
++	return hl_pll_get_freq(mmPSOC_CPU_PLL_BASE, HL_PLL_DIV1);
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/gaudi/common.c b/gaudi/common.c
+index aa3d0ea..79057cf 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -12,6 +12,8 @@
+ #include <pcie_phy_regs.h>
+ #include <pcie_dbi_regs.h>
+ 
++#include <cpu_timestamp_regs.h>
++
+ #include <hl_boot_if.h>
+ #include <gaudi/gaudi_reg_map.h>
+ 
+@@ -245,3 +247,8 @@
+ 	/* to be handled by SW - enable */
+ 	regmap_writel(0, mmPCIE_AUX_FLR_CTRL);
+ }
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmCPU_TIMESTAMP_CNTCR;
++}
+diff --git a/gaudi/onix.c b/gaudi/onix.c
+index c7abdd0..2a3bd4e 100644
+--- a/gaudi/onix.c
++++ b/gaudi/onix.c
+@@ -18,9 +18,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/gaudi/pldm.c b/gaudi/pldm.c
+index 26d30f6..8a08f58 100644
+--- a/gaudi/pldm.c
++++ b/gaudi/pldm.c
+@@ -20,9 +20,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya/asic.c b/goya/asic.c
+index 43b2513..958fd2b 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -19,11 +19,9 @@
+ 	return regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS) & BIT(21);
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	u32 cpu_div0_freq = hl_pll_get_freq(mmCPU_PLL_BASE, HL_PLL_DIV0);
+-
+-	return cpu_div0_freq / USEC_PER_SEC;
++	return hl_pll_get_freq(mmCPU_PLL_BASE, HL_PLL_DIV1);
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya/common.c b/goya/common.c
+index 77aafb6..4e1144b 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -12,6 +12,8 @@
+ #include <cpu_timestamp_regs.h>
+ #include <pcie_db_rsv_regs.h>
+ 
++#include <cpu_timestamp_regs.h>
++
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+@@ -126,11 +128,7 @@
+ void preboot_delay(void)
+ {
+ 	unsigned long cntpct, end;
+-	int sysclk = SYS_REF_CLOCK, i;
+-
+-	/* timer init */
+-	regmap_writel(sysclk, mmCPU_TIMESTAMP_CNTFID0);
+-	regmap_writel(0x3, mmCPU_TIMESTAMP_CNTCR); /* EN | HDBG */
++	int i;
+ 
+ 	/* get begin counter value and calc end counter value */
+ 	asm volatile("mrs %0, cntpct_el0" : "=r" (cntpct));
+@@ -191,3 +189,8 @@
+ 
+ 	spi_copy((void *)loadaddr, offset, size, name);
+ }
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmCPU_TIMESTAMP_CNTCR;
++}
+diff --git a/goya/onix.c b/goya/onix.c
+index ce73ff8..5faa410 100644
+--- a/goya/onix.c
++++ b/goya/onix.c
+@@ -18,9 +18,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya/pldm.c b/goya/pldm.c
+index 7391714..b6c632f 100644
+--- a/goya/pldm.c
++++ b/goya/pldm.c
+@@ -18,9 +18,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya2/asic.c b/goya2/asic.c
+index f5d905a..64c857b 100644
+--- a/goya2/asic.c
++++ b/goya2/asic.c
+@@ -22,12 +22,10 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	/* As per Goya2 PLL cfg.xslx, PCI PLL Div[1] drives CPU */
+-	u32 cpu_div0_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV1);
+-
+-	return cpu_div0_freq / USEC_PER_SEC;
++	/* As per Goya2 PLL cfg.xslx, PCI PLL Div[3] drives CPU timestamp */
++	return hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV3);
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya2/common.c b/goya2/common.c
+index ebacbad..37cc4f7 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -14,6 +14,8 @@
+ #include <pcie_phy_regs.h>
+ #include <pcie_dbi_regs.h>
+ 
++#include <cpu_timestamp_regs.h>
++
+ #include <hl_boot_if.h>
+ #include <goya2/goya2_reg_map.h>
+ 
+@@ -254,3 +256,8 @@
+ 	/* to be handled by SW - enable */
+ 	regmap_writel(0, mmPCIE_AUX_FLR_CTRL);
+ }
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmCPU_TIMESTAMP_CNTCR;
++}
+diff --git a/goya2/onix.c b/goya2/onix.c
+index 30c2dfa..27d60f0 100644
+--- a/goya2/onix.c
++++ b/goya2/onix.c
+@@ -19,9 +19,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya2/pldm.c b/goya2/pldm.c
+index 26d30f6..8a08f58 100644
+--- a/goya2/pldm.c
++++ b/goya2/pldm.c
+@@ -20,9 +20,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya2_arc_gnu/asic.c b/goya2_arc_gnu/asic.c
+index 33f42b4..df9a774 100644
+--- a/goya2_arc_gnu/asic.c
++++ b/goya2_arc_gnu/asic.c
+@@ -19,12 +19,9 @@
+ 	return regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L) & BIT(10);
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	u32 cpu_div0_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_CTRL_BASE,
+-						HL_PLL_DIV1);
+-
+-	return cpu_div0_freq / USEC_PER_SEC;
++	return hl_pll_get_freq(mmPSOC_PCI_PLL_CTRL_BASE, HL_PLL_DIV3);
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index db80820..e1bcba0 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -16,6 +16,8 @@
+ #include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
+ 
++#include <cpu_timestamp_regs.h>
++
+ #include <hl_boot_if.h>
+ #include <goya2/goya2_reg_map.h>
+ #include <pci_ids.h>
+@@ -308,3 +310,8 @@
+ {
+ 	/* Not implemented - ARC BootROM copies and validates preboot */
+ }
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmCPU_TIMESTAMP_CNTCR;
++}
+diff --git a/goya2_arc_gnu/onix.c b/goya2_arc_gnu/onix.c
+index 63e2013..6d86fbc 100644
+--- a/goya2_arc_gnu/onix.c
++++ b/goya2_arc_gnu/onix.c
+@@ -23,9 +23,9 @@
+ 	return 1;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya2_arc_gnu/pldm.c b/goya2_arc_gnu/pldm.c
+index 31906a7..6b9ee7a 100644
+--- a/goya2_arc_gnu/pldm.c
++++ b/goya2_arc_gnu/pldm.c
+@@ -20,9 +20,9 @@
+ 	return 0;
+ }
+ 
+-u64 hl_pll_get_cpu_cycles_per_usec(void)
++u64 hl_pll_timestamp_freq_get(void)
+ {
+-	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+ void hl_uart_init(void)

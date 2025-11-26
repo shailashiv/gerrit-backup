@@ -1,0 +1,374 @@
+From f86b5cd8f4d0b9cb4caaa7da90f9b8db98d15b14 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Wed, 06 Nov 2019 13:47:58 +0200
+Subject: [PATCH] [SW-0] goya2: enable compilation for HS46 CPU
+
+This will run on ARC proccessor HS46 which is 32bit nad will be used to
+establish PCIe link
+
+Change-Id: I70420feae404994527f5f137f7a1f8c61b04c5ba
+---
+
+diff --git a/common/preboot.h b/common/preboot.h
+index 3278135..264fd44 100644
+--- a/common/preboot.h
++++ b/common/preboot.h
+@@ -11,6 +11,13 @@
+ #define BIT(nr)					(1 << (nr))
+ #define ARRAY_SIZE(x)				(sizeof(x) / sizeof((x)[0]))
+ 
++#ifdef __arc__
++#define HL_SPI_BASE				0x1A000000
++#define HL_CFG_BASE				0x1C000000
++#define SDRAM_BASE				0x10000000
++#define SPL_TEXT_BASE				0x10080000
++#endif
++
+ #ifdef __aarch64__
+ #define HL_SPI_BASE				0x7FF8000000ull
+ #define HL_CFG_BASE				0x7FFC000000ull
+diff --git a/common/start.S b/common/start.S
+index da9ffe5..423ce29 100644
+--- a/common/start.S
++++ b/common/start.S
+@@ -12,6 +12,15 @@
+ .globl	_start
+ _start:
+ 
++#ifdef __arc__
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++
++	mov	sp, _start + 0x10000
++	mov	fp, sp
++#endif
++
+ #ifdef __aarch64__
+ 	ldr	x0, =(_start + 0x10000)
+ 	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
+diff --git a/goya2/Makefile b/goya2/Makefile
+new file mode 100644
+index 0000000..eacfb1c
+--- /dev/null
++++ b/goya2/Makefile
+@@ -0,0 +1 @@
++FW_SIZE := 0x8000
+diff --git a/goya2/asic.c b/goya2/asic.c
+new file mode 100644
+index 0000000..7342ecb
+--- /dev/null
++++ b/goya2/asic.c
+@@ -0,0 +1,110 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdbool.h>
++
++#include <psoc_global_conf_regs.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++static struct hl_pll_cfg goya_pll_cfg[] = {
++	{
++		.name = "IC", .base = mmIC_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 15, .nb = 31,
++		.div_factor = { 0, 1, 1, 2 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "EMMC", .base = mmPSOC_EMMC_PLL_BASE,
++		.nr = 24, .nf = 415, .od = 15, .nb = 207,
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "MME", .base = mmPSOC_MME_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 15, .nb = 31,
++		.div_factor = { 0, 1, 2, 8 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "PCI", .base = mmPSOC_PCI_PLL_BASE,
++		.nr = 4, .nf = 343, .od = 3, .nb = 171,
++		.div_factor = { 0, 35, 8, 85 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "TPC", .base = mmTPC_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 15, .nb = 31,
++		.div_factor = { 0, 1, 1, 8 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	},
++};
++
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return cfg->base != mmCPU_PLL_BASE;
++}
++
++int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
++{
++	int pll_num = ARRAY_SIZE(goya_pll_cfg);
++
++	*hl_pll_cfg = goya_pll_cfg;
++
++	return pll_num;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	/* Use DumpSel[8] to skip PCIe initialization */
++	return regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L) & BIT(21);
++}
++
++u64 hl_pll_get_cpu_cycles_per_usec(void)
++{
++	u32 cpu_div0_freq = hl_pll_get_freq(mmCPU_PLL_BASE, HL_PLL_DIV0);
++
++	return cpu_div0_freq / USEC_PER_SEC;
++}
++
++void hl_uart_init(void)
++{
++	u32 uart_clk_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV1);
++
++	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor;
++	u32 spi_clk_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV1);
++
++	factor = spi_clk_freq / HL_SPI_FLASH_MAX_FREQ;
++
++	return factor > 2 ? factor : 2;
++}
++
+diff --git a/goya2/common.c b/goya2/common.c
+new file mode 100644
+index 0000000..63f9229
+--- /dev/null
++++ b/goya2/common.c
+@@ -0,0 +1,141 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <pcie_phy_regs.h>
++#include <psoc_global_conf_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_core_regs.h>
++#include <cpu_timestamp_regs.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++#define BTL_COUNTER_MAX		BIT(22)
++
++static int preboot_wait_for_bit(unsigned int reg, unsigned long timeout_ns)
++{
++	unsigned int val;
++	unsigned long count = (timeout_ns * SYS_REF_CLOCK) / 1000000000UL;
++
++	while (count--) {
++		val = regmap_readl(reg);
++		if (val & 1)
++			return 0;
++	}
++
++	return 1;
++}
++
++static void preboot_wait_for_ext_ld_done(void)
++{
++	/*
++	 * Wait for HW FSM to complete 16KB copy to PHY
++	 * this is enough to set ext_ld_done.
++	 * FSM will set ext_ld_done after 32KB but why wait
++	 * if we can already move on
++	 */
++	while ((regmap_readl(mmPCIE_PHY_CR_PARA_CMD) & 0xFFFF) <= 0xD780)
++		;
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3);
++}
++
++static void preboot_wait_for_stable_pclk(void)
++{
++	int ret;
++
++	while (1) {
++		ret = 0;
++		/* Wait for PCLK stable - check MPLLA [no timeout] */
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLA_STATE_0, 100);
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLA_STATE_1, 100);
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLA_STATE_2, 100);
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLA_STATE_3, 100);
++		if (!ret)
++			break;
++
++		ret = 0;
++		/* Wait for PCLK stable - check MPLLB [no timeout] */
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLB_STATE_0, 100);
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLB_STATE_1, 100);
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLB_STATE_2, 100);
++		ret |= preboot_wait_for_bit(mmPCIE_PHY_PHYX_MPLLB_STATE_3, 100);
++		if (!ret)
++			break;
++	}
++}
++
++/*
++ * Handle PCIe erratum: make sure reset_n de-asserted only after perst
++ * Assume PRSTn tied with cold reset
++ * Assume PCIe enable strap (DIP switch) is set, and hence HW enable LTSSM
++ */
++void preboot_pcie_wait_for_link(void)
++{
++	preboot_wait_for_ext_ld_done();
++	preboot_wait_for_stable_pclk();
++
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh, hot_reset;
++
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++		hot_reset = regmap_readl(mmPCIE_CORE_HOT_RST);
++
++		if ((hot_reset & BIT(0)) == BIT(0)) {
++			regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
++			regmap_writel(1, mmPCIE_AUX_LTSSM_EN);
++		}
++
++		if (prstn && smlh && rdlh)
++			break;
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(1, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++}
++
++void preboot_delay(void) {}
++void preboot_putc_virt_uart(const char c) {}
++
++u32 get_cs_pad_sel(void)
++{
++	return mmPSOC_GLOBAL_CONF_PAD_SEL_53;
++}
++
++u32 get_cpu_boot_status_reg(void)
++{
++	return mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++}
++
++u32 get_upd_pending_sts_reg(void)
++{
++	return mmPSOC_GLOBAL_CONF_NON_RST_FLOPS_3;
++}
++
++void hl_pll_wa(void) {}
++void preboot_sync_btl(void) {}
+diff --git a/goya2/common.h b/goya2/common.h
+new file mode 100644
+index 0000000..f6e0b2d
+--- /dev/null
++++ b/goya2/common.h
+@@ -0,0 +1,13 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#define mmCPU_PLL_BASE		0x4A2000
++#define mmIC_PLL_BASE		0x4A3000
++#define mmPSOC_EMMC_PLL_BASE	0xC70000
++#define mmPSOC_MME_PLL_BASE	0xC71000
++#define mmPSOC_PCI_PLL_BASE	0xC72000
++#define mmTPC_PLL_BASE		0xE01000
+diff --git a/goya2/preboot.lds.S b/goya2/preboot.lds.S
+new file mode 100644
+index 0000000..2186e48
+--- /dev/null
++++ b/goya2/preboot.lds.S
+@@ -0,0 +1,30 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifdef __arc__
++MEMORY { .sram : ORIGIN = 0xf0000000, LENGTH = 0x10000 }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++#endif
++
++#ifdef __aarch64__
++MEMORY { .sram : ORIGIN = 0x7ff0000000, LENGTH = 0x10000 }
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++#endif
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		common/start.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}

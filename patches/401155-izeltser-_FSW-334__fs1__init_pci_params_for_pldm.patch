@@ -1,0 +1,194 @@
+From 29fecbd33d5a187ac111848e3532fb2aeafac9f4 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 06 Mar 2024 11:10:47 +0200
+Subject: [PATCH] [FSW-334] fs1: init pci params for pldm
+
+Add specific PCI configuration for PLDM.
+On PLDM emulator there is no PHY and the configuration required for
+PCI are very minimal, and mostly depend on vlsi image support.
+To provide some flexibility, spare efuse bits are used to control over
+some features, like nubmer of VFs, Cxl.cache capability and ATS
+capability support. Other custom configs might be added in the future.
+
+Change-Id: Iaca2f07581210164991f6d8b7a434eca22d4df74
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/asic.c b/arch/fs1/arc/asic.c
+index ea23586..20647e9 100644
+--- a/arch/fs1/arc/asic.c
++++ b/arch/fs1/arc/asic.c
+@@ -48,3 +48,8 @@
+ 			 mmPSOC_PAD_CONF_PAD_SEL_50);				/* UART0 TXD */
+ 	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
+ }
++
++void preboot_pcie_wait_for_link(void)
++{
++	/* TODO: implement PCI init for Asic */
++}
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 74e9c3d..9c04ecf 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -231,11 +231,6 @@
+ 	hl_dev_psoc_pll_init();
+ }
+ 
+-void preboot_pcie_wait_for_link(void)
+-{
+-	/* TODO: fill Pcie link offload to ARC0 */
+-}
+-
+ #define SPSRAM_ADDR_MASK	0xFFFFF
+ 
+ static u32 fs1_translate_arc_addr(u64 addr)
+diff --git a/arch/fs1/arc/onix.c b/arch/fs1/arc/onix.c
+index 96a337b..1ceaa1f 100644
+--- a/arch/fs1/arc/onix.c
++++ b/arch/fs1/arc/onix.c
+@@ -40,3 +40,8 @@
+ 			 mmPSOC_PAD_CONF_PAD_SEL_50);				/* UART0 TXD */
+ 	preboot_uart_init(SYS_CLOCK_FREQUENCY / (HL_UART_BAUDRATE / 2));
+ }
++
++void preboot_pcie_wait_for_link(void)
++{
++	/* no PCI init required for Onix */
++}
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+index a55c55c..5efc705 100644
+--- a/arch/fs1/arc/pldm.c
++++ b/arch/fs1/arc/pldm.c
+@@ -4,11 +4,21 @@
+  */
+ 
+ #include <psoc_pad_conf_regs.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
++#include <pcie_aux_regs.h>
++#include <pcie_aux_masks.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
+ #include <fs1_blocks_linux_driver.h>
+ 
+ #include <baremetal.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <bitops.h>
++#include <fs1_reg_map.h>
++#include <fs1_efuse.h>
++#include <efuse.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
+ 
+@@ -65,3 +75,109 @@
+ {
+ 	hl_pll_init(fs1_psoc_pll_cfg, 1);
+ }
++
++static bool is_cxl_mode(void)
++{
++	u32 val;
++
++	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_H));
++	val &= PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_CXL_MODE_M;
++
++	return !!val;
++}
++
++#define SRIOV_MAX_NUM_VFS	4
++#define SRIOV_DEFAULT_NUM_VFS	1
++
++static void pldm_pcie_dynamic_init(void)
++{
++	bool cxl_mode = is_cxl_mode();
++	u32 pci_efuse_cfg;
++	u8 num_vf = 0;
++	u32 val;
++
++	hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, IO_EFUSE_PLDM_PCI_CFG_OFFSET,
++		     &pci_efuse_cfg);
++	preboot_puts_hex("efuse pci cfg = ", pci_efuse_cfg, false);
++
++	if (cxl_mode) {
++		/* CXL capability is enabled as reset default */
++
++		/* disable CXL.Cache capability if required */
++		if (!(pci_efuse_cfg & CXL_CACHE_CAP_ENABLED_M)) {
++			val = regmap_readl(IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++			val &= ~PCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF_CACHE_CAP_M;
++			regmap_writel(val, IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++			val = regmap_readl(IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++			val &= ~PCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF_CACHE_CAP_M;
++			regmap_writel(val, IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++		}
++	} else { /* pci mode */
++		/* switch to PCI mode by disabling Alternative Protocol Support */
++		val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++		val &= ~PCIE_DBI_PL32G_CAPABILITY_REG_MOD_TS_ALT_PROTOCOL_SUPPORT_M;
++		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++
++		/* set number of VFs */
++		num_vf = pci_efuse_cfg & SRIOV_NUM_OF_VFS_M;
++		if (num_vf > SRIOV_MAX_NUM_VFS) {
++			num_vf = SRIOV_DEFAULT_NUM_VFS;
++			preboot_puts("VF exceeds 4, using default of 1 VF\n");
++		}
++
++		val = num_vf << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_INITIAL_VFS_S |
++		      num_vf << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_TOTAL_VFS_S;
++		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG));
++	}
++
++	/* skip ATS capability */
++	if (!(pci_efuse_cfg & ATS_CAPABILITY_ENABLED_M)) {
++		val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++		val &= ~PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_M;
++		val |= mmPCIE_DBI_PRS_EXT_CAP_HDR_REG <<
++			PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_S;
++		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++	}
++}
++
++#define BAR_TYPE_MEM	0xC
++#define BAR_SIZE_1GB	(((SZ_1G - 1) & PCIE_DBI_BAR0_REG_BAR0_START_M) | BAR_TYPE_MEM)
++
++static void pldm_pcie_params_init(void)
++{
++	u32 val;
++
++	/* enable writing to DBI RO regs */
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++	val |= PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++
++	/* set PF CFG BAR to 1GB */
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR1_REG));
++
++	/* set SRIOV CFG BAR to 1GB */
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR1_REG));
++
++	pldm_pcie_dynamic_init();
++
++	/* disable writing to DBI RO regs */
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++	val &= ~PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++}
++
++#define LTTSM_ENA_MASK	(PCIE_AUX_LTSSM_EN_IND_M | PCIE_AUX_LTSSM_EN_MASK_M)
++
++void preboot_pcie_wait_for_link(void)
++{
++	pldm_pcie_params_init();
++
++	regmap_writel(LTTSM_ENA_MASK, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE +
++				      mmPCIE_AUX_LTSSM_EN);
++}

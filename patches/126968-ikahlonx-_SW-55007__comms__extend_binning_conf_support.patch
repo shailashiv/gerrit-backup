@@ -1,0 +1,149 @@
+From 04854a7a81a42dafde5905762904c823932a1d8c Mon Sep 17 00:00:00 2001
+From: Moria Zuberi <moria.zuberi@tandemg.com>
+Date: Sun, 08 Aug 2021 11:36:42 +0300
+Subject: [PATCH] [SW-55007] comms: extend binning conf support
+
+controlling HBM, TPC and VDEC binning conf from LKD
+to allow flexebility during power on tests.
+The message is set to preboot and passed to u-boot
+since the data is required at early u-boot boot stages.
+
+Change-Id: Ia41d289ef7ccc273c400703bb8e474d10a02bff6
+Signed-off-by: Idan Kahlon <idan.kahlon@tandemg.com>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 7212a60..70f23f8 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -52,6 +52,7 @@
+ 
+ static struct hl_rsp_err pending_error;
+ static u64 preboot_en_caps;
++static struct hl_binning_conf binning_conf;
+ static u8 fw_cfg_skip;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+@@ -492,9 +493,20 @@
+ 	fw_cfg_skip = skip;
+ }
+ 
++void preboot_set_binning_conf(struct hl_binning_masks *masks)
++{
++	if (!binning_conf.is_valid) {
++		memcpy(&binning_conf.masks, masks, sizeof(struct hl_binning_masks));
++		binning_conf.is_valid = true;
++	}
++}
++
+ void preboot_finalize_uboot_override(void)
+ {
+ 	if (fw_cfg_skip)
+ 		boot_info_set(HL_BOOT_INFO_FW_CFG_SKIP, &fw_cfg_skip, sizeof(fw_cfg_skip));
+ 
++	if (binning_conf.is_valid)
++		boot_info_set(HL_BOOT_INFO_BINNING_CONF, &binning_conf.masks,
++			      sizeof(binning_conf.masks));
+ }
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index a374d29..8173836 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -117,6 +117,11 @@
+ 	return true;
+ }
+ 
++bool hl_binning_conf_is_supported(void)
++{
++	return true;
++}
++
+ void hl_ts_data_init(void)
+ {
+ 	u32 pll_freq;
+diff --git a/include/preboot.h b/include/preboot.h
+index 8481226..0486425 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -80,6 +80,17 @@
+ 	uint32_t bitmask;
+ };
+ 
++struct hl_binning_masks {
++	uint64_t tpc;
++	uint32_t dec;
++	uint32_t hbm;
++};
++
++struct hl_binning_conf {
++	bool is_valid;
++	struct hl_binning_masks masks;
++};
++
+ extern uintptr_t _start;	/* Start of ppboot/preboot region */
+ extern uintptr_t __stack_top;	/* End of ppboot/preboot region */
+ extern u32 __stack;		/* stack last cell value */
+@@ -213,8 +224,10 @@
+ void preboot_engines_init(void);
+ void preboot_clear_wd_gpio(void);
+ void preboot_set_fw_cfg_skip(u8 skip);
++void preboot_set_binning_conf(struct hl_binning_masks *masks);
+ void preboot_finalize_uboot_override(void);
+ bool hl_fw_cfg_skip_is_supported(void);
++bool hl_binning_conf_is_supported(void);
+ 
+ void ppboot_init_stack_mon_dev_specific(void);
+ void ppboot_check_stack_mon_dev_specific(void);
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 9e23518..5c10f9d 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -20,6 +20,7 @@
+ #include "i2cslave_indirect.h"
+ #include "uart.h"
+ #include "fit.h"
++#include "security.h"
+ 
+ struct lkd_status {
+ 	struct comms_command cmd;
+@@ -115,6 +116,30 @@
+ 	return 0;
+ }
+ 
++__weak bool hl_binning_conf_is_supported(void) { return false; }
++
++static int module_lkd_msg_binning_conf(struct lkd_fw_comms_msg *mcomms)
++{
++	struct hl_binning_masks masks;
++
++	if (!hl_binning_conf_is_supported()) {
++		preboot_puts("binning_conf is not supported\n");
++		return -1;
++	}
++
++	if (preboot_security_is_enabled()) {
++		preboot_puts("binning_conf is not supported - due to security\n");
++		return -1;
++	}
++
++	masks.tpc = mcomms->tpc_binning_conf;
++	masks.dec = mcomms->dec_binning_conf;
++	masks.hbm = mcomms->hbm_binning_conf;
++	preboot_set_binning_conf(&masks);
++
++	return 0;
++}
++
+ static int module_lkd_msg_process(struct lkd_fw_comms_msg *mcomms)
+ {
+ 	int err = 1;
+@@ -126,6 +151,9 @@
+ 	case HL_COMMS_FW_CFG_SKIP_TYPE:
+ 		err = module_lkd_msg_fw_cfg_skip(mcomms);
+ 		break;
++	case HL_COMMS_BINNING_CONF_TYPE:
++		err = module_lkd_msg_binning_conf(mcomms);
++		/* no break */
+ 	default:
+ 		break;
+ 	}

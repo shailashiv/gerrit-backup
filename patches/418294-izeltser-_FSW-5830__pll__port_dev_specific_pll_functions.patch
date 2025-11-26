@@ -1,0 +1,111 @@
+From dfe2cae6cff53e252816fda98e8fce0894efa436 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 22 May 2024 18:38:23 +0300
+Subject: [PATCH] [FSW-5830] pll: port dev specific pll functions
+
+Device specific PLL functions are ported for FS1
+
+Change-Id: Ia935be727ffea5299ab0ca35dae45694adfedb03
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/Makefile b/arch/fs1/arc/Makefile
+index fe1ff63..684c1cb 100644
+--- a/arch/fs1/arc/Makefile
++++ b/arch/fs1/arc/Makefile
+@@ -17,6 +17,7 @@
+ 
+ PPBOOT_SRCS_C := $(filter-out lib/common/module_i2c_slave.c,$(PPBOOT_SRCS_C))
+ PPBOOT_SRCS_C := $(filter-out lib/common/pif_ts.c,$(PPBOOT_SRCS_C))
++PPBOOT_SRCS_C += $(HL_DEV_ARCH)/pll.c
+ 
+ # TODO: uncomment when bootrom exports is available
+ #ifeq ($(HL_TARGET),onix)
+diff --git a/arch/fs1/arc/pll.c b/arch/fs1/arc/pll.c
+new file mode 100644
+index 0000000..3e3953c
+--- /dev/null
++++ b/arch/fs1/arc/pll.c
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++#include <pll_control_regs.h>
++#include <pll_control_masks.h>
++#include <fs1_blocks_linux_driver.h>
++
++#include <stddef.h>
++#include <bitops.h>
++#include <baremetal.h>
++#include <pll.h>
++#include "common.h"
++
++#define FS1_PLL_CFG_EN	(PLL_CONTROL_CFG_FOUTPOSTDIVEN_M | PLL_CONTROL_CFG_EN_M)
++
++void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++{
++	u32 reg = regmap_readl(cfg->base + mmPLL_CONTROL_CFG);
++
++	if (reset)
++		reg &= ~FS1_PLL_CFG_EN;
++	else
++		reg |= FS1_PLL_CFG_EN;
++
++	regmap_writel(reg, cfg->base + mmPLL_CONTROL_CFG);
++}
++
++int hl_pll_is_locked(struct hl_pll_cfg *cfg)
++{
++	return regmap_readl(cfg->base + mmPLL_CONTROL_CFG) & PLL_CONTROL_CFG_LOCK_M;
++}
++
++#define FS1_PLL_MAX_WAIT_TIME	5
++
++void hl_pll_cfg(struct hl_pll_cfg *cfg)
++{
++	u32 reg = 0;
++
++	/* put the PLL into reset by writing 0 to CTRL_CFG.EN and CTRL_CFG.FOUTPOSTDIVEN */
++	hl_pll_reset(cfg, true);
++
++	/* FBDIV - bit 0
++	 * POSTDIV1 - bit 16
++	 * POSTDIV2 - bit 20
++	 * REFDIV - bit 24
++	 */
++	reg = cfg->nr << PLL_CONTROL_CFG_DIV_REFDIV_S | cfg->nb << PLL_CONTROL_CFG_DIV_POSTDIV2_S |
++	      cfg->od << PLL_CONTROL_CFG_DIV_POSTDIV1_S | cfg->nf;
++
++	regmap_writel(reg, cfg->base + mmPLL_CONTROL_CFG_DIV);
++	regmap_writel(PLL_CONTROL_VCO_CTRL_VCOSEL_M, cfg->base + mmPLL_CONTROL_VCO_CTRL);
++
++	/* after updating the coefficients we need to wait >=1us */
++	udelay(FS1_PLL_MAX_WAIT_TIME);
++
++	/* enable the PLL by writing a value of 1 to CTRL_CFG.EN and CTRL_CFG.FOUTPOSTDIVEN */
++	hl_pll_reset(cfg, false);
++}
++
++void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg) {}
++
++void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg) {}
++
++void hl_pll_ack_int(struct hl_pll_cfg *cfg) {}
++
++void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg)
++{
++	regmap_writel(1, cfg->base + mmPLL_CONTROL_DIV_SEL_DELAY);
++}
++
++void hl_pll_vco_en(struct hl_pll_cfg *cfg)
++{
++	u32 val;
++
++	val = regmap_readl(cfg->base + mmPLL_CONTROL_VCO_CTRL);
++	val |= PLL_CONTROL_VCO_CTRL_FOUTVCOEN_M;
++	regmap_writel(val, cfg->base + mmPLL_CONTROL_VCO_CTRL);
++}
++
++u32 hl_get_pll_div_fix(void) { return 1; }

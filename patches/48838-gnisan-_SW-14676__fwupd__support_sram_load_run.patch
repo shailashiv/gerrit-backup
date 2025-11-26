@@ -1,0 +1,258 @@
+From 3353700a2b8d2ca52465b83d851541348bcdfb0f Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 26 Aug 2020 01:10:28 +0300
+Subject: [PATCH] [SW-14676] fwupd: support sram load run
+
+Add support for running FIT images using fwupd sram load protocol
+
+This protocol offer better robustness than LKD protocol while performing
+maintenance operations.
+The fw-loader utility uses it to communicate with the device, sending
+commandw, retrieving statuses and validate exxecution.
+
+Change-Id: I8aa2956a99c22beb5bec95bf20048f85ed52468a
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 1753bae..789d845 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -81,6 +81,7 @@
+ void module_fwupd_setup(void);
+ enum cmd_check_res module_fwupd_check(void);
+ void module_fwupd_run(void);
++void module_fwupd_run_noret(void);
+ 
+ /* LKD */
+ void module_lkd_setup(void);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 8d06dfc..2653a50 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -10,6 +10,7 @@
+ #include <hl_boot_if.h>
+ #include <preboot.h>
+ #include <boot_if.h>
++#include <fit_load_type.h>
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
+@@ -37,6 +38,7 @@
+ #define FIT_KEY_NAME_HINT	"key-name-hint"
+ #define FIT_PUB_KEY_PROP	"pub-key"
+ #define FIT_PUB_KEY_EXT_PROP	"pub-key-ext"
++#define FIT_LOAD_TYPE_PROP	"load-type"
+ 
+ #define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+ 
+@@ -513,6 +515,32 @@
+ 	preboot_copy_image(dst, buf, len, arch);
+ }
+ 
++static bool fit_load_is_runnable(const void *fit, int conf)
++{
++	const u32 *cell;
++	u32 type;
++	int len;
++
++	cell = fdt_getprop(fit, conf, FIT_LOAD_TYPE_PROP, &len);
++
++	/* If load type does not exists, assume it's u-boot */
++	if (!cell)
++		return true;
++
++	if (len != sizeof(*cell)) {
++		preboot_puts("Currupted load type\n");
++		return false;
++	}
++
++	type = fdt32_to_cpu(*cell);
++	if (type >= FIT_LOAD_TYPE_COUNT) {
++		preboot_puts_hex("Unsupported load type ", type, false);
++		return false;
++	}
++
++	return type == FIT_LOAD_TYPE_RUN;
++}
++
+ static enum fit_load_result fit_copy_images(const void *fit)
+ {
+ 	int node, len;
+@@ -525,6 +553,9 @@
+ 	if (conf < 0)
+ 		return FIT_LOAD_CORRUPTED;
+ 
++	if (!fit_load_is_runnable(fit, conf))
++		return FIT_LOAD_CORRUPTED;
++
+ 	if (fit_verify_security(fit, conf))
+ 		return FIT_LOAD_SEC_FAILED;
+ 
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 9506d8f..9d52bed 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -7,9 +7,20 @@
+ #include <psoc_global_conf_regs.h>
+ #include <hl_fw_if.h>
+ #include <preboot.h>
++#include <string.h>
++#include <fit_load_type.h>
++#include <stdint.h>
++#include <inttypes.h>
+ 
+ #include "cmd_module.h"
+ #include "uart.h"
++#include "pll.h"
++#include "fit.h"
++
++#define WFC_TIMEOUT_MS		500
++#define TIMEOUT_US		1000
++
++static bool is_fit_checked;
+ 
+ void module_fwupd_setup(void)
+ {
+@@ -21,10 +32,94 @@
+ 
+ enum cmd_check_res module_fwupd_check(void)
+ {
+-	if (regmap_readl(mmUPD_CMD) != HL_UPD_NOOP)
+-		return FOUND_FAST_RETURN;
++	struct hl_upd_command cmd;
+ 
+-	return NOT_FOUND;
++	if (is_fit_checked)
++		return FOUND_NO_RETURN;
++
++	cmd.val = regmap_readl(mmUPD_CMD);
++	switch (cmd.cmd) {
++	case HL_UPD_CLR_STS:
++	case HL_UPD_RST_STATE:
++	case HL_UPD_MAP_SRAM:
++	case HL_UPD_RUN_SRAM:
++		return FOUND_SLOW_RETURN;
++	default:
++		return NOT_FOUND;
++	}
++}
++
++static void module_fwupd_send_status(enum hl_upd_sts sts, void *offset)
++{
++	struct hl_upd_status status;
++	uintptr_t off = (uintptr_t)offset;
++
++	status.val = 0;
++	status.status = sts;
++	status.offset = (u32)(off & ~HL_UPD_STS_OFFSET_MASK);
++	regmap_writel(status.val, mmUPD_STS);
++}
++
++static int module_fwupd_wfc(int timeout_ms)
++{
++	unsigned int reg;
++
++	for (; timeout_ms > 0; timeout_ms--) {
++		reg = regmap_readl(mmUPD_CMD);
++		if (reg == HL_UPD_NOOP)
++			return 0;
++		udelay(TIMEOUT_US);
++	}
++
++	return 1;
++}
++
++static void module_fwupd_reset_state(void)
++{
++	module_fwupd_send_status(HL_UPD_STS_RST_ACK, 0);
++	/* reset state should never fail */
++	module_fwupd_wfc(WFC_TIMEOUT_MS);
++	module_fwupd_send_status(HL_UPD_STS_RST_OK, 0);
++}
++
++static void module_fwupd_sram_map(unsigned int size, enum hl_upd_cmd cmd)
++{
++	module_fwupd_send_status(HL_UPD_STS_MAP_ACK, 0);
++
++	if (module_fwupd_wfc(WFC_TIMEOUT_MS)) {
++		module_fwupd_send_status(HL_UPD_STS_TIMEOUT_ERR, 0);
++		preboot_puts("Timeout error\n");
++		return;
++	}
++
++	if (!preboot_is_valid_address_range(FIT_IMG_BASE, size)) {
++		module_fwupd_send_status(HL_UPD_STS_VALID_ERR, 0);
++		preboot_puts("Mapped address range is invalid\n");
++		return;
++	}
++
++	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)FIT_IMG_BASE);
++}
++
++static void module_fwupd_sram_run(void)
++{
++	module_fwupd_send_status(HL_UPD_STS_RUN_ACK, 0);
++
++	is_fit_checked = !fit_load_images();
++
++	if (module_fwupd_wfc(WFC_TIMEOUT_MS)) {
++		module_fwupd_send_status(HL_UPD_STS_TIMEOUT_ERR, 0);
++		preboot_puts("Timeout error\n");
++		return;
++	}
++
++	if (!is_fit_checked) {
++		module_fwupd_send_status(HL_UPD_STS_VALID_ERR, 0);
++		preboot_puts("Failed to load FIT image\n");
++		return;
++	}
++
++	module_fwupd_send_status(HL_UPD_STS_RUN_OK, 0);
+ }
+ 
+ void module_fwupd_run(void)
+@@ -37,7 +132,24 @@
+ 		regmap_writel(HL_UPD_STS_NOOP, mmUPD_STS);
+ 		preboot_puts("FW UPD CLR STS received\n");
+ 		break;
++	case HL_UPD_RST_STATE:
++		module_fwupd_reset_state();
++		preboot_puts("HL UPD RST STATE received\n");
++		break;
++	case HL_UPD_MAP_SRAM:
++		preboot_puts("HL UPD MAP SRAM received\n");
++		module_fwupd_sram_map(cmd.size, cmd.cmd);
++		break;
++	case HL_UPD_RUN_SRAM:
++		preboot_puts("HL UPD RUN SRAM received\n");
++		module_fwupd_sram_run();
++		break;
+ 	default:
+ 		break;
+ 	}
+ }
++
++void module_fwupd_run_noret(void)
++{
++	fit_run_image();
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index e40cb27..597f1e1 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -36,11 +36,11 @@
+ 		.setup = module_fwupd_setup,
+ 		.check = module_fwupd_check,
+ 		.disable = noop,
+-		.run = noop,
++		.run = module_fwupd_run,
+ 		.enable = noop,
+-		.run_fast = module_fwupd_run,
++		.run_fast = noop,
+ 		.teardown = noop,
+-		.run_noreturn = noop,
++		.run_noreturn = module_fwupd_run_noret,
+ 	},
+ 	{	/* LKD module */
+ 		.setup = module_lkd_setup,

@@ -1,0 +1,191 @@
+From defa096387f6101f240e04b1194b0cb531adeeee Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 15 Sep 2020 20:31:46 +0300
+Subject: [PATCH] [SW-1441] gaudi: security: condition security en
+
+Move the security initializations to run only if security is enabled.
+
+Change-Id: Ie9a40c1d0b953731558bcee6d13ff92d994f6ea6
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index b0c2631..506a6df 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -488,21 +488,10 @@
+ 	set_prot_bits_range_all(base, PROT_SIZE_MAX);
+ 
+ 	/* Protect CPU_IF */
+-	base = mmCPU_IF_BASE & ~HL_CFG_BASE;	/* offsets: 0 - 0x100 */
+-	set_prot_bits_range_all(base, SNGL_REG_PROT_SIZE * 2);
++	base = mmCPU_IF_BASE & ~HL_CFG_BASE;	/* offsets: 0 - 0x200 */
++	set_prot_bits_range_all(base, SNGL_REG_PROT_SIZE * 4);
+ 
+-	/*
+-	 * TODO: this is a temporary open register until the LKD and ARMCP code
+-	 * handling this register is merged. Then we can remove this.
+-	 */
+-	prot_base = base + SNGL_REG_PROT_SIZE * 2; /* offsets: 0x100 - 0x180 */
+-	mask = ~PROT_BIT(mmCPU_IF_CPU_MSB_ADDR);
+-	regmap_writel(mask, PRIV_PROT_REG(prot_base));
+-
+-	prot_base += SNGL_REG_PROT_SIZE;	/*  offsets: 0x180 - 0x200 */
+-	set_prot_bits_range_all(prot_base, SNGL_REG_PROT_SIZE);
+-
+-	prot_base += SNGL_REG_PROT_SIZE; /* offsets: 0x200 - 0x280 */
++	prot_base = base + SNGL_REG_PROT_SIZE * 4; /* offsets: 0x200 - 0x280 */
+ 	mask = ~(PROT_BIT(mmCPU_IF_PF_PQ_PI) &
+ 		PROT_BIT(mmCPU_IF_PQ_BASE_ADDR_LOW) &
+ 		PROT_BIT(mmCPU_IF_PQ_BASE_ADDR_HIGH) &
+@@ -536,13 +525,7 @@
+ 
+ 	/* PSOC_CPU, PSOC_MME, PSOC_PCI, PSOC_TPC, PSOC_HBM */
+ 	base = mmPSOC_CPU_PLL_BASE & ~HL_CFG_BASE;
+-	/*
+-	 * TODO: the counter should be 5 to cover all 5 PSOC PLLs.
+-	 * For the LKD to load successfully before the integration, skip the
+-	 * PSOC_HBM_PLL. Once the HBM PLL data passing is implemented in LKD,
+-	 * we can return this to 5.
+-	 */
+-	set_prot_bits_pages_range_all(base, 0x1000, 4);
++	set_prot_bits_pages_range_all(base, 0x1000, 5);
+ 
+ 	/* NIC0, NIC1 */
+ 	base = mmNIC0_PLL_BASE & ~HL_CFG_BASE;
+@@ -709,16 +692,9 @@
+ {
+ 	u32 mask, prot_base, base = mmPSOC_GLOBAL_CONF_BASE & ~HL_CFG_BASE;
+ 
+-	/*
+-	 * TODO: the register below is open temporarily to allow
+-	 * LKD master to work correctly and condition the PCIe link init
+-	 * properly.
+-	 * mmPREBOOT_PCIE_EN (mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_1).
+-	 */
+ 	prot_base = base;	/* offsets: 0 - 0x80 */
+ 	mask = ~(PROT_BIT(mmPSOC_GLOBAL_CONF_NON_RST_FLOPS_0) &
+-		PROT_BIT(mmPSOC_GLOBAL_CONF_BTM_FSM) &
+-		PROT_BIT(mmPREBOOT_PCIE_EN));
++		PROT_BIT(mmPSOC_GLOBAL_CONF_BTM_FSM));
+ 	regmap_writel(mask, PRIV_PROT_REG(prot_base));
+ 
+ 	prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x80 - 0x100 */
+@@ -754,7 +730,7 @@
+ 
+ static void preboot_secure_psoc(void)
+ {
+-	u32 mask/*, base*/;	/* uncomment along with eFuse protection code */
++	u32 mask, base;
+ 
+ 	/* Set PSOC level to privilege */
+ 	mask = BIT(PSOC_GLOBAL_CONF_PROT_AR_SHIFT) |
+@@ -764,15 +740,8 @@
+ 	/* Note: PSOC_TIMESTAMP should not be protected */
+ 
+ 	/* Protect EFUSE */
+-	/* TODO: This eFuse protection is temporarily disabled until preboot
+-	 * provides the eFuse data string offset through a scratchpad register
+-	 * and LKD implements its parsing instead of direct access to eFuse h/w
+-	 * interface. Then we can uncomment the eFuse protection.
+-	 */
+-/*
+ 	base = mmPSOC_EFUSE_BASE & ~HL_CFG_BASE;
+ 	set_prot_bits_range_all(base, PROT_SIZE_MAX);
+- */
+ 
+ 	/* Protect GLOBAL_CONF - 4K */
+ 	preboot_secure_psoc_global_conf();
+@@ -1385,26 +1354,26 @@
+ 
+ 	is_sec_en = preboot_security_is_enabled();
+ 	if (is_sec_en) {
++		preboot_secure_cpu();
++		preboot_secure_psoc();
++		preboot_secure_pci();
++		preboot_secure_mme();
++		preboot_secure_tpc();
++		preboot_secure_pll();
++		preboot_secure_nic();
++		preboot_secure_if();
++		preboot_secure_sram_cfg();
++		preboot_secure_dma();
++
++		preboot_secure_lbw();
++		preboot_secure_hbw();
++
+ 		preboot_puts("Security is enabled\n");
+ 	} else {
+ 		preboot_security_pci_disable();
+ 		preboot_puts("Security is disabled\n");
+ 	}
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_SECURITY_EN, is_sec_en);
+-
+-	preboot_secure_cpu();
+-	preboot_secure_psoc();
+-	preboot_secure_pci();
+-	preboot_secure_mme();
+-	preboot_secure_tpc();
+-	preboot_secure_pll();
+-	preboot_secure_nic();
+-	preboot_secure_if();
+-	preboot_secure_sram_cfg();
+-	preboot_secure_dma();
+-
+-	preboot_secure_lbw();
+-	preboot_secure_hbw();
+ 
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, false);
+ 	preboot_puts("Security init finished.\n");
+@@ -1462,10 +1431,9 @@
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg = &preboot_sec_dyn_cfg[IMAGE];
+ 
+-	/* TODO: uncomment for release */
+-/*	if (!preboot_security_is_enabled())
++	if (!preboot_security_is_enabled())
+ 		return;
+-*/
++
+ 	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
+ }
+ 
+@@ -1480,10 +1448,9 @@
+ 	u64 vers_max = vers_off + size;
+ 	int i;
+ 
+-	/* TODO: uncomment for release */
+-/*	if (!preboot_security_is_enabled())
++	if (!preboot_security_is_enabled())
+ 		return;
+-*/
++
+ 	/* Set PCIe RRs to allow read access to versions */
+ 	preboot_sec_dyn_cfg[SRAM_BGN_TO_VERS].max = vers_off;
+ 	preboot_sec_dyn_cfg[VERSION].min = vers_off - 1;
+@@ -1508,10 +1475,9 @@
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
+ 	int i;
+ 
+-	/* TODO: uncomment for release */
+-/*	if (!preboot_security_is_enabled())
++	if (!preboot_security_is_enabled())
+ 		return;
+-*/
++
+ 	/*
+ 	 * TPC_3 is sharing SIF_7 RTR with PCIe, so we close its access to SRAM
+ 	 * via the secured level RRs. This is to prevent it from
+@@ -1537,10 +1503,9 @@
+ 
+ void preboot_security_cleanup_before_run(void)
+ {
+-	/* TODO: uncomment for release */
+-/*	if (!preboot_security_is_enabled())
++	if (!preboot_security_is_enabled())
+ 		return;
+-*/
++
+ 	/* Enable the SIF7 HBW SRAM_IF_DYN_RR_BGN - SRAM_IF_DYN_RR_END */
+ 	preboot_secure_hbw_sram();
+ 

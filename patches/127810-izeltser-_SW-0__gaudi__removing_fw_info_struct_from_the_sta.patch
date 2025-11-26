@@ -1,0 +1,56 @@
+From ae6c01ffa109a1dd493a26cec5e1b8dba6e23713 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 25 Aug 2021 09:43:23 +0300
+Subject: [PATCH] [SW-0] gaudi: removing fw_info struct from the stack
+
+fw_info struct is fairly large, and when allocated on the stack
+it causes stack overflow on gaudi.
+In the preboot_process_last_boot_info() it's allocated locally just
+for verification purpose and then copied to a global struct.
+So instead, if verification fails, the struct memory is being cleared
+
+Change-Id: I151b1460ba199244caa4684f51b28dffe52e832c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 48082ca..5ee5748 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -8,6 +8,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <time.h>	/* required for nvme data */
++#include <string.h>	/* for memset */
+ 
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_dbi_regs.h>
+@@ -306,7 +307,6 @@
+ 
+ static void preboot_process_last_boot_info(void)
+ {
+-	struct hl_fw_info_compat fw_info_local = {};
+ 	u32 boot_err = HL_FW_FIT_BOOT_ERR_NONE;
+ 	u32 data_size, rst_src;
+ 	u32 nic_en_local;
+@@ -347,13 +347,14 @@
+ 
+ 	module_fwupd_pcie_disable(fw_upd_is_dis);
+ 
+-	if (!boot_info_get(HL_BOOT_INFO_FW_INFO, &fw_info_local,
+-			   sizeof(fw_info_local), &data_size)) {
+-		if (fw_info_local.version == HL_FW_INFO_VERSION)
+-			fw_info = fw_info_local;
+-		else
++	if (!boot_info_get(HL_BOOT_INFO_FW_INFO, &fw_info,
++			   sizeof(fw_info), &data_size)) {
++		if (fw_info.version != HL_FW_INFO_VERSION) {
+ 			preboot_puts_hex("Ignoring fw info with version: ",
+-					 fw_info_local.version, false);
++					 fw_info.version, false);
++			/* ignoring fw_info data */
++			memset((void *)&fw_info, 0, sizeof(fw_info));
++		}
+ 
+ 		/*
+ 		 * Ignore reset cause that came from Linux as it is invalid to

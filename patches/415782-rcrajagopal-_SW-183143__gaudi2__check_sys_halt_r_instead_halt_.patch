@@ -1,0 +1,173 @@
+From f98e0649eb780a076ae5d1fa79e9d773b03c815b Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Fri, 10 May 2024 13:22:01 +0300
+Subject: [PATCH] [SW-183143] gaudi2: check sys_halt_r instead halt_run_ack
+
+ARC never updates the status register for "0" value on arc_run_ack
+and arc_halt_ack signals till next reset.
+
+So, after halt or run requested we should check sys_halt_r instead of
+halt_ack or run_ack bit.
+
+Change-Id: Ie410d6892408af1185ced0163693215820c1b89a
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arm/common.h b/arch/gaudi2/arm/common.h
+index c05c633..9281ef8 100644
+--- a/arch/gaudi2/arm/common.h
++++ b/arch/gaudi2/arm/common.h
+@@ -64,33 +64,6 @@
+ #define ARC0_ICCM			0x3FF7000000
+ #define BOOT_INFO_BASE			(HL_SP_SRAM_BASE + BOOT_INFO_OFFSET)
+ 
+-/*
+- * Set ARCs in halt state before reset
+- * 1. Set halt bit in RUN_HALT_REQ register
+- * 2. Clear halt bit in RUN_HALT_REQ register
+- * 3. Set Reset bit
+- */
+-#define HALT_N_RESET_ARC(id)						 \
+-	do {								 \
+-		regmap_writel(BIT(1), mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);\
+-		regmap_writel(0x0, mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);	 \
+-		regmap_writel(0x1, mmPSOC_ARC##id##_CFG_ARC_RST);	 \
+-	} while (0)
+-/*
+- * Set ARC in running state
+- * 1. Set run bit in RUN_HALT_REQ register
+- * 2. Wait for ACK from core in RUN_HALT_ACK register
+- * 3. Clear run bit in RUN_HALT_REQ register
+- */
+-#define RUN_ARC(id)							       \
+-	do {								       \
+-		regmap_writel(BIT(0), mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);      \
+-		while (!(regmap_readl(mmPSOC_ARC##id##_CFG_RUN_HALT_ACK) &     \
+-				PSOC_ARC##id##_CFG_RUN_HALT_ACK_RUN_ACK_MASK)) \
+-			;						       \
+-		regmap_writel(0x0, mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);	       \
+-	} while (0)
+-
+ #define PCIE_PHY_EXT_MPLLB_SSC_PEAK			0x5000
+ #define PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE		0x19CE
+ #define PCIE_PHY_EXT_MPLLA_SSC_PEAK			0x6666
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index f516f6d..d7e5065 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -77,7 +77,6 @@
+ 
+ #define ARC_HALT_ACK_RETRIES		100
+ #define ARC_RUN_ACK_TIMEOUT_US		100
+-#define ARC_IS_RUNNING			BIT(0) /* arc's "is running" sts bit */
+ 
+ #define HL_GPIO_DATA		0x0
+ #define HL_GPIO_DATAOUT		0x4
+@@ -823,7 +822,7 @@
+ 	u32 val;
+ 
+ 	val = regmap_readl(halt_ack_offset);
+-	if (val & ARC_IS_RUNNING)
++	if (!(val & PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK))
+ 		return;
+ 
+ 	halt_n_reset_arc(0);
+@@ -835,7 +834,7 @@
+ {
+ 	u32 val, halt_ack_offset, halt_req_offset;
+ 	u32 retry = ARC_HALT_ACK_RETRIES;
+-	u32 halt_mask, halt_ack_mask;
++	u32 halt_mask;
+ 	u32 rst_offset;
+ 	enum cpu_boot_err cpu_boot_err_val;
+ 
+@@ -843,13 +842,11 @@
+ 		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+ 		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
+ 		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+ 
+ 	} else {
+ 		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+ 		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
+ 		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+ 	}
+ 
+ 	halt_ack_offset = preboot_get_halt_offset(id);
+@@ -860,7 +857,7 @@
+ 		regmap_writel(BIT(1), halt_req_offset);
+ 		while (1) {
+ 			val = regmap_readl(halt_ack_offset);
+-			if (val & halt_ack_mask)
++			if (val & halt_mask)
+ 				break;
+ 
+ 			retry--;
+@@ -925,27 +922,41 @@
+ void run_arc(u8 id)
+ {
+ 	u32 run_ack_offset, run_req_offset;
+-	u32 run_ack_mask;
++	u32 halt_mask;
+ 	u64 start;
+ 	enum cpu_boot_err cpu_boot_err_val;
++	u32 arc_rst_mask, arc_rst_offset;
+ 
+ 	if (id) {
+ 		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+ 		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+-		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		arc_rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
++		arc_rst_mask = PSOC_ARC1_CFG_ARC_RST_CORE_MASK;
+ 
+ 	} else {
+ 		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+ 		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+-		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		arc_rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
++		arc_rst_mask = PSOC_ARC0_CFG_ARC_RST_CORE_MASK;
++	}
+ 
++	/*
++	 * Since SYS_HALT_R bit at reset and ARC runnig state value is 0.
++	 * So, before putting ARC in running state and check SYS_HALT_R,
++	 * ensure that ARC is out of reset.
++	 */
++	if (regmap_readl(arc_rst_offset) & arc_rst_mask) {
++		preboot_puts_hex("Still is ARC is in reset state, ARC id is ", id, false);
++		return;
+ 	}
+ 
+ 	/* Set ARC in running state */
+ 	regmap_writel(BIT(0), run_req_offset);
+ 
+ 	start = timestamp_get_us();
+-	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
++	while ((regmap_readl(run_ack_offset) & halt_mask)) {
+ 
+ 		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
+ 			preboot_puts_hex("No running state ack from ARC ",
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index c5e77f5..41adb3f 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -1457,7 +1457,6 @@
+ }
+ 
+ #define ARC_FARM_ARC0_RUN_HALT_ACK_SYS_HALT_R_MASK	BIT(8)
+-#define ARC_FARM_ARC0_RUN_HALT_ACK_HALT_ACK_MASK	BIT(4)
+ #define ARC_FARM_ARC0_HALT_RETRIES			1000
+ 
+ static int halt_arc_farm_arc0(void)
+@@ -1473,7 +1472,7 @@
+ 		regmap_writel(BIT(1), mmARC_FARM_ARC0_AUX_RUN_HALT_REQ);
+ 		while (1) {
+ 			val = regmap_readl(mmARC_FARM_ARC0_AUX_RUN_HALT_ACK);
+-			if (val & ARC_FARM_ARC0_RUN_HALT_ACK_HALT_ACK_MASK)
++			if (val & ARC_FARM_ARC0_RUN_HALT_ACK_SYS_HALT_R_MASK)
+ 				break;
+ 
+ 			udelay(1);

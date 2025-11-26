@@ -1,0 +1,89 @@
+From 394d60b1fc7acf79718faeea429d51253ceb04ad Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 09 Jan 2023 18:40:00 +0200
+Subject: [PATCH] [SW-116867] gaudi2: un-obscure sram plls init
+
+The PLLs init should not be obscured inside the SRAM self repair code.
+Introduce the ppboot_plls_init() common function that can be used for
+initializing PLLs in ppboot.
+Move Gaudi2 SRAM PLLs initialization to run out of this function.
+
+Change-Id: I3925d6e06cb9f389c4fe5bbd04331f14a88cddf3
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index e27e0f6..c47b2e4 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -301,6 +301,7 @@
+ __weak void ppboot_secure_arc(void) {}
+ __weak void hl_sram_self_repair(void) {}
+ __weak void ppboot_init_fw_info(void) {}
++__weak void ppboot_plls_init(void) {}
+ 
+ void ppboot_main(void)
+ {
+@@ -337,10 +338,12 @@
+ 	ppboot_version();
+ 	rst_src_dump();
+ 
++	ppboot_plls_init();
+ 	hl_plat_init();
+ 
+ 	preboot_delay();
+ 
++	/* SRAM PLLs must be configured before running BIST operations */
+ 	hl_sram_self_repair();
+ 
+ 	ppboot_init_fw_info();
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 9c14a06..f856645 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -467,9 +467,6 @@
+ 
+ 	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
+ 
+-	/* Configure SRAM PLLs before running BIST operations */
+-	gaudi2_sram_pll_init();
+-
+ 	/* If FW_ALL reset then skip bist */
+ 	if (hl_rst_src_get() == HL_FW_ALL_RST) {
+ 		preboot_puts("bist skipped for 48MB SRAM during FW_ALL reset\n");
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index 7c745ea..9bc9354 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -22,6 +22,5 @@
+ void run_arc(u8 id);
+ void preboot_pcie_monitoring(void);
+ void init_arc_mem(u8 id, u64 addr, u32 size);
+-void gaudi2_sram_pll_init(void);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */
+diff --git a/arch/gaudi2/common/pll.c b/arch/gaudi2/common/pll.c
+index 0c94277..48373ed 100644
+--- a/arch/gaudi2/common/pll.c
++++ b/arch/gaudi2/common/pll.c
+@@ -200,7 +200,7 @@
+ 	hl_pll_init(gaudi2_arch_pll_cfg, ARRAY_SIZE(gaudi2_arch_pll_cfg));
+ }
+ 
+-void gaudi2_sram_pll_init(void)
++void ppboot_plls_init(void)
+ {
+ 	hl_pll_init(gaudi2_sram_pll_cfg, ARRAY_SIZE(gaudi2_sram_pll_cfg));
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index 3b4417b..47f5ac2 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -255,6 +255,7 @@
+ void ppboot_pcie_drain_init(void);
+ void ppboot_security_init(void);
+ int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
++void ppboot_plls_init(void);
+ 
+ void preboot_main(void);
+ void preboot_version(void);

@@ -1,0 +1,96 @@
+From 4a612e96bda344c2a263e9729ffc82e2919d7b28 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 03 Aug 2021 16:20:24 +0300
+Subject: [PATCH] [SW-51026] gaudi: security: fine tune mme protect
+
+Add protection of additional bits in MME ACC and SBAB.
+Since we should keep unprotected less registers than protected, use the
+~mask.
+
+Change-Id: Ifdd0051a3c4918f557f3541eeb23ea6244dfe1f0
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi/security.c b/arch/gaudi/security.c
+index c68edf1..77b740f 100644
+--- a/arch/gaudi/security.c
++++ b/arch/gaudi/security.c
+@@ -928,27 +928,63 @@
+ 
+ #define MMES_NUM	4
+ #define MMES_DIST	0x80000
++
++static void preboot_secure_mme_acc(void)
++{
++	u32 reg, mask, prot_base, base = mmMME0_ACC_BASE & ~HL_CFG_BASE;
++	int i;
++
++	for (i = 0; i < MMES_NUM; i++) {
++		/* Set ACC to user */
++		reg = mmMME0_ACC_PROT + MMES_DIST * i;
++		regmap_writel(PROT_OVR_USER, reg);
++
++		/* blocking regs within offsets: 0 - 0x80 */
++		prot_base = base + MMES_DIST * i;
++		mask = ~(PROT_BIT(mmMME0_ACC_ACC_STALL) &
++			 PROT_BIT(mmMME0_ACC_WBC));
++		regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++		prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x80 - 0xF80 */
++		set_prot_bits_range_all(prot_base,
++					PROT_SIZE_MAX - (prot_base - base));
++	}
++}
++
++static void preboot_secure_mme_sbab(void)
++{
++	u32 reg, mask, prot_base, base = mmMME0_SBAB_BASE & ~HL_CFG_BASE;
++	int i;
++
++	for (i = 0; i < MMES_NUM; i++) {
++		/* Set SBAB to user */
++		reg = mmMME0_SBAB_PROT + MMES_DIST * i;
++		regmap_writel(PROT_OVR_USER, reg);
++
++		/* blocking regs within offsets: 0 - 0x80 */
++		prot_base = base + MMES_DIST * i;
++		mask = ~(PROT_BIT(mmMME0_SBAB_SB_STALL) &
++			 PROT_BIT(mmMME0_SBAB_ARUSER0) &
++			 PROT_BIT(mmMME0_SBAB_ARUSER1));
++		regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++		prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x80 - 0xF80 */
++		set_prot_bits_range_all(prot_base,
++					PROT_SIZE_MAX - (prot_base - base));
++	}
++}
++
+ static void preboot_secure_mme(void)
+ {
+ 	u32 reg;
+ 	int i;
+ 
+-	/* Set MME engines level to user */
++	/* Protect the ACC */
++	preboot_secure_mme_acc();
++	/* Protect the SBAB */
++	preboot_secure_mme_sbab();
++
+ 	for (i = 0; i < MMES_NUM; i++) {
+-		/* Set ACC to user */
+-		reg = mmMME0_ACC_PROT + MMES_DIST * i;
+-		regmap_writel(PROT_OVR_USER, reg);
+-		/* Protect the ACC configuration */
+-		regmap_writel(PROT_BIT(mmMME0_ACC_PROT), PRIV_PROT_REG(reg));
+-		set_prot_bits_priv_int_conf(mmMME0_ACC_BASE + MMES_DIST * i);
+-
+-		/* Set SBAB to user */
+-		reg = mmMME0_SBAB_PROT + MMES_DIST * i;
+-		regmap_writel(PROT_OVR_USER, reg);
+-		/* Protect the SBAB configuration */
+-		regmap_writel(PROT_BIT(mmMME0_SBAB_PROT), PRIV_PROT_REG(reg));
+-		set_prot_bits_priv_int_conf(mmMME0_SBAB_BASE + MMES_DIST * i);
+-
+ 		/* Set CTRL to user */
+ 		reg = mmMME0_CTRL_PROT + MMES_DIST * i;
+ 		regmap_writel(PROT_OVR_USER, reg);

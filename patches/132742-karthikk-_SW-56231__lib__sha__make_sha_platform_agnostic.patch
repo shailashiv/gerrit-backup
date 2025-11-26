@@ -1,0 +1,448 @@
+From 55849fa91a4284ba356e42da583ecdc8869dab57 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 28 Sep 2021 05:46:16 +0300
+Subject: [PATCH] [SW-56231] lib: sha: make sha platform agnostic
+
+Currently /lib/ directory in preboot supports only sha256 as hash
+algorithm. Gaudi2 needs to support sha384 has algorithm as a part
+of security. This patch makes the common code in /lib/ platform
+agnostic such that gaudi2 supports sha384 while the other platforms
+(gaudi, greco) still use sha256. This way sha specific code in the
+common /lib/ directory can be extended to support any sha variant for
+future platforms.
+
+Change-Id: I08dfad8a71671f33b163a542b55aa3c987a41aab
+---
+
+diff --git a/arch/gaudi/arm/Makefile b/arch/gaudi/arm/Makefile
+index 29b959a..f01c94e 100644
+--- a/arch/gaudi/arm/Makefile
++++ b/arch/gaudi/arm/Makefile
+@@ -6,6 +6,7 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/hbm.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/reset.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/rma_info.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/sha.c)
+ 
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
+ 
+diff --git a/arch/gaudi/arm/rma_info.c b/arch/gaudi/arm/rma_info.c
+index b1d92ad..d866724 100644
+--- a/arch/gaudi/arm/rma_info.c
++++ b/arch/gaudi/arm/rma_info.c
+@@ -16,6 +16,7 @@
+ #include "module_i2c_slave.h"
+ #include "hl_i2c_slave_events.h"
+ #include "i2cslave_indirect.h"
++#include "sha.h"
+ 
+ #define ROUND_UP4(n)	(((n) + sizeof(u32) - 1) & ~(sizeof(u32) - 1))
+ #define RMA_HEADER_ENTRY_SIZE		sizeof(struct rma_entry)
+@@ -119,7 +120,7 @@
+ 	struct hl_boot_info_ptrs ptrs;
+ 	struct hl_boot_info_desc desc;
+ 	u32 i;
+-	u8 chksum[HL_CHKSUM_SIZE];
++	u8 chksum[SHA_SUM_LEN];
+ 	int err;
+ 	u32 desc_offset, desc_start = sizeof(struct hl_boot_info_ptrs);
+ 
+@@ -155,7 +156,7 @@
+ 			return err;
+ 
+ 		sha256_csum((u8 *)data, desc.size, chksum);
+-		if (memcmp(chksum, desc.chksum, HL_CHKSUM_SIZE))
++		if (memcmp(chksum, desc.chksum, SHA_SUM_LEN))
+ 			return 1;
+ 
+ 		*size = desc.size;
+diff --git a/arch/gaudi/arm/sha.c b/arch/gaudi/arm/sha.c
+new file mode 100644
+index 0000000..c152e68
+--- /dev/null
++++ b/arch/gaudi/arm/sha.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * (C) Copyright 2021 HabanaLabs, Ltd.
++ *
++ */
++
++
++#include <preboot.h>
++#include <uart.h>
++
++#include "hl.h"
++#include <sha.h>
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
++	sha256_csum(input, ilen, output);
++}
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			 u8 *output)
++{
++	struct sha256_context ctx;
++	int i;
++
++	sha256_starts(&ctx);
++	for (i = 0; i < region_count; i++)
++		sha256_update(&ctx, region[i].data, region[i].size);
++	sha256_finish(&ctx, output);
++}
+diff --git a/arch/gaudi/arm/sha.h b/arch/gaudi/arm/sha.h
+new file mode 100644
+index 0000000..4c4d248
+--- /dev/null
++++ b/arch/gaudi/arm/sha.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <sha256.h>
++#include <preboot/fit_rsa.h>
++
++#define SHA_SUM_LEN			SHA256_SUM_LEN
++#define SHA_DER_LEN			SHA256_DER_LEN
++#define SHA_DER_PRE			sha256_der_prefix
++#define FIT_SHA				"sha256"
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output);
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			u8 *output);
+diff --git a/arch/gaudi2/common/sha.h b/arch/gaudi2/common/sha.h
+new file mode 100644
+index 0000000..e52dc57
+--- /dev/null
++++ b/arch/gaudi2/common/sha.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <sha512.h>
++#include <preboot/fit_rsa.h>
++
++#define SHA_SUM_LEN			SHA384_SUM_LEN
++#define SHA_DER_LEN			SHA384_DER_LEN
++#define SHA_DER_PRE			sha384_der_prefix
++#define FIT_SHA				"sha384"
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha384,rsa3072"
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output);
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			u8 *output);
+diff --git a/arch/greco/arc/Makefile b/arch/greco/arc/Makefile
+index 33d7b4c..5b02e80 100644
+--- a/arch/greco/arc/Makefile
++++ b/arch/greco/arc/Makefile
+@@ -6,5 +6,6 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/pll.c)
+ PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/sha.c)
+ 
+ image_validation: image_validation_preboot
+diff --git a/arch/greco/arm/Makefile b/arch/greco/arm/Makefile
+index d02991a..d0c483f 100644
+--- a/arch/greco/arm/Makefile
++++ b/arch/greco/arm/Makefile
+@@ -4,6 +4,7 @@
+ PPBOOT_MAX_SIZE := 18432
+ PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/sha.c)
+ 
+ CFLAGS += -mstrict-align
+ 
+diff --git a/arch/greco/common/sha.c b/arch/greco/common/sha.c
+new file mode 100644
+index 0000000..c152e68
+--- /dev/null
++++ b/arch/greco/common/sha.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * (C) Copyright 2021 HabanaLabs, Ltd.
++ *
++ */
++
++
++#include <preboot.h>
++#include <uart.h>
++
++#include "hl.h"
++#include <sha.h>
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
++	sha256_csum(input, ilen, output);
++}
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			 u8 *output)
++{
++	struct sha256_context ctx;
++	int i;
++
++	sha256_starts(&ctx);
++	for (i = 0; i < region_count; i++)
++		sha256_update(&ctx, region[i].data, region[i].size);
++	sha256_finish(&ctx, output);
++}
+diff --git a/arch/greco/common/sha.h b/arch/greco/common/sha.h
+new file mode 100644
+index 0000000..4c4d248
+--- /dev/null
++++ b/arch/greco/common/sha.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <sha256.h>
++#include <preboot/fit_rsa.h>
++
++#define SHA_SUM_LEN			SHA256_SUM_LEN
++#define SHA_DER_LEN			SHA256_DER_LEN
++#define SHA_DER_PRE			sha256_der_prefix
++#define FIT_SHA				"sha256"
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output);
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			u8 *output);
+diff --git a/lib/preboot/boot_info.c b/lib/preboot/boot_info.c
+index 1e20cec..3ed5d1e 100644
+--- a/lib/preboot/boot_info.c
++++ b/lib/preboot/boot_info.c
+@@ -9,7 +9,7 @@
+ #include <preboot.h>
+ #include <hl_boot_desc.h>
+ #include <common.h>
+-#include <sha256.h>
++#include <sha.h>
+ 
+ #include "boot_info.h"
+ #include "uart.h"
+@@ -79,7 +79,7 @@
+ 	for (i = 0; i < boot_info.ptrs.count; i++) {
+ 		desc = &descs[i];
+ 		src = offset2ptr(desc->offset, PREBOOT_TEXT_BASE);
+-		sha256_csum((u8 *)src, desc->size, desc->chksum);
++		sha_csum((u8 *)src, desc->size, desc->chksum);
+ 		copy_sz = ROUND_UP4(desc->size);
+ 
+ 		for (j = 0; j < copy_sz / sizeof(u32); j++)
+@@ -169,7 +169,7 @@
+ 	struct hl_boot_info_ptrs ptrs;
+ 	struct hl_boot_info_desc desc;
+ 	u32 *offsets, i, cpy_sz;
+-	u8 chksum[HL_CHKSUM_SIZE];
++	u8 chksum[SHA_SUM_LEN];
+ 	void *src;
+ 
+ 	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
+@@ -192,8 +192,8 @@
+ 		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
+ 		boot_info_memcpy32(data, src, cpy_sz);
+ 
+-		sha256_csum((u8 *)data, desc.size, chksum);
+-		if (memcmp(chksum, desc.chksum, HL_CHKSUM_SIZE))
++		sha_csum((u8 *)data, desc.size, chksum);
++		if (memcmp(chksum, desc.chksum, SHA_SUM_LEN))
+ 			return 1;
+ 
+ 		*copy_size = cpy_sz;
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 0a06725..0724a14 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -17,7 +17,6 @@
+ #include <boot_info.h>
+ #include <lzo/lzo.h>
+ #include <hl_fw_if.h>
+-#include <sha256.h>
+ #include <types.h>
+ #include "uart.h"
+ #include "fit.h"
+@@ -25,6 +24,7 @@
+ #include "fit_regions.h"
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
++#include <sha.h>
+ 
+ #define FIT_IMAGES_PATH		"/images"
+ #define FIT_CONFS_PATH		"/configurations"
+@@ -50,9 +50,6 @@
+ #define FIT_PUB_KEY_EXT_PROP	"pub-key-ext"
+ #define FIT_LOAD_TYPE_PROP	"load-type"
+ #define FIT_PUB_KEY_HASH_PROP	"hash"
+-
+-#define FIT_SHA256			"sha256"
+-#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+ 
+ #define FIT_MAX_PATH		200
+ #define MAX_FDT_REGIONS		20
+@@ -722,25 +719,30 @@
+ 
+ 	hash = fdt_subnode_offset(fit, node, FIT_HASH_PROP);
+ 	prop = (const char *)fdt_getprop(fit, hash, FIT_ALGO_PROP, NULL);
+-	if (strcmp(prop, FIT_SHA256))
++	if (strcmp(prop, FIT_SHA))
+ 		return NULL;
+ 
+ 	return (const u8 *)fdt_getprop(fit, hash, FIT_VALUE_PROP, NULL);
++}
++
++__weak void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
+ }
+ 
+ static int fit_node_check_hash(const void *fit, int node, const u8 *buf,
+ 			       int len)
+ {
+ 	const u8 *node_hash = fit_node_get_hash(fit, node);
+-	u8 calc_hash[SHA256_SUM_LEN];
++	u8 calc_hash[SHA_SUM_LEN];
+ 
+ 	if (!node_hash) {
+ 		preboot_puts("Missing hash for loadable\n");
+ 		return 1;
+ 	}
+ 
+-	sha256_csum(buf, len, calc_hash);
+-	if (memcmp(node_hash, calc_hash, SHA256_SUM_LEN))
++	sha_csum(buf, len, calc_hash);
++	if (memcmp(node_hash, calc_hash, SHA_SUM_LEN))
+ 		return 1;
+ 
+ 	return 0;
+diff --git a/lib/preboot/fit_regions.c b/lib/preboot/fit_regions.c
+index d32c448..e89e9e6 100644
+--- a/lib/preboot/fit_regions.c
++++ b/lib/preboot/fit_regions.c
+@@ -7,7 +7,7 @@
+ #include "common.h"
+ #include "fit_rsa.h"
+ #include "fit_regions.h"
+-#include "sha256.h"
++#include "sha.h"
+ 
+ #define FDT_MAX_DEPTH	8
+ 
+@@ -162,14 +162,7 @@
+ 	return count;
+ }
+ 
+-void sha256_csum_regions(const struct image_region region[], int region_count,
+-			 u8 *output)
++__weak void sha_csum_regions(const struct image_region region[],
++				int region_count, u8 *output)
+ {
+-	struct sha256_context ctx;
+-	int i;
+-
+-	sha256_starts(&ctx);
+-	for (i = 0; i < region_count; i++)
+-		sha256_update(&ctx, region[i].data, region[i].size);
+-	sha256_finish(&ctx, output);
+ }
+diff --git a/lib/preboot/fit_regions.h b/lib/preboot/fit_regions.h
+index 0feead5..0254526 100644
+--- a/lib/preboot/fit_regions.h
++++ b/lib/preboot/fit_regions.h
+@@ -21,8 +21,4 @@
+ 		     struct fdt_region region[], int max_regions,
+ 		     char *path, int path_len, int add_string_tab);
+ 
+-void sha256_csum_regions(const struct image_region region[], int region_count,
+-			 u8 *output);
+-
+-
+ #endif /* COMMON_FIT_REGIONS_H_ */
+diff --git a/lib/preboot/fit_rsa.c b/lib/preboot/fit_rsa.c
+index 83bf73e..036bb27 100644
+--- a/lib/preboot/fit_rsa.c
++++ b/lib/preboot/fit_rsa.c
+@@ -5,10 +5,10 @@
+ 
+ #include <libfdt.h>
+ #include "common.h"
+-#include "sha256.h"
+ #include "uart.h"
+ #include "fit_rsa.h"
+ #include "fit_regions.h"
++#include "sha.h"
+ 
+ struct rsa_public_key {
+ 	u32 len;	/* len of modulus[] in number of u32 */
+@@ -18,9 +18,9 @@
+ 	u64 exponent;	/* public exponent */
+ };
+ 
+-#define CHECKSUM_LENGTH		(SHA256_SUM_LEN)
+-#define CHECKSUM_DER_LENGTH	(SHA256_DER_LEN)
+-#define CHECKSUM_DER_PREFIX	(sha256_der_prefix)
++#define CHECKSUM_LENGTH		(SHA_SUM_LEN)
++#define CHECKSUM_DER_LENGTH	(SHA_DER_LEN)
++#define CHECKSUM_DER_PREFIX	(SHA_DER_PRE)
+ 
+ 
+ #define RSA4096_BITS		(4096)
+@@ -353,7 +353,7 @@
+ 		return 1;
+ 	}
+ 
+-	sha256_csum_regions(region, region_count, (u8 *)hash);
++	sha_csum_regions(region, region_count, (u8 *)hash);
+ 	ret = rsa_verify_key(prop, sig, sig_len, (u8 *)hash, CRYPTO_RSA_LENGTH);
+ 	preboot_puts_hex("rsa_verify_regions ret: ", ret, 0);
+ 	return ret;
+diff --git a/lib/preboot/i2cslave_indirect.c b/lib/preboot/i2cslave_indirect.c
+index e0b5a1e..d984610 100644
+--- a/lib/preboot/i2cslave_indirect.c
++++ b/lib/preboot/i2cslave_indirect.c
+@@ -25,6 +25,7 @@
+ #include "i2cslave_indirect.h"
+ #include <rma_if.h>
+ #include "rma_info.h"
++#include <sha.h>
+ 
+ #define SUPPORTED_OPCODES_MASK	( \
+ 				BIT(HL_I2CI_REQ_OP_DEVICE_INFO) | \
+@@ -467,7 +468,7 @@
+ 		FLOPS_UPD_NOOP,		/* Primary */
+ 		FLOPS_UPD_PENDING,	/* Secondary */
+ 	};
+-	u8 hash[SHA256_SUM_LEN];
++	u8 hash[SHA_SUM_LEN];
+ 	bool is_valid, is_prime;
+ 	u32 idx;
+ 	int i;
+@@ -493,7 +494,7 @@
+ 		/* Using fit image base as playground */
+ 		spi_copy((void *)mdesc.base, desc.spi_offset, desc.img_size,
+ 			 NULL);
+-		sha256_csum((void *)mdesc.base, desc.img_size, hash);
++		sha_csum((void *)mdesc.base, desc.img_size, hash);
+ 		is_valid = !memcmp(hash, desc.chksum, ARRAY_SIZE(hash));
+ 
+ 		if (is_prime)

@@ -1,0 +1,233 @@
+From 7f46451d883aa90951ff21497801247c87e1a54e Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 19 Sep 2022 13:22:55 +0300
+Subject: [PATCH] PIF LOAD DEBUG PRINTS
+
+Change-Id: If1904c1e2833fb8d16331ee6f7d5d29f712c21f8
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index bbffefa..0b20022 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -287,34 +287,50 @@
+ 	device_init_pll(); /* used for uart and delay */
+ }
+ 
+-static void ppboot_time_critical_section_start(void)
+-{
+-	/* prints are stored in mem buffer */
+-	preboot_uart_rbuf_init();
+-}
++// static void ppboot_time_critical_section_start(void)
++// {
++// 	/* prints are stored in mem buffer */
++// 	preboot_uart_rbuf_init();
++// }
+ 
+-static void ppboot_time_critical_section_end(void)
+-{
+-	preboot_uart_rbuf_flush();
+-	preboot_uart_rbuf_disable();
+-}
++// static void ppboot_time_critical_section_end(void)
++// {
++// 	preboot_uart_rbuf_flush();
++// 	preboot_uart_rbuf_disable();
++// }
+ 
+ __weak void ppboot_security_init(void) {}
+ __weak void ppboot_secure_arc(void) {}
+ __weak void hl_sram_self_repair(void) {}
+ __weak void ppboot_init_fw_info(void) {}
+ __weak void ppboot_plls_init(void) {}
+-__weak void hl_pcie_enable_elbi_access(void) {}
+-__weak void ppboot_tpm_extend(void) {}
++
++#define CPU_PLL_FREQ_MHZ	1000
++
++static inline void udelaytest(unsigned long usec)
++{
++
++	unsigned long loops = CPU_PLL_FREQ_MHZ * usec;
++
++       __asm__ __volatile__(
++       "       mov lp_count, %0        \n"
++       "       lp  1f                  \n"
++       "       nop                     \n"
++       "1:                             \n"
++       :
++        : "r"(loops)
++        : "lp_count");
++}
+ 
+ void ppboot_main(void)
+ {
+ 	u64 loadaddr;
+ 	bool ret;
++	u64 t1, t2;
+ 
+ 	ppboot_init_stack_monitor();
+ 	/************time critical section**************/
+-	ppboot_time_critical_section_start();
++	// ppboot_time_critical_section_start();
+ 	device_init();
+ 	/* Set ARCs to privileged mode */
+ 	ppboot_secure_arc();
+@@ -335,16 +351,14 @@
+ 	hl_uart_init();
+ 	spi_flash_prot_early();
+ 	ppboot_security_init();
++
++	t1 = timestamp_get_us();
++	udelaytest(1000);
++	t2 = timestamp_get_us();
++	preboot_puts_hex("1ms delay = ", t2 - t1, false);
++
+ 	hl_pcie_init();
+-	ppboot_tpm_extend();
+-	/*
+-	 * Enabling pcie elbi after ppboot_tpm_extend since elbi protection level
+-	 * is usually secured and it can access configuration space. This access
+-	 * can interfere with tpm extend.
+-	 */
+-	if (link_is_up)
+-		hl_pcie_enable_elbi_access();
+-	ppboot_time_critical_section_end();
++	// ppboot_time_critical_section_end();
+ 	/**********time critical section end************/
+ 	ppboot_pcie_drain_init();
+ 	ppboot_version();
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 8903e08..2f12ef3 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -21,7 +21,7 @@
+ 
+ u32 hl_skip_pcie_init(void)
+ {
+-	return hl_is_debug_mode(HL_DEBUG_HW_PCIE);
++	return false; //hl_is_debug_mode(HL_DEBUG_HW_PCIE);
+ }
+ 
+ u64 hl_pll_timestamp_freq_get(void)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 55ddcc8..38ea070 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -752,6 +752,7 @@
+ 	u32 addr, actual_size;
+ 	unsigned int num_crc;
+ 	int ret;
++	u64 ts_start, ts_end;
+ 
+ 	num_crc = ppboot_get_num_crc(desc->img_size);
+ 	actual_size = desc->img_size - (num_crc * CRC32_SIZE);
+@@ -761,7 +762,10 @@
+ 		return false;
+ 	}
+ 
++	ts_start = timestamp_get_us();
+ 	ret = secureboot_verify_image_hash384(desc->chksum, (unsigned char *)addr, actual_size);
++	ts_end = timestamp_get_us();
++	preboot_puts_hex64("valid_img dur ", ts_end - ts_start, false);
+ 
+ 	return !ret;
+ }
+@@ -784,6 +788,7 @@
+ 	u32 buff_addr;
+ 	u32 ccm_terminate_reg = data->cpu_cfg_base + PIF_CCM_TERM_OFF;
+ 	u32 mem_addr = ppboot_get_arc_addr(desc->loadaddr);
++	u64 ts_end1, ts_end2, ts_start;
+ 
+ 	/* By default CCM termination is enabled, should be disabled when accessing the CCMs */
+ 	regmap_writel(~CCM_TERMINATE_MASK, ccm_terminate_reg);
+@@ -794,9 +799,15 @@
+ 	 * copying PIF_ARC_CCM_SIZE of bytes, in a single memcpy the image is copied
+ 	 * from ICCM1 to PIF CCM, and the rest of the PIF CCM is initialized.
+ 	 */
++	preboot_puts_hex("copying image to ", mem_addr, false);
++	ts_start = timestamp_get_us();
+ 	memcpy((void *)mem_addr, (void *)buff_addr, PIF_ARC_CCM_SIZE);
++	ts_end1 = timestamp_get_us();
+ 	/* wait for all writes to complete */
+ 	HL_ARC_W_BARRIER();
++	ts_end2 = timestamp_get_us();
++	preboot_puts_hex64("memcpy dur ", ts_end1 - ts_start, false);
++	preboot_puts_hex64("mem_init dur ", ts_end2 - ts_start, false);
+ 
+ 	regmap_writel(CCM_TERMINATE_MASK, ccm_terminate_reg);
+ }
+@@ -821,7 +832,9 @@
+ 	enum hl_fw_img_type img_type;
+ 	u32 idx;
+ 	bool is_psoc_mem;
++	u64 ts_start, ts_end;
+ 
++	preboot_puts(">> ppboot_copy_pif_arc_img\n");
+ 	img_type = data->img_type[data->img_idx];
+ 	idx = boot_desc_get_img_desc(FLOPS_UPD_NOOP, img_type, &desc);
+ 	if (idx == HL_FW_IMG_NOT_FOUND) {
+@@ -829,6 +842,11 @@
+ 		return -1;
+ 	}
+ 
++	preboot_puts_hex("spi offset: ", desc.spi_offset, false);
++	preboot_puts_hex64("dest addr ", desc.loadaddr, false);
++	preboot_puts_hex("img size ", desc.img_size, false);
++
++	ts_start = timestamp_get_us();
+ 	dma_type = preboot_get_dma_dest_type(data->inter_buffer_addr);
+ 	is_psoc_mem = preboot_is_dma_dest_psoc_mem(data->inter_buffer_addr);
+ 
+@@ -846,10 +864,17 @@
+ 		return -1;
+ 	}
+ 
++	ts_end = timestamp_get_us();
++	preboot_puts_hex64("dma_copy dur ", ts_end - ts_start, false);
++
++	preboot_puts("spi copy finished successfully\n");
++
+ 	if (!pif_is_valid_image(data, &desc)) {
+ 		preboot_puts("pif fw hash validation failed\n");
+ 		return -1;
+ 	}
++
++	preboot_puts("image is valid\n");
+ 
+ 	pif_arc_mem_init(data, &desc);
+ 
+@@ -866,6 +891,7 @@
+ 	u32 run_req_reg = data->cpu_cfg_base + PIF_RUN_HALT_REQ_OFF;
+ 	u64 start;
+ 
++	preboot_puts(">> ppboot_run_pif_arc\n");
+ 	/* Set ARC in running state */
+ 	regmap_writel(D0_PIF_ARC_RUN_HALT_REQ_RUN_REQ_M, run_req_reg);
+ 
+@@ -892,6 +918,7 @@
+ 	u32 val;
+ 	u64 start;
+ 
++	preboot_puts(">> ppboot_halt_n_reset_pif_arc\n");
+ 	/* Check if already in reset state */
+ 	val = regmap_readl(rst_reg);
+ 	if (val & D0_PIF_ARC_ARC_RST_CORE_M)
+@@ -928,6 +955,7 @@
+ 	u32 rst_vec_reg = data->cpu_cfg_base + PIF_RST_VEC_ADDR_OFF;
+ 	u32 rst_reg = data->cpu_cfg_base + PIF_ARC_RST_OFF;
+ 
++	preboot_puts(">> ppboot_load_and_run_pif_arc\n");
+ 	ppboot_halt_n_reset_pif_arc(data->cpu_cfg_base);
+ 
+ 	/*
+@@ -959,6 +987,7 @@
+ 	}
+ 
+ 	ppboot_run_pif_arc(data);
++	preboot_puts("<< ppboot_load_and_run_pif_arc\n");
+ }
+ 
+ #define PHY_FW_FSM_ENA_MASK	(D0_PCIE_WRAP_PHY_FW_FSM_EN_M | \

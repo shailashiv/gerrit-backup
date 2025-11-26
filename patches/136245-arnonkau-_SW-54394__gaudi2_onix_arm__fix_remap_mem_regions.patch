@@ -1,0 +1,175 @@
+From e456e93cd887bce6ff4b5a80ef19969a01ecf262 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sun, 10 Oct 2021 12:57:44 +0300
+Subject: [PATCH] [SW-54394] gaudi2,onix,arm: fix remap mem regions
+
+A fix made to arc regions remapping was fixed only for the arc's
+architecture when actually it should be common to Onix platform,
+serving both arc and arm.
+
+This patch takes an existing fic done in arch/arc/onix.c
+and moves it the arch/common/onix.c
+
+[copied from the original commit]
+On onix the memory the RAM is 6M, and split into 2.
+The first 3M located on lower end of HBM0, and the other 3M located
+on the upper end of HBM3.
+
+The existing RAM's work area regions, is not suited to the limited
+memory of the Onix. The FWUPD area is not usable, Use the LKD region
+instead. the LKD region starts at offset 2M, which leave us with only
+1M, as the memory continuation is broken after 3M.
+The Region 1M-2M, is reserved for the Uboot.
+
+Change-Id: I4555074fbdeaf0df9047f3d9b10b5e7c15b51887
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/onix.c b/arch/gaudi2/arc/onix.c
+index 5a27910..605400a 100644
+--- a/arch/gaudi2/arc/onix.c
++++ b/arch/gaudi2/arc/onix.c
+@@ -8,47 +8,11 @@
+ #include <preboot.h>
+ #include <efuse.h>
+ #include <psoc_arc1_cfg_regs.h>
+-#include <uart.h>
+-#include <memory.h>
+ #include <string.h>
+-#include "common.h"
+ 
+ #define EFUSE_SYSCFG_ONIX_DEFAULT	0
+ 
+ #define SDRAM_BASE_FULL	0x1001000200000000ull
+-
+-/*
+- * because of ONIX RAM size and layout limitation,
+- * both MEM_LKD_PCI and MEM_FWUPD_PCI, are overlapped.
+- *
+- * This table is used by the preboot_get_dev_spec_mem_region.
+- * the original function is defined as a weak function
+- *
+- * the MEM_LKD_PCI start in 2MB offset leaving a 1MB for downloaded
+- * images. the upper 3MB was not tested yet, so it was so using
+- * this arrangement, of using the lower segment up to 1MB and overllap it with
+- *  the LKD seems a fine solution for the ONIX.
+- *  NOTE: it is worth checking if using the upper 3MB
+- *  will work out of the box. if it will not, stay with the current solution.
+- */
+-static struct mem_desc mem_desc[MEM_NOENT] = {
+-	[MEM_GP] = {
+-		.base = MEM_GP_BASE,
+-		.size = MEM_GP_SZ,
+-	},
+-	[MEM_LKD_PCI] = {
+-		.base = MEM_LKD_PCI_BASE,
+-		.size = MEM_LKD_PCI_SZ,
+-	},
+-	[MEM_FWUPD_PCI] = {
+-		.base = MEM_LKD_PCI_BASE,
+-		.size = MEM_LKD_PCI_SZ,
+-	},
+-	[MEM_I2C] = {
+-		.base = MEM_GP_BASE,
+-		.size = MEM_GP_SZ,
+-	},
+-};
+ 
+ u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+ {
+@@ -88,23 +52,6 @@
+ 	 */
+ 	regmap_writel(SRAM_EXTENSION_MSB, mmPSOC_ARC1_CFG_SRAM_MSB_ADDR);
+ 	regmap_writel(0x0, mmPSOC_ARC1_CFG_SRAM_LSB_ADDR);
+-}
+-
+-int preboot_get_dev_spec_mem_region(enum mem_region region,
+-					   struct mem_desc *desc)
+-{
+-	if (region >= MEM_NOENT) {
+-		preboot_puts_hex("unknown region = ", region, true);
+-		return 1;
+-	}
+-
+-	if (!desc)
+-		return 1;
+-
+-	desc->base = mem_desc[region].base;
+-	desc->size = mem_desc[region].size;
+-
+-	return 0;
+ }
+ 
+ void preboot_init_pcie_phy(void) {}
+diff --git a/arch/gaudi2/common/onix.c b/arch/gaudi2/common/onix.c
+index c4ebe18..61cb7cf 100644
+--- a/arch/gaudi2/common/onix.c
++++ b/arch/gaudi2/common/onix.c
+@@ -9,9 +9,42 @@
+ #include <psoc_global_conf_regs.h>
+ #include <cmd_module.h>
+ #include <uart.h>
+-
++#include <memory.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	35000000ULL
++
++/*
++ * because of ONIX RAM size and layout limitation,
++ * both MEM_LKD_PCI and MEM_FWUPD_PCI, are overlapped.
++ *
++ * This table is used by the preboot_get_dev_spec_mem_region.
++ * the original function is defined as a weak function
++ *
++ * the MEM_LKD_PCI start in 2MB offset leaving a 1MB for downloaded
++ * images. the upper 3MB was not tested yet, so it was so using
++ * this arrangement, of using the lower segment up to 1MB and overllap it with
++ *  the LKD seems a fine solution for the ONIX.
++ *  NOTE: it is worth checking if using the upper 3MB
++ *  will work out of the box. if it will not, stay with the current solution.
++ */
++static struct mem_desc mem_desc[MEM_NOENT] = {
++	[MEM_GP] = {
++		.base = MEM_GP_BASE,
++		.size = MEM_GP_SZ,
++	},
++	[MEM_LKD_PCI] = {
++		.base = MEM_LKD_PCI_BASE,
++		.size = MEM_LKD_PCI_SZ,
++	},
++	[MEM_FWUPD_PCI] = {
++		.base = MEM_LKD_PCI_BASE,
++		.size = MEM_LKD_PCI_SZ,
++	},
++	[MEM_I2C] = {
++		.base = MEM_GP_BASE,
++		.size = MEM_GP_SZ,
++	},
++};
+ 
+ 
+ u32 hl_skip_pcie_init(void)
+@@ -41,6 +74,23 @@
+ 	return NOT_FOUND;
+ }
+ 
++int preboot_get_dev_spec_mem_region(enum mem_region region,
++					   struct mem_desc *desc)
++{
++	if (region >= MEM_NOENT) {
++		preboot_puts_hex("unknown region = ", region, true);
++		return 1;
++	}
++
++	if (!desc)
++		return 1;
++
++	desc->base = mem_desc[region].base;
++	desc->size = mem_desc[region].size;
++
++	return 0;
++}
++
+ void hl_dev_ts_init(void) {}
+ 
+ void hl_ts_shutdown(void) {}

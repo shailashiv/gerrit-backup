@@ -1,0 +1,105 @@
+From 8025cd3b6e19acf6dfc11a5a638e372d9a84faa6 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Mon, 26 Apr 2021 18:03:42 +0300
+Subject: [PATCH] [SW-37130] spi-flash: restructure spi_prot status
+
+To further optimize the time in spi_prot() before PCIe link is up,
+spi protection status check and associated print are moved
+to preboot. Also Current numerical value is restored with more human
+readable strings.
+
+Change-Id: I870d713945d0c705b95d79383d3971a77aab1fbc
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/common/spi.c b/common/spi.c
+index fc5c81a..0228506 100644
+--- a/common/spi.c
++++ b/common/spi.c
+@@ -256,7 +256,7 @@
+ 	*regs = mmPSOC_SPI_CTRLR0;
+ }
+ 
+-static void spi_init(void)
++void spi_init(void)
+ {
+ 	u32 baudr;
+ 
+@@ -289,19 +289,6 @@
+ 	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+ 	sr |= PROT_MASK;
+ 	spi_common_write(CMD_WRITE_STATUS, &sr, sizeof(sr), 1);
+-	sr = 0; /* reset old value before read */
+-	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-
+-	/* Avoided long string prints before pci link is enabled.
+-	 * So added following numerical prints instead.
+-	 * '6' means "Flash may be protected, depend on WP# signal"
+-	 * '7' means "Flash is not protected"
+-	 */
+-	if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD)
+-				&& !(sr & READ_STATUS_WEL))
+-		preboot_puts("6\n");
+-	else
+-		preboot_puts("7\n");
+ }
+ 
+ __weak void spi_prot_early(void)
+@@ -311,6 +298,24 @@
+ 
+ __weak void spi_prot_late(void) {}
+ 
++void spi_prot_status(void)
++{
++	unsigned char sr = 0;
++
++	if (!spi_initialized) {
++		preboot_puts("spi not initialized\n");
++		return;
++	}
++
++	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
++
++	if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD)
++				&& !(sr & READ_STATUS_WEL))
++		preboot_puts("Flash may be protected, depend on WP# signal\n");
++	else
++		preboot_puts("Flash is not protected\n");
++}
++
+ void spi_copy_otp(void *dst, unsigned int offset, unsigned int size)
+ {
+ 	spi_init();
+diff --git a/include/spi.h b/include/spi.h
+index f55d118..f52d28f 100644
+--- a/include/spi.h
++++ b/include/spi.h
+@@ -27,6 +27,7 @@
+ #define PROT_MASK			ALL_PROT_MASK
+ #endif
+ 
++void spi_init(void);
+ void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name);
+ void spi_copy_otp(void *dst, unsigned int offset, unsigned int size);
+ unsigned int get_cs_pad_sel(void);
+@@ -34,5 +35,6 @@
+ int spi_erase(unsigned int offset, unsigned int size);
+ void spi_prot_early(void);
+ void spi_prot_late(void);
++void spi_prot_status(void);
+ 
+ #endif /* _HL_SPI_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 756c742..0d9f3ac 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -349,7 +349,9 @@
+ 
+ 	hl_uart_init();
+ 
++	spi_init();
+ 	spi_prot_late();
++	spi_prot_status();
+ 
+ 	preboot_sp_sram_init();
+ 

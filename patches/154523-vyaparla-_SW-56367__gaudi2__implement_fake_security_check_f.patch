@@ -1,0 +1,151 @@
+From 16dc84a8cb1a74655fb1d6fe525b9489475dd3c7 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 07 Dec 2021 15:26:11 +0200
+Subject: [PATCH] [SW-56367] gaudi2: implement fake security check function
+
+This change adds fake security check support in preboot.
+To reduce processing in ppboot pre-linkup, pcie rrs are blocked
+unconditionally in ppboot, and based on the security enable
+criteria, it opens up these rr's in preboot in case secuirty is
+disabled and continues other rr configurations in case security
+is enabled
+
+Change-Id: I26e54b5504c2c4f27ae1af6fc567196535673256
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 7315b93..c01add1 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -332,6 +332,7 @@
+ 	u32 data_size, rst_src;
+ 	u32 nic_en_local;
+ 	u32 fw_upd_is_dis = 0;
++	u32 fake_security = 0;
+ 
+ 	if (!boot_info_get(HL_BOOT_INFO_FIT_BOOT_ERROR, &boot_err,
+ 			   sizeof(boot_err), &data_size)) {
+@@ -383,6 +384,18 @@
+ 		 */
+ 		fw_info.reset_cause = HL_FW_RESET_CAUSE_UNKNOWN;
+ 	}
++
++	/*
++	 * Preserve fake security boot info if exists. This info will be later utilized by u-boot,
++	 * zephyr, and agent to check whether fake security is enabled or not
++	 */
++	if (!boot_info_get(HL_BOOT_INFO_FAKE_SECURITY, &fake_security,
++				sizeof(fake_security), &data_size)) {
++		preboot_puts_hex("Preserving fake security boot info:", fake_security, 0);
++		if (boot_info_set(HL_BOOT_INFO_FAKE_SECURITY, &fake_security,
++					sizeof(fake_security)))
++			preboot_puts("Failed to preserve fake security boot info\n");
++	}
+ }
+ 
+ __weak void hl_set_reset_cause(uint32_t reset_cause) {}
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 723af20..0c73a54 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -442,6 +442,14 @@
+ 
+ bool preboot_security_is_enabled(void)
+ {
++	if (preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK))
++		return true;
++
++	return preboot_fake_security_is_enabled();
++}
++
++bool preboot_sec_is_enabled_in_efuse(void)
++{
+ 	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK);
+ }
+ 
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 6cb3795..f748692 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -435,6 +435,15 @@
+ 	if (hl_is_security_strap_enabled())
+ 		return true;
+ 
++	if (preboot_sec_efuse_is_set(EFUSE_SECURITY_ENABLE_BIT))
++		return true;
++
++	return preboot_fake_security_is_enabled();
++
++}
++
++bool preboot_sec_is_enabled_in_efuse(void)
++{
+ 	return preboot_sec_efuse_is_set(EFUSE_SECURITY_ENABLE_BIT);
+ }
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index e463f38..da461be 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -57,6 +57,8 @@
+ #include <boot_if.h>
+ #include <security.h>
+ #include <spi_flash.h>
++#include <boot_info.h>
++#include <hl_boot_desc.h>
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+@@ -83,6 +85,9 @@
+ 	(_g) < (GPIOS_PER_BANK * 4) ? mmPSOC_GPIO3_BASE :	\
+ 	(_g) < (GPIOS_PER_BANK * 5) ? mmPSOC_GPIO4_BASE :	\
+ 	(_g) < (GPIOS_PER_BANK * 6) ? mmPSOC_GPIO5_BASE : 0; })
++
++static u32 fake_security;
++static bool is_fake_sec_read;
+ 
+ static uint64_t hl_gpio_to_bank(int gpio)
+ {
+@@ -121,6 +126,22 @@
+ 
+ 	/* Set GPIO direction to output */
+ 	regmap_writel(gpio_pin_mask, gpio_reg_addr + HL_GPIO_OUTENSET);
++}
++
++bool preboot_fake_security_is_enabled(void)
++{
++	u32 actual_sz;
++
++	if (!is_fake_sec_read) {
++		if (boot_info_get(HL_BOOT_INFO_FAKE_SECURITY, &fake_security,
++					sizeof(fake_security), &actual_sz)) {
++			preboot_puts("Preboot: Failed to read fake security boot info\n");
++			fake_security = 0;
++		}
++		is_fake_sec_read = true;
++	}
++
++	return !!fake_security;
+ }
+ 
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+@@ -302,7 +323,7 @@
+ 	 * PCI_IDS_GAUDI2_SEC : 0x1030
+ 	 */
+ 	/* If security is enabled set the PCI ID accordingly*/
+-	if (preboot_security_is_enabled())
++	if (preboot_sec_is_enabled_in_efuse())
+ 		pci_dev_id = PCI_IDS_GAUDI2_SEC;
+ 
+ 	/* using vendor id as a magic number */
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 3795e74..fd23547 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -197,4 +197,6 @@
+ };
+ 
+ void gaudi2_axi_drain_ena(void);
++bool preboot_sec_is_enabled_in_efuse(void);
++bool preboot_fake_security_is_enabled(void);
+ #endif /* ARCH_GAUDI2_COMMON_COMMON_H_ */

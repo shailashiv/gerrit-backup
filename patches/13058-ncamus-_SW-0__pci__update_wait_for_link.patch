@@ -1,0 +1,59 @@
+From 8e119808dcbcd24f898d585a6df43309312e4af6 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Mon, 27 May 2019 17:23:19 +0300
+Subject: [PATCH] [SW-0] pci: update wait for link
+
+Make it more like Goya to make sure we handle LTSSM properly both in
+cold power and also on PRSTn when host is rebooted.
+
+Note that we used CPLD which do not create RSTn on PRSTn
+
+Change-Id: I5f8f186e9d6dc19bc89f384ae7f01e02d8733c8e
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 8205883..0cef19a 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -7,6 +7,7 @@
+ 
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_aux_regs.h>
++#include <pcie_core_regs.h>
+ 
+ #include <preboot.h>
+ #include <pll.h>
+@@ -21,12 +22,31 @@
+ 		;
+ 
+ 	while (1) {
+-		unsigned int smlh, rdlh;
++		unsigned int prstn, ltssm, smlh, rdlh;
+ 
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+ 		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+-		if (smlh && rdlh)
++
++		if (prstn && smlh && rdlh)
+ 			break;
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
+ 	}
+ }
+ 

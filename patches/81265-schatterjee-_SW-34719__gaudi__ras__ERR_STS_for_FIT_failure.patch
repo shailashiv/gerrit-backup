@@ -1,0 +1,118 @@
+From fd64a784398ff192e9dc53fd053b66ab6e03b3af Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Tue, 09 Mar 2021 19:18:22 +0200
+Subject: [PATCH] [SW-34719] gaudi: ras: ERR_STS for FIT failure
+
+Support added for direct command ERR_STS (242) via
+i2c slave. In this current patch ERR_STS reg values
+are updated in case of FIT and security failures.
+On receiving this ERR_STS status BMC can further read
+indirect "Error Status" opcode for more details.
+
+Change-Id: I0f6ef801701e1fddb50672ec9a1a992a8d7a8ac8
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 3d093d8..4162534 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -237,6 +237,28 @@
+ 	return ret;
+ }
+ 
++#define ERR_STS_REG_MASK_LOW	0xFF
++#define ERR_STS_REG_MASK_HI	0xFF00
++u8 i2cslave_error_status_cmd(u8 cmd)
++{
++	switch (cmd) {
++	case HL_ERROR_STATUS_ALERT_CAUSE_1:
++		/* clear the low byte as reg is RC(read and clear) */
++		err_sts_reg_val &= ERR_STS_REG_MASK_HI;
++		/* return the stored low byte */
++		return (err_sts_reg_val & ERR_STS_REG_MASK_LOW);
++	case HL_ERROR_STATUS_ALERT_CAUSE_2:
++		/* clear the high byte as reg is RC(read and clear) */
++		 err_sts_reg_val &= ERR_STS_REG_MASK_LOW;
++		/* return the stored high byte */
++		return ((err_sts_reg_val & ERR_STS_REG_MASK_HI) >> 8);
++	default:
++		break;
++	}
++
++	return 0;
++}
++
+ static inline u8 *i2cslave_consume_hw(u8 *data, u8 cnt)
+ {
+ 	register u8 val = (u8)regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index 41637c7..298e165 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -14,8 +14,10 @@
+ 	)
+ 
+ extern u32 device_id_vendor_id;
++extern u32 err_sts_reg_val;
+ 
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd);
++u8 i2cslave_error_status_cmd(u8 cmd);
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq);
+ u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt);
+ void i2cslave_handle_sync_error(void);
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 5bfe950..cdcca79 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -46,6 +46,13 @@
+ 	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+ 		ret = i2cslave_pcie_vendor_id_cmd(cmd);
+ 		break;
++	case HL_ERROR_STATUS_CODE:
++		ret = HL_ERROR_STATUS_CMD_LEN;
++		break;
++	case HL_ERROR_STATUS_ALERT_CAUSE_1:
++	case HL_ERROR_STATUS_ALERT_CAUSE_2:
++		ret = i2cslave_error_status_cmd(cmd);
++		break;
+ 	case HL_INDIRECT_REQ_STS_CODE:
+ 		ret = HL_I2CI_REQ_STS_LEN;
+ 		break;
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 583ca4a..ba5521c 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -26,6 +26,7 @@
+ #include "pll.h"
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
++#include "hl_i2c_slave_events.h"
+ 
+ static u64 preboot_en_caps;
+ 
+@@ -249,6 +250,7 @@
+ }
+ 
+ u32 device_id_vendor_id;
++u32 err_sts_reg_val = 0;
+ 
+ static inline void preboot_retrieve_device_id_from_pcie(void)
+ {
+@@ -268,11 +270,16 @@
+ 		case HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION:
+ 		case HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE:
+ 			cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
++			/* set FIT error bit of ERR_STS cmd */
++			err_sts_reg_val |= HL_ERROR_STATUS_OTHER |
++					       (HL_ERROR_STATUS_OTHER_FIT << 8);
+ 			break;
+ 		case HL_FW_FIT_BOOT_ERR_REVOKED_KEY:
+ 		case HL_FW_FIT_BOOT_ERR_SVN:
+ 		case HL_FW_FIT_BOOT_ERR_SIGNATURE:
+ 			cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_FAIL, true);
++			/* set Security error bit of ERR_STS cmd */
++			err_sts_reg_val |= HL_ERROR_STATUS_SECURITY;
+ 			break;
+ 		}
+ 

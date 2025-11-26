@@ -1,0 +1,97 @@
+From e2429addd517222f8353ac966f809356aea543f7 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Thu, 13 Dec 2018 21:24:57 +0200
+Subject: [PATCH] [SW-0] Update PCIs flow for Gaudi
+
+Since most HW issues in Goya were fixed now for Gaudi SW got no left
+part in PCie initialization
+
+Change-Id: Ifb6bf3c45337339754c20fb7ee0cdfea497c881b
+---
+
+diff --git a/preboot.c b/preboot.c
+index f9b6635..b2d2d21 100644
+--- a/preboot.c
++++ b/preboot.c
+@@ -46,13 +46,6 @@
+ #define PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
+ #define frame_size_bits(b)		((b) << 16)
+ 
+-/* Use DumpSel[8] to skip PCIe initialization */
+-#ifdef DEV_IS_GOYA
+-#define SKIP_PCIE_INIT BIT(21)
+-#else
+-#define SKIP_PCIE_INIT BIT(16)
+-#endif
+-
+ #define VERSION_MAX_LEN	128
+ #define STR_UINT_SZ	8
+ 
+@@ -421,11 +414,15 @@
+ 			break;
+ 	}
+ }
++
++/* Use DumpSel[8] to skip PCIe initialization */
++#define SKIP_PCIE_INIT BIT(21)
+ #else
+ #define preboot_delay()
++#define SKIP_PCIE_INIT BIT(16)
+ #endif
+ 
+-#if defined (DEV_IS_GOYA) && !defined(TARGET_IS_PLDM)
++#if defined (DEV_IS_GOYA)
+ static int preboot_wait_for_bit(unsigned long reg, unsigned long timeout_ns)
+ {
+ 	unsigned int val;
+@@ -479,19 +476,10 @@
+ 			break;
+ 	}
+ }
+-#else
+-#define preboot_wait_for_ext_ld_done()
+-#define preboot_wait_for_stable_pclk()
+-#endif
+ 
+ /* Handle PCIe errata: make sure reset_n de-asserted only after perst */
+-static void preboot_pcie_init(void)
++static void preboot_pcie_wait_for_link(void)
+ {
+-	if (readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS) & SKIP_PCIE_INIT) {
+-		preboot_puts("PCIe initialization is skipped!\n");
+-		return;
+-	}
+-
+ 	preboot_wait_for_ext_ld_done();
+ 
+ 	/* Wait for PRSTn */
+@@ -534,7 +522,29 @@
+ 			continue;
+ 		}
+ 	}
++}
++#else
++static void preboot_pcie_wait_for_link(void)
++{
++	while (1) {
++		unsigned int smlh, rdlh;
+ 
++		smlh = readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = readl(mmPCIE_AUX_RDLH_LINK_UP);
++		if (smlh && rdlh)
++			break;
++	}
++}
++#endif
++
++static void preboot_pcie_init(void)
++{
++	if (readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS) & SKIP_PCIE_INIT) {
++		preboot_puts("PCIe initialization is skipped!\n");
++		return;
++	}
++
++	preboot_pcie_wait_for_link();
+ 	preboot_puts("PCIe link is UP!\n");
+ }
+ 

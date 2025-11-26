@@ -1,0 +1,137 @@
+From 06c0dd6888b8ec00fd8888ed0648bbd447891c62 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 28 Sep 2021 05:44:45 +0300
+Subject: [PATCH] [SW-56231] gaudi2: add sha384 support
+
+Use sha384 for fit validation functions for gaudi2.
+
+Change-Id: I5793cb3267fa4545c9430c1490a9f02df107f769
+---
+
+diff --git a/arch/gaudi2/arc/security.c b/arch/gaudi2/arc/security.c
+index 36cd8e6..121f2fe 100644
+--- a/arch/gaudi2/arc/security.c
++++ b/arch/gaudi2/arc/security.c
+@@ -9,7 +9,7 @@
+ #include <preboot.h>
+ #include <string.h>
+ #include <uart.h>
+-#include <sha256.h>
++#include <sha512.h>
+ #include <gaudi2/gaudi2_security.h>
+ 
+ #define EFUSE_SYSCFG_ENABLE_VALIDATION_MASK	BIT(10)
+@@ -45,7 +45,7 @@
+ {
+ 	u32 key_base, hash_calculated, hash_stored;
+ 	u8 bytes_per_dword = sizeof(u32);
+-	u8 value[SHA256_SUM_LEN];
++	u8 value[SHA384_SUM_LEN];
+ 	u8 key[KEY_SIZE];
+ 	u8 i;
+ 
+@@ -67,7 +67,7 @@
+ 	memcpy(key, pub_key, pub_key_len);
+ 	memcpy((key + pub_key_len), pub_key_ext, pub_key_ext_len);
+ 
+-	sha256_csum(key, pub_key_len + pub_key_ext_len, value);
++	sha384_csum(key, pub_key_len + pub_key_ext_len, value, 0);
+ 
+ 	key_base = (key_idx * bytes_per_dword * SECURITY_DWORD_PER_KEY)
+ 			+ SECURITY_EFUSE_KEYS_OFFSET;
+diff --git a/arch/gaudi2/arm/asic.c b/arch/gaudi2/arm/asic.c
+index 28c6061..e2d9783 100644
+--- a/arch/gaudi2/arm/asic.c
++++ b/arch/gaudi2/arm/asic.c
+@@ -8,7 +8,7 @@
+ #include <string.h>
+ #include <bitops.h>
+ #include <preboot.h>
+-#include <sha256.h>
++#include <sha512.h>
+ #include <boot_desc.h>
+ 
+ #define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
+@@ -30,9 +30,9 @@
+ 
+ bool ppboot_is_valid_img_desc(struct boot_desc *desc)
+ {
+-	u8 hash[SHA256_SUM_LEN];
++	u8 hash[SHA384_SUM_LEN];
+ 
+-	sha256_csum((void *)(uintptr_t)desc->loadaddr, desc->img_size, hash);
++	sha384_csum((void *)(uintptr_t)desc->loadaddr, desc->img_size, hash, 0);
+ 
+ 	return !memcmp(hash, desc->chksum, ARRAY_SIZE(hash));
+ }
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 2191722..c03cd3d 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -4,6 +4,7 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/axuser.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/sha.c)
+ 
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+diff --git a/arch/gaudi2/common/sha.c b/arch/gaudi2/common/sha.c
+new file mode 100644
+index 0000000..ff56b4b
+--- /dev/null
++++ b/arch/gaudi2/common/sha.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * (C) Copyright 2021 HabanaLabs, Ltd.
++ *
++ */
++
++
++#include <preboot.h>
++#include <uart.h>
++
++#include "hl.h"
++#include <sha.h>
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
++	sha384_csum(input, ilen, output, 0);
++}
++
++void sha_csum_regions(const struct image_region region[], int region_count,
++			 u8 *output)
++{
++	struct sha512_context ctx;
++	int i;
++
++	sha384_starts(&ctx);
++	for (i = 0; i < region_count; i++)
++		sha384_update(&ctx, region[i].data, region[i].size);
++	sha384_finish(&ctx, output);
++}
+diff --git a/include/boot_desc.h b/include/boot_desc.h
+index 67f261a..cd2defa 100644
+--- a/include/boot_desc.h
++++ b/include/boot_desc.h
+@@ -10,7 +10,7 @@
+ #include <preboot.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_desc.h>
+-#include <sha256.h>
++#include <sha.h>
+ 
+ #define HL_FW_IMG_NOT_FOUND	((u32)-1)
+ 
+@@ -19,7 +19,7 @@
+ 	u32 spi_offset;
+ 	u32 img_size;
+ 	u64 loadaddr;
+-	u8 chksum[SHA256_SUM_LEN];
++	u8 chksum[SHA_SUM_LEN];
+ };
+ 
+ /*

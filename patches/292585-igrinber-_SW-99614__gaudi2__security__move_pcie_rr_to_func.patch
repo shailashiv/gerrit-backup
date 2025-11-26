@@ -1,0 +1,68 @@
+From 89f88da7a52d774245bedf9467cd9cca21860c9e Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 16 Jan 2023 21:38:46 +0200
+Subject: [PATCH] [SW-99614] gaudi2: security: move pcie rr to func
+
+To prepare for leaning the Ppboot and eROM PCIe code, extract the
+PCIe RR security functionality to a function of its own.
+This will allow later patches to better garbage-collect the unused code.
+
+Change-Id: If0fad6d11008dcac07590e5c5064593dc42592b7
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index ee595cc..83b8697 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -937,6 +937,25 @@
+ 	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
+ }
+ 
++static void hl_secure_hbw_pcie_rr(int rr_idx, u64 min, u64 max, bool if_rtr)
++{
++	/* Apart from the pcie mstr if, pcie traffic is also routed
++	 * through dcore0 rtr0 if. Hence configuring pcie mstr if range
++	 * registers alone is not enough to block/allow pcie traffic.
++	 * The dcore0 rtr0 is therefore coupled with pcie rr configuration.
++	 */
++	hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_HBW_NUM, HL_SEC_ENGINE_PCIE);
++
++	/*
++	 * In case noc is already enabled along with pcie, then dcore0 rtr0 is configured
++	 * as a part of noc select itself, hence not required to reconfigure in such case.
++	 */
++	if (if_rtr)
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_RTR_NUM,
++							HL_SEC_ENGINE_IF_RTR);
++
++}
++
+ static void hl_secure_hbw_rr(int rr_idx, u64 min, u64 max, struct hl_rr_eng_select rr_sel)
+ {
+ 	int i;
+@@ -951,21 +970,9 @@
+ 		}
+ 	}
+ 
+-	if (rr_sel.pcie) {
+-		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_HBW_NUM, HL_SEC_ENGINE_PCIE);
+-		/* Apart from the pcie mstr if, pcie traffic is also routed
+-		 * through dcore0 rtr0 if. Hence configuring pcie mstr if range
+-		 * registers alone is not enough to block/allow pcie traffic.
+-		 * The dcore0 rtr0 is therefore coupled with pcie rr configuration.
+-		 */
+-		/*
+-		 * In case noc is already enabled along with pcie, then dcore0 rtr0 is configured
+-		 * as a part of noc select itself, hence not required to reconfigure in such case.
+-		 */
+-		if (!rr_sel.noc)
+-			hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_RTR_NUM,
+-						HL_SEC_ENGINE_IF_RTR);
+-	}
++	/* no need to configure noc (IF RTR) twice, so if set, it is already done - pass false */
++	if (rr_sel.pcie)
++		hl_secure_hbw_pcie_rr(rr_idx, min, max, !rr_sel.noc);
+ 
+ 	if (rr_sel.psoc)
+ 		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PSOC_INST_NUM, HL_SEC_ENGINE_PSOC);

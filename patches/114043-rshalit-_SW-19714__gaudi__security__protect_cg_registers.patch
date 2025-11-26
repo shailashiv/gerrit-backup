@@ -1,0 +1,145 @@
+From 035c7663d3e40a16c2988cda66da7d337695080a Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Tue, 20 Jul 2021 13:19:47 +0300
+Subject: [PATCH] [SW-19714] gaudi: security: protect cg registers
+
+Protect all clock gating registers in QMAN using protection bits,
+as part of security requirements.
+These protection was already expected to be in version before,
+but it was found that it is missing.
+
+Change-Id: I5b60a4a5e05246bd4a4688ee14e3ac4c8e8fa5c8
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index eba153f..292de74 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -18,6 +18,7 @@
+ #include <mme0_sbab_regs.h>
+ #include <mme0_ctrl_regs.h>
+ #include <tpc0_cfg_regs.h>
++#include <tpc0_qm_regs.h>
+ #include <nic0_qpc0_regs.h>
+ #include <nic0_rxb_regs.h>
+ #include <nic0_rxe0_regs.h>
+@@ -519,6 +520,27 @@
+ 	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX - (prot_base - base));
+ }
+ 
++static void preboot_secure_qm(u32 base)
++{
++	u32 mask, prot_base = base;
++
++	/*
++	 * offsets: 0 - 0xC00 - allowed access
++	 * offset: 0xC00 - 0xC80 as following:
++	 */
++	prot_base = base + SNGL_REG_PROT_SIZE * 24;
++	mask = (PROT_BIT(mmTPC0_QM_CGM_CFG) &
++		PROT_BIT(mmTPC0_QM_CGM_CFG1));
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	/*
++	 * offset: 0xC80 - 0xE80 - allowed access
++	 * offset: 0xE80 - 0xF80 as following:
++	 */
++	prot_base += SNGL_REG_PROT_SIZE * 5;
++	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX - (prot_base - base));
++}
++
+ #define DMA_DIST		0x20000
+ #define DMA_ENGINES		4
+ #define DMA_CHANNELS		8
+@@ -538,11 +560,13 @@
+ 		preboot_secure_dma_if_down_regs(prot_base);
+ 	}
+ 
+-	/* Protect open pages of DMA CORE and DMA QM */
++	/* Protect open pages of DMA CORE */
+ 	for (i = 0; i < DMA_CHANNELS; i++) {
+ 		base = i * DMA_DIST;
+ 		set_prot_bits_priv_int_conf(mmDMA0_CORE_BASE + base);
+-		set_prot_bits_priv_int_conf(mmDMA0_QM_BASE + base);
++		/* Protect the QM */
++		prot_base = base + (mmDMA0_QM_BASE & ~HL_CFG_BASE);
++		preboot_secure_qm(prot_base);
+ 	}
+ }
+ 
+@@ -943,8 +967,9 @@
+ 			regmap_writel(1, reg);
+ 		}
+ 
+-		/* protect QM priv and conf bits */
+-		set_prot_bits_priv_int_conf(mmMME0_QM_BASE + MMES_DIST * i);
++		/* Protect the QM */
++		reg = (MMES_DIST * i) + (mmMME0_QM_BASE & ~HL_CFG_BASE);
++		preboot_secure_qm(reg);
+ 
+ 		/* close the clock back */
+ 		if (i & BIT(0)) {
+@@ -976,8 +1001,9 @@
+ 		reg = mmTPC0_E2E_CRED_BASE & ~HL_CFG_BASE;
+ 		set_prot_bits_range_all(reg + TPCS_DIST * i, PROT_SIZE_MAX);
+ 
+-		/* Protect the QM priv and int conf bits */
+-		set_prot_bits_priv_int_conf(mmTPC0_QM_BASE + TPCS_DIST * i);
++		/* Protect the QM */
++		reg = (mmTPC0_QM_BASE & ~HL_CFG_BASE) + TPCS_DIST * i;
++		preboot_secure_qm(reg);
+ 	}
+ }
+ 
+@@ -1055,15 +1081,28 @@
+ 		base = nic_off + mmNIC0_MAC_AUX_BASE;
+ 		set_prot_bits_priv_int_conf(base);
+ 
+-		/* QM[0-1] */
+-		base = nic_off + mmNIC0_QM0_BASE;
+-		set_prot_bits_priv_int_conf(base);
+-		set_prot_bits_priv_int_conf(base + NIC_QM_DIST);
+-
+ 		/* TXB */
+ 		base = nic_off + mmNIC0_TXB_BASE;
+ 		set_prot_bits_priv_int_conf(base);
+ 	}
++}
++
++static void preboot_secure_nic_qm_pages(u32 base)
++{
++	u32 port;
++
++	for (port = 0; port < GAUDI_NICS_NUM; port++) {
++		preboot_secure_qm(base);
++		base += GAUDI_NICS_DIST;
++	}
++}
++
++static void preboot_secure_nic_qm(void)
++{
++	u32 base = mmNIC0_QM0_BASE & ~HL_CFG_BASE;
++
++	preboot_secure_nic_qm_pages(base);
++	preboot_secure_nic_qm_pages(base + NIC_QM_DIST);
+ }
+ 
+ /* registers 0xF60-0xF80 are allowed access */
+@@ -1093,7 +1132,7 @@
+ {
+ 	u32 reg, mask;
+ 
+-	/* STAT, MAC CORE/AUX, QMs, TXB */
++	/* STAT, MAC CORE/AUX, TXB */
+ 	preboot_secure_nic_open_pages();
+ 
+ 	/* QPC */
+@@ -1143,6 +1182,7 @@
+ 	preboot_secure_prot_nics_engs_regs(reg, mask, 1);
+ 
+ 	preboot_secure_nic_phy();
++	preboot_secure_nic_qm();
+ }
+ 
+ #define SRAM_BANKS_NUM	32

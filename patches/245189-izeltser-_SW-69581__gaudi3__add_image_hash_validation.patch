@@ -1,0 +1,100 @@
+From 0a3c1bfda2e2e661b79d7501ac20dc86307edaf1 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 16 Aug 2022 12:29:06 +0300
+Subject: [PATCH] [SW-69581] gaudi3: add image hash validation
+
+In Gaudi3 SPI flash each image descriptor holds sha384 hash value of
+it's image. In order to validate the image, the sha384 hash should be
+calculated on the actual data, and compared with the hash in the
+boot descriptor.
+
+Change-Id: I6a5ee5c10450b47fc518c9a3f7bcb548b3529f5f
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index f2c6abe..dfc8c1f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -43,6 +43,7 @@
+ #include <efuse.h>
+ #include <arcboot_export_dev.h>
+ #include <address_space.h>
++#include <boot_desc.h>
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -432,3 +433,57 @@
+ 
+ 	return false;
+ }
++
++static u32 ppboot_get_arc_addr(u64 addr)
++{
++	u32 arc_addr = (u32)(addr & ARC_ADDR_MASK);
++
++	if (addr >= HL_SRAM_BASE_FULL && addr < HL_SRAM_BASE_FULL + SDRAM_SIZE)
++		return (arc_addr + SRAM_MEM_REGION_BASE);
++
++	if (addr >= HL_FW_MEM_BASE_FULL && addr < HL_FW_MEM_BASE_FULL + HL_FW_MEM_SIZE) {
++		if (addr >= ARC1_ICCM_FULL_BASE && addr < ARC1_ICCM_FULL_BASE + ARC1_ICCM_SIZE)
++			return arc_addr; /* access local iccm via mem region 0 */
++
++		return (arc_addr + FW_MEM_REGION_BASE);
++	}
++
++	if (addr >= HL_CFG_MEM_BASE_FULL && addr < HL_CFG_MEM_BASE_FULL + HL_CFG_MEM_SIZE)
++		return (arc_addr + HL_CFG_BASE);
++
++	return (u32)(~0);
++}
++
++#define CRC32_SIZE		4
++#define MAX_DMA_SIZE		0xFFF0
++#define MAX_DMA_SIZE_CRC	(MAX_DMA_SIZE + CRC32_SIZE)
++
++static unsigned int ppboot_get_num_crc(u32 size)
++{
++	unsigned int num_crc;
++
++	num_crc = size / MAX_DMA_SIZE_CRC;
++	if (size % MAX_DMA_SIZE_CRC)
++		num_crc++;
++
++	return num_crc;
++}
++
++bool ppboot_is_valid_img_desc(struct boot_desc *desc)
++{
++	u32 addr, actual_size;
++	unsigned int num_crc;
++	int ret;
++
++	num_crc = ppboot_get_num_crc(desc->img_size);
++	actual_size = desc->img_size - (num_crc * CRC32_SIZE);
++	addr = ppboot_get_arc_addr(desc->loadaddr);
++	if (addr == (u32)(~0)) {
++		preboot_puts_hex64("unsupported img address ", addr, false);
++		return false;
++	}
++
++	ret = secureboot_verify_image_hash384(desc->chksum, (unsigned char *)addr, actual_size);
++
++	return !ret;
++}
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 44bccc4..79a4e49 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -17,6 +17,11 @@
+ #define HL_SP_SRAM_SIZE			SZ_64K
+ #define HL_FW_SRAM_FULL_BASE		0x300007FD3140000ULL
+ #define HL_FW_SRAM_SIZE			SZ_128K
++#define HL_SRAM_BASE_FULL		0x200fffffd000000ULL
++#define HL_FW_MEM_BASE_FULL		0x300007FD0000000ULL
++#define HL_FW_MEM_SIZE			SZ_256M
++#define HL_CFG_MEM_BASE_FULL		0x300007FFC000000ULL
++#define HL_CFG_MEM_SIZE			SZ_64M
+ 
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)

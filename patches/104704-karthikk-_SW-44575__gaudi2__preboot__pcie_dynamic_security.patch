@@ -1,0 +1,197 @@
+From 022a61dd45f329bc2d79479b121ac26092a7e765 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 08 Nov 2021 03:55:06 +0200
+Subject: [PATCH] [SW-44575] gaudi2: preboot: pcie dynamic security
+
+In order to add security in firmware, the access of sram memory to
+host are limited to mandatory regions (eg.fit images) and the others
+are blocked. This is done by blocking the pcie access using pcie
+range registers
+
+Change-Id: I032105001265d01b99b1401332e2f9730487f570
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 87d9dde..3dc07c9 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -6,6 +6,8 @@
+  */
+ 
+ #include <preboot.h>
++#include <uart.h>
++#include <memory.h>
+ #include <gaudi2/gaudi2.h>
+ #include <gaudi2_blocks.h>
+ #include <security.h>
+@@ -153,9 +155,28 @@
+ 	HL_SEC_HBW_STM = 0,
+ 	HL_SEC_HBW_SPI_FLASH = 1,
+ 	HL_SEC_HBW_ICCM0_TO_RAZWI = 2,
++	HL_SEC_HBW_SRAM_BGN = 3,
++	HL_SEC_HBW_SRAM_IMG = 4,
+ 	HL_SEC_HBW_SRAM = 6,
++	/*
++	 * SRAM END points to the first byte of HBM
++	 * hence a full rr needs to be used.
++	 */
++	HL_SEC_HBW_SRAM_END = HL_SEC_HBW_SRAM,
+ 	HL_SEC_HBW_HBM = 7,
+ 	HL_SEC_HBW_MAX_RR_IDX = 10,
++};
++
++enum preboot_sec_dyn_rr_window {
++	SRAM_BGN_TO_IMG = 0,
++	IMAGE,
++	IMG_END_TO_SRAM_END,
++};
++
++struct preboot_sec_dyn_pcie_rr_cfg {
++	int rr;
++	u64 min;
++	u64 max;
+ };
+ 
+ #define DCORE_DIST	0x200000
+@@ -269,6 +290,26 @@
+ 		.max_full.hi = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_HI_0,
+ 		.hit_wr_breg = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AW,
+ 		.hit_rd_breg = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
++	},
++};
++
++#define SRAM_END	(SRAM_BASE_ADDR + SRAM_SIZE)
++
++static struct preboot_sec_dyn_pcie_rr_cfg preboot_sec_dyn_cfg[] = {
++	[SRAM_BGN_TO_IMG] = {
++		.rr = HL_SEC_HBW_SRAM_BGN,
++		.min = SRAM_BASE_ADDR,
++		.max = 0,	/* sram start to image start */
++	},
++	[IMAGE] = {
++		.rr = HL_SEC_HBW_SRAM_IMG,
++		.min = 0,
++		.max = 0,	/* image */
++	},
++	[IMG_END_TO_SRAM_END] = {
++		.rr = HL_SEC_HBW_SRAM_END,
++		.min = 0,
++		.max = SRAM_END,	/* image end to sram end */
+ 	},
+ };
+ 
+@@ -676,6 +717,114 @@
+ 	hl_secure_hbw(rr_sel);
+ }
+ 
++static void hl_secure_dyn_rr_cfg(int rr_idx, u64 min64, u64 max64)
++{
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++	/* Block pcie RR for dyn rr */
++	rr_sel.pcie = true;
++	/*
++	 * PCIE shares noc rtrs.
++	 * TODO: Refine based on specific
++	 * rtrs.
++	 */
++	rr_sel.noc = true;
++
++	hl_secure_hbw_rr(rr_idx, min64, max64, rr_sel);
++}
++
++#define IMAGE_OFFSET_MASK		0xF00000
++
++static u64 hl_calc_mem_region_full_addr(uintptr_t img_base)
++{
++	u32 img_offs;
++
++	img_offs = img_base & IMAGE_OFFSET_MASK;
++
++	return SRAM_BASE_ADDR + img_offs;
++}
++
++void preboot_security_dynamic_init(void)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	struct mem_desc mdesc;
++	u64 img_max, image_base_full;
++	int i;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	/* Initialize image related configuration with default settings */
++	preboot_get_mem_region(MEM_LKD_PCI, &mdesc);
++	image_base_full = hl_calc_mem_region_full_addr(mdesc.base);
++	img_max = image_base_full + mdesc.size;
++	preboot_sec_dyn_cfg[SRAM_BGN_TO_IMG].max = image_base_full;
++	preboot_sec_dyn_cfg[IMAGE].min = image_base_full;
++	preboot_sec_dyn_cfg[IMAGE].max = img_max;
++	preboot_sec_dyn_cfg[IMG_END_TO_SRAM_END].min = img_max;
++
++	/* Apply all already known configurations */
++	for (i = SRAM_BGN_TO_IMG; i <= IMG_END_TO_SRAM_END; i++) {
++		cfg = &preboot_sec_dyn_cfg[i];
++
++		if (cfg->rr >= 0 && cfg->min && cfg->max)
++			hl_secure_dyn_rr_cfg(cfg->rr, cfg->min, cfg->max);
++	}
++}
++
++void preboot_security_dynamic_img_sram_open(enum mem_region img_region,
++				enum preboot_mem_access_mode mode)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	struct mem_desc mdesc;
++	u64 img_max, image_base_full;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	switch (img_region) {
++	case MEM_LKD_PCI:
++	case MEM_FWUPD_PCI:
++		if (preboot_get_mem_region(img_region, &mdesc))
++			preboot_puts_hex("SEC: failed requesting mem region ",
++					 img_region, false);
++		break;
++	default:
++		preboot_puts_hex("SEC: forbidden opening mem region ",
++				 img_region, false);
++		return;
++	}
++
++	/* Move the image window to the requested image memory region */
++	image_base_full = hl_calc_mem_region_full_addr(mdesc.base);
++	img_max = image_base_full + mdesc.size;
++	preboot_sec_dyn_cfg[SRAM_BGN_TO_IMG].max = image_base_full;
++	preboot_sec_dyn_cfg[IMAGE].min = image_base_full;
++	preboot_sec_dyn_cfg[IMAGE].max = img_max;
++	preboot_sec_dyn_cfg[IMG_END_TO_SRAM_END].min = img_max;
++
++	/* Apply the new window limits */
++	cfg = &preboot_sec_dyn_cfg[SRAM_BGN_TO_IMG];
++	hl_secure_dyn_rr_cfg(cfg->rr, cfg->min, cfg->max);
++	cfg = &preboot_sec_dyn_cfg[IMG_END_TO_SRAM_END];
++	hl_secure_dyn_rr_cfg(cfg->rr, cfg->min, cfg->max);
++
++	/* TODO: Check mode based opening possibility for gaudi2 */
++	/* Finally open the image memory space */
++	hl_secure_dyn_rr_cfg(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
++}
++
++void preboot_security_dynamic_img_sram_close(void)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg = &preboot_sec_dyn_cfg[IMAGE];
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	hl_secure_dyn_rr_cfg(cfg->rr, cfg->min, cfg->max);
++}
++
+ void ppboot_security_init(void)
+ {
+ 	preboot_secure_arc();

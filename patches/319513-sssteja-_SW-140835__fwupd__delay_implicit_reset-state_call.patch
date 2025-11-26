@@ -1,0 +1,55 @@
+From dc37a81136fbeeb46b09a20ee96f4da34aaa3c96 Mon Sep 17 00:00:00 2001
+From: sai surya teja <sssteja@habana.ai>
+Date: Wed, 19 Apr 2023 06:40:24 +0300
+Subject: [PATCH] [SW-140835] fwupd: delay implicit reset-state call
+
+This patch aligns erom and preboot based on the patch below:
+https://gerrit.habana-labs.com/#/c/255080/
+
+Any kind of FIT error during fwupd procedure will stall for few minutes
+using IB.
+
+The original scenario was observed on a secured machine and a corrupted
+FIT image. The FW rejected the update request as it was aware of the FIT
+error.
+The acknowledge appears immediately in the console. But the FWL doesn't
+receive any indication about it, as it should have,
+by receiving the SRAM_RUN error status FIT.
+
+It appears that the fit error happens always when the preboot is in
+"fast" mode. In order to send a status with a message back the preboot
+should be in "slow" mode. A flag is set and the command module switch
+the mode to slow, planing on sending the error status to the FWL. The
+problem is, that because of the error path, an internal "reset state"
+is invoked cleaning the flag.
+
+This patch moved the call to reset-state to a later time, after the
+error status is read by the host and send a RST_STATE request.
+
+Change-Id: I92ee9ba952f0d54f008e3dd97820478f7b398080
+---
+
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index 3a932f5..a1943b5 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -734,6 +734,8 @@
+ 		preboot_puts("FW UPD prepare ERROR_STATUS\n");
+ 		module_fwupd_push_error_status(state);
+ 		state->sending_error_flag = false;
++		state->run_mode = NOT_FOUND;
++		return;
+ 	}
+ 
+ 	switch (state->wfc_cmd.cmd) {
+@@ -761,9 +763,7 @@
+ 	 *       be kept open until an explicit request for RST_STATE invoked
+ 	 *       by the host arrives.
+ 	 */
+-	if (err) {
+-		module_fwupd_internal_reset_state(state);
+-	} else if (state->exec_res == NOT_FOUND) {
++	if (!err && state->exec_res == NOT_FOUND) {
+ 		state->wfc_cmd.val = 0;	/* NOOP - clear cmds state machine */
+ 		state->cmd.val = 0;	/* NOOP */
+ 	}

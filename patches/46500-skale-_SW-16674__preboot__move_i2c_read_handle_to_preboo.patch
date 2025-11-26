@@ -1,0 +1,204 @@
+From b47a3d1ed7fa6c2588b96804b930f8edd6f753c5 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 05 Aug 2020 10:26:23 +0300
+Subject: [PATCH] [SW-16674] preboot: move i2c read handle to preboot
+
+Since i2c module is moved to common folder which will be used
+by both preboot and recovery image, we need to make sure that
+command request from I2C handled by preboot and recovery should
+be only those which they are expected to handle. In order to achieve
+this, i2cslave_handle_read_req function is moved to preboot only file.
+
+At later part, i2cslave_handle_read_req will be added in recovery file
+which handles its own commands.
+
+Change-Id: I292b2844d03883d665b72b077f27a7e89ad5e615
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 547e8d2..6ce1ee5 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -13,30 +13,17 @@
+ #include <pcie_dbi_regs.h>
+ #include <preboot.h>
+ #include <preboot/thermal.h>
++#include <hl_i2c_slave_events.h>
+ 
+ #include "cmd_module.h"
+ #include "pll.h"
+ #include "uart.h"
+ #include "common.h"
++#include "module_i2c_slave.h"
+ 
+ #define I2C_SLAVE_ADDRESS_DBG		0x47
+-#define HL_DEVICE_STATUS_LINUX		0x0
+-#define HL_DEVICE_STATUS_PREBOOT	0x1
+ 
+-#define HL_DEVICE_STATUS_CMD_CODE_LEN		0x1
+-#define HL_PCIE_VENDOR_ID_CMD_CODE_LEN		0x16
+-
+-static unsigned int cmd;
+-static unsigned int read_bytes_count;
+-
+-enum preboot_i2c_slave_event_id {
+-	HL_ASIC_TEMP_CMD_CODE = 0,
+-	HL_ASIC_TEMP_MAX_VAL = 3,
+-	HL_PCIE_VENDOR_ID_VAL_LOW = 9,
+-	HL_PCIE_VENDOR_ID_VAL_HIGH = 10,
+-	HL_DEVICE_STATUS_CMD_CODE = 165,
+-	HL_DEVICE_STATUS = 166,
+-};
++static struct module_i2c_data data;
+ 
+ static void hl_i2c_slave_init(bool debug_mode)
+ {
+@@ -194,12 +181,12 @@
+ 	preboot_puts("I2C SLAVE: disabled\n");
+ }
+ 
+-static char i2cslave_pcie_vendor_id_cmd(int command_idx, int bytes_count)
++char i2cslave_pcie_vendor_id_cmd(int command_idx)
+ {
+ 	char ret;
+ 	unsigned int data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+ 
+-	switch (command_idx + bytes_count) {
++	switch (command_idx) {
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+ 		data &= 0xFFFF;
+ 		ret = (data & 0xFF00) >> 8;
+@@ -216,36 +203,6 @@
+ 	return ret;
+ }
+ 
+-static int i2cslave_handle_read_req(void)
+-{
+-	int max_tmp, ret;
+-
+-	switch (cmd) {
+-	case HL_ASIC_TEMP_CMD_CODE:
+-	case HL_ASIC_TEMP_MAX_VAL:
+-		max_tmp = hl_ts_get_max_temp();
+-		/* Convert from mC to C */
+-		ret = max_tmp / 1000;
+-		break;
+-	case HL_DEVICE_STATUS_CMD_CODE:
+-		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
+-		break;
+-	case HL_DEVICE_STATUS:
+-		ret = HL_DEVICE_STATUS_PREBOOT;
+-		break;
+-	case HL_PCIE_VENDOR_ID_VAL_LOW:
+-	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		ret = i2cslave_pcie_vendor_id_cmd(cmd, read_bytes_count);
+-		break;
+-	default:
+-		/* NA */
+-		ret = 0;
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+ void module_i2c_s_run_fast(void)
+ {
+ 	unsigned int stat;
+@@ -255,9 +212,9 @@
+ 
+ 	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) {
+ 		if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK) {
+-			read_bytes_count = 0;
++			data.read_bytes_count = 0;
+ 
+-			cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
++			data.cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
+ 
+ 			/* clear read request */
+ 			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+@@ -268,8 +225,8 @@
+ 			stat = i2c_dw_read_clear_intrbits_slave();
+ 		}
+ 
+-		ret = i2cslave_handle_read_req();
+-		read_bytes_count++;
++		ret = i2cslave_handle_read_req(&data);
++		data.read_bytes_count++;
+ 		regmap_writel(ret, mmPSOC_I2C_S_IC_DATA_CMD);
+ 		preboot_puts("I2C SLAVE: read request processed\n");
+ 	}
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+new file mode 100644
+index 0000000..a5a66c3
+--- /dev/null
++++ b/common/module_i2c_slave.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _MODULE_I2C_SLAVE_H_
++#define _MODULE_I2C_SLAVE_H_
++
++struct module_i2c_data {
++	unsigned int cmd;
++	unsigned int read_bytes_count;
++};
++
++char i2cslave_pcie_vendor_id_cmd(int command_idx);
++int i2cslave_handle_read_req(struct module_i2c_data *data);
++
++#endif /* _MODULE_I2C_SLAVE_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+new file mode 100644
+index 0000000..627b37c
+--- /dev/null
++++ b/preboot/module_i2c_slave.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <preboot.h>
++#include <hl_i2c_slave_events.h>
++
++#include "thermal.h"
++#include "module_i2c_slave.h"
++
++int i2cslave_handle_read_req(struct module_i2c_data *data)
++{
++	int max_tmp, ret;
++
++	switch (data->cmd) {
++	case HL_ASIC_TEMP_CMD_CODE:
++	case HL_ASIC_TEMP_MAX_VAL:
++		max_tmp = hl_ts_get_max_temp();
++		/* Convert from mC to C */
++		ret = max_tmp / 1000;
++		break;
++	case HL_DEVICE_STATUS_CMD_CODE:
++		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
++		break;
++	case HL_DEVICE_STATUS:
++		ret = HL_DEVICE_STATUS_UBOOT;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++		ret = i2cslave_pcie_vendor_id_cmd(data->cmd +
++						data->read_bytes_count);
++		break;
++	default:
++		/* NA */
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}

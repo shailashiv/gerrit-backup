@@ -1,0 +1,448 @@
+From 9bbc074e6ff0fedd8a31b19e914c065a631954b8 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 21 Jun 2021 11:44:45 +0300
+Subject: [PATCH] [SW-46313] security: enable sram sf access
+
+Enable read access to SRAM and SPI address ranges when a special FIT is
+transferred via ELBI interface to open/close access.
+While the SPI access is open, no SPI transaction from preboot is allowed
+and any SPI transaction is ignored and result with an error message.
+SRAM and SF access is not allowed in case that HBM init have failed.
+
+Change-Id: Iea60b5047905661062de457c1c0d3fd7278e5b70
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/spi.c b/common/spi.c
+index 0711fae..ebabf42 100644
+--- a/common/spi.c
++++ b/common/spi.c
+@@ -47,6 +47,20 @@
+ 
+ static unsigned int spi_regs;
+ static bool spi_initialized;
++static bool spi_access_is_locked;
++
++void spi_lock_access(bool is_lock)
++{
++	spi_access_is_locked = is_lock;
++}
++
++static inline bool spi_is_locked(void)
++{
++	if (spi_access_is_locked)
++		preboot_puts("spi access is locked\n");
++
++	return spi_access_is_locked;
++}
+ 
+ /*
+  * SSI device Chip Select (CS0) is combined with GPIO53
+@@ -242,6 +256,9 @@
+ 	unsigned int cmd = CMD_ERASE;
+ 	int ret;
+ 
++	if (spi_is_locked())
++		return 1;
++
+ 	for (i = 0; i < size; i += PAGE_SIZE) {
+ 		ret = spi_common_write(cmd | __builtin_bswap32(offset + i), NULL, 0, sizeof(cmd));
+ 		if (ret)
+@@ -261,6 +278,9 @@
+ 	u32 baudr;
+ 
+ 	if (spi_initialized)
++		return;
++
++	if (spi_is_locked())
+ 		return;
+ 
+ 	baudr = hl_spi_baudr_get();
+@@ -283,6 +303,9 @@
+ void spi_prot(void)
+ {
+ 	unsigned char sr;
++
++	if (spi_is_locked())
++		return;
+ 
+ 	spi_init();
+ 
+@@ -307,6 +330,9 @@
+ 		return;
+ 	}
+ 
++	if (spi_is_locked())
++		return;
++
+ 	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+ 
+ 	if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD)
+@@ -318,6 +344,9 @@
+ 
+ void spi_copy_otp(void *dst, unsigned int offset, unsigned int size)
+ {
++	if (spi_is_locked())
++		return;
++
+ 	spi_init();
+ 	spi_char_cmd_csel(SPINOR_OP_ENSO, NULL);
+ 	spi_read(dst, offset, size);
+@@ -326,6 +355,9 @@
+ 
+ void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name)
+ {
++	if (spi_is_locked())
++		return;
++
+ 	spi_init();
+ 	spi_read(dst, offset, size);
+ 
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 26724de..29c5d3a 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -265,6 +265,7 @@
+ 		preboot_set_enabled_cap(HL_FW_EN_CAPS_MEM_CLR);
+ 		preboot_puts("finished\n");
+ 		preboot_security_hbm_pci_open_ro();
++		preboot_set_hbm_init(true);
+ 	}
+ }
+ 
+diff --git a/gaudi/common.c b/gaudi/common.c
+index e648613..9fd5231 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -515,6 +515,7 @@
+ }
+ 
+ static struct hl_nic_en nic_en;
++static bool hbm_is_init;
+ 
+ #define NIC_PHY_RX_CFG_OFFSET	0x10
+ #define NIC_PORT_EN		0
+@@ -552,3 +553,22 @@
+ 	if (nic_en.is_valid)
+ 		boot_info_set(HL_BOOT_INFO_NIC_EN, &nic_en.bitmask, sizeof(u32));
+ }
++
++void preboot_set_hbm_init(bool is_init)
++{
++	hbm_is_init = is_init;
++}
++
++int preboot_set_sram_sf_access(bool is_enable)
++{
++	if (is_enable && !hbm_is_init) {
++		preboot_puts("SRAM and SF access is disabled while HBM is not initialized\n");
++		return 1;
++	}
++
++	spi_lock_access(is_enable);
++	preboot_security_sram_pci_set_ro(is_enable);
++	preboot_security_sf_pci_set_ro(is_enable);
++
++	return 0;
++}
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 6cba60b..4ec9ec4 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -66,6 +66,7 @@
+ 
+ int gaudi_hbm_init(void);
+ u32 preboot_get_vendor_id_device_id(void);
++void preboot_set_hbm_init(bool is_init);
+ 
+ #endif /* __ASSEMBLY__ */
+ #endif /* COMMON_GAUDI_H_ */
+diff --git a/include/preboot.h b/include/preboot.h
+index 336e155..cf1bde4 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -203,6 +203,8 @@
+ void preboot_device_id_init(void);
+ u32 preboot_device_id_get(void);
+ 
++int preboot_set_sram_sf_access(bool is_enable);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/include/spi.h b/include/spi.h
+index f52d28f..ef934a7 100644
+--- a/include/spi.h
++++ b/include/spi.h
+@@ -9,6 +9,7 @@
+ #define _HL_SPI_H_
+ 
+ #include <bitops.h>
++#include <stdbool.h>
+ 
+ /* The Status Register (SR) in use bits definition */
+ #define READ_STATUS_WIP			BIT(0)
+@@ -36,5 +37,6 @@
+ void spi_prot_early(void);
+ void spi_prot_late(void);
+ void spi_prot_status(void);
++void spi_lock_access(bool is_lock);
+ 
+ #endif /* _HL_SPI_H_ */
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index c6bedfe..476774c 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -394,6 +394,7 @@
+ static void module_fwupd_reset_state_secure(struct fwupd_state *state)
+ {
+ 	module_fwupd_reset_state(state);
++	preboot_set_sram_sf_access(false);
+ 	preboot_security_dynamic_img_sram_close();
+ 	preboot_security_dynamic_img_spsram_close();
+ }
+@@ -638,6 +639,7 @@
+ 	 * we do not allow mapping of SRAM and SPSRAM at the same time -
+ 	 * close both.
+ 	 */
++	preboot_set_sram_sf_access(false);
+ 	preboot_security_dynamic_img_sram_close();
+ 	preboot_security_dynamic_img_spsram_close();
+ 
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index c67e44e..1f58755 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -13,6 +13,7 @@
+ #include <security.h>
+ #include <crc32.h>
+ #include <memory.h>
++#include <fit_load_type.h>
+ 
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
+@@ -25,6 +26,9 @@
+ 	struct comms_command do_cmd;
+ 	enum cmd_check_res exec_res;
+ 	unsigned int next_size;
++	bool is_elbi_desc;
++	bool is_load_fit;
++	u32 fit_load_type;
+ };
+ 
+ static struct lkd_status sts;
+@@ -105,19 +109,61 @@
+ 	return err;
+ }
+ 
++static int module_lkd_sram_sf_access(void *fit)
++{
++	int err;
++	const void *data = 0;
++
++	err = fit_image_get_loadable_data(fit, &data, sizeof(u32));
++	if (!err)
++		err = preboot_set_sram_sf_access(*(u32 *)data);
++
++	return err;
++}
++
++static int lkd_get_image_addr(struct mem_desc *desc)
++{
++	int err = 0;
++
++	if (sts.is_elbi_desc) {
++		desc->base = (uintptr_t)FIT_IMG_SPSRAM_BASE;
++		desc->size = FIT_IMG_SPSRAM_MAX_SIZE;
++	} else {
++		/*
++		 * For non-ELBI descriptor, the same SRAM addr is used for both
++		 * the descriptor and the image.
++		 */
++		err = preboot_get_mem_region(MEM_LKD_PCI, desc);
++	}
++
++	return err;
++}
++
+ static int module_lkd_run_fast_exec(void)
+ {
+-	struct mem_desc desc;
+ 	struct lkd_fw_comms_msg *mcomms;
++	struct mem_desc desc;
+ 	int err;
+ 
+-	err = preboot_get_mem_region(MEM_LKD_PCI, &desc);
++	err = lkd_get_image_addr(&desc);
+ 	if (err)
+ 		return err;
+ 
+-	mcomms = (struct lkd_fw_comms_msg *)desc.base;
++	if (!sts.is_load_fit) {
++		mcomms = (struct lkd_fw_comms_msg *)desc.base;
+ 
+-	return module_lkd_msg_process(mcomms);
++		return module_lkd_msg_process(mcomms);
++	}
++
++	switch (sts.fit_load_type) {
++	case FIT_LOAD_TYPE_SRAM_SF_ACCESS:
++		err = module_lkd_sram_sf_access((void *)desc.base);
++		break;
++	default:
++		err = 1;
++	}
++
++	return err;
+ }
+ 
+ static void module_lkd_reset_state(void)
+@@ -127,6 +173,9 @@
+ 	sts.cmd.val = 0;
+ 	sts.wfc_cmd.val = 0;
+ 	sts.do_cmd.val = 0;
++	sts.is_elbi_desc = false;
++	sts.is_load_fit = false;
++	sts.fit_load_type = 0;
+ }
+ 
+ static void module_lkd_run_fast_noop(void)
+@@ -168,6 +217,7 @@
+ 	/* check the command we got before waiting for sync */
+ 	switch (sts.do_cmd.cmd) {
+ 	case COMMS_PREP_DESC:
++	case COMMS_PREP_DESC_ELBI:
+ 	case COMMS_DATA_RDY:
+ 		res = FOUND_SLOW_RETURN;
+ 		break;
+@@ -212,6 +262,7 @@
+ 		res = module_lkd_check_noop();
+ 		break;
+ 	case COMMS_PREP_DESC:
++	case COMMS_PREP_DESC_ELBI:
+ 		sts.next_size = sts.cmd.size;
+ 		/* no break */
+ 	case COMMS_CLR_STS:
+@@ -267,6 +318,9 @@
+ 		/* no break */
+ 	case COMMS_PREP_DESC:
+ 		cmd_str = cmd_str ?: "prep_desc";
++		/* no break */
++	case COMMS_PREP_DESC_ELBI:
++		cmd_str = cmd_str ?: "prep_desc_elbi";
+ 		/* no break */
+ 	case COMMS_DATA_RDY:
+ 		cmd_str = cmd_str ?: "data_rdy";
+@@ -324,25 +378,43 @@
+ 	int err;
+ 	struct mem_desc desc;
+ 
++	preboot_set_sram_sf_access(false);
+ 	preboot_security_dynamic_img_sram_close();
++	preboot_security_dynamic_img_spsram_close();
+ 
+-	err = preboot_get_mem_region(MEM_LKD_PCI, &desc);
++	err = lkd_get_image_addr(&desc);
+ 	if (err) {
+ 		preboot_puts("LKD: failed requesting memory\n");
+ 		return err;
+ 	}
+ 
+-	/* validate if shared memory has fit image */
+-	err = fit_load_images((void *)desc.base);
+-	if (!err) {
+-		sts.exec_res = FOUND_NO_RETURN;
+-		return 0;
++	err = fit_get_load_type((void *)desc.base, &sts.fit_load_type);
++	sts.is_load_fit = !err;
++
++	if (!sts.is_load_fit) {
++		/* shared mem doesn't contain fit image. */
++		err = module_lkd_msg_validate(desc.base);
++		if (err)
++			sts.exec_res = NOT_FOUND;
++
++		return err;
+ 	}
+ 
+-	/* shared mem doesn't contain fit image. */
+-	err = module_lkd_msg_validate(desc.base);
+-	if (err)
+-		sts.exec_res = NOT_FOUND;
++	switch (sts.fit_load_type) {
++	case FIT_LOAD_TYPE_SRAM_SF_ACCESS:
++		sts.exec_res = FOUND_FAST_RETURN;
++		break;
++	case FIT_LOAD_TYPE_RUN:
++		/* validate if shared memory has fit image */
++		err = fit_load_images((void *)desc.base);
++		if (!err)
++			sts.exec_res = FOUND_NO_RETURN;
++
++		break;
++	default:
++		preboot_puts("LKD: Unknown FIT load type\n");
++		err = 1;
++	}
+ 
+ 	return err;
+ }
+@@ -358,7 +430,7 @@
+ 
+ static int module_lkd_prep_desc(int size, u32 *offset)
+ {
+-	struct mem_desc mdesc;
++	struct mem_desc mdesc, img_desc;
+ 	struct lkd_fw_comms_desc *cdesc;
+ 	int err;
+ 	const char *preboot_ver, *fuse_data;
+@@ -383,7 +455,12 @@
+ 	memcpy(cdesc->fuse_ver, fuse_data, VERSION_MAX_LEN);
+ 	preboot_ver = preboot_get_version(PREBOOT_BTL_VER);
+ 	memcpy(cdesc->cur_fw_ver, preboot_ver, VERSION_MAX_LEN);
+-	cdesc->img_addr = mdesc.base;
++
++	err = lkd_get_image_addr(&img_desc);
++	if (err)
++		return err;
++
++	cdesc->img_addr = img_desc.base;
+ 
+ 	/* Header */
+ 	cdesc->header.magic = HL_COMMS_DESC_MAGIC;
+@@ -392,10 +469,11 @@
+ 	cdesc_data_off = (u8 *)cdesc + sizeof(cdesc->header);
+ 	cdesc->header.crc32 = crc32(0, cdesc_data_off, cdesc->header.size);
+ 
+-	/* the same SRAM addr is used for both the descriptor and the image */
+ 	*offset = (u32)mdesc.base;
+ 
+ 	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
++	if (sts.is_elbi_desc)
++		preboot_security_dynamic_img_spsram_open();
+ 
+ 	return err;
+ }
+@@ -408,6 +486,8 @@
+ 	/* depending on the current state machine, perform action */
+ 	switch (sts.do_cmd.cmd) {
+ 	case COMMS_PREP_DESC:
++	case COMMS_PREP_DESC_ELBI:
++		sts.is_elbi_desc = sts.do_cmd.cmd == COMMS_PREP_DESC_ELBI;
+ 		err = module_lkd_prep_desc(sts.next_size, &offset);
+ 		if (err)
+ 			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 27a038d..f7cb575 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -450,3 +450,9 @@
+ 	pending_error.error = 0;
+ 	return *major;
+ }
++
++__weak int preboot_set_sram_sf_access(bool is_enable)
++{
++	return 1;
++}
++

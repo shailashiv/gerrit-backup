@@ -1,0 +1,89 @@
+From caf189ee7317e352d83ace5311f09b53e992dd41 Mon Sep 17 00:00:00 2001
+From: Peleg Vigodny <pvigodny@habana.ai>
+Date: Thu, 08 Sep 2022 16:25:05 +0300
+Subject: [PATCH] [SW-102141] erom: tpm: allow time for init
+
+When waiting for TPM initialization, we poll until successfully
+reading TPM_ACCESS_VALID from SPI or timing out after 2000 MS.
+
+However, if the device is not initialized the first SPI reads might
+themselves time out. This fix changes the behavior in such case to keep
+trying to read the status from SPI within the 2000-MS timeout period
+instead of failing initialization.
+
+Change-Id: I85e82ad413a6dd2c28650b41a166389e5ae74e8d
+Signed-off-by: Peleg Vigodny <pvigodny@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+index fd32f44..9366a5b 100644
+--- a/arch/gaudi2/common/tpm2.c
++++ b/arch/gaudi2/common/tpm2.c
+@@ -277,6 +277,7 @@
+  * @addr: register address to read from
+  * @buffer: provided by caller
+  * @len: number of bytes to read
++ * @silent: Do not issue an error message in case of timeout
+  *
+  * Read len bytes from TPM register and put them into
+  * buffer (little-endian format, i.e. first byte is put into buffer[0]).
+@@ -284,9 +285,9 @@
+  * NOTE: TPM is big-endian for multi-byte values. Multi-byte
+  * values have to be swapped.
+  *
+- * @return -EIO on error, 0 on success.
++ * @return 0 on success or negative error code on failure
+  */
+-static int tpm_tis_spi_xfer(u32 addr, const u8 *out, u8 *in, u16 len)
++static int tpm_tis_spi_xfer(u32 addr, const u8 *out, u8 *in, u16 len, bool silent)
+ {
+ 	int transfer_len, ret;
+ 	u8 tx_buf[MAX_SPI_FRAMESIZE];
+@@ -331,8 +332,9 @@
+ 			}
+ 
+ 			if (i == TPM_WAIT_STATES) {
+-				preboot_puts("TPM2: timeout on wait state\n");
+-				ret = -1;
++				if (!silent)
++					preboot_puts("TPM2: timeout on wait state\n");
++				ret = -ETIMEDOUT;
+ 				goto release_bus;
+ 			}
+ 		}
+@@ -373,7 +375,12 @@
+ 
+ static int tpm_tis_spi_read(u16 addr, u8 *in, u16 len)
+ {
+-	return tpm_tis_spi_xfer(addr, NULL, in, len);
++	return tpm_tis_spi_xfer(addr, NULL, in, len, false);
++}
++
++static int tpm_tis_spi_read_silent(u16 addr, u8 *in, u16 len)
++{
++	return tpm_tis_spi_xfer(addr, NULL, in, len, true);
+ }
+ 
+ static int tpm_tis_spi_read32(u32 addr, u32 *result)
+@@ -462,7 +469,7 @@
+ 
+ static int tpm_tis_spi_write(u16 addr, const u8 *out, u16 len)
+ {
+-	return tpm_tis_spi_xfer(addr, out, NULL, len);
++	return tpm_tis_spi_xfer(addr, out, NULL, len, false);
+ }
+ 
+ static int tpm_tis_spi_cancel(void)
+@@ -1075,8 +1082,10 @@
+ 	do {
+ 		mdelay(TPM_TIMEOUT_MS);
+ 
+-		ret = tpm_tis_spi_read(TPM_ACCESS(loc), &status, 1);
+-		if (ret)
++		ret = tpm_tis_spi_read_silent(TPM_ACCESS(loc), &status, 1);
++		if (ret == -ETIMEDOUT)
++			continue;
++		else if (ret != 0)
+ 			break;
+ 
+ 		if (status & TPM_ACCESS_VALID)

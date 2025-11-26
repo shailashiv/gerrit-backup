@@ -1,0 +1,1599 @@
+From 088e02b9f34cda7fdaf68810900c6fd7075cff61 Mon Sep 17 00:00:00 2001
+From: ylevavi <yehuda.levavi@tandemg.com>
+Date: Tue, 05 Oct 2021 14:34:24 +0300
+Subject: [PATCH] [SW-56463] spi driver: refactor to generic
+
+Make preboot SPI driver generic so it will support both SPI flash and
+SPI TPM devices.
+Former spi_* API prefix functions that were related to spi flash changed
+to spi_flash_*.
+
+Change-Id: Ibc4c70d8d2cf74ab98409904adc7ca5a81a895d8
+Signed-off-by: ylevavi <yehuda.levavi@tandemg.com>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index ee1ed86..bc09dec 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -16,7 +16,7 @@
+ 
+ #include "common.h"
+ #include "uart.h"
+-#include <spi.h>
++#include <spi_flash.h>
+ #include "boot_desc.h"
+ #include "pll.h"
+ #include <boot_if.h>
+@@ -280,7 +280,7 @@
+ 
+ 	preboot_sync_btl();
+ 	hl_uart_init();
+-	spi_prot_early();
++	spi_flash_prot_early();
+ 	hl_pcie_init();
+ 	ppboot_pcie_drain_init();
+ 	ppboot_version();
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index adcbedd..980b913 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -33,7 +33,7 @@
+ #include "i2cslave_indirect.h"
+ #include "hl_i2c_slave_events.h"
+ #include "rma_info.h"
+-#include <spi.h>
++#include <spi_flash.h>
+ #include <hl.h>
+ 
+ struct hl_rsp_err {
+@@ -414,9 +414,9 @@
+ 
+ 	preboot_cond_arc0_reset();
+ 
+-	spi_init();
+-	spi_prot_late();
+-	spi_prot_status();
++	spi_flash_init();
++	spi_flash_prot_late();
++	spi_flash_prot_status();
+ 
+ 	preboot_sp_sram_init();
+ 	preboot_reset_init();
+diff --git a/arch/gaudi/arm/asic.c b/arch/gaudi/arm/asic.c
+index c5462e6..9692fc0 100644
+--- a/arch/gaudi/arm/asic.c
++++ b/arch/gaudi/arm/asic.c
+@@ -343,7 +343,7 @@
+ 		return false;
+ 
+ 	buf = (u8 *)desc.base;
+-	spi_copy(buf, offset, PPBOOT_MAX_SIZE, NULL);
++	spi_flash_copy(buf, offset, PPBOOT_MAX_SIZE, NULL);
+ 
+ 	i = 0;
+ 	while (i < PPBOOT_MAX_SIZE) {
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index 7a52c4e..8777db8 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -12,6 +12,8 @@
+ #include <psoc_global_conf_masks.h>
+ #include <psoc_efuse_regs.h>
+ #include <psoc_gpio1_regs.h>
++#include <psoc_spi_regs.h>
++#include <psoc_gpio3_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_wrap_regs.h>
+@@ -39,6 +41,7 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <spi_flash.h>
+ #include <preboot/fit.h>
+ #include <preboot/thermal.h>
+ #include <efuse.h>
+@@ -392,9 +395,22 @@
+ 	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
+ }
+ 
+-unsigned int get_cs_pad_sel(void)
++unsigned int get_cs_pad_sel_flash(void)
+ {
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_53;
++}
++
++void spi_flash_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_SPI_CTRLR0;
++}
++
++void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset)
++{
++	*mask = BIT(53 % 16);
++	*data_offset = mmPSOC_GPIO3_DATAOUT;
++	*out_en_offset = mmPSOC_GPIO3_OUTENSET;
+ }
+ 
+ /*
+@@ -442,7 +458,7 @@
+ 			     (u32)(loadaddr >> 32), false);
+ 	preboot_puth((u32)loadaddr, false);
+ 
+-	spi_copy((void *)loadaddr, offset, size, name);
++	spi_flash_copy((void *)loadaddr, offset, size, name);
+ }
+ 
+ void pci_dev_specific_hot_rst(void)
+@@ -584,7 +600,7 @@
+ 		return 1;
+ 	}
+ 
+-	spi_lock_access(is_enable);
++	spi_flash_lock_access(is_enable);
+ 	preboot_security_sram_pci_set_ro(is_enable);
+ 	preboot_security_sf_pci_set_ro(is_enable);
+ 
+diff --git a/arch/gaudi/arm/common.h b/arch/gaudi/arm/common.h
+index 6964e28..3c55d5c 100644
+--- a/arch/gaudi/arm/common.h
++++ b/arch/gaudi/arm/common.h
+@@ -46,7 +46,7 @@
+ #define SHA256_ENABLE
+ 
+ #ifndef __ASSEMBLY__
+-#include <spi.h>
++#include <spi_flash.h>
+ #include <types.h>
+ 
+ /* Let this file be included in any order and override the PROT_MASK */
+diff --git a/arch/gaudi/arm/rma_info.c b/arch/gaudi/arm/rma_info.c
+index d866724..d052892 100644
+--- a/arch/gaudi/arm/rma_info.c
++++ b/arch/gaudi/arm/rma_info.c
+@@ -7,6 +7,7 @@
+ 
+ #include <common.h>
+ #include <sha256.h>
++#include <spi_flash.h>
+ #include <hl_boot_desc.h>
+ #include <string.h>
+ #include "uart.h"
+@@ -61,7 +62,7 @@
+ 	int ret, i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(flash_mem_context.base); i++) {
+-		ret = spi_erase(flash_mem_context.base[i],
++		ret = spi_flash_erase(flash_mem_context.base[i],
+ 				flash_mem_context.flash_size[i]);
+ 		if (ret)
+ 			return ret;
+@@ -77,10 +78,10 @@
+ 	struct flash_header header0, header1;
+ 
+ 	/* on every read we first choose a valid sector to read from */
+-	spi_copy(&header0, flash_mem_context.base[0],
++	spi_flash_copy(&header0, flash_mem_context.base[0],
+ 				sizeof(struct flash_header), NULL);
+ 
+-	spi_copy(&header1, flash_mem_context.base[1],
++	spi_flash_copy(&header1, flash_mem_context.base[1],
+ 				sizeof(struct flash_header), NULL);
+ 
+ 	if (header0.magic == FLASH_SECTOR_MAGIC &&
+@@ -110,7 +111,7 @@
+ 
+ 	flash_offset = flash_mem_context.base[flash_select] + offset
+ 						+ sizeof(struct flash_header);
+-	spi_copy(data, flash_offset, size, NULL);
++	spi_flash_copy(data, flash_offset, size, NULL);
+ 
+ 	return 0;
+ }
+diff --git a/arch/gaudi/arm/security.c b/arch/gaudi/arm/security.c
+index 2838338..b847d79 100644
+--- a/arch/gaudi/arm/security.c
++++ b/arch/gaudi/arm/security.c
+@@ -63,6 +63,7 @@
+ #include <efuse.h>
+ #include <gaudi/gaudi_security.h>
+ #include <spi.h>
++#include <spi_flash.h>
+ #include <sha256.h>
+ #include <hl_fw_if.h>
+ #include <preboot/fit.h>
+@@ -124,7 +125,7 @@
+ #define FAKE_OTP_OFFSET	(2 * 1024 * 1024)
+ static void preboot_security_copy_otp(struct hl_sec_otp *otp)
+ {
+-	spi_copy(otp, FAKE_OTP_OFFSET, sizeof(struct hl_sec_otp), "FAKE OTP");
++	spi_flash_copy(otp, FAKE_OTP_OFFSET, sizeof(struct hl_sec_otp), "FAKE OTP");
+ }
+ 
+ #define FAKE_FUSE_OFFSET ((2 * 1024 * 1024) + (64 * 1024))
+@@ -137,7 +138,7 @@
+ 	if (preboot_security_fuse_cache.is_invalid) {
+ 		fuse = &preboot_security_fuse_cache.fuse;
+ 		preboot_puts("preboot in fake security mode\n");
+-		spi_copy(fuse, FAKE_FUSE_OFFSET +
++		spi_flash_copy(fuse, FAKE_FUSE_OFFSET +
+ 			 (EFUSE_SECURITY_OFFSET * sizeof(*val)), sizeof(*fuse),
+ 			 "FAKE FUSE");
+ 
+@@ -167,7 +168,7 @@
+ #else
+ static void preboot_security_copy_otp(struct hl_sec_otp *otp)
+ {
+-	spi_copy_otp(otp, OTP_SECURITY_OFFSET, sizeof(struct hl_sec_otp));
++	spi_flash_copy_otp(otp, OTP_SECURITY_OFFSET, sizeof(struct hl_sec_otp));
+ }
+ 
+ static const struct hl_sec_efuse *preboot_security_get_fuse(void)
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index cf93999..9d395aa 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -31,6 +31,7 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <spi_flash.h>
+ #include <preboot/fit.h>
+ #include <boot_if.h>
+ #include <pci.h>
+@@ -278,7 +279,7 @@
+ 			     (u32)(loadaddr >> 32), false);
+ 	preboot_puth((u32)loadaddr, false);
+ 
+-	spi_copy((void *)loadaddr, offset, size, name);
++	spi_flash_copy((void *)loadaddr, offset, size, name);
+ }
+ 
+ bool preboot_sram_is_valid_address_range(u64 addr, int len)
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 8f96b09..4da94eb 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -13,6 +13,7 @@
+ #include <psoc_gpio3_regs.h>
+ #include <psoc_gpio5_regs.h>
+ #include <psoc_qspi_regs.h>
++#include <psoc_spi_regs.h>
+ #include <psoc_efuse_regs.h>
+ #include <pcie_phy_regs.h>
+ #include <pcie_phy_masks.h>
+@@ -707,7 +708,7 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+-unsigned int get_cs_pad_sel(void)
++unsigned int get_cs_pad_sel_flash(void)
+ {
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+ }
+@@ -720,7 +721,7 @@
+ 	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
+ }
+ 
+-void spi_base_get(unsigned int *regs)
++void spi_flash_base_get(unsigned int *regs)
+ {
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+diff --git a/arch/goya/arm/common.c b/arch/goya/arm/common.c
+index 2acacba..aec8c83 100644
+--- a/arch/goya/arm/common.c
++++ b/arch/goya/arm/common.c
+@@ -10,6 +10,8 @@
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_global_conf_masks.h>
+ #include <psoc_efuse_regs.h>
++#include <psoc_gpio3_regs.h>
++#include <psoc_spi_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+ #include <cpu_timestamp_regs.h>
+@@ -24,6 +26,7 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <spi_flash.h>
+ #include <preboot/fit.h>
+ #include <preboot/thermal.h>
+ #include <string.h>
+@@ -197,7 +200,7 @@
+ 	regmap_writel(1, mmPCIE_DB_RSV_RSV_1);
+ }
+ 
+-unsigned int get_cs_pad_sel(void)
++unsigned int get_cs_pad_sel_flash(void)
+ {
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_53;
+ }
+@@ -219,7 +222,20 @@
+ 			     (u32)(loadaddr >> 32), false);
+ 	preboot_puth((u32)loadaddr, false);
+ 
+-	spi_copy((void *)loadaddr, offset, size, name);
++	spi_flash_copy((void *)loadaddr, offset, size, name);
++}
++
++void spi_flash_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_SPI_CTRLR0;
++}
++
++void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset)
++{
++	*mask = BIT(53 % 16);
++	*data_offset = mmPSOC_GPIO3_DATAOUT;
++	*out_en_offset = mmPSOC_GPIO3_OUTENSET;
+ }
+ 
+ u32 hl_pll_timestamp_base_get(void)
+@@ -264,12 +280,12 @@
+ 		sizeof(struct hl_ts_cfg) * GOYA_ASIC_TS_MAX_COUNT);
+ }
+ 
+-void spi_prot_late(void)
++void spi_flash_prot_late(void)
+ {
+-	spi_prot();
++	spi_flash_prot();
+ }
+ 
+-void spi_prot_early(void) {}
++void spi_flash_prot_early(void) {}
+ 
+ bool is_nvme_mi_compatible(void)
+ {
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index 5db1b08..8da3d5a 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -35,6 +35,7 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <spi_flash.h>
+ #include <preboot/fit.h>
+ #include <boot_if.h>
+ #include <address_space.h>
+diff --git a/arch/greco/arm/common.c b/arch/greco/arm/common.c
+index 7412344..03730f5 100644
+--- a/arch/greco/arm/common.c
++++ b/arch/greco/arm/common.c
+@@ -34,6 +34,7 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <spi_flash.h>
+ #include <preboot/fit.h>
+ #include <boot_if.h>
+ #include <pci.h>
+@@ -228,7 +229,7 @@
+ 			     (u32)(loadaddr >> 32), false);
+ 	preboot_puth((u32)loadaddr, false);
+ 
+-	spi_copy((void *)loadaddr, offset, size, name);
++	spi_flash_copy((void *)loadaddr, offset, size, name);
+ }
+ 
+ u32 dev_pci_dbi_cfg_offset_get(void)
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index cedfe6e..bd46b42 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -15,6 +15,7 @@
+ #include <pcie_phy_masks.h>
+ #include <pcie_aux_regs.h>
+ #include <psoc_gpio1_regs.h>
++#include <psoc_spi_regs.h>
+ #include <psoc_qspi_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+ #include <psoc_arc0_cfg_masks.h>
+@@ -133,7 +134,7 @@
+ 	return mmPSOC_EFUSE_READ;
+ }
+ 
+-unsigned int get_cs_pad_sel(void)
++unsigned int get_cs_pad_sel_flash(void)
+ {
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+ }
+@@ -148,7 +149,7 @@
+ 	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
+ }
+ 
+-void spi_base_get(unsigned int *regs)
++void spi_flash_base_get(unsigned int *regs)
+ {
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+diff --git a/include/errno.h b/include/errno.h
+new file mode 100644
+index 0000000..6181fae
+--- /dev/null
++++ b/include/errno.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef _HL_ERRNO_H_
++#define _HL_ERRNO_H_
++
++#define ENOENT 2	/* No such file or directory */
++#define EIO 5		/* I/O error */
++#define E2BIG 7		/* Arg list too long */
++#define EBUSY 16	/* Mount device busy */
++#define EINVAL 22       /* Invalid argument */
++#define ETIMEDOUT 60    /* Connection timed out */
++
++#endif /* _HL_ERRNO_H_ */
+diff --git a/include/iopoll.h b/include/iopoll.h
+new file mode 100644
+index 0000000..f4e6264
+--- /dev/null
++++ b/include/iopoll.h
+@@ -0,0 +1,57 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2012-2014 The Linux Foundation. All rights reserved.
++ */
++
++#ifndef _LINUX_IOPOLL_H
++#define _LINUX_IOPOLL_H
++
++#include <preboot.h>
++#include <pll.h>
++#include <errno.h>
++
++/**
++ * read_poll_timeout - Periodically poll an address until a condition is met or
++ * a timeout occurs
++ * @op: accessor function (takes @addr as its only argument)
++ * @addr: Address to poll
++ * @val: Variable to read the value into
++ * @cond: Break condition (usually involving @val)
++ * @sleep_us: Maximum time to sleep in us
++ * @timeout_us: Timeout in us, 0 means never timeout
++ *
++ * Returns 0 on success and -ETIMEDOUT upon a timeout. In either
++ * case, the last read value at @addr is stored in @val.
++ *
++ * When available, you'll probably want to use one of the specialized
++ * macros defined below rather than this macro directly.
++ */
++#define read_poll_timeout(op, addr, val, cond, sleep_us, timeout_us)	\
++({ \
++	unsigned long timeout = timestamp_get_us() + timeout_us; \
++	unsigned long current; \
++	for (;;) { \
++		(val) = op(addr); \
++		if (cond) \
++			break; \
++		current = timestamp_get_us(); \
++		if (timeout_us && current > timeout) { \
++			(val) = op(addr); \
++			break; \
++		} \
++		if (sleep_us) \
++			udelay(sleep_us); \
++	} \
++	(cond) ? 0 : -ETIMEDOUT; \
++})
++
++#define readx_poll_sleep_timeout(op, addr, val, cond, sleep_us, timeout_us) \
++	read_poll_timeout(op, addr, val, cond, sleep_us, timeout_us)
++
++#define readx_poll_timeout(op, addr, val, cond, timeout_us) \
++	read_poll_timeout(op, addr, val, cond, false, timeout_us)
++
++#define readl_poll_timeout(addr, val, cond, timeout_us) \
++	readx_poll_timeout(regmap_readl, addr, val, cond, timeout_us)
++
++#endif /* _LINUX_IOPOLL_H */
+diff --git a/include/spi.h b/include/spi.h
+index ef934a7..d40e417 100644
+--- a/include/spi.h
++++ b/include/spi.h
+@@ -10,33 +10,36 @@
+ 
+ #include <bitops.h>
+ #include <stdbool.h>
++#include <stddef.h>
++#include <types.h>
+ 
+-/* The Status Register (SR) in use bits definition */
+-#define READ_STATUS_WIP			BIT(0)
+-#define READ_STATUS_WEL			BIT(1)
+-#define READ_STATUS_BP0			BIT(2)
+-#define READ_STATUS_BP1			BIT(3)
+-#define READ_STATUS_BP2			BIT(4)
+-#define READ_STATUS_BP3			BIT(5)
+-#define READ_STATUS_SRWD		BIT(7)
+-#define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | \
+-					READ_STATUS_BP2 | READ_STATUS_BP3)
+-#define ALL_PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
++#define SPI_XFER_BEGIN		BIT(0)	/* Assert CS before transfer */
++#define SPI_XFER_END		BIT(1)	/* Deassert CS after transfer */
++#define SPI_XFER_ONCE		(SPI_XFER_BEGIN | SPI_XFER_END)
+ 
+-/* The PROT_MASK is meant to be overridden by device specific setting */
+-#ifndef PROT_MASK
+-#define PROT_MASK			ALL_PROT_MASK
+-#endif
++struct spi_ctx {
++	unsigned int spi_base;
++	bool spi_initialized;
++	bool spi_access_is_locked;
++	u32 fifo_len;
+ 
+-void spi_init(void);
+-void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name);
+-void spi_copy_otp(void *dst, unsigned int offset, unsigned int size);
+-unsigned int get_cs_pad_sel(void);
+-void spi_prot(void);
+-int spi_erase(unsigned int offset, unsigned int size);
+-void spi_prot_early(void);
+-void spi_prot_late(void);
+-void spi_prot_status(void);
+-void spi_lock_access(bool is_lock);
++	void (*cs_init)();
++	void (*claim_bus)();
++	void (*release_bus)();
++};
++
++void spi_init(struct spi_ctx *ctx);
++int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
++		const void *dout, void *din, unsigned long flags);
++
++void spi_lock_access(struct spi_ctx *ctx, bool is_lock);
++void spi_dev_update_frame_size(struct spi_ctx *ctx, unsigned int len);
++void spi_dev_dword_cmd(struct spi_ctx *ctx, unsigned int cmd,
++			unsigned int *val);
++bool spi_is_locked(struct spi_ctx *ctx);
++void spi_char_cmd_csel(struct spi_ctx *ctx, unsigned char cmd,
++			unsigned char *val);
++void spi_special_cmd_csel(struct spi_ctx *ctx, unsigned int cmd,
++				unsigned char *val, size_t size, int cmd_size);
+ 
+ #endif /* _HL_SPI_H_ */
+diff --git a/include/spi_flash.h b/include/spi_flash.h
+new file mode 100644
+index 0000000..0c15769
+--- /dev/null
++++ b/include/spi_flash.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef _HL_SPI_FLASH_H_
++#define _HL_SPI_FLASH_H_
++
++#include "spi.h"
++
++/* The Status Register (SR) in use bits definition */
++#define READ_STATUS_WIP			BIT(0)
++#define READ_STATUS_WEL			BIT(1)
++#define READ_STATUS_BP0			BIT(2)
++#define READ_STATUS_BP1			BIT(3)
++#define READ_STATUS_BP2			BIT(4)
++#define READ_STATUS_BP3			BIT(5)
++#define READ_STATUS_SRWD		BIT(7)
++#define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | \
++					READ_STATUS_BP2 | READ_STATUS_BP3)
++#define ALL_PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
++
++/* The PROT_MASK is meant to be overridden by device specific setting */
++#ifndef PROT_MASK
++#define PROT_MASK			ALL_PROT_MASK
++#endif
++
++void spi_flash_init(void);
++void spi_flash_copy(void *dst, unsigned int offset, unsigned int size,
++				char *name);
++void spi_flash_copy_otp(void *dst, unsigned int offset, unsigned int size);
++void spi_flash_prot(void);
++int spi_flash_erase(unsigned int offset, unsigned int size);
++void spi_flash_prot_early(void);
++void spi_flash_prot_late(void);
++void spi_flash_prot_status(void);
++void spi_flash_lock_access(bool is_lock);
++
++/* implemented per arch */
++unsigned int get_cs_pad_sel_flash(void);
++void spi_flash_base_get(unsigned int *regs);
++void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset);
++
++#endif /* _HL_SPI_FLASH_H_ */
+diff --git a/lib/common/boot_desc.c b/lib/common/boot_desc.c
+index 1ce014f..284b5c3 100644
+--- a/lib/common/boot_desc.c
++++ b/lib/common/boot_desc.c
+@@ -14,7 +14,7 @@
+ #include <common.h>
+ 
+ #include "boot_desc.h"
+-#include <spi.h>
++#include <spi_flash.h>
+ #include "uart.h"
+ 
+ #define MAX_IMGS		5
+@@ -62,7 +62,7 @@
+ 	u32 desc_offs[MAX_IMGS] = { 0 };
+ 
+ 	/* Read the main boot pointers structure */
+-	spi_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
++	spi_flash_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
+ 	boot_desc_print_magic("FW boot PTRs", &boot_ptrs.magic);
+ 
+ 	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
+@@ -72,12 +72,12 @@
+ 
+ 	/* Read all the descriptors offsets */
+ 	spi_off += sizeof(struct hl_fw_boot_ptrs);
+-	spi_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
++	spi_flash_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
+ 
+ 	/* Read all descriptors */
+ 	for (i = 0; i < count; i++) {
+ 		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
+-		spi_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
++		spi_flash_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
+ 		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
+ 			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+ 			return 0;
+diff --git a/lib/common/spi.c b/lib/common/spi.c
+index ebabf42..29bdf16 100644
+--- a/lib/common/spi.c
++++ b/lib/common/spi.c
+@@ -7,14 +7,12 @@
+ 
+ #include <stddef.h>
+ 
+-#include <psoc_gpio3_regs.h>
+-#include <psoc_spi_regs.h>
+-
+ #include <bitops.h>
+ #include <preboot.h>
+ #include "common.h"
+ #include <spi.h>
+ #include "uart.h"
++#include "iopoll.h"
+ #include <pll.h>
+ 
+ /* Registers */
+@@ -26,343 +24,436 @@
+ #define RXFTLR				0x1C
+ #define TXFLR				0x20
+ #define RXFLR				0x24
++#define SR				0x28
+ #define IMR				0x2C
+ #define DR0				0x60
+ 
+-#define CMD_WRITE_STATUS		0x01
+-#define CMD_READ			0x03
+-#define CMD_WRITE_DISABLE		0x04
+-#define CMD_READ_STATUS			0x05
+-#define CMD_WRITE_ENABLE		0x06
+-#define CMD_FLAG_STATUS			0x70
+-#define CMD_ERASE			0xD8
+-#define READ_STATUS_PEC			(1 << 7)
++#define CTRLR0_TMOD_MASK		GENMASK(9, 8)
++#define	CTRLR0_TMOD_TR			0x0		/* xmit & recv */
++#define CTRLR0_TMOD_TO			0x1		/* xmit only */
++#define CTRLR0_TMOD_RO			0x2		/* recv only */
++#define CTRLR0_TMOD_EPROMREAD		0x3		/* eeprom read mode */
++
++#define CTRLR0_FRF_MASK			GENMASK(5, 4)
++#define CTRLR0_FRF_SPI			0x0
++#define CTRLR0_FRF_SSP			0x1
++#define CTRLR0_FRF_MICROWIRE		0x2
++#define CTRLR0_FRF_RESV			0x3
++
++#define CTRLR0_MODE_MASK		GENMASK(7, 6)
++#define CTRLR0_MODE_SCPH		0x1
++#define CTRLR0_MODE_SCPOL		0x2
++
++/* Only present when SSI_MAX_XFER_SIZE=32 */
++#define CTRLR0_DFS_32_MASK		GENMASK(20, 16)
++#define CTRLR0_FRF_SPI			0x0
++
++/* Bit fields in SR, 7 bits */
++#define SR_MASK				GENMASK(6, 0)	/* cover 7 bits */
++#define SR_BUSY				BIT(0)
++#define SR_TF_NOT_FULL			BIT(1)
++#define SR_TF_EMPT			BIT(2)
++#define SR_RF_NOT_EMPT			BIT(3)
++#define SR_RF_FULL			BIT(4)
++#define SR_TX_ERR			BIT(5)
++#define SR_DCOL				BIT(6)
++
++#define RX_TIMEOUT			1000		/* timeout in ms */
++
+ #define frame_size_bits(b)		((b) << 16)
+ 
+-/* Used for Macronix flashes only. */
+-#define SPINOR_OP_ENSO			0xB1
+-#define SPINOR_OP_EXSO			0xC1
++#define min_t(type, x, y) ({			\
++	type __min1 = (x);			\
++	type __min2 = (y);			\
++	__min1 < __min2 ? __min1 : __min2; })
+ 
+-#define PAGE_SIZE			0x10000
++#define MIN(a, b)	(((a) > (b)) ? (b) : (a))
++#define MAX(a, b)	(((a) > (b)) ? (a) : (b))
+ 
+-static unsigned int spi_regs;
+-static bool spi_initialized;
+-static bool spi_access_is_locked;
++#define MIN3(x, y, z) MIN((typeof(x))MIN(x, y), z)
++#define MAX3(x, y, z) MAX((typeof(x))MAX(x, y), z)
+ 
+-void spi_lock_access(bool is_lock)
++#define MS_TO_US(m) ((m) * 1000)
++
++struct xfer_priv {
++	struct spi_ctx *ctx;
++
++	const void *tx;
++	const void *tx_end;
++	void *rx;
++	void *rx_end;
++	u32 fifo_len;			/* depth of the FIFO buffer */
++	u32 max_xfer;			/* Maximum transfer size (in bits) */
++
++	int len;
++	int bits_per_word;
++};
++
++void spi_lock_access(struct spi_ctx *ctx, bool is_lock)
+ {
+-	spi_access_is_locked = is_lock;
++	ctx->spi_access_is_locked = is_lock;
+ }
+ 
+-static inline bool spi_is_locked(void)
++bool spi_is_locked(struct spi_ctx *ctx)
+ {
+-	if (spi_access_is_locked)
++	if (ctx->spi_access_is_locked)
+ 		preboot_puts("spi access is locked\n");
+ 
+-	return spi_access_is_locked;
++	return ctx->spi_access_is_locked;
+ }
+ 
+-/*
+- * SSI device Chip Select (CS0) is combined with GPIO53
+- * Using this we can really do SSI bus claim/release
+- * GPIO53 is set through mmPSOC_GPIO3 where each
+- * mmPSOC_GPIO serve 16 GPIOs
+- * Note: CS0 is active low
+- */
+-__weak void spi_ssi_cs0_get(unsigned int *mask,
+-					   unsigned int *data_offset,
+-					   unsigned int *out_en_offset)
++static inline void spi_writel(struct spi_ctx *ctx, u32 val, u32 offset)
+ {
+-	*mask = BIT(53 % 16);
+-	*data_offset = mmPSOC_GPIO3_DATAOUT;
+-	*out_en_offset = mmPSOC_GPIO3_OUTENSET;
++	regmap_writel(val, ctx->spi_base + offset);
+ }
+ 
+-static void spi_ssi_cs0_init(void)
++static inline u32 spi_readl(struct spi_ctx *ctx, u32 offset)
+ {
+-	unsigned int reg, mask, data, out_en;
+-
+-	spi_ssi_cs0_get(&mask, &data, &out_en);
+-	reg  = regmap_readl(data);
+-	reg  &= ~mask;
+-	regmap_writel(reg, data);
+-
+-	reg = regmap_readl(out_en);
+-	reg |=  mask;
+-	regmap_writel(reg, out_en);
++	return regmap_readl(ctx->spi_base + offset);
+ }
+ 
+-static void spi_claim_bus(void)
++static inline void spi_writeb(struct spi_ctx *ctx, u8 val, u32 offset)
+ {
+-	regmap_writel(1, get_cs_pad_sel());
++	regmap_writeb(val, ctx->spi_base + offset);
+ }
+ 
+-static void spi_release_bus(void)
++static inline u8 spi_readb(struct spi_ctx *ctx, u32 offset)
+ {
+-	regmap_writel(0, get_cs_pad_sel());
++	return regmap_readb(ctx->spi_base + offset);
+ }
+ 
+-static inline void spi_dev_update_frame_size(unsigned int len)
++void spi_dev_update_frame_size(struct spi_ctx *ctx, unsigned int len)
+ {
+-	regmap_writel(0, spi_regs + SSIENR);
+-	regmap_writel(frame_size_bits((len * 8) - 1), spi_regs + CTRLR0);
+-	regmap_writel(1, spi_regs + SSIENR);
++	spi_writel(ctx, 0, SSIENR);
++	spi_writel(ctx, frame_size_bits((len * 8) - 1), CTRLR0);
++	spi_writel(ctx, 1, SSIENR);
+ }
+ 
+-static inline int spi_fifo_is_empty(unsigned int level_reg)
++static inline int spi_fifo_is_empty(struct spi_ctx *ctx, unsigned int level_reg)
+ {
+-	return !regmap_readl(level_reg);
++	return !spi_readl(ctx, level_reg);
+ }
+ 
+-static void spi_dev_dword_cmd(unsigned int cmd, unsigned int *val)
++static void spi_dev_transmit_word(struct spi_ctx *ctx, unsigned int data)
++{
++	while (!spi_fifo_is_empty(ctx, TXFLR))
++		;
++	spi_writel(ctx, data, DR0);
++}
++
++static void spi_dev_receive_word(struct spi_ctx *ctx, unsigned int *val)
+ {
+ 	unsigned int tmp;
+ 
+-	while (!spi_fifo_is_empty(spi_regs + TXFLR))
++	while (spi_fifo_is_empty(ctx, RXFLR))
+ 		;
+-	regmap_writel(cmd, spi_regs + DR0);
+-
+-	while (spi_fifo_is_empty(spi_regs + RXFLR))
+-		;
+-	tmp = regmap_readl(spi_regs + DR0);
++	tmp = spi_readl(ctx, DR0);
+ 
+ 	if (val)
+ 		*val = tmp;
+ }
+ 
+-static void spi_special_cmd(unsigned int cmd, unsigned char *val)
++static void spi_dev_transmit_byte(struct spi_ctx *ctx, unsigned char data)
++{
++	while (!spi_fifo_is_empty(ctx, TXFLR))
++		;
++	spi_writeb(ctx, data, DR0);
++}
++
++static void spi_dev_receive_byte(struct spi_ctx *ctx, unsigned char *val)
+ {
+ 	unsigned char tmp;
+ 
+-	spi_dev_update_frame_size(sizeof(tmp));
+-
+-	while (!spi_fifo_is_empty(spi_regs + TXFLR))
++	while (spi_fifo_is_empty(ctx, RXFLR))
+ 		;
+-	regmap_writeb(cmd, spi_regs + DR0);
+-
+-	while (spi_fifo_is_empty(spi_regs + RXFLR))
+-		;
+-	tmp = regmap_readb(spi_regs + DR0);
++	tmp = spi_readb(ctx, DR0);
+ 
+ 	if (val)
+ 		*val = tmp;
+ }
+ 
+-/* Hold chip select (CS) during transaction */
+-static void spi_char_cmd_csel(unsigned char cmd, unsigned char *val)
++void spi_dev_dword_cmd(struct spi_ctx *ctx, unsigned int cmd, unsigned int *val)
+ {
+-	spi_claim_bus();
++	spi_dev_transmit_word(ctx, cmd);
+ 
+-	spi_special_cmd(cmd, NULL);
+-	if (val)
+-		spi_special_cmd(0, val);
+-
+-	spi_release_bus();
++	spi_dev_receive_word(ctx, val);
+ }
+ 
+-static void spi_cmd_write(unsigned int cmd, int cmd_size)
++static void spi_special_cmd(struct spi_ctx *ctx, unsigned int cmd,
++				unsigned char *val)
++{
++	unsigned char tmp;
++
++	spi_dev_update_frame_size(ctx, sizeof(tmp));
++
++	spi_dev_transmit_byte(ctx, cmd);
++
++	spi_dev_receive_byte(ctx, val);
++}
++
++/* Hold chip select (CS) during transaction */
++void spi_char_cmd_csel(struct spi_ctx *ctx, unsigned char cmd,
++			unsigned char *val)
++{
++	ctx->claim_bus();
++
++	spi_special_cmd(ctx, cmd, NULL);
++	if (val)
++		spi_special_cmd(ctx, 0, val);
++
++	ctx->release_bus();
++}
++
++static void spi_cmd_write(struct spi_ctx *ctx, unsigned int cmd, int cmd_size)
+ {
+ 	int i, bit_shift = 0;
+ 
+ 	for (i = 0; i < cmd_size; i++) {
+-		while (!spi_fifo_is_empty(spi_regs + TXFLR))
+-			;
+-		regmap_writeb((cmd >> bit_shift) & 0xff, spi_regs + DR0);
++		spi_dev_transmit_byte(ctx, (cmd >> bit_shift) & 0xff);
+ 		bit_shift += 8;
+ 	}
+ }
+ 
+-static void spi_special_cmd_csel(unsigned int cmd, unsigned char *val,
+-				 size_t size, int cmd_size)
++void spi_special_cmd_csel(struct spi_ctx *ctx, unsigned int cmd,
++				unsigned char *val, size_t size, int cmd_size)
+ {
+ 	int i;
+ 
+-	spi_claim_bus();
++	ctx->claim_bus();
+ 
+-	spi_dev_update_frame_size(sizeof(*val));
++	spi_dev_update_frame_size(ctx, sizeof(*val));
+ 
+-	spi_cmd_write(cmd, cmd_size);
++	spi_cmd_write(ctx, cmd, cmd_size);
+ 
+ 	if (val) {
+-		for (i = 0; i < size; i++) {
+-			while (!spi_fifo_is_empty(spi_regs + TXFLR))
+-				;
+-			regmap_writeb(val[i], spi_regs + DR0);
+-		}
++		for (i = 0; i < size; i++)
++			spi_dev_transmit_byte(ctx, val[i]);
+ 
+-		while (spi_fifo_is_empty(spi_regs + RXFLR))
+-			;
+-		regmap_readb(spi_regs + DR0);
+-		for (i = 0; i < size; i++) {
+-			while (spi_fifo_is_empty(spi_regs + RXFLR))
+-				;
+-			regmap_readb(spi_regs + DR0);
+-		}
++		spi_dev_receive_byte(ctx, NULL);
++		for (i = 0; i < size; i++)
++			spi_dev_receive_byte(ctx, NULL);
+ 	}
+-	spi_release_bus();
++	ctx->release_bus();
+ }
+ 
+-
+-/*
+- * 40ms as worst case WRSR cycle time given in mx25u25635f datasheet.
+- * 2sec is the worse erase time according to DS.
+- */
+-#define SPI_WRITE_WAIT_TIMEOUT_US	2000000
+-static int spi_common_write(unsigned int cmd, unsigned char *buf, size_t size, int cmd_size)
++static u32 dw_spi_dw32_update_cr0(int bits_per_word, int tmode)
+ {
+-	int ret = 0;
+-	unsigned char sr;
+-	u64 start = timestamp_get_us();
++	return FIELD_PREP(CTRLR0_DFS_32_MASK, bits_per_word - 1)
++	     | FIELD_PREP(CTRLR0_FRF_MASK, CTRLR0_FRF_SPI)
++	     | FIELD_PREP(CTRLR0_MODE_MASK, 0x0)
++	     | FIELD_PREP(CTRLR0_TMOD_MASK, tmode);
++}
+ 
+-	spi_char_cmd_csel(CMD_WRITE_ENABLE, NULL);
+-	do {
+-		spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-		if (timeout_expired(start, SPI_WRITE_WAIT_TIMEOUT_US))
+-			return 1;
+-	} while (!(sr & READ_STATUS_WEL));
++/* Return the max entries we can fill into tx fifo */
++static inline u32 tx_max(struct xfer_priv *priv)
++{
++	u32 tx_left, tx_room, rxtx_gap;
+ 
+-	start = timestamp_get_us();
+-	spi_special_cmd_csel(cmd, buf, size, cmd_size);
+-	do {
+-		spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-		if (timeout_expired(start, SPI_WRITE_WAIT_TIMEOUT_US)) {
+-			ret = 1;
+-			break;
++	tx_left = (priv->tx_end - priv->tx) / (priv->bits_per_word >> 3);
++	tx_room = priv->fifo_len - spi_readl(priv->ctx, TXFLR);
++
++	/*
++	 * Another concern is about the tx/rx mismatch, we
++	 * thought about using (priv->fifo_len - rxflr - txflr) as
++	 * one maximum value for tx, but it doesn't cover the
++	 * data which is out of tx/rx fifo and inside the
++	 * shift registers. So a control from sw point of
++	 * view is taken.
++	 */
++	rxtx_gap = ((priv->rx_end - priv->rx) - (priv->tx_end - priv->tx)) /
++		(priv->bits_per_word >> 3);
++
++	return MIN3(tx_left, tx_room, (u32)(priv->fifo_len - rxtx_gap));
++}
++
++/* Return the max entries we should read out of rx fifo */
++static inline u32 rx_max(struct xfer_priv *priv)
++{
++	u32 rx_left = (priv->rx_end - priv->rx) / (priv->bits_per_word >> 3);
++
++	return min_t(u32, rx_left, spi_readl(priv->ctx, RXFLR));
++}
++
++static void dw_writer(struct xfer_priv *priv)
++{
++	u32 max = tx_max(priv);
++	u32 txw = 0x0;
++
++	while (max--) {
++		/* Set the tx word if the transfer's	*/
++		/* original "tx" is not null		*/
++		if (priv->tx_end - priv->len) {
++			if (priv->bits_per_word == 8)
++				txw = *(u8 *)(priv->tx);
++			else
++				txw = *(u32 *)(priv->tx);
+ 		}
+-	} while (sr & READ_STATUS_WIP);
+-
+-	spi_char_cmd_csel(CMD_WRITE_DISABLE, NULL);
+-
+-	return ret;
+-}
+-
+-static void spi_read(void *dst, unsigned int offset, unsigned int size)
+-{
+-	unsigned int cmd = (CMD_READ << 24) | offset;
+-	int i;
+-
+-	spi_claim_bus();
+-	spi_dev_update_frame_size(sizeof(cmd));
+-	spi_dev_dword_cmd(cmd, NULL);
+-	for (i = 0; i < size; i += sizeof(unsigned int))
+-		spi_dev_dword_cmd(0, dst + i);
+-	spi_dev_dword_cmd(0, NULL);
+-	spi_release_bus();
+-}
+-
+-int spi_erase(unsigned int offset, unsigned int size)
+-{
+-	unsigned int i;
+-	unsigned int cmd = CMD_ERASE;
+-	int ret;
+-
+-	if (spi_is_locked())
+-		return 1;
+-
+-	for (i = 0; i < size; i += PAGE_SIZE) {
+-		ret = spi_common_write(cmd | __builtin_bswap32(offset + i), NULL, 0, sizeof(cmd));
+-		if (ret)
+-			return ret;
++		spi_writel(priv->ctx, txw, DR0);
++		// log_content("tx=0x%02x\n", txw);
++		priv->tx += priv->bits_per_word >> 3;
+ 	}
++}
++
++static void dw_reader(struct xfer_priv *priv)
++{
++	u32 max = rx_max(priv);
++	u32 rxw;
++
++	while (max--) {
++		rxw = spi_readl(priv->ctx, DR0);
++
++		/* Care about rx if the transfer's original "rx" is not null */
++		if (priv->rx_end - priv->len) {
++			if (priv->bits_per_word == 8)
++				*(u8 *)(priv->rx) = rxw;
++			else
++				*(u32 *)(priv->rx) = rxw;
++		}
++		priv->rx += priv->bits_per_word >> 3;
++	}
++}
++
++static int poll_transfer(struct xfer_priv *priv)
++{
++	do {
++		dw_writer(priv);
++		dw_reader(priv);
++	} while (priv->rx_end > priv->rx);
+ 
+ 	return 0;
+ }
+ 
+-__weak void spi_base_get(unsigned int *regs)
++/* based on u-boot designware SPI driver */
++int spi_xfer(struct spi_ctx *ctx, unsigned int bitlen,
++		const void *dout, void *din, unsigned long flags)
+ {
+-	*regs = mmPSOC_SPI_CTRLR0;
++	const u8 *tx = dout;
++	u8 *rx = din;
++	int ret = 0;
++	u32 cr0 = 0;
++	u32 val;
++	u8 tmode;			/* TR/TO/RO/EEPROM */
++	struct xfer_priv priv = {0};
++
++	priv.ctx = ctx;
++
++	/* spi core configured to do 8 bit transfers */
++	if (bitlen % 8) {
++		preboot_puts("Non byte aligned SPI transfer.\n");
++		return -1;
++	}
++
++	/* Start the transaction if necessary. */
++	/* currently we do it at init time in spi driver */
++	/*
++	 * if (flags & SPI_XFER_BEGIN)
++	 *	external_cs_manage(dev, false);
++	 */
++
++	priv.bits_per_word = 8;
++
++	if (rx && tx)
++		tmode = CTRLR0_TMOD_TR;
++	else if (rx)
++		tmode = CTRLR0_TMOD_RO;
++	else
++		/*
++		 * In transmit only mode (CTRL0_TMOD_TO) input FIFO never gets
++		 * any data which breaks our logic in poll_transfer() above.
++		 */
++		tmode = CTRLR0_TMOD_TR;
++
++	cr0 = dw_spi_dw32_update_cr0(priv.bits_per_word, tmode);
++
++	priv.len = bitlen >> 3;
++
++	priv.tx = (void *)tx;
++	priv.tx_end = priv.tx + priv.len;
++	priv.rx = rx;
++	priv.rx_end = priv.rx + priv.len;
++
++	/* Disable controller before writing control registers */
++	spi_writel(priv.ctx, 0, SSIENR);
++
++	/* Reprogram cr0 only if changed */
++	if (spi_readl(priv.ctx, CTRLR0) != cr0)
++		spi_writel(priv.ctx, cr0, CTRLR0);
++
++	/*
++	 * Configure the desired SS (slave select 0...3) in the controller
++	 * The DW SPI controller will activate and deactivate this CS
++	 * automatically. So no cs_activate() etc is needed in this driver.
++	 */
++	// cs = spi_chip_select(dev);
++	// spi_writel(priv.ctx, 1 << cs, DW_SPI_SER);
++
++	/* Enable controller after writing control registers */
++	spi_writel(priv.ctx, 1, SSIENR);
++
++	priv.fifo_len = ctx->fifo_len;
++
++	/* Start transfer in a polling loop */
++	ret = poll_transfer(&priv);
++
++	/*
++	 * Wait for current transmit operation to complete.
++	 * Otherwise if some data still exists in Tx FIFO it can be
++	 * silently flushed, i.e. dropped on disabling of the controller,
++	 * which happens when writing 0 to DW_SPI_SSIENR which happens
++	 * in the beginning of new transfer.
++	 */
++	if (readl_poll_timeout(ctx->spi_base + SR, val,
++			       (val & SR_TF_EMPT) && !(val & SR_BUSY),
++			       RX_TIMEOUT * 1000)) {
++		ret = -1;
++	}
++
++	/* Stop the transaction if necessary */
++	/* if (flags & SPI_XFER_END)
++	 *	external_cs_manage(dev, true);
++	 */
++
++	return ret;
+ }
+ 
+-void spi_init(void)
++static void get_fifo_len(struct spi_ctx *ctx)
++{
++	u32 fifo;
++
++	for (fifo = 1; fifo < 256; fifo++) {
++		spi_writel(ctx, fifo, TXFTLR);
++		if (fifo != spi_readl(ctx, TXFTLR))
++			break;
++	}
++
++	ctx->fifo_len = (fifo == 1) ? 0 : fifo;
++	spi_writel(ctx, 0, TXFTLR);
++}
++
++void spi_init(struct spi_ctx *ctx)
+ {
+ 	u32 baudr;
+ 
+-	if (spi_initialized)
++	if (ctx->spi_initialized)
+ 		return;
+ 
+-	if (spi_is_locked())
++	if (spi_is_locked(ctx))
+ 		return;
+ 
+ 	baudr = hl_spi_baudr_get();
+ 	/* Validate that baudr is even */
+ 	baudr = (baudr + 1) & ~1;
+ 
+-	spi_base_get(&spi_regs);
+-	spi_ssi_cs0_init();
+-	regmap_writel(0x00000000, spi_regs + SSIENR);
+-	regmap_writel(baudr, spi_regs + BAUDR);
+-	regmap_writel(0x00000000, spi_regs + RXFTLR);
+-	regmap_writel(0x00000000, spi_regs + TXFTLR);
+-	regmap_writel(0x00000000, spi_regs + IMR);	/* Disable Interrupts */
+-	regmap_writel(0x00000001, spi_regs + SER);
+-	regmap_writel(0x00000001, spi_regs + SSIENR);
++	ctx->cs_init();
++	spi_writel(ctx, 0x00000000, SSIENR);
++	spi_writel(ctx, baudr, BAUDR);
++	spi_writel(ctx, 0x00000000, RXFTLR);
++	spi_writel(ctx, 0x00000000, TXFTLR);
++	spi_writel(ctx, 0x00000000, IMR);	/* Disable Interrupts */
++	spi_writel(ctx, 0x00000001, SER);
++	spi_writel(ctx, 0x00000001, SSIENR);
+ 
+-	spi_initialized = true;
+-}
++	get_fifo_len(ctx);
+ 
+-void spi_prot(void)
+-{
+-	unsigned char sr;
+-
+-	if (spi_is_locked())
+-		return;
+-
+-	spi_init();
+-
+-	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-	sr |= PROT_MASK;
+-	spi_common_write(CMD_WRITE_STATUS, &sr, sizeof(sr), 1);
+-}
+-
+-__weak void spi_prot_early(void)
+-{
+-	spi_prot();
+-}
+-
+-__weak void spi_prot_late(void) {}
+-
+-void spi_prot_status(void)
+-{
+-	unsigned char sr = 0;
+-
+-	if (!spi_initialized) {
+-		preboot_puts("spi not initialized\n");
+-		return;
+-	}
+-
+-	if (spi_is_locked())
+-		return;
+-
+-	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-
+-	if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD)
+-				&& !(sr & READ_STATUS_WEL))
+-		preboot_puts("Flash may be protected, depend on WP# signal\n");
+-	else
+-		preboot_puts("Flash is not protected\n");
+-}
+-
+-void spi_copy_otp(void *dst, unsigned int offset, unsigned int size)
+-{
+-	if (spi_is_locked())
+-		return;
+-
+-	spi_init();
+-	spi_char_cmd_csel(SPINOR_OP_ENSO, NULL);
+-	spi_read(dst, offset, size);
+-	spi_char_cmd_csel(SPINOR_OP_EXSO, NULL);
+-}
+-
+-void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name)
+-{
+-	if (spi_is_locked())
+-		return;
+-
+-	spi_init();
+-	spi_read(dst, offset, size);
+-
+-	if (name) {
+-		preboot_puts_raw(name);
+-		preboot_puts(" copying from flash is completed\n");
+-	}
++	ctx->spi_initialized = true;
+ }
+diff --git a/lib/common/spi_flash.c b/lib/common/spi_flash.c
+new file mode 100644
+index 0000000..203e1d6
+--- /dev/null
++++ b/lib/common/spi_flash.c
+@@ -0,0 +1,219 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ */
++
++#include <psoc_gpio3_regs.h>
++#include <psoc_spi_regs.h>
++#include <bitops.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++#include <psoc_gpio3_regs.h>
++#include <psoc_spi_regs.h>
++
++#include <bitops.h>
++#include <preboot.h>
++#include "common.h"
++#include <spi.h>
++#include "uart.h"
++#include <pll.h>
++
++#include "spi_flash.h"
++
++/* spi flash commands */
++#define CMD_WRITE_STATUS		0x01
++#define CMD_READ			0x03
++#define CMD_WRITE_DISABLE		0x04
++#define CMD_READ_STATUS			0x05
++#define CMD_WRITE_ENABLE		0x06
++#define CMD_FLAG_STATUS			0x70
++#define CMD_ERASE			0xD8
++#define READ_STATUS_PEC			(1 << 7)
++
++/* Used for Macronix flashes only. */
++#define SPINOR_OP_ENSO			0xB1
++#define SPINOR_OP_EXSO			0xC1
++
++#define PAGE_SIZE			0x10000
++
++static struct spi_ctx flash_spi = {0};
++
++static void spi_ssi_cs_init(void)
++{
++	unsigned int reg, mask, data, out_en;
++
++	spi_ssi_cs0_get(&mask, &data, &out_en);
++
++	reg  = regmap_readl(data);
++	reg  &= ~mask;
++	regmap_writel(reg, data);
++
++	reg = regmap_readl(out_en);
++	reg |= mask;
++	regmap_writel(reg, out_en);
++}
++
++static void spi_flash_claim_bus(void)
++{
++	regmap_writel(1, get_cs_pad_sel_flash());
++}
++
++static void spi_flash_release_bus(void)
++{
++	regmap_writel(0, get_cs_pad_sel_flash());
++}
++
++void spi_flash_init(void)
++{
++	spi_flash_base_get(&flash_spi.spi_base);
++	flash_spi.spi_initialized = false;
++	flash_spi.spi_access_is_locked = false;
++	flash_spi.cs_init = spi_ssi_cs_init;
++	flash_spi.claim_bus = spi_flash_claim_bus;
++	flash_spi.release_bus = spi_flash_release_bus;
++	flash_spi.fifo_len = 0;
++	spi_init(&flash_spi);
++}
++
++/*
++ * 40ms as worst case WRSR cycle time given in mx25u25635f datasheet.
++ * 2sec is the worse erase time according to DS.
++ */
++#define SPI_WRITE_WAIT_TIMEOUT_US	2000000
++static int spi_flash_common_write(unsigned int cmd, unsigned char *buf,
++				size_t size, int cmd_size)
++{
++	int ret = 0;
++	unsigned char sr;
++	u64 start = timestamp_get_us();
++
++	spi_char_cmd_csel(&flash_spi, CMD_WRITE_ENABLE, NULL);
++	do {
++		spi_char_cmd_csel(&flash_spi, CMD_READ_STATUS, &sr);
++		if (timeout_expired(start, SPI_WRITE_WAIT_TIMEOUT_US))
++			return 1;
++	} while (!(sr & READ_STATUS_WEL));
++
++	start = timestamp_get_us();
++	spi_special_cmd_csel(&flash_spi, cmd, buf, size, cmd_size);
++	do {
++		spi_char_cmd_csel(&flash_spi, CMD_READ_STATUS, &sr);
++		if (timeout_expired(start, SPI_WRITE_WAIT_TIMEOUT_US)) {
++			ret = 1;
++			break;
++		}
++	} while (sr & READ_STATUS_WIP);
++
++	spi_char_cmd_csel(&flash_spi, CMD_WRITE_DISABLE, NULL);
++
++	return ret;
++}
++
++void spi_flash_read(void *dst, unsigned int offset, unsigned int size)
++{
++	unsigned int cmd = (CMD_READ << 24) | offset;
++	int i;
++
++	spi_flash_claim_bus();
++	spi_dev_update_frame_size(&flash_spi, sizeof(cmd));
++	spi_dev_dword_cmd(&flash_spi, cmd, NULL);
++	for (i = 0; i < size; i += sizeof(unsigned int))
++		spi_dev_dword_cmd(&flash_spi, 0, dst + i);
++	spi_dev_dword_cmd(&flash_spi, 0, NULL);
++	spi_flash_release_bus();
++}
++
++void spi_flash_copy(void *dst, unsigned int offset, unsigned int size,
++			char *name)
++{
++	if (spi_is_locked(&flash_spi))
++		return;
++
++	spi_flash_init();
++	spi_flash_read(dst, offset, size);
++
++	if (name) {
++		preboot_puts_raw(name);
++		preboot_puts(" copying from flash is completed\n");
++	}
++}
++
++void spi_flash_copy_otp(void *dst, unsigned int offset, unsigned int size)
++{
++	if (spi_is_locked(&flash_spi))
++		return;
++
++	spi_flash_init();
++	spi_char_cmd_csel(&flash_spi, SPINOR_OP_ENSO, NULL);
++	spi_flash_read(dst, offset, size);
++	spi_char_cmd_csel(&flash_spi, SPINOR_OP_EXSO, NULL);
++}
++
++void spi_flash_prot(void)
++{
++	unsigned char sr;
++
++	if (spi_is_locked(&flash_spi))
++		return;
++
++	spi_flash_init();
++
++	spi_char_cmd_csel(&flash_spi, CMD_READ_STATUS, &sr);
++	sr |= PROT_MASK;
++	spi_flash_common_write(CMD_WRITE_STATUS, &sr, sizeof(sr), 1);
++}
++
++int spi_flash_erase(unsigned int offset, unsigned int size)
++{
++	unsigned int i;
++	unsigned int cmd = CMD_ERASE;
++	int ret;
++
++	if (spi_is_locked(&flash_spi))
++		return 1;
++
++	for (i = 0; i < size; i += PAGE_SIZE) {
++		ret = spi_flash_common_write(cmd |
++					__builtin_bswap32(offset + i), NULL, 0,
++					sizeof(cmd));
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++__weak void spi_flash_prot_early(void)
++{
++	spi_flash_prot();
++}
++
++__weak void spi_flash_prot_late(void) {}
++
++void spi_flash_prot_status(void)
++{
++	unsigned char sr = 0;
++
++	if (!flash_spi.spi_initialized) {
++		preboot_puts("spi not initialized\n");
++		return;
++	}
++
++	if (spi_is_locked(&flash_spi))
++		return;
++
++	spi_char_cmd_csel(&flash_spi, CMD_READ_STATUS, &sr);
++
++	if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD)
++				&& !(sr & READ_STATUS_WEL))
++		preboot_puts("Flash may be protected, depend on WP# signal\n");
++	else
++		preboot_puts("Flash is not protected\n");
++}
++
++void spi_flash_lock_access(bool is_lock)
++{
++	spi_lock_access(&flash_spi, is_lock);
++}
+diff --git a/lib/preboot/i2cslave_indirect.c b/lib/preboot/i2cslave_indirect.c
+index cbc0c15..dea9adb 100644
+--- a/lib/preboot/i2cslave_indirect.c
++++ b/lib/preboot/i2cslave_indirect.c
+@@ -18,7 +18,7 @@
+ #include <crc32.h>
+ #include <hl_fw_if.h>
+ #include <boot_desc.h>
+-#include <spi.h>
++#include <spi_flash.h>
+ #include <memory.h>
+ 
+ #include "fit.h"
+@@ -493,7 +493,7 @@
+ 
+ 		is_prime = !i;
+ 		/* Using fit image base as playground */
+-		spi_copy((void *)mdesc.base, desc.spi_offset, desc.img_size,
++		spi_flash_copy((void *)mdesc.base, desc.spi_offset, desc.img_size,
+ 			 NULL);
+ 		sha_csum((void *)mdesc.base, desc.img_size, hash);
+ 		is_valid = !memcmp(hash, desc.chksum, ARRAY_SIZE(hash));

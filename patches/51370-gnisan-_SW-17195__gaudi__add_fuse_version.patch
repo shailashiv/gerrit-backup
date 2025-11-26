@@ -1,0 +1,91 @@
+From e10b3baadb70d74d2ff13309c8e2ac423428710d Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 14 Sep 2020 14:46:44 +0300
+Subject: [PATCH] [SW-17195] gaudi: add fuse version
+
+Add fuse version read to Gaudi specific code
+
+Change-Id: Ib597ed8c0c006723d3b7d94ed89bd062841f8de4
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 6dd1393..d678711 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -10,6 +10,7 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <efuse.h>
+ 
+ #include "common.h"
+ 
+@@ -62,3 +63,67 @@
+ 		break;
+ 	}
+ }
++
++#define GAUDI_FUSE_TABLE_SIZE	4
++#define GAUDI_FUSE_DEVID_SIZE	8
++#define GAUDI_FUSE_FAB_SIZE	2
++#define GAUDI_FUSE_LOT_SIZE	6
++#define GAUDI_FUSE_WAFER_SIZE	2
++#define GAUDI_FUSE_XADDR_SIZE	2
++#define GAUDI_FUSE_YADDR_SIZE	2
++
++struct hl_fuse_data {
++	union {
++		struct {
++			char table_ver[GAUDI_FUSE_TABLE_SIZE];
++			char dev_id[GAUDI_FUSE_DEVID_SIZE];
++			char process_type;
++			char fab[GAUDI_FUSE_FAB_SIZE];
++			char hbm_config;
++			char lot[GAUDI_FUSE_LOT_SIZE];
++			char wafer[GAUDI_FUSE_WAFER_SIZE];
++			char xaddr[GAUDI_FUSE_XADDR_SIZE];
++			char yaddr[GAUDI_FUSE_YADDR_SIZE];
++		} __packed;
++		u32 data[7];
++	};
++};
++
++int hl_fuse_get_version(char *version, size_t size)
++{
++	struct hl_fuse_data fuse;
++	struct preboot_fuse_ver_data ver_data = {
++		.table_ver = fuse.table_ver,
++		.table_ver_sz = sizeof(fuse.table_ver),
++		.dev_id = fuse.dev_id,
++		.dev_id_sz = sizeof(fuse.dev_id),
++		.fab = fuse.fab,
++		.fab_sz = sizeof(fuse.fab),
++		.lot = fuse.lot,
++		.lot_sz = sizeof(fuse.lot),
++		.wafer = fuse.wafer,
++		.wafer_sz = sizeof(fuse.wafer),
++		.xaddr = fuse.xaddr,
++		.xaddr_sz = sizeof(fuse.xaddr),
++		.yaddr = fuse.yaddr,
++		.yaddr_sz = sizeof(fuse.yaddr),
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(fuse.data); i++)
++		if (preboot_fuse_read(i, &fuse.data[i]))
++			return 1;
++
++	/* Gaudi eFuse definition was changed from 7 characters device id to 8
++	 * characters. But some Gaudis already had their eFuse programmed with
++	 * 7 characters device id, and the last char is \0.
++	 * In this case we are adding '0' to the device id string:
++	 * HL2000B -> HL2000B0
++	 */
++	if (!fuse.dev_id[GAUDI_FUSE_DEVID_SIZE - 1])
++		fuse.dev_id[GAUDI_FUSE_DEVID_SIZE - 1] = '0';
++
++	preboot_fuse_version_serialize(version, size, &ver_data);
++
++	return 0;
++}

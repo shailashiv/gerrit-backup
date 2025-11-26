@@ -1,0 +1,75 @@
+From 6ef96045f3d858203c1fc4157bae055934166aac Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Wed, 07 Jun 2023 16:08:10 +0300
+Subject: [PATCH] [SW-70697] gaudi3: pcie: add pwrbrk capability
+
+In order to support power break over PCIe,
+PCIe capabilities should contain pwrbrk capability,
+otherwise - host will fail to deliver pwrbrk capability,
+and requesting power break entry from host over PCIe
+will fail.
+
+Also note that this capability is reflected in lspci,
+and should show in string that this feature is supported:
+
+$ sudo lspci -d 1da3: -vv
+.....
+DevCap2: Completion Timeout: Range ABCD, TimeoutDis+, NROPrPrP-, LTR-
+ 10BitTagComp+, 10BitTagReq-, OBFF Not Supported, ExtFmt-, EETLPPrefix-
+ EmergencyPowerReduction Form Factor Dev Specific,
+....
+
+Change-Id: I0d1981a43f40526c809458ceac80ce9789f6cfd3
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 461423a..ab16f65 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -36,6 +36,7 @@
+ #include <pll_ctrl_regs.h>
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <gaudi3_reg_map.h>
++#include <pcie_dbi_masks.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+ #include <gaudi3/gaudi3_reg_map.h>
+@@ -1033,10 +1034,15 @@
+ 			D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG));
+ }
+ 
++#define EMR_PWR_M	PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP2_EMERGENCY_PWR_RED_SUPPORT_M
++#define ENABLE_PWRBRK_CTRL_VAL	0x2
++
+ static void pif_arc_config_dbi_params(void)
+ {
+ 	regmap_writel(0x02402801, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_GEN3_RELATED_OFF));
+ 	regmap_writel(0x04020031, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_GEN3_EQ_CONTROL_OFF));
++	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG),
++					ENABLE_PWRBRK_CTRL_VAL, EMR_PWR_M);
+ }
+ 
+ __weak void preboot_update_bar_sizes(void) {}
+diff --git a/include/preboot.h b/include/preboot.h
+index 87f7918..c57956c 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -138,6 +138,17 @@
+ 	*((volatile u32 *)(HL_CFG_BASE + offset)) = val;
+ }
+ 
++static inline void regmap_rmwritel(u32 addr, u32 data, u32 mask)
++{
++	u32 val;
++
++	val = regmap_readl(addr);
++	val &= ~mask;
++	val |= (data << (__builtin_ffsll(mask) - 1));
++
++	regmap_writel(val, addr);
++}
++
+ u32 hl_skip_pcie_init(void);
+ u32 hl_skip_fw_cfg(void);
+ void hl_uart_init(void);

@@ -1,0 +1,92 @@
+From 3c3e433f6f2086d59c8af248378224aaa066d078 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Mon, 18 Nov 2024 04:34:48 +0200
+Subject: [PATCH] [SW-208882] gaudi3: fix manifest hash calc in ppboot
+
+Manifest image is used to calculate the manifest hash. The manifest
+image header which is part of the manifest image, includes a key
+index that changes after the image is signed. Consequently, manifest
+image used to generate the gaudi3-pcr.bin and the signed manifest
+image sent to card during FW update are different. This causes the
+TPM PCR mismatch if image signing is used.
+
+This patch removes the manifest image header from the image used
+for manifest hash calculation in ppboot.
+
+This is a temporary fix as it removes useful data such as the key
+index, key, and signature from the manifest. In future patches, the
+manifest hash calculation will include the entire manifest. Since
+the hash changes after key signing when the full manifest is
+included, the PCR generation will be done post-signing. This
+temporary fix is implemented to avoid the step of PCR generation
+after signing with a new key.
+
+Change-Id: I25f88ea63f00ce2e191b5348103cb9b39a676af4
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 627d551..05e295f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1506,18 +1506,39 @@
+ 
+ void ppboot_compute_img_ptr_hash(u8 *hash)
+ {
+-	u32 img_ptrs_size, img_ptrs_img_size, img_ptrs_pub_key_size, img_ptrs_sig_size;
+-	u8 crc_bytes, num_crc;
++	u32 img_ptrs_size, img_ptrs_img_size, img_ptrs_pub_key_size, img_ptrs_sig_size,
++	img_ptrs_img_offset;
++	u8 crc_bytes, num_crc, img_ptrs_version, img_ptrs_hdr_size;
+ 
+ 	memcpy(&img_ptrs_size, (void *)(uintptr_t)IMG_PTRS_SIZE_OFFSET, 4);
+ 	memcpy(&img_ptrs_sig_size, (void *)(uintptr_t)IMG_PTRS_SIG_SIZE_OFFSET, 4);
+ 	memcpy(&img_ptrs_pub_key_size, (void *)(uintptr_t)IMG_PTRS_PUB_KEY_SIZE_OFFSET, 4);
++	memcpy(&img_ptrs_version, (void *)(uintptr_t)IMG_PTRS_VER_OFFSET, 1);
++
++	/* boot_ptrs_sz field in supported in manifest header starting from manifest version 1 */
++	if (img_ptrs_version == HL_FW_IMG_PTR_VERSION_0)
++		img_ptrs_hdr_size = sizeof(struct hl_fw_boot_ptrs);
++	else
++		memcpy(&img_ptrs_hdr_size, (void *)(uintptr_t)IMG_PTRS_HDR_SIZE_OFFSET, 1);
++
++	/* skip the manifest header for manifest hash computation */
++	img_ptrs_img_offset = IMG_PTRS_OFFSET + img_ptrs_hdr_size;
+ 
+ 	num_crc = ppboot_get_num_crc(img_ptrs_size);
+ 	crc_bytes = num_crc * CRC32_SIZE;
+-	img_ptrs_img_size = img_ptrs_size - img_ptrs_pub_key_size - img_ptrs_sig_size - crc_bytes;
++	/*
++	 * TODO: This is a temporary fix which removes manifest hdr, key index,
++	 * key, and signature from the manifest before manifest hash calculation.
++	 * Since the hash changes after key signing when the full manifest is
++	 * included, the PCR generation has to be done post-signing. This temporary
++	 * fix is implemented to avoid the step of PCR generation after signing
++	 * with a new key. In future, the manifest hash calculation should include
++	 * the entire manifest.
++	 */
++	img_ptrs_img_size = img_ptrs_size - img_ptrs_hdr_size - img_ptrs_pub_key_size
++				- img_ptrs_sig_size - crc_bytes;
+ 
+-	sha384_csum((void *)(uintptr_t)IMG_PTRS_OFFSET, img_ptrs_img_size, hash, 0);
++	sha384_csum((void *)(uintptr_t)img_ptrs_img_offset, img_ptrs_img_size, hash, 0);
+ }
+ 
+ bool get_img_ptr_hash(u8 *hash)
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 5d25a42..c7e354d 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -128,6 +128,12 @@
+ 					offsetof(struct hl_fw_boot_ptrs, sig_sz))
+ #define IMG_PTRS_PUB_KEY_SIZE_OFFSET	(IMG_PTRS_OFFSET + \
+ 					offsetof(struct hl_fw_boot_ptrs, pub_key_sz))
++#define IMG_PTRS_VER_OFFSET		(IMG_PTRS_OFFSET + \
++					offsetof(struct hl_fw_boot_ptrs, version))
++#define IMG_PTRS_HDR_SIZE_OFFSET		(IMG_PTRS_OFFSET + \
++					offsetof(struct hl_fw_boot_ptrs, boot_ptrs_sz))
++
++#define HL_FW_IMG_PTR_VERSION_0		0
+ 
+ #define SW_STATUS_SPI_BOOT_DESC_DMA_START	4
+ #define SW_STATUS_SPI_BOOT_DESC_DMA_START_MASK	BIT(SW_STATUS_SPI_BOOT_DESC_DMA_START)

@@ -1,0 +1,290 @@
+From 415f7f2119b5fe625137843b425feb59c81f6aa3 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 24 Aug 2021 21:02:13 +0300
+Subject: [PATCH] [SW-47990] gaudi2: move pll related code to common
+
+The legacy boot flow needs to initialize the SRAM PLLs, thus move the
+PLL code to common Gaudi2 location.
+
+Change-Id: I16c6c6fa16207be89d9af556c5345544b3297a65
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+index c62ae85..c2c8bcc 100644
+--- a/arch/gaudi2/arc/Makefile
++++ b/arch/gaudi2/arc/Makefile
+@@ -5,6 +5,5 @@
+ 
+ LDFLAGS += -Wl,--just-symbols $(PREBOOT_ROOT_DIR)/../arcboot-custom/exports.elf
+ 
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/pll.c)
+ PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
+diff --git a/arch/gaudi2/arc/pll.c b/arch/gaudi2/arc/pll.c
+deleted file mode 100644
+index 792820c..0000000
+--- a/arch/gaudi2/arc/pll.c
++++ /dev/null
+@@ -1,122 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2021 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <stddef.h>
+-#include <bitops.h>
+-#include <preboot.h>
+-#include <pll.h>
+-#include <uart.h>
+-#include "common.h"
+-
+-
+-#define GAUDI2_PLL_CFG_DIV		0x104
+-
+-u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
+-{
+-	u32 div_sel, factor, offset;
+-	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
+-	u64 out_freq = SYS_REF_CLOCK;
+-
+-	offset = div * sizeof(u32);
+-	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
+-
+-	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
+-		reg = regmap_readl(pll_base + GAUDI2_PLL_CFG_DIV);
+-		/* fbdiv : bits 0-11 */
+-		fbdiv = EXTRACT_BITS(reg, 0, 12);
+-		/* postdiv1 : bits 16-18 */
+-		postdiv1 = EXTRACT_BITS(reg, 16, 3);
+-		/* postdiv2 : bits 20-22 */
+-		postdiv2 = EXTRACT_BITS(reg, 20, 3);
+-		/* refdiv : bits 24-29 */
+-		refdiv  = EXTRACT_BITS(reg, 24, 6);
+-		out_freq = SYS_REF_CLOCK * fbdiv;
+-		out_freq /= refdiv * postdiv1 * postdiv2;
+-	}
+-
+-	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
+-		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
+-		out_freq /= factor + 1;
+-	}
+-
+-	/*
+-	 * TODO : The clock relaxation is not accounted here.
+-	 * We might need to deal with it in the future.
+-	 */
+-
+-	return out_freq;
+-}
+-
+-#ifdef TARGET_IS_PLDM
+-
+-#define GAUDI2_PLL_CFG		0x100
+-#define GAUDI2_PLL_CFG_EN	BIT(0)
+-#define GAUDI2_PLL_CFG_LOCK	BIT(16)
+-#define GAUDI2_PLL_DIV_SEL_DELAY	0x1E0
+-
+-
+-void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
+-{
+-	u32 reg = regmap_readl(cfg->base + GAUDI2_PLL_CFG);
+-
+-	if (true == reset)
+-		reg |= GAUDI2_PLL_CFG_EN;
+-	else
+-		reg &= ~GAUDI2_PLL_CFG_EN;
+-
+-	regmap_writel(reg, cfg->base + GAUDI2_PLL_CFG);
+-}
+-
+-int hl_pll_is_locked(struct hl_pll_cfg *cfg)
+-{
+-	return regmap_readl(cfg->base + GAUDI2_PLL_CFG) & GAUDI2_PLL_CFG_LOCK;
+-}
+-
+-#define GAUDI2_PLL_POSTDIV1_SHIFT	16
+-#define GAUDI2_PLL_POSTDIV2_SHIFT	20
+-#define GAUDI2_PLL_REFDIV_SHIFT		24
+-#define GAUDI2_PLL_MAX_WAIT_TIME		1
+-
+-void hl_pll_cfg(struct hl_pll_cfg *cfg)
+-{
+-	u32 reg = 0;
+-
+-	/* put the PLL into reset by writing 0 to CTRL_CFG.EN */
+-	hl_pll_reset(cfg, false);
+-
+-	/* FBDIV - bit 0
+-	 * POSTDIV1 - bit 16
+-	 * POSTDIV2 - bit 20
+-	 * REFDIV - bit 24
+-	 */
+-	reg = cfg->nr << GAUDI2_PLL_REFDIV_SHIFT |
+-		cfg->nb << GAUDI2_PLL_POSTDIV2_SHIFT |
+-		cfg->od << GAUDI2_PLL_POSTDIV1_SHIFT | cfg->nf;
+-
+-	regmap_writel(reg, cfg->base + GAUDI2_PLL_CFG_DIV);
+-
+-	/* after updating the coefficients we need to wait >=1us */
+-	udelay(GAUDI2_PLL_MAX_WAIT_TIME);
+-
+-	/* enable the PLL by writing a value of 1 to CTRL_CFG.EN*/
+-	hl_pll_reset(cfg, true);
+-}
+-
+-void hl_pll_ack_int(struct hl_pll_cfg *cfg) { }
+-
+-void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg) { }
+-
+-void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg)
+-{
+-	/* TODO: implement resetting the clock relaxation */
+-}
+-
+-void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg)
+-{
+-	regmap_writel(1, cfg->base + GAUDI2_PLL_DIV_SEL_DELAY);
+-}
+-
+-#endif /* TARGET_IS_PLDM */
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 3c20d65..08210b0 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -1,5 +1,6 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ 
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+diff --git a/arch/gaudi2/common/pll.c b/arch/gaudi2/common/pll.c
+new file mode 100644
+index 0000000..792820c
+--- /dev/null
++++ b/arch/gaudi2/common/pll.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <stddef.h>
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include "common.h"
++
++
++#define GAUDI2_PLL_CFG_DIV		0x104
++
++u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div)
++{
++	u32 div_sel, factor, offset;
++	u32 reg, fbdiv, refdiv, postdiv1, postdiv2;
++	u64 out_freq = SYS_REF_CLOCK;
++
++	offset = div * sizeof(u32);
++	div_sel = regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
++
++	if (div_sel == HL_PLL_PLL_CLK || div_sel == HL_PLL_DIV_PLL) {
++		reg = regmap_readl(pll_base + GAUDI2_PLL_CFG_DIV);
++		/* fbdiv : bits 0-11 */
++		fbdiv = EXTRACT_BITS(reg, 0, 12);
++		/* postdiv1 : bits 16-18 */
++		postdiv1 = EXTRACT_BITS(reg, 16, 3);
++		/* postdiv2 : bits 20-22 */
++		postdiv2 = EXTRACT_BITS(reg, 20, 3);
++		/* refdiv : bits 24-29 */
++		refdiv  = EXTRACT_BITS(reg, 24, 6);
++		out_freq = SYS_REF_CLOCK * fbdiv;
++		out_freq /= refdiv * postdiv1 * postdiv2;
++	}
++
++	if (div_sel == HL_PLL_DIV_REF || div_sel == HL_PLL_DIV_PLL) {
++		factor = regmap_readl(pll_base + HL_PLL_DIV_FACTOR + offset);
++		out_freq /= factor + 1;
++	}
++
++	/*
++	 * TODO : The clock relaxation is not accounted here.
++	 * We might need to deal with it in the future.
++	 */
++
++	return out_freq;
++}
++
++#ifdef TARGET_IS_PLDM
++
++#define GAUDI2_PLL_CFG		0x100
++#define GAUDI2_PLL_CFG_EN	BIT(0)
++#define GAUDI2_PLL_CFG_LOCK	BIT(16)
++#define GAUDI2_PLL_DIV_SEL_DELAY	0x1E0
++
++
++void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++{
++	u32 reg = regmap_readl(cfg->base + GAUDI2_PLL_CFG);
++
++	if (true == reset)
++		reg |= GAUDI2_PLL_CFG_EN;
++	else
++		reg &= ~GAUDI2_PLL_CFG_EN;
++
++	regmap_writel(reg, cfg->base + GAUDI2_PLL_CFG);
++}
++
++int hl_pll_is_locked(struct hl_pll_cfg *cfg)
++{
++	return regmap_readl(cfg->base + GAUDI2_PLL_CFG) & GAUDI2_PLL_CFG_LOCK;
++}
++
++#define GAUDI2_PLL_POSTDIV1_SHIFT	16
++#define GAUDI2_PLL_POSTDIV2_SHIFT	20
++#define GAUDI2_PLL_REFDIV_SHIFT		24
++#define GAUDI2_PLL_MAX_WAIT_TIME		1
++
++void hl_pll_cfg(struct hl_pll_cfg *cfg)
++{
++	u32 reg = 0;
++
++	/* put the PLL into reset by writing 0 to CTRL_CFG.EN */
++	hl_pll_reset(cfg, false);
++
++	/* FBDIV - bit 0
++	 * POSTDIV1 - bit 16
++	 * POSTDIV2 - bit 20
++	 * REFDIV - bit 24
++	 */
++	reg = cfg->nr << GAUDI2_PLL_REFDIV_SHIFT |
++		cfg->nb << GAUDI2_PLL_POSTDIV2_SHIFT |
++		cfg->od << GAUDI2_PLL_POSTDIV1_SHIFT | cfg->nf;
++
++	regmap_writel(reg, cfg->base + GAUDI2_PLL_CFG_DIV);
++
++	/* after updating the coefficients we need to wait >=1us */
++	udelay(GAUDI2_PLL_MAX_WAIT_TIME);
++
++	/* enable the PLL by writing a value of 1 to CTRL_CFG.EN*/
++	hl_pll_reset(cfg, true);
++}
++
++void hl_pll_ack_int(struct hl_pll_cfg *cfg) { }
++
++void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg) { }
++
++void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg)
++{
++	/* TODO: implement resetting the clock relaxation */
++}
++
++void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg)
++{
++	regmap_writel(1, cfg->base + GAUDI2_PLL_DIV_SEL_DELAY);
++}
++
++#endif /* TARGET_IS_PLDM */

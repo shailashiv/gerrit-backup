@@ -1,0 +1,184 @@
+From 1f6f152ac040a6f365c4a7dede19c78b942dcd21 Mon Sep 17 00:00:00 2001
+From: Varun <vyaparla@habana.ai>
+Date: Tue, 08 Feb 2022 06:29:01 +0200
+Subject: [PATCH] [SW-69281] common: refactor elbi related code
+
+gaudi uses spsram  as backend storage for fit to be
+downloaded via elbi interface and gaudi2 uses arc farm
+arc0 dccm as backend storage. This change generalize
+elbi changes as backend storage agnostic
+
+Change-Id: If8389f502902eba3d1e26b1a93965813a9732f2c
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 4e83daf..282d325 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -277,6 +277,7 @@
+ __weak void preboot_security_dynamic_img_sram_close(void) {}
+ __weak void preboot_security_dynamic_img_elbi_reg_open(void) {}
+ __weak void preboot_security_dynamic_img_elbi_reg_close(void) {}
++__weak void preboot_dynamic_img_elbi_reg_cleanup(void *map_addr, u32 size) {}
+ __weak void preboot_security_cleanup_before_run(void) {}
+ __weak void preboot_led_on(void) {}
+ __weak void preboot_sp_sram_init(void) {}
+@@ -301,6 +302,16 @@
+ 	return false;
+ }
+ 
++__weak uintptr_t preboot_get_elbi_reg_base(void)
++{
++	return 0;
++}
++
++__weak u32 preboot_get_elbi_reg_size(void)
++{
++	return 0;
++}
++
+ __weak bool preboot_is_valid_address_range(u64 addr, int len)
+ {
+ 	return preboot_sram_is_valid_address_range(addr, len);
+diff --git a/arch/gaudi/arm/security.c b/arch/gaudi/arm/security.c
+index 0411f9a..2f135bd 100644
+--- a/arch/gaudi/arm/security.c
++++ b/arch/gaudi/arm/security.c
+@@ -2078,6 +2078,16 @@
+ 	}
+ }
+ 
++uintptr_t preboot_get_elbi_reg_base(void)
++{
++	return (uintptr_t)FIT_IMG_SPSRAM_BASE;
++}
++
++u32 preboot_get_elbi_reg_size(void)
++{
++	return FIT_IMG_SPSRAM_MAX_SIZE;
++}
++
+ void preboot_security_dynamic_img_elbi_reg_close(void)
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg =
+@@ -2094,6 +2104,11 @@
+ 	preboot_secure_pcie_rr(preboot_sec_dyn_cfg[SPSRAM_IMAGE].rr, 0, 0);
+ }
+ 
++void preboot_dynamic_img_elbi_reg_cleanup(void *map_addr, u32 size)
++{
++	memset(map_addr, 0, size);
++}
++
+ void preboot_security_dynamic_vers_init(u64 vers_off, u32 size)
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
+diff --git a/include/preboot.h b/include/preboot.h
+index b1b8a17..623f7ad 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -188,6 +188,9 @@
+ 				    bool is_reverse);
+ bool preboot_sram_is_valid_address_range(u64 addr, int len);
+ bool preboot_is_valid_address_range(u64 addr, int len);
++uintptr_t preboot_get_elbi_reg_base(void);
++u32 preboot_get_elbi_reg_size(void);
++void preboot_dynamic_img_elbi_reg_cleanup(void *map_addr, u32 size);
+ bool preboot_is_overlap_address_range(u64 addr, int len);
+ 
+ enum hl_fw_en_caps;
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index f85e554..63102a9 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -161,6 +161,11 @@
+ 	return err;
+ }
+ 
++__weak u32 preboot_get_elbi_reg_offset_from_base(uintptr_t address)
++{
++	return (u32)((address - SDRAM_BASE) & ~HL_UPD_STS_OFFSET_MASK);
++}
++
+ static void module_fwupd_send_status_fast(struct fwupd_state *state,
+ 					  enum hl_upd_sts sts, void *offset)
+ {
+@@ -168,19 +173,24 @@
+ 	uintptr_t address = (uintptr_t)offset;
+ 
+ 	if (state->use_security && offset)
+-		preboot_security_dynamic_img_sram_open(state->mregion,
+-						       ACCESS_RO);
++		preboot_security_dynamic_img_sram_open(state->mregion, ACCESS_RO);
+ 
+ 	status.val = 0;
+ 	status.status = sts;
+ 
+ 	/* only if we get a address we need to calc offset */
+-	if (address >=  SDRAM_BASE)
+-		status.offset = (u32)((address - SDRAM_BASE) &
+-				~HL_UPD_STS_OFFSET_MASK);
+-	else
+-		status.offset = (u32)(address & ~HL_UPD_STS_OFFSET_MASK);
+-
++	if (state->wfc_cmd.cmd == HL_UPD_MAP_ELBI) {
++		if (address)
++			status.offset = preboot_get_elbi_reg_offset_from_base(address);
++		else
++			status.offset = 0;
++	} else {
++		if (address >=  SDRAM_BASE)
++			status.offset = (u32)((address - SDRAM_BASE) &
++					~HL_UPD_STS_OFFSET_MASK);
++		else
++			status.offset = (u32)(address & ~HL_UPD_STS_OFFSET_MASK);
++	}
+ 
+ 	state->sts_writel(status.val);
+ }
+@@ -456,7 +466,10 @@
+ 		return HL_UPD_STS_MAP_ERR;
+ 	}
+ 
+-	base_offset = cmd == HL_UPD_MAP_SRAM ? mdesc.base : FIT_IMG_SPSRAM_BASE;
++	if (cmd == HL_UPD_MAP_ELBI)
++		base_offset = preboot_get_elbi_reg_base();
++	else
++		base_offset = mdesc.base;
+ 
+ 	err = !preboot_is_valid_address_range(base_offset, size);
+ 	if (err || size > mdesc.size) {
+@@ -493,8 +506,7 @@
+ 		break;
+ 	case HL_UPD_MAP_SRAM:
+ 	case HL_UPD_MAP_ELBI:
+-		sts = module_fwupd_map(state,
+-				       state->wfc_cmd.size, state->wfc_cmd.cmd);
++		sts = module_fwupd_map(state, state->wfc_cmd.size, state->wfc_cmd.cmd);
+ 		module_fwupd_send_status(state, sts, state->map_offset);
+ 		break;
+ 	case HL_UPD_RUN_SRAM:
+@@ -682,7 +694,7 @@
+ 	err = module_fwupd_load_type(state);
+ 
+ 	if (cmd == HL_UPD_RUN_ELBI)
+-		memset(state->map_offset, 0, ROUND_UP4(state->map_size));
++		preboot_dynamic_img_elbi_reg_cleanup(state->map_offset, ROUND_UP4(state->map_size));
+ 
+ 	if (err) {
+ 		sts = HL_UPD_STS_ERR;
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 5f612e2..64f5486 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -184,8 +184,8 @@
+ 	int err = 0;
+ 
+ 	if (sts.is_elbi_desc) {
+-		desc->base = (uintptr_t)FIT_IMG_SPSRAM_BASE;
+-		desc->size = FIT_IMG_SPSRAM_MAX_SIZE;
++		desc->base = preboot_get_elbi_reg_base();
++		desc->size = preboot_get_elbi_reg_size();
+ 	} else {
+ 		/*
+ 		 * For non-ELBI descriptor, the same SRAM addr is used for both

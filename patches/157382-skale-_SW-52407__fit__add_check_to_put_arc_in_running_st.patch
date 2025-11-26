@@ -1,0 +1,177 @@
+From e9c3be25c539c7e302e1a049e49284a0f0e1c201 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 16 Dec 2021 08:19:02 +0200
+Subject: [PATCH] [SW-52407] fit: add check to put arc in running state
+
+Currently as part of greco and gaudi2 preboot_start_image
+function, ARCs and ARM are put into running state. However
+in some of scenarios, fit image received doesn't contain
+arc images and still arcs are put to running state or jumped
+to ICCM location assuming images from fit for ARCs are already
+copied. This patch add change to conditionally set ARCs in
+running state if ARC images are received as part of FIT.
+
+Change-Id: I9197671fafc287802d33632246d393ddc69092f9
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 85f4808..bf78845 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -170,7 +170,7 @@
+ 	image_entry();
+ }
+ 
+-void preboot_start_image(u64 startaddr)
++void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+ 	void (*image_entry)(void);
+ 	u32 lsb, msb;
+@@ -193,6 +193,15 @@
+ 		regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+ 	}
+ 
++	if (!valid_arc_img) {
++		/*
++		 * Dont run ARC0 or jump to ARC1 ICCM if no arc images
++		 * received as part of fit. Replace sleep() with wfe()
++		 * once wfe() for gaudi2 is fixed.
++		 */
++		sleep();
++	}
++
+ 	/* Set ARC0 in running state */
+ 	run_arc(0);
+ 
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 32e04ea..3ed456c 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -195,11 +195,17 @@
+ 	init_arc();
+ }
+ 
+-void preboot_start_image(u64 startaddr)
++void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+-	/* Set ARC0 and ARC1 in running state */
+-	run_arc(0);
+-	run_arc(1);
++	/*
++	 * Set ARC0 and ARC1 in running state. Don't run
++	 * ARCs if no arc images received as part of fit.
++	 */
++	if (valid_arc_img) {
++		run_arc(0);
++		run_arc(1);
++	}
++
+ 	/*
+ 	 * After image_entry, control is not expected to return
+ 	 * here and continue.
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index 9617a94..b3784b1 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -68,7 +68,7 @@
+ 	return 1;
+ }
+ 
+-void preboot_start_image(u64 startaddr)
++void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+ 	void (*image_entry)(void);
+ 	u32 lsb, msb;
+@@ -85,6 +85,14 @@
+ 		regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+ 	}
+ 
++	if (!valid_arc_img) {
++		/*
++		 * Dont run ARC0 or jump to ARC1 ICCM if no arc images
++		 * received as part of fit.
++		 */
++		wfe();
++	}
++
+ 	 /* Set ARC0 in running state */
+ 	run_arc(0);
+ 
+diff --git a/arch/greco/arm/common.c b/arch/greco/arm/common.c
+index 03730f5..0fac70a 100644
+--- a/arch/greco/arm/common.c
++++ b/arch/greco/arm/common.c
+@@ -160,11 +160,16 @@
+ 	image_entry();
+ }
+ 
+-void preboot_start_image(u64 startaddr)
++void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+-	/* Set ARC0 and ARC1 in running state */
+-	run_arc(0);
+-	run_arc(1);
++	/*
++	 * Set ARC0 and ARC1 in running state. Don't run
++	 * ARCs if no arc images received as part of fit.
++	 */
++	if (valid_arc_img) {
++		run_arc(0);
++		run_arc(1);
++	}
+ 
+ 	/*
+ 	 * After image_entry, control is not expected to return
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 6e836f2..5d371d1 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -86,7 +86,7 @@
+ struct fdt_region fdt_regions[MAX_FDT_REGIONS];
+ struct image_region region[MAX_FDT_REGIONS];
+ 
+-__weak void preboot_start_image(u64 startaddr)
++__weak void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+ 	image_start(startaddr);
+ }
+@@ -986,14 +986,26 @@
+ void fit_run_image(void)
+ {
+ 	u64 startaddr = 0;
++	bool valid_arc_img = false;
+ 	u32 i;
+ 
+ 	for (i = 0; i < FIT_MAX_IMAGES; i++) {
+-		if (strcmp(images[i].arch, "arm64"))
+-			continue;
+ 
+-		startaddr = images[i].startaddr;
+-		break;
++		/*
++		 * Below check to detect end of valid images
++		 * in images array.
++		 */
++		if (!images[i].arch)
++			break;
++
++		if (!(strcmp(images[i].arch, "arm64")))
++			startaddr = images[i].startaddr;
++
++		if (!(strcmp(images[i].arch, "arc")))
++			valid_arc_img = true;
++
++		if ((valid_arc_img) && (startaddr))
++			break;
+ 	}
+ 
+ 	preboot_finalize_nic_en();
+@@ -1003,7 +1015,7 @@
+ 	preboot_finalize_enabled_caps();
+ 	preboot_finalize_uboot_override();
+ 	boot_info_finalize();
+-	preboot_start_image(startaddr);
++	preboot_start_image(startaddr, valid_arc_img);
+ }
+ 
+ __weak size_t preboot_get_img_sec_desc_size(void)

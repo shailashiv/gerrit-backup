@@ -1,0 +1,304 @@
+From deb40a75e24b8e1c977fc0586080100394ba125a Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Mon, 27 May 2024 13:10:20 +0300
+Subject: [PATCH] [SW-0] gaudi2: card boot stuck debug changes
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: If9a8b49342a76a434fce6825c96e76990368cf65
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index f2864fa..1748ae6 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -21,6 +21,7 @@
+ #include <pci.h>
+ #include <efuse.h>
+ #include <hl.h>
++#include <psoc_global_conf_regs.h>
+ 
+ struct device_ca53_cfg ca53_cfg;
+ 
+@@ -291,6 +292,7 @@
+ 	device_init_global_conf();
+ 	device_init_ca53_cfg();
+ 	device_init_pll(); /* used for uart and delay */
++	device_init_i2c_s();
+ }
+ 
+ static void ppboot_time_critical_section_start(void)
+@@ -305,7 +307,39 @@
+ 	preboot_uart_rbuf_disable();
+ 	preboot_puts("\n");
+ }
++#if 0
++#define ARC0_WAIT_TIMEOUT	1000000
++static void preboot_print_arc0_status(void)
++{	u64 start = timestamp_get_us();
++	u32 retry = 30;
+ 
++	preboot_puts_hex("ARC0 status ", regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_13), false);
++	preboot_puts_hex("PRSTN reg ", regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN), false);
++	preboot_puts_hex("PSOC AXI drain ", regmap_readl(mmPSOC_GLOBAL_CONF_AXI_DRAIN_INTR), false);
++	preboot_puts_hex("retry ", retry, false);
++	if (link_is_up)
++		return;
++	while (retry) {
++		if (timeout_expired(start, ARC0_WAIT_TIMEOUT)) {
++			start = timestamp_get_us();
++			retry--;
++			preboot_puts_hex("ARC0 status ", regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_13), false);
++			preboot_puts_hex("PRSTN reg ", regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN), false);
++			preboot_puts_hex("PSOC AXI drain ", regmap_readl(mmPSOC_GLOBAL_CONF_AXI_DRAIN_INTR), false);
++			preboot_puts_hex("retry ", retry, false);
++
++		}
++		if (regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_13) & BIT(13)) {
++			preboot_puts_hex("ARC0 status ", regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_13), false);
++			preboot_puts_hex("PRSTN reg ", regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN), false);
++			preboot_puts_hex("PSOC AXI drain ", regmap_readl(mmPSOC_GLOBAL_CONF_AXI_DRAIN_INTR), false);
++			preboot_puts_hex("retry ", retry, false);
++			return;
++		}
++	}
++	preboot_puts("timeout for pcie link\n");
++}
++#endif
+ __weak void ppboot_security_init(void) {}
+ __weak void ppboot_secure_arc(void) {}
+ __weak void hl_sram_self_repair(void) {}
+@@ -314,6 +348,7 @@
+ __weak void hl_pcie_enable_elbi_access(void) {}
+ __weak void ppboot_tpm_extend(void) {}
+ __weak void ppboot_boot_info_init(void) {}
++//__weak void preboot_i2cslave_init(bool debug_mode) {}
+ 
+ void ppboot_main(void)
+ {
+@@ -372,7 +407,10 @@
+ 
+ 	ret = ppboot_load_preboot_img(&loadaddr);
+ 	ppboot_check_stack_monitor();
++	//preboot_i2cslave_init(true);
++	//preboot_print_arc0_status();
+ 	preboot_puts("Ppboot resigned\n\r\n");
++	preboot_uart_rbuf_flush();
+ 	if (ret)
+ 		image_start(loadaddr);
+ 	hl_enter_recovery();
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 49cde90..dccb198 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -733,9 +733,11 @@
+ 
+ void secondary_main(void)
+ {
++	preboot_update_arc0_status(0);
+ 	secondary_device_init();
++	preboot_update_arc0_status(1);
+ 	preboot_pcie_monitoring();
+-
++	preboot_update_arc0_status(14);
+ 	/* Put secondary CPU in sleep state until further notice */
+ 	wfe();
+ }
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 052267a..c1c1713 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -58,7 +58,6 @@
+ 
+ #include <common/pci_ids.h>
+ 
+-#include <device.h>
+ #include <uart.h>
+ #include <pll.h>
+ #include <pci.h>
+@@ -68,6 +67,7 @@
+ #include <boot_info.h>
+ #include <hl_boot_desc.h>
+ #include <efuse.h>
++#include <device.h>
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+@@ -557,6 +557,7 @@
+ void preboot_init_pcie(void)
+ {
+ 	preboot_init_pcie_phy();
++	preboot_update_arc0_status(4);
+ 
+ 	preboot_pcie_device_id_vendor_id_set();
+ 
+@@ -568,14 +569,17 @@
+ 	regmap_writel(0x01402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+ 	regmap_writel(0x04027041, mmPCIE_DBI_GEN3_EQ_CONTROL_OFF);
+ 
++	preboot_update_arc0_status(5);
+ 	/* Wait for ext_ld_done before executing W/A */
+ 	pcie_wait_for_sram_ext_ld_done();
+ 
++	preboot_update_arc0_status(6);
+ 	/* Execute the Synopsys W/A */
+ 	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
+ 	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+ 	udelay(20);
+ 
++	preboot_update_arc0_status(7);
+ 	/* Set HBM BAR size */
+ 	preboot_update_bar_sizes();
+ 
+@@ -588,19 +592,23 @@
+ 	/* Mask Completer Abort AER */
+ 	hl_pcie_mask_ca_aer();
+ 
++	preboot_update_arc0_status(8);
+ 	/* Enable and Mask LTSSM (erratum 102) */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+ void preboot_pcie_monitoring(void)
+ {
++	preboot_update_arc0_status(2);
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+ 		;
+ 
++	preboot_update_arc0_status(3);
+ 	/* Only after PRSTn is de-asserted */
+ 	preboot_pcie_enable();
+ 
++	preboot_update_arc0_status(9);
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+ 
+@@ -609,8 +617,10 @@
+ 		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+ 
+-		if (prstn && smlh && rdlh)
++		if (prstn && smlh && rdlh) {
++			preboot_update_arc0_status(10);
+ 			break;
++		}
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+@@ -620,11 +630,13 @@
+ 		 */
+ 		if (!prstn && ltssm) {
+ 			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			preboot_update_arc0_status(11);
+ 			continue;
+ 		}
+ 
+ 		if (prstn && !ltssm) {
+ 			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			preboot_update_arc0_status(12);
+ 			continue;
+ 		}
+ 	}
+@@ -635,6 +647,7 @@
+ 	 * does not hurt.
+ 	 */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++	preboot_update_arc0_status(13);
+ }
+ 
+ bool tpm_is_supported(void) { return true; }
+@@ -1342,3 +1355,43 @@
+ {
+ 	return hl_fuse_read(mmPSOC_EFUSE_BASE, word, val);
+ }
++
++#if 0
++void preboot_i2cslave_init(bool debug_mode)
++{
++	/* Check if already enabled */
++	if (regmap_readl(i2c_s.enable_reg)) {
++		preboot_puts("I2C SLAVE already initialized\n");
++		return;
++	}
++
++	if (debug_mode) {
++		regmap_writel(I2C_SLAVE_ADDRESS_DBG, i2c_s.sar_reg);
++	} else {
++		/* Program IC_SAR with address to which slave responds */
++		regmap_writel(I2C_SLAVE_ADDRESS, i2c_s.sar_reg);
++
++		/* Enable I2C Slave */
++		regmap_writel(0x1, global_conf.i2c_slv_reg);
++
++		/* Enable I2C Slave interrupts */
++		regmap_writel(0x0, global_conf.i2c_slv_intr_mask_reg);
++	}
++
++	/* Program IC_CON */
++	regmap_writel(0x22, i2c_s.con_reg);
++
++	/* Set INTR mask to default */
++	regmap_writel(I2C_SLAVE_DEFAULT_INTR_MASK, i2c_s.intr_mask_reg);
++
++	/* Write to IC_RX_TL to set Rx FIFO threshold level */
++	regmap_writel(0x0, i2c_s.rx_tl_reg);
++
++	/* Write to IC_TX_TL to set Tx FIFO threshold level */
++	regmap_writel(0x7, i2c_s.tx_tl_reg);
++
++	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
++	regmap_writel(0x1, i2c_s.enable_reg);
++	preboot_puts("i2c slave init\n");
++}
++#endif
+\ No newline at end of file
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index 184ca51..deab740 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -15,7 +15,8 @@
+ #define HL_PLL_DIV_FACTOR_CMD	0x220
+ #define HL_PLL_DIV_SEL		0x280
+ #define HL_PLL_DIV_EN		0x2a0
+-
++#define preboot_update_arc0_status(bit_pos) \
++	regmap_writel(regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_13) | BIT(bit_pos), mmPSOC_GLOBAL_CONF_SCRATCHPAD_13)
+ void set_pci_msix_pba_offset_val(void);
+ void set_slv_cfg_reg_val(void);
+ void halt_n_reset_arc(u8 id);
+@@ -23,5 +24,6 @@
+ void preboot_pcie_monitoring(void);
+ void init_arc_mem(u8 id, u64 addr, u32 size);
+ const struct hl_sec_efuse *preboot_get_hl_sec_real_efuse(void);
++//void preboot_update_arc0_status(u32 bit_pos);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index c5e77f5..39dbdf5 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -1310,10 +1310,9 @@
+ {
+ 	ppboot_secure_hbm();
+ 	ppboot_secure_spi_dma();
+-
++	/* Enable JTAG to override disablement in arcboot */
++	ppboot_secure_enable_jtag_if();
+ 	if (!preboot_security_is_enabled()) {
+-		/* Enable JTAG to override disablement in arcboot */
+-		ppboot_secure_enable_jtag_if();
+ 		return;
+ 	}
+ 
+diff --git a/include/baremetal.h b/include/baremetal.h
+index f8d75b9..709025f 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -282,6 +282,7 @@
+ void preboot_boot_info_init(void);
+ void ppboot_boot_info_init(void);
+ void preboot_recovery_flag(bool en);
++//void preboot_i2cslave_init(bool debug_mode);
+ 
+ #endif /* __ASSEMBLY__ */
+ 

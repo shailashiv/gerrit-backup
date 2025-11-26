@@ -1,0 +1,94 @@
+From ec64c382b71babce1f6fba23076779fa16ea68a9 Mon Sep 17 00:00:00 2001
+From: Varun Kumar Reddy Yaparla <vyaparla@habana.ai>
+Date: Wed, 19 Jan 2022 18:17:53 +0200
+Subject: [PATCH] [SW-70899] gaudi2: sec: reset CPU_PLL protection bits configuration
+
+This change resets CPU_PLL protection bits configuration if
+security is not enabled.
+When fake security is enabled, all the protection bits configuration
+registers are configured. Disabling fake security followed by a reboot
+issues a PRSTn reset.
+As part of PRSTn reset, CPU_PLL is not getting reset due to which
+the protection bits configuration registers programmed as part of
+security init are not getting reset even if security is disabled
+
+Change-Id: Ib348e50c83366dd7c2adfcaeb5ebf3a447e8bd30
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 18bcb43..99cc1de 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -714,6 +714,15 @@
+ 	},
+ };
+ 
++static struct hl_prot_bits_cfg gaudi2_prot_bits_reset[] = {
++	{{ HL_BLOCK_TYPE_PLL, (mmPSOC_CPU_PLL_CTRL_BASE & ~CFG_BASE), 1, 0, 0, 0x0, 0x0, 0x0 },
++	  .prot_map = 0xFFFFFFFF,
++	  .data_map = 0x0000000,
++	  .data = NULL,
++	  .data_size = 0
++	},
++};
++
+ void ppboot_secure_arc(void)
+ {
+ 	/* enable security and privilege mode for arc0 and arc1 */
+@@ -739,12 +748,17 @@
+ 		       PCIE_WRAP_PCIE_PROT_OVR_WR_EN_MASK), mmPCIE_WRAP_PCIE_PROT_OVR);
+ }
+ 
+-static int init_prot_bits_block(u32 index, u8 major, u8 minor, u8 sub_minor)
++static int init_prot_bits_block(u32 index, u8 major, u8 minor, u8 sub_minor, bool is_reset_conf)
+ {
+-	struct hl_prot_bits_cfg *cfg = &gaudi2_prot_bits_cfg[index];
++	struct hl_prot_bits_cfg *cfg;
+ 	u8 b_idx = 0, d_idx = 0;
+ 	u32 val;
+ 	u32 addr, reg_addr;
++
++	if (is_reset_conf)
++		cfg = &gaudi2_prot_bits_reset[index];
++	else
++		cfg = &gaudi2_prot_bits_cfg[index];
+ 
+ 	addr = cfg->addr.base_addr + HL_GLBL_PRIV_REG_OFFSET + major * cfg->addr.major_offset +
+ 			  minor * cfg->addr.minor_offset + sub_minor * cfg->addr.sub_minor_offset;
+@@ -787,7 +801,7 @@
+ 				sub_minor_idx = 0;
+ 				do {
+ 					init_prot_bits_block(cfg_idx, major_idx, minor_idx,
+-							     sub_minor_idx);
++								sub_minor_idx, false);
+ 					sub_minor_idx++;
+ 				} while (sub_minor_idx < block_addr.sub_minor);
+ 				minor_idx++;
+@@ -1105,6 +1119,7 @@
+ static void preboot_unlock_pcie_rr(void)
+ {
+ 	struct hl_rr_eng_select rr_sel;
++	u8 i;
+ 
+ 	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
+ 	/* select pcie rr */
+@@ -1121,6 +1136,19 @@
+ 	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, 0, 0, rr_sel);
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SRAM, 0, 0, rr_sel);
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, 0, 0, rr_sel);
++
++	/*
++	 * Reset protection bits configuration
++	 * This is done to reset CPU_PLL protection bits configuration.
++	 * When fake security is enabled, all the protection bits configuration
++	 * registers are configured. Disabling fake security followed by a reboot
++	 * issues a PRSTn reset.
++	 * As part of PRSTn reset, CPU_PLL is not getting reset due to which
++	 * the protection bits configuration registers programmed as part of
++	 * security init are not getting reset even if security is disabled
++	 */
++	for (i = 0; i < ARRAY_SIZE(gaudi2_prot_bits_reset); i++)
++		init_prot_bits_block(i, 0, 0, 0, true);
+ }
+ 
+ #define PROT_OVR_SECURE		0

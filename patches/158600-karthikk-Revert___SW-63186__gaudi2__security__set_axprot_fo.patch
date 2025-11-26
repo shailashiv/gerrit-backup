@@ -1,0 +1,95 @@
+From f0d87115359422b91f1dd827ae9a693c36ed32cd Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 20 Dec 2021 07:50:18 +0200
+Subject: [PATCH] Revert "[SW-63186] gaudi2: security: set axprot for rot"
+
+As per alignment with LKD, MSTR_IF's OVRD register should not be used
+to set to "USER level".
+
+This is because sub-blocks which should be secure won’t be able to work,
+as MSTR_IF's OVRD bit takes precedence over the engine's internal PROT
+configuration
+
+This reverts commit f70c80894e584cec0894ac2d8086f1ce3add5e94.
+
+Change-Id: I4fce46966c37a095dccd809f07237757403c08aa
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 3589fcc..443cca3 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -33,8 +33,6 @@
+ #include <pcie_wrap_masks.h>
+ #include <dcore0_vdec0_mstr_if_core_hbw_regs.h>
+ #include <dcore0_vdec0_mstr_if_core_lbw_regs.h>
+-#include <rot0_mstr_if_core_hbw_regs.h>
+-#include <rot0_mstr_if_core_lbw_regs.h>
+ #include <pmmu_hbw_mstr_if_core_hbw_regs.h>
+ 
+ /*
+@@ -192,10 +190,6 @@
+ 	int rr;
+ 	u64 min;
+ 	u64 max;
+-};
+-
+-enum preboot_sec_axprot_regs {
+-	AXPROT_ROT,
+ };
+ 
+ #define DCORE_DIST	0x200000
+@@ -906,45 +900,6 @@
+ #define AXPROT_OVRD_EN		BIT(0)
+ #define AXPROT_USER_VAL		((PROT_OVR_USER << 1) | AXPROT_OVRD_EN)
+ #define AXPROT_SEC_VAL		((PROT_OVR_SECURE << 1) | AXPROT_OVRD_EN)
+-#define ROT_RTR_INST_NUM	1
+-#define ROT_INST_NUM		2
+-#define ROT_INST_DIST		0x10000
+-
+-static struct axprot_regs axprot_reg[] = {
+-	[AXPROT_ROT] = {
+-		.base_reg = mmROT0_MSTR_IF_CORE_HBW_AXPROT_OVRD,
+-		.value = AXPROT_USER_VAL,
+-		.dcore_dist = ROT_INST_DIST,
+-		.dcore_num = ROT_INST_NUM,
+-		.inst_dist = 0,
+-		.inst_num = ROT_RTR_INST_NUM,
+-	},
+-};
+-
+-static void preboot_axprot_regs_init(enum preboot_sec_axprot_regs idx)
+-{
+-	int i, j, dcore_reg, rtr_reg;
+-	struct axprot_regs *reg = &axprot_reg[idx];
+-
+-	for (i = 0; i < reg->dcore_num; i++) {
+-		dcore_reg = reg->base_reg + i * reg->dcore_dist;
+-		for (j = 0; j < reg->inst_num; j++) {
+-			rtr_reg = dcore_reg + j * reg->inst_dist;
+-			regmap_writel(reg->value, rtr_reg);
+-		}
+-	}
+-}
+-
+-static void preboot_secure_rot(void)
+-{
+-	/* HBW AXPROT */
+-	preboot_axprot_regs_init(AXPROT_ROT);
+-
+-	axprot_reg[AXPROT_ROT].base_reg = mmROT0_MSTR_IF_CORE_LBW_AXPROT_OVRD;
+-
+-	/* LBW AXPROT */
+-	preboot_axprot_regs_init(AXPROT_ROT);
+-}
+ 
+ static void preboot_secure_pmmu(void)
+ {
+@@ -960,7 +915,6 @@
+ 	if (preboot_security_is_enabled()) {
+ 		preboot_lbw_rtr_preconfig();
+ 		hl_dev_prot_bits_init();
+-		preboot_secure_rot();
+ 		preboot_secure_pmmu();
+ 		preboot_secure_lbw();
+ 		preboot_secure_hbw();

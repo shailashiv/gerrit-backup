@@ -1,0 +1,86 @@
+From 82c0ad016146a0205b320370630cc56439946e78 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 04 May 2021 16:20:46 +0300
+Subject: [PATCH] [SW-39664] lkd: fix comms msg magic validation
+
+Use comms message magic validation provided in embedded specs boot_if.
+It`s doing a much more comprehansive validate of 3 MSB bytes versus the
+comms message magic.
+Also validating that the LSB byte of magic has a version equal or
+greater of this feature supported version.
+
+Change-Id: I367176cf5aca23e66e226c258661346c0b070ce6
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 3e56a3a..36bff94 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -1124,6 +1124,7 @@
+ 	}
+ }
+ 
++/* running from module_lkd fast context - please consider when changing */
+ int i2csi_set_wd_err(enum hl_fw_reset_cause err)
+ {
+ 	u32 err_sts_wd_err = HL_ERROR_STATUS_OTHER |
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index ebce196..b6c84bd 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -123,7 +123,7 @@
+ 	return res;
+ }
+ 
+-static int module_lkd_msg_reset_cause(struct lkd_msg_comms *mcomms)
++static int module_lkd_msg_reset_cause(struct lkd_fw_comms_msg *mcomms)
+ {
+ 	int err = 1;
+ 
+@@ -141,7 +141,7 @@
+ 	return err;
+ }
+ 
+-static int module_lkd_msg_process(struct lkd_msg_comms *mcomms)
++static int module_lkd_msg_process(struct lkd_fw_comms_msg *mcomms)
+ {
+ 	int err = 1;
+ 
+@@ -158,11 +158,11 @@
+ 
+ static int module_lkd_run_fast_exec(void)
+ {
+-	struct lkd_msg_comms *mcomms = (struct lkd_msg_comms *) FIT_IMG_BASE;
++	struct lkd_fw_comms_msg *mcomms =
++		(struct lkd_fw_comms_msg *)FIT_IMG_BASE;
+ 	int err;
+ 
+ 	err = module_lkd_msg_process(mcomms);
+-
+ 	if (err)
+ 		preboot_security_dynamic_img_sram_open();
+ 
+@@ -393,12 +393,11 @@
+ 
+ static int module_lkd_msg_validate(uintptr_t offset)
+ {
+-	struct lkd_msg_comms *mcomms = (struct lkd_msg_comms *) offset;
++	struct lkd_fw_comms_msg *mcomms = (struct lkd_fw_comms_msg *)offset;
+ 	int err = 1;
+ 
+-
+-
+-	if (mcomms->header.magic == HL_COMMS_MSG_MAGIC) {
++	if (HL_COMMS_MSG_MAGIC_VALIDATE(mcomms->header.magic,
++					HL_COMMS_MSG_MAGIC_V1)) {
+ 		sts.exec_res = FOUND_FAST_RETURN;
+ 		err = 0;
+ 	}
+@@ -422,7 +421,6 @@
+ 
+ 	/* shared mem doesn't contain fit image. */
+ 	err = module_lkd_msg_validate(FIT_IMG_BASE);
+-
+ 	if (err) {
+ 		preboot_security_dynamic_img_sram_open();
+ 		sts.exec_res = NOT_FOUND;

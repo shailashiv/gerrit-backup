@@ -1,0 +1,73 @@
+From 985f0d591dc0e1b1cbbf8fcd203b935ea69f7a6c Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Thu, 17 Mar 2022 10:56:22 +0200
+Subject: [PATCH] [SW-79403] greco: initialize sp sram
+
+This patch initialize sp sram starting from 4K offset
+using memcpy block. First 4K is used by arcboot rom.
+PSOC_MEM_ERR interrupt was seen during boot,
+which is due to un-initialized sp sram access.
+
+Change-Id: Ifbc625d644b9b949daebca1d2cc858178cf77d6f
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index ae373f8..4788c01 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -172,3 +172,44 @@
+ 
+ 	return boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK;
+ }
++
++#define SP_SRAM_60K_SZ_16B_GRANULARITY	0xF00
++void preboot_sp_sram_init(void)
++{
++	u32 mem_cfg, cpy_sts;
++	u64 start;
++
++	/* Use memblock to initialize scratchpad memory from 4K offset
++	 * as first 4K offset is used by arcboot rom
++	 */
++	regmap_writel((u32)(HL_SP_SRAM_BASE + SZ_4K),
++			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((u32)((HL_SP_SRAM_BASE + SZ_4K) >> 32),
++			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	/* set size of 60k in granuality of 16 bytes */
++	mem_cfg |= (SP_SRAM_60K_SZ_16B_GRANULARITY & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	mem_cfg |= (BIT(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT));
++
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(BIT(0), mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	start = timestamp_get_us();
++
++	while (1) {
++		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts)
++			break;
++
++		/* If copy does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, MEM_CPY_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for mem_cpy\n");
++			break;
++		}
++	}
++}
+diff --git a/arch/greco/arc/common.h b/arch/greco/arc/common.h
+index 1e2a149..be0b07d 100644
+--- a/arch/greco/arc/common.h
++++ b/arch/greco/arc/common.h
+@@ -63,4 +63,5 @@
+ #define TS_CALIB_A_G_COEFF	65670
+ #define TS_CALIB_B_H_COEFF	254100
+ 
++#define MEM_CPY_TIMEOUT_US	(5 * USEC_PER_SEC)
+ #endif /* COMMON_GRECO_ARC_GNU_H_ */

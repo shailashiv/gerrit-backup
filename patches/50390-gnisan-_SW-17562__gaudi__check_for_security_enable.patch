@@ -1,0 +1,123 @@
+From 6f31d850cf6f8997c29466d32a0ceab188e35279 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 07 Sep 2020 11:59:40 +0300
+Subject: [PATCH] [SW-17562] gaudi: check for security enable
+
+Add security eFuse data read and use it to check for enabled security.
+
+Change-Id: Ia883257d9746c29ab0af5cce112430f1e50f29ff
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index b35135d..dd7acb8 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -10,16 +10,81 @@
+ #include <gaudi_blocks.h>
+ #include <pcie_wrap_regs.h>
+ #include <sif_rtr_ctrl_7_regs.h>
++#include <psoc_global_conf_regs.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
+ #include <hl_boot_if.h>
+ #include <boot_if.h>
++#include <string.h>
++#include <efuse.h>
++#include <gaudi/gaudi_security.h>
++
++struct preboot_security_efuse_cache {
++	bool is_invalid;
++	struct hl_sec_efuse fuse;
++};
++
++static struct preboot_security_efuse_cache preboot_security_fuse_cache = {
++	.is_invalid = true,
++};
++
++static const struct hl_sec_efuse *preboot_security_get_fuse(void)
++{
++	struct hl_sec_efuse *fuse;
++	u32 *val;
++	int i;
++
++	if (preboot_security_fuse_cache.is_invalid) {
++		fuse = &preboot_security_fuse_cache.fuse;
++
++		for (i = 0; i < ARRAY_SIZE(fuse->data); i++) {
++			val = &fuse->data[i];
++			if (preboot_fuse_read(EFUSE_SECURITY_OFFSET + i, val))
++				return NULL;
++		}
++		preboot_security_fuse_cache.is_invalid = false;
++	}
++
++	return &preboot_security_fuse_cache.fuse;
++}
++
++/* Enable bit is SOC_STRAP10 in schematics */
++#define SECURITY_ENABLE_SW BIT(10)
++
++/* The routine shall return true in case of security enable in strap.
++ * Otherwise, shall return false (The polarity of strap is inverted:
++ * meaning '0' is for security enable).
++ */
++static bool preboot_security_is_strap_enabled(void)
++{
++	u32 boot_strap;
++
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
++
++	return !(boot_strap & SECURITY_ENABLE_SW);
++}
++
++/* Security is enabled in the following condition:
++ * Boot strap pin for security is enabled or efuse bit
++ * for "security enabled" is true.
++ */
++static bool preboot_security_is_enabled(void)
++{
++	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
++
++	if (preboot_security_is_strap_enabled())
++		return true;
++
++	/* If eFuse read failed, assume an attacker sabotage, security in on */
++	if (!fuse)
++		return true;
++
++	return !!fuse->security_enable;
++}
+ 
+ static void preboot_security_pci_disable(void)
+ {
+-	preboot_puts("Disabling security temporarily till all implemented\n");
+-
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MAX_0);
+ 	regmap_writel(0, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MIN_0);
+@@ -45,14 +110,21 @@
+ {
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, true);
+ 
++	if (preboot_security_is_enabled()) {
++		preboot_puts("Security is enabled\n");
++	} else {
++		preboot_puts("Security is disabled\n");
++		/* TODO: add preboot_security_pci_disable(); */
++	}
++
+ 	/*
+-	 * TODO: check the efuse and boot strap for security enablement
+-	 *	 and call the below function if security is disabled.
++	 * TODO: Remove this call once it's added to the security enable check
+ 	 *
+ 	 *	 Meanwhile, keep the below call until we have finished
+ 	 *	 initializing all the security and there is no worry
+ 	 *	 to brick a device.
+ 	 */
++	preboot_puts("Disabling security temporarily till all implemented\n");
+ 	preboot_security_pci_disable();
+ 
+ 	/* TODO: implement security enablement */

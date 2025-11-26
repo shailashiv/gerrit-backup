@@ -1,0 +1,662 @@
+From 37c651efe354662afa37d2adcace4d52849b7cac Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Fri, 31 Jan 2020 22:17:59 +0200
+Subject: [PATCH] [SW-0] goya2: add common header
+
+For code to be built for ONIX
+
+Change-Id: Id64a144a3702732130fae8131bcafe80b5ef6de8
+---
+
+diff --git a/goya2/Makefile b/goya2/Makefile
+new file mode 100644
+index 0000000..861ab3b
+--- /dev/null
++++ b/goya2/Makefile
+@@ -0,0 +1 @@
++FW_SIZE := 0x4400
+diff --git a/goya2/asic.c b/goya2/asic.c
+new file mode 100644
+index 0000000..94b116f
+--- /dev/null
++++ b/goya2/asic.c
+@@ -0,0 +1,208 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdbool.h>
++
++#include <psoc_global_conf_regs.h>
++#include <psoc_pci_pll_ctrl_regs.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++static struct hl_pll_cfg goya2_pll_cfg[] = {
++	{
++		.name = "DMA_W", .base = mmDMA_W_PLL_BASE,
++		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "IF_W", .base = mmIF_W_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "IF_E", .base = mmIF_E_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "DMA_E", .base = mmDMA_E_PLL_BASE,
++		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
++		.div_factor = { 0, 1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "MESH_W", .base = mmMESH_W_PLL_BASE,
++		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "SRAM_W", .base = mmSRAM_W_PLL_BASE,
++		.nr = 0, .nf = 35, .od = 1, .nb = 17, /* 900 */
++		.div_factor = { 0, -1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "MESH_E", .base = mmMESH_E_PLL_BASE,
++		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "SRAM_E", .base = mmSRAM_E_PLL_BASE,
++		.nr = 0, .nf = 35, .od = 1, .nb = 17, /* 900 */
++		.div_factor = { 0, -1, -1, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "MME", .base = mmPSOC_MME_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "PCI", .base = mmPSOC_PCI_PLL_BASE,
++//		.nr = 0, .nf = 37, .od = 1, .nb = 18, /* 950 */
++		.nr = 4, .nf = 331, .od = 3, .nb = 165, //DAY 1 (830MHz)
++		.div_factor = { 0, 0, 4, 9 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "TPC", .base = mmPSOC_TPC_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "NIC0", .base = mmNIC0_PLL_BASE,
++		.nr = 24, .nf = 1665, .od = 3, .nb = 832, /* 833 MHz */
++		.div_factor = { 0, 4, 8, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "NIC1", .base = mmNIC1_PLL_BASE,
++		.nr = 24, .nf = 1665, .od = 3, .nb = 832, /* 833 MHz */
++		.div_factor = { 0, 4, 8, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
++	}, {
++		.name = "NIC2_MME", .base = mmNIC2_MME_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	}, {
++		.name = "NIC2_TPC", .base = mmNIC2_TPC_PLL_BASE,
++		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	},
++};
++
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	switch (cfg->base) {
++	case mmPSOC_CPU_PLL_BASE:
++		return false;
++	default:
++		break;
++	}
++
++	return true;
++}
++
++int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
++{
++	int pll_num = ARRAY_SIZE(goya2_pll_cfg);
++
++	*hl_pll_cfg = goya2_pll_cfg;
++
++	return pll_num;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	/* Use DumpSel[11] to skip PCIe initialization */
++	return regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L) & BIT(19);
++}
++
++u64 hl_pll_get_cpu_cycles_per_usec(void)
++{
++	u32 cpu_div0_freq = hl_pll_get_freq(mmPSOC_CPU_PLL_BASE, HL_PLL_DIV0);
++
++	return cpu_div0_freq / USEC_PER_SEC;
++}
++
++void hl_uart_init(void)
++{
++	u32 pcie_div2_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV2);
++
++	preboot_uart_init(pcie_div2_freq / HL_UART_BAUDRATE);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor;
++	u32 pcie_div2_freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE, HL_PLL_DIV2);
++
++	factor = pcie_div2_freq / HL_SPI_FLASH_MAX_FREQ;
++
++	return factor > 2 ? factor : 2;
++}
+diff --git a/goya2/common.c b/goya2/common.c
+new file mode 100644
+index 0000000..c48a56a
+--- /dev/null
++++ b/goya2/common.c
+@@ -0,0 +1,204 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_core_regs.h>
++#include <pcie_wrap_regs.h>
++#include <pcie_phy_regs.h>
++#include <pcie_dbi_regs.h>
++
++#include <hl_boot_if.h>
++#include <goya2/goya2_reg_map.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++#define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
++static void preboot_init_pcie_phy_fw_update(void)
++{
++	/* Configure FW update size */
++	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
++
++	/*
++	 * PHY FW FSM EN and Direct FW write mechanism enable
++	 * FW FSM assumes that the data is present in the SRAM
++	 * The FSM will wait for SRAM init done before updating
++	 * the SRAM contents
++	 */
++	regmap_writel(9, mmPCIE_WRAP_PHY_FW_FSM);
++
++	/* Take the PHY out of reset */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++}
++
++__attribute__((weak)) void preboot_init_pcie_phy(void)
++{
++	/* Reset PCIe PHY */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++	/*
++	 * Set PCIe PHY CR Para I/F to CFG.
++	 * Select CR PARA I/F instead of JTAG
++	 */
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
++
++	/* Select indirect access to CR PARA I/F instead of PRBI */
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
++
++	/*
++	 * Use PHY configuration from SoC online
++	 * instead of default values
++	 */
++	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
++	preboot_init_pcie_phy_fw_update();
++}
++
++static void preboot_init_pcie(void)
++{
++	preboot_init_pcie_phy();
++
++	/* Update Vendor ID */
++	regmap_writel(0x10001DA3, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++
++	/* Update subsystem Vendor ID */
++	regmap_writel(0x10001DA3,
++		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
++
++	/* Disable the EQ REDO */
++	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
++
++	/* delay before executing Synopsys W/A > 300us */
++	hl_pll_udelay(300);
++
++	/* Execute the Synopsys W/A */
++	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
++	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
++	hl_pll_udelay(20);
++
++	/* Enable and Mask LTSSM (erratum 102) */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++/*
++ * This logic copied from BTL PCIe section (#4)
++ * In BTL it is called when DIP switch for PCIe enable is set
++ * Now we wish to do this logic also here as a measure of security
++ * It means that in new PCB's version by default PCIe won't be enabled
++ * So without proper FW device won't be accessible through PCIe
++ * Hence device is more secured
++ */
++static void preboot_pcie_enable(void)
++{
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++	u32 reset_cause;
++
++	/* Check if already done by BTL */
++	if (boot_strap & 0x2)
++		return;
++
++	/* During hard reset triggered by LKD keep PCIe intact */
++	reset_cause = regmap_readl(mmPREBOOT_PCIE_EN);
++	regmap_writel(0, mmPREBOOT_PCIE_EN);
++	if (reset_cause == LKD_HARD_RESET_MAGIC)
++		return;
++
++	preboot_init_pcie();
++}
++
++void preboot_pcie_wait_for_link(void)
++{
++	/* Wait for PRSTn */
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
++		;
++
++	/* Only after PRSTn is de-asserted */
++	preboot_pcie_enable();
++
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh;
++
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++		if (prstn && smlh && rdlh)
++			break;
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++
++	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++void preboot_delay(void) {}
++
++#define mmPCIE_WRAP_VUART_TX_DATA	0xC01F60
++#define mmPCIE_WRAP_VUART_TX_STATUS	0xC01F64
++void preboot_putc_virt_uart(const char c)
++{
++	/*
++	 * update vUART to HOST
++	 * DATA: mmPCIE_WRAP_VUART_TX_DATA
++	 * STATUS: mmPCIE_WRAP_VUART_TX_STATUS
++	 */
++	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
++	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
++}
++
++u32 get_cs_pad_sel(void)
++{
++	return mmPSOC_GLOBAL_CONF_PAD_SEL_53;
++}
++
++u32 get_cpu_boot_status_reg(void)
++{
++	return mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++}
++
++u32 get_upd_pending_sts_reg(void)
++{
++	return mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_3;
++}
++/*
++ * Wait for Boot Manager to complete PCIe image execution
++ * and return to idle state, so it won't initiate UART access anymore
++ */
++void preboot_sync_btl(void)
++{
++	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM))
++		;
++}
++
++int hl_pcie_init_only(void)
++{
++	return 0;
++}
++
++void hl_plat_init(void) {}
+diff --git a/goya2/common.h b/goya2/common.h
+new file mode 100644
+index 0000000..a9fe4d5
+--- /dev/null
++++ b/goya2/common.h
+@@ -0,0 +1,28 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <preboot.h>
++
++#define PPBOOT_TEXT_BASE		0x7FF0000000
++#define PREBOOT_TEXT_BASE		(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
++
++#define mmDMA_W_PLL_BASE		0x487000
++#define mmIF_W_PLL_BASE			0x488000
++#define mmIF_E_PLL_BASE			0x4A7000
++#define mmDMA_E_PLL_BASE		0x4A8000
++#define mmMESH_W_PLL_BASE		0x4C7000
++#define mmSRAM_W_PLL_BASE		0x4C8000
++#define mmMESH_E_PLL_BASE		0x4E7000
++#define mmSRAM_E_PLL_BASE		0x4E8000
++#define mmPSOC_CPU_PLL_BASE		0xC70000
++#define mmPSOC_MME_PLL_BASE		0xC71000
++#define mmPSOC_PCI_PLL_BASE		0xC72000
++#define mmPSOC_TPC_PLL_BASE		0xC73000
++#define mmNIC0_PLL_BASE			0xCF9000
++#define mmNIC1_PLL_BASE			0xD39000
++#define mmNIC2_MME_PLL_BASE		0xD79000
++#define mmNIC2_TPC_PLL_BASE		0xD7A000
+diff --git a/goya2/onix.c b/goya2/onix.c
+new file mode 100644
+index 0000000..f3e924b
+--- /dev/null
++++ b/goya2/onix.c
+@@ -0,0 +1,49 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdbool.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#define SYS_CLOCK_FREQUENCY	35000000ULL
++
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return false;
++}
++
++int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
++{
++	return 0;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 1;
++}
++
++u64 hl_pll_get_cpu_cycles_per_usec(void)
++{
++	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++}
++
++void hl_uart_init(void)
++{
++	preboot_uart_init(SYS_CLOCK_FREQUENCY / HL_UART_BAUDRATE);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor;
++
++	factor = SYS_CLOCK_FREQUENCY / HL_SPI_FLASH_MAX_FREQ;
++
++	/* baud rate doesn't support odd number */
++	return (factor + 1) & 0xFFFE;
++}
+diff --git a/goya2/pldm.c b/goya2/pldm.c
+new file mode 100644
+index 0000000..b2a204d
+--- /dev/null
++++ b/goya2/pldm.c
+@@ -0,0 +1,52 @@
++/*
++ * (C) Copyright 2019 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stdbool.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#define SYS_CLOCK_FREQUENCY	155000ULL
++#define UART_CLOCK_FREQUENCY	(SYS_CLOCK_FREQUENCY / 5)
++#define PLDM_UART_BAUDRATE	1200
++
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return false;
++}
++
++int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
++{
++	return 0;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 1;
++}
++
++u64 hl_pll_get_cpu_cycles_per_usec(void)
++{
++	return SYS_CLOCK_FREQUENCY / USEC_PER_SEC;
++}
++
++void hl_uart_init(void)
++{
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor = 2; /* Min Divider */
++
++	/* baud rate doesn't support odd number */
++	return (factor + 1) & 0xFFFE;
++}
++
++void preboot_init_pcie_phy(void) {}
++
+diff --git a/goya2/ppboot.lds.S b/goya2/ppboot.lds.S
+new file mode 100644
+index 0000000..68d58f1
+--- /dev/null
++++ b/goya2/ppboot.lds.S
+@@ -0,0 +1,31 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include "common.h"
++
++MEMORY { .sram : ORIGIN = PPBOOT_TEXT_BASE, LENGTH = PPBOOT_SIZE }
++
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		app/crt0_ppboot.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/goya2/preboot.lds.S b/goya2/preboot.lds.S
+new file mode 100644
+index 0000000..01650fd
+--- /dev/null
++++ b/goya2/preboot.lds.S
+@@ -0,0 +1,31 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include "common.h"
++
++MEMORY { .sram : ORIGIN = PREBOOT_TEXT_BASE, LENGTH = PREBOOT_SIZE }
++
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		app/crt0_preboot.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}

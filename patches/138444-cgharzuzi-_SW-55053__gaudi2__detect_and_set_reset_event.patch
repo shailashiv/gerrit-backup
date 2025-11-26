@@ -1,0 +1,91 @@
+From b2227c88e2b56578aaa842df77c21a0ff27f1bf3 Mon Sep 17 00:00:00 2001
+From: Christine Gharzuzi <cgharzuzi@habana.ai>
+Date: Mon, 18 Oct 2021 10:29:23 +0300
+Subject: [PATCH] [SW-55053] gaudi2: detect and set reset event
+
+Due to HW bug in mmPSOC_GLOBAL_CONF_RST_SRC all
+resets handled by the FW will be set in a shadow register
+with appropriate cause.
+
+Change-Id: Id1d5391deaf33ff5e7dfeb2ec8df727c819562bd
+Signed-off-by: Christine Gharzuzi <cgharzuzi@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 5bf98ee..750c6c9 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -373,6 +373,7 @@
+ 	}
+ }
+ 
++__weak void hl_set_reset_cause(uint32_t reset_cause) {}
+ __weak u32 hl_skip_fw_cfg(void) { return 0; }
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+diff --git a/arch/gaudi2/common/reset.c b/arch/gaudi2/common/reset.c
+index 7706737..844f784 100644
+--- a/arch/gaudi2/common/reset.c
++++ b/arch/gaudi2/common/reset.c
+@@ -13,6 +13,7 @@
+ #include <uart.h>
+ 
+ #include <common.h>
++#include <gaudi2/gaudi2_fw_if.h>
+ 
+ struct gaudi2_rst_mask {
+ 	u32 val;
+@@ -78,10 +79,18 @@
+ 	regmap_writel(1, mmPSOC_RESET_CONF_SW_ALL_RST);
+ }
+ 
++void hl_set_reset_cause(uint32_t reset_cause)
++{
++	regmap_writel(reset_cause, mmRST_SRC);
++}
++
+ void hl_dev_reset(void)
+ {
+ 	hl_pcie_disable_access();
+ 
+ 	gaudi2_hw_fini();
++
++	hl_set_reset_cause(HL_SW_ALL_RST);
++
+ 	wfe();
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index 5da5aa2..9671826 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -146,6 +146,7 @@
+ void hl_esc_key_handle(void);
+ u32 hl_rst_src_get(void);
+ void hl_reset_src_init(void);
++void hl_set_reset_cause(uint32_t reset_cause);
+ 
+ void preboot_pcie_wait_for_link(void);
+ void preboot_delay(void);
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 181077f..61efb91 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -16,6 +16,7 @@
+ #include <memory.h>
+ #include <fit_load_type.h>
+ #include <memory.h>
++#include <hl.h>
+ 
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
+@@ -642,6 +643,10 @@
+ static void module_lkd_run_noret_wfe(void)
+ {
+ 	module_lkd_preserve_sp_info();
++
++	/* Exiting WFE will probably be done by SW reset */
++	hl_set_reset_cause(HL_SW_ALL_RST);
++
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
+ 	wfe();
+ }

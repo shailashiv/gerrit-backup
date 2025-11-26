@@ -1,0 +1,226 @@
+From 5f65b843da7feed58b215223b1d86ecae4f5fa97 Mon Sep 17 00:00:00 2001
+From: Tally Jacobs <tally.jacobs@tandemg.com>
+Date: Sun, 07 Nov 2021 11:11:19 +0200
+Subject: [PATCH] [SW-61363] erom: exc tpm auth flow from erom recov
+
+Preboot's TPM flow should not be called when preboot is run via erom
+recovery
+
+Change-Id: I21c76a0ef37a03c2e6e829abe0e155617244c44c
+Signed-off-by: Tally Jacobs <tally.jacobs@tandemg.com>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 757e907..d5c5905 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -44,7 +44,11 @@
+ PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/app/preboot/*.c)
+ PREBOOT_SRCS_C := $(filter-out $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
+ 
++PREBOOT_SRCS_C += recovery_stubs.c
++
+ include $(HL_DEV_ARCH)/Makefile
++PREBOOT_SRCS_C := $(filter-out $(HL_DEV_ARCH_COMMON)/tpm2.c, $(PREBOOT_SRCS_C)) #tpm code is not needed in recovery image
++PREBOOT_SRCS_C := $(filter-out $(HL_DEV_ARCH_COMMON)/tpm_auth.c, $(PREBOOT_SRCS_C)) #tpm code is not needed in recovery image
+ 
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
+diff --git a/app/ext_rom/recovery_stubs.c b/app/ext_rom/recovery_stubs.c
+new file mode 100644
+index 0000000..9fec1bd
+--- /dev/null
++++ b/app/ext_rom/recovery_stubs.c
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++void preboot_tpm_auth(void) {}
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index df93d38..e7b623a 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -5,6 +5,7 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/sha.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/security.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm_auth.c)
+ 
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+diff --git a/arch/gaudi2/common/asic.c b/arch/gaudi2/common/asic.c
+index a853f2f..228f401 100644
+--- a/arch/gaudi2/common/asic.c
++++ b/arch/gaudi2/common/asic.c
+@@ -24,15 +24,6 @@
+ #include <lzo/unaligned.h>
+ #include <boot_if.h>
+ 
+-#define TPM_NV_DEV_SN_ADDRESS	0x01c10100
+-
+-struct tpm_dev_id {
+-	union {
+-		u32 efuse_data[2];
+-		u64 tpm_data;
+-	};
+-};
+-
+ #define HBM_BAR_PF_NUM (1 << 4)
+ 
+ __weak void preboot_update_bar_sizes(void)
+@@ -331,64 +322,4 @@
+ void hl_ram_init(void)
+ {
+ 	hl_fuse_print_hbm();
+-}
+-
+-static int preboot_get_efuse_dev_id(struct tpm_dev_id *efuse_dev_id_ret)
+-{
+-	int ret;
+-
+-	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_1, &efuse_dev_id_ret->efuse_data[0]);
+-	if (ret)
+-		return ret;
+-
+-	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_2, &efuse_dev_id_ret->efuse_data[1]);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
+-}
+-
+-void preboot_tpm_auth(void)
+-{
+-	int ret;
+-	u64 tpm_dev_id = 0;
+-	struct tpm_dev_id efuse_dev_id;
+-
+-	efuse_dev_id.tpm_data = 0x0;
+-
+-	ret = tpm2_init();
+-	if (ret)
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-
+-	ret = tpm2_startup(TPM2_SU_CLEAR);
+-	if (ret) {
+-		preboot_puts_hex("TPM: startup failed. ret = ", ret, true);
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
+-	if (ret) {
+-		preboot_puts_hex("TPM: NV_READ failed. ret = ", ret, true);
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	/* tpm device id returns as Big Endian, need to convert */
+-	tpm_dev_id = get_unaligned_be64(&tpm_dev_id);
+-	preboot_puts_hex64("TPM device ID: ", tpm_dev_id, true);
+-
+-	ret = preboot_get_efuse_dev_id(&efuse_dev_id);
+-	if (ret) {
+-		preboot_puts_hex("TPM flow: efuse read failed. ret = ", ret, true);
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	} else {
+-		preboot_puts_hex64("EFUSE device ID: ", efuse_dev_id.tpm_data, true);
+-	}
+-
+-	if (efuse_dev_id.tpm_data == 0) {
+-		preboot_puts("TPM flow: error: efuse device ID not programed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	} else if (efuse_dev_id.tpm_data != tpm_dev_id) {
+-		preboot_puts("TPM flow: error: efuse device ID is different than TPM device ID\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+ }
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+new file mode 100644
+index 0000000..452e1ee
+--- /dev/null
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <efuse.h>
++#include <boot_if.h>
++#include <tpm2.h>
++#include <uart.h>
++#include "lzo/unaligned.h"
++
++#define TPM_NV_DEV_SN_ADDRESS	0x01c10100
++
++struct tpm_dev_id {
++	union {
++		u32 efuse_data[2];
++		u64 tpm_data;
++	};
++};
++
++static int preboot_get_efuse_dev_id(struct tpm_dev_id *efuse_dev_id_ret)
++{
++	int ret;
++
++	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_1, &efuse_dev_id_ret->efuse_data[0]);
++	if (ret)
++		return ret;
++
++	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_2, &efuse_dev_id_ret->efuse_data[1]);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++void preboot_tpm_auth(void)
++{
++	int ret;
++	u64 tpm_dev_id = 0;
++	struct tpm_dev_id efuse_dev_id;
++
++	efuse_dev_id.tpm_data = 0x0;
++
++	ret = tpm2_init();
++	if (ret)
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++
++	ret = tpm2_startup(TPM2_SU_CLEAR);
++	if (ret) {
++		preboot_puts_hex("TPM: startup failed. ret = ", ret, true);
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
++	if (ret) {
++		preboot_puts_hex("TPM: NV_READ failed. ret = ", ret, true);
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	/* tpm device id returns as Big Endian, need to convert */
++	tpm_dev_id = get_unaligned_be64(&tpm_dev_id);
++	preboot_puts_hex64("TPM device ID: ", tpm_dev_id, true);
++
++	ret = preboot_get_efuse_dev_id(&efuse_dev_id);
++	if (ret) {
++		preboot_puts_hex("TPM flow: efuse read failed. ret = ", ret, true);
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	} else {
++		preboot_puts_hex64("EFUSE device ID: ", efuse_dev_id.tpm_data, true);
++	}
++
++	if (efuse_dev_id.tpm_data == 0) {
++		preboot_puts("TPM flow: error: efuse device ID not programed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	} else if (efuse_dev_id.tpm_data != tpm_dev_id) {
++		preboot_puts("TPM flow: error: efuse device ID is different than TPM device ID\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++}

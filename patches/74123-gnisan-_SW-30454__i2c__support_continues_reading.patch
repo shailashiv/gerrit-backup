@@ -1,0 +1,211 @@
+From 1e0ac80078a4606e2a80e4beb73598816cde24d3 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 27 Jan 2021 14:15:32 +0200
+Subject: [PATCH] [SW-30454] i2c: support continues reading
+
+I2C (SMBus) allows sequential reading across multiple commands. This
+commit adds this kind of support.
+
+When the master starts the read sequence, it send the start command and
+produces read request. The read request triggers the increase of command
+to be used by the next read request.
+
+One exception to this rule is virtual regiters (RDATA, WDATA) which are
+not fully addressable since their data size can be a lot longer then 256
+which is the command limit.
+
+Change-Id: I0fb65b47e8f5b2c3c52abbd11deac7831cdb72cd
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index feebccb..9c6ee24 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -29,6 +29,7 @@
+ struct i2cslave_buf {
+ 	u8 *data;
+ 	u8 cmd;
++	u8 seq_cmd;
+ 	u8 cnt;
+ };
+ 
+@@ -41,6 +42,12 @@
+ 	.buf = { .data = &i2cs_data.buf.cmd },
+ 	.seq = { .wr = 1 },
+ };
++
++static void i2cslave_reset_buffer(struct i2cslave_buf *buf)
++{
++	buf->data = &i2cs_data.buf.cmd;
++	buf->cnt = 0;
++}
+ 
+ static void i2cslave_init(bool debug_mode)
+ {
+@@ -231,6 +238,9 @@
+ {
+ 	register u32 seq_wr;
+ 
++	if (!buf->cnt)
++		buf->seq_cmd = buf->cmd;
++
+ 	/* Notify upper layer */
+ 	seq_wr = i2cslave_handle_write_req(buf->cmd, &buf->data, buf->cnt);
+ 
+@@ -238,8 +248,7 @@
+ 		buf->cnt++;
+ 	} else {
+ 		/* Upper layer finished it's process, reset buffer */
+-		buf->data = &i2cs_data.buf.cmd;
+-		buf->cnt = 0;
++		i2cslave_reset_buffer(buf);
+ 		seq_wr = 1;
+ 	}
+ 
+@@ -274,9 +283,14 @@
+ 
+ static inline u8 i2cslave_consume_handler(void)
+ {
+-	u8 ret = i2cslave_handle_read_req(i2cs_data.buf.cmd, i2cs_data.seq.rd);
++	struct i2cslave_buf *buf = &i2cs_data.buf;
++	u8 seq_cmd = buf->seq_cmd;
++	u8 ret = i2cslave_handle_read_req(seq_cmd, i2cs_data.seq.rd);
+ 
+-	i2cs_data.seq.rd++; /* For next sequential read */
++	/* For next sequential read */
++	i2cs_data.seq.rd++;
++	if (!I2CSLAVE_IS_VIRTUAL_CMD(seq_cmd))
++		i2cs_data.buf.seq_cmd = seq_cmd + 1;
+ 
+ 	/* Check if we are in the middle of write request processing */
+ 	if (i2cs_data.buf.cnt) {
+@@ -285,8 +299,7 @@
+ 
+ 		/* Reset buffer */
+ 		i2cs_data.seq.wr = 1;
+-		i2cs_data.buf.data = &i2cs_data.buf.cmd;
+-		i2cs_data.buf.cnt = 0;
++		i2cslave_reset_buffer(buf);
+ 	}
+ 	return ret;
+ }
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index 25adc9b..6a3af95 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -8,6 +8,11 @@
+ #ifndef _MODULE_I2C_SLAVE_H_
+ #define _MODULE_I2C_SLAVE_H_
+ 
++#define I2CSLAVE_IS_VIRTUAL_CMD(cmd) (			\
++		(cmd) >= HL_INDIRECT_REQ_WDATA_CODE &&	\
++		(cmd) <= HL_INDIRECT_REQ_RDATA_DATA_3	\
++	)
++
+ extern u32 device_id_vendor_id;
+ 
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 871edd7..fb3d3c3 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -525,9 +525,9 @@
+  * Handle request port status reading by the master. Update the request status
+  * header with the latest WDATA opcode data and send it on its way.
+  */
+-u8 i2csi_req_handle_sts(u8 cmd, u32 read_seq)
++u8 i2csi_req_handle_sts(u8 cmd)
+ {
+-	int idx = cmd + read_seq - HL_INDIRECT_REQ_STS_DATA;
++	int idx = cmd - HL_INDIRECT_REQ_STS_DATA;
+ 
+ 	if (idx >= HL_I2CI_REQ_STS_LEN)
+ 		return 0;
+@@ -703,9 +703,9 @@
+ 	return 0;
+ }
+ 
+-u8 i2csi_ctrl_handle_status(u8 cmd, u32 read_seq)
++u8 i2csi_ctrl_handle_status(u8 cmd)
+ {
+-	register int idx = cmd + read_seq - HL_INDIRECT_CTRL_STS_DATA;
++	register int idx = cmd - HL_INDIRECT_CTRL_STS_DATA;
+ 	u8 ret;
+ 
+ 	if (idx >= HL_I2CI_CTRL_STS_LEN)
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+index 65101aa..4c35e9e 100644
+--- a/preboot/i2cslave_indirect.h
++++ b/preboot/i2cslave_indirect.h
+@@ -8,12 +8,12 @@
+ #ifndef _I2CSLAVE_INDIRECT_H_
+ #define _I2CSLAVE_INDIRECT_H_
+ 
+-u8 i2csi_req_handle_sts(u8 cmd, u32 read_seq);
++u8 i2csi_req_handle_sts(u8 cmd);
+ u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
+ u32 i2csi_req_handle_wdata(u8 **data, u8 cnt);
+ u32 i2csi_req_handle_cfg(u8 **data, u8 cnt);
+ u32 i2csi_ctrl_handle_command(u8 **data, u8 cnt);
+-u8 i2csi_ctrl_handle_status(u8 cmd, u32 read_seq);
++u8 i2csi_ctrl_handle_status(u8 cmd);
+ void i2csi_req_set_idle(void);
+ void i2csi_req_handle_sync_error(void);
+ void i2csi_req_handle_process_op(void);
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index d13a04b..d7f6ca8 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -38,20 +38,18 @@
+ 		break;
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+ 	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		ret = i2cslave_pcie_vendor_id_cmd(cmd + read_seq);
++		ret = i2cslave_pcie_vendor_id_cmd(cmd);
+ 		break;
+ 	case HL_INDIRECT_REQ_STS_CODE:
+-		if (!read_seq) {
+-			ret = HL_I2CI_REQ_STS_LEN;
+-			break;
+-		}
++		ret = HL_I2CI_REQ_STS_LEN;
++		break;
+ 		/* Fall through */
+ 	case HL_INDIRECT_REQ_STS_DATA:
+ 	case HL_INDIRECT_REQ_STS_DATA_1:
+ 	case HL_INDIRECT_REQ_STS_DATA_2:
+ 	case HL_INDIRECT_REQ_STS_DATA_3:
+ 	case HL_INDIRECT_REQ_STS_DATA_4:
+-		ret = i2csi_req_handle_sts(cmd, read_seq);
++		ret = i2csi_req_handle_sts(cmd);
+ 		break;
+ 	case HL_INDIRECT_REQ_WDATA_CODE:
+ 		ret = HL_I2CI_REQ_WDATA_LEN;
+@@ -74,15 +72,13 @@
+ 		ret = HL_I2CI_CTRL_CMD_LEN;
+ 		break;
+ 	case HL_INDIRECT_CTRL_STS_CODE:
+-		if (!read_seq) {
+-			ret = HL_I2CI_CTRL_STS_LEN;
+-			break;
+-		}
++		ret = HL_I2CI_CTRL_STS_LEN;
++		break;
+ 	case HL_INDIRECT_CTRL_STS_DATA:
+ 	case HL_INDIRECT_CTRL_STS_DATA_1:
+ 	case HL_INDIRECT_CTRL_STS_DATA_2:
+ 	case HL_INDIRECT_CTRL_STS_DATA_3:
+-		ret = i2csi_ctrl_handle_status(cmd, read_seq);
++		ret = i2csi_ctrl_handle_status(cmd);
+ 		break;
+ 	default:
+ 		/* NA */
+@@ -102,6 +98,7 @@
+ 		return i2csi_req_handle_cfg(data, cnt);
+ 	case HL_INDIRECT_CTRL_CMD_DATA:
+ 		return i2csi_ctrl_handle_command(data, cnt);
++	case HL_INDIRECT_REQ_RDATA_CODE:
+ 	case HL_INDIRECT_REQ_RDATA_DATA:
+ 		i2csi_req_set_idle();
+ 		/* Fall Though */

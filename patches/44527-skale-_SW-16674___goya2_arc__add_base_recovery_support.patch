@@ -1,0 +1,172 @@
+From 4788f68de0e0bba55d5f6154d237df3a838842a7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 21 Jul 2020 21:09:35 +0300
+Subject: [PATCH] [SW-16674]: goya2_arc: add base recovery support
+
+In goya2 arc based flow, arcboot loads recovery image in case of
+primary and secondary image load or verification failed.
+
+recovery image is responsible to support set of NVMe MI commands which
+also include firmware update (modify SPI flash). Since recovery image
+can re-use some of i2c based infrastructure from preboot, its
+implemented as part of preboot git.
+
+This patch adds base support for recovery image.
+
+Change-Id: I1f0f385d54d32e0a4314f8d5510c6e0bfcb72a38
+---
+
+diff --git a/goya2_arc_gnu/common.h b/goya2_arc_gnu/common.h
+index 4315317..1a3eeff 100644
+--- a/goya2_arc_gnu/common.h
++++ b/goya2_arc_gnu/common.h
+@@ -22,6 +22,9 @@
+ #define FUSE_WORDS_PER_BANK	0x40
+ #define I2C_SLAVE_ADDRESS	0x6A
+ 
++#define RECOVERY_TEXT_BASE	(0x0 + 0x4)
++#define RECOVERY_SIZE		0x4000
++
+ /*
+  * extracts "num" number of bits from position "pos" in the
+  * given number "value"
+diff --git a/goya2_arc_gnu/recovery.lds.S b/goya2_arc_gnu/recovery.lds.S
+new file mode 100644
+index 0000000..fe20ea8
+--- /dev/null
++++ b/goya2_arc_gnu/recovery.lds.S
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++#ifdef __arc__
++MEMORY { .sram : ORIGIN = RECOVERY_TEXT_BASE, LENGTH = RECOVERY_SIZE }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++#endif
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(4);
++		crt0_recovery.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.stack : {
++		. = ALIGN(4);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/recovery/Makefile b/recovery/Makefile
+new file mode 100644
+index 0000000..3b4ebd2
+--- /dev/null
++++ b/recovery/Makefile
+@@ -0,0 +1,45 @@
++CC = $(CROSS_COMPILE)gcc
++OBJCOPY = $(CROSS_COMPILE)objcopy
++SPECS_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++CFLAGS += -I$(dir $(BR2_EXTERNAL))/specs/$(SPECS_DEV)/asic_reg
++CFLAGS += -Wall -Werror
++CFLAGS += -g -c
++CFLAGS += -I ./../include/ -I ./../ -I ./../common/ -I ./../$(HL_DEV)/
++
++CFLAGS += -Os -fdata-sections -ffunction-sections
++SFLAGS := $(CFLAGS) -D__ASSEMBLY__
++
++RECOVERY_LD_SCRIPT := ./../$(HL_DEV)/recovery.lds
++LDFLAGS := -g -nostdlib -static
++LDFLAGS += -Wl,--gc-sections
++LDLIBS := -lgcc
++
++RECOVERY_SRCS_C := $(shell ls *.c)
++RECOVERY_APP_S := $(shell ls crt0_recovery.S)
++
++RECOVERY_OBJECTS := $(RECOVERY_SRCS_C:.c=.o)
++RECOVERY_OBJECTS += $(RECOVERY_APP_S:.S=.o)
++
++# TODO: add version info
++
++all: recovery.bin
++
++%.bin: %
++	$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
++
++recovery: $(RECOVERY_OBJECTS) $(RECOVERY_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(RECOVERY_LD_SCRIPT) -o $@ -Wl,--start-group $(RECOVERY_OBJECTS) $(LDLIBS) -Wl,--end-group
++
++%.lds: %.lds.S
++	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
++
++%.o: %.c
++	@$(CC) $(CFLAGS) -o $@ $<
++
++%.o: %.S
++	@$(CC) $(SFLAGS) -o $@ $<
++
++clean:
++	rm -f $(RECOVERY_OBJECTS)
++
++.PHONY: clean
+diff --git a/recovery/crt0_recovery.S b/recovery/crt0_recovery.S
+new file mode 100644
+index 0000000..c948e58
+--- /dev/null
++++ b/recovery/crt0_recovery.S
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++/*
++ * This is recovery entry point
++ * Setting sp/fp/lr and jumping to C code
++ */
++.globl	_start
++_start:
++
++#ifdef __arc__
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++#endif
++
++#ifdef __arc__
++	push_s	blink
++#endif
++	bl	recovery_main	/* Set LR (x30) */
++#ifdef __arc__
++	pop_s	blink
++	j_s	[blink]
++#endif
+diff --git a/recovery/recovery.c b/recovery/recovery.c
+new file mode 100644
+index 0000000..1bcb430
+--- /dev/null
++++ b/recovery/recovery.c
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++void recovery_main(void)
++{
++	while (1)
++		;
++}

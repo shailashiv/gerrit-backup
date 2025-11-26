@@ -1,0 +1,118 @@
+From 2a6f1e32952d40ab7cbb8ee9a548ee0e93b3954a Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 04 Jun 2019 11:36:02 +0300
+Subject: [PATCH] [SW-2891] uart: rework preboot_uint2hexstring()
+
+The preboot_uint2hexstring() function padding functionality is not
+working and is just always enabled.
+Rework the function to fix the padding functionalilty and also reuse
+this code in the preboot_puth_raw() function.
+
+This is also a preparation for the version code fix after the code base
+move to scratch pad SRAM.
+
+Change-Id: I914cd24ffad1639f9a312149c76b62656c301fce
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/uart.c b/common/uart.c
+index 703ff41..3f57dc1 100644
+--- a/common/uart.c
++++ b/common/uart.c
+@@ -4,6 +4,7 @@
+  *
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
++#include <stddef.h>
+ 
+ #include <psoc_uart_0_regs.h>
+ 
+@@ -41,64 +42,14 @@
+ 	preboot_puts_raw("\r");
+ }
+ 
+-/*
+- * preboot_byte2char	- convert half byte to char.
+- *
+- * This function takes a byte number and converts its value to
+- * a character representing the value (e.g. 0x8c can be converted to
+- * '8' or 'c').
+- */
+-static inline char preboot_byte2char(u8 byte, bool upper)
+-{
+-	/* upper or lower 4 bits of the byte */
+-	byte = upper ? byte >> 4 : byte & 0xf;
+-
+-	/*
+-	 * convert: if half byte is a number [0..9] => use '0' as an offset
+-	 *	    if half byte is a letter [0xa..0xf] => use 'a' as a base,
+-	 *	    but since 'a' is not 0, we need to subtract
+-	 *	    its base offset - 0xa.
+-	 */
+-	return byte + ((byte >= 0xa) ? 'a' - 0xa : '0');
+-}
+-
+-/*
+- * preboot_uint2hexstring	- convert uint to a hex values string.
+- *
+- * Take a number and provide its hexadecimal string representation.
+- */
+ int preboot_uint2hexstring(char *str, unsigned int num, bool pad)
+ {
+ 	int j = 0;
+-	char tmp;
+-
+-	/*
+-	 * Here we walk on each byte of uint num in the reverse order, so
+-	 * we build the string in the correct order.
+-	 */
+-	for (int i = 3; i >= 0; i--) {
+-		u8 byte = (u8)((num >> (i * 8)) & 0xff);
+-		/* here we run the loop on 2 parts of byte: upper and lower */
+-		for (int k = 0; k < 2; k++) {
+-			tmp = preboot_byte2char(byte, !k);
+-			if (tmp == '0')	/* care of the leading zeroes (pad) */
+-				pad = true;
+-			if (pad)
+-				str[j++] = tmp;
+-		}
+-	}
+-
+-	/* for !pad, return how many characters were actually written */
+-	return j;
+-}
+-
+-void preboot_puth_raw(unsigned int val, bool pad)
+-{
+ 	char ch;
+ 	int shift_start = (STR_UINT_SZ - 1) * BITS_IN_SINGLE_CHAR;
+ 
+ 	for (int i = shift_start; i >= 0; i -= BITS_IN_SINGLE_CHAR) {
+-		ch = (val >> i) & 0xf;
++		ch = (num >> i) & 0xf;
+ 		/*
+ 		 * if char is a number [0..9] => use '0' as an offset
+ 		 * if char is a letter [0xa..0xf] => use 'a' as a base,
+@@ -109,9 +60,21 @@
+ 		if (!pad && ch == '0' && i != 0)
+ 			continue;
+ 
+-		preboot_putc_raw(ch);
++		if (str)
++			str[j++] = ch;
++		else
++			preboot_putc_raw(ch);
++
+ 		pad = true;
+ 	}
++
++	/* for !pad, return how many characters were actually written */
++	return j;
++}
++
++void preboot_puth_raw(unsigned int val, bool pad)
++{
++	preboot_uint2hexstring(NULL, val, pad);
+ }
+ 
+ void preboot_puth(unsigned int val, bool pad)

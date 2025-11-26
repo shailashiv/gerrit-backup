@@ -1,0 +1,162 @@
+From ab8ca36b2a04f5b77387f90e675dc352201e778f Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 13 Aug 2021 14:32:08 +0300
+Subject: [PATCH] [SW-0] cpu_if: make status/err regs pseudo ro
+
+Since the status and error registers are not protected from host attacks
+and LKD relies on the them, we need to make them read-only.
+Unfortunately, we do not have a h/w mechanism available to protect these
+registers.
+Instead, implement a pseudo read-only mechanism which will write these
+registers each main loop iteration.
+
+Change-Id: I046893266c0aad75f4fa145d7dbd32838c352fe8
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 5c74941..2093b53 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -238,6 +238,8 @@
+ 	u64 loadaddr;
+ 	bool ret;
+ 
++	/* Initialize internal if variables */
++	cpu_boot_if_init();
+ 	hl_plat_early_init();
+ 	hl_init_pcie_phy_fw();
+ 	hl_jtag_init();
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index bf9e946..1800d81 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -378,6 +378,8 @@
+ 	u64 ver_off = (uintptr_t)preboot_vers;
+ 	bool is_sec_en;
+ 
++	/* Initialize internal if variables */
++	cpu_boot_if_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+ 	/* Enable the errors communication */
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_ENABLED, true);
+diff --git a/include/boot_if.h b/include/boot_if.h
+index 3e9bb95..11d688d 100644
+--- a/include/boot_if.h
++++ b/include/boot_if.h
+@@ -12,6 +12,7 @@
+ #include <types.h>
+ #include <hl_boot_if.h>		/* requires stdint.h */
+ 
++void cpu_boot_if_init(void);
+ u32 cpu_boot_cmd_get(void);
+ void cpu_boot_cmd_clr_before_wfe(void);
+ void cpu_boot_sts_set(u32 val);
+@@ -19,6 +20,7 @@
+ void cpu_boot_dev_sts_clrset(u32 mask, bool set);
+ void cpu_boot_rsp_set(enum cpu_msg_status sts);
+ u64 cpu_boot_dev_sts_get_all(void);
++void cpu_boot_if_fix_ro_regs(void);
+ 
+ /* COMMS APIs */
+ void cpu_comms_sts_set(struct comms_status *sts);
+diff --git a/lib/common/boot_if.c b/lib/common/boot_if.c
+index 00134d0..5fc43b1 100644
+--- a/lib/common/boot_if.c
++++ b/lib/common/boot_if.c
+@@ -12,6 +12,12 @@
+ #include <preboot.h>
+ #include <hl_boot_if.h>			/* requires stdint.h */
+ 
++/* TODO: add support for both registers of status and error */
++/* Shadow the status and error registers */
++static u32 cpu_boot_dev_sts;
++static u32 cpu_boot_err;
++static u32 cpu_boot_progress;
++
+ /*
+  * The cpu_boot_cmd_clr_before_wfe() function should NOT be used in general as
+  * the LKD message register should be written by LKD solely.
+@@ -34,17 +40,43 @@
+ 
+ void cpu_boot_sts_set(u32 val)
+ {
++	cpu_boot_progress = val;
+ 	regmap_writel(val, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
++}
++
++void cpu_boot_if_init(void)
++{
++	cpu_boot_dev_sts = regmap_readl(mmCPU_BOOT_DEV_STS0);
++	cpu_boot_err = regmap_readl(mmCPU_BOOT_ERR0);
++}
++
++void cpu_boot_if_fix_ro_regs(void)
++{
++	regmap_writel(cpu_boot_dev_sts, mmCPU_BOOT_DEV_STS0);
++	regmap_writel(cpu_boot_err, mmCPU_BOOT_ERR0);
++	regmap_writel(cpu_boot_progress, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
+ }
+ 
+ static void cpu_boot_reg_clrset(u32 reg, u32 mask, bool set)
+ {
+-	u32 val = regmap_readl(reg) & ~mask;
++	u32 *shadow;
+ 
++	switch (reg) {
++	case mmCPU_BOOT_DEV_STS0:
++		shadow = &cpu_boot_dev_sts;
++		break;
++	case mmCPU_BOOT_ERR0:
++		shadow = &cpu_boot_err;
++		break;
++	default:
++		return;
++	}
++
++	*shadow &= ~mask;
+ 	if (set)
+-		val |= mask;
++		*shadow |= mask;
+ 
+-	regmap_writel(val, reg);
++	regmap_writel(*shadow, reg);
+ }
+ 
+ /* We support only ERR0 for now */
+@@ -69,11 +101,10 @@
+ 	regmap_writel(sts->val, mmCPU_CMD_STATUS_TO_HOST);
+ }
+ 
++/* TODO: add support for real 64 bits */
+ u64 cpu_boot_dev_sts_get_all(void)
+ {
+-	u64 ret;
++	u64 val = cpu_boot_dev_sts;
+ 
+-	ret = ((u64)regmap_readl(mmCPU_BOOT_DEV_STS1) << 32);
+-	ret |= (u64)regmap_readl(mmCPU_BOOT_DEV_STS0);
+-	return ret;
++	return val;
+ }
+diff --git a/lib/common/cmd_module.c b/lib/common/cmd_module.c
+index b5d84b2..0eb60a6 100644
+--- a/lib/common/cmd_module.c
++++ b/lib/common/cmd_module.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <preboot.h>
++#include <boot_if.h>
+ 
+ #include "uart.h"
+ #include "cmd_module.h"
+@@ -48,6 +49,8 @@
+ 
+ 		i2c_debug_mode_handling();
+ 
++		cpu_boot_if_fix_ro_regs();
++
+ 		res = cmd_ops[i].check();
+ 		switch (res) {
+ 		case NOT_FOUND:

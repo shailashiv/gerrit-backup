@@ -1,0 +1,54 @@
+From b9eafa09019520f4ad4fb6b8c435461a4362cdf2 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Tue, 22 Feb 2022 05:46:19 +0200
+Subject: [PATCH] [SW-72680] greco: pci: avoid pci core register access
+
+During hot reset handling, if firmware accesses pcie core
+register it causes self halt in ARC due to memory error.
+This implied that during hot reset pcie core registers
+are not accessible temporarily. As a work around this
+patch handles hot reset differently for greco. It checks
+for hot reset irq after pcie link is up. As ltssm_en is
+already set to 0x3 there is no need to reconfigure it.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I5e010fde626e5aea0cb888df5f9092cc81648076
+---
+
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 0fc49de..9d2df9f 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -24,6 +24,7 @@
+ #include <psoc_uart_0_regs.h>
+ #include <psoc_i2c_s_regs.h>
+ #include <pcie_core_regs.h>
++#include <pcie_core_masks.h>
+ #include <pcie_phy_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+@@ -260,7 +261,23 @@
+ void pci_dev_specific_hot_rst(void)
+ {
+ 	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++u32 pci_dev_specific_hot_rst_check(void)
++{
++	/* Avoid accessing PCIE core register */
++	return 0;
++}
++
++void pci_dev_specific_post_link_up(void)
++{
++	u32 hot_rst_reg_val;
++
++	hot_rst_reg_val = regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
++	if (hot_rst_reg_val == PCIE_CORE_HOT_RST_INTR_MASK) {
++		preboot_puts("HOT RST received\n");
++		pci_dev_specific_hot_rst();
++	}
+ }
+ 
+ void pci_dev_specific_flr(void)

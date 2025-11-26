@@ -1,0 +1,156 @@
+From 9f0a22afc24e0aefd39f32b394b9d7c72c760881 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 23 Jun 2021 17:24:49 +0300
+Subject: [PATCH] [SW-46517] greco: implement platform init function
+
+As part of secureboot flow, initialization of arc0 and SRAM
+scrambling init needs to be done as part of platform init. This
+patch adds implementation of those functionalities.
+
+Change-Id: Id32381d35f2b0b7096978069758c7b1bb210e8eb
+---
+
+diff --git a/arch/greco_arc/common.c b/arch/greco_arc/common.c
+index 4a27bf0..605f587 100644
+--- a/arch/greco_arc/common.c
++++ b/arch/greco_arc/common.c
+@@ -8,6 +8,7 @@
+ 
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <psoc_gpio1_regs.h>
+ #include <psoc_qspi_regs.h>
+ #include <psoc_efuse_regs.h>
+@@ -19,6 +20,19 @@
+ #include <pcie_dbi_masks.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
++#include <dcon0_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon0_hbw_rtr_if1_rtr_h3_regs.h>
++#include <dcon1_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon1_hbw_rtr_if1_rtr_h3_regs.h>
++#include <dcon2_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon2_hbw_rtr_if1_rtr_h3_regs.h>
++#include <dcon3_hbw_rtr_if0_rtr_h3_regs.h>
++#include <dcon3_hbw_rtr_if1_rtr_h3_regs.h>
++
++#include <psoc_arc0_cfg_regs.h>
++#include <psoc_arc0_cfg_masks.h>
++#include <psoc_arc1_cfg_regs.h>
++#include <psoc_arc1_cfg_masks.h>
+ 
+ #include <hl_boot_if.h>			 /* requires stdint.h */
+ #include <greco/greco_reg_map.h>
+@@ -306,24 +320,90 @@
+ 	regmap_writel(0x0, mmPSOC_GLOBAL_CONF_BOOT_SEQ_EXT_LD);
+ }
+ 
+-static void init_arc0(void)
++void hl_plat_early_init(void)
+ {
++	/* Functionality used to be done in BTL */
++	init_prstn();
++}
++
++static void halt_n_reset_arc(u8 id)
++{
++	u32 val, halt_ack_offset, halt_req_offset;
++	u32 retry = ARC_HALT_ACK_RETRIES;
++	u32 halt_mask, halt_ack_mask;
++	u32 rst_offset;
++
++	if (id) {
++		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
++		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++
++	} else {
++		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
++		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++	}
++
++	val = regmap_readl(halt_ack_offset);
++	if (val & halt_mask) {
++		preboot_puts_hex("Skipping halt for ARC", id, false);
++	} else {
++		/* Halt ARC */
++		regmap_writel(BIT(1), halt_req_offset);
++		while (1) {
++			val = regmap_readl(halt_ack_offset);
++			if (val & halt_ack_mask)
++				break;
++			udelay(10);
++			retry--;
++			if (!retry) {
++				preboot_puts_hex("No ack from ARC", id, false);
++				break;
++			}
++		}
++		regmap_writel(0x0, halt_req_offset);
++	}
++
++	/* Reset ARC */
++	regmap_writel(0x1, rst_offset);
++}
++
++/* initialize sram scrambling before preboot is downloaded */
++static void sram_scrambling_init(void)
++{
++	regmap_writel(1, mmDCON0_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON0_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON1_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON1_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON2_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON2_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON3_HBW_RTR_IF0_RTR_H3_SCRAM_SRAM_EN);
++	regmap_writel(1, mmDCON3_HBW_RTR_IF1_RTR_H3_SCRAM_SRAM_EN);
++}
++
++static void init_arc(void)
++{
++	halt_n_reset_arc(0);
++
+ 	/*
+-	 * Program Reset vector address for ARC0 to ICCM 0x0 location
+-	 * where vector table first entry will be available and then
+-	 * bring ARC0 out of reset. ARC when out of reset is by default
+-	 * in halt state.
++	 * Program Reset vector address for ARC0 and ARC1 to ICCM 0x0
++	 * location where vector table first entry will be available and
++	 * then bring ARC0 and ARC1 out of reset. ARCs when out of reset
++	 * is by default in halt state.
+ 	 */
+ 	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
+ 	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
+ }
+ 
+-void hl_plat_early_init(void)
++void hl_plat_init(void)
+ {
+-	/* Functionality used to be done in BTL */
+-	init_prstn();
++	init_arc();
+ 
+-	init_arc0();
++	sram_scrambling_init();
+ }
+ 
+ void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
+diff --git a/arch/greco_arc/common.h b/arch/greco_arc/common.h
+index 5257799..1385f27 100644
+--- a/arch/greco_arc/common.h
++++ b/arch/greco_arc/common.h
+@@ -46,6 +46,7 @@
+ 
+ #define ARC_RST_VALUE		0x110
+ #define ARC_RST_VEC_ADDR	0x0
++#define ARC_HALT_ACK_RETRIES	10
+ 
+ #define PCIE_WAIT_TIMEOUT_US	(5 * USEC_PER_SEC)
+ #define PCIE_EXT_LD_TIMEOUT_US	576

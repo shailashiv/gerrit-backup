@@ -1,0 +1,92 @@
+From da0ca185ec45030d9f541335a902d438b9358c7f Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 27 Sep 2021 20:51:00 +0300
+Subject: [PATCH] [SW-57369] gaudi2: arm: perform checks using sram full addr
+
+Currently, it is assumed that SRAM address received from FIT file
+for uboot load is of ARM viewpoint and used directly to validate
+address range as well as to copy image to address. This patch
+add changes to convert full address received from FIT to ARM viewpoint
+and then use to validate and copy the contents.
+
+Change-Id: I03050b9ca5c65460a489cb08d5ce2f2259cc9a3e
+---
+
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 74c26a1..0ded012 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -38,6 +38,7 @@
+ 
+ #include "common.h"
+ #include <hl.h>
++#include <address_space.h>
+ 
+ 
+ #define ARC0_ICCM_BASE_ADDR		0x1000007FF7000000ull
+@@ -176,6 +177,7 @@
+ 	 * After image_entry, control is not expected to return
+ 	 * here and continue.
+ 	 */
++	startaddr =  (startaddr & ARM_VP_ADDR_MASK) | MEM_REGION_MASK;
+ 	image_start(startaddr);
+ }
+ 
+@@ -257,10 +259,14 @@
+ 
+ void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+-	if (!strcmp(arch, "arc"))
++	u64 arm_dst;
++
++	if (!strcmp(arch, "arc")) {
+ 		fit_copy_arc_image(dst, buf, len);
+-	else
+-		memcpy((void *)dst, buf, len);
++	} else {
++		arm_dst =  (dst & ARM_VP_ADDR_MASK) | MEM_REGION_MASK;
++		memcpy((void *)arm_dst, buf, len);
++	}
+ }
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+@@ -272,6 +278,20 @@
+ 	spi_copy((void *)loadaddr, offset, size, name);
+ }
+ 
++bool preboot_sram_is_valid_address_range(u64 addr, int len)
++{
++	/* Prepare the ARM SRAM address */
++	u64 arm_addr = (addr & ARM_VP_ADDR_MASK) | MEM_REGION_MASK;
++
++	if (arm_addr >= SDRAM_BASE && arm_addr + len <= SDRAM_BASE + SRAM_SIZE)
++		return !preboot_is_overlap_address_range(arm_addr, len);
++
++	if (addr >= FIT_IMG_SPSRAM_BASE && addr + len <= FIT_IMG_SPSRAM_END)
++		return true;
++
++	return false;
++}
++
+ bool preboot_is_valid_address_range(u64 addr, int len)
+ {
+ 	if (addr >= HL_SP_SRAM_BASE &&
+diff --git a/arch/gaudi2/arm/common.h b/arch/gaudi2/arm/common.h
+index 02be606..a7e7159 100644
+--- a/arch/gaudi2/arm/common.h
++++ b/arch/gaudi2/arm/common.h
+@@ -20,11 +20,14 @@
+ #ifdef TARGET_IS_ONIX
+ #define PPBOOT_TEXT_BASE		0x8200000000
+ #define SDRAM_BASE			0x8200000000ull
++#define MEM_REGION_MASK			0x8000000000
+ #else
+ #define PPBOOT_TEXT_BASE		0x7FFD000000
+ #define SDRAM_BASE			0x7FFD000000ull
++#define MEM_REGION_MASK			0x4000000000
+ #endif
+ 
++#define ARM_VP_ADDR_MASK		0x3FFFFFFFFF
+ #define HL_FW_BOOT_PTRS_BASE		0x60000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+ 

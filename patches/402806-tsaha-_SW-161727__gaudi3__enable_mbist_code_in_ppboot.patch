@@ -1,0 +1,99 @@
+From d342549cfceedcb78250fb7f91f0ab7b7c834f54 Mon Sep 17 00:00:00 2001
+From: Tamal <tasaha@habana.ai>
+Date: Fri, 15 Mar 2024 05:30:33 +0200
+Subject: [PATCH] [SW-161727] gaudi3: enable mbist code in ppboot
+
+This patch enables sram mbist code in ppboot,
+however skips mbist execution for die-0 SRAM to
+avoid memcpy engine timeout error.
+
+In PPboot, after sram mbist for die-0 sram is performed,
+memcpy engine is used to scrub entire (48 MB) die-0 sram.
+This leads to memcpy engine timeout and system hangs.
+However, memcpy engine is able to scrub same sram memory
+when mbist execution is skipped. Discussion with
+architecture team ongoing.
+
+TODO: Enable MBIST execution in PPboot.
+
+Change-Id: I6612318db9da58a1532e8716000b32fbdc36d853
+Signed-off-by: Tamal <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 5386d90..5113f22 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -31,24 +31,17 @@
+ #include <cache_special_regs.h>
+ #include <cache_special_masks.h>
+ 
+-/* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
+-#define GAUDI3_SRAM_MBIST_DISABLED	1
+-
+-/* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
+-#ifdef GAUDI3_SRAM_MBIST_DISABLED
+-void hl_sram_self_repair(void) { }
+-#else
+ static struct hl_ras_sram_bist_data bist_data;
+ static u32 *hl_gaudi3_sram_mbist_data_start_address;
+ 
+ static void gaudi3_sram_self_repair(u64 sram_loadaddr)
+ {
+-	int status;
++	int status = 0;
+ 
+ 	hl_gaudi3_sram_mbist_data_start_address = (u32 *) ((u32)((sram_loadaddr &
+ 				ARC_ADDR_MASK) | FW_MEM_REGION_BASE));
+ 
+-	status = hl_ppboot_sram_self_repair_mismatch_logic((u32)mmD0_PSOC_DFT_APB_BASE,
++	status = hl_ppboot_sram_self_repair_mismatch_logic(mmD0_PSOC_DFT_APB_BASE,
+ 		hl_gaudi3_sram_mbist_data_start_address, &bist_data.mbist_fail_engine_arr[0],
+ 		SRAM_MBIST_FAIL_CNTRL_MAX_COUNT);
+ 
+@@ -58,7 +51,8 @@
+ 		preboot_puts("Die 0 cache memories MBIST fail\n");
+ 	} else {
+ 		bist_data.bist_result = SRAM_MBIST_ALL_PASS;
+-		preboot_puts("Die 0 cache memories MBIST Pass\n");
++		/* TODO: update "skip" by "pass" after memcpy engine timeout resolved */
++		preboot_puts("Die 0 cache memories MBIST Skip\n");
+ 	}
+ 
+ 	/*
+@@ -235,7 +229,6 @@
+ 	gaudi3_sram_ecc_init();
+ 	preboot_puts("bist done for 48MB SRAM/CACHE\n");
+ }
+-#endif
+ 
+ u32 hl_skip_pcie_init(void)
+ {
+diff --git a/arch/gaudi3/arc/mbist.c b/arch/gaudi3/arc/mbist.c
+index 279691b..1f94167 100644
+--- a/arch/gaudi3/arc/mbist.c
++++ b/arch/gaudi3/arc/mbist.c
+@@ -7,6 +7,8 @@
+ #include <hl.h>
+ #include <pll.h>
+ #include <sram_bist.h>
++#include <uart.h>
++
+ 
+ #define IST_OPC_WRITE_NO_COMPARE	0
+ #define IST_OPC_WRITE_BIN_COMPARE	1
+@@ -27,8 +29,13 @@
+ 	u32 i = 1, read_id;
+ 	u32 fail_index = 0;
+ 
+-	if (data[0] != 1)
++	if (data[0] != 1) {
++		preboot_puts("mbist self repair version mismatch\n");
+ 		return -1;  /* version mismatch */
++	}
++
++	/* TODO: Remove following line after memcpy engine timeout resolved */
++	return 0;
+ 
+ 	read_id = data[i];
+ 	++i;

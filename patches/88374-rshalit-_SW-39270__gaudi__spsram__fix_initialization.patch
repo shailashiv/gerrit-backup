@@ -1,0 +1,60 @@
+From e467b5a8776147c555901ad234bb5a2ca22cd8e7 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Tue, 13 Apr 2021 19:26:59 +0300
+Subject: [PATCH] [SW-39270] gaudi: spsram: fix initialization
+
+SP-SRAM requires initialization, otherwise ECC
+event PSOC_MEM_DERR is triggered when reading
+from SP-SRAM. Previously, SP-SRAM SW initialization
+is done only if is a cold reset cause. But some
+boards may receive PRSTN event before reaching
+SP-SRAM initialization, and thus preboot main
+for the PRSTN reset did not do the SW initialization
+and therefore DERR ECC events were triggered.
+This patch fix this issue by using FLOPS_2 register
+bit 0, as an indication for SP-SRAM SW init done.
+
+Change-Id: Iafabe4b5ef555734e0fec922cf26afa3013a58e2
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 7ca7184..171bbfc 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -25,6 +25,7 @@
+ #include <hl_boot_if.h>			/* requires stdint.h */
+ #include <boot_if.h>
+ #include <gaudi/gaudi_reg_map.h>
++#include <gaudi/gaudi_fw_if.h>
+ #include <common/pci_ids.h>
+ 
+ #include <bitops.h>
+@@ -419,16 +420,24 @@
+ 		sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+ }
+ 
++#define RESET_PATTERN		0x5a5a5a5a
++#define SPSRAM_INIT_DONE	1
++
+ void preboot_sp_sram_init(void)
+ {
+ 	register int i;
++	struct gaudi_flops_2_data flops_2_data;
+ 	u32 *data = (u32 *)(HL_SP_SRAM_BASE);
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
+ 
+-	if (rst_src == HL_COLD_RST) {
++	flops_2_data.data = regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++	if (flops_2_data.spsram_init_done != SPSRAM_INIT_DONE) {
+ 		/* SP SRAM access is limited to 32bit */
+ 		for (i = 0; i < HL_SP_SRAM_SIZE / sizeof(u32); i++)
+-			data[i] = 0x5a5a5a5a;
++			data[i] = RESET_PATTERN;
++
++		flops_2_data.spsram_init_done = SPSRAM_INIT_DONE;
++		regmap_writel(flops_2_data.data,
++			      mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
+ 	}
+ 
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_SP_SRAM_EN, true);

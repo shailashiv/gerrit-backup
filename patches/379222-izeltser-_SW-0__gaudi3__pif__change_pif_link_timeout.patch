@@ -1,0 +1,72 @@
+From 0ba5a190e3f55cafa999ff80df0d029ec0e7798b Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 14 Dec 2023 18:10:11 +0200
+Subject: [PATCH] [SW-0] gaudi3: pif: change pif link timeout
+
+Pif Arc is monitoring the time it takes for the pci link to go up.
+Before the timeout value was tightly coupled to the reset type
+and the PCIe standart. but in real world the Host can decide to
+bringup the pcie link at any later time, so this tight monitoring
+is pointless.
+this patch simplifies the timeout monitor and sets it to constant
+500msec.
+
+Change-Id: I81f6cda4409d57ff1a776100a984a5313b359703
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index ca1cf2d..88ce53f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1048,31 +1048,10 @@
+ 	PIF_WARM_REBOOT,
+ };
+ 
+-/*
+- * PIF is being reset only by PRST_n signal (warm reboot) or power cycle (cold boot).
+- * Due to a known bug in the psoc rst_src register, this register should never be cleared, only
+- * power cycle is clearing it. Hence, we are looking for 2 scenarios:
+- * 1. PRST_n indication is on == last reset source was warm reboot
+- * 2. PRST_n indication is off == last reset source necessarily was cold boot.
+- */
+-static enum pif_reset_source pif_get_reset_source(void)
+-{
+-	u32 regval = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_RST_SRC));
+-
+-	if (regval & GLOBAL_CONF_RST_SRC_PRSTN_RST_IND_M)
+-		return PIF_WARM_REBOOT;
+-
+-	return PIF_COLD_BOOT;
+-}
+-
+-#define COLD_LINK_TIMEOUT_US	100000
+-#define WARM_LINK_TIMEOUT_US	20000
++#define LINK_TIMEOUT_REPORT_US	500000
+ 
+ void pif_arc_pcie_monitoring(void)
+ {
+-	u32 link_timeout;
+-	enum pif_reset_source rst_src;
+-
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN)))
+ 		;
+@@ -1084,8 +1063,6 @@
+ 	pif_arc_init_pcie();
+ 
+ 	hl_pif_report_sts(PIF_STAT_WAITING_FOR_LINK);
+-	rst_src = pif_get_reset_source();
+-	link_timeout = (rst_src == PIF_WARM_REBOOT) ? WARM_LINK_TIMEOUT_US : COLD_LINK_TIMEOUT_US;
+ 
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+@@ -1098,7 +1075,7 @@
+ 		if (prstn && smlh && rdlh)
+ 			break;
+ 
+-		if (pif_ts_timeout_expired(0, link_timeout))
++		if (pif_ts_timeout_expired(0, LINK_TIMEOUT_REPORT_US))
+ 			hl_pif_report_err(PIF_ERR_PCI_LINK_UP_TIMEOUT);
+ 
+ 		/*

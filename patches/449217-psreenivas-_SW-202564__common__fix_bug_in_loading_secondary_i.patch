@@ -1,0 +1,162 @@
+From 27117c938face46d58364a549183008984f5b1a7 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Mon, 23 Sep 2024 09:14:23 +0300
+Subject: [PATCH] [SW-202564] common: fix bug in loading secondary image
+
+If the dma copy of preboot primary image fails, the ppboot
+is not trying to load secondary image as the status of
+dma is not returned from ppboot_cp_preboot. This patch
+fixes this by returning the status of dma copy.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: Ib7b7667e7d1995b27b01248594681faaacee42e5
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 4c84846..0075273 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -51,9 +51,8 @@
+ 	preboot_puts_hex_raw(", size: ", desc->img_size, false);
+ 	preboot_puts(")\n");
+ 
+-	ppboot_cp_preboot(desc->loadaddr, desc->spi_offset,
+-			  desc->img_size, "PREBOOT");
+-	if (desc->desc_ver > 1) {
++	is_valid = ppboot_cp_preboot(desc->loadaddr, desc->spi_offset, desc->img_size, "PREBOOT");
++	if (is_valid && desc->desc_ver > 1) {
+ 		is_valid = ppboot_is_valid_img_desc(desc);
+ 		if (!is_valid)
+ 			preboot_puts("Checksum is not valid.\n");
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 9dfe0f6..95caf5c 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -422,7 +422,7 @@
+ /* TODO: use bootrom code when it is mature enough FSW-2070 */
+ #endif /* USE_BOOTROM_SPI_DMA */
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++bool ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	enum dma_error dma_err;
+ 	enum dma_dest_type dma_type;
+@@ -434,8 +434,12 @@
+ 	dma_type = preboot_get_dma_dest_type(loadaddr);
+ 
+ 	dma_err = dma_copy_image_v2(size, offset, loadaddr, dma_type, false);
+-	if (dma_err != DMA_SUCCESS)
++	if (dma_err != DMA_SUCCESS) {
+ 		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
++		return false;
++	}
++
++	return true;
+ }
+ 
+ void hl_erom_bringup_pcie_link(void)
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c57c82f..1c771bd 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -293,9 +293,10 @@
+ 	image_entry();
+ }
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++bool ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	/* Not implemented - ARC BootROM copies and validates preboot */
++	return true;
+ }
+ 
+ static u32 ppboot_flash_image_offset(u8 image_ptr)
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 56b6848..9ca810f 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -301,7 +301,7 @@
+ 	}
+ }
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++bool ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	if (name)
+ 		preboot_puts_raw(name);
+@@ -310,6 +310,8 @@
+ 	preboot_puth((u32)loadaddr, false);
+ 
+ 	spi_flash_copy((void *)loadaddr, offset, size, name);
++
++	return true;
+ }
+ 
+ bool preboot_sram_is_valid_address_range(u64 addr, int len)
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 50cc976..8e0cf64 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -68,10 +68,10 @@
+ 	preboot_puts_hex_raw(", size: ", desc->img_size, false);
+ 	preboot_puts(")\n");
+ 
+-	ppboot_cp_preboot(desc->loadaddr, desc->spi_offset,
+-		desc->img_size, "SRAM_MBIST_DATA");
++	is_valid = ppboot_cp_preboot(desc->loadaddr, desc->spi_offset,
++				     desc->img_size, "SRAM_MBIST_DATA");
+ 
+-	if (desc->desc_ver > 1) {
++	if (is_valid && desc->desc_ver > 1) {
+ 		is_valid = ppboot_is_valid_img_desc_ex((void *)desc);
+ 
+ 		if (!is_valid)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 46535b7..e273907 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -209,12 +209,13 @@
+ 	return DMA_DEST_HBW;
+ }
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++bool ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	u64 dma_dest_addr;
+ 	enum dma_error dma_err;
+ 	enum dma_dest_type dma_type;
+ 	bool is_psoc_mem;
++	bool ret = true;
+ 
+ 	if (name)
+ 		preboot_puts_raw(name);
+@@ -228,11 +229,15 @@
+ 		preboot_cfg_dma_mmu_bypass(true);
+ 
+ 	dma_err = dma_copy_image_v2(size, offset, dma_dest_addr, dma_type, false);
+-	if (dma_err != DMA_SUCCESS)
++	if (dma_err != DMA_SUCCESS) {
+ 		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
++		ret = false;
++	}
+ 
+ 	if (!is_psoc_mem)
+ 		preboot_cfg_dma_mmu_bypass(false);
++
++	return ret;
+ }
+ 
+ #define HL_BTM_FIFO_POP_DELAY	1 /* 1 us*/
+diff --git a/include/baremetal.h b/include/baremetal.h
+index e256fbe..f4cf564 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -207,7 +207,7 @@
+ void preboot_cond_arc0_reset(void);
+ void preboot_configure_arc(int id, uint64_t startaddr);
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
++bool ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);
+ u32 sp_sram_readl(u32 offset);
+ void hl_sram_self_repair(void);

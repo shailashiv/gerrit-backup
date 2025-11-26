@@ -1,0 +1,466 @@
+From aac64de748d5655b55bec12c7d301fc07c6df521 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 16 Nov 2022 18:18:06 +0200
+Subject: [PATCH] [SW-66327] pif_arc: gaudi3: init pcie
+
+In previous devices the task of configuring and monitoring PciE link
+was offloaded to psoc ARC0 or another core of the ARM CPU.
+In Gaudi3, since we have a dedicated ARC CPU in the PIF, it shall
+handle this task.
+
+Every time the PIF ARC is booting (cold/warm reboot), it waits for
+prst_n signal to deassert, configures the required parameters of the
+PHY and PIF, upgrades the PHY FW, and enables the link state machine.
+
+Once the PciE link is up, PIF ARC proceeds to monitoring the incoming
+FLR requests.
+
+Change-Id: Ie4699b308786f3d770298320c04e38df4d91b4d0
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/Makefile b/app/pcie_pif/Makefile
+index cad2210..476feee 100644
+--- a/app/pcie_pif/Makefile
++++ b/app/pcie_pif/Makefile
+@@ -8,14 +8,16 @@
+ 
+ CFLAGS += -I$(SPECS_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
++CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(BASE_DEV_NAME)
+ CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c
+ CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+-# dummy parameter, real one required only for ppboot build
+-CFLAGS += -DPHY_FW_SIZE=0
++
++include $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH_COMMON)/pcie_phy_fw.mk
++CFLAGS += -DPHY_FW_SIZE=$(PHY_FW_SIZE)
+ 
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+ 
+@@ -36,7 +38,8 @@
+ 
+ # TODO: add version info
+ 
+-all: pcie_pif.elf
++all: clean
++	$(MAKE) pcie_pif.elf
+ 
+ pcie_pif.elf: $(PIF_ARC_OBJECTS) $(PIF_ARC_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(PIF_ARC_LD_SCRIPT) -o $@ -Wl,--start-group $(PIF_ARC_OBJECTS) $(LDLIBS) -Wl,--end-group
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index a05c925..e30c89e 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -53,7 +53,7 @@
+ 	regmap_writel(reg_val, pif_arc.error_reg);
+ }
+ 
+-static void hl_pif_report_sts(u32 status_bit)
++void hl_pif_report_sts(u32 status_bit)
+ {
+ 	u32 reg_val;
+ 
+@@ -62,7 +62,7 @@
+ 	regmap_writel(reg_val, pif_arc.status_reg);
+ }
+ 
+-static void hl_pif_clear_sts(u32 status_bit)
++void hl_pif_clear_sts(u32 status_bit)
+ {
+ 	u32 reg_val;
+ 
+@@ -287,6 +287,8 @@
+ {
+ 	device_init();
+ 
++	pif_arc_pcie_monitoring();
++
+ 	/* Handle commands */
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index f8ea49d..ae029ac 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -1,6 +1,6 @@
+ include $(HL_DEV_ARCH_COMMON)/Makefile
++include $(HL_DEV_ARCH_COMMON)/pcie_phy_fw.mk
+ 
+-PHY_FW_SIZE := 0xA500
+ PPBOOT_MAX_SIZE := 16384
+ PREBOOT_BIN_MAX_SIZE := 130048
+ 
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index a9c359e..8903e08 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -5,10 +5,19 @@
+ 
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_g4_pci_pll_ctrl_regs.h>
++#include <d0_pcie_aux_regs.h>
++#include <d0_pcie_aux_masks.h>
++#include <d0_pcie_dbi_sig_regs.h>
++#include <d0_pcie_phy_regs.h>
++#include <common/pci_ids.h>
+ 
++#include <bitops.h>
+ #include <preboot.h>
+ #include <uart.h>
+ #include <pll.h>
++#include <hl.h>
++#include <pif_ts.h>
++#include <hl_pif_arc_if.h>
+ 
+ u32 hl_skip_pcie_init(void)
+ {
+@@ -43,3 +52,49 @@
+ 
+ 	return (factor + 1) & 0xFFFE;
+ }
++
++#define HBM_BAR_PF_NUM	BIT(4)
++
++void preboot_update_bar_sizes(void)
++{
++	/* Set HBM BAR size to 128GB */
++	regmap_writel(HBM_BAR_PF_NUM << D0_PCIE_AUX_DBI_PF_NUM_S, mmD0_PCIE_AUX_DBI);
++	regmap_writel(0xFFFFFFFF, mmD0_PCIE_DBI_SIG_BAR4_REG);
++	regmap_writel(0x0000001F, mmD0_PCIE_DBI_SIG_BAR5_REG);
++	regmap_writel(0x00000000, mmD0_PCIE_AUX_DBI);
++}
++
++u32 preboot_device_id_get(void)
++{
++	u32 dev_id = PCI_IDS_GAUDI3;
++
++	if (!hl_is_dual_die_sku())
++		dev_id = PCI_IDS_GAUDI3_SINGLE_DIE;
++
++	return dev_id;
++}
++
++#define PCIE_EXT_LD_TIMEOUT_US	10000
++
++void pcie_wait_for_sram_ext_ld_done(void)
++{
++	u64 start = pif_ts_get_us();
++
++	if (!pif_ts_is_timeout_possible(start, PCIE_EXT_LD_TIMEOUT_US))
++		pif_ts_counter_arm();
++
++	hl_pif_report_sts(PIF_STAT_POLL_PCIE_PHY_LOAD);
++
++	while (!(regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0) &&
++	       regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1) &&
++	       regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2) &&
++	       regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3))) {
++
++		if (pif_ts_timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
++			hl_pif_report_err(PIF_ERR_PHY_FW_LOAD_TIMEOUT);
++			break;
++		}
++	}
++
++	hl_pif_clear_sts(PIF_STAT_POLL_PCIE_PHY_LOAD);
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 66c6c03..59180df 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -5,11 +5,13 @@
+ 
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_psoc_boot_conf_regs.h>
++#include <d0_psoc_boot_conf_masks.h>
+ #include <d0_cpu_timestamp_regs.h>
+ #include <d0_cpu_ca53_cfg_regs.h>
+ #include <d0_psoc_gpio0_regs.h>
+ #include <d0_psoc_qspi_regs.h>
+ #include <d0_pcie_aux_regs.h>
++#include <d0_pcie_aux_masks.h>
+ #include <d0_pcie_core_regs.h>
+ #include <d0_pcie_dbi_sig_regs.h>
+ #include <d0_psoc_reset_conf_regs.h>
+@@ -33,6 +35,7 @@
+ #include <d0_parc_global_conf_regs.h>
+ #include <d0_parc_global_conf_masks.h>
+ #include <d0_psoc_global_conf_masks.h>
++#include <d0_pcie_phy_regs.h>
+ #include <d0_pcie_wrap_regs.h>
+ #include <d0_pcie_wrap_masks.h>
+ #include <d1_pcie_aux_regs.h>
+@@ -44,6 +47,7 @@
+ #include <gaudi3_blocks_linux_driver.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
++#include <gaudi3/gaudi3_reg_map.h>
+ 
+ #include <bitops.h>
+ #include <string.h>
+@@ -63,6 +67,9 @@
+ #include <boot_desc.h>
+ #include <boot_info.h>
+ #include <pll.h>
++#include <pci.h>
++#include <pif_ts.h>
++#include <hl_pif_arc_if.h>
+ 
+ #define PIF_ARC_NUM_OF_MEM	2
+ 
+@@ -828,6 +835,171 @@
+ 	ppboot_run_pif_arc(data);
+ }
+ 
++#define PHY_FW_FSM_ENA_MASK	(D0_PCIE_WRAP_PHY_FW_FSM_EN_M | \
++				 D0_PCIE_WRAP_PHY_FW_FSM_DIRECT_WRITE_EN_M)
++#define FW_WORD_NUM		(PHY_FW_SIZE / 2)
++
++static void pif_arc_init_pcie_phy_fw_update(void)
++{
++	/*
++	 * Configure FW update size.
++	 * PHY_FW_FSM_SIZE takes few clocks to propagate. It is being sampled by HW few
++	 * clock cycles after the rising edge of PCIE_WRAP ➔ PHY_FW_FSM ➔ DIRECT_WRITE_EN bit.
++	 */
++	regmap_writel(0, mmD0_PCIE_WRAP_PHY_FW_FSM);
++	regmap_writel(FW_WORD_NUM, mmD0_PCIE_WRAP_PHY_FW_FSM_SIZE);
++
++	/* let PHY_FW_FSM_SIZE propagate */
++	pif_ts_delay(1);
++
++	/*
++	 * PHY FW FSM EN and Direct FW write mechanism enable
++	 * FW FSM assumes that the data is present in the SRAM
++	 * The FSM will wait for SRAM init done before updating
++	 * the SRAM contents
++	 */
++	regmap_writel(PHY_FW_FSM_ENA_MASK, mmD0_PCIE_WRAP_PHY_FW_FSM);
++
++	/* Take the PHY out of reset */
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++}
++
++static void pcie_ref_clk_mode_init(void)
++{
++	u32 strap_h = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H);
++	bool srns, sris;
++
++	srns = strap_h & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRNS_M;
++	sris = strap_h & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRIS_M;
++
++	/* if common clk mode, no configs are required */
++	if (!srns && !sris)
++		return;
++
++	/* common configs for both srns and sris clk */
++	regmap_writel(0, mmD0_PCIE_PHY_PIPE_LANE_CMN_REFCLK_MODE);
++	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_0);
++	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_1);
++	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_2);
++	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_3);
++
++	if (sris) {
++		regmap_writel(1, mmD0_PCIE_AUX_APP_SRIS_MODE);
++		regmap_writel(1, mmD0_PCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++	}
++}
++
++static void pif_arc_init_pcie_phy(void)
++{
++	/* Reset PCIe PHY */
++	regmap_writel(0, mmD0_PSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++	/*
++	 * Set PCIe PHY CR Para I/F to CFG.
++	 * Select CR PARA I/F instead of JTAG
++	 */
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_3);
++
++	/* Select indirect access to CR PARA I/F instead of PRBI */
++	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_CFG);
++
++	pcie_ref_clk_mode_init();
++
++	pif_arc_init_pcie_phy_fw_update();
++}
++
++static void pif_arc_pcie_device_id_vendor_id_set(void)
++{
++	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
++
++	/* Update Vendor ID */
++	regmap_writel(device_id_vendor_id, mmD0_PCIE_DBI_SIG_DEVICE_ID_VENDOR_ID_REG);
++
++	/* Update subsystem Vendor ID */
++	regmap_writel(device_id_vendor_id, mmD0_PCIE_DBI_SIG_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
++}
++
++static void pif_arc_config_dbi_params(void)
++{
++	regmap_writel(0x02402801, mmD0_PCIE_DBI_SIG_GEN3_RELATED_OFF);
++	regmap_writel(0x04020031, mmD0_PCIE_DBI_SIG_GEN3_EQ_CONTROL_OFF);
++}
++
++__weak void preboot_update_bar_sizes(void) {}
++__weak void pcie_wait_for_sram_ext_ld_done(void) {}
++
++#define LTTSM_ENA_MASK	(D0_PCIE_AUX_LTSSM_EN_IND_M | D0_PCIE_AUX_LTSSM_EN_MASK_M)
++
++static void pif_arc_init_pcie(void)
++{
++	/* arm timer for delays and timeouts in the pcie init sequence */
++	pif_ts_counter_arm();
++
++	pif_arc_init_pcie_phy();
++
++	pif_arc_pcie_device_id_vendor_id_set();
++
++	pif_arc_config_dbi_params();
++
++	/* Set HBM BAR size */
++	preboot_update_bar_sizes();
++
++	/* Mask Completer Abort AER */
++	hl_pcie_mask_ca_aer();
++
++	/* Wait for phy fw upgrade completion */
++	pcie_wait_for_sram_ext_ld_done();
++
++	/* Enable and Mask LTSSM */
++	regmap_writel(LTTSM_ENA_MASK, mmD0_PCIE_AUX_LTSSM_EN);
++}
++
++
++void pif_arc_pcie_monitoring(void)
++{
++	/* Wait for PRSTn */
++	while (!regmap_readl(mmD0_PSOC_GLOBAL_CONF_PRSTN))
++		;
++
++	/* Only after PRSTn is de-asserted */
++	pif_arc_init_pcie();
++
++	hl_pif_report_sts(PIF_STAT_WAITING_FOR_LINK);
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh;
++
++		prstn = regmap_readl(mmD0_PSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmD0_PSOC_GLOBAL_CONF_PRSTN);
++		smlh = regmap_readl(mmD0_PCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmD0_PCIE_AUX_RDLH_LINK_UP);
++
++		if (prstn && smlh && rdlh)
++			break;
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmD0_PCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(LTTSM_ENA_MASK, mmD0_PCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++
++	hl_pif_clear_sts(PIF_STAT_WAITING_FOR_LINK);
++	hl_pif_report_sts(PIF_STAT_PCIE_INIT_DONE);
++}
++
+ void preboot_pcie_wait_for_link(void)
+ {
+ 	struct cpu_load_data load_data = {
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index d4bd6b0..67c8057 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -58,5 +58,6 @@
+ bool hl_is_dual_die_sku(void);
+ u64 gaudi3_dma_addr_fixup(u64 loadaddr);
+ u32 gaudi3_rst_src_fixup(u32 rst_src);
++void pif_arc_pcie_monitoring(void);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/onix.c b/arch/gaudi3/arc/onix.c
+index 55592c0..d38b4ff 100644
+--- a/arch/gaudi3/arc/onix.c
++++ b/arch/gaudi3/arc/onix.c
+@@ -5,6 +5,7 @@
+ 
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_parc_arc1_cfg_regs.h>
++#include <common/pci_ids.h>
+ 
+ #include <gaudi3/address_space.h>
+ #include <preboot.h>
+@@ -66,3 +67,8 @@
+ 
+ 	return addr;
+ }
++
++u32 preboot_device_id_get(void)
++{
++	return PCI_IDS_GAUDI3_FPGA;
++}
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index a42ddbe..fd1a769 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -5,6 +5,7 @@
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_psoc_global_conf_masks.h>
++#include <common/pci_ids.h>
+ #include <stddef.h>
+ #include <bitops.h>
+ #include <preboot.h>
+@@ -186,3 +187,13 @@
+ {
+ 	return true;
+ }
++
++u32 preboot_device_id_get(void)
++{
++	u32 dev_id = PCI_IDS_GAUDI3;
++
++	if (!hl_is_dual_die_sku())
++		dev_id = PCI_IDS_GAUDI3_SINGLE_DIE;
++
++	return dev_id;
++}
+diff --git a/arch/gaudi3/common/pcie_phy_fw.mk b/arch/gaudi3/common/pcie_phy_fw.mk
+new file mode 100644
+index 0000000..2a0e729
+--- /dev/null
++++ b/arch/gaudi3/common/pcie_phy_fw.mk
+@@ -0,0 +1 @@
++PHY_FW_SIZE := 0xA500
+\ No newline at end of file
+diff --git a/include/preboot.h b/include/preboot.h
+index c5f6344..3dba9af 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -261,6 +261,8 @@
+ void ppboot_secure_arc(void);
+ 
+ void hl_pif_report_err(u32 err_bit);
++void hl_pif_report_sts(u32 status_bit);
++void hl_pif_clear_sts(u32 status_bit);
+ void preboot_security_sp_sram_init(void);
+ u32 hl_get_pll_div_fix(void);
+ 

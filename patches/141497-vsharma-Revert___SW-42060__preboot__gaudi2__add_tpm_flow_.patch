@@ -1,0 +1,224 @@
+From f2d21bebac70783eeeb6b2d84bf9c5b3fb0de533 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Fri, 29 Oct 2021 14:11:29 +0300
+Subject: [PATCH] Revert "[SW-42060] preboot: gaudi2: add tpm flow"
+
+This reverts commit 8cb8a5aebd16c69db6814ed0a3b352d58c1e0b8c.
+
+With onix image h6_top_v35_141021 along with this patch,
+lkd fw communication is failing. Reverting this until root cause is
+found.
+
+Change-Id: I245c4eb5901f9b38d6cb5dd1a46921125a833258
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 750c6c9..a3e1f99 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -389,7 +389,6 @@
+ __weak void preboot_read_test_mode(void) {}
+ __weak void preboot_reset_init(void) {}
+ __weak void preboot_cond_arc0_reset(void) {}
+-__weak void preboot_tpm_flow(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -461,8 +460,6 @@
+ 	preboot_engines_init();
+ 
+ 	preboot_clear_wd_gpio();
+-
+-	preboot_tpm_flow();
+ 
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index b17505b..60b243a 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -9,7 +9,7 @@
+ #include <bitops.h>
+ 
+ #define PPBOOT_SIZE			0x4000		/* 16KB */
+-#define PREBOOT_SIZE			0xFD00		/* 63KB */
++#define PREBOOT_SIZE			0xFC00		/* 63KB */
+ 
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+diff --git a/arch/gaudi2/arc/onix.c b/arch/gaudi2/arc/onix.c
+index 34f75cb..0bd31f1 100644
+--- a/arch/gaudi2/arc/onix.c
++++ b/arch/gaudi2/arc/onix.c
+@@ -11,8 +11,6 @@
+ #include <string.h>
+ 
+ #define EFUSE_SYSCFG_ONIX_DEFAULT	0
+-#define EFUSE_DEV_ID_BACKUP_1_DEFAULT	0
+-#define EFUSE_DEV_ID_BACKUP_2_DEFAULT	0
+ 
+ #define SDRAM_BASE_FULL	0x1001000200000000ull
+ 
+@@ -35,16 +33,6 @@
+ 
+ 	if (word == EFUSE_SYSCFG_OFFSET) {
+ 		*val = EFUSE_SYSCFG_ONIX_DEFAULT;
+-		ret = 0;
+-	}
+-
+-	if (word == EFUSE_DEV_ID_BACKUP_OFFSET_1) {
+-		*val = EFUSE_DEV_ID_BACKUP_1_DEFAULT;
+-		ret = 0;
+-	}
+-
+-	if (word == EFUSE_DEV_ID_BACKUP_OFFSET_2) {
+-		*val = EFUSE_DEV_ID_BACKUP_2_DEFAULT;
+ 		ret = 0;
+ 	}
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index a2f82c1..fbe173e 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -71,19 +71,9 @@
+ #include <common/pci_ids.h>
+ 
+ #include <uart.h>
+-#include <tpm2.h>
+-#include <efuse.h>
+ #include <pll.h>
+-#include <lzo/unaligned.h>
+ #include <pci.h>
+ #include <boot_if.h>
+-
+-#define TPM_NV_DEV_SN_ADDRESS	0x01c10100
+-
+-union efuse_dev_id_backup {
+-	u32 i[2];
+-	u64 l;
+-};
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+@@ -1079,96 +1069,6 @@
+ 		preboot_puts_raw("Test mode indication: Compliance mode");
+ 
+ 	preboot_puts("\n");
+-}
+-
+-static int preboot_get_efuse_dev_id(union efuse_dev_id_backup *efuse_dev_id_ret)
+-{
+-	int ret;
+-
+-	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_1, &efuse_dev_id_ret->i[0]);
+-	if (ret)
+-		return ret;
+-
+-	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_2, &efuse_dev_id_ret->i[1]);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
+-}
+-
+-static int preboot_write_efuse_dev_id(u64 dev_id_to_write)
+-{
+-	int ret;
+-	union efuse_dev_id_backup efuse_dev_id;
+-
+-	efuse_dev_id.l = dev_id_to_write;
+-
+-	ret = preboot_fuse_write(EFUSE_DEV_ID_BACKUP_OFFSET_1, efuse_dev_id.i[0]);
+-	if (ret)
+-		return ret;
+-
+-	ret = preboot_fuse_write(EFUSE_DEV_ID_BACKUP_OFFSET_2, efuse_dev_id.i[1]);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
+-}
+-
+-void preboot_tpm_flow(void)
+-{
+-	int ret;
+-	u64 tpm_dev_id = 0;
+-	union efuse_dev_id_backup efuse_dev_id;
+-	int err = CPU_BOOT_ERR_TPM_FLOW_FAIL;
+-
+-	efuse_dev_id.l = 0x0;
+-
+-	ret = tpm2_init();
+-	if (ret)
+-		cpu_boot_err_set(err);
+-
+-	ret = tpm2_startup(TPM2_SU_CLEAR);
+-	if (ret) {
+-		preboot_puts_hex("TPM: startup failed. ret = ", ret, true);
+-		cpu_boot_err_set(err);
+-	}
+-
+-	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
+-	if (ret) {
+-		preboot_puts_hex("TPM: NV_READ failed. ret = ", ret, true);
+-		cpu_boot_err_set(err);
+-	}
+-
+-	tpm_dev_id = get_unaligned_be64(&tpm_dev_id);
+-	preboot_puts_hex64("TPM device ID: ", tpm_dev_id, true);
+-
+-	ret = preboot_get_efuse_dev_id(&efuse_dev_id);
+-	if (ret) {
+-		preboot_puts_hex("TPM flow: efuse read failed. ret = ", ret, true);
+-		cpu_boot_err_set(err);
+-	}
+-
+-	preboot_puts_hex64("EFUSE device ID: ", efuse_dev_id.l, true);
+-
+-	if (efuse_dev_id.l == 0) {
+-		preboot_puts("EFUSE device ID not programed, writing efuse\n");
+-		ret = preboot_write_efuse_dev_id(tpm_dev_id);
+-		if (ret) {
+-			preboot_puts("Failed to write EFUSE\n");
+-			cpu_boot_err_set(err);
+-		}
+-
+-		ret = preboot_get_efuse_dev_id(&efuse_dev_id);
+-		if (ret) {
+-			preboot_puts_hex("TPM flow: efuse read failed. ret = ",
+-							ret, true);
+-			cpu_boot_err_set(err);
+-		}
+-	} else if (efuse_dev_id.l != tpm_dev_id) {
+-		preboot_puts("TPM flow: error: efuse device ID is different than TPM device ID\n");
+-		err = CPU_BOOT_ERR_TPM_DEV_ID_FAIL;
+-		cpu_boot_err_set(err);
+-	}
+ }
+ 
+ static void clr_flr_reset(void)
+diff --git a/arch/gaudi2/common/tpm2.h b/arch/gaudi2/common/tpm2.h
+index 6435f3e..33a8730 100644
+--- a/arch/gaudi2/common/tpm2.h
++++ b/arch/gaudi2/common/tpm2.h
+@@ -63,6 +63,5 @@
+ unsigned int get_sclk_out_pad_sel_tpm(void);
+ void spi_ssi_cs1_get(unsigned int *mask, unsigned int *data_offset,
+ 		     unsigned int *out_en_offset);
+-void preboot_tpm_flow(void);
+ 
+ #endif /* _HL_TPM2_H_ */
+diff --git a/lib/common/efuse.h b/lib/common/efuse.h
+index c719648..c855923 100644
+--- a/lib/common/efuse.h
++++ b/lib/common/efuse.h
+@@ -12,8 +12,6 @@
+ 
+ #define EFUSE_READ_RANGE_ALL		0x3F80
+ #define EFUSE_PRODUCT_ID_OFFSET		0x1
+-#define EFUSE_DEV_ID_BACKUP_OFFSET_1	0x38
+-#define EFUSE_DEV_ID_BACKUP_OFFSET_2	0x39
+ #define EFUSE_SYSCFG_OFFSET             0x3A
+ 
+ int preboot_fuse_init(void);

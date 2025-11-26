@@ -1,0 +1,96 @@
+From 959541b48b2355a304f2370f0d79db64c0ecbbf2 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 11 Mar 2021 01:37:55 +0200
+Subject: [PATCH] [SW-28697] module_lkd: prepare for comms addition
+
+Add determination of the protocol used by LKD and split the code to
+legacy and "yet to be implemented parts".
+This is to prepare for a state when FW has implemented the protocol
+while LKD is still not.
+Once both sides talk the same language, the legacy part can be removed.
+
+Change-Id: Ic8129bbb49a548bc2de1fe5d5c6c3166c4b1a06d
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 6cef9df..6606b7c 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -17,7 +17,7 @@
+ struct lkd_status {
+ 	bool is_fit_checked;
+ 	bool is_fit_ready_ignored;
+-	u32 msg_reg_val;
++	struct comms_command cmd;
+ };
+ 
+ static struct lkd_status sts;
+@@ -38,16 +38,16 @@
+ 
+ __weak void preboot_disable_iatu_access(void) {}
+ 
+-enum cmd_check_res module_lkd_check(void)
++static bool is_legacy_comms(u32 msg)
++{
++	return msg > 0 && msg < KMD_MSG_LAST;
++}
++
++static enum cmd_check_res module_lkd_check_legacy(void)
+ {
+ 	enum cmd_check_res res;
+ 
+-	/* we already have the FIT and it is good */
+-	if (sts.is_fit_checked)
+-		return FOUND_NO_RETURN;
+-
+-	sts.msg_reg_val = cpu_boot_cmd_get();
+-	switch (sts.msg_reg_val) {
++	switch (sts.cmd.val) {
+ 	case KMD_MSG_GOTO_WFE:
+ 		preboot_puts("LKD WFE received\n");
+ 		if (preboot_security_is_enabled()) {
+@@ -100,6 +100,21 @@
+ 	return res;
+ }
+ 
++enum cmd_check_res module_lkd_check(void)
++{
++	enum cmd_check_res res = NOT_FOUND;
++
++	/* we already have the FIT and it is good */
++	if (sts.is_fit_checked)
++		return FOUND_NO_RETURN;
++
++	sts.cmd.val = cpu_boot_cmd_get();
++	if (is_legacy_comms(sts.cmd.val))
++		return module_lkd_check_legacy();
++
++	return res;
++}
++
+ void module_lkd_disable(void)
+ {
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+@@ -124,9 +139,9 @@
+ /* For devices that do not implement RST_DEV command, mimic WFE */
+ __weak void hl_dev_reset(void) { wfe(); }
+ 
+-void module_lkd_run_noret(void)
++static void module_lkd_run_noret_legacy(void)
+ {
+-	switch (sts.msg_reg_val) {
++	switch (sts.cmd.val) {
+ 	case KMD_MSG_GOTO_WFE:
+ 		cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
+ 		wfe();
+@@ -147,3 +162,9 @@
+ 		break;
+ 	}
+ }
++
++void module_lkd_run_noret(void)
++{
++	if (is_legacy_comms(sts.cmd.val))
++		return module_lkd_run_noret_legacy();
++}

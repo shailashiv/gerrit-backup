@@ -1,0 +1,154 @@
+From f398542ab0936fcae31a268472d002e97612e6a0 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 10 Apr 2024 17:55:23 +0300
+Subject: [PATCH] [SW-180536] gaudi3: reuse sha384_csum api from rom
+
+For gaudi3, reuse the sha384_csum api exported from rom.
+
+Since gaudi2 still makes use of sha384_csum function
+defined in preboot/lib/common, this function is moved
+from common to gaudi2 specific files. For gaudi3,
+sha384_csum function definition is removed since it
+is no longer utilized and instead reuses rom api.
+
+Change-Id: Ic843a834d9a65d5de32aa09f830985680e491e9b
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arm/asic.c b/arch/gaudi2/arm/asic.c
+index 2371531..594a376 100644
+--- a/arch/gaudi2/arm/asic.c
++++ b/arch/gaudi2/arm/asic.c
+@@ -8,7 +8,7 @@
+ #include <string.h>
+ #include <bitops.h>
+ #include <baremetal.h>
+-#include <sha512.h>
++#include <sha.h>
+ #include <boot_desc.h>
+ 
+ #include "common.h"
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 584b162..3513d91 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -9,6 +9,7 @@
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/security.c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/sha.c)
+ 
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(DEV_PREFIX)
+diff --git a/arch/gaudi2/common/sha.c b/arch/gaudi2/common/sha.c
+index 45cb2ea..720a85e 100644
+--- a/arch/gaudi2/common/sha.c
++++ b/arch/gaudi2/common/sha.c
+@@ -23,3 +23,22 @@
+ 		sha384_update(&ctx, region[i].data, region[i].size);
+ 	sha384_finish(&ctx, output);
+ }
++
++/*
++ * Output = SHA-512( input buffer ).
++ *
++ * Original Code from Uboot has chunk_sz used when enabled with WD.
++ * This is intentionally removed, just like SHA256 for Preboot.
++ */
++void sha384_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output,
++		__attribute__ ((unused))unsigned int chunk_sz)
++{
++	struct sha512_context ctx;
++
++	sha384_starts(&ctx);
++
++	sha384_update(&ctx, input, ilen);
++
++	sha384_finish(&ctx, output);
++}
+diff --git a/arch/gaudi2/common/sha.h b/arch/gaudi2/common/sha.h
+index e52dc57..301a054 100644
+--- a/arch/gaudi2/common/sha.h
++++ b/arch/gaudi2/common/sha.h
+@@ -17,3 +17,6 @@
+ 
+ void sha_csum_regions(const struct image_region region[], int region_count,
+ 			u8 *output);
++
++void sha384_csum(const u8 *input, unsigned int ilen,
++		u8 *output, __attribute__ ((unused)) unsigned int chunk_sz);
+diff --git a/arch/gaudi3/arc/exports.elf b/arch/gaudi3/arc/exports.elf
+index 2f463cb..af5d207 100644
+--- a/arch/gaudi3/arc/exports.elf
++++ b/arch/gaudi3/arc/exports.elf
+Binary files differ
+diff --git a/arch/gaudi3/arc/exports_onix.elf b/arch/gaudi3/arc/exports_onix.elf
+index f1249da..af5d207 100644
+--- a/arch/gaudi3/arc/exports_onix.elf
++++ b/arch/gaudi3/arc/exports_onix.elf
+Binary files differ
+diff --git a/arch/gaudi3/common/sha.c b/arch/gaudi3/common/sha.c
+index 3e89fed..b7f72bf 100644
+--- a/arch/gaudi3/common/sha.c
++++ b/arch/gaudi3/common/sha.c
+@@ -11,6 +11,7 @@
+ 
+ #include "hl.h"
+ #include <sha.h>
++#include <arcboot_export_dev.h>
+ 
+ void sha_csum_regions(const struct image_region region[], int region_count,
+ 			 u8 *output)
+diff --git a/include/sha512.h b/include/sha512.h
+index 2a74b89..2424204 100644
+--- a/include/sha512.h
++++ b/include/sha512.h
+@@ -31,8 +31,4 @@
+ void sha384_update(struct sha512_context *ctx, const u8 *input, u32 length);
+ void sha384_finish(struct sha512_context *ctx, u8 digest[SHA384_SUM_LEN]);
+ 
+-void sha384_csum(const u8 *input, unsigned int ilen,
+-		u8 *output, __attribute__ ((unused)) unsigned int chunk_sz);
+-
+-
+ #endif /* _SHA512_H */
+diff --git a/lib/common/sha512.c b/lib/common/sha512.c
+index 8012cde..135a172 100644
+--- a/lib/common/sha512.c
++++ b/lib/common/sha512.c
+@@ -278,22 +278,3 @@
+ 	for (i = 0; i < SHA384_SUM_LEN / sizeof(u64); i++)
+ 		PUT_UINT64_BE(ctx->state[i], digest, i * 8);
+ }
+-
+-/*
+- * Output = SHA-512( input buffer ).
+- *
+- * Original Code from Uboot has chunk_sz used when enabled with WD.
+- * This is intentionally removed, just like SHA256 for Preboot.
+- */
+-void sha384_csum(const unsigned char *input, unsigned int ilen,
+-		unsigned char *output,
+-		__attribute__ ((unused))unsigned int chunk_sz)
+-{
+-	struct sha512_context ctx;
+-
+-	sha384_starts(&ctx);
+-
+-	sha384_update(&ctx, input, ilen);
+-
+-	sha384_finish(&ctx, output);
+-}
+diff --git a/lib/common/tpm_auth.c b/lib/common/tpm_auth.c
+index 777c94c..7381300 100644
+--- a/lib/common/tpm_auth.c
++++ b/lib/common/tpm_auth.c
+@@ -9,7 +9,6 @@
+ #include <boot_if.h>
+ #include <tpm2.h>
+ #include <uart.h>
+-#include <sha512.h>
+ #include <boot_desc.h>
+ #include <errno.h>
+ #include "lzo/unaligned.h"

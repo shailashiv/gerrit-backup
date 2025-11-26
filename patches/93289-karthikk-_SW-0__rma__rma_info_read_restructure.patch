@@ -1,0 +1,282 @@
+From f09a8f51c17ec6608cc721f96f70a2074742fb94 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Sun, 09 May 2021 22:42:24 +0300
+Subject: [PATCH] [SW-0] rma: rma info read restructure
+
+Currently table entry size and offset
+location is calculated by referring
+to the individual entry type instead
+of referring the parameters in the
+table header.
+
+This does not impact the functionality
+as it is, instead is a compatibility
+specific update.
+
+Change-Id: I476cf0e5e9123c1f6a5fee581d2f14f0195ab7d6
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/gaudi/rma_info.c b/gaudi/rma_info.c
+index b991113..00f3962 100644
+--- a/gaudi/rma_info.c
++++ b/gaudi/rma_info.c
+@@ -20,18 +20,11 @@
+ #define ROUND_UP4(n)	(((n) + sizeof(u32) - 1) & ~(sizeof(u32) - 1))
+ #define RMA_HEADER_ENTRY_SIZE		sizeof(struct rma_entry)
+ #define RMA_SRAM_ECC_ENTRY_SIZE		sizeof(struct rma_sram_ecc_entry)
+-#define RMA_HBM_ECC_ENTRY_SIZE		sizeof(struct rma_hbm_ecc_entry)
+-#define RMA_HBM_PARITY_ENTRY_SIZE	sizeof(struct rma_hbm_parity_entry)
+ #define MAX_SIZE_ONE_RMA_TABLE		RMA_SRAM_ECC_ENTRY_SIZE
+ #define RMA_TABLE_HEADER_SIZE		sizeof(struct table_header)
+-#define RMA_HBM_ROW_REP_ENTRY_SIZE	sizeof(struct rma_hbm_row_replacement_entry)
+ 
+ #define MAX_INFO_DESC_DATA	\
+ 	((MAX_SRAM_ECC_ENTRIES * MAX_SIZE_ONE_RMA_TABLE) + RMA_TABLE_HEADER_SIZE)
+-
+-/* Number of RMA HEADER is 1 */
+-#define MAX_RMA_HEADER_DATA	\
+-		(RMA_HEADER_ENTRY_SIZE + RMA_TABLE_HEADER_SIZE)
+ 
+ #define FLASH_STORAGE_BLOCK0	0x100000
+ #define FLASH_STORAGE_BLOCK1	(FLASH_STORAGE_BLOCK0 + 0x10000)
+@@ -39,7 +32,6 @@
+ #define FLASH_NUM_FLASH_INFO	2
+ #define FLASH_SECTOR_MAGIC	0xAA55AA55
+ 
+-u8 err_sts_rma_buf[MAX_INFO_DESC_DATA]__aligned(4);
+ static struct hbm_init_err rma_hbm_init_err;
+ 
+ struct flash_header {
+@@ -177,15 +169,16 @@
+ /* Read RMA header table */
+ static void preboot_process_rma_header(void)
+ {
+-	u32 size = MAX_RMA_HEADER_DATA;
+-	int ret;
++	int err;
++	struct rma_table *table = NULL;
++	size_t size;
+ 	struct rma_entry *rma_header;
+ 
+-	ret = rma_info_get(RMA_HEADER_TABLE, err_sts_rma_buf, &size);
+-	if (ret)
++	err = rma_table_read(RMA_HEADER_TABLE, &table, &size);
++	if (err || (size == 0))
+ 		return;
+ 
+-	rma_header = (struct rma_entry *) &err_sts_rma_buf[RMA_TABLE_HEADER_SIZE];
++	rma_header = (struct rma_entry *)table->data;
+ 	/* Update ERR_STS if any error */
+ 	if (rma_header->rma_failure.sram_ecc ||
+ 		rma_header->rma_failure.hbm_ecc ||
+@@ -202,8 +195,7 @@
+ 			rma_hbm_init_err = rma_header->hbm_init_err;
+ 	}
+ 
+-	/* Clear out the data for buffer re-use */
+-	memset(err_sts_rma_buf, 0, size);
++	rma_table_free(table, size);
+ }
+ 
+ void preboot_process_last_rma_info(void)
+@@ -213,17 +205,16 @@
+ 
+ void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op)
+ {
+-	int table_info_size, ret;
+-	u32 size = MAX_INFO_DESC_DATA;
+-	struct rma_sram_ecc_entry *sram_ecc_entry;
+-	u16 offset;
++	int err;
++	struct rma_table *table = NULL;
++	size_t size;
++	struct rma_sram_ecc_entry *sram_ecc_entry, *entry_select;
+ 
+-	ret = rma_info_get(RMA_SRAM_ECC_TABLE, err_sts_rma_buf, &size);
+-	if (ret)
++	err = rma_table_read(RMA_SRAM_ECC_TABLE, &table, &size);
++	if (err || (size == 0))
+ 		return;
+ 
+-	table_info_size = size - RMA_TABLE_HEADER_SIZE;
+-	op->total_err =  table_info_size / RMA_SRAM_ECC_ENTRY_SIZE;
++	op->total_err =  size / table->header.entry_size;
+ 
+ 	/*
+ 	 * Opcode's query of error status must
+@@ -231,31 +222,29 @@
+ 	 * that are currently active.
+ 	 */
+ 	if (op->entry_index < op->total_err) {
+-		offset = RMA_TABLE_HEADER_SIZE + (op->entry_index * RMA_SRAM_ECC_ENTRY_SIZE);
+-		sram_ecc_entry = (struct rma_sram_ecc_entry *)&err_sts_rma_buf[offset];
+-		op->sram_index = sram_ecc_entry->sram_index;
+-		op->sram_address = sram_ecc_entry->address;
+-		op->cause.multiple_serr = sram_ecc_entry->header.serr_cause;
+-		op->cause.derr = sram_ecc_entry->header.derr_cause;
++		sram_ecc_entry = (struct rma_sram_ecc_entry *)table->data;
++		entry_select = &sram_ecc_entry[op->entry_index];
++		op->sram_index = entry_select->sram_index;
++		op->sram_address = entry_select->address;
++		op->cause.multiple_serr = entry_select->header.serr_cause;
++		op->cause.derr = entry_select->header.derr_cause;
+ 	}
+ 
+-	/* Clear out the data for buffer re-use */
+-	memset(err_sts_rma_buf, 0, size);
++	rma_table_free(table, size);
+ }
+ 
+ void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op)
+ {
+-	int table_info_size, ret;
+-	u32 size = MAX_INFO_DESC_DATA;
+-	struct rma_hbm_ecc_entry *hbm_ecc_entry;
+-	u16 offset;
++	int err;
++	struct rma_table *table = NULL;
++	size_t size;
++	struct rma_hbm_ecc_entry *hbm_ecc_entry, *entry_select;
+ 
+-	ret = rma_info_get(RMA_HBM_ECC_TABLE, err_sts_rma_buf, &size);
+-	if (ret)
++	err = rma_table_read(RMA_HBM_ECC_TABLE, &table, &size);
++	if (err || (size == 0))
+ 		return;
+ 
+-	table_info_size = size - RMA_TABLE_HEADER_SIZE;
+-	op->total_err =  table_info_size / RMA_HBM_ECC_ENTRY_SIZE;
++	op->total_err =  size / table->header.entry_size;
+ 
+ 	/*
+ 	 * Opcode's query of error status must
+@@ -263,33 +252,31 @@
+ 	 * that are currently active.
+ 	 */
+ 	if (op->entry_index < op->total_err) {
+-		offset = RMA_TABLE_HEADER_SIZE + (op->entry_index * RMA_HBM_ECC_ENTRY_SIZE);
+-		hbm_ecc_entry = (struct rma_hbm_ecc_entry *)&err_sts_rma_buf[offset];
+-		op->device = hbm_ecc_entry->device;
+-		op->pc = hbm_ecc_entry->pc;
+-		op->sid = hbm_ecc_entry->sid;
+-		op->bank = hbm_ecc_entry->bank;
+-		op->cause.multiple_serr = hbm_ecc_entry->header.serr_cause;
+-		op->cause.derr = hbm_ecc_entry->header.derr_cause;
++		hbm_ecc_entry = (struct rma_hbm_ecc_entry *)table->data;
++		entry_select = &hbm_ecc_entry[op->entry_index];
++		op->device = entry_select->device;
++		op->pc = entry_select->pc;
++		op->sid = entry_select->sid;
++		op->bank = entry_select->bank;
++		op->cause.multiple_serr = entry_select->header.serr_cause;
++		op->cause.derr = entry_select->header.derr_cause;
+ 	}
+ 
+-	/* Clear out the data for buffer re-use */
+-	memset(err_sts_rma_buf, 0, size);
++	rma_table_free(table, size);
+ }
+ 
+ void rma_info_hbm_par_err_sts(struct hl_i2ci_error_status_hbm_parity *op)
+ {
+-	int table_info_size, ret;
+-	u32 size = MAX_INFO_DESC_DATA;
+-	struct rma_hbm_parity_entry *hbm_par_entry;
+-	u16 offset;
++	int err;
++	struct rma_table *table = NULL;
++	size_t size;
++	struct rma_hbm_parity_entry *hbm_par_entry, *entry_select;
+ 
+-	ret = rma_info_get(RMA_HBM_PARITY_TABLE, err_sts_rma_buf, &size);
+-	if (ret)
++	err = rma_table_read(RMA_HBM_PARITY_TABLE, &table, &size);
++	if (err || (size == 0))
+ 		return;
+ 
+-	table_info_size = size - RMA_TABLE_HEADER_SIZE;
+-	op->total_err =  table_info_size / RMA_HBM_PARITY_ENTRY_SIZE;
++	op->total_err =  size / table->header.entry_size;
+ 
+ 	/*
+ 	 * Opcode's query of error status must
+@@ -297,17 +284,16 @@
+ 	 * that are currently active.
+ 	 */
+ 	if (op->entry_index < op->total_err) {
+-		offset = RMA_TABLE_HEADER_SIZE + (op->entry_index * RMA_HBM_PARITY_ENTRY_SIZE);
+-		hbm_par_entry = (struct rma_hbm_parity_entry *)&err_sts_rma_buf[offset];
+-		op->device = hbm_par_entry->device;
+-		op->pc = hbm_par_entry->pc;
+-		op->cause.ca = hbm_par_entry->header.ca_cause;
+-		op->cause.data_rd = hbm_par_entry->header.rd_cause;
+-		op->cause.data_wr = hbm_par_entry->header.wr_cause;
++		hbm_par_entry = (struct rma_hbm_parity_entry *)table->data;
++		entry_select = &hbm_par_entry[op->entry_index];
++		op->device = entry_select->device;
++		op->pc = entry_select->pc;
++		op->cause.ca = entry_select->header.ca_cause;
++		op->cause.data_rd = entry_select->header.rd_cause;
++		op->cause.data_wr = entry_select->header.wr_cause;
+ 	}
+ 
+-	/* Clear out the data for buffer re-use */
+-	memset(err_sts_rma_buf, 0, size);
++	rma_table_free(table, size);
+ }
+ 
+ void rma_info_hbm_init_err_sts(struct hl_i2ci_error_status_hbm_init *op)
+@@ -322,36 +308,32 @@
+ 
+ void rma_info_hbm_row_replacement(struct hl_i2ci_dram *op)
+ {
+-	u32 size = MAX_INFO_DESC_DATA;
+-	int ret, table_info_size;
+-	struct rma_hbm_row_replacement_entry *hbm_row_replacement;
+-	u16 offset;
++	int err;
++	struct rma_table *table = NULL;
++	size_t size;
++	struct rma_hbm_row_replacement_entry *hbm_row_replacement, *entry_select;
+ 
+-	ret = rma_info_get(RMA_HBM_ROW_REPLACEMENT_TABLE, err_sts_rma_buf, &size);
+-	if (ret)
++	err = rma_table_read(RMA_HBM_ROW_REPLACEMENT_TABLE, &table, &size);
++	if (err || (size == 0))
+ 		return;
+ 
+-	table_info_size = size - RMA_TABLE_HEADER_SIZE;
+-	op->number_of_replaced_rows =  table_info_size / RMA_HBM_ROW_REP_ENTRY_SIZE;
++	op->number_of_replaced_rows = size / table->header.entry_size;
+ 
+ 	/*
+ 	 * Opcode's query of row index must
+ 	 * be an index within the replaced rows
+ 	 */
+ 	if (op->index_replaced_row_selection < op->number_of_replaced_rows) {
+-		offset = RMA_TABLE_HEADER_SIZE +
+-				(op->index_replaced_row_selection * RMA_HBM_ROW_REP_ENTRY_SIZE);
+-		hbm_row_replacement =
+-				(struct rma_hbm_row_replacement_entry *)&err_sts_rma_buf[offset];
+-		op->replaced_row_hbm_index = hbm_row_replacement->device;
+-		op->replaced_row_pc_index = hbm_row_replacement->pc;
+-		op->replaced_row_bank_index = hbm_row_replacement->bank;
+-		op->replaced_row_cause.data = hbm_row_replacement->header.data_cause;
+-		op->replaced_row_address = hbm_row_replacement->row;
+-
++		hbm_row_replacement = (struct rma_hbm_row_replacement_entry *)table->data;
++		entry_select = &hbm_row_replacement[op->index_replaced_row_selection];
++		op->replaced_row_hbm_index = entry_select->device;
++		op->replaced_row_pc_index = entry_select->pc;
++		op->replaced_row_bank_index = entry_select->bank;
++		op->replaced_row_cause.data = entry_select->header.data_cause;
++		op->replaced_row_address = entry_select->row;
+ 	}
+-	/* Clear out the data for buffer re-use */
+-	memset(err_sts_rma_buf, 0, size);
++
++	rma_table_free(table, size);
+ }
+ 
+ #define RMA_HDR_TBL_SIZE (RMA_HEADER_ENTRY_SIZE + RMA_TABLE_HEADER_SIZE)

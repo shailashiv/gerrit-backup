@@ -1,0 +1,68 @@
+From e25a9afce8ba906147d891847ce7e63f0273257c Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Mon, 05 Apr 2021 23:38:47 +0300
+Subject: [PATCH] [SW-36011] preboot: config iautu address mode
+
+Configure BAR 2, in IATU address mode, which gives a
+better resolution in BAR configuration, so that configuration
+space is included as before, but SP SRAM is excluded.
+
+Change-Id: Ibeb96ed546a9f3cd9ef9b21981e0e957331e3c1e
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 174c309..45a2f6e 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -324,6 +324,7 @@
+ 
+ void hl_pci_iatu_init(void)
+ {
++	u64 sp_sram_offset;
+ 	struct hl_pci_inbound_region inbound_region;
+ 	struct hl_pci_outbound_region outbound_region;
+ 
+@@ -333,21 +334,34 @@
+ 	inbound_region.addr = SDRAM_BASE;
+ 	hl_pci_set_inbound_region(0, &inbound_region);
+ 
+-	/* Inbound Region 1 - Bar 2 - Point to SPI FLASH */
+-	inbound_region.mode = PCI_BAR_MATCH_MODE;
+-	inbound_region.bar = PCI_BAR_ID_2;
+-	inbound_region.addr = HL_SPI_BASE; //cfg_base
+-	hl_pci_set_inbound_region(1, &inbound_region);
+-
+-	/* Inbound Region 2 - Bar 4 - Point to HBM */
++	/* Inbound Region 1 - Bar 4 - Point to HBM */
+ 	inbound_region.mode = PCI_BAR_MATCH_MODE;
+ 	inbound_region.bar = PCI_BAR_ID_4;
+ 	inbound_region.addr = DRAM_BASE;
++	hl_pci_set_inbound_region(1, &inbound_region);
++
++	hl_pci_get_bar_phys_addr(PCI_BAR_ID_2, &inbound_region.pcie_bar_phys);
++
++	/* Inbound Region 2 - Bar 2 - SPI FLASH till start of SP SRAM */
++	inbound_region.mode = PCI_ADDRESS_MATCH_MODE;
++	inbound_region.bar = PCI_BAR_ID_2;
++	inbound_region.offset_in_bar = 0;
++	inbound_region.addr = HL_SPI_BASE;
++	sp_sram_offset = HL_SP_SRAM_BASE - HL_SPI_BASE;
++	inbound_region.size = sp_sram_offset;
+ 	hl_pci_set_inbound_region(2, &inbound_region);
++
++	/* Inbound Region 3 - Bar 2 - End of SP SRAM till end of config */
++	inbound_region.mode = PCI_ADDRESS_MATCH_MODE;
++	inbound_region.bar = PCI_BAR_ID_2;
++	inbound_region.offset_in_bar = sp_sram_offset + HL_SP_SRAM_SIZE;
++	inbound_region.addr = HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE;
++	inbound_region.size = HOST_PHYS_BASE - HL_SP_SRAM_BASE +
++			       HL_SP_SRAM_SIZE;
++	hl_pci_set_inbound_region(3, &inbound_region);
+ 
+ 	/* Outbound Region 0 - Point to Host */
+ 	outbound_region.addr = HOST_PHYS_BASE;
+ 	outbound_region.size = HOST_PHYS_SIZE;
+ 	hl_pci_set_outbound_region(&outbound_region);
+ }
+-

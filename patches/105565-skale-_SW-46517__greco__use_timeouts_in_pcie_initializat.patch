@@ -1,0 +1,102 @@
+From 28d684e6a318ee397f6fadaef732d77adbb12a79 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 06 Jul 2021 14:15:36 +0300
+Subject: [PATCH] [SW-46517] greco: use timeouts in pcie initialization
+
+timeouts were added while performing pcie initialization as part
+of legacy ppboot code for greco. Carry same functionality in
+ppboot for secureboot flow.
+
+Change-Id: I1c64bbecf0fdfe6bcdb5de99a2570d0c7d85a92d
+---
+
+diff --git a/arch/greco_arc/common.c b/arch/greco_arc/common.c
+index 9b35509..2de6bc9 100644
+--- a/arch/greco_arc/common.c
++++ b/arch/greco_arc/common.c
+@@ -161,6 +161,7 @@
+ 
+ void preboot_init_pcie(void)
+ {
++	u64 start;
+ 
+ 	preboot_init_pcie_phy();
+ 
+@@ -169,9 +170,21 @@
+ 	/* Disable the EQ REDO */
+ 	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+ 
++	start = timestamp_get_us();
++
++	/* Wait for init_done before executing W/A */
+ 	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0) &&
+-		regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1)))
+-		;
++		 regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1))) {
++		/*
++		 * PCIe external load complete should take maximum of 300us
++		 * to complete. Including some grace period 576us of
++		 * timeout is used
++		 */
++		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for ext_ld_done!");
++			break;
++		}
++	}
+ 
+ 	/* Execute the Synopsys W/A */
+ 	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
+@@ -187,15 +200,27 @@
+ 
+ void preboot_pcie_wait_for_link(void)
+ {
++	u64 start = timestamp_get_us();
++
+ 	/* init dev id as soon as possible, while waiting for prstn */
+ 	preboot_device_id_init();
+ 
+ 	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+-		;
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
++		/* If PRSTn does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PRSTn!\n");
++			return;
++		}
++	}
+ 
+ 	/* Only after PRSTn is de-asserted */
+ 	preboot_pcie_enable();
++
++	/* Reset start timer */
++	start = timestamp_get_us();
+ 
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+@@ -210,6 +235,11 @@
+ 			break;
+ 		}
+ 
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PCIe link UP!\n");
++			break;
++		}
++
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+ 		 * This cause BAR size to be reset
+diff --git a/arch/greco_arc/common.h b/arch/greco_arc/common.h
+index ae92092..5257799 100644
+--- a/arch/greco_arc/common.h
++++ b/arch/greco_arc/common.h
+@@ -47,4 +47,7 @@
+ #define ARC_RST_VALUE		0x110
+ #define ARC_RST_VEC_ADDR	0x0
+ 
++#define PCIE_WAIT_TIMEOUT_US	(5 * USEC_PER_SEC)
++#define PCIE_EXT_LD_TIMEOUT_US	576
++
+ #endif /* COMMON_GRECO_ARC_H_ */

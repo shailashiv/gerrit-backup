@@ -1,0 +1,97 @@
+From db723819e0cac105ec87c63a2de1e0b6b8ac8f99 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 07 Feb 2022 12:33:49 +0200
+Subject: [PATCH] [SW-73994] module_pci: postpone setup till link up
+
+On some systems the PERSTn can still be low when we reach the setup
+routine, so the FLR setup has no effect.
+For the FLR setting to take effect we need to wait for the PCIe
+controller and wrappers to be ready.
+Add a state machine which enables tracking the PCIe initialization and
+postpone the FLR setup up till it is ready.
+
+Change-Id: I219acb1bbe7202eea536c3322bfa985b8b70dda6
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/lib/preboot/module_pci.c b/lib/preboot/module_pci.c
+index 450653f..6aed3d4 100644
+--- a/lib/preboot/module_pci.c
++++ b/lib/preboot/module_pci.c
+@@ -24,6 +24,7 @@
+ 	bool mem_enabled;
+ 	bool mem_enabled_prev;
+ 	bool pci_pll_initialized;
++	bool setup_done;
+ };
+ 
+ static struct pci_status pci_sts = {
+@@ -34,6 +35,7 @@
+ 	.link_is_up = false,
+ 	.mem_enabled_prev = false,
+ 	.pci_pll_initialized = false,
++	.setup_done = false,
+ };
+ 
+ __weak void pci_dev_specific_setup(void) {}
+@@ -69,12 +71,22 @@
+ __weak bool is_pcie_initialized(void) { return true; }
+ __weak void hl_dev_pci_pll_wa(void) {}
+ 
+-void module_pci_setup(void)
++static void module_pci_do_setup(void)
+ {
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_setup();
+ 		pci_dev_flr_enable(true);
+ 	}
++
++	pci_sts.setup_done = true;
++}
++
++void module_pci_setup(void)
++{
++	if (!is_pcie_initialized())
++		return;
++
++	module_pci_do_setup();
+ }
+ 
+ #define DBG_TIMEOUT_US		1000000
+@@ -112,6 +124,9 @@
+ 		pci_init_wait_dbg();
+ 		return NOT_FOUND;
+ 	}
++
++	if (!pci_sts.setup_done)
++		module_pci_do_setup();
+ 
+ 	pci_sts.flr_reg_val = regmap_readl(pci.aux_flr_int_reg);
+ 	pci_sts.hot_rst_reg_val = pci_dev_specific_hot_rst_check();
+@@ -151,6 +166,8 @@
+ 		pci_dev_specific_disable();
+ 		pci_dev_flr_enable(false);
+ 	}
++
++	pci_sts.setup_done = false;
+ }
+ 
+ void module_pci_run(void)
+@@ -213,6 +230,8 @@
+ 		pci_dev_specific_enable();
+ 		pci_dev_flr_enable(true);
+ 	}
++
++	pci_sts.setup_done = true;
+ }
+ 
+ void module_pci_teardown(void)
+@@ -221,6 +240,8 @@
+ 		pci_dev_specific_teardown();
+ 		pci_dev_flr_enable(false);
+ 	}
++
++	pci_sts.setup_done = false;
+ }
+ 
+ bool hl_pci_link_is_up(void)

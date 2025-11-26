@@ -1,0 +1,131 @@
+From 56fc9555980666ff50bc7ef4d3918815b2272366 Mon Sep 17 00:00:00 2001
+From: Alona Solntseva <alona.solntseva@tandemg.com>
+Date: Wed, 09 Feb 2022 18:50:56 +0200
+Subject: [PATCH] [SW-67906] erom pcie: configure erom pcie for gen1
+
+Change erom pcie configuration to gen1
+
+Change-Id: I3d3da04b591e2561502412f75dd7eca58a42ee61
+Signed-off-by: Alona Solntseva <alona.solntseva@tandemg.com>
+---
+
+diff --git a/app/ext_rom/erom_pcie.c b/app/ext_rom/erom_pcie.c
+index cd400fd..9b0c495 100644
+--- a/app/ext_rom/erom_pcie.c
++++ b/app/ext_rom/erom_pcie.c
+@@ -8,6 +8,7 @@
+ #include <stdint.h>
+ #include <hl.h>
+ #include <pll.h>
++#include <pci.h>
+ #include <preboot.h>
+ #include <device.h>
+ #include <uart.h>
+@@ -15,6 +16,8 @@
+ #include <boot_if.h>
+ 
+ #include <psoc_global_conf_regs.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_phy_regs.h>
+ #include <pcie_aux_regs.h>
+ 
+ static void device_init(void)
+@@ -26,8 +29,66 @@
+ 
+ __weak void init_prstn(void) {}
+ __weak void set_pci_msix_pba_offset_val(void) {}
+-__weak void preboot_init_pcie(void) {}
+ __weak void ppboot_log_waiting_for_pcie(void) {}
++__weak void preboot_init_pcie_phy(void)
++{
++	/* Reset PCIe PHY */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++	udelay(100);
++
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_BYPASS_0);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_BYPASS_1);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_BYPASS_2);
++	regmap_writel(1, mmPCIE_PHY_PHYX_SRAM_BYPASS_3);
++
++	udelay(10);
++
++	/* Take the PHY out of reset */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++}
++
++static void preboot_pcie_device_id_vendor_id_set(void)
++{
++	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
++
++	/* Update Vendor ID */
++	regmap_writel(device_id_vendor_id,
++		      mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++
++	/* Update subsystem Vendor ID */
++	regmap_writel(device_id_vendor_id,
++		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
++
++}
++
++void erom_init_pcie(void)
++{
++	u32 link_control;
++
++	preboot_init_pcie_phy();
++
++	preboot_pcie_device_id_vendor_id_set();
++
++	/* Execute the Synopsys W/A */
++	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
++	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
++	udelay(20);
++
++	/* Set HBM BAR size */
++	preboot_update_bar_sizes();
++
++	/* PCIe disable LTR */
++	preboot_disable_pcie_ltr();
++
++	link_control = regmap_readl(mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG);
++	link_control &= 0xFFFFFFF0;
++	link_control |= 1;
++	regmap_writel(link_control, mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG);
++
++	/* Enable and Mask LTSSM (erratum 102) */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
+ 
+ void preboot_pcie_enable(void)
+ {
+@@ -38,7 +99,7 @@
+ 	case HL_COLD_RST:
+ 	case HL_PRSTN_RST:
+ 		/* PCIe is reset, so must initialize PCIe */
+-		preboot_init_pcie();
++		erom_init_pcie();
+ 		break;
+ 	default:
+ 		/*
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 7bdcefb..f1f500a 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -355,7 +355,7 @@
+ 
+ #define PCIE_EXT_LD_TIMEOUT_US	10000
+ 
+-static void pcie_wait_for_sram_ext_ld_done(void)
++void pcie_wait_for_sram_ext_ld_done(void)
+ {
+ 	u64 start = timestamp_get_us();
+ 	bool usr_notify = true;
+@@ -442,7 +442,7 @@
+ 	return !!(boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_H_SRIS_MODE_MASK);
+ }
+ 
+-static void pcie_wa_snps_case_01038891(void)
++void pcie_wa_snps_case_01038891(void)
+ {
+ 	uint8_t separate_reference = 0;
+ 	uint8_t ssc_en = 0, srns = 0;

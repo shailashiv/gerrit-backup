@@ -1,0 +1,238 @@
+From c7e56d539905d4b8566361165477f8537f7dcc92 Mon Sep 17 00:00:00 2001
+From: Alona Solntseva <alona.solntseva@tandemg.com>
+Date: Wed, 09 Feb 2022 18:27:08 +0200
+Subject: [PATCH] [SW-67906] erom recovery: port api of preboot main
+
+Call erom recovery API's directly instead of calling preboot main
+function
+Preboot main function ported partially: only recovery related API's
+
+Change-Id: I50c9b479531d6b5e34758bcb054c78e2f3a233f5
+Signed-off-by: Alona Solntseva <alona.solntseva@tandemg.com>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 6a80d33..9ba3e86 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -42,23 +42,43 @@
+ 	$(HL_DEV_ARCH)/common.o \
+ 	$(HL_DEV_ARCH)/secondary.o
+ 
+-PREBOOT_SRCS_C := $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
+-PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/*.c)
+-PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/lzo/*.c)
+-PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/app/preboot/*.c)
+-PREBOOT_SRCS_C := $(filter-out $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
+-
+-PREBOOT_SRCS_C += recovery_stubs.c
+-
+-include $(HL_DEV_ARCH)/Makefile
+-PREBOOT_SRCS_C := $(filter-out $(HL_DEV_ARCH_COMMON)/tpm2.c, $(PREBOOT_SRCS_C)) #tpm code is not needed in recovery image
+-PREBOOT_SRCS_C := $(filter-out $(HL_DEV_ARCH_COMMON)/tpm_auth.c, $(PREBOOT_SRCS_C)) #tpm code is not needed in recovery image
+-
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
+-PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+-
+-EROM_RECOVERY_DEPS := ${PREBOOT_OBJECTS} # EROM recovery image contains entire preboot image
++EROM_RECOVERY_DEPS := \
++	recovery_stubs.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/boot_desc.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/cmd_module.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/module_i2c_slave.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/pll.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/spi.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/spi_flash.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/uart.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/sha256.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/sha512.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/string.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/pci.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/lib_common.o \
++	$(PREBOOT_ROOT_DIR)/app/preboot/preboot.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/boot_info.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/fit_regions.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/module_fwupd.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/module_uart.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/fit_rsa.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/module_i2c_slave.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/module_pci.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/crc8.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/crc32.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/i2cslave_indirect.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/module_lkd.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/thermal.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/fit.o \
++	$(PREBOOT_ROOT_DIR)/lib/preboot/memory.o \
++	$(HL_DEV_ARCH)/common.o \
++	$(HL_DEV_ARCH)/../common/common.o \
++	$(HL_DEV_ARCH)/../common/security.o \
++	$(HL_DEV_ARCH)/../common/pll.o \
++	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
++	$(HL_DEV_ARCH)/$(HL_TARGET).o \
+ 
+ EROM_RECOVERY_EXTRA_LIBS := "-lfdt"
+ 
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index 5fa69c0..b3be286 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -5,9 +5,128 @@
+  *
+  */
+ 
+-#include "preboot.h"
++#include <stdint.h>
++#include <boot_if.h>
++#include <cmd_module.h>
++#include <stddef.h>
++#include <pll.h>
++#include <preboot.h>
++#include <security.h>
++#include <spi_flash.h>
++#include <device.h>
++
++#include <uart.h>
++
++#define BTL_VER_PREFIX  "BTL version "
++#define FUSE_VER_PREFIX "Fuse version "
++
++static char preboot_vers[][VERSION_MAX_LEN] = {
++	[PREBOOT_BTL_VER] = { BTL_VER_PREFIX },
++	[PREBOOT_EFUSE_VER] = { FUSE_VER_PREFIX },
++};
++
++static struct cmd_module_ops cmd_ops[] = {
++	{	/* PCI module */
++		.setup = module_pci_setup,
++		.check = module_pci_check,
++		.disable = module_pci_disable,
++		.run = module_pci_run,
++		.enable = module_pci_enable,
++		.run_fast = module_pci_run_fast,
++		.teardown = module_pci_teardown,
++		.run_noreturn = noop,
++	},
++	{	/* FW UPD module */
++		.setup = module_fwupd_setup,
++		.check = module_fwupd_check,
++		.disable = noop,
++		.run = module_fwupd_run,
++		.enable = noop,
++		.run_fast = module_fwupd_run_fast,
++		.teardown = noop,
++		.run_noreturn = module_fwupd_run_noret,
++	},
++	{	/* I2C FW UPD module */
++		.setup = module_i2c_fwupd_setup,
++		.check = module_i2c_fwupd_check,
++		.disable = noop,
++		.run = module_i2c_fwupd_run,
++		.enable = noop,
++		.run_fast = module_i2c_fwupd_run_fast,
++		.teardown = noop,
++		.run_noreturn = module_fwupd_run_noret,
++	},
++	{	/* UART module */
++		.setup = module_uart_setup,
++		.check = module_uart_check,
++		.disable = noop,
++		.run = noop,
++		.enable = noop,
++		.run_fast = module_uart_run,
++		.teardown = module_uart_teardown,
++		.run_noreturn = noop,
++	},
++	{	/* I2C SLAVE module */
++		.setup = module_i2c_s_setup,
++		.check = module_i2c_s_check,
++		.disable = module_i2c_s_disable,
++		.run = module_i2c_s_run,
++		.enable = module_i2c_s_enable,
++		.run_fast = module_i2c_s_run_fast,
++		.teardown = module_i2c_s_teardown,
++		.run_noreturn = module_i2c_s_run_noret,
++	},
++};
++
++static void device_init(void)
++{
++	device_init_global_conf();
++	device_init_uart();
++	device_init_pci();
++	device_init_i2c_s();
++}
+ 
+ void erom_main_function(void)
+ {
+-	preboot_main();
++	u64 ver_off = (uintptr_t)preboot_vers;
++
++	device_init();
++	/*
++	 * Note: we assume CPU frequency is not changed while CPU is running,
++	 * so the udelay init is done once before we start.
++	 */
++	cpu_boot_if_init();
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
++	/* Enable the errors communication */
++	cpu_boot_err_set(CPU_BOOT_ERR_ENABLED);
++	/* Enable the device status communication */
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_ENABLED);
++
++	udelay_init();
++
++	hl_dev_pll_init();
++
++	hl_uart_init();
++
++	preboot_cond_arc0_reset();
++
++	spi_flash_init();
++	spi_flash_prot_late();
++	spi_flash_prot_status();
++
++	preboot_sp_sram_init();
++
++	preboot_device_id_init();
++
++	hl_ts_init();
++
++	/* Prepare boot FW versions and eFuse data for host */
++	preboot_version();
++	preboot_security_dynamic_vers_init(ver_off, sizeof(preboot_vers));
++
++	preboot_dev_enable_caps();
++
++	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
++
++	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index e98c512..3cc17a2 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -156,7 +156,7 @@
+ 	return i;
+ }
+ 
+-static void preboot_version(void)
++void preboot_version(void)
+ {
+ 	int err;
+ 	u32 btlver = regmap_readl(global_conf.preboot_ver_off_map);
+diff --git a/include/preboot.h b/include/preboot.h
+index 28bfb8a..44e2f74 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -246,6 +246,7 @@
+ void ppboot_security_init(void);
+ 
+ void preboot_main(void);
++void preboot_version(void);
+ void ppboot_secure_arc(void);
+ 
+ #endif /* __ASSEMBLY__ */

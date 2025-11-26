@@ -1,0 +1,71 @@
+From 50836bc1d53b7ddd6497f31a8c342ca08562453f Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 19 Aug 2024 10:36:55 +0300
+Subject: [PATCH] [SW-195710] g3: set pci rev for bis device
+
+When a device is operating under BIS limitations for China market, the
+PCI revision is changed to reflect that to the host at the earliest
+stage.
+The PCIe revision is set by PIF ARC. To maximize PIF ARC stability, it
+is not accessing outside of PIF, but instead the BIS status is passed to
+him via a local configuration register.
+
+Change-Id: I77445c6c8b49537b3c9c3b94867e9e6dc43d3365
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+(cherry picked from commit ba2fc9e44794555cacc6bc581d109b31150e466e)
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 0e4bc0c..14d1e0a 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -967,6 +967,18 @@
+ 	pif_arc_init_pcie_phy_fw_update();
+ }
+ 
++static void pif_set_bis_compliant_device(void)
++{
++	regmap_rmwritel(mmD0_PIF_ARC_CONTROL, 1, PIF_CTRL_BIS_MODE_EN);
++}
++
++static bool pif_is_bis_compliant_device(void)
++{
++	return !!(regmap_readl(mmD0_PIF_ARC_CONTROL) & PIF_CTRL_BIS_MODE_EN);
++}
++
++#define BIS_DEVICE_PCIE_REVISION	0x4
++
+ static void pif_arc_pcie_device_id_vendor_id_set(void)
+ {
+ 	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+@@ -977,6 +989,11 @@
+ 	/* Update subsystem Vendor ID */
+ 	regmap_writel(device_id_vendor_id,
+ 			D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG));
++
++	if (pif_is_bis_compliant_device())
++		regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_CLASS_CODE_REVISION_ID),
++				BIS_DEVICE_PCIE_REVISION,
++				PCIE_DBI_CLASS_CODE_REVISION_ID_REVISION_ID_M);
+ }
+ 
+ #define EMR_PWR_M	PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP2_EMERGENCY_PWR_RED_SUPPORT_M
+@@ -1104,6 +1121,9 @@
+ 		.inter_buffer_addr = ARC1_ICCM_FULL_BASE + SZ_64K,
+ 		.die_id = GAUDI3_MASTER_DIE_ID,
+ 	};
++
++	if (preboot_is_bis_compliant_mode())
++		pif_set_bis_compliant_device();
+ 
+ 	ppboot_load_and_run_pif_arc(&load_data);
+ }
+@@ -1594,3 +1614,8 @@
+ {
+ 	return true;
+ }
++
++__weak bool preboot_is_bis_compliant_mode(void)
++{
++	return ppboot_sys_cfg_efuse_is_set(EFUSE_BIS_COMPLIANT_EN_MASK);
++}

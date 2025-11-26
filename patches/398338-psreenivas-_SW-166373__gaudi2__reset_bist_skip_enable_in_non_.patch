@@ -1,0 +1,45 @@
+From e47696f7439b4678ff5d5523e8bd94438875daf7 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Thu, 22 Feb 2024 12:57:18 +0200
+Subject: [PATCH] [SW-166373] gaudi2: reset bist_skip_enable in non hard reset
+
+It is observed that on some host prstn reset is asserted
+followed by cold reset. If the firmware has already completed
+the bist in cold reset and before issuing the hard reset if the
+prstn is asserted will result in skipping of bist. This patch
+adds addtional check for bist skip by checking the reset source
+for sw_all_reset.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I15f1c9e6552492de844fd05ded542663c56cd8a3
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 513df4b..cdde13f 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -456,17 +456,23 @@
+ void hl_sram_self_repair(void)
+ {
+ 	struct gaudi2_cold_rst_data cold_rst_data;
++	u32 rst_src = hl_rst_src_get();
+ 
+ 	init_sram_bist_data();
+ 
+ 	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
+ 
+ 	/* If FW_ALL reset then skip bist */
+-	if (hl_rst_src_get() == HL_FW_ALL_RST) {
++	if (rst_src == HL_FW_ALL_RST) {
+ 		preboot_puts("bist skipped for 48MB SRAM during FW_ALL reset\n");
+ 		return;
+ 	}
+ 
++	if (cold_rst_data.bist_skip_enable && rst_src != HL_SW_ALL_RST) {
++		cold_rst_data.bist_skip_enable = 0;
++		regmap_writel(cold_rst_data.data, mmCOLD_RST_DATA);
++	}
++
+ 	if (cold_rst_data.bist_skip_enable) {
+ 		preboot_puts("bist skipped for 48MB SRAM\n");
+ 		return;

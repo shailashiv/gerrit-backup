@@ -1,0 +1,140 @@
+From 370870aebc17b29fe5703c48a7a26ac10144cfe9 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 22 Mar 2022 19:34:27 +0200
+Subject: [PATCH] [SW-66329] pif_arc: add runtime status logging
+
+Monitoring of the pif arc activity and status is very limited
+because it is not allowed to access any registers of memory outside
+of the pci block during runtime.
+So to provide some minimal progress information, an enum status is
+being writen to a local register.
+
+Change-Id: Iacafbc7efb51b2f5431a29b5984901eb2a32574e
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index 20e25a0..5ff9251 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -53,6 +53,14 @@
+ 	regmap_writel(reg_val, pif_arc.error_reg);
+ }
+ 
++static void flr_report_status(u32 stat_val)
++{
++	if (stat_val >= STAT_LAST)
++		return;
++
++	regmap_writel(stat_val, pif_arc.status_reg);
++}
++
+ bool is_pcie_initialized(void)
+ {
+ 	/* avoid reading psoc register after init phase */
+@@ -70,6 +78,7 @@
+ 	regmap_writel(1, pif_arc.pf_flr_done);
+ 	pif_ts_delay(FLR_ACTIVE_SIG_WIDTH_US);
+ 	regmap_writel(0, pif_arc.pf_flr_done);
++	flr_report_status(STAT_FLR_DONE_REPORTED);
+ }
+ 
+ static void wait_for_secondary_die(void)
+@@ -83,6 +92,7 @@
+ 	}
+ 
+ 	regmap_writel(0, pif_arc.psoc2pif_die_ready);
++	flr_report_status(STAT_SEC_DIE_READY);
+ }
+ 
+ static void set_flr_active(void)
+@@ -90,6 +100,7 @@
+ 	regmap_writel(1, pif_arc.pif2psoc_flr_active);
+ 	pif_ts_delay(FLR_ACTIVE_SIG_WIDTH_US);
+ 	regmap_writel(0, pif_arc.pif2psoc_flr_active);
++	flr_report_status(STAT_INT_RESET_ACTIVE);
+ }
+ 
+ static void poll_flr_done(void)
+@@ -104,6 +115,7 @@
+ 	}
+ 
+ 	regmap_writel(0, pif_arc.psoc2pif_flr_done);
++	flr_report_status(STAT_INT_RESET_DONE);
+ }
+ 
+ #define PIF_ISOLATE_OUTBOUND	BIT(0)
+@@ -127,6 +139,8 @@
+ 			break;
+ 		}
+ 	}
++
++	flr_report_status(STAT_PCI_ACCESS_DISABLED);
+ }
+ 
+ static void enable_pci_access(void)
+@@ -139,6 +153,8 @@
+ 	regval = regmap_readl(pif_arc.outbound_iso);
+ 	regval &= ~PIF_ISOLATE_OUTBOUND;
+ 	regmap_writel(regval, pif_arc.outbound_iso);
++
++	flr_report_status(STAT_PCI_ACCESS_ENABLED);
+ }
+ 
+ static void trigger_flr_reset(void)
+@@ -152,6 +168,7 @@
+ 
+ void pci_dev_specific_run(void)
+ {
++	flr_report_status(STAT_FLR_EVENT_START);
+ 	terminate_pci_access();
+ 	trigger_flr_reset();
+ 
+@@ -165,6 +182,7 @@
+ 	/* TODO: wait for confirmation from FW that security preparations have finished */
+ 
+ 	enable_pci_access();
++	flr_report_status(STAT_FLR_EVENT_FINISH);
+ 
+ 	pif_ts_rearm_enable(true);
+ }
+@@ -179,6 +197,7 @@
+ 	flr_sts.primary_die = hl_get_die_id() ? false : true;
+ 	flr_sts.flr_sw_ctrl = true;
+ 	flr_sts.setup_done = true;
++	flr_report_status(STAT_FLR_INITIALIZED);
+ }
+ 
+ void pci_dev_specific_disable(void)
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 06e6d4e..0bc492b 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -366,6 +366,7 @@
+ 		pif_arc.timestamp_ctrl = mmD0_PIF_ARC_FLR_TIMESTAMP_CTRL;
+ 		pif_arc.timestamp_cnt = mmD0_PIF_ARC_FLR_TIMESTAMP_CNT;
+ 		pif_arc.error_reg = mmD0_PIF_ARC_ERROR;
++		pif_arc.status_reg = mmD0_PIF_ARC_STATUS;
+ 	} else {	/* DIE1 */
+ 		pif_arc.pf_flr_active = mmD1_PIF_ARC_PF_FLR_ACTIVE;
+ 		pif_arc.pf_flr_done = mmD1_PIF_ARC_PF_FLR_DONE;
+@@ -380,6 +381,7 @@
+ 		pif_arc.timestamp_ctrl = mmD1_PIF_ARC_FLR_TIMESTAMP_CTRL;
+ 		pif_arc.timestamp_cnt = mmD1_PIF_ARC_FLR_TIMESTAMP_CNT;
+ 		pif_arc.error_reg = mmD1_PIF_ARC_ERROR;
++		pif_arc.status_reg = mmD1_PIF_ARC_STATUS;
+ 	}
+ }
+ 
+diff --git a/include/device.h b/include/device.h
+index 7a384c5..ad87763 100644
+--- a/include/device.h
++++ b/include/device.h
+@@ -97,6 +97,7 @@
+ 	u32 timestamp_ctrl;
+ 	u32 timestamp_cnt;
+ 	u32 error_reg;
++	u32 status_reg;
+ };
+ 
+ extern struct device_efuse efuse;

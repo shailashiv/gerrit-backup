@@ -1,0 +1,1066 @@
+From 082565d89f40e7066009b16280ebc94c9dec7105 Mon Sep 17 00:00:00 2001
+From: Noam.Lessner <nlessner@habana.ai>
+Date: Sun, 15 Aug 2021 12:13:47 +0300
+Subject: [PATCH] [SW-47998] gaudi2: init masterif and axuser
+
+migrate masterIF and axuser init from LKD.
+referance -
+commit "Revert [SW-34072] gaudi2: add DMMU isolation to cluster binning"
+("38d966cb2f5216bdf6379a9a753745b6578ff657")
+gaudi2_bringup.c
+
+Signed-off-by: Noam.Lessner <nlessner@habana.ai>
+Change-Id: I7b493a3d0114cb88769b9b121d1213793286c9c8
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 1221a5b..7ac7f4a 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -368,6 +368,8 @@
+ __weak void preboot_process_last_rma_info(void) {}
+ __weak void preboot_rate_limiter_init(void) {}
+ __weak void preboot_hbm_credits_init(void) {}
++__weak void preboot_master_if_init(void) {}
++__weak void preboot_axuser_override(void) {}
+ __weak void preboot_e2e_credits_init(void) {}
+ __weak void preboot_device_id_init(void) {}
+ __weak u32 preboot_device_id_get(void) { return 0; }
+@@ -405,6 +407,7 @@
+ 
+ 	preboot_device_id_init();
+ 
++	preboot_axuser_override();
+ 	preboot_e2e_credits_init();
+ 	preboot_hbm_credits_init();
+ 	preboot_rate_limiter_init();
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 4f98465..fc80de2 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -1,5 +1,6 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/credits.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/axuser.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ 
+diff --git a/arch/gaudi2/common/axuser.c b/arch/gaudi2/common/axuser.c
+new file mode 100644
+index 0000000..48bacb2
+--- /dev/null
++++ b/arch/gaudi2/common/axuser.c
+@@ -0,0 +1,530 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <preboot.h>
++#include <uart.h>
++#include "hl.h"
++
++/*
++ * master-if AXUSER override bits
++ *
++ * For HBW fabric, AWUSER defined as follows:
++ *   [41:38] |Y |CORD/Y
++ *   [37:33] |X |CORD/X
++ *   [32]    |Coreherency |HB_CORE
++ *   [31]    |RESERVED |HB_RSVD/BIT_31
++ *   [30]    |RESERVED |HB_RSVD/BIT_30
++ *   [29]    |EXTMEM_CLOSE_PAGE |HB_DDR/CPAGE_WR
++ *   [28]    |RESERVED |HB_RSVD/BIT_28
++ *   [27]    |RESERVED |HB_RSVD/BIT_27
++ *   [26]    |REDUCTION_MAX |HB_REDUCTION/MAX
++ *   [25:22] |QOS |HB_DDR/QOS_WR
++ *   [21:20] |REDUCTION_ROUNDING_MODE |HB_REDUCTION/ROUND
++ *   [19:18] |REDUCTION_OPERATION |HB_REDUCTION/OP
++ *   [17:14] |REDUCTION_DATA_TYPE |HB_REDUCTION/DTYPE
++ *   [13]    |REDUCTION_INDICATION |HB_REDUCTION/IND
++ *   [12]    |NO_SNOOP |HB_PCIE/NO_SNOOP
++ *   [11]    |STRONG_ORDER |HB_PCIE/STRONG_ORDER
++ *   [10]    |MMBP |HB_SEC/MMBP
++ *   [9:0]   |ASID |HB_SEC/ASID
++ *
++ * For HBW fabric, ARUSER defined as follows:
++ *   [41:38] |Y |CORD/Y
++ *   [37:33] |X |E2E/X
++ *   [32]    |Coreherency |CORE
++ *   [31]    |REGULATOR |HB_RSVD/BIT_31
++ *   [30]    |RESERVED |HB_RSVD/BIT_30
++ *   [29]    |DDR_CLOSE_PAGE |HB_DDR/CPAGE_RD
++ *   [28]    |RESERVED |HB_RSVD/BIT_28
++ *   [27]    |RESERVED |HB_RSVD/BIT_27
++ *   [26]    |REDUCTION_MAX |HB_REDUCTION/MAX
++ *   [25:22] |QOS |HB_DDR/QOS_RD
++ *   [21:13] |RESERVED |HB_REDUCTION/RD_RSVD
++ *   [12]    |NO_SNOOP |HB_PCIE/NO_SNOOP
++ *   [11]    |STRONG_ORDER |HB_PCIE/STRONG_ORDER
++ *   [10]    |MMBP |HB_SEC/MMBP
++ *   [9:0]   |ASID |HB_SEC/ASID
++ *
++ * For LBW fabric, both AWUSER and ARUSER:
++ *   [31:28] |Y |E2E/Y
++ *   [27:23] |X |E2E/X
++ *   [22]    |RESERVED |LB_RSVD/BIT_22
++ *   [21:11] |RESERVED |LB_RSVD/BIT_21_11
++ *   [10]    |LOCK_INDICATION |LB_LOCK/VAL
++ *   [9:0]   |RESERVED |LB_COORD/VAL
++ */
++
++static void gaudi2_init_mstr_if(u32 mstr_if_base)
++{
++	regmap_writel(0, mstr_if_base + MSTR_IF_AXUSER_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(0, mstr_if_base + MSTR_IF_AXUSER_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(ARC_FARM_KDMA_MSTR_IF_AXUSER_HB_MMU_BP_RD_MASK |
++		      ARC_FARM_KDMA_MSTR_IF_AXUSER_HB_MMU_BP_RD_MASK,
++		      mstr_if_base + MSTR_IF_AXUSER_HB_MMU_BP_OFFSET);
++}
++
++static void _gaudi2_init_qm_axuser_overrides(u32 qm_base)
++{
++	/* Configure QM AXUSER overrides */
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, qm_base +
++		      QM_AXUSER_SECURED_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, qm_base +
++		      QM_AXUSER_SECURED_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, qm_base +
++		      QM_AXUSER_SECURED_LB_OVRD_OFFSET);
++	regmap_writel(0x0, qm_base + QM_AXUSER_SECURED_HB_STRONG_ORDER_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, qm_base +
++		      QM_AXUSER_NONSECURED_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, qm_base +
++		      QM_AXUSER_NONSECURED_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, qm_base +
++		      QM_AXUSER_NONSECURED_LB_OVRD_OFFSET);
++	regmap_writel(0x0, qm_base +
++		      QM_AXUSER_NONSECURED_HB_STRONG_ORDER_OFFSET);
++}
++
++static void gaudi2_init_qm_axuser_overrides(void)
++{
++	u64 nic_idx, qm_idx;
++
++	_gaudi2_init_qm_axuser_overrides(mmPDMA0_QM_BASE);
++	_gaudi2_init_qm_axuser_overrides(mmPDMA1_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE0_INSTANCE0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_EDMA0_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE0_INSTANCE1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_EDMA1_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE1_INSTANCE0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_EDMA0_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE1_INSTANCE1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_EDMA1_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE2_INSTANCE0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_EDMA0_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE2_INSTANCE1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_EDMA1_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE3_INSTANCE0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_EDMA0_QM_BASE);
++
++	if (EDMA_ENABLED_MASK & BIT(EDMA_ID_DCORE3_INSTANCE1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_EDMA1_QM_BASE);
++
++	/*
++	 * MME
++	 */
++	if (MME_MASK & BIT(0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_MME_QM_BASE);
++
++	if (MME_MASK & BIT(1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_MME_QM_BASE);
++
++	if (MME_MASK & BIT(2))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_MME_QM_BASE);
++
++	if (MME_MASK & BIT(3))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_MME_QM_BASE);
++
++	/*
++	 * TPC
++	 */
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC0_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC1_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC2))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC2_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC3))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC3_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC4))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC4_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC5))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC5_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC6))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE0_TPC6_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_TPC0_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_TPC1_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC2))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_TPC2_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC3))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_TPC3_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC4))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_TPC4_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC5))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE1_TPC5_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_TPC0_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_TPC1_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC2))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_TPC2_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC3))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_TPC3_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC4))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_TPC4_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC5))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE2_TPC5_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC0))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_TPC0_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC1))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_TPC1_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC2))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_TPC2_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC3))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_TPC3_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC4))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_TPC4_QM_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC5))
++		_gaudi2_init_qm_axuser_overrides(mmDCORE3_TPC5_QM_BASE);
++
++	/*
++	 * ROTATOR
++	 */
++	if (ROTATOR_MASK & BIT(0))
++		_gaudi2_init_qm_axuser_overrides(mmROT0_QM_BASE);
++
++	if (ROTATOR_MASK & BIT(1))
++		_gaudi2_init_qm_axuser_overrides(mmROT1_QM_BASE);
++
++	/*
++	 * NIC
++	 */
++	for (nic_idx = 0; nic_idx < NIC_NUMBER_OF_MACROS; nic_idx++)
++		for (qm_idx = 0; qm_idx < QM_PER_MACRO; qm_idx++) {
++			if (!(NIC_PORTS_MASK & BIT(nic_idx * QM_PER_MACRO +
++						   qm_idx)))
++				continue;
++
++			_gaudi2_init_qm_axuser_overrides(mmNIC0_QM0_BASE +
++							 nic_idx * NIC_OFFSET +
++							 qm_idx * NIC_QM_OFFSET);
++		}
++}
++
++static void _gaudi2_init_dma_core_axuser_overrides(u32 core_base)
++{
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      DMA_CORE_CTX_AXUSER_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_DMA_AXUSER_HB_RD_OVRD_L, core_base +
++		      DMA_CORE_CTX_AXUSER_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, core_base +
++		      DMA_CORE_CTX_AXUSER_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base +
++		      DMA_CORE_CTX_AXUSER_HB_STRONG_ORDER_OFFSET);
++}
++
++static void gaudi2_init_edma_core_axuser_overrides(void)
++{
++	int dcore, inst;
++	u32 core_base;
++	u8 seq;
++
++	for (dcore = 0; dcore < NUM_OF_DCORES; dcore++) {
++		for (inst = 0; inst < NUM_OF_EDMA_PER_DCORE; inst++) {
++			seq = (NUM_OF_EDMA_PER_DCORE * dcore) + inst;
++
++			if (!(EDMA_ENABLED_MASK & BIT(seq)))
++				continue;
++
++			core_base = mmDCORE0_EDMA0_CORE_BASE +
++				    (DCORE_OFFSET * dcore) +
++				    (DCORE_EDMA_OFFSET * inst);
++			_gaudi2_init_dma_core_axuser_overrides(core_base);
++		}
++	}
++}
++
++static void gaudi2_init_dma_core_axuser_overrides(void)
++{
++	_gaudi2_init_dma_core_axuser_overrides(mmPDMA0_CORE_BASE);
++	_gaudi2_init_dma_core_axuser_overrides(mmPDMA1_CORE_BASE);
++	_gaudi2_init_dma_core_axuser_overrides(mmARC_FARM_KDMA_BASE);
++	gaudi2_init_edma_core_axuser_overrides();
++}
++
++static void _gaudi2_init_tpc_axuser_overrides(u32 core_base)
++{
++	regmap_writel(GAUDI2_TPC_AXUSER_HB_WR_OVRD_L, core_base +
++		      TPC_CFG_AXUSER_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      TPC_CFG_AXUSER_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_TPC_AXUSER_LB_OVRD, core_base +
++		      TPC_CFG_AXUSER_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base + TPC_CFG_AXUSER_HB_STRONG_ORDER_OFFSET);
++}
++
++static void gaudi2_init_tpc_axuser_overrides(void)
++{
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC0))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC0_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC1))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC1_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC2))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC2_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC3))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC3_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC4))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC4_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC5))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC5_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE0_TPC6))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE0_TPC6_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC0))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE1_TPC0_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC1))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE1_TPC1_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC2))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE1_TPC2_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC3))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE1_TPC3_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC4))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE1_TPC4_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE1_TPC5))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE1_TPC5_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC0))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE2_TPC0_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC1))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE2_TPC1_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC2))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE2_TPC2_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC3))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE2_TPC3_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC4))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE2_TPC4_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE2_TPC5))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE2_TPC5_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC0))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE3_TPC0_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC1))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE3_TPC1_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC2))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE3_TPC2_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC3))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE3_TPC3_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC4))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE3_TPC4_CFG_BASE);
++
++	if (TPC_ENABLED_MASK & BIT(TPC_ID_DCORE3_TPC5))
++		_gaudi2_init_tpc_axuser_overrides(mmDCORE3_TPC5_CFG_BASE);
++}
++
++static void _gaudi2_init_mme_axuser_overrides(u32 core_base)
++{
++	int i, ports_offset;
++
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      MME_CTRL_LO_MME_AXUSER_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      MME_CTRL_LO_MME_AXUSER_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, core_base +
++		      MME_CTRL_LO_MME_AXUSER_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base +
++		      MME_CTRL_LO_MME_AXUSER_HB_STRONG_ORDER_OFFSET);
++
++	for (i = 0; i < NUM_OF_MME_SBTE_PORTS; i++) {
++		ports_offset = i * DCORE_MME_SBTE_OFFSET;
++
++		regmap_writel(0x0, core_base + ports_offset +
++			      MME_CTRL_SBTE_AXUSER_HB_RD_OVRD_LO_OFFSET);
++		regmap_writel(0x0, core_base + ports_offset +
++			      MME_CTRL_SBTE_AXUSER_HB_STRONG_ORDER_OFFSET);
++	}
++
++	for (i = 0; i < NUM_OF_MME_WB_PORTS; i++) {
++		ports_offset = i * DCORE_MME_WB_OFFSET;
++
++		regmap_writel(GAUDI2_MME_AXUSER_HB_WR_OVRD_L, core_base +
++			      ports_offset +
++			      MME_CTRL_WB_AXUSER_HB_WR_OVRD_LO_OFFSET);
++		regmap_writel(0x0, core_base + ports_offset +
++			      MME_CTRL_WB_AXUSER_HB_STRONG_ORDER_OFFSET);
++	}
++}
++
++void gaudi2_init_mme_axuser_overrides(void)
++{
++	if (MME_MASK & BIT(0))
++		_gaudi2_init_mme_axuser_overrides(mmDCORE0_MME_CTRL_LO_BASE);
++
++	if (MME_MASK & BIT(1))
++		_gaudi2_init_mme_axuser_overrides(mmDCORE1_MME_CTRL_LO_BASE);
++
++	if (MME_MASK & BIT(2))
++		_gaudi2_init_mme_axuser_overrides(mmDCORE2_MME_CTRL_LO_BASE);
++
++	if (MME_MASK & BIT(3))
++		_gaudi2_init_mme_axuser_overrides(mmDCORE3_MME_CTRL_LO_BASE);
++}
++
++static void _gaudi2_init_vdec_axuser_overrides(u32 core_base)
++{
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_DEC_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_DEC_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_DEC_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_DEC_HB_STRONG_ORDER_OFFSET);
++
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_WR_OVRD_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_RD_OVRD_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_STRONG_ORDER_OFFSET);
++
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_HB_STRONG_ORDER_OFFSET);
++
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_LB_OVRD_OFFSET);
++	regmap_writel(0x0, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_HB_STRONG_ORDER_OFFSET);
++
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(0x0, core_base +
++		      VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_HB_STRONG_ORDER_OFFSET);
++}
++
++static void gaudi2_init_vdec_axuser_overrides(void)
++{
++	if (DECODER_ENABLED_MASK & BIT(0))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE0_VDEC0_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(1))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE0_VDEC1_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(2))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE1_VDEC0_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(3))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE1_VDEC1_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(4))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE2_VDEC0_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(5))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE2_VDEC1_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(6))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE3_VDEC0_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(7))
++		_gaudi2_init_vdec_axuser_overrides(
++						mmDCORE3_VDEC1_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(8))
++		_gaudi2_init_vdec_axuser_overrides(mmPCIE_VDEC0_BRDG_CTRL_BASE);
++
++	if (DECODER_ENABLED_MASK & BIT(9))
++		_gaudi2_init_vdec_axuser_overrides(mmPCIE_VDEC1_BRDG_CTRL_BASE);
++}
++
++static void _gaudi2_init_arc_dup_eng_axuser_overrides(u32 arc_base)
++{
++	regmap_writel(GAUDI2_AXUSER_HB_WR_OVRD_LO, arc_base +
++		      ARC_DUP_ENG_AXUSER_HB_WR_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_HB_RD_OVRD_LO, arc_base +
++		      ARC_DUP_ENG_AXUSER_HB_RD_OVRD_LO_OFFSET);
++	regmap_writel(GAUDI2_AXUSER_LB_OVRD, arc_base +
++		      ARC_DUP_ENG_AXUSER_LB_OVRD_OFFSET);
++	regmap_writel(0, arc_base + ARC_DUP_ENG_AXUSER_HB_STRONG_ORDER_OFFSET);
++}
++
++static void gaudi2_init_arc_dup_eng_axuser_overrides(void)
++{
++	_gaudi2_init_arc_dup_eng_axuser_overrides(mmARC_FARM_ARC0_DUP_ENG_BASE);
++	_gaudi2_init_arc_dup_eng_axuser_overrides(mmARC_FARM_ARC1_DUP_ENG_BASE);
++	_gaudi2_init_arc_dup_eng_axuser_overrides(mmARC_FARM_ARC2_DUP_ENG_BASE);
++	_gaudi2_init_arc_dup_eng_axuser_overrides(mmARC_FARM_ARC3_DUP_ENG_BASE);
++}
++
++void preboot_axuser_override(void)
++{
++	gaudi2_init_mstr_if(mmPCIE_MSTR_RR_MSTR_IF_AXUSER_BASE);
++	gaudi2_init_dma_core_axuser_overrides();
++	gaudi2_init_qm_axuser_overrides();
++	gaudi2_init_tpc_axuser_overrides();
++	gaudi2_init_mme_axuser_overrides();
++	gaudi2_init_vdec_axuser_overrides();
++	gaudi2_init_arc_dup_eng_axuser_overrides();
++}
+diff --git a/arch/gaudi2/common/axuser.h b/arch/gaudi2/common/axuser.h
+new file mode 100644
+index 0000000..03413a4
+--- /dev/null
++++ b/arch/gaudi2/common/axuser.h
+@@ -0,0 +1,275 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <arc_farm_kdma_ctx_axuser_masks.h>
++#include <arc_farm_kdma_ctx_axuser_regs.h>
++#include <arc_farm_kdma_mstr_if_axuser_regs.h>
++#include <arc_farm_kdma_mstr_if_axuser_masks.h>
++#include <dcore0_mme_ctrl_lo_mme_axuser_regs.h>
++#include <dcore0_mme_sbte0_mstr_if_axuser_regs.h>
++#include <dcore0_mme_qm_arc_dup_eng_axuser_regs.h>
++#include <dcore0_mme_wb0_mstr_if_axuser_regs.h>
++#include <dcore0_tpc0_cfg_axuser_regs.h>
++#include <dcore0_vdec0_brdg_ctrl_axuser_dec_regs.h>
++#include <dcore0_vdec0_brdg_ctrl_axuser_msix_abnrm_regs.h>
++#include <dcore0_vdec0_brdg_ctrl_axuser_msix_l2c_regs.h>
++#include <dcore0_vdec0_brdg_ctrl_axuser_msix_nrm_regs.h>
++#include <dcore0_vdec0_brdg_ctrl_axuser_msix_vcd_regs.h>
++#include <pdma0_qm_axuser_nonsecured_regs.h>
++#include <pdma0_qm_axuser_secured_regs.h>
++
++#define AXUSER_HB_WR_REDUCTION_MAX_MASK		BIT(26)
++#define AXUSER_HB_WR_REDUCTION_ROUND_MASK	GENMASK(21, 20)
++#define AXUSER_HB_WR_REDUCTION_OP_MASK		GENMASK(19, 18)
++#define AXUSER_HB_WR_REDUCTION_DTYPE_MASK	GENMASK(17, 14)
++#define AXUSER_HB_WR_REDUCTION_IND_MASK		BIT(13)
++#define AXUSER_HB_RD_ATOMIC_IND_MASK		GENMASK(14, 13)
++#define AXUSER_LB_LOCK_IND_MASK			BIT(10)
++
++#define MSTR_IF_AXUSER_OFFSET(REG)			\
++			(REG - mmARC_FARM_KDMA_MSTR_IF_AXUSER_BASE)
++
++#define MSTR_IF_AXUSER_HB_WR_OVRD_LO_OFFSET	\
++	MSTR_IF_AXUSER_OFFSET(mmARC_FARM_KDMA_MSTR_IF_AXUSER_HB_WR_OVRD_LO)
++
++#define MSTR_IF_AXUSER_HB_RD_OVRD_LO_OFFSET	\
++	MSTR_IF_AXUSER_OFFSET(mmARC_FARM_KDMA_MSTR_IF_AXUSER_HB_RD_OVRD_LO)
++
++#define MSTR_IF_AXUSER_HB_MMU_BP_OFFSET	\
++	MSTR_IF_AXUSER_OFFSET(mmARC_FARM_KDMA_MSTR_IF_AXUSER_HB_MMU_BP)
++
++/* AXUSER offsets in TPC */
++#define TPC_CFG_AXUSER_OFFSET(REG) \
++	((REG)-mmDCORE0_TPC0_CFG_BASE)
++
++#define TPC_CFG_AXUSER_HB_WR_OVRD_LO_OFFSET \
++	TPC_CFG_AXUSER_OFFSET(mmDCORE0_TPC0_CFG_AXUSER_HB_WR_OVRD_LO)
++
++#define TPC_CFG_AXUSER_HB_RD_OVRD_LO_OFFSET \
++	TPC_CFG_AXUSER_OFFSET(mmDCORE0_TPC0_CFG_AXUSER_HB_RD_OVRD_LO)
++
++#define TPC_CFG_AXUSER_LB_OVRD_OFFSET \
++	TPC_CFG_AXUSER_OFFSET(mmDCORE0_TPC0_CFG_AXUSER_LB_OVRD)
++
++#define TPC_CFG_AXUSER_HB_STRONG_ORDER_OFFSET \
++	TPC_CFG_AXUSER_OFFSET(mmDCORE0_TPC0_CFG_AXUSER_HB_STRONG_ORDER)
++
++#define GAUDI2_AXUSER_HB_WR_OVRD_LO	0
++#define GAUDI2_AXUSER_HB_RD_OVRD_LO	0
++#define GAUDI2_AXUSER_LB_OVRD		0xFF800000
++
++#define GAUDI2_MME_AXUSER_HB_WR_OVRD_L \
++	(GAUDI2_AXUSER_HB_WR_OVRD_LO | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_MAX_MASK, 0x1) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_ROUND_MASK, 0x3) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_OP_MASK, 0x3) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_DTYPE_MASK, 0xF) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_IND_MASK, 0x1))
++
++#define GAUDI2_TPC_AXUSER_HB_WR_OVRD_L \
++	(GAUDI2_AXUSER_HB_WR_OVRD_LO | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_ROUND_MASK, 0x3) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_OP_MASK, 0x3) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_DTYPE_MASK, 0xF) | \
++	FIELD_PREP(AXUSER_HB_WR_REDUCTION_IND_MASK, 0x1))
++
++#define GAUDI2_TPC_AXUSER_LB_OVRD \
++	(GAUDI2_AXUSER_LB_OVRD | FIELD_PREP(AXUSER_LB_LOCK_IND_MASK, 0x1))
++
++#define GAUDI2_DMA_AXUSER_HB_RD_OVRD_L \
++	(GAUDI2_AXUSER_HB_RD_OVRD_LO | \
++	FIELD_PREP(AXUSER_HB_RD_ATOMIC_IND_MASK, 0x3))
++
++#define QM_AXUSER_SECURED_HB_WR_OVRD_LO_OFFSET \
++		(mmPDMA0_QM_AXUSER_SECURED_HB_WR_OVRD_LO - mmPDMA0_QM_BASE)
++
++#define QM_AXUSER_SECURED_HB_RD_OVRD_LO_OFFSET \
++		(mmPDMA0_QM_AXUSER_SECURED_HB_RD_OVRD_LO - mmPDMA0_QM_BASE)
++
++#define QM_AXUSER_SECURED_LB_OVRD_OFFSET \
++		(mmPDMA0_QM_AXUSER_SECURED_LB_OVRD - mmPDMA0_QM_BASE)
++
++#define QM_AXUSER_SECURED_HB_STRONG_ORDER_OFFSET \
++	(mmPDMA0_QM_AXUSER_SECURED_HB_STRONG_ORDER - mmPDMA0_QM_BASE)
++
++#define QM_AXUSER_NONSECURED_HB_WR_OVRD_LO_OFFSET \
++	(mmPDMA0_QM_AXUSER_NONSECURED_HB_WR_OVRD_LO - mmPDMA0_QM_BASE)
++
++#define QM_AXUSER_NONSECURED_HB_RD_OVRD_LO_OFFSET \
++	(mmPDMA0_QM_AXUSER_NONSECURED_HB_RD_OVRD_LO - mmPDMA0_QM_BASE)
++
++#define QM_AXUSER_NONSECURED_LB_OVRD_OFFSET \
++	(mmPDMA0_QM_AXUSER_NONSECURED_LB_OVRD - mmPDMA0_QM_BASE)
++
++#define DMA_CORE_CTX_AXUSER_HB_WR_OVRD_LO_OFFSET \
++		(mmARC_FARM_KDMA_CTX_AXUSER_HB_WR_OVRD_LO - \
++						mmARC_FARM_KDMA_BASE)
++
++#define DMA_CORE_CTX_AXUSER_HB_RD_OVRD_LO_OFFSET \
++		(mmARC_FARM_KDMA_CTX_AXUSER_HB_RD_OVRD_LO - \
++						mmARC_FARM_KDMA_BASE)
++
++#define DMA_CORE_CTX_AXUSER_LB_OVRD_OFFSET \
++		(mmARC_FARM_KDMA_CTX_AXUSER_LB_OVRD - mmARC_FARM_KDMA_BASE)
++
++#define DMA_CORE_CTX_AXUSER_HB_MMU_BP_OFFSET \
++		(mmARC_FARM_KDMA_CTX_AXUSER_HB_MMU_BP - mmARC_FARM_KDMA_BASE)
++
++#define DMA_CORE_CTX_AXUSER_HB_STRONG_ORDER_OFFSET \
++		(mmARC_FARM_KDMA_CTX_AXUSER_HB_STRONG_ORDER - \
++						mmARC_FARM_KDMA_BASE)
++
++/* AXUSER offsets in MME */
++#define MME_CTRL_LO_AXUSER_OFFSET(REG) \
++	((REG) - mmDCORE0_MME_CTRL_LO_BASE)
++
++#define MME_CTRL_LO_MME_AXUSER_HB_WR_OVRD_LO_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_MME_AXUSER_HB_WR_OVRD_LO)
++
++#define MME_CTRL_LO_MME_AXUSER_HB_RD_OVRD_LO_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_MME_AXUSER_HB_WR_OVRD_LO)
++
++#define MME_CTRL_LO_MME_AXUSER_LB_OVRD_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_MME_AXUSER_LB_OVRD)
++
++#define MME_CTRL_LO_MME_AXUSER_HB_STRONG_ORDER_OFFSET \
++	(MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_MME_AXUSER_HB_STRONG_ORDER))
++
++#define MME_CTRL_LO_REDUN_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_REDUN)
++
++#define MME_CTRL_LO_FMA_FUNC_REDUN_CLK_EN32_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_FMA_FUNC_REDUN_CLK_EN32)
++
++#define MME_CTRL_LO_FMA_FUNC_REDUN_CLK_EN33_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_FMA_FUNC_REDUN_CLK_EN33)
++
++#define MME_CTRL_LO_EU_ISOLATION_DIS_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_EU_ISOLATION_DIS)
++
++#define MME_CTRL_LO_REDUN_PSOC_SEL_SEC_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_REDUN_PSOC_SEL_SEC)
++
++#define MME_CTRL_LO_QM_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_CTRL_LO_QM)
++
++#define MME_CTRL_SBTE_AXUSER_HB_RD_OVRD_LO_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_SBTE0_MSTR_IF_AXUSER_HB_RD_OVRD_LO)
++
++#define MME_CTRL_SBTE_AXUSER_HB_STRONG_ORDER_OFFSET \
++	(MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_SBTE0_MSTR_IF_AXUSER_HB_STRONG_ORDER))
++
++#define MME_CTRL_WB_AXUSER_HB_WR_OVRD_LO_OFFSET \
++	MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_WB0_MSTR_IF_AXUSER_HB_WR_OVRD_LO)
++
++#define MME_CTRL_WB_AXUSER_HB_STRONG_ORDER_OFFSET \
++	(MME_CTRL_LO_AXUSER_OFFSET(mmDCORE0_MME_WB0_MSTR_IF_AXUSER_HB_STRONG_ORDER))
++
++/* AXUSER offsets in VDEC */
++#define VDEC_BRDG_CTRL_AXUSER_OFFSET(REG) \
++	((REG) - mmDCORE0_VDEC0_BRDG_CTRL_BASE)
++
++#define VDEC_BRDG_CTRL_AXUSER_DEC_HB_WR_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                  \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_DEC_HB_WR_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_DEC_HB_RD_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                  \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_DEC_HB_RD_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_DEC_LB_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(            \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_DEC_LB_OVRD)
++
++#define VDEC_BRDG_CTRL_AXUSER_DEC_HB_STRONG_ORDER_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                    \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_DEC_HB_STRONG_ORDER)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_WR_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                      \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_WR_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_RD_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                      \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_RD_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_LB_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                   \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_ABNRM_LB_OVRD)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_STRONG_ORDER_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                           \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_ABNRM_HB_STRONG_ORDER)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_HB_WR_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                       \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_L2C_HB_WR_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_HB_RD_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                       \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_L2C_HB_RD_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_LB_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                 \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_L2C_LB_OVRD)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_L2C_HB_STRONG_ORDER_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                         \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_L2C_HB_STRONG_ORDER)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_HB_WR_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                       \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_NRM_HB_WR_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_HB_RD_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                       \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_NRM_HB_RD_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_LB_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                 \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_NRM_LB_OVRD)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_NRM_HB_STRONG_ORDER_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                         \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_NRM_HB_STRONG_ORDER)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_HB_WR_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                       \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_VCD_HB_WR_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_HB_RD_OVRD_LO_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                       \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_VCD_HB_RD_OVRD_LO)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_LB_OVRD_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                 \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_VCD_LB_OVRD)
++
++#define VDEC_BRDG_CTRL_AXUSER_MSIX_VCD_HB_STRONG_ORDER_OFFSET \
++	VDEC_BRDG_CTRL_AXUSER_OFFSET(                         \
++	    mmDCORE0_VDEC0_BRDG_CTRL_AXUSER_MSIX_VCD_HB_STRONG_ORDER)
++
++
++/* AXUSER offsets in Arc Dup Eng */
++#define ARC_DUP_ENG_AXUSER_HB_WR_OVRD_LO_OFFSET				\
++		(mmDCORE0_MME_QM_ARC_DUP_ENG_AXUSER_HB_WR_OVRD_LO -	\
++				mmDCORE0_MME_QM_ARC_DUP_ENG_BASE)
++
++#define ARC_DUP_ENG_AXUSER_HB_RD_OVRD_LO_OFFSET				\
++		(mmDCORE0_MME_QM_ARC_DUP_ENG_AXUSER_HB_RD_OVRD_LO -	\
++				mmDCORE0_MME_QM_ARC_DUP_ENG_BASE)
++
++#define ARC_DUP_ENG_AXUSER_LB_OVRD_OFFSET				\
++		(mmDCORE0_MME_QM_ARC_DUP_ENG_AXUSER_LB_OVRD -		\
++				mmDCORE0_MME_QM_ARC_DUP_ENG_BASE)
++
++#define ARC_DUP_ENG_AXUSER_HB_STRONG_ORDER_OFFSET			\
++		(mmDCORE0_MME_QM_ARC_DUP_ENG_AXUSER_HB_STRONG_ORDER -	\
++				mmDCORE0_MME_QM_ARC_DUP_ENG_BASE)
++
++#define QM_AXUSER_NONSECURED_HB_STRONG_ORDER_OFFSET \
++		(mmPDMA0_QM_AXUSER_NONSECURED_HB_STRONG_ORDER - mmPDMA0_QM_BASE)
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 1b88fd1..dbf85a7 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -7,6 +7,7 @@
+ #include <limits.h>
+ #include <gaudi2_blocks_linux_driver.h>
+ #include "credits.h"
++#include "axuser.h"
+ 
+ #define GAUDI2_DECODER_FULL_MASK	0x3FF
+ #define GAUDI2_EDMA_FULL_MASK		0xFF
+@@ -46,6 +47,8 @@
+ #define NUM_OF_MME_WB_PER_DCORE		2
+ #define NUM_OF_VDEC_PER_DCORE		2
+ #define NUM_OF_PCIE_VDEC		2
++#define NUM_OF_MME_SBTE_PORTS		5
++#define NUM_OF_MME_WB_PORTS		2
+ 
+ enum nic_mac_lane {
+ 	NIC_MAC_LANE_0,
+@@ -61,6 +64,7 @@
+ #define NIC_NUMBER_OF_PORTS	NIC_NUMBER_OF_ENGINES
+ #define NIC_MAX_NUM_OF_LANES	(NIC_NUMBER_OF_MACROS * NIC_MAC_LANES)
+ #define NIC_PORTS_IN_MACRO	(NIC_NUMBER_OF_PORTS / NIC_NUMBER_OF_MACROS)
++#define QM_PER_MACRO		2
+ 
+ 
+ #define NUMBER_OF_PDMA_QUEUES		2
+@@ -89,6 +93,9 @@
+ 
+ #define NIC_OFFSET			(mmNIC1_MSTR_IF_RR_SHRD_HBW_BASE - \
+ 					 mmNIC0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define NIC_QM_OFFSET			(mmNIC0_QM1_BASE - mmNIC0_QM0_BASE)
++
+ #define PCIE_VDEC_OFFSET	\
+ 		(mmPCIE_VDEC1_MSTR_IF_RR_SHRD_HBW_BASE - \
+ 		 mmPCIE_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE)
+@@ -105,6 +112,90 @@
+ 		(mmDCORE0_VDEC1_MSTR_IF_RR_SHRD_HBW_BASE - \
+ 		 mmDCORE0_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE)
+ 
++enum gaudi2_edma_id {
++	EDMA_ID_DCORE0_INSTANCE0,
++	EDMA_ID_DCORE0_INSTANCE1,
++	EDMA_ID_DCORE1_INSTANCE0,
++	EDMA_ID_DCORE1_INSTANCE1,
++	EDMA_ID_DCORE2_INSTANCE0,
++	EDMA_ID_DCORE2_INSTANCE1,
++	EDMA_ID_DCORE3_INSTANCE0,
++	EDMA_ID_DCORE3_INSTANCE1,
++	EDMA_ID_SIZE,
++};
++
++enum gaudi2_dma_core_id {
++	DMA_CORE_ID_PDMA0, /* Dcore 0 */
++	DMA_CORE_ID_PDMA1, /* Dcore 0 */
++	DMA_CORE_ID_EDMA0, /* Dcore 0 */
++	DMA_CORE_ID_EDMA1, /* Dcore 0 */
++	DMA_CORE_ID_EDMA2, /* Dcore 1 */
++	DMA_CORE_ID_EDMA3, /* Dcore 1 */
++	DMA_CORE_ID_EDMA4, /* Dcore 2 */
++	DMA_CORE_ID_EDMA5, /* Dcore 2 */
++	DMA_CORE_ID_EDMA6, /* Dcore 3 */
++	DMA_CORE_ID_EDMA7, /* Dcore 3 */
++	DMA_CORE_ID_KDMA,  /* Dcore 0 */
++	DMA_CORE_ID_SIZE
++};
++
++enum gaudi2_rotator_id {
++	ROTATOR_ID_0,
++	ROTATOR_ID_1,
++	ROTATOR_ID_SIZE,
++};
++
++enum gaudi2_mme_id {
++	MME_ID_DCORE0,
++	MME_ID_DCORE1,
++	MME_ID_DCORE2,
++	MME_ID_DCORE3,
++	MME_ID_SIZE,
++};
++
++enum gaudi2_tpc_id {
++	TPC_ID_DCORE0_TPC0,
++	TPC_ID_DCORE0_TPC1,
++	TPC_ID_DCORE0_TPC2,
++	TPC_ID_DCORE0_TPC3,
++	TPC_ID_DCORE0_TPC4,
++	TPC_ID_DCORE0_TPC5,
++	TPC_ID_DCORE0_TPC6,
++	TPC_ID_DCORE1_TPC0,
++	TPC_ID_DCORE1_TPC1,
++	TPC_ID_DCORE1_TPC2,
++	TPC_ID_DCORE1_TPC3,
++	TPC_ID_DCORE1_TPC4,
++	TPC_ID_DCORE1_TPC5,
++	TPC_ID_DCORE2_TPC0,
++	TPC_ID_DCORE2_TPC1,
++	TPC_ID_DCORE2_TPC2,
++	TPC_ID_DCORE2_TPC3,
++	TPC_ID_DCORE2_TPC4,
++	TPC_ID_DCORE2_TPC5,
++	TPC_ID_DCORE3_TPC0,
++	TPC_ID_DCORE3_TPC1,
++	TPC_ID_DCORE3_TPC2,
++	TPC_ID_DCORE3_TPC3,
++	TPC_ID_DCORE3_TPC4,
++	TPC_ID_DCORE3_TPC5,
++	TPC_ID_SIZE,
++};
++
++enum gaudi2_dec_id {
++	DEC_ID_DCORE0_DEC0,
++	DEC_ID_DCORE0_DEC1,
++	DEC_ID_DCORE1_DEC0,
++	DEC_ID_DCORE1_DEC1,
++	DEC_ID_DCORE2_DEC0,
++	DEC_ID_DCORE2_DEC1,
++	DEC_ID_DCORE3_DEC0,
++	DEC_ID_DCORE3_DEC1,
++	DEC_ID_PCIE_VDEC0,
++	DEC_ID_PCIE_VDEC1,
++	DEC_ID_SIZE,
++};
++
+ /**
+  * struct block_ctx - context to initialize unit instances across multiple
+  *                    blocks where block can be either a dcore of duplicated
+diff --git a/include/bitops.h b/include/bitops.h
+index b021068..901fe14 100644
+--- a/include/bitops.h
++++ b/include/bitops.h
+@@ -4,18 +4,30 @@
+  * All Rights Reserved.
+  *
+  */
++
+ #ifndef _BITOPS_H_
+ #define _BITOPS_H_
+ 
+ #include <const.h>
+ 
+ #define BITS_PER_LONG_LONG	64
++
++#ifdef __arc__
+ #define BITS_PER_LONG		32
++#else
++#define BITS_PER_LONG		64
++#endif
++
+ #define BIT(nr)		(1 << (nr))
+ #define BIT_WORD(nr)	((nr) / BITS_PER_LONG)
+ 
+ /* extracts "n" number of bits from position "p" in the given number "v" */
+ #define EXTRACT_BITS(v, p, n) (((v) & (((1 << (n)) - 1) << (p))) >> (p))
++
++#define GENMASK(h, l)                      \
++	(((~UL(0)) - (UL(1) << (l)) + 1) & \
++	 (~UL(0) >> (BITS_PER_LONG - 1 - (h))))
++
+ #define GENMASK_ULL(h, l)                    \
+ 	(((~ULL(0)) - (ULL(1) << (l)) + 1) & \
+ 	 (~ULL(0) >> (BITS_PER_LONG_LONG - 1 - (h))))
+@@ -98,6 +110,24 @@
+ 	return num;
+ }
+ 
++#define __bf_shf(x) (__ffs32(x) - 1)
++
++/**
++ * FIELD_PREP() - prepare a bitfield element
++ * @_mask: shifted mask defining the field's length and position
++ * @_val:  value to put in the field
++ *
++ * FIELD_PREP() masks and shifts up the value.  The result should
++ * be combined with other fields of the bitfield using logical OR.
++ */
++#define FIELD_PREP(_mask, _val)						  \
++	(								  \
++	    {								  \
++		    ((typeof(_mask))(_val) << __bf_shf(_mask)) & (_mask); \
++	    }								  \
++	)
++
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _BITOPS_H_ */
+diff --git a/include/preboot.h b/include/preboot.h
+index 56254fe..f7c1919 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -197,6 +197,7 @@
+ 
+ void preboot_hbm_credits_init(void);
+ void preboot_rate_limiter_init(void);
++void preboot_axuser_override(void);
+ void preboot_e2e_credits_init(void);
+ 
+ int preboot_set_sram_sf_access(bool is_enable);

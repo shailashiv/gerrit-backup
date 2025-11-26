@@ -1,0 +1,211 @@
+From c0bfa647c5597ef65c66e3c06ca0b4e1a3cfe74b Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Wed, 08 Jun 2022 11:56:53 +0300
+Subject: [PATCH] [SW-70527] gaudi2: ras: tpc sram rings repair
+
+This patch added support for BIRA, BISR and BIST operations
+for TPC SRAM rings. Also after BIST TPC unit reset
+is done to avoid ECC.
+
+TODO: Waiting for VLSI guideline for doing memory
+initialization of those memories not connected to reset
+block.
+
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+Change-Id: Ib7a7dbe09842529ecac4fe2a51670f07b6a7cdc5
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index b150e54..8866c11 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -13,6 +13,7 @@
+ #include <dcore0_sram0_bank_special_regs.h>
+ #include <dcore0_sram0_bank_special_masks.h>
+ #include <psoc_global_conf_masks.h>
++#include <psoc_reset_conf_masks.h>
+ #include <cpu_if_regs.h>
+ #include <cpu_if_masks.h>
+ #include <psoc_reset_conf_regs.h>
+@@ -29,6 +30,9 @@
+ #define	DELAY_100K_USEC			100000
+ #define	DELAY_5K_USEC			5000
+ #define	DELAY_67_USEC			67
++#define DELAY_7P5K_USEC			7500
++#define DELAY_1K_USEC			1000
++#define DELAY_17_USEC			17
+ 
+ #define GAUDI2_DFX_NUM			5
+ #define GAUDI2_MAX_RING_NUM		28
+@@ -190,6 +194,84 @@
+ 	return 0;
+ }
+ 
++static void gaudi2_tpc_ring_pattern(enum gaudi2_sram_self_repair_op op)
++{
++	uint32_t expected_ones, expected_zeros;
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL23, mmPSOC_DFT_APB_WORD0);
++	if (op == SRAM_SELF_REPAIR_OP_BIRA) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL24, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL25, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL25, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL26, mmPSOC_DFT_APB_WORD1);
++		udelay(DELAY_7P5K_USEC);
++	} else if (op == SRAM_SELF_REPAIR_OP_BISR) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL27, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL28, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL28, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL29, mmPSOC_DFT_APB_WORD1);
++		udelay(DELAY_17_USEC);
++	} else if (op == SRAM_SELF_REPAIR_OP_BIST) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL30, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL31, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL31, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL32, mmPSOC_DFT_APB_WORD1);
++		udelay(DELAY_7P5K_USEC);
++	} else {
++		preboot_puts("Invalid sram repair operation\n");
++		return;
++	}
++	regmap_writel(GAUDI2_RING_PATTERN_VAL33, mmPSOC_DFT_APB_WORD0);
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++
++	expected_ones = 0b00000000010100000010100000010100;
++	expected_zeros = 0b00000000001011100001011100001011;
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++
++	expected_ones = 0b00001010000001010000001010000001;
++	expected_zeros = 0b10000101110000101110000101110000;
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++
++	expected_ones = 0b01000000101000000101000000101000;
++	expected_zeros = 0b10111000010111000010111000010111;
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	if (op == SRAM_SELF_REPAIR_OP_BIST)
++		regmap_writel(GAUDI2_RING_PATTERN_VAL6, mmPSOC_DFT_APB_WORD1);
++	else
++		regmap_writel(GAUDI2_RING_PATTERN_VAL7, mmPSOC_DFT_APB_WORD1);
++
++	expected_ones = 0b00001010000001010000001010000000;
++	expected_zeros = 0b00000101110000101110000101110000;
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	if (op == SRAM_SELF_REPAIR_OP_BIST) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL23, mmPSOC_DFT_APB_WORD0);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
++
++		regmap_writel(GAUDI2_RING_PATTERN_VAL34, mmPSOC_DFT_APB_WORD0);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++
++		expected_ones = 0b00000000000000000000000000000000;
++		expected_zeros = 0b00000000100100100100100100100100;
++		gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++		regmap_writel(GAUDI2_RING_PATTERN_VAL7, mmPSOC_DFT_APB_WORD1);
++
++		expected_ones = 0b00000000000000000000000000000000;
++		expected_zeros = 0b00000000000000010010010010010000;
++		gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++	}
++}
++
+ static void gaudi2_sram_ring_pattern(enum gaudi2_sram_self_repair_op op)
+ {
+ 	uint32_t expected_ones, expected_zeros;
+@@ -271,7 +353,7 @@
+ }
+ 
+ static void (*gaudi2_sram_region_ring_pattern[])(enum gaudi2_sram_self_repair_op op)  = {
+-				[SRAM_RING_TYPE_TPC] = NULL,
++				[SRAM_RING_TYPE_TPC] = gaudi2_tpc_ring_pattern,
+ 				[SRAM_RING_TYPE_SOB_ROT] = NULL,
+ 				[SRAM_RING_TYPE_SRAM] = gaudi2_sram_ring_pattern,
+ 				[SRAM_RING_TYPE_XBAR_MID] = NULL,
+@@ -295,7 +377,8 @@
+ 	for (dfx = 0; dfx < ARRAY_SIZE(dfx_value_table); dfx++) {
+ 		for (ring = 0; ring < ring_count_table[dfx]; ring++) {
+ 			ring_type = gauid2_ring_type_table[dfx][ring];
+-			if (ring_type == SRAM_RING_TYPE_SRAM) {
++			if (ring_type == SRAM_RING_TYPE_SRAM ||
++				ring_type == SRAM_RING_TYPE_TPC) {
+ 				gaudi2_sram_id_sel();
+ 				gaudi2_sram_ring_sel(dfx_value_table[dfx], ring + 1);
+ 				gaudi2_sram_region_ring_pattern[ring_type](op);
+@@ -410,6 +493,29 @@
+ 	gaudi2_mask_sram_ecc(false);
+ }
+ 
++/* TODO: initialize internal tpc srams which
++ * are not connected to reset block
++ */
++static void gaudi2_reset_tpc(void)
++{
++	u32 tpc_iso_val;
++
++	tpc_iso_val = regmap_readl(mmPSOC_GLOBAL_CONF_TPC_ISO);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_TPC_ISO);
++
++	regmap_writel(PSOC_RESET_CONF_TPC_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_TPC_UNIT_RST);
++	regmap_writel(PSOC_RESET_CONF_TPC_DIV_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_TPC_DIV_UNIT_RST);
++	regmap_writel(PSOC_RESET_CONF_UNIT_RST_N_IND_MASK, mmPSOC_RESET_CONF_UNIT_RST_N);
++	udelay(DELAY_1K_USEC); /* TODO: confirm the delay */
++	regmap_writel(0, mmPSOC_RESET_CONF_UNIT_RST_N);
++	regmap_writel(0, mmPSOC_RESET_CONF_TPC_UNIT_RST);
++	regmap_writel(0, mmPSOC_RESET_CONF_TPC_DIV_UNIT_RST);
++	udelay(DELAY_1K_USEC); /* TODO: confirm the delay */
++
++	/* Restore original iso value */
++	regmap_writel(tpc_iso_val, mmPSOC_GLOBAL_CONF_TPC_ISO);
++}
++
+ #define DFT_APB_CONTROL_DEFAULT_VAL		0xFE
+ void hl_sram_self_repair(void)
+ {
+@@ -419,5 +525,6 @@
+ 	/* Get back to normal from DFT mode */
+ 	regmap_writel(DFT_APB_CONTROL_DEFAULT_VAL, mmPSOC_GLOBAL_CONF_DFT_APB_CONTROL);
+ 	gaudi2_scrub_sram(); /* TODO: Replace this by UNIT reset (Refer SIV-1088) */
++	gaudi2_reset_tpc();
+ 	preboot_puts("sram bist done\n");
+ }
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index ad9112e..74d2e23 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -222,6 +222,7 @@
+ 	SRAM_RING_TYPE_MAX
+ };
+ 
++#define GAUDI2_RING_PATTERN_VAL0		0
+ #define GAUDI2_RING_PATTERN_VAL1		0x1000012
+ #define GAUDI2_RING_PATTERN_VAL2		0x121
+ #define GAUDI2_RING_PATTERN_VAL3		0x131
+@@ -244,6 +245,18 @@
+ #define GAUDI2_RING_PATTERN_VAL20		0x100000a
+ #define GAUDI2_RING_PATTERN_VAL21		0x3
+ #define GAUDI2_RING_PATTERN_VAL22		0x1000001
++#define GAUDI2_RING_PATTERN_VAL23		0x1000072
++#define GAUDI2_RING_PATTERN_VAL24		0x484848
++#define GAUDI2_RING_PATTERN_VAL25		0x48484848
++#define GAUDI2_RING_PATTERN_VAL26		0x12121
++#define GAUDI2_RING_PATTERN_VAL27		0x4c4c4c
++#define GAUDI2_RING_PATTERN_VAL28		0x4c4c4c4c
++#define GAUDI2_RING_PATTERN_VAL29		0x13131
++#define GAUDI2_RING_PATTERN_VAL30		0x444444
++#define GAUDI2_RING_PATTERN_VAL31		0x44444444
++#define GAUDI2_RING_PATTERN_VAL32		0x11111
++#define GAUDI2_RING_PATTERN_VAL33		0x100007f
++#define GAUDI2_RING_PATTERN_VAL34		0x1000031
+ 
+ 
+ void gaudi2_axi_drain_ena(void);

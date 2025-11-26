@@ -1,0 +1,95 @@
+From 96958323e5ea47645fdb48e69e6d0d14534f859c Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 14 Jul 2020 13:20:48 +0300
+Subject: [PATCH] [SW-15841] module: pci: add teardown
+
+When we move on to boot or execute another S/W agent, the FLR handling
+must be handed over to H/W, so in case of an FLR event, it will not be
+missed and link will not break.
+Add PCI module teardown function which calls a device specific API and
+implement it for Gaudi.
+
+Change-Id: I0f8068c6de93d25ec39af00beec2a243f4fed6ec
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index adb14e6..7f07d69 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -66,7 +66,9 @@
+ void module_pci_setup(void);
+ enum cmd_check_res module_pci_check(void);
+ void module_pci_run(void);
++void module_pci_teardown(void);
+ void pci_dev_specific_setup(void);
++void pci_dev_specific_teardown(void);
+ 
+ /* FWUPD */
+ void module_fwupd_setup(void);
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 0113afa..d22e162 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -11,8 +11,9 @@
+ #include <pcie_wrap_regs.h>
+ #include <pcie_phy_regs.h>
+ #include <pcie_dbi_regs.h>
+-
+ #include <cpu_timestamp_regs.h>
++
++#include <pcie_aux_masks.h>
+ 
+ #include <hl_boot_if.h>
+ #include <gaudi/gaudi_reg_map.h>
+@@ -293,6 +294,15 @@
+ 	regmap_writel(0, mmPCIE_AUX_FLR_CTRL);
+ }
+ 
++/* Move FLR handling to H/W */
++void pci_dev_specific_teardown(void)
++{
++	u32 val = PCIE_AUX_FLR_CTRL_HW_CTRL_MASK |
++			PCIE_AUX_FLR_CTRL_INT_MASK_MASK;
++
++	regmap_writel(val, mmPCIE_AUX_FLR_CTRL);
++}
++
+ u32 hl_pll_timestamp_base_get(void)
+ {
+ 	return mmCPU_TIMESTAMP_CNTCR;
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 0089231..bf9463a 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -23,6 +23,7 @@
+ };
+ 
+ __weak void pci_dev_specific_setup(void) {}
++__weak void pci_dev_specific_teardown(void) {}
+ 
+ void module_pci_setup(void)
+ {
+@@ -64,3 +65,9 @@
+ 		preboot_puts("HOT RST received\n");
+ 	}
+ }
++
++void module_pci_teardown(void)
++{
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++		pci_dev_specific_teardown();
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 480b670..01875fe 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -27,7 +27,7 @@
+ 		.run = noop,
+ 		.enable = noop,
+ 		.run_fast = module_pci_run,
+-		.teardown = noop,
++		.teardown = module_pci_teardown,
+ 		.run_noreturn = noop,
+ 	},
+ 	{	/* FW UPD module */

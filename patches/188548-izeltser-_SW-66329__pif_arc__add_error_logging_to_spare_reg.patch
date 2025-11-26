@@ -1,0 +1,174 @@
+From 66158d444d1cc447dc5345799195faf92b61e56c Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 13 Mar 2022 12:28:52 +0200
+Subject: [PATCH] [SW-66329] pif_arc: add error logging to spare register
+
+Pif Arc might encounter some error conditions during runtime.
+Since by definition this CPU is not allowed to access to any
+resources outside of the pci block, the chosen way to report
+those error is by logging them to a register (1 of the spares)
+and let other CPUs read it when they can.
+
+Change-Id: Iccd1b8f5c94603e0cf5ab7ecf8d73c56def5cdad
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index 6a477e6..20e25a0 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -10,6 +10,7 @@
+ #include <device.h>
+ #include <hl.h>
+ #include <bitops.h>
++#include <hl_pif_arc_if.h>
+ #include "cmd_module.h"
+ #include "pif_ts.h"
+ #include "pll.h"
+@@ -43,6 +44,15 @@
+ 	},
+ };
+ 
++void hl_flr_report_err(u32 err_bit)
++{
++	u32 reg_val;
++
++	reg_val = regmap_readl(pif_arc.error_reg);
++	reg_val |= err_bit;
++	regmap_writel(reg_val, pif_arc.error_reg);
++}
++
+ bool is_pcie_initialized(void)
+ {
+ 	/* avoid reading psoc register after init phase */
+@@ -66,9 +76,10 @@
+ {
+ 	while (!regmap_readl(pif_arc.psoc2pif_die_ready)) {
+ 		/* meassuring timeout from FLR event start */
+-		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US))
+-			/* TODO: set error bit */
++		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US)) {
++			hl_flr_report_err(PIF_ERR_SEC_DIE_READY_TIMEOUT);
+ 			break;
++		}
+ 	}
+ 
+ 	regmap_writel(0, pif_arc.psoc2pif_die_ready);
+@@ -86,9 +97,10 @@
+ 	/* wait for FLR reset done from HW */
+ 	while (!regmap_readl(pif_arc.psoc2pif_flr_done)) {
+ 		/* meassuring timeout from FLR event start */
+-		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US))
+-			/* TODO: set error bit */
++		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US)) {
++			hl_flr_report_err(PIF_ERR_FLR_HW_RESET_TIMEOUT);
+ 			break;
++		}
+ 	}
+ 
+ 	regmap_writel(0, pif_arc.psoc2pif_flr_done);
+@@ -110,9 +122,10 @@
+ 	/* wait for outstanding outbound transactions to complete */
+ 	while (!regmap_readl(pif_arc.outstand_trans)) {
+ 		/* meassuring timeout from FLR event start */
+-		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US))
+-			/* TODO: set error bit */
++		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US)) {
++			hl_flr_report_err(PIF_ERR_PCI_OUTBOUND_TIMEOUT);
+ 			break;
++		}
+ 	}
+ }
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 6e68f5a..06e6d4e 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -20,10 +20,12 @@
+ #include <d0_parc_int_aggr_i2c_slv_comb_regs.h>
+ #include <d0_parc_local_cfg_regs.h>
+ #include <d0_pif_arc_regs.h>
++#include <d0_pif_arc_special_regs.h>
+ #include <d1_pcie_aux_regs.h>
+ #include <d1_pcie_core_regs.h>
+ #include <d1_pcie_dbi_sig_regs.h>
+ #include <d1_pif_arc_regs.h>
++#include <d1_pif_arc_special_regs.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+ 
+@@ -363,6 +365,7 @@
+ 		pif_arc.psoc2pif_die_ready = mmD0_PIF_ARC_PSOC2PIF_DIE_READY;
+ 		pif_arc.timestamp_ctrl = mmD0_PIF_ARC_FLR_TIMESTAMP_CTRL;
+ 		pif_arc.timestamp_cnt = mmD0_PIF_ARC_FLR_TIMESTAMP_CNT;
++		pif_arc.error_reg = mmD0_PIF_ARC_ERROR;
+ 	} else {	/* DIE1 */
+ 		pif_arc.pf_flr_active = mmD1_PIF_ARC_PF_FLR_ACTIVE;
+ 		pif_arc.pf_flr_done = mmD1_PIF_ARC_PF_FLR_DONE;
+@@ -376,6 +379,7 @@
+ 		pif_arc.psoc2pif_die_ready = mmD1_PIF_ARC_PSOC2PIF_DIE_READY;
+ 		pif_arc.timestamp_ctrl = mmD1_PIF_ARC_FLR_TIMESTAMP_CTRL;
+ 		pif_arc.timestamp_cnt = mmD1_PIF_ARC_FLR_TIMESTAMP_CNT;
++		pif_arc.error_reg = mmD1_PIF_ARC_ERROR;
+ 	}
+ }
+ 
+diff --git a/include/device.h b/include/device.h
+index cabd971..7a384c5 100644
+--- a/include/device.h
++++ b/include/device.h
+@@ -96,6 +96,7 @@
+ 	u32 psoc2pif_die_ready;
+ 	u32 timestamp_ctrl;
+ 	u32 timestamp_cnt;
++	u32 error_reg;
+ };
+ 
+ extern struct device_efuse efuse;
+diff --git a/include/preboot.h b/include/preboot.h
+index a10e397..417afa6 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -253,6 +253,8 @@
+ void preboot_version(void);
+ void ppboot_secure_arc(void);
+ 
++void hl_flr_report_err(u32 err_bit);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/lib/common/pif_ts.c b/lib/common/pif_ts.c
+index 4ca7369..f2dbd28 100644
+--- a/lib/common/pif_ts.c
++++ b/lib/common/pif_ts.c
+@@ -7,6 +7,7 @@
+ #include <preboot.h>
+ #include <device.h>
+ #include <bitops.h>
++#include <hl_pif_arc_if.h>
+ 
+ static bool pif_ts_rearm_allowed = true;
+ 
+@@ -67,7 +68,7 @@
+ 				start = 0;
+ 				continue;
+ 			} else {
+-				/* TODO: set error bit */
++				hl_flr_report_err(PIF_ERR_TS_COUNTER_OVERFLOW);
+ 				break;
+ 			}
+ 		}
+@@ -85,9 +86,10 @@
+ 	timeout = start_usec + delay_usec;
+ 
+ 	current = pif_ts_get();
+-	if (current == PIF_TIMESTAMP_MAX_VAL)
+-		/* TODO: set error bit */
++	if (current == PIF_TIMESTAMP_MAX_VAL) {
++		hl_flr_report_err(PIF_ERR_TS_COUNTER_OVERFLOW);
+ 		return true;
++	}
+ 
+ 	if (current > pif_ts_us_to_ticks(timeout))
+ 		return true;

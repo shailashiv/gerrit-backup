@@ -1,0 +1,712 @@
+From 61e0b6e2188cf019b8b9b1bf5b96bcc86bc71485 Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Thu, 30 May 2024 18:25:49 +0300
+Subject: [PATCH] [SW-165981] emb cmn: deleted module lkd file
+
+Since there is no requirement in eROM to communicate
+with LKD, deleted this file and corresponding functions.
+
+Change-Id: I0282a1bc56e27619bc59ba134b355088c8c956a3
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 4d51ca3..0cc8996 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -76,7 +76,6 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_i2c_slave.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/crc8.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/i2cslave_indirect.o \
+-	$(PREBOOT_ROOT_DIR)/lib/preboot/module_lkd.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/thermal.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/fit.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/memory.o \
+diff --git a/lib/common/cmd_module.h b/lib/common/cmd_module.h
+index d7dacce..de590e8 100644
+--- a/lib/common/cmd_module.h
++++ b/lib/common/cmd_module.h
+@@ -105,17 +105,6 @@
+ u32 i2c_fwupd_readl(u32 offset);
+ void i2c_fwupd_writel(u32 offset, u32 val);
+ 
+-/* LKD */
+-void module_lkd_setup(void);
+-enum cmd_check_res module_lkd_check(void);
+-void module_lkd_enable(void);
+-void module_lkd_disable(void);
+-void module_lkd_run(void);
+-void module_lkd_run_fast(void);
+-void module_lkd_run_noret(void);
+-void lkd_dev_specific_setup(void);
+-void lkd_dev_spec_regs(struct cpu_dyn_regs *regs);
+-
+ /* UART */
+ void module_uart_setup(void);
+ enum cmd_check_res module_uart_check(void);
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index 8f3be9e..fa78557 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -805,6 +805,8 @@
+ 	__module_fwupd_run(&i2c_state);
+ }
+ 
++__weak void preboot_finalize_nic_en(void) {}
++
+ static void module_fwupd_preserve_boot_info(void)
+ {
+ 	preboot_finalize_fw_info();
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+deleted file mode 100644
+index feb6b7a..0000000
+--- a/lib/preboot/module_lkd.c
++++ /dev/null
+@@ -1,647 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <string.h>
+-#include <hl_boot_if.h>
+-#include <baremetal.h>
+-#include <hl_fw_if.h> /* requires baremetal.h for __packed */
+-#include <boot_if.h>
+-#include <boot_info.h>
+-#include <bitops.h>
+-#include <security.h>
+-#include <crc32.h>
+-#include <memory.h>
+-#include <fit_load_type.h>
+-#include <memory.h>
+-#include <hl.h>
+-
+-#include "cmd_module.h"
+-#include "i2cslave_indirect.h"
+-#include "uart.h"
+-#include "fit.h"
+-#include "security.h"
+-
+-struct lkd_status {
+-	struct comms_command cmd;
+-	struct comms_command wfc_cmd;
+-	struct comms_command do_cmd;
+-	enum cmd_check_res exec_res;
+-	unsigned int next_size;
+-	bool is_elbi_desc;
+-	bool is_load_fit;
+-	u32 fit_load_type;
+-};
+-
+-static struct lkd_status sts;
+-
+-void module_lkd_enable(void)
+-{
+-	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_LD_COM_EN);
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
+-}
+-
+-__weak void lkd_dev_specific_setup(void) {}
+-
+-void module_lkd_setup(void)
+-{
+-	lkd_dev_specific_setup();
+-	module_lkd_enable();
+-}
+-
+-static void module_lkd_send_status(enum comms_sts sts,
+-				   enum comms_ram_types ram_type,
+-				   unsigned int offset)
+-{
+-	struct comms_status status;
+-	u32 off = offset >> COMMS_STATUS_OFFSET_ALIGN_SHIFT;
+-
+-	status.val = 0;
+-	status.status = sts;
+-	status.ram_type = ram_type;
+-	status.offset = off & COMMS_STATUS_OFFSET_MASK;
+-	cpu_comms_sts_set(&status);
+-}
+-
+-static bool is_legacy_comms(u32 msg)
+-{
+-	return msg > 0 && msg < KMD_MSG_LAST;
+-}
+-
+-static enum cmd_check_res module_lkd_check_legacy(void)
+-{
+-	preboot_puts("legacy LKD not supported.\n");
+-
+-	/* clear command register */
+-	cpu_boot_cmd_clr_before_wfe();
+-	sts.cmd.val = 0;
+-
+-	return NOT_FOUND;
+-}
+-
+-static int module_lkd_msg_reset_cause(struct lkd_fw_comms_msg *mcomms)
+-{
+-	int err = 1;
+-
+-	switch (mcomms->reset_cause) {
+-	case HL_RESET_CAUSE_HEARTBEAT:
+-		err = oob_set_wd_err(HL_FW_RESET_CAUSE_HEARTBEAT);
+-		break;
+-	case HL_RESET_CAUSE_TDR:
+-		err = oob_set_wd_err(HL_FW_RESET_CAUSE_TDR);
+-		/* no break */
+-	default:
+-		break;
+-	}
+-
+-	return err;
+-}
+-
+-static int module_lkd_msg_eeprom_defaults(struct lkd_fw_comms_msg *mcomms)
+-{
+-	if (preboot_security_is_enabled()) {
+-		preboot_puts("EEPROM defaults are not supported due to security\n");
+-		return -1;
+-	}
+-
+-	preboot_set_eeprom_defaults_en(mcomms->eeprom_defaults_on_err);
+-
+-	return 0;
+-}
+-
+-
+-static int module_lkd_msg_process(struct lkd_fw_comms_msg *mcomms)
+-{
+-	int err = 1;
+-
+-	switch (mcomms->header.type) {
+-	case HL_COMMS_RESET_CAUSE_TYPE:
+-		err = module_lkd_msg_reset_cause(mcomms);
+-		break;
+-	case HL_COMMS_EEPROM_DEFAULTS_TYPE:
+-		err = module_lkd_msg_eeprom_defaults(mcomms);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return err;
+-}
+-
+-static int module_lkd_sram_sf_access(void *fit)
+-{
+-	int err;
+-	const void *data = 0;
+-
+-	err = fit_image_get_loadable_data(fit, &data, sizeof(u32));
+-	if (!err)
+-		err = preboot_set_sram_sf_access(*(u32 *)data);
+-
+-	return err;
+-}
+-
+-static int lkd_get_image_addr(struct mem_desc *desc)
+-{
+-	int err = 0;
+-
+-	if (sts.is_elbi_desc) {
+-		desc->base = preboot_get_elbi_reg_base();
+-		desc->size = preboot_get_elbi_reg_size();
+-	} else {
+-		/*
+-		 * For non-ELBI descriptor, the same SRAM addr is used for both
+-		 * the descriptor and the image.
+-		 */
+-		err = preboot_get_mem_region(MEM_LKD_PCI, desc);
+-	}
+-
+-	return err;
+-}
+-
+-static int module_lkd_run_fast_exec(void)
+-{
+-	struct lkd_fw_comms_msg *mcomms;
+-	struct mem_desc desc;
+-	int err;
+-
+-	err = lkd_get_image_addr(&desc);
+-	if (err)
+-		return err;
+-
+-	if (!sts.is_load_fit) {
+-		mcomms = (struct lkd_fw_comms_msg *)desc.base;
+-
+-		return module_lkd_msg_process(mcomms);
+-	}
+-
+-	switch (sts.fit_load_type) {
+-	case FIT_LOAD_TYPE_SRAM_SF_ACCESS:
+-		err = module_lkd_sram_sf_access((void *)desc.base);
+-		break;
+-	default:
+-		err = 1;
+-	}
+-
+-	return err;
+-}
+-
+-static void module_lkd_reset_state(void)
+-{
+-	sts.exec_res = NOT_FOUND;
+-	sts.next_size = 0;
+-	sts.cmd.val = 0;
+-	sts.wfc_cmd.val = 0;
+-	sts.do_cmd.val = 0;
+-	sts.is_elbi_desc = false;
+-	sts.is_load_fit = false;
+-	sts.fit_load_type = 0;
+-}
+-
+-static void module_lkd_run_fast_noop(void)
+-{
+-	int err;
+-
+-	/* depending on the current state machine, perform action */
+-	switch (sts.do_cmd.cmd) {
+-	case COMMS_NOOP:
+-	case COMMS_CLR_STS:
+-	case COMMS_GOTO_WFE:
+-	case COMMS_SKIP_BMC:
+-	case COMMS_LOW_PLL_OPP:
+-		module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
+-		break;
+-	case COMMS_RST_STATE:
+-		module_lkd_reset_state();
+-		module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
+-		break;
+-	case COMMS_EXEC:
+-		err = module_lkd_run_fast_exec();
+-		if (err)
+-			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+-		else
+-			module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
+-
+-		break;
+-	default:	/* should never get here */
+-		preboot_puts_raw(__func__);
+-		preboot_puts(": default case - err\n");
+-	}
+-}
+-
+-/* NOOP is a sync command, so here we decide what execution type is needed */
+-static enum cmd_check_res module_lkd_check_noop(void)
+-{
+-	enum cmd_check_res res = NOT_FOUND;
+-
+-	/* check the command we got before waiting for sync */
+-	switch (sts.do_cmd.cmd) {
+-	case COMMS_PREP_DESC:
+-	case COMMS_PREP_DESC_ELBI:
+-	case COMMS_DATA_RDY:
+-		res = FOUND_SLOW_RETURN;
+-		break;
+-	case COMMS_EXEC:
+-		res = sts.exec_res;
+-		break;
+-	case COMMS_RST_DEV:
+-		res = FOUND_NO_RETURN;
+-		break;
+-	case COMMS_GOTO_WFE:
+-		if (!preboot_security_is_enabled()) {
+-			res = FOUND_NO_RETURN;
+-			break;
+-		}
+-		/* no break */
+-	case COMMS_NOOP:
+-	case COMMS_CLR_STS:
+-	case COMMS_RST_STATE:
+-	case COMMS_SKIP_BMC:
+-	case COMMS_LOW_PLL_OPP:
+-	default:
+-		res = FOUND_FAST_RETURN;
+-		break;
+-	}
+-
+-	return res;
+-}
+-
+-enum cmd_check_res module_lkd_check(void)
+-{
+-	enum cmd_check_res res = NOT_FOUND;
+-
+-	sts.cmd.val = cpu_boot_cmd_get();
+-	if (is_legacy_comms(sts.cmd.val))
+-		return module_lkd_check_legacy();
+-
+-	if (sts.cmd.cmd == sts.wfc_cmd.cmd)
+-		return NOT_FOUND;
+-
+-	switch (sts.cmd.cmd) {
+-	case COMMS_NOOP:	/* NOOP is a special command */
+-		res = module_lkd_check_noop();
+-		break;
+-	case COMMS_PREP_DESC:
+-	case COMMS_PREP_DESC_ELBI:
+-		sts.exec_res = NOT_FOUND;
+-		sts.next_size = sts.cmd.size;
+-		/* no break */
+-	case COMMS_CLR_STS:
+-	case COMMS_RST_STATE:
+-	case COMMS_DATA_RDY:
+-	case COMMS_EXEC:
+-	case COMMS_RST_DEV:
+-	case COMMS_GOTO_WFE:
+-	case COMMS_SKIP_BMC:
+-	case COMMS_LOW_PLL_OPP:
+-		res = FOUND_FAST_RETURN;
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return res;
+-}
+-
+-void module_lkd_disable(void)
+-{
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+-}
+-
+-static void module_lkd_state_shift(void)
+-{
+-	/* do not shift if got CLR_STS several times */
+-	if (sts.cmd.cmd == COMMS_CLR_STS && sts.wfc_cmd.cmd == COMMS_CLR_STS)
+-		return;
+-
+-	/* CLR_STS should not propagate to do_cmd */
+-	sts.do_cmd.cmd = sts.wfc_cmd.cmd == COMMS_CLR_STS ? COMMS_NOOP : sts.wfc_cmd.cmd;
+-	/* save current command waiting for clear, until handled */
+-	sts.wfc_cmd = sts.cmd;
+-}
+-
+-void module_lkd_run_fast(void)
+-{
+-	const char *cmd_str = NULL;
+-	const char *err_str = NULL;
+-
+-	switch (sts.cmd.cmd) {
+-	case COMMS_NOOP:
+-		cmd_str = "noop";
+-		module_lkd_run_fast_noop();
+-		break;
+-	case COMMS_CLR_STS:
+-		cmd_str = "clr_sts";
+-		/* Clear the status */
+-		module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
+-		break;
+-	case COMMS_RST_STATE:
+-		cmd_str = "rst_state";
+-		/* no break */
+-	case COMMS_PREP_DESC:
+-		cmd_str = cmd_str ?: "prep_desc";
+-		/* no break */
+-	case COMMS_PREP_DESC_ELBI:
+-		cmd_str = cmd_str ?: "prep_desc_elbi";
+-		/* no break */
+-	case COMMS_DATA_RDY:
+-		cmd_str = cmd_str ?: "data_rdy";
+-		/* no break */
+-	case COMMS_RST_DEV:
+-		cmd_str = cmd_str ?: "rst_dev";
+-		module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
+-		/* We ACK the command, but handle only on CLR, so save cmd */
+-		break;
+-	case COMMS_GOTO_WFE:
+-		cmd_str = "wfe";
+-		if (preboot_security_is_enabled()) {
+-			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+-			err_str = "WFE denied - security is enabled...";
+-		} else {
+-			module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
+-		}
+-
+-		break;
+-	case COMMS_EXEC:
+-		cmd_str = "exec";
+-		if (preboot_check_stack_monitor()) {
+-			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+-			err_str = "EXEC denied - critical fw error detected";
+-			sts.exec_res = NOT_FOUND;
+-		} else {
+-			module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
+-		}
+-
+-		break;
+-	case COMMS_SKIP_BMC:
+-		cmd_str = "skip_bmc";
+-		/* no break */
+-	case COMMS_LOW_PLL_OPP:
+-		cmd_str = cmd_str ?: "low_pll_opp";
+-		/* no break */
+-	default:
+-		cmd_str = cmd_str ?: "unknown";
+-		module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+-	}
+-
+-	/* no problem to shift on error, as later we check the validity */
+-	module_lkd_state_shift();
+-
+-	preboot_puts_raw("Got host ");
+-	preboot_puts_raw(cmd_str);
+-	preboot_puts(" command\n");
+-
+-	if (err_str) {
+-		preboot_puts_raw(err_str);
+-		preboot_puts("\n");
+-	}
+-}
+-
+-static int module_lkd_msg_validate(uintptr_t offset)
+-{
+-	struct lkd_fw_comms_msg *mcomms = (struct lkd_fw_comms_msg *)offset;
+-	int err = 1;
+-
+-	if (HL_COMMS_MSG_MAGIC_VALIDATE_MAGIC(mcomms->header.magic)) {
+-		sts.exec_res = FOUND_FAST_RETURN;
+-		err = 0;
+-	}
+-
+-	return err;
+-}
+-
+-static int module_lkd_validate(void)
+-{
+-	int err;
+-	struct mem_desc desc;
+-
+-	preboot_set_sram_sf_access(false);
+-	preboot_security_dynamic_img_sram_close();
+-	preboot_security_dynamic_img_elbi_reg_close();
+-
+-	err = lkd_get_image_addr(&desc);
+-	if (err) {
+-		preboot_puts("LKD: failed requesting memory\n");
+-		return err;
+-	}
+-
+-	err = fit_get_load_type((void *)desc.base, &sts.fit_load_type);
+-	sts.is_load_fit = !err;
+-
+-	if (!sts.is_load_fit) {
+-		/* shared mem doesn't contain fit image. */
+-		err = module_lkd_msg_validate(desc.base);
+-		if (err)
+-			sts.exec_res = NOT_FOUND;
+-
+-		return err;
+-	}
+-
+-	switch (sts.fit_load_type) {
+-	case FIT_LOAD_TYPE_SRAM_SF_ACCESS:
+-		sts.exec_res = FOUND_FAST_RETURN;
+-		break;
+-	case FIT_LOAD_TYPE_RUN:
+-		/* validate if shared memory has fit image */
+-		err = fit_load_images((void *)desc.base);
+-		if (!err)
+-			sts.exec_res = FOUND_NO_RETURN;
+-
+-		break;
+-	default:
+-		preboot_puts("LKD: Unknown FIT load type\n");
+-		err = 1;
+-	}
+-
+-	return err;
+-}
+-
+-static int module_lkd_run_exec(void)
+-{
+-	/* Placeholder - empty for now */
+-
+-	return 1;
+-}
+-
+-__weak void lkd_dev_spec_regs(struct cpu_dyn_regs *regs);
+-
+-__weak u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+-{
+-	return base;
+-}
+-
+-__weak u32 lkd_dev_spec_get_desc_offset(uintptr_t base)
+-{
+-	return (u32)base;
+-}
+-
+-static int module_lkd_prep_desc(int size, u32 *offset)
+-{
+-	struct mem_desc mdesc, img_desc;
+-	struct lkd_fw_comms_desc *cdesc;
+-	int err;
+-	const char *preboot_ver, *fuse_data;
+-	u8 *cdesc_data_off;
+-
+-	preboot_get_mem_region(MEM_LKD_PCI, &mdesc);
+-
+-	err = !preboot_is_valid_address_range(mdesc.base, size);
+-	if (!err && size > mdesc.size)
+-		err = 1;
+-
+-	if (err) {
+-		preboot_puts("Requested size is not supported!\n");
+-		return err;
+-	}
+-
+-	cdesc = (struct lkd_fw_comms_desc *)mdesc.base;
+-	memset(cdesc, 0, sizeof(*cdesc));
+-
+-	lkd_dev_spec_regs(&cdesc->cpu_dyn_regs);
+-	fuse_data = preboot_get_version(PREBOOT_EFUSE_VER);
+-	memcpy(cdesc->fuse_ver, fuse_data, VERSION_MAX_LEN);
+-	preboot_ver = preboot_get_version(PREBOOT_BTL_VER);
+-	memcpy(cdesc->cur_fw_ver, preboot_ver, VERSION_MAX_LEN);
+-
+-	err = lkd_get_image_addr(&img_desc);
+-	if (err)
+-		return err;
+-
+-	cdesc->img_addr = lkd_dev_spec_get_img_addr(img_desc.base);
+-
+-	/* Header */
+-	cdesc->header.magic = HL_COMMS_DESC_MAGIC;
+-	cdesc->header.size = sizeof(*cdesc) - sizeof(cdesc->header);
+-	cdesc->header.version = HL_COMMS_DESC_VER;
+-	cdesc_data_off = (u8 *)cdesc + sizeof(cdesc->header);
+-	cdesc->header.crc32 = crc32(0, cdesc_data_off, cdesc->header.size);
+-
+-	*offset = lkd_dev_spec_get_desc_offset(mdesc.base);
+-
+-	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI, ACCESS_RW);
+-	if (sts.is_elbi_desc)
+-		preboot_security_dynamic_img_elbi_reg_open();
+-
+-	return err;
+-}
+-
+-void module_lkd_run(void)
+-{
+-	int err = 0;
+-	u32 offset = 0;
+-
+-	/* depending on the current state machine, perform action */
+-	switch (sts.do_cmd.cmd) {
+-	case COMMS_PREP_DESC:
+-	case COMMS_PREP_DESC_ELBI:
+-		sts.is_elbi_desc = sts.do_cmd.cmd == COMMS_PREP_DESC_ELBI;
+-		err = module_lkd_prep_desc(sts.next_size, &offset);
+-		if (err)
+-			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+-		else
+-			module_lkd_send_status(COMMS_STS_OK,
+-					       COMMS_SRAM, offset);
+-		break;
+-	case COMMS_DATA_RDY:
+-		err = module_lkd_validate();
+-		if (err)
+-			module_lkd_send_status(COMMS_STS_VALID_ERR,
+-					       COMMS_SRAM, 0);
+-		else
+-			module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
+-
+-		break;
+-	case COMMS_EXEC:
+-		err = module_lkd_run_exec();
+-		if (err)
+-			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+-		else
+-			module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
+-
+-		break;
+-	default:	/* should never get here */
+-		preboot_puts_raw(__func__);
+-		preboot_puts(": default case - err\n");
+-	}
+-
+-	/* no problem to shift here on error as it will only clear the do_cmd */
+-	module_lkd_state_shift();
+-}
+-
+-/* For devices that do not implement RST_DEV command, mimic WFE */
+-__weak void hl_dev_reset(void) { wfe(); }
+-
+-static void module_lkd_run_noret_exec(void)
+-{
+-	/*
+-	 * List of status bits we clear because we do not know if the FW we are
+-	 * loading supports these functionalities
+-	 */
+-	u64 sts_msk = BIT_ULL(CPU_BOOT_DEV_STS_FW_HARD_RST_EN) |
+-		      BIT_ULL(CPU_BOOT_DEV_STS_FW_LD_COM_EN);
+-
+-	/*
+-	 * Some events (like RAZWI or PCI ERR) might appear during boot
+-	 * due to async access from host side to locked range registers (PCI)
+-	 * (i.e. during iatu initlization or reset flow, PCI access is
+-	 * disabled). Therefore this ack is needed.
+-	 */
+-	preboot_ack_irq();
+-
+-	preboot_security_cleanup_before_run();
+-	hl_ts_shutdown();
+-	cpu_boot_dev_sts_clrset(sts_msk, false);
+-
+-	fit_run_image();
+-}
+-
+-__weak void preboot_finalize_nic_en(void) {}
+-
+-static void module_lkd_preserve_sp_info(void)
+-{
+-	preboot_finalize_fw_info();
+-	preboot_finalize_nic_en();
+-	preboot_finalize_fw_upd_closure();
+-	hl_boot_info_finalize();
+-}
+-
+-static void module_lkd_run_noret_reset(void)
+-{
+-	module_lkd_preserve_sp_info();
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
+-	hl_dev_reset();	/* should not return */
+-}
+-
+-static void module_lkd_run_noret_wfe(void)
+-{
+-	module_lkd_preserve_sp_info();
+-
+-	/* Exiting WFE will probably be done by SW reset */
+-	hl_set_reset_cause(HL_SW_ALL_RST);
+-
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
+-	wfe();
+-}
+-
+-void module_lkd_run_noret(void)
+-{
+-	/* we are not returning - clear comms status */
+-	module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
+-
+-	/* depending on the current state machine, perform action */
+-	switch (sts.do_cmd.cmd) {
+-	case COMMS_EXEC:
+-		module_lkd_run_noret_exec();
+-		break;
+-	case COMMS_RST_DEV:
+-		module_lkd_run_noret_reset();
+-		break;
+-	case COMMS_GOTO_WFE:
+-		module_lkd_run_noret_wfe();
+-		break;
+-	default:	/* should never get here */
+-		preboot_puts_raw(__func__);
+-		preboot_puts(": default case - err\n");
+-	}
+-}

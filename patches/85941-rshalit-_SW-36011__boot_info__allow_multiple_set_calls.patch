@@ -1,0 +1,74 @@
+From e4414383962c3f2ca6e33606b4eb397780b3c2c2 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Thu, 01 Apr 2021 13:05:53 +0300
+Subject: [PATCH] [SW-36011] boot_info: allow multiple set calls
+
+Allow boot_info set to be called multiple times during
+preboot runtime. If already exist then the same pointer
+is used. Otherwise - a new boot descriptor is added.
+This is required to allow multiple set operations off
+the same boot descriptor.
+As this is not restricted, on loading NIC enable fit can be
+done multiple times, and therefore shall result in multiple
+call for setting the same boot descriptor.
+
+Change-Id: I32ea2163d08ce5f46cd34d8caddb6b5bfe288742
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/preboot/boot_info.c b/preboot/boot_info.c
+index 24c125c..db903b9 100644
+--- a/preboot/boot_info.c
++++ b/preboot/boot_info.c
+@@ -41,15 +41,15 @@
+ 	return (u32)((uintptr_t)ptr) - base;
+ }
+ 
+-static bool boot_info_type_is_exists(u32 type)
++static struct hl_boot_info_desc *boot_info_get_desc(u32 type)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < boot_info.ptrs.count; i++)
+ 		if (boot_info.descs[i].type == type)
+-			return true;
++			return &boot_info.descs[i];
+ 
+-	return false;
++	return NULL;
+ }
+ 
+ void boot_info_finalize(void)
+@@ -120,23 +120,22 @@
+ {
+ 	struct hl_boot_info_desc *desc;
+ 
+-	if (boot_info.ptrs.count >= MAX_INFO_DESCS) {
+-		preboot_puts_hex("No room to store boot info type: ", type, 0);
+-		return 1;
++	desc = boot_info_get_desc(type);
++	if (!desc) {
++		if (boot_info.ptrs.count >= MAX_INFO_DESCS) {
++			preboot_puts_hex("reached max desc count ", type, 0);
++			return 1;
++		}
++
++		desc = &boot_info.descs[boot_info.ptrs.count];
++		boot_info.ptrs.count++;
+ 	}
+ 
+-	if (boot_info_type_is_exists(type)) {
+-		preboot_puts_hex("Boot info type already exists: ", type, 0);
+-		return 1;
+-	}
+-
+-	desc = &boot_info.descs[boot_info.ptrs.count];
+ 	desc->type = type;
+ 	desc->size = size;
+ 	desc->magic = HL_BOOT_INFO_DESC_MAGIC | type;
+ 	/* Store offset relative to preboot text */
+ 	desc->offset = ptr2offset(data, PREBOOT_TEXT_BASE);
+-	boot_info.ptrs.count++;
+ 
+ 	return 0;
+ }

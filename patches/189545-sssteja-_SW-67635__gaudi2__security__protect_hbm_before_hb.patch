@@ -1,0 +1,91 @@
+From 22b8263015914ea4802a94a20e3e083ed46d852d Mon Sep 17 00:00:00 2001
+From: Sai Surya Teja <sssteja@habana.ai>
+Date: Wed, 16 Mar 2022 05:58:45 +0200
+Subject: [PATCH] [SW-67635] gaudi2: security: protect hbm before hbm init in early ppboot
+
+This patch configures HMMU to block HBM in the ppboot security.
+This is needed as host can crash when a malicious user tries to access
+HBM after link up and before HBM init.
+
+Change-Id: Ifd6ebb4dbec02b11f75786d659c4f00a284633a2
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 7142e7d..0ec4eb7 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -51,6 +51,9 @@
+ #include <psoc_cs_trace_regs.h>
+ #include <arc_farm_arc0_aux_regs.h>
+ #include <arc_farm_arc0_dccm0_regs.h>
++#include <psoc_global_conf_regs.h>
++#include <dcore0_hmmu0_mmu_regs.h>
++#include <dcore0_hmmu0_mmu_masks.h>
+ #include <pll.h>
+ #include "common.h"
+ 
+@@ -137,6 +140,16 @@
+ 		.hit_wr_breg = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AW,
+ 		.hit_rd_breg = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
+ 	},
++};
++
++static struct hl_sec_cfg_hmmu hmmu_cfg = {
++	.instances_num = HL_SEC_HBW_HMMU_INST_NUM,
++	.instances_dist = HL_SEC_HBW_HMMU_DIST,
++	.min_lo = mmDCORE0_HMMU0_MMU_MMU_RR_PRIV_MIN_31_0_0,
++	.min_hi = mmDCORE0_HMMU0_MMU_MMU_RR_PRIV_MIN_63_32_0,
++	.max_lo = mmDCORE0_HMMU0_MMU_MMU_RR_PRIV_MAX_31_0_0,
++	.max_hi = mmDCORE0_HMMU0_MMU_MMU_RR_PRIV_MAX_63_32_0,
++	.rr_en = mmDCORE0_HMMU0_MMU_DDR_RANGE_REG_ENABLE,
+ };
+ 
+ #define SRAM_END	(SRAM_BASE_ADDR + SRAM_SIZE)
+@@ -955,6 +968,39 @@
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, min, max, rr_sel);
+ }
+ 
++#define HL_REGS_DATA_MASK	DCORE0_HMMU0_MMU_MMU_RR_PRIV_MIN_31_0_PRIV_MIN_31_0_MASK
++#define HMMU_RR_EN		DCORE0_HMMU0_MMU_DDR_RANGE_REG_ENABLE_ENABLE_MASK
++static void ppboot_secure_hbm(void)
++{
++	int dcore, hmmu;
++	uint32_t data_min, data_max;
++	uint64_t base, offset;
++
++	/*
++	 * Remove hmmu and xbar isolation before accessing hmmu registers
++	 * Note: Later these isolation registers are re-configured in preboot
++	 * binning and isolation logic based on efuse.
++	 */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_HIF_HMMU_ISO);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_XBAR_EDGE_ISO);
++
++	/* Protect max possible range (0x0 - 0xFFFFFFFFFFFFFFFF) by HMMU */
++	data_min = 0;
++	data_max = HL_REGS_DATA_MASK;
++
++	for (dcore = 0; dcore < HL_SEC_NUM_OF_DCORES; dcore++) {
++		base = dcore * HL_SEC_HMMU_DIST;
++		for (hmmu = 0; hmmu < hmmu_cfg.instances_num; hmmu++) {
++			offset = base + (hmmu * hmmu_cfg.instances_dist);
++			regmap_writel(data_min, offset + hmmu_cfg.min_lo);
++			regmap_writel(data_min, offset + hmmu_cfg.min_hi);
++			regmap_writel(data_max, offset + hmmu_cfg.max_lo);
++			regmap_writel(data_max, offset + hmmu_cfg.max_hi);
++			regmap_writel(HMMU_RR_EN, offset + hmmu_cfg.rr_en);
++		}
++	}
++}
++
+ static void ppboot_secure_hbw(void)
+ {
+ 	struct hl_rr_eng_select rr_sel;
+@@ -1137,6 +1183,7 @@
+ void ppboot_security_init(void)
+ {
+ 	ppboot_secure_elbi();
++	ppboot_secure_hbm();
+ 
+ 	if (!preboot_security_is_enabled())
+ 		return;

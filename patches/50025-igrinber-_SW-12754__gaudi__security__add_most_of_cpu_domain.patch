@@ -1,0 +1,163 @@
+From 305a6afd8b9a8e05d646c9f6f767354b895ca36f Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 04 Sep 2020 12:31:40 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: add most of cpu domain
+
+Implement CPU protection with "protection bits".
+The RRs protection will be added in a separate commits - thus this is a
+partial protection of the CPU domain.
+
+Note: there is one register which is left open for the integration to go
+more smoothly and it has a TODO comment with it for removal after the
+actual code handling it is merged.
+
+Change-Id: I4a79806c347e6e892531416089f3bff2215e99e3
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 9e5e5a7..8b46562 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -8,9 +8,13 @@
+ #include <stdbool.h>
+ 
+ #include <gaudi_blocks.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <cpu_if_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <sif_rtr_ctrl_7_regs.h>
+ #include <psoc_global_conf_regs.h>
++
++#include <cpu_if_masks.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
+@@ -20,6 +24,35 @@
+ #include <efuse.h>
+ #include <gaudi/gaudi_security.h>
+ #include <spi.h>
++
++#define PROT_REGS_COUNT		32
++#define PROT_REGS_MAX		(PROT_REGS_COUNT - 1) /* Secure config -> LKD */
++#define BITS_IN_REG		32
++#define SNGL_REG_PROT_SIZE	(BITS_IN_REG * sizeof(u32))
++#define PROT_SIZE_MAX		(PROT_REGS_MAX * SNGL_REG_PROT_SIZE)
++
++/*
++ * Protection register calculation:
++ *
++ * prot_reg_base = (reg & 0xFFF000) + (secure_or_priv ? 0xE80 : 0xF80)
++ * prot_reg_offset = (reg & 0xF80) / 32
++ * prot_offset = prot_reg_base + prot_reg_offset
++ *
++ * Protection value (bit) calculation:
++ *
++ * val = ~(1 << ((reg & 0x7F) / 4))
++ */
++
++/* Protection bits helpers */
++#define PROT_REG_BASE(x, off)	(((x) & 0xFFF000) + (off))
++#define PROT_REG_OFF(x)		(((x) & 0xF80) / 32)
++#define PRIV_PROT_REG(x)	(PROT_REG_BASE((x), 0xE80) + PROT_REG_OFF(x))
++#define SEC_PROT_REG(x)		(PROT_REG_BASE((x), 0xF80) + PROT_REG_OFF(x))
++#define PROT_BIT(x)		(~(1 << (((x) & 0x7F) / 4)))
++
++#define PROT_OVR_SECURE		0
++#define PROT_OVR_PRIV		BIT(0)
++#define PROT_OVR_USER		BIT(1)
+ 
+ struct preboot_security_efuse_cache {
+ 	bool is_invalid;
+@@ -124,6 +157,71 @@
+ 	return !!fuse->security_enable;
+ }
+ 
++static void set_prot_bits_range_all(u32 base, int size)
++{
++	int i, count = size / SNGL_REG_PROT_SIZE;
++	u32 prot_base;
++
++	for (i = 0; i < count; i++) {
++		/* each write protects 32 registers starting from prot_base */
++		prot_base = base + i * SNGL_REG_PROT_SIZE;
++		regmap_writel(0, PRIV_PROT_REG(prot_base));
++	}
++}
++
++static void preboot_secure_cpu(void)
++{
++	u32 prot_base, base = mmCPU_CA53_CFG_BASE & ~HL_CFG_BASE;
++	u32 mask;
++
++	/* Set CPU level to privilege */
++	mask = CPU_IF_PROT_OVR_WR_EN_MASK |
++		CPU_IF_PROT_OVR_RD_EN_MASK |
++		BIT(CPU_IF_PROT_OVR_READ_SHIFT) |
++		BIT(CPU_IF_PROT_OVR_WRITE_SHIFT);
++	regmap_writel(mask, mmCPU_IF_PROT_OVR);
++
++	/* Protect CPU_CA53_CFG - 4K */
++	set_prot_bits_range_all(base, PROT_SIZE_MAX);
++
++	/* Protect CPU_IF */
++	base = mmCPU_IF_BASE & ~HL_CFG_BASE;	/* offsets: 0 - 0x100 */
++	set_prot_bits_range_all(base, SNGL_REG_PROT_SIZE * 2);
++
++	/*
++	 * TODO: this is a temporary open register until the LKD and ARMCP code
++	 * handling this register is merged. Then we can remove this.
++	 */
++	prot_base = base + SNGL_REG_PROT_SIZE * 2; /* offsets: 0x100 - 0x180 */
++	mask = ~PROT_BIT(mmCPU_IF_CPU_MSB_ADDR);
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	prot_base += SNGL_REG_PROT_SIZE;	/*  offsets: 0x180 - 0x200 */
++	set_prot_bits_range_all(prot_base, SNGL_REG_PROT_SIZE);
++
++	prot_base += SNGL_REG_PROT_SIZE; /* offsets: 0x200 - 0x280 */
++	mask = ~(PROT_BIT(mmCPU_IF_PF_PQ_PI) &
++		PROT_BIT(mmCPU_IF_PQ_BASE_ADDR_LOW) &
++		PROT_BIT(mmCPU_IF_PQ_BASE_ADDR_HIGH) &
++		PROT_BIT(mmCPU_IF_PQ_LENGTH) &
++		PROT_BIT(mmCPU_IF_CQ_BASE_ADDR_LOW) &
++		PROT_BIT(mmCPU_IF_CQ_BASE_ADDR_HIGH) &
++		PROT_BIT(mmCPU_IF_CQ_LENGTH) &
++		PROT_BIT(mmCPU_IF_EQ_BASE_ADDR_LOW) &
++		PROT_BIT(mmCPU_IF_EQ_BASE_ADDR_HIGH) &
++		PROT_BIT(mmCPU_IF_EQ_LENGTH) &
++		PROT_BIT(mmCPU_IF_EQ_RD_OFFS) &
++		PROT_BIT(mmCPU_IF_QUEUE_INIT));
++	/* allow only secured access */
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x280 - 0xF80 */
++	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX - (prot_base - base));
++
++	/* Protect CPU_TIMESTAMP - 4K */
++	/* TODO: use RRs for CPU_TIMESTAMP protection */
++}
++
+ static void preboot_security_pci_disable(void)
+ {
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
+@@ -150,6 +248,7 @@
+ void preboot_security_init(void)
+ {
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, true);
++	preboot_puts("Security init started...\n");
+ 
+ 	if (preboot_security_is_enabled()) {
+ 		preboot_puts("Security is enabled\n");
+@@ -168,7 +267,10 @@
+ 	preboot_puts("Disabling security temporarily till all implemented\n");
+ 	preboot_security_pci_disable();
+ 
+-	/* TODO: implement security enablement */
++	preboot_secure_cpu();
++
++	/* TODO: implement the rest of security enablement */
+ 
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, false);
++	preboot_puts("Security init finished.\n");
+ }

@@ -1,0 +1,98 @@
+From 88642eeea26f6a50cd0e8a6ce5cd64b538b851d4 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 26 Jul 2021 11:29:22 +0300
+Subject: [PATCH] [SW-50309] gaudi: pci: block only mem access during iatu init
+
+During iATU initialization we are disabling pci access to eliminate
+any interfering in the process.
+Blocking configuration space access is against the spec and in fact
+causing hosts to crash in some scenrios like VM loading.
+Therefore, from now on only memory access is disabled during iATU
+initialization.
+
+Change-Id: I2f539756722f59a3731192e20b9b0a25343a1142
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi/arm/asic.c b/arch/gaudi/arm/asic.c
+index ee2c3e4..40f59c8 100644
+--- a/arch/gaudi/arm/asic.c
++++ b/arch/gaudi/arm/asic.c
+@@ -384,7 +384,7 @@
+ 	struct hl_pci_inbound_region inbound_region;
+ 	struct hl_pci_outbound_region outbound_region;
+ 
+-	hl_pcie_disable_access();
++	hl_pcie_disable_mem_access();
+ 
+ 	/* Inbound Region 0 - Bar 0 - Point to SRAM + CFG */
+ 	inbound_region.mode = PCI_BAR_MATCH_MODE;
+@@ -421,7 +421,7 @@
+ 	outbound_region.size = HOST_PHYS_SIZE;
+ 	hl_pci_set_outbound_region(&outbound_region);
+ 
+-	hl_pcie_enable_access();
++	hl_pcie_enable_mem_access();
+ }
+ 
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index 3d38570..cbaad5b 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -269,10 +269,15 @@
+  */
+ void hl_pcie_disable_access(void)
+ {
+-	u32 reg;
+-
+ 	/* Disable the ELBI access */
+ 	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++
++	hl_pcie_disable_mem_access();
++}
++
++void hl_pcie_disable_mem_access(void)
++{
++	u32 reg;
+ 
+ 	/* Disable the PCIe inbound memory requests */
+ 	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+@@ -282,16 +287,22 @@
+ 
+ void hl_pcie_enable_access(void)
+ {
+-	u32 reg;
+-
+ 	/* Enable the ELBI access */
+ 	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
++
++	hl_pcie_enable_mem_access();
++}
++
++void hl_pcie_enable_mem_access(void)
++{
++	u32 reg;
+ 
+ 	/* Enable the PCIe inbound memory requests */
+ 	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+ 	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+ 	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+ }
++
+ static void preboot_pcie_monitoring(void)
+ {
+ 	/* Wait for PRSTn */
+diff --git a/include/preboot.h b/include/preboot.h
+index fb9c048..668f7f9 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -185,6 +185,8 @@
+ bool hl_pci_link_is_up(void);
+ void hl_pcie_enable_access(void);
+ void hl_pcie_disable_access(void);
++void hl_pcie_enable_mem_access(void);
++void hl_pcie_disable_mem_access(void);
+ 
+ void preboot_finalize_fw_info(void);
+ void preboot_finalize_nic_en(void);

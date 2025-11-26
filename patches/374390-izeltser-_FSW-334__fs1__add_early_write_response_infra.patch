@@ -1,0 +1,102 @@
+From cd1f4154787f121bf74df25876e6b4023b06f783 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 29 Nov 2023 13:55:52 +0200
+Subject: [PATCH] [FSW-334] fs1: add early write response infra
+
+LBW Early write response is enabled for MNG Arc for more efficient
+writes access to the configuration space. Also a macro for waiting
+for writes in flight is added (write barrier).
+
+Change-Id: Idfcb3947c9b5818935e8a207d9b23db981a5c0f8
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index ec86362..79090c2 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -16,12 +16,17 @@
+ #include <pll_ctrl_regs.h>
+ #include <cxl_ep_cfg_pcie_wrap_regs.h>
+ #include <cxl_ep_cfg_pcie_wrap_masks.h>
++#include <psoc_arc_wrap_local_regs.h>
++#include <psoc_arc_wrap_local_masks.h>
++#include <psoc_arc_wrap_arc_regs.h>
++#include <pcie_arc_pcie_arc_regs.h>
+ #include <fs1_blocks_linux_driver.h>
+ 
+ #include <baremetal.h>
+ #include <bitops.h>
+ #include <device.h>
+ #include <fs1_reg_map.h>
++#include <fs1_fw_if.h>
+ #include "common.h"
+ 
+ u32 hl_pll_timestamp_base_get(void)
+@@ -186,9 +191,38 @@
+ 	/* TODO: add proper vuart registers */
+ }
+ 
++#define EARLY_WRITE_RESP_MASK	(								\
++			PSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2_FORCE_WR_BUF_M |		\
++			1 << PSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2_AWCACHE_OVRD_EN_S |	\
++			1 << PSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2_ARCACHE_OVRD_EN_S)
++
++static void hl_lbw_early_write_resp_enable(void)
++{
++	u32 axi_split_val, val;
++
++	axi_split_val = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_ARC_MNG_LOCAL_BASE +
++				     mmPSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2);
++	val = axi_split_val | EARLY_WRITE_RESP_MASK;
++	regmap_writel(val, mmIO_0_CFG_HALF_0_PSOC_ARC_MNG_LOCAL_BASE +
++			   mmPSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2);
++}
++
++static void hl_init_cpu_ids(void)
++{
++	regmap_writel(IO0_PSOC_ARC_RST_ID, mmIO_0_CFG_HALF_0_PSOC_ARC_RST_ARC_BASE +
++					   mmPSOC_ARC_WRAP_ARC_ARC_NUM);
++	regmap_writel(IO0_PSOC_ARC_PID_ID, mmIO_0_CFG_HALF_0_PSOC_ARC_PID_ARC_BASE +
++					   mmPSOC_ARC_WRAP_ARC_ARC_NUM);
++	regmap_writel(IO0_PSOC_ARC_MISC_ID, mmIO_0_CFG_HALF_0_PSOC_ARC_MISC_ARC_BASE +
++					    mmPSOC_ARC_WRAP_ARC_ARC_NUM);
++	regmap_writel(IO0_PCIE_ARC_CXL_ID, mmIO_0_CFG_HALF_1_CXL_EP_PIF_ARC_CFG_PCIE_ARC_BASE +
++					   mmPCIE_ARC_PCIE_ARC_ARC_NUM);
++}
++
+ void hl_plat_early_init(void)
+ {
+-	/* TODO: add early inits such as drain, early response, cpu IDs, etc */
++	hl_init_cpu_ids();
++	hl_lbw_early_write_resp_enable();
+ }
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index b1d5abd..1781af6 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -20,4 +20,22 @@
+ #define HL_PLL_DIV_SEL		0x50
+ #define HL_PLL_DIV_EN		0x60
+ 
++#define HL_W_BARRIER_TIMEOUT_US	100000
++#define HL_MNG_W_BARRIER()									\
++({												\
++	u32 __val, __addr;									\
++	int err;										\
++												\
++	__addr = mmIO_0_CFG_HALF_0_PSOC_ARC_MNG_LOCAL_BASE +					\
++		 mmPSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2;					\
++	err = readl_poll_timeout(__addr,							\
++			__val,									\
++			__val & PSOC_ARC_WRAP_LOCAL_ARC_LBU_AXI_SPLIT_CTRL2_NO_WR_INFLIGHT_M,	\
++			HL_W_BARRIER_TIMEOUT_US);						\
++	if (err)										\
++		preboot_puts("HL_MNG_W_BARRIER timeout");					\
++												\
++	err;											\
++})
++
+ #endif /* ARCH_FS1_ARC_HL_H_ */

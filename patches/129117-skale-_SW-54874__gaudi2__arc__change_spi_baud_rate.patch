@@ -1,0 +1,75 @@
+From f79e86e318d97bb35f0f2907053c13966c58cb53 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 14 Sep 2021 10:21:51 +0300
+Subject: [PATCH] [SW-54874] gaudi2: arc: change spi baud rate
+
+Currently for secureboot, preboot image is copied to SRAM using
+SPI DMA. However with default baud rate of SPI DMA set to 0x2,
+overruns are observed as the data read from SPI is faster compared
+to data write to SRAM due to which copied SRAM preboot image does
+not match with SPI preboot image. To overcome this issue, this
+patch change the baud rate of SPI DMA to 0x4 before DMA to SRAM
+and restore it to default value once DMA is completed.
+
+HW Errata: GAUDI2_0307
+
+Change-Id: Ia2d0cc2de1f229e0450f7e9521b20cea73e093cd
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 464ac07..6ed11dd 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -242,9 +242,29 @@
+ 	return PREBOOT_TEXT_BASE;
+ }
+ 
++__weak void set_spi_dma_br(u16 value)
++{
++	regmap_writel(value, mmPSOC_GLOBAL_CONF_SPI_DMA_BAUDR);
++}
++
+ bool ppboot_load_preboot_img(u64 *loadaddr)
+ {
++	/*
++	 * Preboot is copied and executed from SRAM.
++	 * With default baudrate for SPI DMA set to 0x2, it is
++	 * observed that SRAM content doesn't matched with SPI
++	 * content due to possibility of data overrun observed in
++	 * SPI controller. To overcome the issue, change baudrate for
++	 * SPI DMA to 0x4 before SPI DMA and restore to default
++	 * value after DMA is completed
++	 * HW Errata: GAUDI2_0307
++	 *
++	 * This workaround is not needed for onix as SRAM is carved
++	 * out of HBM region.
++	 */
++	set_spi_dma_br(SPI_DMA_BAUDR_SRAM_DMA);
+ 	*loadaddr = copy_preboot();
++	set_spi_dma_br(SPI_DMA_BAUDR_DEFAULT);
+ 	return true;
+ }
+ 
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index 8aa141b..7df71d3 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -73,6 +73,9 @@
+ 
+ #define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ 
++#define SPI_DMA_BAUDR_DEFAULT	0x2
++#define SPI_DMA_BAUDR_SRAM_DMA	0x4
++
+ #ifndef __ASSEMBLY__
+ void init_secondary(void);
+ extern void secondary_entry(void);
+diff --git a/arch/gaudi2/arc/onix.c b/arch/gaudi2/arc/onix.c
+index 64914e9..50a5fec 100644
+--- a/arch/gaudi2/arc/onix.c
++++ b/arch/gaudi2/arc/onix.c
+@@ -41,3 +41,4 @@
+ }
+ 
+ void preboot_init_pcie_phy(void) {}
++void set_spi_dma_br(u16 value) {}

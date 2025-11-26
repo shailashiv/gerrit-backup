@@ -1,0 +1,109 @@
+From fb1e30e098a77128d1dd00d146bc6a827f467744 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 06 Aug 2020 12:42:54 +0300
+Subject: [PATCH] [SW-16674] recovery: add uart, i2c module support
+
+This patch adds uart and i2c slave module support as part of
+recovery image. recovery image is expected to support minimal
+NVMe MI commands (firmware update and security status).
+
+Change-Id: If5441071b1c052ed3927772334b0fdb87b0189a0
+---
+
+diff --git a/recovery/Makefile b/recovery/Makefile
+index 3b4ebd2..34764e8 100644
+--- a/recovery/Makefile
++++ b/recovery/Makefile
+@@ -1,6 +1,7 @@
+ CC = $(CROSS_COMPILE)gcc
+ OBJCOPY = $(CROSS_COMPILE)objcopy
+ SPECS_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++CFLAGS += -I$(dir $(BR2_EXTERNAL))/embedded/specs
+ CFLAGS += -I$(dir $(BR2_EXTERNAL))/specs/$(SPECS_DEV)/asic_reg
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c
+@@ -15,6 +16,9 @@
+ LDLIBS := -lgcc
+ 
+ RECOVERY_SRCS_C := $(shell ls *.c)
++RECOVERY_SRCS_C += $(shell ls ../common/*.c)
++RECOVERY_SRCS_C += $(shell ls ../$(HL_DEV)/common.c)
++RECOVERY_SRCS_C += $(shell ls ../$(HL_DEV)/$(HL_TARGET).c)
+ RECOVERY_APP_S := $(shell ls crt0_recovery.S)
+ 
+ RECOVERY_OBJECTS := $(RECOVERY_SRCS_C:.c=.o)
+diff --git a/recovery/module_i2c_slave.c b/recovery/module_i2c_slave.c
+new file mode 100644
+index 0000000..0151dc3
+--- /dev/null
++++ b/recovery/module_i2c_slave.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * (C) Copyright 2020 HabanaLabs, Ltd.
++ * All rights reserved.
++ *
++ */
++
++#include <preboot.h>
++#include <hl_i2c_slave_events.h>
++
++#include "module_i2c_slave.h"
++
++int i2cslave_handle_read_req(struct module_i2c_data *data)
++{
++	int ret;
++
++	switch (data->cmd) {
++	case HL_FW_UPDATE_CMD_CODE:
++		ret = HL_FW_UPDATE_CMD_LEN;
++		break;
++	case HL_FW_UPDATE_CONTROL:
++		ret = 0;
++		break;
++	default:
++		/* NA */
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
+diff --git a/recovery/recovery.c b/recovery/recovery.c
+index 1bcb430..5a9688b 100644
+--- a/recovery/recovery.c
++++ b/recovery/recovery.c
+@@ -5,8 +5,31 @@
+  *
+  */
+ 
++#include <stddef.h>
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "pll.h"
++
++static struct cmd_module_ops cmd_ops[] = {
++	{	/* I2C SLAVE module */
++		.setup = module_i2c_s_setup,
++		.check = module_i2c_s_check,
++		.disable = module_i2c_s_disable,
++		.run = noop,
++		.enable = module_i2c_s_setup,
++		.run_fast = module_i2c_s_run_fast,
++		.teardown = module_i2c_s_teardown,
++		.run_noreturn = noop,
++	},
++};
++
+ void recovery_main(void)
+ {
+-	while (1)
+-		;
++
++	udelay_init();
++	hl_uart_init();
++
++	/* Handle commands */
++	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }

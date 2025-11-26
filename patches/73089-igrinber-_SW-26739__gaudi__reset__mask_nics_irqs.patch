@@ -1,0 +1,90 @@
+From f2e8752b6845fd08b1621211e651cf9554cbafd2 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 28 Jan 2021 17:53:24 +0200
+Subject: [PATCH] [SW-26739] gaudi: reset: mask nics irqs
+
+When a device is going to perform reset, we no longer interested
+in receiving the interrupts from NICs. In fact they are just
+interrupting the regular reset flow.
+Disable the NICs interrupts the first thing in handling the reset flow.
+
+Change-Id: I303fe9871b6ed703ffabe18a12d4b220b0d60a85
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/reset.c b/gaudi/reset.c
+index 9f1356a..6e0857a 100644
+--- a/gaudi/reset.c
++++ b/gaudi/reset.c
+@@ -11,10 +11,13 @@
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <nic0_rxb_regs.h>
++#include <nic0_rxe0_regs.h>
+ #include <nic0_qpc0_regs.h>
+ #include <nic0_qm0_regs.h>
+ #include <nic0_qm1_regs.h>
+ #include <nic0_txe0_regs.h>
++#include <nic0_txs0_regs.h>
++#include <nic0_tmr_regs.h>
+ #include <dma0_core_regs.h>
+ #include <dma1_core_regs.h>
+ #include <dma2_core_regs.h>
+@@ -108,6 +111,49 @@
+ #define UNIT_RST_H_MSK		(UNIT_RST_H_MME_MSK | UNIT_RST_H_NIC_MSK |     \
+ 				 UNIT_RST_H_DMA_MSK | UNIT_RST_H_SM_MSK)
+ 
++static void gaudi_mask_nics_ints(void)
++{
++	int i, j;
++	u32 reg, base, eng_base;
++
++	for (i = 0; i < GAUDI_NICS_NUM; i++) {
++		base = GAUDI_NICS_DIST * i;
++		for (j = 0; j < GAUDI_NIC_ENGS_IN_NIC; j++) {
++			eng_base = base + GAUDI_NIC_ENGS_DIST * j;
++
++			reg = eng_base + mmNIC0_QPC0_INTERRUPT_MASK;
++			regmap_writel(0, reg);
++
++			reg = eng_base + mmNIC0_QPC0_INTRRRUPT_RESP_ERR_MASK;
++			regmap_writel(0, reg);
++
++			reg = eng_base + mmNIC0_RXE0_CQ_CFG0;
++			regmap_writel(0, reg);
++
++			reg = eng_base + mmNIC0_RXE0_SPI_MASK;
++			regmap_writel(0xFFFFFFFF, reg);
++
++			reg = eng_base + mmNIC0_RXE0_SEI_MASK;
++			regmap_writel(0x7, reg);
++
++			reg = eng_base + mmNIC0_RXE0_MSI_CASUE_MASK;
++			regmap_writel(0, reg);
++
++			reg = eng_base + mmNIC0_TXE0_INTERRUPT_MASK;
++			regmap_writel(0, reg);
++
++			reg = eng_base + mmNIC0_TXS0_INTERRUPT_MASK;
++			regmap_writel(0, reg);
++		}
++
++		reg = base + mmNIC0_RXB_DBG_SEI_INTR;
++		regmap_writel(0x4, reg);
++
++		reg = base + mmNIC0_TMR_INTERRUPT_MASK;
++		regmap_writel(0, reg);
++	}
++}
++
+ static void gaudi_nics_rxb_drop_reset(void)
+ {
+ 	int i, j;
+@@ -162,6 +208,7 @@
+ 
+ static void gaudi_nics_handle(void)
+ {
++	gaudi_mask_nics_ints();
+ 	gaudi_nics_rxb_drop_reset();
+ 	gaudi_nics_txe_read_choke();
+ 	gaudi_nics_qpcs_disable();

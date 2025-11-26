@@ -1,0 +1,164 @@
+From ed1ebe19c0d3cebfcad4b06284cecd81a1223b97 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 10 May 2021 17:03:39 +0300
+Subject: [PATCH] [SW-25959] greco: arc: add firmware hard reset support
+
+Add FW hard reset sequence flow to fix the rare bug when a transaction
+is stuck in the PCIE_IF and prevents the chip from normal execution
+after the reset.
+
+As a part of the new reset flow the PCIe is closed for accesses in both,
+the memory space access and the ELBI access. Therefore the new reset
+sequence depends on the fact that after the reset Ppboot knows to open
+the PCIe for requests.
+
+Note that hard reset by firmware is not enabled, it will be enabled
+once LKD adds hard reset by firmware support for greco.
+
+Change-Id: Icdbb4d256c99cb7e76255d1f78c2f61d705a1174
+---
+
+diff --git a/greco_arc/common.c b/greco_arc/common.c
+index 1ea8640..bbf7c8d 100644
+--- a/greco_arc/common.c
++++ b/greco_arc/common.c
+@@ -388,3 +388,35 @@
+ 
+ 	return PREBOOT_TEXT_BASE;
+ }
++
++/*
++ * This function makes sure no access is done from host to the SoC's PCIe IF.
++ * The inbound memory requests are disabled. The ELBI access gets "retry"
++ * response. All channels provide responses to the host and PCIe
++ * link will not break.
++ */
++void hl_pcie_disable_access(void)
++{
++	u32 reg;
++
++	/* Disable the ELBI access */
++	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Disable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg &= ~BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
++
++void hl_pcie_enable_access(void)
++{
++	u32 reg;
++
++	/* Enable the ELBI access */
++	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Enable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
+diff --git a/greco_arc_gnu/Makefile b/greco_arc_gnu/Makefile
+index 31c01e0..f07a293 100644
+--- a/greco_arc_gnu/Makefile
++++ b/greco_arc_gnu/Makefile
+@@ -3,3 +3,4 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/pll.c)
+ PREBOOT_SRCS_C += $(shell ls preboot/thermal_v2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/security.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/reset.c)
+diff --git a/greco_arc_gnu/common.c b/greco_arc_gnu/common.c
+index 9baf372..5d73a22 100644
+--- a/greco_arc_gnu/common.c
++++ b/greco_arc_gnu/common.c
+@@ -18,6 +18,7 @@
+ #include <pcie_wrap_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
+ 
+@@ -252,3 +253,35 @@
+ 	memcpy(hl_ts_data, greco_hl_ts_data,
+ 			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+ }
++
++/*
++ * This function makes sure no access is done from host to the SoC's PCIe IF.
++ * The inbound memory requests are disabled. The ELBI access gets "retry"
++ * response. All channels provide responses to the host and PCIe
++ * link will not break.
++ */
++void hl_pcie_disable_access(void)
++{
++	u32 reg;
++
++	/* Disable the ELBI access */
++	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Disable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg &= ~BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
++
++void hl_pcie_enable_access(void)
++{
++	u32 reg;
++
++	/* Enable the ELBI access */
++	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Enable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
+diff --git a/greco_arc_gnu/reset.c b/greco_arc_gnu/reset.c
+new file mode 100644
+index 0000000..cd9e761
+--- /dev/null
++++ b/greco_arc_gnu/reset.c
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
++
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include "common.h"
++
++#define SW_ALL_RST_L_MSK		0xC00FF8F2
++#define SW_ALL_RST_M_MSK		0xFFFFFFFF
++#define SW_ALL_RST_H_MSK		0x7FFFFF
++
++static void greco_hw_fini(void)
++{
++	/* Restart BTL/BLR upon hard-reset */
++	regmap_writel(0x770, mmPSOC_GLOBAL_CONF_BOOT_SEQ_RE_START);
++
++	udelay(1000);
++
++	regmap_writel(SW_ALL_RST_L_MSK, mmPSOC_GLOBAL_CONF_SW_ALL_RST_CFG_L);
++	regmap_writel(SW_ALL_RST_M_MSK, mmPSOC_GLOBAL_CONF_SW_ALL_RST_CFG_M);
++	regmap_writel(SW_ALL_RST_H_MSK, mmPSOC_GLOBAL_CONF_SW_ALL_RST_CFG_H);
++
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_SW_ALL_RST);
++}
++
++void hl_dev_reset(void)
++{
++	hl_pcie_disable_access();
++
++	greco_hw_fini();
++	wfe();
++}

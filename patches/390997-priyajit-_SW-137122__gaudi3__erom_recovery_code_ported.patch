@@ -1,0 +1,93 @@
+From 7e7ed3944b9b581d6122ec7e51e1307492b0f5a4 Mon Sep 17 00:00:00 2001
+From: Priyajit Ghosh <prghosh@habana.ai>
+Date: Wed, 31 Jan 2024 20:34:17 +0200
+Subject: [PATCH] [SW-137122] gaudi3: erom_recovery code ported
+
+Ported code from gaudi2 for erom recovery.
+These code will update firmware when code flow
+stuck in ppboot or preboot in bootup time.
+
+In this patch added function to clear gpio to stop
+CPLD watchdog and recovery flag enable.
+
+Change-Id: I26adea6aa47ac9688bee55f4c341c243c196d3e0
+Signed-off-by: Priyajit Ghosh <prghosh@habana.ai>
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index c2e37fc..57c9f45 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -199,6 +199,16 @@
+ }
+ 
+ __weak void preboot_recovery_flag(bool en) { }
++__weak void preboot_boot_info_init(void) { }
++__weak void preboot_cond_arc0_reset(void) { }
++__weak void preboot_device_id_init(void) { }
++__weak void preboot_security_init(void) { }
++__weak void preboot_security_dynamic_init(void) { }
++__weak bool preboot_sram_is_valid_address_range(u64 addr, int len)
++{
++	return true;
++}
++__weak void hl_dev_pll_init(void) { }
+ 
+ void erom_main_function(void)
+ {
+diff --git a/arch/gaudi3/common/common.c b/arch/gaudi3/common/common.c
+index bc68d26..a4c99ad 100644
+--- a/arch/gaudi3/common/common.c
++++ b/arch/gaudi3/common/common.c
+@@ -12,6 +12,14 @@
+ #include <pcie_aux_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_aux_masks.h>
++#include <global_conf_regs.h>
++#include <gaudi3_fw_if.h>
++#include <uart.h>
++#include <bitops.h>
++#include <gpio_regs.h>
++
++#define GPIOS_PER_BANK			16
++#define FORCE_RECOVERY_MASK	BIT(2)
+ 
+ void hl_pcie_clear_boot_termination(void)
+ {
+@@ -37,3 +45,35 @@
+ 	/* Enable PCIe outbound memory access  */
+ 	regmap_writel(0, D0_PCIE_WRAP_REG(mmPCIE_WRAP_MASK_REQ));
+ }
++
++/*
++ * Request CPLD to stop the watchdog, by deasserting
++ * GPIO_66.
++ */
++#define GAUDI3_CPLD_WDOG_GPIO		66
++void preboot_clear_wd_gpio(void)
++{
++	uint32_t index = GAUDI3_CPLD_WDOG_GPIO % GPIOS_PER_BANK;
++	uint32_t val, mask = BIT(index);
++
++	/* configure GPIO in input mode */
++	val = regmap_readl(D0_PSOC_GPIO4_REG(mmGPIO_OUTENSET));
++	val = val | mask;
++	regmap_writel(val, D0_PSOC_GPIO4_REG(mmGPIO_OUTENSET));
++
++	/* gpio is active high */
++	val = regmap_readl(D0_PSOC_GPIO4_REG(mmGPIO_DATAOUT));
++	val = val | mask;
++	regmap_writel(val, (D0_PSOC_GPIO4_REG(mmGPIO_DATAOUT)));
++}
++
++void preboot_recovery_flag(bool en)
++{
++	struct gaudi3_cold_rst_data cold_rst_data;
++
++	cold_rst_data.data = regmap_readl(
++		D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_COLD_RST_FLOPS_2));
++	cold_rst_data.recovery_flag = en;
++	regmap_writel(cold_rst_data.data,
++		D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_COLD_RST_FLOPS_2));
++}

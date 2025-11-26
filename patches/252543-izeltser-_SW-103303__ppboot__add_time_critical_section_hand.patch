@@ -1,0 +1,88 @@
+From 9c8279d223adaf5d4f897d6fabcbbeb86e8aa6cc Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 07 Sep 2022 12:21:19 +0300
+Subject: [PATCH] [SW-103303] ppboot: add time critical section handling
+
+A portion of the PPboot application is running before the
+PCIe link is up, since there are time constrains on the PCIe
+link establishment, this portion of the code is time critical.
+This section is explicitly marked in the code, and start/end
+functions are added.
+during the time critical section, non-important and time consuming
+operation such as uart prints must be avoided. In order to preserve
+the debug information, the uart prints are written into a memory
+buffer, and flushed to the uart when time critical section is over.
+
+Change-Id: I169ebe33b0c78615afb02a74af38d73e9213eff8
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 48fcf0e..773db78 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -271,6 +271,18 @@
+ 	device_init_pll(); /* used for uart and delay */
+ }
+ 
++static void ppboot_time_critical_section_start(void)
++{
++	/* prints are stored in mem buffer */
++	preboot_uart_rbuf_init();
++}
++
++static void ppboot_time_critical_section_end(void)
++{
++	preboot_uart_rbuf_flush();
++	preboot_uart_rbuf_disable();
++}
++
+ __weak void ppboot_security_init(void) {}
+ __weak void ppboot_secure_arc(void) {}
+ __weak void hl_sram_self_repair(void) {}
+@@ -281,6 +293,8 @@
+ 	bool ret;
+ 
+ 	ppboot_init_stack_monitor();
++	/************time critical section**************/
++	ppboot_time_critical_section_start();
+ 	device_init();
+ 	/* Set ARCs to privileged mode */
+ 	ppboot_secure_arc();
+@@ -300,6 +314,8 @@
+ 	spi_flash_prot_early();
+ 	ppboot_security_init();
+ 	hl_pcie_init();
++	ppboot_time_critical_section_end();
++	/**********time critical section end************/
+ 	ppboot_pcie_drain_init();
+ 	ppboot_version();
+ 	rst_src_dump();
+diff --git a/lib/common/uart.c b/lib/common/uart.c
+index 5d43f06..130530a 100644
+--- a/lib/common/uart.c
++++ b/lib/common/uart.c
+@@ -34,6 +34,11 @@
+ 	tx_buf.initialized = true;
+ }
+ 
++void preboot_uart_rbuf_disable(void)
++{
++	tx_buf.initialized = false;
++}
++
+ static void preboot_uart_rbuf_push(char ch)
+ {
+ 	unsigned int head = tx_buf.head + 1;
+diff --git a/lib/common/uart.h b/lib/common/uart.h
+index ea59b68..de4de38 100644
+--- a/lib/common/uart.h
++++ b/lib/common/uart.h
+@@ -26,6 +26,7 @@
+ int preboot_uart_tstc(void);
+ int preboot_uart_getc(void);
+ void preboot_uart_rbuf_init(void);
++void preboot_uart_rbuf_disable(void);
+ void preboot_uart_rbuf_pop(void);
+ void preboot_uart_rbuf_flush(void);
+ bool preboot_uart_rbuf_empty(void);

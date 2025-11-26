@@ -1,0 +1,122 @@
+From ff3789a8052d151a4e847fc0b174d98714b317fa Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 03 May 2021 15:19:48 +0300
+Subject: [PATCH] [SW-40470] gaudi: sec: removing fit embedded signature verification
+
+For platforms with image security descriptor support, the signature
+of the descriptor is validated. otherwise the fit internal signature
+is validated as before.
+
+Change-Id: I3eb526e70450cbd6345879b9829579bae65e4ae6
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index db82b67..d2e9801 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1804,6 +1804,9 @@
+ 	const void *pub_key_fit;
+ 	u8 signature[FIT_SIGNATURE_SIZE];
+ 
++	if (!preboot_security_is_enabled())
++		return 0;
++
+ 	/* hl fit files are padded so the size is 4 bytes aligned */
+ 	img_size = ROUND_UP4(img_size);
+ 
+@@ -1875,3 +1878,8 @@
+ {
+ 	return FIT_SEC_DESC_SIZE;
+ }
++
++bool preboot_is_image_sig_supported(void)
++{
++	return true;
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 69618b9..89f0bf4 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -182,6 +182,7 @@
+ uintptr_t preboot_shm_get_offset(void);
+ void preboot_shm_set_offset(uintptr_t offset);
+ 
++bool preboot_is_image_sig_supported(void);
+ int preboot_verify_img_sig(const void *fit, size_t img_size,
+ 			   enum fit_sec_failure *res);
+ size_t preboot_get_img_sec_desc_size(void);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 80e7f12..d6376cb 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -599,22 +599,11 @@
+ 	return 0;
+ }
+ 
+-__weak int preboot_verify_img_sig(const void *fit, size_t img_size,
+-				  enum fit_sec_failure *res)
+-{
+-	return 0;
+-}
+-
+ static int fit_verify_security(const void *fit, int noffset,
+ 			       enum fit_sec_failure *res)
+ {
+-	size_t fit_size = fdt_totalsize(fit);
+-
+ 	if (!preboot_security_is_enabled())
+ 		return 0;
+-
+-	if (preboot_verify_img_sig(fit, fit_size, res))
+-		return 1;
+ 
+ 	if (!fit_svn_is_valid(fit)) {
+ 		*res = FIT_SEC_SVN_INVALID;
+@@ -756,6 +745,17 @@
+ 	return 0;
+ }
+ 
++__weak bool preboot_is_image_sig_supported(void)
++{
++	return false;
++}
++
++__weak int preboot_verify_img_sig(const void *fit, size_t img_size,
++				  enum fit_sec_failure *res)
++{
++	return 0;
++}
++
+ static enum fit_load_result fit_copy_images(const void *fit,
+ 					    enum fit_sec_failure *res)
+ {
+@@ -764,6 +764,7 @@
+ 	const u8 *buf;
+ 	u64 load, start;
+ 	const char *cmpr;
++	size_t fit_size = fdt_totalsize(fit);
+ 
+ 	/* Check if image supports a minimum FDT version or newer */
+ 	if (fdt_version(fit) < FDT_MIN_SUPPORTED_VERSION)
+@@ -777,8 +778,18 @@
+ 	if (!fit_load_is_runnable(fit, conf))
+ 		return FIT_LOAD_CORRUPTED;
+ 
+-	if (fit_verify_security(fit, conf, res))
+-		return FIT_LOAD_SEC_FAILED;
++	/*
++	 * for platforms with image security descriptor support, the signature
++	 * of the descriptor is validated. otherwise the fit internal signature
++	 * is validated.
++	 */
++	if (preboot_is_image_sig_supported()) {
++		if (fit_verify_security(fit, conf, res))
++			return FIT_LOAD_SEC_FAILED;
++	} else {
++		if (preboot_verify_img_sig(fit, fit_size, res))
++			return FIT_LOAD_SEC_FAILED;
++	}
+ 
+ 	if (fit_pub_key_value_node_get(fit))
+ 		return FIT_LOAD_SEC_FAILED;

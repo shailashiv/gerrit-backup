@@ -1,0 +1,959 @@
+From c56558b601640f16391e1929b56ff06953853cdd Mon Sep 17 00:00:00 2001
+From: Noam.Lessner <nlessner@habana.ai>
+Date: Mon, 09 Aug 2021 15:59:53 +0300
+Subject: [PATCH] [SW-47997] gaudi2: init e2e credits
+
+migrate end to end credits from LKD.
+referance -
+commit "Revert [SW-34072] gaudi2: add DMMU isolation to cluster binning"
+("38d966cb2f5216bdf6379a9a753745b6578ff657")
+gaudi2_bringup.c
+
+Signed-off-by: Noam.Lessner <nlessner@habana.ai>
+Change-Id: Iea36c4f6ffe0242d3ad12744a00ed41140ec5eaa
+---
+
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 08210b0..4f98465 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -1,4 +1,5 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/credits.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0aa5c3c..782a8f7 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -634,3 +634,22 @@
+ 
+ 	regmap_writel(0x0, run_req_offset);
+ }
++
++static void gaudi2_init_block_instances(u32 block_idx,
++					struct block_ctx *cfg_ctx)
++{
++	u64 block_base = cfg_ctx->base + block_idx * cfg_ctx->block_off;
++	int i;
++
++	for (i = 0; i < cfg_ctx->instances; i++)
++		cfg_ctx->instance_cfg_fn(block_base + i * cfg_ctx->instance_off,
++					 cfg_ctx->data);
++}
++
++void gaudi2_init_blocks(struct block_ctx *cfg_ctx)
++{
++	int i;
++
++	for (i = 0; i < cfg_ctx->blocks; i++)
++		gaudi2_init_block_instances(i, cfg_ctx);
++}
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+new file mode 100644
+index 0000000..1b88fd1
+--- /dev/null
++++ b/arch/gaudi2/common/common.h
+@@ -0,0 +1,129 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <preboot.h>
++#include <limits.h>
++#include <gaudi2_blocks_linux_driver.h>
++#include "credits.h"
++
++#define GAUDI2_DECODER_FULL_MASK	0x3FF
++#define GAUDI2_EDMA_FULL_MASK		0xFF
++#define GAUDI2_TPC_FULL_MASK		0x1FFFFFF
++
++#ifdef TARGET_IS_PLDM
++	#define MME_MASK 0x0
++	#define EDMA_ENABLED_MASK 0xFF
++	#define ROTATOR_MASK 0x3
++	#define DECODER_ENABLED_MASK 0x1AB
++	#define NIC_PORTS_MASK 0x0
++	#define TPC_ENABLED_MASK 0x1020101
++#elif TARGET_IS_ONIX
++	#define MME_MASK 0
++	#define EDMA_ENABLED_MASK 0x0
++	#define ROTATOR_MASK 0x3
++	#define DECODER_ENABLED_MASK 0x1AB
++	#define NIC_PORTS_MASK 0
++	#define TPC_ENABLED_MASK 0x1020101
++#else /* ASIC */
++	#define MME_MASK 0xF
++	#define EDMA_ENABLED_MASK 0xFF
++	#define ROTATOR_MASK 0x3
++	#define DECODER_ENABLED_MASK 0x1FF
++	#define NIC_PORTS_MASK 0xFFFFFF
++	#define TPC_ENABLED_MASK 0x1FFFFFF
++#endif
++
++#define NUM_OF_DCORES			4
++#define NUM_OF_EDMA_PER_DCORE		2
++#define NUM_OF_HIF_PER_DCORE		4
++#define NUM_OF_TPC_PER_DCORE		6
++#define NUM_DCORE0_TPC			7
++#define NUM_OF_ROT			2
++#define NUM_OF_HMMU_PER_DCORE		4
++#define NUM_OF_MME_SBTE_PER_DCORE	5
++#define NUM_OF_MME_WB_PER_DCORE		2
++#define NUM_OF_VDEC_PER_DCORE		2
++#define NUM_OF_PCIE_VDEC		2
++
++enum nic_mac_lane {
++	NIC_MAC_LANE_0,
++	NIC_MAC_LANE_1,
++	NIC_MAC_LANE_2,
++	NIC_MAC_LANE_3,
++	NIC_MAC_LANES,
++};
++
++#define NIC_NUMBER_OF_MACROS	12
++#define NIC_NUMBER_OF_ENGINES	(NIC_NUMBER_OF_MACROS * 2)
++#define NIC_MAX_NUMBER_OF_PORTS	(NIC_NUMBER_OF_ENGINES * 2)
++#define NIC_NUMBER_OF_PORTS	NIC_NUMBER_OF_ENGINES
++#define NIC_MAX_NUM_OF_LANES	(NIC_NUMBER_OF_MACROS * NIC_MAC_LANES)
++#define NIC_PORTS_IN_MACRO	(NIC_NUMBER_OF_PORTS / NIC_NUMBER_OF_MACROS)
++
++
++#define NUMBER_OF_PDMA_QUEUES		2
++
++#define DCORE_OFFSET			(mmDCORE1_TPC0_QM_BASE - \
++					 mmDCORE0_TPC0_QM_BASE)
++
++#define DCORE_EDMA_OFFSET		(mmDCORE0_EDMA1_QM_BASE - \
++						mmDCORE0_EDMA0_QM_BASE)
++
++#define DCORE_PDMA_OFFSET		(mmPDMA1_QM_BASE - mmPDMA0_QM_BASE)
++
++#define DCORE_TPC_OFFSET		(mmDCORE0_TPC1_QM_BASE - \
++						mmDCORE0_TPC0_QM_BASE)
++
++#define DCORE_DEC_OFFSET		(mmDCORE0_DEC1_VSI_BASE - \
++						mmDCORE0_DEC0_VSI_BASE)
++
++#define ROT_OFFSET			(mmROT1_BASE - mmROT0_BASE)
++
++#define PDMA_OFFSET			(mmPDMA1_MSTR_IF_RR_SHRD_HBW_BASE - \
++					 mmPDMA0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define DCORE_HMMU_OFFSET		(mmDCORE0_HMMU1_MMU_BASE - \
++						mmDCORE0_HMMU0_MMU_BASE)
++
++#define NIC_OFFSET			(mmNIC1_MSTR_IF_RR_SHRD_HBW_BASE - \
++					 mmNIC0_MSTR_IF_RR_SHRD_HBW_BASE)
++#define PCIE_VDEC_OFFSET	\
++		(mmPCIE_VDEC1_MSTR_IF_RR_SHRD_HBW_BASE - \
++		 mmPCIE_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define DCORE_MME_SBTE_OFFSET	\
++		(mmDCORE0_MME_SBTE1_MSTR_IF_RR_SHRD_HBW_BASE - \
++		 mmDCORE0_MME_SBTE0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define DCORE_MME_WB_OFFSET	\
++		(mmDCORE0_MME_WB1_MSTR_IF_RR_SHRD_HBW_BASE - \
++		 mmDCORE0_MME_WB0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define DCORE_VDEC_OFFSET	\
++		(mmDCORE0_VDEC1_MSTR_IF_RR_SHRD_HBW_BASE - \
++		 mmDCORE0_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++/**
++ * struct block_ctx - context to initialize unit instances across multiple
++ *                    blocks where block can be either a dcore of duplicated
++ *                    common module. this code relies on constant offsets
++ *                    of blocks and unit instances in a block.
++ * @instance_cfg_fn: instance specific configuration function.
++ * @data: private configuration data.
++ * @base: base address of the first instance in the first block.
++ * @block_off: subsequent blocks address spacing.
++ * @instance_off: subsequent block's instances address spacing.
++ * @blocks: number of blocks.
++ * @instances: unit instances per block.
++ */
++struct block_ctx {
++	void (*instance_cfg_fn)(u64 base, void *data);
++	void *data;
++	u64 base;
++	u64 block_off;
++	u64 instance_off;
++	unsigned int blocks;
++	unsigned int instances;
++};
+diff --git a/arch/gaudi2/common/credits.c b/arch/gaudi2/common/credits.c
+new file mode 100644
+index 0000000..0c3c2d1
+--- /dev/null
++++ b/arch/gaudi2/common/credits.c
+@@ -0,0 +1,531 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * (C) Copyright 2021 HabanaLabs, Ltd.
++ *
++ */
++
++#include <arc_farm_kdma_mstr_if_e2e_crdt_regs.h>
++#include <dcore0_hif0_regs.h>
++#include <dcore0_rtr0_mstr_if_e2e_crdt_regs.h>
++#include <pmmu_pif_regs.h>
++#include <preboot.h>
++#include <uart.h>
++
++#include "hl.h"
++
++static void gaudi2_init_module_mstr_if(u32 block_idx, u32 instances,
++					   u64 block_base, u64 block_off,
++					   u64 instance_off,
++					   unsigned long enable_mask,
++					   struct block_ctx *cfg_ctx)
++{
++	u64 base = block_base + block_idx * block_off;
++	int i, seq;
++
++	for (i = 0; i < instances; i++) {
++		seq = block_idx * instances + i;
++
++		if (!test_bit(seq, &enable_mask))
++			continue;
++
++		cfg_ctx->instance_cfg_fn(base + i * instance_off,
++								cfg_ctx->data);
++	}
++}
++
++static inline void gaudi2_init_dcore_mstr_if(u32 dcore, u32 instances,
++					     u64 dcore0_base, u64 offset,
++					     unsigned long enable_mask,
++					     struct block_ctx *cfg_ctx)
++{
++	gaudi2_init_module_mstr_if(dcore, instances, dcore0_base,
++				       DCORE_OFFSET, offset,
++				       enable_mask, cfg_ctx);
++}
++
++static inline void gaudi2_init_common_mstr_if(u32 instances, u64 base,
++					      u64 offset,
++					      unsigned long enable_mask,
++					      struct block_ctx *cfg_ctx)
++{
++	gaudi2_init_module_mstr_if(0, instances, base, 0, offset,
++						enable_mask, cfg_ctx);
++}
++
++static void gaudi2_init_e2e_mstr_if_cfg(u64 base, void *data)
++{
++	int i;
++	struct e2e_cfg_data *e2e_data = (struct e2e_cfg_data *)data;
++
++	regmap_writel(0x1, base + MSTR_IF_E2E_CRDT_E2E_EMEM_EN_OFFSET);
++	regmap_writel(0x1, base + MSTR_IF_E2E_CRDT_E2E_PCI_EN_OFFSET);
++	regmap_writel(0x1, base +
++		      MSTR_IF_E2E_CRDT_E2E_EMEM_SB_RELEASE_EN_OFFSET);
++	regmap_writel(0x1, base +
++		      MSTR_IF_E2E_CRDT_E2E_PCI_SB_RELEASE_EN_OFFSET);
++
++	/*
++	 * Actual initialization of the component "credits vector".
++	 * each credits vector has 16 entries in which the indexes groups
++	 * {0-3}, {4-7}, {8-11} and {12-15} has the same value.
++	 */
++	for (i = 0; i <= E2E_PCIE; i++) {
++		regmap_writel(e2e_data->emem_rd_sz.cfg_val_idx_0_3, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_RD_SIZE_0_OFFSET);
++		regmap_writel(e2e_data->emem_wr_sz.cfg_val_idx_0_3, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_WR_SIZE_0_OFFSET);
++	}
++	for (i = E2E_HBM_DMA; i <= E2E_HBM_MMU; i++) {
++		regmap_writel(e2e_data->emem_rd_sz.cfg_val_idx_4_7, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_RD_SIZE_0_OFFSET);
++		regmap_writel(e2e_data->emem_wr_sz.cfg_val_idx_4_7, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_WR_SIZE_0_OFFSET);
++	}
++	for (i = E2E_PCIE_MMU; i <= E2E_SM; i++) {
++		regmap_writel(e2e_data->emem_rd_sz.cfg_val_idx_8_11, i * 4 +
++			     base +
++			     MSTR_IF_E2E_CRDT_E2E_EMEM_RD_SIZE_0_OFFSET);
++		regmap_writel(e2e_data->emem_wr_sz.cfg_val_idx_8_11, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_WR_SIZE_0_OFFSET);
++	}
++	for (i = E2E_NIC; i <= E2E_MME; i++) {
++		regmap_writel(e2e_data->emem_rd_sz.cfg_val_idx_12_15, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_RD_SIZE_0_OFFSET);
++		regmap_writel(e2e_data->emem_wr_sz.cfg_val_idx_12_15, i * 4 +
++			      base +
++			      MSTR_IF_E2E_CRDT_E2E_EMEM_WR_SIZE_0_OFFSET);
++	}
++
++	/* configure the PCIe rs/wr credits */
++	regmap_writel(e2e_data->pcie.rd, base +
++		      MSTR_IF_E2E_CRDT_E2E_PCI_RD_SIZE_OFFSET);
++	regmap_writel(e2e_data->pcie.wr, base +
++		      MSTR_IF_E2E_CRDT_E2E_PCI_WR_SIZE_OFFSET);
++}
++
++static void init_e2e_emem_config(struct e2e_emem_config *conf, u16 idx_12_15,
++				 u16 idx_8_11, u16 idx_4_7, u16 idx_0_3)
++{
++	conf->cfg_val_idx_0_3 = idx_0_3;
++	conf->cfg_val_idx_4_7 = idx_4_7;
++	conf->cfg_val_idx_8_11 = idx_8_11;
++	conf->cfg_val_idx_12_15 = idx_12_15;
++}
++
++static void init_e2e_pcie_config(struct e2e_pcie_config *conf, u16 rd, u16 wr)
++{
++	conf->rd = rd;
++	conf->wr = wr;
++}
++
++static void gaudi2_init_dcore_tpcs_e2e(int dcore, struct e2e_cfg_data *e2e_data)
++{
++	switch (dcore) {
++	case 0:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 38, 35, 27, 24);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 38, 35, 28, 23);
++		break;
++	case 1:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 27, 24, 38, 35);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 28, 23, 38, 35);
++		break;
++	case 2:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 35, 38, 24, 27);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 35, 38, 23, 28);
++		break;
++	case 3:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 24, 27, 35, 38);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 23, 28, 35, 38);
++		break;
++	default:
++		preboot_puts_hex("in TPC e2e config - Illegal dcore", dcore,
++				 false);
++		return;
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 7, 30);
++}
++
++static void gaudi2_init_dcore_mme_sbte_e2e(int dcore,
++					   struct e2e_cfg_data *e2e_data)
++{
++	switch (dcore) {
++	case 0:
++	case 2:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 52, 52, 39, 39);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 57, 57, 42, 42);
++		break;
++	case 1:
++	case 3:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 39, 39, 52, 52);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 42, 42, 57, 57);
++		break;
++	default:
++		preboot_puts_hex("in MME SBTE e2e config - Illegal dcore",
++				 dcore, false);
++		return;
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 1, 1);
++}
++
++static void gaudi2_init_dcore_mme_wap_e2e(int dcore,
++					  struct e2e_cfg_data *e2e_data)
++{
++	switch (dcore) {
++	case 0:
++	case 2:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 52, 52, 39, 39);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 57, 57, 42, 42);
++		break;
++	case 1:
++	case 3:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 39, 39, 52, 52);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 42, 42, 57, 57);
++		break;
++	default:
++		preboot_puts_hex("in MME WAP e2e config - Illegal dcore", dcore,
++				 false);
++		return;
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 1, 1);
++}
++
++static void gaudi2_init_dcore_edma_e2e(int dcore, struct e2e_cfg_data *e2e_data)
++{
++	switch (dcore) {
++	case 0:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 70, 64, 32, 28);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 69, 63, 32, 28);
++		break;
++	case 1:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 32, 28, 70, 64);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 32, 28, 69, 63);
++		break;
++	case 2:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 64, 70, 28, 32);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 63, 69, 28, 32);
++		break;
++	case 3:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 28, 32, 64, 70);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 28, 32, 63, 69);
++		break;
++	default:
++		preboot_puts_hex("in EDMA e2e config - Illegal dcore", dcore,
++				 false);
++		return;
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 2, 2);
++}
++
++static void gaudi2_init_dcore_vdec_e2e(int dcore, struct e2e_cfg_data *e2e_data)
++{
++	switch (dcore) {
++	case 0:
++	case 2:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 9, 9, 7, 7);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 9, 9, 7, 7);
++		break;
++	case 1:
++	case 3:
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 7, 7, 9, 9);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 7, 7, 9, 9);
++		break;
++	default:
++		preboot_puts_hex("in VDEC e2e config - Illegal dcore", dcore,
++				 false);
++		return;
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 16, 16);
++}
++
++static void gaudi2_init_nic_e2e(int nic_idx, struct e2e_cfg_data *e2e_data)
++{
++	/*
++	 * NICs has 2 slightly different configurations for the
++	 * following NIC macros: {0-4, 9-11}, {5-8}
++	 * the below "if" reflects the e2e config difference
++	 */
++	if (nic_idx > 4 && nic_idx < 9) {
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 23, 23, 17, 17);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 23, 23, 17, 17);
++	} else {
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 17, 17, 23, 23);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 17, 17, 23, 23);
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 14, 14);
++}
++
++static void gaudi2_init_rot_e2e(int rot_idx, struct e2e_cfg_data *e2e_data)
++{
++	if (rot_idx == 0) {
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 9, 9, 7, 7);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 9, 9, 7, 7);
++	} else {
++		init_e2e_emem_config(&e2e_data->emem_rd_sz, 7, 7, 9, 9);
++		init_e2e_emem_config(&e2e_data->emem_wr_sz, 7, 7, 9, 9);
++	}
++	init_e2e_pcie_config(&e2e_data->pcie, 3, 3);
++}
++
++static void gaudi2_init_dcores_e2e_mstr_ifs(void)
++{
++	struct e2e_cfg_data e2e_data;
++	struct block_ctx e2e_ctx = {
++		.instance_cfg_fn = &gaudi2_init_e2e_mstr_if_cfg,
++		.data = &e2e_data,
++	};
++	struct e2e_emem_config *emem_rd_conf = &e2e_data.emem_rd_sz;
++	struct e2e_emem_config *emem_wr_conf = &e2e_data.emem_wr_sz;
++	struct e2e_pcie_config *emem_pcie_conf = &e2e_data.pcie;
++	unsigned long mme_mask = MME_MASK;
++	int i, inst, tpc_num, tpc_seq = 0;
++
++	/* init e2e in all DCORES */
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++
++		/* HMMUs */
++		init_e2e_emem_config(emem_rd_conf, 16, 16, 16, 16);
++		init_e2e_emem_config(emem_wr_conf, 0, 0, 0, 0);
++		init_e2e_pcie_config(emem_pcie_conf, 3, 0);
++		gaudi2_init_dcore_mstr_if(i, NUM_OF_HMMU_PER_DCORE,
++				mmDCORE0_HMMU0_MSTR_IF_RR_SHRD_HBW_BASE,
++				DCORE_HMMU_OFFSET, ULONG_MAX, &e2e_ctx);
++
++		/* MME */
++		if (test_bit(i, &mme_mask)) {
++			init_e2e_emem_config(emem_rd_conf, 1, 1, 1, 1);
++			init_e2e_emem_config(emem_wr_conf, 1, 1, 1, 1);
++			init_e2e_pcie_config(emem_pcie_conf, 1, 1);
++			gaudi2_init_e2e_mstr_if_cfg(
++				mmDCORE0_MME_CTRL_MSTR_IF_RR_SHRD_HBW_BASE +
++				i * DCORE_OFFSET, &e2e_data);
++
++			/* MME_SBTEs */
++			gaudi2_init_dcore_mme_sbte_e2e(i, &e2e_data);
++			gaudi2_init_dcore_mstr_if(i, NUM_OF_MME_SBTE_PER_DCORE,
++				mmDCORE0_MME_SBTE0_MSTR_IF_RR_SHRD_HBW_BASE,
++				DCORE_MME_SBTE_OFFSET, ULONG_MAX, &e2e_ctx);
++
++			/* MME_WBs */
++			gaudi2_init_dcore_mme_wap_e2e(i, &e2e_data);
++			gaudi2_init_dcore_mstr_if(i, NUM_OF_MME_WB_PER_DCORE,
++				mmDCORE0_MME_WB0_MSTR_IF_RR_SHRD_HBW_BASE,
++				DCORE_MME_WB_OFFSET, ULONG_MAX, &e2e_ctx);
++		}
++
++		/* SYNC MANAGER */
++		init_e2e_emem_config(emem_rd_conf, 1, 1, 1, 1);
++		init_e2e_emem_config(emem_wr_conf, 1, 1, 1, 1);
++		init_e2e_pcie_config(emem_pcie_conf, 2, 2);
++		gaudi2_init_e2e_mstr_if_cfg(
++				mmDCORE0_SYNC_MNGR_MSTR_IF_RR_SHRD_HBW_BASE +
++				i * DCORE_OFFSET, &e2e_data);
++
++		/* EDMAs */
++		gaudi2_init_dcore_edma_e2e(i, &e2e_data);
++		gaudi2_init_dcore_mstr_if(i, NUM_OF_EDMA_PER_DCORE,
++				mmDCORE0_EDMA0_MSTR_IF_RR_SHRD_HBW_BASE,
++				DCORE_EDMA_OFFSET, EDMA_ENABLED_MASK, &e2e_ctx);
++
++		/* VDECs */
++		gaudi2_init_dcore_vdec_e2e(i, &e2e_data);
++		gaudi2_init_dcore_mstr_if(i, NUM_OF_VDEC_PER_DCORE,
++					mmDCORE0_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE,
++					DCORE_VDEC_OFFSET, DECODER_ENABLED_MASK,
++					&e2e_ctx);
++	}
++
++	tpc_seq = 0;
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++
++		tpc_num = (i == 0) ? NUM_DCORE0_TPC : NUM_OF_TPC_PER_DCORE;
++		gaudi2_init_dcore_tpcs_e2e(i, &e2e_data);
++
++		for (inst = 0; inst < tpc_num; inst++) {
++			if (!(TPC_ENABLED_MASK & BIT(tpc_seq))) {
++				tpc_seq++;
++				continue;
++			}
++
++			if (inst == (NUM_DCORE0_TPC - 1)) {
++				init_e2e_emem_config(emem_rd_conf, 31, 31, 31,
++						     31);
++				init_e2e_emem_config(emem_wr_conf, 30, 30, 30,
++						     30);
++				init_e2e_pcie_config(emem_pcie_conf, 7, 30);
++			}
++
++			gaudi2_init_e2e_mstr_if_cfg(
++					mmDCORE0_TPC0_MSTR_IF_RR_SHRD_HBW_BASE +
++					i * DCORE_OFFSET +
++					inst * DCORE_TPC_OFFSET,
++					&e2e_data);
++			tpc_seq++;
++		}
++	}
++}
++
++static u64 gaudi2_nic_ports_to_macros(void)
++{
++	u64 mask = 0;
++	int i;
++
++	/* create the list of enabled nics from the list of enabled ports */
++	for (i = 0; i < NIC_NUMBER_OF_PORTS; i += NIC_PORTS_IN_MACRO)
++		if (NIC_PORTS_MASK & GENMASK_ULL(i + NIC_PORTS_IN_MACRO - 1, i))
++			mask |= BIT(i / NIC_PORTS_IN_MACRO);
++
++	return mask;
++}
++
++static void gaudi2_init_common_e2e_mstr_ifs(void)
++{
++	struct e2e_cfg_data e2e_data;
++	struct block_ctx e2e_ctx = {
++		.instance_cfg_fn = &gaudi2_init_e2e_mstr_if_cfg,
++		.data = &e2e_data,
++	};
++	struct e2e_emem_config *emem_rd_conf = &e2e_data.emem_rd_sz;
++	struct e2e_emem_config *emem_wr_conf = &e2e_data.emem_wr_sz;
++	struct e2e_pcie_config *emem_pcie_conf = &e2e_data.pcie;
++	unsigned long mask, rotator_mask = ROTATOR_MASK;
++	int i;
++
++	/* PCIE_MSTR_RR */
++	init_e2e_emem_config(emem_rd_conf, 12, 12, 8, 8);
++	init_e2e_emem_config(emem_wr_conf, 11, 11, 8, 8);
++	init_e2e_pcie_config(emem_pcie_conf, 1, 1);
++	gaudi2_init_e2e_mstr_if_cfg(mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_BASE,
++				    &e2e_data);
++
++	/* PSOC */
++	init_e2e_emem_config(emem_rd_conf, 3, 3, 3, 3);
++	init_e2e_emem_config(emem_wr_conf, 3, 3, 3, 3);
++	init_e2e_pcie_config(emem_pcie_conf, 40, 40);
++	gaudi2_init_e2e_mstr_if_cfg(mmPSOC_MSTR_IF_RR_SHRD_HBW_BASE, &e2e_data);
++
++	/* PDMs */
++	init_e2e_emem_config(emem_rd_conf, 27, 27, 20, 20);
++	init_e2e_emem_config(emem_wr_conf, 25, 25, 19, 19);
++	init_e2e_pcie_config(emem_pcie_conf, 158, 507);
++	gaudi2_init_common_mstr_if(NUMBER_OF_PDMA_QUEUES,
++				   mmPDMA0_MSTR_IF_RR_SHRD_HBW_BASE,
++				   PDMA_OFFSET, ULONG_MAX, &e2e_ctx);
++
++#ifndef TARGET_IS_ONIX
++	/* onix doesn't have this mem space */
++	/* CPU */
++	init_e2e_emem_config(emem_rd_conf, 30, 30, 30, 30);
++	init_e2e_emem_config(emem_wr_conf, 3, 3, 3, 3);
++	init_e2e_pcie_config(emem_pcie_conf, 40, 40);
++	gaudi2_init_e2e_mstr_if_cfg(mmCPU_MSTR_IF_RR_SHRD_HBW_BASE, &e2e_data);
++#endif
++
++	/* PMMU_HBW */
++	init_e2e_emem_config(emem_rd_conf, 36, 36, 27, 27);
++	init_e2e_emem_config(emem_wr_conf, 0, 0, 0, 0);
++	init_e2e_pcie_config(emem_pcie_conf, 158, 0);
++	gaudi2_init_e2e_mstr_if_cfg(
++				mmPMMU_HBW_MSTR_IF_RR_SHRD_HBW_BASE, &e2e_data);
++
++	/* ROTs */
++	for (i = 0; i < NUM_OF_ROT; i++) {
++		if (!test_bit(i, &rotator_mask))
++			continue;
++		gaudi2_init_rot_e2e(i, &e2e_data);
++		gaudi2_init_e2e_mstr_if_cfg(
++			mmROT0_MSTR_IF_RR_SHRD_HBW_BASE + i * ROT_OFFSET,
++			&e2e_data);
++	}
++
++	/* ARC_FARM_FARM */
++	init_e2e_emem_config(emem_rd_conf, 4, 4, 4, 4);
++	init_e2e_emem_config(emem_wr_conf, 4, 4, 4, 4);
++	init_e2e_pcie_config(emem_pcie_conf, 2, 2);
++	gaudi2_init_e2e_mstr_if_cfg(mmARC_FARM_FARM_MSTR_IF_RR_SHRD_HBW_BASE,
++				    &e2e_data);
++
++	/* ARC_FARM_KDMA */
++	init_e2e_emem_config(emem_rd_conf, 1, 1, 1, 1);
++	init_e2e_emem_config(emem_wr_conf, 1, 1, 1, 1);
++	init_e2e_pcie_config(emem_pcie_conf, 5, 5);
++	gaudi2_init_e2e_mstr_if_cfg(
++				mmARC_FARM_KDMA_MSTR_IF_RR_SHRD_HBW_BASE,
++				&e2e_data);
++
++	/* PCIE_VDECs */
++	mask = DECODER_ENABLED_MASK >>
++				(NUM_OF_DCORES * NUM_OF_VDEC_PER_DCORE);
++
++	mask &= (u64)((1 << NUM_OF_VDEC_PER_DCORE) - 1);
++	init_e2e_emem_config(emem_rd_conf, 9, 9, 7, 7);
++	init_e2e_emem_config(emem_wr_conf, 9, 9, 7, 7);
++	init_e2e_pcie_config(emem_pcie_conf, 16, 16);
++	gaudi2_init_common_mstr_if(NUM_OF_PCIE_VDEC,
++				mmPCIE_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE,
++				PCIE_VDEC_OFFSET, mask, &e2e_ctx);
++
++	/* NICs */
++	mask = gaudi2_nic_ports_to_macros();
++	for (i = 0; i < NIC_NUMBER_OF_MACROS; i++) {
++		if (!(mask & BIT(i)))
++			continue;
++
++		gaudi2_init_nic_e2e(i, &e2e_data);
++		gaudi2_init_e2e_mstr_if_cfg(
++			mmNIC0_MSTR_IF_RR_SHRD_HBW_BASE + i * NIC_OFFSET,
++			&e2e_data);
++	}
++}
++
++static void gaudi2_init_e2e_mstr_if(void)
++{
++	gaudi2_init_dcores_e2e_mstr_ifs();
++	gaudi2_init_common_e2e_mstr_ifs();
++}
++
++static void gaudi2_init_e2e_hif_cfg(u64 base, void *data)
++{
++	u64 off = mmDCORE0_HIF0_DISABLE_E2E_CREDITS - mmDCORE0_HIF0_BASE;
++
++	regmap_writel(0, base + off);
++}
++
++static void gaudi2_init_e2e_hifs(void)
++{
++	struct block_ctx hif_ctx = {
++		.blocks = NUM_OF_DCORES,
++		.instances = NUM_OF_HIF_PER_DCORE,
++		.base = mmDCORE0_HIF0_BASE,
++		.block_off = DCORE_OFFSET,
++		.instance_off = mmDCORE0_HIF1_BASE - mmDCORE0_HIF0_BASE,
++		.instance_cfg_fn = &gaudi2_init_e2e_hif_cfg,
++	};
++
++	gaudi2_init_blocks(&hif_ctx);
++}
++
++void preboot_e2e_credits_init(void)
++{
++
++	/* enable PCIe E2E credits */
++	regmap_writel(0, mmPMMU_PIF_DISABLE_E2E_CREDITS);
++	gaudi2_init_e2e_hifs();
++	gaudi2_init_e2e_mstr_if();
++
++	/*
++	 * On palladium, the MMU PGT clearing will take a lot of time with the
++	 * KDMA E2E credits. Therefore we disable them here and enable them back
++	 * at the end of gaudi2_late_init() after all KDMA initialization jobs
++	 * are done.
++	 */
++#ifdef TARGET_IS_PLDM
++	regmap_writel(0, mmARC_FARM_KDMA_MSTR_IF_E2E_CRDT_E2E_EMEM_EN);
++#endif
++}
+diff --git a/arch/gaudi2/common/credits.h b/arch/gaudi2/common/credits.h
+new file mode 100644
+index 0000000..371dd33
+--- /dev/null
++++ b/arch/gaudi2/common/credits.h
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#include <dcore0_rtr0_mstr_if_e2e_crdt_regs.h>
++
++enum e2e_credit_component {
++	E2E_DECODER,
++	E2E_PSOC,
++	E2E_PCIE,
++	E2E_CPU,
++	E2E_HBM_DMA,
++	E2E_PCIE_DMA,
++	E2E_KDMA,
++	E2E_HBM_MMU,
++	E2E_PCIE_MMU,
++	E2E_MME_QMAN,
++	E2E_ROT,
++	E2E_SM,
++	E2E_NIC,
++	E2E_ARC_FARM,
++	E2E_TPC,
++	E2E_MME,
++	MSTR_IF_E2E_CRDT_E2E_EMEM_RW_SIZE_ELEMENTS
++};
++
++#define MSTR_IF_E2E_CRDT_E2E_EMEM_EN_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_EMEM_EN - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_PCI_EN_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_PCI_EN - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_EMEM_SB_RELEASE_EN_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_EMEM_SB_RELEASE_EN - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_PCI_SB_RELEASE_EN_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_PCI_SB_RELEASE_EN - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_EMEM_WR_SIZE_0_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_EMEM_WR_SIZE_0 - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_EMEM_RD_SIZE_0_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_EMEM_RD_SIZE_0 - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_PCI_WR_SIZE_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_PCI_WR_SIZE - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++#define MSTR_IF_E2E_CRDT_E2E_PCI_RD_SIZE_OFFSET \
++		(mmDCORE0_RTR0_MSTR_IF_E2E_CRDT_E2E_PCI_RD_SIZE - \
++		 mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_BASE)
++
++/**
++ * struct e2e_emem_config - e2e component EMEM vector configuration
++ * Note: this structure is based on the fact that each "quarter" of components
++ *       vector (of size 16, i.e. group of 4) has the same config value.
++ * @cfg_val_idx_0_3: config value to indexes 0-3.
++ * @cfg_val_idx_4_7: config value to indexes 4-7.
++ * @cfg_val_idx_8_11: config value to indexes 8-11.
++ * @cfg_val_idx_12_15: config value to indexes 12-15.
++ */
++struct e2e_emem_config {
++	u16 cfg_val_idx_0_3;
++	u16 cfg_val_idx_4_7;
++	u16 cfg_val_idx_8_11;
++	u16 cfg_val_idx_12_15;
++};
++
++/**
++ * struct e2e_pcie_config - e2e component PCIe values configuration
++ * @rd: read credits.
++ * @wr: write credits.
++ */
++struct e2e_pcie_config {
++	u16 rd;
++	u16 wr;
++};
++
++/**
++ * struct e2e_cfg_data - e2e internal configuration data
++ * @emem_rd_sz: E2E_CRDT_E2E_EMEM_RD_SIZE config values.
++ * @emem_wr_sz: E2E_CRDT_E2E_EMEM_WR_SIZE config values.
++ * @pcie: E2E pcie config values
++ */
++struct e2e_cfg_data {
++	struct e2e_emem_config emem_rd_sz;
++	struct e2e_emem_config emem_wr_sz;
++	struct e2e_pcie_config pcie;
++};
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index 04f0cf1..e276685 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -6,6 +6,8 @@
+ #ifndef ARCH_GAUDI2_COMMON_HL_H_
+ #define ARCH_GAUDI2_COMMON_HL_H_
+ 
++#include "common.h"
++
+ enum hl_rst_src {
+ 	HL_COLD_RST = 1,
+ 	HL_MANUAL_RST = 2,
+@@ -22,5 +24,6 @@
+ void set_slv_cfg_reg_val(void);
+ void halt_n_reset_arc(u8 id);
+ void run_arc(u8 id);
++void gaudi2_init_blocks(struct block_ctx *cfg_ctx);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */
+diff --git a/include/bitops.h b/include/bitops.h
+index 5737a58..b021068 100644
+--- a/include/bitops.h
++++ b/include/bitops.h
+@@ -7,15 +7,67 @@
+ #ifndef _BITOPS_H_
+ #define _BITOPS_H_
+ 
++#include <const.h>
++
++#define BITS_PER_LONG_LONG	64
++#define BITS_PER_LONG		32
+ #define BIT(nr)		(1 << (nr))
++#define BIT_WORD(nr)	((nr) / BITS_PER_LONG)
+ 
+ /* extracts "n" number of bits from position "p" in the given number "v" */
+ #define EXTRACT_BITS(v, p, n) (((v) & (((1 << (n)) - 1) << (p))) >> (p))
+-
++#define GENMASK_ULL(h, l)                    \
++	(((~ULL(0)) - (ULL(1) << (l)) + 1) & \
++	 (~ULL(0) >> (BITS_PER_LONG_LONG - 1 - (h))))
+ 
+ #ifndef __ASSEMBLY__
+ 
+ /**
++ * import test_bit from linux kernel bitops.h
++ * for arc from linux/arch/arc/include/asm/bitops.h
++ * for arm from linux/include/asm-generic/bitops/non-atomic.h
++ *
++ * these function allow to test bit from base long register address.
++ * e.g: bit 250 can be tested relative to a long register address space.
++ */
++
++#ifdef __arc__
++/**
++ * test_bit - Determine whether a bit is set
++ * @nr: bit number to test
++ * @addr: Address to start counting from
++ */
++static inline int test_bit(unsigned int nr, const unsigned long *addr)
++{
++	unsigned long mask;
++
++	addr += nr >> 5;
++
++	mask = 1UL << (nr & 0x1f);
++
++	return ((mask & *addr) != 0);
++}
++#endif
++
++#ifdef __aarch64__
++/**
++ * test_bit - Determine whether a bit is set
++ * @nr: bit number to test
++ * @addr: Address to start counting from
++ */
++static inline int test_bit(int nr, const unsigned long *addr)
++{
++	unsigned long mask;
++
++	addr += BIT_WORD(nr);
++
++	mask = BITS_PER_LONG - 1;
++
++	return 1UL & (*addr >> (nr & mask));
++}
++#endif
++
++/**
+  * __ffs - find first bit in word.
+  * @word: The word to search
+  *
+diff --git a/include/const.h b/include/const.h
+new file mode 100644
+index 0000000..5253d5f
+--- /dev/null
++++ b/include/const.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _LINUX_CONST_H
++#define _LINUX_CONST_H
++
++/* const.h: Macros for dealing with constants.  */
++
++/* Some constant macros are used in both assembler and
++ * C code.  Therefore we cannot annotate them always with
++ * 'UL' and other type specifiers unilaterally.  We
++ * use the following macros to deal with this.
++ *
++ * Similarly, _AT() will cast an expression with a type in C, but
++ * leave it unchanged in asm.
++ */
++
++#ifdef __ASSEMBLY__
++#define _AC(X, Y)	X
++#define _AT(T, X)	X
++#else
++#define __AC(X, Y)	(X##Y)
++#define _AC(X, Y)	__AC(X, Y)
++#define _AT(T, X)	((T)(X))
++#endif
++
++#define _UL(x)		(_AC(x, UL))
++#define _ULL(x)		(_AC(x, ULL))
++
++#define _BITUL(x)	(_UL(1) << (x))
++#define _BITULL(x)	(_ULL(1) << (x))
++
++#define UL(x)		(_UL(x))
++#define ULL(x)		(_ULL(x))
++
++#endif /* _LINUX_CONST_H */

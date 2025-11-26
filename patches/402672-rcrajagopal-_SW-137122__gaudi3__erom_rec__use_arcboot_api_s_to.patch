@@ -1,0 +1,173 @@
+From c59029ed8c93b30fe25e7bd5810915402a12d000 Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Tue, 12 Mar 2024 14:03:49 +0200
+Subject: [PATCH] [SW-137122] gaudi3: erom rec: use arcboot api's to set boot info data
+
+Since boot_info_finalize_no_merge will not copy the old boot info data,
+explicitly copy the old boot info data using boot_info_sync_data() api.
+
+Use arcboot api to set a erom version and fw info in boot info, so that
+boot_info.ptrs.count will incremented along with existing boot info data
+and which will get finalized when boot_info_finalize_no_merge() is called.
+
+So added device specific function to set a erom version, fw info and
+boot info finalize.
+
+Change-Id: I6b485bb6d70c897e2312ae65a1397e8cae9b08d2
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index 57c9f45..de0c537 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -21,7 +21,6 @@
+ #include <uart.h>
+ 
+ #include <hl_i2c_indirect_protocol.h>
+-#include <gaudi2/i2c_indirect_protocol.h>
+ 
+ #define BTL_VER_PREFIX	"BTL version "
+ #define FUSE_VER_PREFIX	"Fuse version "
+@@ -179,7 +178,6 @@
+ 
+ void preboot_version(void)
+ {
+-	int err;
+ 	int j, i = 0, btl_ver_sz = 0;
+ 
+ 	preboot_puts("\n");
+@@ -192,10 +190,8 @@
+ 			break;
+ 	}
+ 
+-	err = boot_info_set(HL_BOOT_INFO_PREBOOT_BTL_VERSION, preboot_vers[PREBOOT_BTL_VER],
+-			    VERSION_MAX_LEN);
+-	if (err)
+-		preboot_puts("Failed to pass preboot BTL version securely\n");
++	hl_erom_boot_info_set_version(HL_BOOT_INFO_PREBOOT_BTL_VERSION,
++				preboot_vers[PREBOOT_BTL_VER], VERSION_MAX_LEN);
+ }
+ 
+ __weak void preboot_recovery_flag(bool en) { }
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 1a0dc9a..19a9a3b 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -1051,3 +1051,16 @@
+ 	memcpy(hash, (void *)(data + PPBOOT_HASH_MAGIC_SIZE), SHA384_SUM_LEN);
+ 	return true;
+ }
++
++void hl_erom_boot_info_set_version(u32 type, void *data, u32 size)
++{
++	if (hl_boot_info_set(type, data, size))
++		preboot_puts("Failed to pass preboot BTL version securely\n");
++}
++
++int hl_boot_info_finalize(void)
++{
++	boot_info_finalize();
++
++	return 0;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 515cd64..6ede63c 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1527,3 +1527,30 @@
+ 	if (tpm_pcr_extend(TPM2_PREBOOT_PCR_IDX, desc->chksum))
+ 		preboot_puts("PPBOOT: preboot pcr extend failed\n");
+ }
++
++void preboot_boot_info_init(void)
++{
++	/* boot info finalize does not merge old data hence copy and set it explicitly */
++	if (boot_info_sync_data())
++		preboot_puts("Failed to merge old boot info\n");
++}
++
++void hl_erom_boot_info_set_version(u32 type, void *data, u32 size)
++{
++	if (hl_boot_info_set(type, data, size))
++		preboot_puts("BOOT_INFO: Failed to set erom version\n");
++}
++
++void preboot_finalize_fw_info(void)
++{
++	fw_info.version = HL_FW_INFO_VERSION;
++	if (hl_boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info)))
++		preboot_puts("BOOT_INFO: Failed to set fw info\n");
++}
++
++int hl_boot_info_finalize(void)
++{
++	boot_info_finalize_no_merge();
++
++	return 0;
++}
+diff --git a/include/baremetal.h b/include/baremetal.h
+index 8de65fc..1821b17 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -287,6 +287,8 @@
+ bool hl_is_efuse_syscfg_dis_secondary_img_set(void);
+ void erom_efuse_init(void);
+ void hl_erom_bringup_pcie_link(void);
++void hl_erom_boot_info_set_version(u32 type, void *data, u32 size);
++int hl_boot_info_finalize(void);
+ 
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/lib/common/boot_info.c b/lib/common/boot_info.c
+index 3e7a59d..8f0975a 100644
+--- a/lib/common/boot_info.c
++++ b/lib/common/boot_info.c
+@@ -236,7 +236,7 @@
+ 		(struct hl_boot_info_ptrs *)BOOT_INFO_BASE;
+ 
+ 	if (ptrs->magic != HL_BOOT_INFO_MAGIC) {
+-		preboot_puts("Failed to read boot info root node (bad magic)");
++		preboot_puts("Failed to read boot info root node (bad magic)\n");
+ 		return 0;
+ 	}
+ 
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index fee6730..46fea22 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -1090,7 +1090,7 @@
+ 	preboot_finalize_fw_upd_closure();
+ 	preboot_finalize_enabled_caps();
+ 	preboot_finalize_uboot_override();
+-	boot_info_finalize();
++	hl_boot_info_finalize();
+ 	preboot_start_image(startaddr, valid_arc_img);
+ }
+ 
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index ad87577..8f3be9e 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -809,7 +809,7 @@
+ {
+ 	preboot_finalize_fw_info();
+ 	preboot_finalize_nic_en();
+-	boot_info_finalize();
++	hl_boot_info_finalize();
+ }
+ 
+ static void module_fwupd_run_noret_reset(void)
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index b411729..961301f 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -603,7 +603,7 @@
+ 	preboot_finalize_fw_info();
+ 	preboot_finalize_nic_en();
+ 	preboot_finalize_fw_upd_closure();
+-	boot_info_finalize();
++	hl_boot_info_finalize();
+ }
+ 
+ static void module_lkd_run_noret_reset(void)

@@ -1,0 +1,311 @@
+From c6b36514cb33f3d8a2acf32b5fac9f2c753261cf Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 03 May 2020 17:23:18 +0300
+Subject: [PATCH] [SW-12005] fit: use loadaddr provided in fit
+
+Now that the FIT image has its image load address inside, we can start
+using it.
+Replace usage of the hard coded load address and use the one provided by
+the FIT image.
+Since previousely the differences between Goya2 ARC and ARM were handled
+in compile time (the UBOOT_TEXT_BASE was defined per architecture),
+and now we are provided with the address in runtime, so we split the
+handling of it among architecture/platform specific files.
+
+Note: the split duplicates some code, but makes this work in runtime on
+      all platforms.
+
+TODO: introduce architecture specific paths, so we will not need to
+      duplicate the code among platforms.
+
+Change-Id: I1049eaa9e23c7c65392c0adb28a1deb10c2f16fc
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index c2d57b9..1822777 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -77,6 +77,7 @@
+ void module_lkd_disable(void);
+ void module_lkd_run(void);
+ void module_lkd_run_noret(void);
++void uboot_start(u64 loadaddr);
+ 
+ /* UART */
+ enum cmd_check_res module_uart_check(void);
+diff --git a/common/fit.c b/common/fit.c
+index 67d6b07..8b9ffb3 100644
+--- a/common/fit.c
++++ b/common/fit.c
+@@ -8,6 +8,7 @@
+ #include <libfdt.h>
+ #include "common.h"
+ #include "uart.h"
++#include "fit.h"
+ 
+ #define FIT_IMAGES_PATH		"/images"
+ #define FIT_CONFS_PATH		"/configurations"
+@@ -16,6 +17,7 @@
+ #define FIT_DESC_PROP		"description"
+ #define FIT_LOADABLE_PROP	"loadables"
+ #define FIT_DATA_PROP		"data"
++#define FIT_LOADADDR_PROP	"loadaddr"
+ 
+ static const char *fit_loadables_name(const void *fit, int noffset, int id)
+ {
+@@ -76,10 +78,12 @@
+ 	return 1;
+ }
+ 
+-int fit_load_uboot(const void *fit, void *dst)
++int fit_load_uboot(const void *fit, u64 *dest)
+ {
+ 	int node, len;
+ 	const u8 *buf;
++	const u32 *loadaddr;
++	u64 dst = 0;
+ 
+ 	node = fit_loadables_node_get(fit, 0);
+ 	if (node < 0) {
+@@ -87,13 +91,23 @@
+ 		return 1;
+ 	}
+ 
++	loadaddr = fdt_getprop(fit, node, FIT_LOADADDR_PROP, &len);
++	if (!loadaddr || len != sizeof(u64)) {
++		preboot_puts("Wrong FIT format: no uboot loadaddr\n");
++		return 1;
++	}
++
++	dst = ((u64)fdt32_to_cpu(loadaddr[0])) << 32;
++	dst |= fdt32_to_cpu(loadaddr[1]);
++
+ 	buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
+ 	if (!buf) {
+ 		preboot_puts("Wrong FIT format: uboot data empty\n");
+ 		return 1;
+ 	}
+ 
+-	memcpy(dst, buf, len);
++	fit_copy_image(dst, buf, len);
++	*dest = dst;
+ 
+ 	return 0;
+ }
+diff --git a/common/fit.h b/common/fit.h
+index 2311f9d..f02271b 100644
+--- a/common/fit.h
++++ b/common/fit.h
+@@ -8,7 +8,8 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
+-int fit_load_uboot(const void *fit, void *dst);
++int fit_load_uboot(const void *fit, u64 *dest);
+ int fit_check_format(const void *fit);
++void fit_copy_image(u64 dst, const void *buf, int len);
+ 
+ #endif /* _HL_FIT_H_ */
+diff --git a/common/module_lkd.c b/common/module_lkd.c
+index 898bfb3..a0bd721 100644
+--- a/common/module_lkd.c
++++ b/common/module_lkd.c
+@@ -15,6 +15,7 @@
+ struct lkd_status {
+ 	int fit_not_checked;	/* negative logic */
+ 	u32 msg_reg_val;
++	u64 loadaddr;
+ };
+ 
+ static struct lkd_status sts = {
+@@ -69,11 +70,10 @@
+ {
+ 	int err;
+ 	void *fit = (void *)UBOOT_FIT_BASE;
+-	void *dst = (void *)UBOOT_TEXT_BASE;
+ 
+ 	err = !fit_check_format(fit);
+ 	if (!err)
+-		err = fit_load_uboot(fit, dst);
++		err = fit_load_uboot(fit, &sts.loadaddr);
+ 
+ 	if (err) {/* Report the FIT is bad */
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+@@ -86,13 +86,6 @@
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, false);
+ }
+ 
+-__attribute__((weak)) void uboot_start(void)
+-{
+-	void (*uboot_entry)(void) = (void *)UBOOT_TEXT_BASE;
+-
+-	uboot_entry();
+-}
+-
+ void module_lkd_run_noret(void)
+ {
+ 	switch (sts.msg_reg_val) {
+@@ -101,7 +94,7 @@
+ 		wfe();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
+-		uboot_start();
++		uboot_start(sts.loadaddr);
+ 		/* no break */
+ 	default:
+ 		break;
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 1e85fcc..fc08060 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -211,6 +211,13 @@
+ 	preboot_puts("5\n");
+ }
+ 
++void uboot_start(u64 loadaddr)
++{
++	void (*uboot_entry)(void) = (void *)loadaddr;
++
++	uboot_entry();
++}
++
+ void preboot_start(u64 loadaddr)
+ {
+ 	void (*preboot_start)(void) = (void *)loadaddr;
+@@ -218,6 +225,14 @@
+ 	preboot_start();
+ }
+ 
++void fit_copy_image(u64 dst, const void *buf, int len)
++{
++	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
++	preboot_puth((u32)dst, false);
++
++	memcpy((void *)dst, buf, len);
++}
++
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	preboot_puts_hex_raw("Preboot loadaddr: ",
+diff --git a/goya/common.c b/goya/common.c
+index e6b09ac..4a27239 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -168,6 +168,13 @@
+ 
+ void hl_plat_init(void) {}
+ 
++void uboot_start(u64 loadaddr)
++{
++	void (*uboot_entry)(void) = (void *)loadaddr;
++
++	uboot_entry();
++}
++
+ void preboot_start(u64 loadaddr)
+ {
+ 	void (*preboot_start)(void) = (void *)loadaddr;
+@@ -175,6 +182,14 @@
+ 	preboot_start();
+ }
+ 
++void fit_copy_image(u64 dst, const void *buf, int len)
++{
++	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
++	preboot_puth((u32)dst, false);
++
++	memcpy((void *)dst, buf, len);
++}
++
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	preboot_puts_hex_raw("Preboot loadaddr: ",
+diff --git a/goya2/common.c b/goya2/common.c
+index 2aa541b..2895c0d 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -225,6 +225,13 @@
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+ 
++void uboot_start(u64 loadaddr)
++{
++	void (*uboot_entry)(void) = (void *)loadaddr;
++
++	uboot_entry();
++}
++
+ void preboot_start(u64 loadaddr)
+ {
+ 	void (*preboot_start)(void) = (void *)loadaddr;
+@@ -232,6 +239,14 @@
+ 	preboot_start();
+ }
+ 
++void fit_copy_image(u64 dst, const void *buf, int len)
++{
++	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
++	preboot_puth((u32)dst, false);
++
++	memcpy((void *)dst, buf, len);
++}
++
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	preboot_puts_hex_raw("Preboot loadaddr: ",
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index 77a7f29..cf89b84 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -22,6 +22,7 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <string.h>
+ 
+ #include "common.h"
+ 
+@@ -223,9 +224,20 @@
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+ 
+-void uboot_start(void)
++void fit_copy_image(u64 dst, const void *buf, int len)
+ {
+-	unsigned int lsb = 0xf0000000 | UBOOT_TEXT_BASE, msb = 0x7f;
++	/* Prepare the ARC SRAM address */
++	u32 arc_dst = ((u32)dst & 0xFFFFFFF) | BIT(28);
++
++	preboot_puts_hex("FIT loadaddr: ", arc_dst, false);
++
++	memcpy((void *)arc_dst, buf, len);
++}
++
++void uboot_start(u64 loadaddr)
++{
++	u32 lsb = (u32)loadaddr, msb = (u32)(loadaddr >> 32);
++
+ 	/* Set CPU0 Reset address to U-Boot */
+ 	regmap_writel(lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_0);
+ 	regmap_writel(msb, mmCPU_CA53_CFG_RST_ADDR_MSB_0);
+diff --git a/include/preboot.h b/include/preboot.h
+index 8d3a7f2..5ace7a0 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -15,7 +15,6 @@
+ #define HL_SPI_BASE				0x1A000000
+ #define HL_CFG_BASE				0xFC000000
+ #define SDRAM_BASE				0x10000000
+-#define UBOOT_TEXT_BASE				0x10100000
+ #define UBOOT_FIT_BASE				0x10200000
+ 
+ #define wfe()	__asm__ __volatile__("sleep 0x11\n\t" : : )
+@@ -25,7 +24,6 @@
+ #define HL_SPI_BASE				0x7FF8000000ull
+ #define HL_CFG_BASE				0x7FFC000000ull
+ #define SDRAM_BASE				0x7FF0000000ull
+-#define UBOOT_TEXT_BASE				0x7FF0100000ull
+ #define UBOOT_FIT_BASE				0x7FF0200000ull
+ 
+ #define wfe()	__asm__ __volatile__ ("wfe\n\t" : : )

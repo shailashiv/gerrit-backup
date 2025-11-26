@@ -1,0 +1,69 @@
+From fa3a7169f560f992e6c6ea614a167adf54c2b2ca Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 28 Jun 2021 16:16:25 +0300
+Subject: [PATCH] [SW-47071] gaudi: sec: protecting stlb block regs
+
+Using protection bits to block access to chosen registers inside
+STLB block.
+
+Change-Id: Iad6f110f1b96c07b2442e588f6454141b641f94d
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 2d2fded..273d785 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -33,6 +33,7 @@
+ #include <sync_mngr_w_s_regs.h>
+ #include <gic_regs.h>
+ #include <mmu_up_regs.h>
++#include <stlb_regs.h>
+ 
+ #include <cpu_if_masks.h>
+ #include <psoc_global_conf_masks.h>
+@@ -868,6 +869,33 @@
+ 	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX - (prot_base - base));
+ }
+ 
++void preboot_secure_stlb(void)
++{
++	u32 mask, prot_base, base = mmSTLB_BASE & ~HL_CFG_BASE;
++
++	/* blocking regs within offsets: 0 - 0x80 */
++	prot_base = base;
++	mask = (PROT_BIT(mmSTLB_STLB_FEATURE_EN) |
++		PROT_BIT(mmSTLB_STLB_AXI_CACHE) |
++		PROT_BIT(mmSTLB_HOP_CONFIGURATION) |
++		PROT_BIT(mmSTLB_LINK_LIST) |
++		PROT_BIT(mmSTLB_MEM_CACHE_CONFIG) |
++		PROT_BIT(mmSTLB_SET_THRESHOLD_HOP0) |
++		PROT_BIT(mmSTLB_SET_THRESHOLD_HOP1) |
++		PROT_BIT(mmSTLB_SET_THRESHOLD_HOP2) |
++		PROT_BIT(mmSTLB_SET_THRESHOLD_HOP3) |
++		PROT_BIT(mmSTLB_SET_THRESHOLD_HOP4));
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	/* leaving 1 reg unblocked within offsets: 0x80 - 0x100 */
++	prot_base += SNGL_REG_PROT_SIZE;
++	mask = ~(PROT_BIT(mmSTLB_MEM_READ_ARPROT));
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x100 - 0xF80 */
++	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX - (prot_base - base));
++}
++
+ static void preboot_secure_pci(void)
+ {
+ 	/* Protect PCIE_WRAP - 4K */
+@@ -876,8 +904,8 @@
+ 	/* protect registers in MMU_UP */
+ 	preboot_secure_mmu_up();
+ 
+-	/* protect STLB priv and conf bits */
+-	set_prot_bits_priv_int_conf(mmSTLB_BASE);
++	/* protect registers in STLB */
++	preboot_secure_stlb();
+ 
+ 	/* The rest is protected by RRs */
+ }

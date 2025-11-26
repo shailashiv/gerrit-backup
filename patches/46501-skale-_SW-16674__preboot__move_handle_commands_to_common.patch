@@ -1,0 +1,146 @@
+From 67345b4b16ebba547af203b7fadccadc0a1c41af Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 06 Aug 2020 12:28:24 +0300
+Subject: [PATCH] [SW-16674] preboot: move handle commands to common
+
+Since handle commands function will also be used by recovery image
+along with preboot, move to common folder.
+
+Change-Id: Ida2de800f3687096c0b42bfc2478f4b1899a32a6
+---
+
+diff --git a/common/cmd_module.c b/common/cmd_module.c
+new file mode 100644
+index 0000000..8e5e2a5
+--- /dev/null
++++ b/common/cmd_module.c
+@@ -0,0 +1,56 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * (C) Copyright 2020 HabanaLabs, Ltd.
++ * All rights reserved.
++ *
++ */
++
++#include <preboot.h>
++
++#include "uart.h"
++#include "cmd_module.h"
++
++void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size)
++{
++	int i = 0, j = 0;
++	enum cmd_check_res res = NOT_FOUND;
++
++	for (j = 0; j < size; j++)
++		cmd_ops[j].setup();
++
++	preboot_puts("Waiting for commands...\n");
++	i = 0;
++	while (1) {
++		res = cmd_ops[i].check();
++		switch (res) {
++		case NOT_FOUND:
++			break;
++		case FOUND_FAST_RETURN:
++			cmd_ops[i].run_fast();
++			break;
++		case FOUND_SLOW_RETURN:
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].disable();
++
++			cmd_ops[i].run();
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].enable();
++
++			break;
++		case FOUND_NO_RETURN:
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].teardown();
++
++			cmd_ops[i].run_noreturn();
++			break;
++		default:
++			break;
++		}
++
++		if (++i == size)
++			i = 0;
++	}
++}
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 7f07d69..bfb88f3 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -93,4 +93,5 @@
+ void module_i2c_s_run_fast(void);
+ void module_i2c_s_teardown(void);
+ 
++void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
+ #endif /* _HL_CMD_MODULE_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 881f3ad..3f95bf1 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -72,51 +72,6 @@
+ 	},
+ };
+ 
+-static void preboot_handle_cmds(void)
+-{
+-	int i = 0, j = 0, size = ARRAY_SIZE(cmd_ops);
+-	enum cmd_check_res res = NOT_FOUND;
+-
+-	for (j = 0; j < size; j++)
+-		cmd_ops[j].setup();
+-
+-	preboot_puts("Waiting for commands...\n");
+-	i = 0;
+-	while (1) {
+-		res = cmd_ops[i].check();
+-		switch (res) {
+-		case NOT_FOUND:
+-			break;
+-		case FOUND_FAST_RETURN:
+-			cmd_ops[i].run_fast();
+-			break;
+-		case FOUND_SLOW_RETURN:
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].disable();
+-
+-			cmd_ops[i].run();
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].enable();
+-
+-			break;
+-		case FOUND_NO_RETURN:
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].teardown();
+-
+-			cmd_ops[i].run_noreturn();
+-			break;
+-		default:
+-			break;
+-		}
+-
+-		if (++i == size)
+-			i = 0;
+-	}
+-}
+-
+ static const char *preboot_ver_str = "Preboot " VERSION_STR;
+ static char preboot_btl_ver_str[VERSION_MAX_LEN] = "BTL version ";
+ 
+@@ -171,5 +126,5 @@
+ 	hl_uart_init();
+ 	hl_ts_init();
+ 	preboot_version();
+-	preboot_handle_cmds();
++	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }

@@ -1,0 +1,267 @@
+From 69669782cc0d0f45bd6da9b9730cbdef0ecce1b8 Mon Sep 17 00:00:00 2001
+From: Erez Shaul <eshaul@habana.ai>
+Date: Thu, 01 Aug 2024 17:31:59 +0300
+Subject: [PATCH] [FSW-2067] fs1: phy fw prepare & copy
+
+- parse the pcie phy hex file provided from the vendor
+  into 2 parts: csr location & sram locations
+- store csr locations as a const in a auto generated header
+- store sram locations as a binary that is concatenated
+  to the ppboot.bin
+- copy csr locations data to phy memory using memcopy
+- copy sram locations data to phy memory using memcopy engine
+- ref: see PCIe PHY FW upgrade requirements doc in jira ticket
+
+Change-Id: I1d7e776cf915fb546fe2f5fc920fbfd97bb7e50e
+Signed-off-by: Erez Shaul <eshaul@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 8fd37c6..008fb1a 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -32,6 +32,7 @@
+ #include <tran_chk_lbw_regs.h>
+ #include <tran_chk_lbw_masks.h>
+ #include <pmmu_pcie_wrap_regs.h>
++#include <pcie_fw_sram_regs.h>
+ #include <fs1_blocks_linux_driver.h>
+ #include <fs1_security.h>
+ #include <string.h>
+@@ -48,6 +49,9 @@
+ #include <boot_desc.h>
+ #include "common.h"
+ #include "hl.h"
++#include "auto_gen_pcie_phy_csr_locations.h"
++
++extern unsigned long __SDATA_LOAD;
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -513,3 +517,42 @@
+ 
+ 	return 0;
+ }
++
++// based on lkd_dev_spec_get_img_addr from preboot
++static u64 get_64bit_addr_from_32bit_addr(uintptr_t base)
++{
++	if (base >= SP_SRAM_BASE && base < SP_SRAM_BASE + HL_SP_SRAM_SIZE)
++		return (base & ~SP_SRAM_BASE) + HL_SP_SRAM_BASE;
++
++	if (base >= FW_SRAM_BASE && base < FW_SRAM_BASE + HL_FW_SRAM_SIZE)
++		return (base & ~FW_SRAM_BASE) + HL_FW_SRAM_FULL_BASE;
++
++	if (base >= ARC_MNG_ICCM_BASE && base < ARC_MNG_ICCM_BASE + ARC_MNG_ICCM_SIZE)
++		return (base & ~ARC_MNG_ICCM_BASE) + ARC_MNG_ICCM_FULL_BASE;
++
++	if (base >= 0 && base < ARC_MNG_ICCM_SIZE)
++		return (base & ~ARC_MNG_ICCM_BASE) + ARC_MNG_ICCM_FULL_BASE;
++
++	preboot_puts_raw(__func__);
++	preboot_puts(": error - unsupported addr\n");
++
++	return 0;
++}
++
++#define ALIGN_TO_16_BYTES(addr) (((addr) + 15) & ~0xF)
++#define PPBOOT_LAST_ADDR ((uint32_t) (&__SDATA_LOAD))
++
++void hl_init_pcie_phy_fw(void)
++{
++	// sram_loc_addr located at PPBOOT_LAST_ADDR, aligned to 16 bytes
++	uint32_t sram_loc_addr = ALIGN_TO_16_BYTES(PPBOOT_LAST_ADDR);
++	const uint32_t *csr_loc_data = get_csr_locations();
++
++	// Copy SRAM_LOCATIONS to PCIE_FW_SRAM_BASE
++	fs1_mem_copy(get_64bit_addr_from_32bit_addr(sram_loc_addr),
++		    HL_PCIE_FW_SRAM_BASE_FULL,
++		    (uint32_t)PHY_FW_SIZE, false);
++
++	//Copy CSR_LOC_DATA to PCIE_FW_CSR_BASE
++	memcpy((void *)PCIE_FW_CSR_BASE, (const void *)csr_loc_data, get_csr_locations_size());
++}
+diff --git a/arch/fs1/arc/common.h b/arch/fs1/arc/common.h
+index 17ee764..d1a3bb7 100644
+--- a/arch/fs1/arc/common.h
++++ b/arch/fs1/arc/common.h
+@@ -45,7 +45,10 @@
+ /* CFG is at Arc region F, specs CFG base address is 0x70000000. 7+8 = 0xF */
+ #define HL_CFG_BASE			0x80000000
+ #define FW_MEM_REGION_BASE		0x78800000 /* IO Die0 Half0 FW memories */
+-#define PCIE_FW_SRAM_BASE		(FW_MEM_REGION_BASE + 0x380000)
++#define PCIE_FW_SRAM_BASE		(HL_CFG_BASE + mmIO_0_CFG_HALF_0_FW_MEM_PCIE_FW_SRAM_BASE +\
++					 mmPCIE_FW_SRAM_SRAM_LOCATIONS)
++#define PCIE_FW_CSR_BASE		(HL_CFG_BASE + mmIO_0_CFG_HALF_0_FW_MEM_PCIE_FW_SRAM_BASE +\
++					 mmPCIE_FW_SRAM_CSR_LOCATIONS)
+ #define FW_SRAM_BASE			(FW_MEM_REGION_BASE + 0x1A0000)
+ #define SP_SRAM_BASE			(FW_MEM_REGION_BASE + 0x200000)
+ #define ARC_MNG_ICCM_BASE		(FW_MEM_REGION_BASE + 0x40000)
+diff --git a/arch/fs1/arc/pcie_phy_fw.mk b/arch/fs1/arc/pcie_phy_fw.mk
+index 68757ba..c4d8b56 100644
+--- a/arch/fs1/arc/pcie_phy_fw.mk
++++ b/arch/fs1/arc/pcie_phy_fw.mk
+@@ -1 +1,9 @@
+-PHY_FW_SIZE := 0x9480
++PHY_FW_SIZE := 0x4920
++
++.PHONY: parse_pcie_phy_fw
++parse_pcie_phy_fw:
++	@echo "Current path: $(CURDIR)"
++	python $(HL_DEV_ARCH)/pcie_phy_fw_parser.py $(HL_DEV_ARCH)/pcie_phy_fw.hex $(HL_DEV_ARCH) $(CURDIR)/bin
++
++# Add the target as a dependency to ensure it runs
++all: parse_pcie_phy_fw
+diff --git a/arch/fs1/arc/pcie_phy_fw_parser.py b/arch/fs1/arc/pcie_phy_fw_parser.py
+new file mode 100644
+index 0000000..c0ee638
+--- /dev/null
++++ b/arch/fs1/arc/pcie_phy_fw_parser.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier:     GPL-2.0+
++#
++# (C) Copyright 2023 HabanaLabs, Ltd.
++
++import sys
++import os
++
++MSB_ADDRESS_MASK = 0x80000000
++
++def extract_sram_locations_from_hex(hex_file_path, target_binary_file_path):
++	try:
++		with open(hex_file_path, 'r') as file:
++			hex_data = file.read().strip()
++
++			parsed_data = []
++			for line in hex_data.split('\n'):
++				if line.strip() != '':
++					address_s, data_s = line.strip().split(',')
++					address = int(address_s, 16)
++					data = int(data_s, 16)
++
++					# Extract the SRAM locations from the hex file
++					if (address & MSB_ADDRESS_MASK) == MSB_ADDRESS_MASK:
++						parsed_data.append(data)
++
++			# Create a binary file with the parsed_data
++			generated_bin_file_path = target_binary_file_path +\
++   						  ('/' if target_binary_file_path else '') +\
++           					  'pcie_phy_fw.bin'
++			with open(generated_bin_file_path, 'wb') as bin_file:
++				for data in parsed_data:
++					bin_file.write(data.to_bytes(4, 'little'))
++
++			print(f"Binary file '{generated_bin_file_path}' created successfully.")
++
++			# Get the size of the binary file
++			binary_file_size = os.path.getsize(generated_bin_file_path)
++			print(f"Size of binary file '{generated_bin_file_path}': {binary_file_size} bytes.")
++			return binary_file_size
++
++	except FileNotFoundError:
++		print(f"Error: File '{hex_file_path}' not found.")
++		return None
++
++def extract_csr_locations_from_hex(hex_file_path, target_header_file_path):
++	try:
++		with open(hex_file_path, 'r') as file:
++			hex_data = file.read().strip()
++
++			parsed_data = []
++			lines_count = 0
++			size_of_csr_locations = 0
++			for line in hex_data.split('\n'):
++				lines_count += 1
++				if line.strip() != '':
++					address_s, data_s = line.strip().split(',')
++					address = int(address_s, 16)
++					data = int(data_s, 16)
++
++     					# Extract the CSR locations from the hex file
++					if (address & MSB_ADDRESS_MASK) != MSB_ADDRESS_MASK:
++						size_of_csr_locations+=8
++						parsed_data.append(data)
++						parsed_data.append(address)
++
++			print(f"Lines count: {lines_count}")
++			print(f"Size of CSR locations: {size_of_csr_locations}B")
++
++			# Create a header file with const array of the parsed csr locations data
++			generated_h_file_path = target_header_file_path + \
++						('/' if target_header_file_path else '') + \
++						'auto_gen_pcie_phy_csr_locations.h'
++			with open(generated_h_file_path, 'w') as h_file:
++
++				h_file.write('////////////////////////////////\n')
++				h_file.write('// This file is auto-generated\n')
++				h_file.write('////////////////////////////////\n\n')
++
++				h_file.write('#pragma once\n\n')
++
++				h_file.write('#include <stdint.h>\n\n')
++
++				h_file.write(f'const size_t csr_locations_size = {len(parsed_data)};\n')
++				h_file.write('const uint32_t csr_locations[] = {\n')
++				for i in range(0, len(parsed_data), 2):
++					data = parsed_data[i]
++					address = parsed_data[i+1]
++					h_file.write(f'\t0x{data:08X},0x{address:08X},\n')
++				h_file.write('};\n\n')
++
++				h_file.write('size_t get_csr_locations_size() {\n')
++				h_file.write('	return csr_locations_size;\n')
++				h_file.write('}\n\n')
++
++				h_file.write('const uint32_t* get_csr_locations() {\n')
++				h_file.write('	return csr_locations;\n')
++				h_file.write('}\n\n')
++
++			print(f"h file '{generated_h_file_path}' created successfully.")
++
++
++	except FileNotFoundError:
++		print(f"Error: File '{hex_file_path}' not found.")
++		return None
++
++
++if __name__ == "__main__":
++	print("~~~~~~~~~~~~~~~~~~~~~~~~~~~")
++	print("~  pcie_phy_fw_parser.py  ~")
++	print("~~~~~~~~~~~~~~~~~~~~~~~~~~~")
++	# Parse the command line arguments
++	if len(sys.argv) < 4:
++		print("Error: Insufficient command line arguments.")
++		print("Usage: python pcie_phy_fw_parser.py" + \
++          			     " " + "<hex_file_path>" + \
++                  		     " " + "<target_header_file_path>" + \
++                		     " " + "<target_binary_file_path>")
++		sys.exit(1)
++
++	# Extract the command line arguments
++	hex_file_path = sys.argv[1]
++	target_header_file_path = sys.argv[2]
++	target_binary_file_path = sys.argv[3]
++
++	if not os.path.exists(hex_file_path):
++		print(f"Error: File '{hex_file_path}' not found - existing.")
++		sys.exit(1)
++
++	# Call the functions to extract CSR and SRAM locations from the hex file
++	extract_csr_locations_from_hex(hex_file_path, target_header_file_path)
++	phy_sram_loc_size = extract_sram_locations_from_hex(hex_file_path, target_binary_file_path)
++
++	print(f"phy_sram_loc_size = {phy_sram_loc_size} Bytes.")
+\ No newline at end of file
+diff --git a/arch/fs1/arc/ppboot.lds.S b/arch/fs1/arc/ppboot.lds.S
+index 1906acc..94feb98 100644
+--- a/arch/fs1/arc/ppboot.lds.S
++++ b/arch/fs1/arc/ppboot.lds.S
+@@ -53,6 +53,8 @@
+ 		_esdata = . ;
+         } > REGION_SDATA
+ 
++	__SDATA_LOAD = LOADADDR(.data) + SIZEOF(.data);
++
+ 	.bss : {
+ 		. = ALIGN(8);
+ 		__bss_start = . ;

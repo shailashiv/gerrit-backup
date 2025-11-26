@@ -1,0 +1,135 @@
+From 9b331998d91d6adb7c88fad9ea05f9b48438d706 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 12 Oct 2020 22:16:58 +0300
+Subject: [PATCH] [SW-0] goya2: pcie: add timeout in pcie link up status
+
+Currently we are waiting indefinitely for PCIe link up status and
+the control doesn't reach to preboot in case PCIe link up is not up
+for any reasons. In such scenario, there is requirement to reach
+control to preboot to handle i2c commands even if PCIe link is not
+established. This patch add changes to add timeout of 5 seconds for
+PCIe link up and proceed with preboot in case link is not up within
+defined timeout.
+
+Change-Id: I7632273b2f0197de5a1813c1ca62a96819cf7481
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 05e511e..b7fd759 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -181,8 +181,10 @@
+ 		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+ 
+-		if (prstn && smlh && rdlh)
++		if (prstn && smlh && rdlh) {
++			preboot_puts("PCIe link is UP!\n");
+ 			break;
++		}
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+diff --git a/goya/common.c b/goya/common.c
+index 4caf0da..af19f19 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -129,8 +129,10 @@
+ 			regmap_writel(1, mmPCIE_AUX_LTSSM_EN);
+ 		}
+ 
+-		if (prstn && smlh && rdlh)
++		if (prstn && smlh && rdlh) {
++			preboot_puts("PCIe link is UP!\n");
+ 			break;
++		}
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+diff --git a/goya2/common.c b/goya2/common.c
+index 7456547..b5fef08 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -147,12 +147,16 @@
+ 
+ void preboot_pcie_wait_for_link(void)
+ {
++	u8 retry = HL_PCIE_LINK_RETRIES;
++
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+ 		;
+ 
+ 	/* Only after PRSTn is de-asserted */
+ 	preboot_pcie_enable();
++
++	preboot_puts("Waiting for PCIe UP status\n");
+ 
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+@@ -162,8 +166,23 @@
+ 		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+ 
+-		if (prstn && smlh && rdlh)
++		if (prstn && smlh && rdlh) {
++			preboot_puts("PCIe link is UP!\n");
+ 			break;
++		}
++
++		/*
++		 * Do not wait indefinitely on PCIe link up status
++		 * Wait for 5 seconds (50 retries with 100 milli-
++		 * seconds sleep), else bailout.
++		 */
++		retry--;
++		if (!retry) {
++			preboot_puts("Timed-out waiting for PCIe link UP!\n");
++			break;
++		}
++
++		udelay(100000);
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+diff --git a/goya2/common.h b/goya2/common.h
+index e40f34c..689a5d7 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -22,6 +22,8 @@
+ #define ARC_RST_VALUE			0x110
+ #define ARC_RST_VEC_ADDR		0x0
+ 
++#define HL_PCIE_LINK_RETRIES		50
++
+ /*
+  * Set ARCs in halt state before reset
+  * 1. Set halt bit in RUN_HALT_REQ register
+diff --git a/goya2_arc/common.c b/goya2_arc/common.c
+index 548ecce..5ad8c4a 100644
+--- a/goya2_arc/common.c
++++ b/goya2_arc/common.c
+@@ -174,8 +174,10 @@
+ 		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+ 
+-		if (prstn && smlh && rdlh)
++		if (prstn && smlh && rdlh) {
++			preboot_puts("PCIe link is UP!\n");
+ 			break;
++		}
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+index 1d6b7f1..928ece2 100644
+--- a/ppboot/ppboot.c
++++ b/ppboot/ppboot.c
+@@ -129,7 +129,6 @@
+ 	/* let the log be device specific according to its restrictions */
+ 	ppboot_log_waiting_for_pcie();
+ 	preboot_pcie_wait_for_link();
+-	preboot_puts("PCIe link is UP!\n");
+ }
+ 
+ __weak bool hl_is_jtag_enabled(void)

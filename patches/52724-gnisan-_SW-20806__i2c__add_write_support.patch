@@ -1,0 +1,340 @@
+From 4abf0bbb36431194d9a563870d6581699dd5558f Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 23 Sep 2020 18:22:30 +0300
+Subject: [PATCH] [SW-20806] i2c: add write support
+
+In order to support loading firmware via I2C it is needed to add I2C
+write support to I2C module.
+
+This patch introduces basic i2c write support which does not process the
+written data but rather just removing it from the queue and call a write
+stub function.
+
+The I2C module was refactored in order to optimize the write procedure
+so that the HW queue will not overflow.
+
+Change-Id: I0743e12666d680940e2ada47669dfd214ddaeb8a
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 9ad75ff..dffe337 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -21,9 +21,28 @@
+ #include "common.h"
+ #include "module_i2c_slave.h"
+ 
+-static struct module_i2c_data data;
++struct i2cslave_seq {
++	u32 rd;
++	u32 wr;
++};
+ 
+-static void hl_i2c_slave_init(bool debug_mode)
++struct i2cslave_buf {
++	u8 *data;
++	u8 cmd;
++	u8 cnt;
++};
++
++struct i2cslave_data {
++	struct i2cslave_seq seq;
++	struct i2cslave_buf buf;
++};
++
++static struct i2cslave_data i2cs_data = {
++	.buf = { .data = &i2cs_data.buf.cmd },
++	.seq = { .wr = 1 },
++};
++
++static void i2cslave_init(bool debug_mode)
+ {
+ 	/* Check if already enabled */
+ 	if (regmap_readl(mmPSOC_I2C_S_IC_ENABLE)) {
+@@ -57,9 +76,9 @@
+ 	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+ }
+ 
+-static u32 i2c_dw_read_clear_intrbits_slave(void)
++static u32 i2cslave_dw_read_clear_intrbits_slave(void)
+ {
+-	u32 stat;
++	register u32 stat;
+ 
+ 	/*
+ 	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
+@@ -119,7 +138,7 @@
+ 
+ 	debug_mode = hl_is_debug_mode(HL_DEBUG_HW_I2C);
+ 
+-	hl_i2c_slave_init(debug_mode);
++	i2cslave_init(debug_mode);
+ 
+ 	if (!debug_mode) {
+ 		i2cslave_flush();
+@@ -132,20 +151,18 @@
+ 
+ enum cmd_check_res module_i2c_s_check(void)
+ {
+-	enum cmd_check_res res = NOT_FOUND;
+ 	u32 stat;
+ 
+ 	if (hl_is_debug_mode(HL_DEBUG_HW_I2C))
+-		return res;
++		return NOT_FOUND;
+ 
+-	i2c_dw_read_clear_intrbits_slave();
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++	stat = i2cslave_dw_read_clear_intrbits_slave();
+ 
+ 	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
+ 	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		res = FOUND_SLOW_RETURN;
++		return FOUND_SLOW_RETURN;
+ 
+-	return res;
++	return NOT_FOUND;
+ }
+ 
+ void module_i2c_s_disable(void)
+@@ -157,12 +174,12 @@
+ 	preboot_puts("I2C SLAVE: disabled\n");
+ }
+ 
+-u8 i2cslave_pcie_vendor_id_cmd(u8 command_idx)
++u8 i2cslave_pcie_vendor_id_cmd(u8 cmd)
+ {
+ 	u8 ret;
+ 	u32 data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+ 
+-	switch (command_idx) {
++	switch (cmd) {
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+ 		data &= 0xFFFF;
+ 		ret = (data & 0xFF00) >> 8;
+@@ -179,32 +196,111 @@
+ 	return ret;
+ }
+ 
++static inline u8 *i2cslave_consume_hw(u8 *data)
++{
++	if (data) {
++		*data = (u8)regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
++		data++;
++	} else {
++		/*
++		 * No data buffer - just consume. This may happens when the
++		 * upper layer expect a request data but does not need it.
++		 */
++		(void)regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
++	}
++
++	return data;
++}
++
++static inline u32 i2cslave_produce_handler(struct i2cslave_buf *buf)
++{
++	register u32 seq_wr;
++
++	/* Notify upper layer */
++	seq_wr = i2cslave_handle_write_req(buf->cmd, &buf->data, buf->cnt);
++
++	if (seq_wr) {
++		buf->cnt++;
++	} else {
++		/* Upper layer finished it's process, reset buffer */
++		buf->data = &i2cs_data.buf.cmd;
++		buf->cnt = 0;
++		seq_wr = 1;
++	}
++
++	return seq_wr;
++}
++
++static void module_i2c_s_do_write(void)
++{
++	register struct i2cslave_seq seq = i2cs_data.seq;
++	register u8 *data = i2cs_data.buf.data;
++
++	/* Next read will start from offset 0 */
++	seq.rd = 0;
++
++	do {
++		/* Consume data as long as we expect it */
++		if (seq.wr) {
++			seq.wr--;
++			data = i2cslave_consume_hw(data);
++		}
++		/* Additional data is not expected, produce data */
++		if (!seq.wr) {
++			seq.wr = i2cslave_produce_handler(&i2cs_data.buf);
++			data = i2cs_data.buf.data;
++		}
++	} while (regmap_readl(mmPSOC_I2C_S_IC_RXFLR));
++
++	i2cs_data.seq = seq;
++	i2cs_data.buf.data = data;
++}
++
++static inline u8 i2cslave_consume_handler(void)
++{
++	u8 ret = i2cslave_handle_read_req(i2cs_data.buf.cmd, i2cs_data.seq.rd);
++
++	i2cs_data.seq.rd++; /* For next sequential read */
++
++	/* Check if we are in the middle of write request processing */
++	if (i2cs_data.buf.cnt) {
++		preboot_puts("I2C SLAVE: sync error\n");
++		i2cslave_handle_sync_error();
++
++		/* Reset buffer */
++		i2cs_data.seq.wr = 1;
++		i2cs_data.buf.data = &i2cs_data.buf.cmd;
++		i2cs_data.buf.cnt = 0;
++	}
++	return ret;
++}
++
++static inline void i2cslave_produce_hw(u8 data)
++{
++	regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
++	regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
++	regmap_writel(data, mmPSOC_I2C_S_IC_DATA_CMD);
++}
++
++static void module_i2c_s_do_read(void)
++{
++	u8 data = i2cslave_consume_handler();
++
++	i2cslave_produce_hw(data);
++}
++
+ void module_i2c_s_run(void)
+ {
+-	u32 stat;
+-	u8 ret;
++	u32 stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+ 
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) {
+-		if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK) {
+-			data.read_bytes_count = 0;
+-
+-			data.cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
+-
+-			/* clear read request */
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+-			stat = i2c_dw_read_clear_intrbits_slave();
+-		} else {
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
+-			stat = i2c_dw_read_clear_intrbits_slave();
+-		}
+-
+-		ret = i2cslave_handle_read_req(&data);
+-		data.read_bytes_count++;
+-		regmap_writel(ret, mmPSOC_I2C_S_IC_DATA_CMD);
+-	}
++	/*
++	 * Process the read request only after all the written data is
++	 * consumed.
++	 */
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)
++		module_i2c_s_do_write();
++	else
++		module_i2c_s_do_read();
+ }
+ 
+ void module_i2c_s_teardown(void)
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index c1957c9..020f855 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -8,12 +8,9 @@
+ #ifndef _MODULE_I2C_SLAVE_H_
+ #define _MODULE_I2C_SLAVE_H_
+ 
+-struct module_i2c_data {
+-	u8 cmd;
+-	u32 read_bytes_count;
+-};
+-
+-u8 i2cslave_pcie_vendor_id_cmd(u8 command_idx);
+-u8 i2cslave_handle_read_req(struct module_i2c_data *data);
++u8 i2cslave_pcie_vendor_id_cmd(u8 cmd);
++u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq);
++u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt);
++void i2cslave_handle_sync_error(void);
+ 
+ #endif /* _MODULE_I2C_SLAVE_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 1b24ec0..64e540d 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -11,12 +11,12 @@
+ #include "thermal.h"
+ #include "module_i2c_slave.h"
+ 
+-u8 i2cslave_handle_read_req(struct module_i2c_data *data)
++u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+ {
+ 	int max_tmp;
+ 	u8 ret;
+ 
+-	switch (data->cmd) {
++	switch (cmd) {
+ 	case HL_ASIC_TEMP_CMD_CODE:
+ 	case HL_ASIC_TEMP_MAX_VAL:
+ 		max_tmp = hl_ts_get_max_temp();
+@@ -31,8 +31,7 @@
+ 		break;
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+ 	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		ret = i2cslave_pcie_vendor_id_cmd(data->cmd +
+-						data->read_bytes_count);
++		ret = i2cslave_pcie_vendor_id_cmd(cmd + read_seq);
+ 		break;
+ 	default:
+ 		/* NA */
+@@ -42,3 +41,10 @@
+ 
+ 	return ret;
+ }
++
++u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt)
++{
++	return 0;
++}
++
++void i2cslave_handle_sync_error(void) {}
+diff --git a/recovery/module_i2c_slave.c b/recovery/module_i2c_slave.c
+index 3cb1470..9b96249 100644
+--- a/recovery/module_i2c_slave.c
++++ b/recovery/module_i2c_slave.c
+@@ -10,11 +10,11 @@
+ 
+ #include "module_i2c_slave.h"
+ 
+-u8 i2cslave_handle_read_req(struct module_i2c_data *data)
++u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+ {
+ 	u8 ret;
+ 
+-	switch (data->cmd) {
++	switch (cmd) {
+ 	case HL_FW_UPDATE_CMD_CODE:
+ 		ret = HL_FW_UPDATE_CMD_LEN;
+ 		break;
+@@ -29,3 +29,10 @@
+ 
+ 	return ret;
+ }
++
++u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt)
++{
++	return 0;
++}
++
++void i2cslave_handle_sync_error(void) {}

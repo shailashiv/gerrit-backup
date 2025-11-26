@@ -1,0 +1,98 @@
+From d969b1815faf3e75d285319e0181afe3073e03fa Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 21 Apr 2021 15:44:15 +0300
+Subject: [PATCH] [SW-39835] goya: pci: removing check of mem enable bit
+
+Goya device is not handling the iATU initialization, so no need to
+check the mem enable bit status.
+In fact this polling creating a race condition with LKD on the
+iATU/dbi registers.
+
+Change-Id: I7136f057dd06fbd52e190aff0dcfdbcaccde96d1
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/pci.c b/common/pci.c
+index 7051d23..c94654d 100644
+--- a/common/pci.c
++++ b/common/pci.c
+@@ -179,7 +179,7 @@
+ /*
+  * hl_pci_is_mem_enabled() - is memory access enabled in the configuration
+  */
+-bool hl_pci_is_mem_enabled(void)
++__weak bool hl_pci_is_mem_enabled(void)
+ {
+ 	u32 sts_cmd_reg;
+ 	u32 aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
+diff --git a/goya/asic.c b/goya/asic.c
+index 60b1253..04b5dfc 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -77,3 +77,12 @@
+ 	regs->kmd_msg_to_cpu = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
+ 	regs->cpu_cmd_status_to_host = mmCPU_CMD_STATUS_TO_HOST;
+ }
++
++bool hl_pci_is_mem_enabled(void)
++{
++	/*
++	 * mem enable flag is not used for goya, returning false to preserve
++	 * logic in pci module
++	 */
++	return false;
++}
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 195cf4c..16b09b4 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -22,6 +22,7 @@
+ 	u32 rdlh_link_reg_val;
+ 	bool link_is_up;
+ 	bool mem_enabled;
++	bool mem_enabled_prev;
+ };
+ 
+ static struct pci_status pci_sts = {
+@@ -30,7 +31,7 @@
+ 	.smlh_link_reg_val = 1,
+ 	.rdlh_link_reg_val = 1,
+ 	.link_is_up = true,
+-	.mem_enabled = false
++	.mem_enabled_prev = false,
+ };
+ 
+ __weak void preboot_pcie_exec_hw_wa(void)
+@@ -72,7 +73,8 @@
+ 	    pci_sts.link_is_up)
+ 		return FOUND_FAST_RETURN;
+ 
+-	if (hl_pci_is_mem_enabled() != pci_sts.mem_enabled)
++	pci_sts.mem_enabled = hl_pci_is_mem_enabled();
++	if (pci_sts.mem_enabled != pci_sts.mem_enabled_prev)
+ 		return FOUND_FAST_RETURN;
+ 
+ 	return NOT_FOUND;
+@@ -94,7 +96,6 @@
+ 
+ void module_pci_run(void)
+ {
+-	bool pci_mem_enabled;
+ 	unsigned int rst_src;
+ 
+ 	if (pci_sts.flr_reg_val == 1) {
+@@ -121,11 +122,10 @@
+ 		}
+ 	}
+ 
+-	pci_mem_enabled = hl_pci_is_mem_enabled();
+-	if (pci_mem_enabled != pci_sts.mem_enabled) {
+-		pci_sts.mem_enabled = pci_mem_enabled;
++	if (pci_sts.mem_enabled_prev != pci_sts.mem_enabled) {
++		pci_sts.mem_enabled_prev = pci_sts.mem_enabled;
+ 		rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
+-		if (pci_mem_enabled && (rst_src < HL_WD_RST))
++		if (pci_sts.mem_enabled && (rst_src < HL_WD_RST))
+ 			hl_pci_iatu_init();
+ 	}
+ }

@@ -1,0 +1,96 @@
+From 5271830d1fbbf282c4b6e84817f57a4db5c0da51 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 09 Aug 2021 10:48:16 +0300
+Subject: [PATCH] [SW-52119] gaudi: prevent tpc3 pcie access
+
+The TPC3 pre-fetcher fails to access the PCIe address space in a way
+that craches the PCIe bus.
+To prevent this behaviour, block the TPC3 pre-fetcher from accessing the
+PCIe address space by writing the high address bytes with 0x7F.
+Additionally, block the high address register with protection bits to
+prevent further changes from the host.
+
+Change-Id: I5fdf5be471a0f138a24a3d3ea6b62be3d2a62fba
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 3d8f0b2..a092660 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -12,6 +12,7 @@
+ #include <dma1_qm_regs.h>
+ #include <mme0_qm_regs.h>
+ #include <mme1_qm_regs.h>
++#include <tpc3_cfg_regs.h>
+ #include <tpc0_qm_regs.h>
+ #include <tpc1_qm_regs.h>
+ #include <cpu_if_regs.h>
+@@ -759,3 +760,16 @@
+ 
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_E2E_CRED_EN, true);
+ }
++
++#define TPC_PREFETCH_HMASK	0x7F
++void preboot_engines_init(void)
++{
++	/*
++	 * TPC3 pre-fetcher does not work for PCIe address space range.
++	 * Mask the high part of the pre-fetch address, so it will not get to
++	 * PCIe address space range.
++	 */
++	if (preboot_security_is_enabled())
++		regmap_writel(TPC_PREFETCH_HMASK,
++			      mmTPC3_CFG_ICACHE_BASE_ADDERESS_HIGH);
++}
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 09417e6..3237c82 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1072,6 +1072,13 @@
+ 	/* offsets 0x900 - 0x980 */
+ 	prot_base = base + SNGL_REG_PROT_SIZE * 18;
+ 	mask = PROT_BIT(mmTPC0_CFG_PROT);
++	if (base == (mmTPC3_CFG_BASE & ~HL_CFG_BASE)) {
++		/*
++		 * TPC3 pre-fetcher does not work for PCIe address space range.
++		 * Block the register from host changes.
++		 */
++		mask &= PROT_BIT(mmTPC0_CFG_ICACHE_BASE_ADDERESS_HIGH);
++	}
+ 	regmap_writel(mask, PRIV_PROT_REG(prot_base));
+ 
+ 	/* offsets 0x980 - 0xA00 */
+diff --git a/include/preboot.h b/include/preboot.h
+index 46e7253..0ba70b5 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -207,6 +207,7 @@
+ bool is_pcie_initialized(void);
+ 
+ int preboot_set_sram_sf_access(bool is_enable);
++void preboot_engines_init(void);
+ 
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index fce5b0a..6730cbe 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -369,6 +369,7 @@
+ __weak void preboot_e2e_credits_init(void) {}
+ __weak void preboot_device_id_init(void) {}
+ __weak u32 preboot_device_id_get(void) { return 0; }
++__weak void preboot_engines_init(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -428,6 +429,8 @@
+ 	if (hl_is_watchdog_reset())
+ 		i2csi_set_wd_err(HL_FW_RESET_CAUSE_WATCHDOG);
+ 
++	preboot_engines_init();
++
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
+ 

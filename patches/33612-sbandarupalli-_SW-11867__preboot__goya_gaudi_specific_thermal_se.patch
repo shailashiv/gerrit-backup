@@ -1,0 +1,296 @@
+From 044af3426043d8845ab0705e308f4a2d0b393b6f Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Sun, 26 Apr 2020 19:23:26 +0300
+Subject: [PATCH] [SW-11867] preboot: goya/gaudi specific thermal sensors programming
+
+this patch adds the implementation required to get goya/gaudi on-chip
+thermal sensors readings from pre-boot using i2c interfaces
+
+As part of the SLIM flash layout changes it is decided to service
+I2C slave requests from pre-boot and hence ASIC temperature sensors
+readings should be supported from preboot.
+
+Change-Id: I3ef9271152add38303c06a254eb8da2d15f188a2
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/common/thermal.c b/common/thermal.c
+index 3d29429..f6711d7 100644
+--- a/common/thermal.c
++++ b/common/thermal.c
+@@ -5,12 +5,13 @@
+  *
+  */
+ #include <stdbool.h>
+-#include "thermal.h"
++#include <preboot.h>
+ #include <pll.h>
+ #include <thermal.h>
+ #include <efuse.h>
+ #include <thermal.h>
+ #include <string.h>
++#include <uart.h>
+ 
+ #define HL_TS_SDIF_DATA_OFFSET	0x44
+ #define HL_TS_CLK_SYNTH		0x010
+@@ -19,31 +20,93 @@
+ #define HL_TS0_ALARMB_CFG	0x164
+ #define C_TO_MC			1000
+ 
++#define TS_CALIB_A_G_COEFF      4805
++#define TS_CALIB_B_H_COEFF      21980
++#define TS_CALIB_J_COEFF        1
++#define TS_CALIB_DIV_COEFF      4094
++#define TS_CALIB_FCLK_COEFF     106
++#define TS_CALIB_OPMODE_COEFF   0x0
++
++#define TS_UNCALIB_A_G_COEFF    6500
++#define TS_UNCALIB_B_H_COEFF    20710
++#define TS_UNCALIB_J_COEFF      16
++#define TS_UNCALIB_DIV_COEFF    4094
++#define TS_UNCALIB_FCLK_COEFF   5
++#define TS_UNCALIB_OPMODE_COEFF 0x1
++
+ struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
+ 
+ __attribute__((weak)) void hl_ts_clk_set(u32 addr, unsigned int clk)
+ {
+-	/* TODO goya/gaudi specific clock settings */
++	unsigned int synth_clk;
++	unsigned int val;
++
++	synth_clk = ((clk / 6000000) / 2) - 1;
++
++	val = synth_clk;
++	val |= synth_clk << 8;
++	val |= 0x101 << 16;
++	regmap_writel(val, addr + HL_TS_CLK_SYNTH);
+ 
+ }
++
+ __attribute__((weak)) void hl_ts_sdif_set(u32 addr, bool use_calib)
+ {
+-	/* TODO goya/gaudi specific sdif settings */
++	udelay(100);
++	/* program sensor power up delay */
++	regmap_writel(0x8d0000ff, addr + HL_TS_SDIF);
++	udelay(100);
++	/* configure sensor mode */
++	regmap_writel(0x89000000, addr + HL_TS_SDIF);
++	udelay(100);
++	/* power up sensor in continuous mode*/
++	regmap_writel(0x88000108, addr + HL_TS_SDIF);
+ }
+ 
+ /* convert 12-bit HL_TMP register value to milliCelsius */
+ __attribute__((weak)) long hl_tmp_temp_reg_to_mC(int val, int ts)
+ {
+-	/* TODO goya/gaudi specific temp conversions */
+-	return 0;
++	long tmp = (val & 0xfff);
++	u32 coef_a_g, coef_b_h, coef_j, coef_div, fclk;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++	coef_j = hl_ts_data[ts].hl_tmp_data.coef_j;
++	fclk = hl_ts_data[ts].hl_tmp_data.fclk;
++
++	tmp = coef_a_g + ((coef_b_h * (((tmp * 1000) / coef_div) -
++					500)) / 1000) - coef_j * fclk;
++
++	/*
++	 * result of equation has to be multiplied
++	 * by 1000, since coefficients are multiplied by 100 an extra
++	 * multiplication of 10 is required.
++	 */
++	tmp *= 10;
++
++	return tmp;
+ }
+ 
+ /* convert milliCelsius to 12-bit HL_TMP register value */
+ __attribute__((weak)) u32 hl_tmp_mC_to_temp_reg(long val, int ts)
+ {
+-	/* TODO goya/gaudi specific temp conversions */
+-	return 0;
++	u32 reg_val;
++	u32 coef_a_g, coef_b_h, coef_j, coef_div, fclk;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++	coef_j = hl_ts_data[ts].hl_tmp_data.coef_j;
++	fclk = hl_ts_data[ts].hl_tmp_data.fclk;
++
++	reg_val = ((coef_div * ((val / 10) -
++			coef_a_g + (coef_j * fclk) +
++			(coef_b_h / 2))) / coef_b_h);
++
++	return reg_val & 0xfff;
+ }
++
+ /* twos complement to u32 without changing result sign
+  * since the temperature formula uses the positive value of
+  * the conversion.
+@@ -109,11 +172,25 @@
+ 	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarmb_offset());
+ }
+ 
+-
+ __attribute__((weak)) void hl_set_calib_coeff(int ts, bool calib_enabled,
+ 		struct hl_tmp_opmode_info *calib_data)
+ {
+-	/* TODO goya/gaudi specific calib offsets */
++	if (calib_enabled) {
++		calib_data->coef_a_g = TS_CALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_CALIB_B_H_COEFF;
++		calib_data->coef_j = TS_CALIB_J_COEFF;
++		calib_data->coef_div = TS_CALIB_DIV_COEFF;
++		calib_data->fclk = TS_CALIB_FCLK_COEFF;
++		calib_data->opmode = TS_CALIB_OPMODE_COEFF;
++	} else {
++		calib_data->coef_a_g = TS_UNCALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_UNCALIB_B_H_COEFF;
++		calib_data->coef_j = TS_UNCALIB_J_COEFF;
++		calib_data->coef_div = TS_UNCALIB_DIV_COEFF;
++		calib_data->fclk = TS_UNCALIB_FCLK_COEFF;
++		calib_data->opmode = TS_UNCALIB_OPMODE_COEFF;
++	}
++
+ }
+ 
+ __attribute__((weak)) int hl_ts_get_count(void)
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 79057cf..e4ac6eb 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -22,6 +22,7 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <thermal.h>
+ 
+ #include "common.h"
+ 
+@@ -252,3 +253,29 @@
+ {
+ 	return mmCPU_TIMESTAMP_CNTCR;
+ }
++
++/* Hard coded each of the gaudi on-chip TS device properties */
++static struct hl_ts_cfg gaudi_hl_ts_data[HL_ASIC_TS_MAX_COUNT] = {
++	{.base = mmPSOC_TS_BASE, .alarm_a = 110, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 11, .hl_tmp_data = { 0 }},
++	{.base = mmNIC0_TS_BASE, .alarm_a = 110, .alarm_b =  120,
++		.use_calib = true, .calib_offset = 10, .hl_tmp_data = { 0 }},
++	{.base = mmNIC1_TS_BASE, .alarm_a = 110, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 9, .hl_tmp_data = { 0 }},
++	{.base = mmNIC3_TS_BASE, .alarm_a = 110, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 8, .hl_tmp_data = { 0 }}
++};
++
++void hl_ts_data_init(void)
++{
++	u32 i;
++
++	gaudi_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE,
++							HL_PLL_DIV2);
++
++	for (i = 1; i < HL_ASIC_TS_MAX_COUNT; i++)
++		gaudi_hl_ts_data[i].freq = hl_pll_get_freq(mmPSOC_TPC_PLL_BASE,
++						HL_PLL_DIV3);
++	memcpy(hl_ts_data, gaudi_hl_ts_data,
++		sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
+diff --git a/gaudi/common.h b/gaudi/common.h
+index b1e14d7..8d132b5 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -25,10 +25,14 @@
+ #define mmPSOC_MME_PLL_BASE		0xC71000
+ #define mmPSOC_PCI_PLL_BASE		0xC72000
+ #define mmPSOC_TPC_PLL_BASE		0xC73000
++#define mmPSOC_TS_BASE			0xC76000
++#define mmNIC0_TS_BASE			0xCF8000
+ #define mmNIC0_PLL_BASE			0xCF9000
++#define mmNIC1_TS_BASE			0xD38000
+ #define mmNIC1_PLL_BASE			0xD39000
+ #define mmNIC2_MME_PLL_BASE		0xD79000
+ #define mmNIC2_TPC_PLL_BASE		0xD7A000
++#define mmNIC3_TS_BASE			0xDB8000
+ 
+ #define FUSE_WORDS_PER_BANK		0x10
+ #define I2C_SLAVE_ADDRESS		0x4f
+diff --git a/goya/common.c b/goya/common.c
+index 4e1144b..5076969 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -19,6 +19,8 @@
+ #include <uart.h>
+ #include <string.h>
+ #include <spi.h>
++#include <thermal.h>
++#include <string.h>
+ 
+ #include "common.h"
+ 
+@@ -194,3 +196,32 @@
+ {
+ 	return mmCPU_TIMESTAMP_CNTCR;
+ }
++
++#define GOYA_ASIC_TS_MAX_COUNT 3
++
++int hl_ts_get_count(void)
++{
++	return GOYA_ASIC_TS_MAX_COUNT;
++}
++
++/* Hard coded each of the goya on-chip TS device properties */
++struct hl_ts_cfg goya_hl_ts_data[GOYA_ASIC_TS_MAX_COUNT] = {
++	{.base = mmNORTH_THERMAL_SENSOR_BASE, .alarm_a = 110, .alarm_b = 120,
++		.calib_offset = 8, .use_calib = true, .hl_tmp_data = { 0 }},
++	{.base = mmPSOC_TS_BASE, .alarm_a = 110, .alarm_b =  120,
++		.calib_offset = 9, .use_calib = true, .hl_tmp_data = { 0 }},
++	{.base = mmTPC_THEMAL_SENSOR_BASE,  .alarm_a = 110, .alarm_b = 120,
++		.calib_offset = 10, .use_calib = true, .hl_tmp_data = { 0 }},
++};
++
++void hl_ts_data_init(void)
++{
++	goya_hl_ts_data[0].freq = hl_pll_get_freq(mmCPU_PLL_BASE,
++						HL_PLL_DIV2);
++	goya_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_PCI_PLL_BASE,
++						HL_PLL_DIV1);
++	goya_hl_ts_data[2].freq = hl_pll_get_freq(mmTPC_PLL_BASE,
++						HL_PLL_DIV3);
++	memcpy(hl_ts_data, goya_hl_ts_data,
++		sizeof(struct hl_ts_cfg) * GOYA_ASIC_TS_MAX_COUNT);
++}
+diff --git a/goya/common.h b/goya/common.h
+index 1500865..fa8481f 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -13,12 +13,15 @@
+ #define PPBOOT_TEXT_BASE	0x7FF0000000
+ #define PREBOOT_TEXT_BASE	(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
+-#define mmCPU_PLL_BASE		0x4A2000
+-#define mmIC_PLL_BASE		0x4A3000
+-#define mmPSOC_EMMC_PLL_BASE	0xC70000
+-#define mmPSOC_MME_PLL_BASE	0xC71000
+-#define mmPSOC_PCI_PLL_BASE	0xC72000
+-#define mmTPC_PLL_BASE		0xE01000
++#define mmNORTH_THERMAL_SENSOR_BASE	0x4A0000
++#define mmCPU_PLL_BASE			0x4A2000
++#define mmIC_PLL_BASE			0x4A3000
++#define mmPSOC_TS_BASE			0xC55000
++#define mmPSOC_EMMC_PLL_BASE		0xC70000
++#define mmPSOC_MME_PLL_BASE		0xC71000
++#define mmPSOC_PCI_PLL_BASE		0xC72000
++#define mmTPC_PLL_BASE			0xE01000
++#define mmTPC_THEMAL_SENSOR_BASE	0xE02000
+ 
+ #define FUSE_WORDS_PER_BANK	0x10
+ #define I2C_SLAVE_ADDRESS	0x4f

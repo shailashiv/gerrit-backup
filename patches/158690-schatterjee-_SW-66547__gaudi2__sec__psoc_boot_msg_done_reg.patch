@@ -1,0 +1,75 @@
+From c1e0cab69b7c36788ac1abd66ccdafe75862f99c Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Mon, 20 Dec 2021 11:08:35 +0200
+Subject: [PATCH] [SW-66547] gaudi2: sec: psoc_boot_msg_done reg
+
+LKD uses PSOC_BOOT_MNG_DONE after HARD_RESET to know
+hard_reset is done.  But this register is blocked
+by RR in ppboot/preboot. So even though hard_reset works
+following error print seen on host,
+
+Change-Id: I5b12165e629cc4b5397272aa7f1030a2c2a51eae
+
+--------------x--------------
+
+[Mon Dec 13 07:55:20 2021] habanalabs hl0: Firmware performs
+				HARD reset, sleeping 500ms
+[Mon Dec 13 07:55:20 2021] habanalabs hl0: Timeout while
+				waiting for device to reset 0x0
+
+------------x----------
+
+So opened PCIE_WRAP region from RR protection and used
+protection bit configuration to open only PSOC_BOOT_MNG_DONE
+register.
+
+Change-Id: I869925998b9d40d5a064bd16e08ec726cd782581
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 6388892..029fa3f 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -359,6 +359,7 @@
+ 
+ /* protection bits configurations to open some selective registers */
+ static u32 gaudi2_protbits_data0[] = { 0x400, 0xc103 };
++static u32 gaudi2_protbits_data1[] = { 0x40000000 };
+ 
+ struct hl_prot_bits_cfg gaudi2_prot_bits_cfg[] = {
+ 	{{ HL_BLOCK_TYPE_PSOC, (mmPSOC_GLOBAL_CONF_BASE & ~CFG_BASE), 1, 0, 0, 0x0, 0x0, 0x0 },
+@@ -366,6 +367,12 @@
+ 	  .data_map = 0x41,
+ 	  .data = gaudi2_protbits_data0,
+ 	  .data_size = ARRAY_SIZE(gaudi2_protbits_data0)
++	},
++	{{ HL_BLOCK_TYPE_PCIE, (mmPCIE_WRAP_BASE & ~CFG_BASE), 1, 0, 0, 0x0, 0x0, 0x0 },
++	  .prot_map = 0x0000000,
++	  .data_map = 0x8000000,
++	  .data = gaudi2_protbits_data1,
++	  .data_size = ARRAY_SIZE(gaudi2_protbits_data1)
+ 	},
+ };
+ 
+@@ -516,10 +523,18 @@
+ 	hl_secure_lbw_rr(HL_SEC_LBW_PSOC_GLBL_CONF, min, max, rr_sel);
+ 
+ 	/*
+-	 * CFG SPACE base to PSOC GLOBAL CONF base
+-	 * 0x1000007FF8000000 - 0x1000007FFCC4B000
++	 * CFG SPACE base to PCIE_WRAP base
++	 * 0x1000007FF8000000 - 0x1000007FFCC01000
+ 	 */
+ 	min = CFG_BASE;
++	max = mmPCIE_WRAP_BASE;
++	hl_secure_lbw_rr(HL_SEC_LBW_PCIE_WRAP, min, max, rr_sel);
++
++	/*
++	 * PCIE DBI base to PSOC GLOBAL CONF base
++	 * 0x1000007FFCC02000 - 0x1000007FFCC4B000
++	 */
++	min = mmPCIE_DBI_BASE;
+ 	max = mmPSOC_GLOBAL_CONF_BASE;
+ 	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
+ }

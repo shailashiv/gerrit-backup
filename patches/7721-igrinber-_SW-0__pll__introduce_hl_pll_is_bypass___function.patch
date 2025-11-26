@@ -1,0 +1,82 @@
+From 8c617add64d640c1f08db3e02ed69762be0390fa Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 08 Jan 2019 15:32:42 +0200
+Subject: [PATCH] [SW-0] pll: introduce hl_pll_is_bypass() function
+
+The hl_pll_is_bypass() function returns the actual bypass state.
+Make use of it in the hl_pll_udelay() function and remove the static
+global flag used till now.
+The new function uses the enum hl_pll_div_out for readability sake.
+
+Change-Id: I133421c5bdeab996de7abb1f0575ecb1e4b3f2b6
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/pll.c b/pll.c
+index d40fe16..0c3e39a 100644
+--- a/pll.c
++++ b/pll.c
+@@ -20,8 +20,6 @@
+ #define HL_PLL_DIV_SEL		0x280
+ #define HL_PLL_DIV_EN		0x2a0
+ 
+-#define HL_PLL_DIV_SIZE		4
+-
+ #define HL_PLL_MAX_WAIT_TIME	20	/* 20 us */
+ #define HL_PLL_LOCK_TOUT	5000	/* 5 ms */
+ 
+@@ -34,13 +32,19 @@
+ #define mmIC_PLL_BASE		0x7FFC4A3000ull
+ #define mmPSOC_MME_PLL_BASE	0x7FFCC71000ull
+ 
+-static int cpu_pll_bypassed = 0;
+-
+ enum hl_pll_bypass_val {
+ 	HL_PLL_REF_CLK,
+ 	HL_PLL_PLL_CLK,
+ 	HL_PLL_DIV_REF,
+ 	HL_PLL_DIV_PLL,
++};
++
++enum hl_pll_div_out {
++	HL_PLL_DIV0,
++	HL_PLL_DIV1,
++	HL_PLL_DIV2,
++	HL_PLL_DIV3,
++	HL_PLL_DIV_SIZE,
+ };
+ 
+ struct hl_pll_cfg {
+@@ -73,14 +77,29 @@
+ 	return pll_num;
+ }
+ 
++static enum hl_pll_bypass_val hl_pll_is_bypass(struct hl_pll_cfg *cfg, enum hl_pll_div_out out)
++{
++	int offset = out * sizeof(u32);
++
++	return readl(cfg->base + HL_PLL_DIV_SEL + offset);
++}
++
+ static void hl_pll_udelay(unsigned int usec)
+ {
+ 	long cnt;
++	/*
++	 * Assumptions:
++	 * 1) the CPU PLL offset in the array is 0
++	 * 2) DIV1 is the PLL output to timestamp counter.
++	 */
++	enum hl_pll_bypass_val bval = hl_pll_is_bypass(goya_pll_cfg, HL_PLL_DIV1);
+ 
+-	if (cpu_pll_bypassed)
+-		cnt = (BYPASS_CYCLES_PER_USEC * usec) / MIN_CYCLES_PER_ITER;
++	if (bval == HL_PLL_REF_CLK || bval == HL_PLL_DIV_REF)
++		cnt = BYPASS_CYCLES_PER_USEC;
+ 	else
+-		cnt = (CPU_CYCELS_PER_USEC * usec) / MIN_CYCLES_PER_ITER;
++		cnt = CPU_CYCELS_PER_USEC;
++
++	cnt = (cnt * usec) / MIN_CYCLES_PER_ITER;
+ 
+ 	while (cnt--);
+ }

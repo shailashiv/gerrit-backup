@@ -1,0 +1,85 @@
+From 88b0e9c801ff31597ab3cd30d3aac11337a9521f Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Fri, 19 Mar 2021 07:25:31 +0200
+Subject: [PATCH] [SW-34719] rma: err_sts: fit error in preboot
+
+In current implementation of ERR_STS register update(direct
+command 242), only last error in uboot/zephyr is handled.
+The ERR_STS update code is moved to a common function to handle
+both previous and current fit/security error scenarios.
+
+Change-Id: I71dd7a4b0cac90b25b5ff2bf95a37aed7db56f5d
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 0310f30..fa4a7e0 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -799,6 +799,8 @@
+ 	struct hl_i2ci_error_status_fit_failure *fit_fail;
+ 	struct hl_i2ci_agent_signature_failure *sig_fail;
+ 	bool is_update_sig_os = false;
++	u32 err_sts_fit_err = HL_ERROR_STATUS_OTHER |
++				       (HL_ERROR_STATUS_OTHER_FIT << 8);
+ 
+ 	fit_fail = &op_err_status.fit_failure;
+ 	sig_fail = &op_err_status.security.agent_failure;
+@@ -808,24 +810,36 @@
+ 		break;
+ 	case HL_FW_FIT_BOOT_ERR_CORRUPTED:
+ 		fit_fail->invalid_image_format = 1;
++		/* set FIT error bit of ERR_STS cmd */
++		err_sts_reg_val |= err_sts_fit_err;
+ 		break;
+ 	case HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION:
+ 		fit_fail->fw_upgrade_target_address_violation = 1;
++		/* set FIT error bit of ERR_STS cmd */
++		err_sts_reg_val |= err_sts_fit_err;
+ 		break;
+ 	case HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE:
+ 		fit_fail->fit_not_runable = 1;
++		/* set FIT error bit of ERR_STS cmd */
++		err_sts_reg_val |= err_sts_fit_err;
+ 		break;
+ 	case HL_FW_FIT_BOOT_ERR_REVOKED_KEY:
+ 		sig_fail->revoked_pub_key = 1;
+ 		is_update_sig_os = true;
++		/* set Security error bit of ERR_STS cmd */
++		err_sts_reg_val |= HL_ERROR_STATUS_SECURITY;
+ 		break;
+ 	case HL_FW_FIT_BOOT_ERR_SVN:
+ 		sig_fail->svn_failure = 1;
+ 		is_update_sig_os = true;
++		/* set Security error bit of ERR_STS cmd */
++		err_sts_reg_val |= HL_ERROR_STATUS_SECURITY;
+ 		break;
+ 	case HL_FW_FIT_BOOT_ERR_SIGNATURE:
+ 		sig_fail->signature_failure = 1;
+ 		is_update_sig_os = true;
++		/* set Security error bit of ERR_STS cmd */
++		err_sts_reg_val |= HL_ERROR_STATUS_SECURITY;
+ 		break;
+ 	}
+ 
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index d4e92ab..92bb193 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -281,16 +281,11 @@
+ 		case HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION:
+ 		case HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE:
+ 			cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+-			/* set FIT error bit of ERR_STS cmd */
+-			err_sts_reg_val |= HL_ERROR_STATUS_OTHER |
+-					       (HL_ERROR_STATUS_OTHER_FIT << 8);
+ 			break;
+ 		case HL_FW_FIT_BOOT_ERR_REVOKED_KEY:
+ 		case HL_FW_FIT_BOOT_ERR_SVN:
+ 		case HL_FW_FIT_BOOT_ERR_SIGNATURE:
+ 			cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_FAIL, true);
+-			/* set Security error bit of ERR_STS cmd */
+-			err_sts_reg_val |= HL_ERROR_STATUS_SECURITY;
+ 			break;
+ 		}
+ 

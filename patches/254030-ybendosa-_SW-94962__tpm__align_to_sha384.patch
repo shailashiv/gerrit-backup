@@ -1,0 +1,324 @@
+From 2835161ec688cdc3d287ad8130616b1406bbfbfd Mon Sep 17 00:00:00 2001
+From: Yotam Ben Dosa <ybendosa@habana.ai>
+Date: Wed, 10 Aug 2022 16:21:53 +0300
+Subject: [PATCH] [SW-94962] tpm: align to sha384
+
+erom and ppboot didn't extract the sha384 values that should represent
+ppboot and preboot.
+
+This patch fixes that by obtaining those values via pre-calculated
+sha384 blobs that are appended to these images in the build process.
+
+Change-Id: Ia2d5beff31407ea5b51c377386c556a69d89da76
+Signed-off-by: Yotam Ben Dosa <ybendosa@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index fd9bd02..fd0b793 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,6 +18,7 @@
+ CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)
++CFLAGS += -I ${EMBEDDED_ROOT}/arcboot/arch
+ CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)/$(SPECS_EMB_DEV)_reg_map.h
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c -fno-builtin
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 10a1bf3..09bf19e 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -17,6 +17,7 @@
+ CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(SPECS_DEV)/$(SPECS_DEV)_reg_map.h
+ CFLAGS += -include $(HL_DEV_ARCH)/dev_ext_rom.h
+ CFLAGS += -D DEF_HL_FW_COMP_EROM
++CFLAGS += -I ${EMBEDDED_ROOT}/arcboot/arch
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+index b2a7607..18a3b7d 100644
+--- a/app/ext_rom/erom_tpm.c
++++ b/app/ext_rom/erom_tpm.c
+@@ -21,6 +21,9 @@
+ #include <uart.h>
+ #include <gaudi2/gaudi2_security.h>
+ #include <gaudi2/gaudi2_bootrom.h>
++#include <gaudi2/arc/dev_security.h>
++#include <sha512.h>
++#include <string.h>
+ 
+ #define ARCBOOT_PRIMARY			0
+ #define ARCBOOT_SECONDARY		1
+@@ -34,88 +37,23 @@
+ #define HL_FWSRAM_BASE			(HL_GEN_MEM_BASE + \
+ 					 HL_FWSRAM_OFFSET)
+ 
+-static int arcboot_rom_status_read(enum arcboot_rom_progress progress)
++#define PPBOOT_SHA_MAGIC		0x1cca566a
++#define PPBOOT_HASH_MAGIC_SIZE		4
++#define PPBOOT_SHA384_FOOTER		SHA384_SUM_LEN
++
++static void erom_get_ppboot_data(uint8_t **offset)
+ {
+-	uint32_t reg, offset;
+-
+-	offset = progress / ARCBOOT_STATUS_REG_SZ_BITS;
+-	progress = progress % ARCBOOT_STATUS_REG_SZ_BITS;
+-
+-	reg = regmap_readl(mmPSOC_SECURITY_SW_STATUS_0 + offset * 4);
+-	return reg & BIT(progress);
+-}
+-
+-static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
+-{
+-	uint32_t flash_image_offset;
+-	uint32_t flash_image_switch;
+-
+-	/* read if we need to switch order of primary/secondary image */
+-	spi_flash_copy(&flash_image_switch, FLASH_IMAGE_SWITCH_OFFSET, 1, NULL);
+-	if (flash_image_switch != 0) {
+-		if (image_ptr != ARCBOOT_SECONDARY)
+-			image_ptr = ARCBOOT_SECONDARY;
+-		else
+-			image_ptr = ARCBOOT_PRIMARY;
+-	}
+-
+-	if (image_ptr == ARCBOOT_SECONDARY)
+-		spi_flash_copy(&flash_image_offset, FLASH_SECONDARY_OFFSET, 1, NULL);
+-	else
+-		spi_flash_copy(&flash_image_offset, FLASH_PRIMARY_OFFSET, 1, NULL);
+-
+-	return flash_image_offset;
+-}
+-
+-static int erom_get_ppboot_data(uint32_t *offset, uint16_t *size)
+-{
+-	uint8_t image_ptr = ARCBOOT_SECONDARY + 1;
+-	uint32_t flash_image_offset;
+-	uint32_t flash_ppboot_pcie_offset;
+-	uint32_t ppboot_pcie_offset;
+ 	uint32_t ppboot_pcie_size;
+ 
+-	if (arcboot_rom_status_read(PROGRESS_BRINGUP_PCI_SEC))
+-		image_ptr = ARCBOOT_SECONDARY;
+-	else if (arcboot_rom_status_read(PROGRESS_BRINGUP_PCI_PRI))
+-		image_ptr = ARCBOOT_PRIMARY;
++	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
+ 
+-	if (image_ptr > ARCBOOT_SECONDARY) {
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-		return -1;
+-	}
++	ppboot_pcie_size -= SIG_SIZE;
++	ppboot_pcie_size -= CRC32_SIZE;
++	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
++	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
++	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
+ 
+-	flash_image_offset = arcboot_flash_image_offset(image_ptr);
+-	/* check if offset is within safe limits */
+-	if ((flash_image_offset + FLASH_64KB_PADD) >= FLASH_VALID_MASK) {
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-		return -1;
+-	}
+-
+-	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
+-					      flash_image_offset);
+-	spi_flash_copy(&ppboot_pcie_size, flash_ppboot_pcie_offset, 4, NULL);
+-	if (ppboot_pcie_size > SECUREBOOT_MAX_PPBOOT_IMG_SIZE ||
+-	    ppboot_pcie_size <= SECUREBOOT_IMG_HEAD_FOOTER) {
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-		return -1;
+-	}
+-
+-	/* check for safe limits */
+-	if ((flash_ppboot_pcie_offset + ppboot_pcie_size) >= FLASH_VALID_MASK) {
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-		return -1;
+-	}
+-
+-	/* remove headers and footers from image, this is the image to verify */
+-	ppboot_pcie_size -= SECUREBOOT_IMG_HEAD_FOOTER;
+-	/* offset of ppboot+pcie_fw image to verify, start from fw_version */
+-	ppboot_pcie_offset = (HL_FWSRAM_BASE + IMG_LEN_SIZE);
+-
+-	*offset = ppboot_pcie_offset;
+-	*size = ppboot_pcie_size;
+-
+-	return 0;
++	*offset = (uint8_t *)(HL_FWSRAM_BASE + ppboot_pcie_size);
+ }
+ 
+ static void device_init(void)
+@@ -130,8 +68,9 @@
+ 
+ void erom_main_function(void)
+ {
+-	uint32_t offset = 0;
+-	uint16_t size = 0;
++	uint8_t *data;
++	uint32_t magic;
++	uint8_t hash[SHA384_SUM_LEN] = { 0 };
+ 
+ 	device_init();
+ 
+@@ -149,9 +88,14 @@
+ 	if (tpm_startup())
+ 		return;
+ 
+-	if (erom_get_ppboot_data(&offset, &size))
+-		return;
++	erom_get_ppboot_data(&data);
+ 
+-	if (tpm_hash_and_pcr_extend(TPM2_PPBOOT_PCR_IDX, offset, size))
+-		return;
++	memcpy(&magic, data, PPBOOT_HASH_MAGIC_SIZE);
++
++	if (magic != PPBOOT_SHA_MAGIC)
++		preboot_puts("no ppboot sha magic found\n");
++	else
++		memcpy(hash, data + PPBOOT_HASH_MAGIC_SIZE, SHA384_SUM_LEN);
++
++	tpm_pcr_extend(TPM2_PPBOOT_PCR_IDX, hash);
+ }
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c7410bd..489aa1b 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -30,7 +30,7 @@
+ #include <arcboot_export.h>
+ #include <preboot.h>
+ #include <pll.h>
+-#include <sha256.h>
++#include <sha512.h>
+ #include <uart.h>
+ #include <efuse.h>
+ #include <string.h>
+@@ -46,6 +46,7 @@
+ #include <security.h>
+ #include <address_space.h>
+ #include <gaudi2/gaudi2_security.h>
++#include <gaudi2/arc/dev_security.h>
+ #include <tpm2.h>
+ #include <errno.h>
+ 
+@@ -66,6 +67,10 @@
+ #define IATU_INBOUND_LOW_OFFSET_ADDR		0x0
+ #define IATU_INBOUND_HI_OFFSET_ADDR		0xC0080000
+ #define DBI_ENABLE				0x300000
++
++#define PREBOOT_SHA_MAGIC		0x1cca566a
++#define PREBOOT_HASH_MAGIC_SIZE		4
++#define PREBOOT_SHA384_FOOTER		SHA384_SUM_LEN
+ 
+ void pcie_phy_set_ext_tx_rx_ctrl(void) {}
+ void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+@@ -336,9 +341,11 @@
+ 	u32 flash_offset;
+ 	u32 num_cycles;
+ 	int ret;
+-	uint8_t hash[SHA256_SUM_LEN];
++	uint32_t magic = 0;
++	uint8_t hash[SHA384_SUM_LEN] = { 0 };
+ 
+ 	flash_offset = ppboot_flash_image_offset(image_ptr);
++
+ 	image_size = spi_flash_readl(flash_offset);
+ 	num_cycles = (image_size / (MAX_DMA_SIZE + CRC_SIZE));
+ 	if (image_size % (MAX_DMA_SIZE + CRC_SIZE))
+@@ -395,14 +402,26 @@
+ 			return ARCBOOT_BRINGUP_ERROR;
+ 	}
+ 
++	payload_size -= SIG_SIZE;
++	payload_size -= TOTAL_PUB_KEY_PROPS_SZ;
++	payload_size -= PREBOOT_SHA384_FOOTER;
++	payload_size -= PREBOOT_HASH_MAGIC_SIZE;
++
++	uint8_t *footer_offset = (uint8_t *)(SDRAM_BASE + payload_size);
++
++	memcpy(&magic, footer_offset, PREBOOT_HASH_MAGIC_SIZE);
++
+ 	/* Hash is encrypted, and only first 48 bytes of it are used
+ 	 * Hash is read and not calculated because of ppboot image size
+ 	 * limitations
+ 	 */
+ 	ret = tpm_init(true);
+ 	if (!ret) {
+-		memcpy(hash, (void *)(SDRAM_BASE + IMG_LEN_SIZE + image_size),
+-		       SHA256_SUM_LEN);
++		if (magic != PREBOOT_SHA_MAGIC)
++			preboot_puts("no preboot sha magic found\n");
++		else
++			memcpy(hash, footer_offset + PREBOOT_HASH_MAGIC_SIZE, SHA384_SUM_LEN);
++
+ 		if (tpm_pcr_extend(TPM2_PREBOOT_PCR_IDX, hash))
+ 			preboot_puts("PPBOOT: pcr extend failed\n");
+ 	} else if (ret == -EOPNOTSUPP) {
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+index 9366a5b..c5fda69 100644
+--- a/arch/gaudi2/common/tpm2.c
++++ b/arch/gaudi2/common/tpm2.c
+@@ -791,8 +791,10 @@
+ 	 * but will return RC_INITIALIZE otherwise.
+ 	 */
+ 	ret = tpm_spi_sendrecv_command(command_v2, NULL, NULL);
+-	if (ret && ret != TPM2_RC_INITIALIZE)
++	if (ret && ret != TPM2_RC_INITIALIZE) {
++		preboot_puts("ret != TPM2_RC_INITIALIZE");
+ 		return ret;
++	}
+ 
+ 	return 0;
+ }
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index 8aebf28..a7eed13 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -9,7 +9,7 @@
+ #include <boot_if.h>
+ #include <tpm2.h>
+ #include <uart.h>
+-#include <sha256.h>
++#include <sha512.h>
+ #include <boot_desc.h>
+ #include <errno.h>
+ #include "lzo/unaligned.h"
+@@ -128,22 +128,13 @@
+ 	if (hash == NULL)
+ 		return -1;
+ 
+-	ret = tpm2_pcr_extend(image_index, TPM2_ALG_SHA256, hash, SHA256_SUM_LEN);
++	ret = tpm2_pcr_extend(image_index, TPM2_ALG_SHA384, hash, SHA384_SUM_LEN);
+ 	if (ret) {
+ 		preboot_puts("preboot_pcr_extend: pcr extend failed\n");
+ 		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+ 	}
+ 
+ 	return ret;
+-}
+-
+-int tpm_hash_and_pcr_extend(uint32_t image_index, uintptr_t image_ptr, uint32_t image_size)
+-{
+-	uint8_t hash[SHA256_SUM_LEN] = { 0 };
+-
+-	sha256_csum((void *)image_ptr, image_size, hash);
+-
+-	return tpm_pcr_extend(image_index, hash);
+ }
+ 
+ void preboot_tpm_auth(void)
+diff --git a/arch/gaudi2/common/tpm_auth.h b/arch/gaudi2/common/tpm_auth.h
+index 75d58c6..30de525 100644
+--- a/arch/gaudi2/common/tpm_auth.h
++++ b/arch/gaudi2/common/tpm_auth.h
+@@ -10,7 +10,6 @@
+ 
+ int tpm_init(bool print);
+ int tpm_startup(void);
+-int tpm_hash_and_pcr_extend(uint32_t image_index, uintptr_t image_ptr, uint32_t image_size);
+ int tpm_pcr_extend(uint32_t image_index, uint8_t *hash);
+ 
+ #endif /* _HL_TPM_AUTH_H_ */

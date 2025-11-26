@@ -1,0 +1,67 @@
+From 3e3ed367f4beffc620f3ed4af745a4c505b12d31 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Tue, 20 Apr 2021 15:55:03 +0300
+Subject: [PATCH] [SW-26273] fwupd: prepare error sending state
+
+Sending a FIT as part of status response implies sending
+via SLOW MODE. The best way to execute it was by adding an operation
+to the module run handler. Explicitly handling an error FIT response
+sending. Due to lack of free command's enumeration. a combination of
+flags will replace it as the condition to invoke the error handling.
+Two conditions are needed:
+1. Informed by the error's inform function that an error occurred
+2. A request to send a status response
+
+As mentioned, the status response sending procedure, can be triggered, by
+a request, but will be delayed for after turning into SLOW MODE.
+
+NOTE: Do to partial implementation at this stage the flag will not be
+set to true. That will be supported at later patches
+
+Change-Id: Ic3df6fa1bc6c9f4a964b36fc539e6a206927c3cd
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 86cac8c..dbbc105 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -24,6 +24,7 @@
+ 
+ static bool is_fit_checked;
+ static unsigned int map_size;
++static bool sending_error_flag;
+ 
+ uintptr_t fit_base_offset;
+ 
+@@ -38,6 +39,17 @@
+ enum cmd_check_res module_fwupd_check(void)
+ {
+ 	struct hl_upd_command cmd;
++
++	/*
++	 * the error status response, involved
++	 * the creation of a FIT file.
++	 * this implies a slow return
++	 * Due to the lack of commands numbers the cmd state (4 bits)
++	 * can't be change to a specific state therefore a flag was added
++	 * other option is to add an internal cmd level.
++	 */
++	if (sending_error_flag)
++		return FOUND_SLOW_RETURN;
+ 
+ 	if (is_fit_checked)
+ 		return FOUND_NO_RETURN;
+@@ -241,6 +253,12 @@
+ 	struct hl_upd_command cmd;
+ 
+ 	cmd.val = regmap_readl(mmUPD_CMD);
++
++	if (sending_error_flag) {
++		preboot_puts("FW UPD prepare ERROR_STATUS\n");
++		sending_error_flag = false;
++	}
++
+ 	switch (cmd.cmd) {
+ 	case HL_UPD_CLR_STS:
+ 		regmap_writel(HL_UPD_STS_NOOP, mmUPD_STS);

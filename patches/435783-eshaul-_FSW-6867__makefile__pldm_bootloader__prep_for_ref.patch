@@ -1,0 +1,2391 @@
+From d18b0ddc12c0de7fc896257d91fe642fab36e9fb Mon Sep 17 00:00:00 2001
+From: Erez Shaul <eshaul@habana.ai>
+Date: Thu, 18 Jul 2024 17:00:14 +0300
+Subject: [PATCH] [FSW-6867] makefile, pldm_bootloader: prep for refactoring pldm target
+
+this is a preparation for target refactor from pldm to palad
+this change will enable to use both pldm and palad target words
+once jenkins scripts will be adjusted to palad the override can be reverted
+
+Change-Id: If6eb18f95175bf738dc58466abc574de832c8bb3
+Signed-off-by: Erez Shaul <eshaul@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 809bfce..e455196 100644
+--- a/Makefile
++++ b/Makefile
+@@ -12,6 +12,11 @@
+ 
+ EMB_COMMON_MOD_DIR := ${PREBOOT_ROOT_DIR}/emb_common_mod
+ 
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ CFLAGS += -I$(SPECS_DIR)
+ CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+ CFLAGS += -I ${EMBEDDED_ROOT}/arcboot/arch
+@@ -23,8 +28,8 @@
+ CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib/common
+ CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib/preboot
+ 
+-ifeq ($(HL_TARGET),pldm)
+-	CFLAGS += -DTARGET_IS_PLDM
++ifeq ($(HL_TARGET),palad)
++	CFLAGS += -DTARGET_IS_PALAD
+ endif
+ ifeq ($(HL_TARGET),onix)
+ 	CFLAGS += -DTARGET_IS_ONIX
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index bacabd5..84aec09 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -9,6 +9,11 @@
+ 
+ EMB_COMMON_MOD_DIR := ${PREBOOT_ROOT_DIR}/emb_common_mod
+ 
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ CFLAGS += -I$(SPECS_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+diff --git a/app/palad_bloader/Makefile b/app/palad_bloader/Makefile
+new file mode 100644
+index 0000000..b3798f6
+--- /dev/null
++++ b/app/palad_bloader/Makefile
+@@ -0,0 +1,75 @@
++CC = $(CROSS_COMPILE)gcc
++OBJCOPY = $(CROSS_COMPILE)objcopy
++BASE_DEV_NAME := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
++PREBOOT_ROOT_DIR := ../..
++HL_DEV_ARCH := $(PREBOOT_ROOT_DIR)/arch/$(BASE_DEV_NAME)/$(HL_DEV_SUBTYPE)
++HL_DEV_ARCH_COMMON := $(PREBOOT_ROOT_DIR)/arch/$(BASE_DEV_NAME)/common
++
++EMB_COMMON_MOD_DIR := ${PREBOOT_ROOT_DIR}/emb_common_mod
++
++include $(HL_DEV_ARCH)/Makefile
++
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
++CFLAGS += -I$(SPECS_DIR)
++CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
++CFLAGS += -Wall -Werror
++CFLAGS += -g -c
++CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(HL_DEV_ARCH)/
++CFLAGS += -I $(EMB_COMMON_MOD_DIR)/include
++CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib
++CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib/common
++CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib/preboot
++
++CFLAGS += -Os -fdata-sections -ffunction-sections
++
++SFLAGS := $(CFLAGS) -D__ASSEMBLY__
++
++PALAD_BLOADER_LD_SCRIPT := $(shell ls $(HL_DEV_ARCH)/palad_bloader.lds.S)
++LDFLAGS := -g -nostdlib -static
++LDFLAGS += -Wl,--gc-sections
++LDLIBS := -lgcc
++
++PALAD_BLOADER_SRCS_C := $(shell ls *.c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
++PALAD_BLOADER_SRCS_C := $(filter-out $(PREBOOT_ROOT_DIR)/lib/common/pif_ts.c,$(PALAD_BLOADER_SRCS_C))
++PALAD_BLOADER_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/lib/common/lib_common.c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/lib/common/pci.c)
++PALAD_BLOADER_APP_S := $(shell ls crt0_rom.S)
++
++include $(HL_DEV_ARCH)/Makefile
++
++PALAD_BLOADER_OBJECTS := $(PALAD_BLOADER_SRCS_C:.c=.o)
++PALAD_BLOADER_OBJECTS += $(PALAD_BLOADER_APP_S:.S=.o)
++
++# TODO: add version info
++
++all: clean
++	$(MAKE) palad_bloader.bin
++
++palad_bloader.bin: palad_bloader.elf
++	$(OBJCOPY) -O binary $< $@
++
++palad_bloader.elf: $(PALAD_BLOADER_OBJECTS) $(PALAD_BLOADER_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(PALAD_BLOADER_LD_SCRIPT) -o $@ -Wl,--start-group $(PALAD_BLOADER_OBJECTS) $(LDLIBS) -Wl,--end-group
++
++%.lds: %.lds.S
++	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
++
++%.o: %.c
++	@$(CC) $(CFLAGS) -o $@ $<
++
++%.o: %.S
++	@$(CC) $(SFLAGS) -o $@ $<
++
++clean:
++	rm -f $(PALAD_BLOADER_OBJECTS)
++
++.PHONY: clean
+diff --git a/app/palad_bloader/crt0_rom.S b/app/palad_bloader/crt0_rom.S
+new file mode 100644
+index 0000000..8a5b537
+--- /dev/null
++++ b/app/palad_bloader/crt0_rom.S
+@@ -0,0 +1,139 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2022 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++;; ************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; ************************************************************************************************
++.file "crt0_rom.S"
++
++.macro CPU_EARLY_SETUP
++	; enable I-cache/D-cache
++	lr	r5, [ic_ctrl]
++	bclr	r5, r5, 0	; 0 - Enable, 1 is Disable
++	sr	r5, [ic_ctrl]
++
++	lr	r5, [dc_ctrl]
++	bclr	r5, r5, 6	; Invalidate (discard w/o wback)
++	bclr	r5, r5, 0	; Enable (+Inv)
++	sr	r5, [dc_ctrl]
++
++	; Disable alignment checking
++	lr	r5, [status32]
++	bset	r5, r5, 19
++	kflag	r5
++.endm
++
++.extern main
++
++.section .ivt, "a", @progbits
++
++; Helper macro to define weak symbols to include into interrupt vector table.
++; User code may define those functions in them, so user function will be
++; referenced in the IVT. By default all handlers point to _exit_halt - so they
++; always cause application halt, because if application causes an exception or
++; interrupt, but doesn't set a handler for it - something is wrong in
++; application. Exception is "start" entry of IVT, which points to __start
++; function.
++#define IVT_ENTRY(name) \
++    .word name `\
++    .weak name `\
++    .set name, _exit_halt
++
++; handler's name,		number,	name,			offset in IVT (hex/dec)
++.word __start			; 0	program entry point	0x0		0
++IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
++IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
++IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
++IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
++IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
++IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
++IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
++IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
++IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
++IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
++IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
++IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
++IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
++IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
++IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
++IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
++IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
++IVT_ENTRY(IRQ_18)		; 18				0x48		72
++IVT_ENTRY(IRQ_19)		; 19				0x4C		76
++IVT_ENTRY(IRQ_20)		; 20				0x50		80
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	CPU_EARLY_SETUP
++	mov gp, @__SDATA_BEGIN__
++
++	mov sp, @__stack_top	; initialize stack pointer
++
++	mov r2, @_rom_non_persistent_dccm_start; r2 = start of the non persistent dccm section
++	sub r3, @_dccm_end, r2	; r3 = size of the dccm section in bytes
++	; set up the loop counter register to the size (in words) of the dccm section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov r4, 0x0
++	; loop to zero out the dccm.  Enter loop only if lp_count != 0
++	lpnz @.Lend_dccm
++	st.ab r4, [r2, 4]	; zero out the word
++	nop
++.Lend_dccm:
++
++	mov_s r1, @_data_after_persist_sec	; r1 = non persistent section begin in ROM(LMA).
++	mov_s r2, @_rom_non_persistent_dccm_start; r2 = non persistent section begin in DCCM(VMA).
++
++	sub r3, @_edata, r2	; r3 = size of the non persistent data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
++	;; branch to main
++	bl.d @palad_bloader_main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/app/palad_bloader/palad_bloader.c b/app/palad_bloader/palad_bloader.c
+new file mode 100644
+index 0000000..6bd29e1
+--- /dev/null
++++ b/app/palad_bloader/palad_bloader.c
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stddef.h>
++#include <baremetal.h>
++#include <hl.h>
++#include <device.h>
++#include <uart.h>
++#include <pll.h>
++
++#include "palad_bloader.h"
++
++int hl_fuse_init(u32 efuse_base) { return 0; }
++
++static void device_init(void)
++{
++	device_init_global_conf();
++	device_init_efuse();
++	device_init_uart();
++}
++
++__weak uint32_t hl_get_die_id(void) { return 0; }
++
++void palad_bloader_main(void)
++{
++	uint32_t die_id = hl_get_die_id();
++
++	device_init_pll(); /* used for uart and delay */
++	udelay_init();
++
++	btldr_pll_fixup(die_id);
++	if (die_id)
++		wfe();
++
++	device_init();
++	hl_uart_init();
++
++	preboot_puts("starting palad-bloader\n");
++	btldr_parc_prepare();
++	btldr_copy_data();
++	btldr_exec_app();
++}
+diff --git a/app/palad_bloader/palad_bloader.h b/app/palad_bloader/palad_bloader.h
+new file mode 100644
+index 0000000..6bc8377
+--- /dev/null
++++ b/app/palad_bloader/palad_bloader.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++#ifndef _PALAD_BLOADER_H_
++#define _PALAD_BLOADER_H_
++
++void btldr_pll_fixup(uint32_t die_id);
++void btldr_parc_prepare(void);
++void btldr_copy_data(void);
++void btldr_exec_app(void);
++
++#endif /* _PALAD_BLOADER_H_ */
+diff --git a/app/pcie_pif/Makefile b/app/pcie_pif/Makefile
+index 450a792..1159854 100644
+--- a/app/pcie_pif/Makefile
++++ b/app/pcie_pif/Makefile
+@@ -8,6 +8,11 @@
+ 
+ EMB_COMMON_MOD_DIR := ${PREBOOT_ROOT_DIR}/emb_common_mod
+ 
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ CFLAGS += -I$(SPECS_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(BASE_DEV_NAME)
+diff --git a/app/pldm_bloader/Makefile b/app/pldm_bloader/Makefile
+deleted file mode 100644
+index 6f84400..0000000
+--- a/app/pldm_bloader/Makefile
++++ /dev/null
+@@ -1,70 +0,0 @@
+-CC = $(CROSS_COMPILE)gcc
+-OBJCOPY = $(CROSS_COMPILE)objcopy
+-BASE_DEV_NAME := $(shell echo $(HL_DEV) | cut -d'_' -f1)
+-HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
+-PREBOOT_ROOT_DIR := ../..
+-HL_DEV_ARCH := $(PREBOOT_ROOT_DIR)/arch/$(BASE_DEV_NAME)/$(HL_DEV_SUBTYPE)
+-HL_DEV_ARCH_COMMON := $(PREBOOT_ROOT_DIR)/arch/$(BASE_DEV_NAME)/common
+-
+-EMB_COMMON_MOD_DIR := ${PREBOOT_ROOT_DIR}/emb_common_mod
+-
+-include $(HL_DEV_ARCH)/Makefile
+-
+-CFLAGS += -I$(SPECS_DIR)
+-CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+-CFLAGS += -Wall -Werror
+-CFLAGS += -g -c
+-CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(HL_DEV_ARCH)/
+-CFLAGS += -I $(EMB_COMMON_MOD_DIR)/include
+-CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib
+-CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib/common
+-CFLAGS += -I $(EMB_COMMON_MOD_DIR)/lib/preboot
+-
+-CFLAGS += -Os -fdata-sections -ffunction-sections
+-
+-SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+-
+-PLDM_BLOADER_LD_SCRIPT := $(shell ls $(HL_DEV_ARCH)/pldm_bloader.lds.S)
+-LDFLAGS := -g -nostdlib -static
+-LDFLAGS += -Wl,--gc-sections
+-LDLIBS := -lgcc
+-
+-PLDM_BLOADER_SRCS_C := $(shell ls *.c)
+-PLDM_BLOADER_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
+-PLDM_BLOADER_SRCS_C := $(filter-out $(PREBOOT_ROOT_DIR)/lib/common/pif_ts.c,$(PLDM_BLOADER_SRCS_C))
+-PLDM_BLOADER_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+-PLDM_BLOADER_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+-PLDM_BLOADER_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
+-PLDM_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/lib/common/lib_common.c)
+-PLDM_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/lib/common/pci.c)
+-PLDM_BLOADER_APP_S := $(shell ls crt0_rom.S)
+-
+-include $(HL_DEV_ARCH)/Makefile
+-
+-PLDM_BLOADER_OBJECTS := $(PLDM_BLOADER_SRCS_C:.c=.o)
+-PLDM_BLOADER_OBJECTS += $(PLDM_BLOADER_APP_S:.S=.o)
+-
+-# TODO: add version info
+-
+-all: clean
+-	$(MAKE) pldm_bloader.bin
+-
+-pldm_bloader.bin: pldm_bloader.elf
+-	$(OBJCOPY) -O binary $< $@
+-
+-pldm_bloader.elf: $(PLDM_BLOADER_OBJECTS) $(PLDM_BLOADER_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(PLDM_BLOADER_LD_SCRIPT) -o $@ -Wl,--start-group $(PLDM_BLOADER_OBJECTS) $(LDLIBS) -Wl,--end-group
+-
+-%.lds: %.lds.S
+-	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
+-
+-%.o: %.c
+-	@$(CC) $(CFLAGS) -o $@ $<
+-
+-%.o: %.S
+-	@$(CC) $(SFLAGS) -o $@ $<
+-
+-clean:
+-	rm -f $(PLDM_BLOADER_OBJECTS)
+-
+-.PHONY: clean
+diff --git a/app/pldm_bloader/crt0_rom.S b/app/pldm_bloader/crt0_rom.S
+deleted file mode 100644
+index b41d0e5..0000000
+--- a/app/pldm_bloader/crt0_rom.S
++++ /dev/null
+@@ -1,139 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0+ */
+-/*
+- * Copyright 2022 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-;; ************************************************************************************************
+-;; -----------------
+-;; ARC start up file
+-;; -----------------
+-;; The startup code for the ARC family of processors does the following
+-;; before transferring control to user defined main label :
+-;;	1. Set sp to __stack_top (link time variable)
+-;;	2. Set fp to zero
+-;;	3. Zero out the bss section (for uninitialized globals)
+-;; After returning from main, the processor is halted and the pipeline is flushed out
+-;;
+-;; ************************************************************************************************
+-.file "crt0_rom.S"
+-
+-.macro CPU_EARLY_SETUP
+-	; enable I-cache/D-cache
+-	lr	r5, [ic_ctrl]
+-	bclr	r5, r5, 0	; 0 - Enable, 1 is Disable
+-	sr	r5, [ic_ctrl]
+-
+-	lr	r5, [dc_ctrl]
+-	bclr	r5, r5, 6	; Invalidate (discard w/o wback)
+-	bclr	r5, r5, 0	; Enable (+Inv)
+-	sr	r5, [dc_ctrl]
+-
+-	; Disable alignment checking
+-	lr	r5, [status32]
+-	bset	r5, r5, 19
+-	kflag	r5
+-.endm
+-
+-.extern main
+-
+-.section .ivt, "a", @progbits
+-
+-; Helper macro to define weak symbols to include into interrupt vector table.
+-; User code may define those functions in them, so user function will be
+-; referenced in the IVT. By default all handlers point to _exit_halt - so they
+-; always cause application halt, because if application causes an exception or
+-; interrupt, but doesn't set a handler for it - something is wrong in
+-; application. Exception is "start" entry of IVT, which points to __start
+-; function.
+-#define IVT_ENTRY(name) \
+-    .word name `\
+-    .weak name `\
+-    .set name, _exit_halt
+-
+-; handler's name,		number,	name,			offset in IVT (hex/dec)
+-.word __start			; 0	program entry point	0x0		0
+-IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
+-IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
+-IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
+-IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
+-IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
+-IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
+-IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
+-IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
+-IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
+-IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
+-IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
+-IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
+-IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
+-IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
+-IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
+-IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
+-IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
+-IVT_ENTRY(IRQ_18)		; 18				0x48		72
+-IVT_ENTRY(IRQ_19)		; 19				0x4C		76
+-IVT_ENTRY(IRQ_20)		; 20				0x50		80
+-
+-.section .text.__startup, "ax", @progbits
+-
+-.global __start
+-.type __start, @function
+-.align 4
+-
+-; Startup code for the ARC600, ARC700 and ARCv2 processors
+-; NOTE:  The following restrictions apply on zero overhead loops (other
+-; restrictions are not pertinent to this code)
+-; - loop end should be 4 instruction words away from the lp_count setting
+-;   instruction
+-; - loop body should have at least two instruction words
+-__start:
+-	CPU_EARLY_SETUP
+-	mov gp, @__SDATA_BEGIN__
+-
+-	mov sp, @__stack_top	; initialize stack pointer
+-
+-	mov r2, @_rom_non_persistent_dccm_start; r2 = start of the non persistent dccm section
+-	sub r3, @_dccm_end, r2	; r3 = size of the dccm section in bytes
+-	; set up the loop counter register to the size (in words) of the dccm section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	mov r4, 0x0
+-	; loop to zero out the dccm.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_dccm
+-	st.ab r4, [r2, 4]	; zero out the word
+-	nop
+-.Lend_dccm:
+-
+-	mov_s r1, @_data_after_persist_sec	; r1 = non persistent section begin in ROM(LMA).
+-	mov_s r2, @_rom_non_persistent_dccm_start; r2 = non persistent section begin in DCCM(VMA).
+-
+-	sub r3, @_edata, r2	; r3 = size of the non persistent data section in bytes
+-
+-	; set up the loop counter register to the size (in words) of the data section
+-	asr_s r13, r3
+-	asr.f lp_count, r13
+-
+-	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
+-	lpnz @.Lend_cdata
+-	ld.ab	r5,[r1,4]
+-	st.ab	r5,[r2,4]
+-.Lend_cdata:
+-
+-	;; branch to main
+-	bl.d @pldm_bloader_main
+-	mov fp, 0		; initialize frame pointer
+-				; r0 contains exit code
+-	j @_exit_halt
+-
+-.global _exit_halt
+-.type _exit_halt, @function
+-.align 4
+-_exit_halt:
+-				; r0 contains exit code
+-	flag 0x01
+-	nop
+-	nop
+-	nop
+-	j @_exit_halt
+-	nop
+diff --git a/app/pldm_bloader/pldm_bloader.c b/app/pldm_bloader/pldm_bloader.c
+deleted file mode 100644
+index bf94585..0000000
+--- a/app/pldm_bloader/pldm_bloader.c
++++ /dev/null
+@@ -1,46 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright (C) 2023 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-#include <baremetal.h>
+-#include <hl.h>
+-#include <device.h>
+-#include <uart.h>
+-#include <pll.h>
+-
+-#include "pldm_bloader.h"
+-
+-int hl_fuse_init(u32 efuse_base) { return 0; }
+-
+-static void device_init(void)
+-{
+-	device_init_global_conf();
+-	device_init_efuse();
+-	device_init_uart();
+-}
+-
+-__weak uint32_t hl_get_die_id(void) { return 0; }
+-
+-void pldm_bloader_main(void)
+-{
+-	uint32_t die_id = hl_get_die_id();
+-
+-	device_init_pll(); /* used for uart and delay */
+-	udelay_init();
+-
+-	btldr_pll_fixup(die_id);
+-	if (die_id)
+-		wfe();
+-
+-	device_init();
+-	hl_uart_init();
+-
+-	preboot_puts("starting pldm-bloader\n");
+-	btldr_parc_prepare();
+-	btldr_copy_data();
+-	btldr_exec_app();
+-}
+diff --git a/app/pldm_bloader/pldm_bloader.h b/app/pldm_bloader/pldm_bloader.h
+deleted file mode 100644
+index eda7a7b..0000000
+--- a/app/pldm_bloader/pldm_bloader.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2023 HabanaLabs Ltd.
+- */
+-
+-#ifndef _PLDM_BLOADER_H_
+-#define _PLDM_BLOADER_H_
+-
+-void btldr_pll_fixup(uint32_t die_id);
+-void btldr_parc_prepare(void);
+-void btldr_copy_data(void);
+-void btldr_exec_app(void);
+-
+-#endif /* _PLDM_BLOADER_H_ */
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+new file mode 100644
+index 0000000..e4da780
+--- /dev/null
++++ b/arch/fs1/arc/palad.c
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * (C) Copyright 2023 HabanaLabs, Ltd.
++ */
++
++#include <psoc_pad_conf_regs.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
++#include <pcie_aux_regs.h>
++#include <pcie_aux_masks.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
++#include <arc_regs.h>
++#include <fs1_blocks_linux_driver.h>
++
++#include <baremetal.h>
++#include <pll.h>
++#include <uart.h>
++#include <bitops.h>
++#include <fs1_reg_map.h>
++#include <fs1_efuse.h>
++#include <efuse.h>
++#include <hl.h>
++
++#define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
++
++#define UART_CLOCK_FREQUENCY	SYS_CLOCK_FREQUENCY
++#define PALAD_UART_BAUDRATE	300
++
++/*
++ * This cfg specific to PALAD bumps up uart freq
++ * to 250 MHz while keeping other divs on nominal frequency
++ */
++static struct hl_pll_cfg fs1_psoc_pll_cfg[] = {
++	{
++		.name = "PSOC", .base = mmIO_0_CFG_HALF_0_SOC_0_PLL_0_PSOC_PLL_BASE,
++		.nr = 1, .nf = 240, .od = 3, .nb = 2,
++		.div_factor = { 0, 1, 4, 3 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	},
++};
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return SYS_CLOCK_FREQUENCY;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 0;
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor = SYS_CLOCK_FREQUENCY / HL_SPI_FLASH_MAX_FREQ;
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	factor = (factor < 2) ? 2 : factor;
++
++	return (factor + 1) & 0xFFFE;
++}
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE +
++			 mmPSOC_PAD_CONF_PAD_SEL_49);				/* UART0 RXD */
++	regmap_writel(1, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE +
++			 mmPSOC_PAD_CONF_PAD_SEL_50);				/* UART0 TXD */
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PALAD_UART_BAUDRATE);
++}
++
++#define PSOC_HBW_DIV_ID		0
++#define PSOC_LBW_DIV_ID		1
++#define PSOC_CFG_DIV_ID		2
++#define PSOC_UART_DIV_ID	3
++
++void hl_dev_psoc_pll_init(void)
++{
++	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_UART_DIV_ID);
++	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_HBW_DIV_ID);
++	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_LBW_DIV_ID);
++	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_CFG_DIV_ID);
++}
++
++static bool is_cxl_mode(void)
++{
++	u32 val;
++
++	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_H));
++	val &= PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_CXL_MODE_M;
++
++	return !!val;
++}
++
++#define SRIOV_MAX_NUM_VFS	4
++#define SRIOV_DEFAULT_NUM_VFS	1
++
++static void palad_pcie_dynamic_init(void)
++{
++	bool cxl_mode = is_cxl_mode();
++	u32 pci_efuse_cfg;
++	u8 num_vf = 0;
++	u32 val;
++
++	hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, IO_EFUSE_PLDM_CFG_0_OFFSET,
++		     &pci_efuse_cfg);
++	preboot_puts_hex("efuse pci cfg = ", pci_efuse_cfg, false);
++
++	if (cxl_mode) {
++		/* CXL capability is enabled as reset default */
++
++		/* disable CXL.Cache capability if required */
++		if (!(pci_efuse_cfg & CXL_CACHE_CAP_ENABLED_M)) {
++			val = regmap_readl(IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++			val &= ~PCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF_CACHE_CAP_M;
++			regmap_writel(val, IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++			val = regmap_readl(IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++			val &= ~PCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF_CACHE_CAP_M;
++			regmap_writel(val, IO0_H0_PCIE_DBI(
++						mmPCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
++		}
++	} else { /* pci mode */
++		/* switch to PCI mode by disabling Alternative Protocol Support */
++		val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++		val &= ~PCIE_DBI_PL32G_CAPABILITY_REG_MOD_TS_ALT_PROTOCOL_SUPPORT_M;
++		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
++
++		/* set number of VFs */
++		num_vf = pci_efuse_cfg & SRIOV_NUM_OF_VFS_M;
++		if (num_vf > SRIOV_MAX_NUM_VFS) {
++			num_vf = SRIOV_DEFAULT_NUM_VFS;
++			preboot_puts("VF exceeds 4, using default of 1 VF\n");
++		}
++
++		val = num_vf << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_INITIAL_VFS_S |
++		      num_vf << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_TOTAL_VFS_S;
++		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG));
++	}
++
++	/* skip ATS capability */
++	if (!(pci_efuse_cfg & ATS_CAPABILITY_ENABLED_M)) {
++		val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++		val &= ~PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_M;
++		val |= mmPCIE_DBI_LTR_CAP_HDR_REG <<
++			PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_S;
++		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
++	}
++}
++
++#define BAR_SIZE_1GB		(SZ_1G - 1)
++#define VF_RES_BAR_SIZES	(PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V512GB_M | \
++				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V256GB_M | \
++				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V128GB_M | \
++				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V64GB_M)
++
++static void palad_pcie_params_init(void)
++{
++	u32 val;
++
++	/* enable writing to DBI RO regs */
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++	val |= PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++
++	/* switch to shadow registers access in order to set BAR masks */
++	regmap_writel(PCIE_AUX_DBI_CS2_M, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE + mmPCIE_AUX_DBI);
++
++	/* set PF CFG BAR to 1GB */
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR1_REG));
++
++	/* set SRIOV CFG BAR to 1GB */
++	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR0_REG));
++	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR1_REG));
++
++	/* disable shadow registers access */
++	regmap_writel(0, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE + mmPCIE_AUX_DBI);
++
++	/* set VF resizable BAR #2 allowed size */
++	regmap_writel(VF_RES_BAR_SIZES, IO0_H0_PCIE_DBI(mmPCIE_DBI_VF_RESBAR_CAP_REG_2_REG));
++
++	palad_pcie_dynamic_init();
++
++	/* disable writing to DBI RO regs */
++	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++	val &= ~PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
++	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
++}
++
++#define LTTSM_ENA_MASK	(PCIE_AUX_LTSSM_EN_IND_M | PCIE_AUX_LTSSM_EN_MASK_M)
++
++void preboot_pcie_wait_for_link(void)
++{
++	palad_pcie_params_init();
++
++	regmap_writel(LTTSM_ENA_MASK, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE +
++				      mmPCIE_AUX_LTSSM_EN);
++}
++
++
++/*
++ * pcie pll is initialized by the boot fsm to nominal values (in secured boot mode). In order to
++ * support uart prints on palad only div3 of the PSOC pll should be modified.
++ */
++void btldr_pll_fixup(uint32_t die_id)
++{
++	hl_dev_psoc_pll_init();
++}
++
++/*
++ * ARC must not be in reset state when accessing the CCM modules.
++ * bloader is using CCM memories of MNG and MISC ARCs. MNG is already running, only MISC's reset
++ * need to be deasserted.
++ */
++void btldr_parc_prepare(void)
++{
++	regmap_writel(0, mmIO_0_CFG_HALF_0_PSOC_ARC_MISC_ARC_BASE + mmARC_ARC_RST);
++}
++
++static void btldr_copy_preboot_app(void)
++{
++	int err;
++	u32 val;
++
++	/*
++	 * Clean copy of the application is stored in MNG ICCM. In case the application binary
++	 * exceeds MNG ICCM size (256kb), the rest is stored in MISC ICCM.
++	 * An efuse bit is controlling whether the application binary is larger than MNG ICCM size.
++	 */
++	fs1_mem_copy(ARC_MNG_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, ARC_MNG_ICCM_SIZE, false);
++
++	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
++	if (err)
++		val = BLOADER_COPY_LARGE_APP;
++
++	val &= BLOADER_COPY_LARGE_APP;
++
++	if (!val)
++		return;
++
++	fs1_mem_copy(ARC_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL + ARC_MNG_ICCM_SIZE,
++		     ARC_MISC_ICCM_SIZE, false);
++}
++
++static void btldr_copy_bootinfo(void)
++{
++	int err;
++	u32 val;
++
++	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
++	if (err)
++		val = BLOADER_COPY_BOOTINFO;
++
++	val &= BLOADER_COPY_BOOTINFO;
++
++	if (!val)
++		return;
++
++	/*
++	 * Normally bootinfo is first written to spsram by the arcboot, so preboot rtos expects some
++	 * bootinfo data to be available when it runs. On PALAD, when running standalone preboot,
++	 * pre-recorded boot info data is loaded to the SPSRAM.
++	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in MISC DCCM and copied
++	 * back to the SPSRAM as part of the preparation to run preboot rtos.
++	 */
++	fs1_mem_copy(ARC_MISC_DCCM_FULL_BASE, HL_SP_SRAM_BASE, BOOT_INFO_SIZE, false);
++}
++
++void btldr_copy_data(void)
++{
++	btldr_copy_preboot_app();
++	btldr_copy_bootinfo();
++}
++
++#define APP_RST_VECTOR_ADDR	PREBOOT_TEXT_BASE_FULL
++
++void btldr_exec_app(void)
++{
++	preboot_puts("palad-bloader resigned\n");
++	image_start(APP_RST_VECTOR_ADDR);
++}
+diff --git a/arch/fs1/arc/palad_bloader.lds.S b/arch/fs1/arc/palad_bloader.lds.S
+new file mode 100644
+index 0000000..367d883
+--- /dev/null
++++ b/arch/fs1/arc/palad_bloader.lds.S
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
++	SBROM	: ORIGIN = 0x78980000, LENGTH = 128K
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 128K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		crt0_rom.o (.text*)
++		*(.text .text.* .rodata .rodata.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext;
++		_data = .;
++		_rom_non_persistent_dccm_start = .;
++		*(.data .data.*)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + 2k;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+deleted file mode 100644
+index 14e4f56..0000000
+--- a/arch/fs1/arc/pldm.c
++++ /dev/null
+@@ -1,288 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * (C) Copyright 2023 HabanaLabs, Ltd.
+- */
+-
+-#include <psoc_pad_conf_regs.h>
+-#include <pcie_dbi_regs.h>
+-#include <pcie_dbi_masks.h>
+-#include <pcie_aux_regs.h>
+-#include <pcie_aux_masks.h>
+-#include <psoc_boot_conf_regs.h>
+-#include <psoc_boot_conf_masks.h>
+-#include <arc_regs.h>
+-#include <fs1_blocks_linux_driver.h>
+-
+-#include <baremetal.h>
+-#include <pll.h>
+-#include <uart.h>
+-#include <bitops.h>
+-#include <fs1_reg_map.h>
+-#include <fs1_efuse.h>
+-#include <efuse.h>
+-#include <hl.h>
+-
+-#define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
+-
+-#define UART_CLOCK_FREQUENCY	SYS_CLOCK_FREQUENCY
+-#define PLDM_UART_BAUDRATE	300
+-
+-/*
+- * This cfg specific to PLDM bumps up uart freq
+- * to 250 MHz while keeping other divs on nominal frequency
+- */
+-static struct hl_pll_cfg fs1_psoc_pll_cfg[] = {
+-	{
+-		.name = "PSOC", .base = mmIO_0_CFG_HALF_0_SOC_0_PLL_0_PSOC_PLL_BASE,
+-		.nr = 1, .nf = 240, .od = 3, .nb = 2,
+-		.div_factor = { 0, 1, 4, 3 },
+-		.div_sel = { HL_PLL_PLL_CLK,
+-			     HL_PLL_DIV_PLL,
+-			     HL_PLL_DIV_PLL,
+-			     HL_PLL_DIV_PLL
+-		},
+-	},
+-};
+-
+-u64 hl_pll_timestamp_freq_get(void)
+-{
+-	return SYS_CLOCK_FREQUENCY;
+-}
+-
+-u32 hl_skip_pcie_init(void)
+-{
+-	return 0;
+-}
+-
+-u32 hl_spi_baudr_get(void)
+-{
+-	u32 factor = SYS_CLOCK_FREQUENCY / HL_SPI_FLASH_MAX_FREQ;
+-
+-	/* baud rate doesn't support odd number and must not be 0 */
+-	factor = (factor < 2) ? 2 : factor;
+-
+-	return (factor + 1) & 0xFFFE;
+-}
+-
+-void hl_uart_init(void)
+-{
+-	regmap_writel(1, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE +
+-			 mmPSOC_PAD_CONF_PAD_SEL_49);				/* UART0 RXD */
+-	regmap_writel(1, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_PAD_CONF_BASE +
+-			 mmPSOC_PAD_CONF_PAD_SEL_50);				/* UART0 TXD */
+-	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
+-}
+-
+-#define PSOC_HBW_DIV_ID		0
+-#define PSOC_LBW_DIV_ID		1
+-#define PSOC_CFG_DIV_ID		2
+-#define PSOC_UART_DIV_ID	3
+-
+-void hl_dev_psoc_pll_init(void)
+-{
+-	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_UART_DIV_ID);
+-	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_HBW_DIV_ID);
+-	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_LBW_DIV_ID);
+-	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_CFG_DIV_ID);
+-}
+-
+-static bool is_cxl_mode(void)
+-{
+-	u32 val;
+-
+-	val = regmap_readl(IO0_H0_PSOC_BOOT(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_H));
+-	val &= PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_CXL_MODE_M;
+-
+-	return !!val;
+-}
+-
+-#define SRIOV_MAX_NUM_VFS	4
+-#define SRIOV_DEFAULT_NUM_VFS	1
+-
+-static void pldm_pcie_dynamic_init(void)
+-{
+-	bool cxl_mode = is_cxl_mode();
+-	u32 pci_efuse_cfg;
+-	u8 num_vf = 0;
+-	u32 val;
+-
+-	hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, IO_EFUSE_PLDM_CFG_0_OFFSET,
+-		     &pci_efuse_cfg);
+-	preboot_puts_hex("efuse pci cfg = ", pci_efuse_cfg, false);
+-
+-	if (cxl_mode) {
+-		/* CXL capability is enabled as reset default */
+-
+-		/* disable CXL.Cache capability if required */
+-		if (!(pci_efuse_cfg & CXL_CACHE_CAP_ENABLED_M)) {
+-			val = regmap_readl(IO0_H0_PCIE_DBI(
+-						mmPCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
+-			val &= ~PCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF_CACHE_CAP_M;
+-			regmap_writel(val, IO0_H0_PCIE_DBI(
+-						mmPCIE_DBI_CXL_RCRB_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
+-			val = regmap_readl(IO0_H0_PCIE_DBI(
+-						mmPCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
+-			val &= ~PCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF_CACHE_CAP_M;
+-			regmap_writel(val, IO0_H0_PCIE_DBI(
+-						mmPCIE_DBI_CXL_RCIEP_DVSEC_HDR_2_FLEXBUS_CAP_OFF));
+-		}
+-	} else { /* pci mode */
+-		/* switch to PCI mode by disabling Alternative Protocol Support */
+-		val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
+-		val &= ~PCIE_DBI_PL32G_CAPABILITY_REG_MOD_TS_ALT_PROTOCOL_SUPPORT_M;
+-		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_PL32G_CAPABILITY_REG));
+-
+-		/* set number of VFs */
+-		num_vf = pci_efuse_cfg & SRIOV_NUM_OF_VFS_M;
+-		if (num_vf > SRIOV_MAX_NUM_VFS) {
+-			num_vf = SRIOV_DEFAULT_NUM_VFS;
+-			preboot_puts("VF exceeds 4, using default of 1 VF\n");
+-		}
+-
+-		val = num_vf << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_INITIAL_VFS_S |
+-		      num_vf << PCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG_SRIOV_TOTAL_VFS_S;
+-		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_TOTAL_VFS_INITIAL_VFS_REG));
+-	}
+-
+-	/* skip ATS capability */
+-	if (!(pci_efuse_cfg & ATS_CAPABILITY_ENABLED_M)) {
+-		val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
+-		val &= ~PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_M;
+-		val |= mmPCIE_DBI_LTR_CAP_HDR_REG <<
+-			PCIE_DBI_SRIOV_BASE_REG_SRIOV_NEXT_OFFSET_S;
+-		regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BASE_REG));
+-	}
+-}
+-
+-#define BAR_SIZE_1GB		(SZ_1G - 1)
+-#define VF_RES_BAR_SIZES	(PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V512GB_M | \
+-				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V256GB_M | \
+-				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V128GB_M | \
+-				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V64GB_M)
+-
+-static void pldm_pcie_params_init(void)
+-{
+-	u32 val;
+-
+-	/* enable writing to DBI RO regs */
+-	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
+-	val |= PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
+-	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
+-
+-	/* switch to shadow registers access in order to set BAR masks */
+-	regmap_writel(PCIE_AUX_DBI_CS2_M, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE + mmPCIE_AUX_DBI);
+-
+-	/* set PF CFG BAR to 1GB */
+-	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR0_REG));
+-	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_BAR1_REG));
+-
+-	/* set SRIOV CFG BAR to 1GB */
+-	regmap_writel(BAR_SIZE_1GB, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR0_REG));
+-	regmap_writel(0, IO0_H0_PCIE_DBI(mmPCIE_DBI_SRIOV_BAR1_REG));
+-
+-	/* disable shadow registers access */
+-	regmap_writel(0, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE + mmPCIE_AUX_DBI);
+-
+-	/* set VF resizable BAR #2 allowed size */
+-	regmap_writel(VF_RES_BAR_SIZES, IO0_H0_PCIE_DBI(mmPCIE_DBI_VF_RESBAR_CAP_REG_2_REG));
+-
+-	pldm_pcie_dynamic_init();
+-
+-	/* disable writing to DBI RO regs */
+-	val = regmap_readl(IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
+-	val &= ~PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M;
+-	regmap_writel(val, IO0_H0_PCIE_DBI(mmPCIE_DBI_MISC_CONTROL_1_OFF));
+-}
+-
+-#define LTTSM_ENA_MASK	(PCIE_AUX_LTSSM_EN_IND_M | PCIE_AUX_LTSSM_EN_MASK_M)
+-
+-void preboot_pcie_wait_for_link(void)
+-{
+-	pldm_pcie_params_init();
+-
+-	regmap_writel(LTTSM_ENA_MASK, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE +
+-				      mmPCIE_AUX_LTSSM_EN);
+-}
+-
+-
+-/*
+- * pcie pll is initialized by the boot fsm to nominal values (in secured boot mode). In order to
+- * support uart prints on pldm only div3 of the PSOC pll should be modified.
+- */
+-void btldr_pll_fixup(uint32_t die_id)
+-{
+-	hl_dev_psoc_pll_init();
+-}
+-
+-/*
+- * ARC must not be in reset state when accessing the CCM modules.
+- * bloader is using CCM memories of MNG and MISC ARCs. MNG is already running, only MISC's reset
+- * need to be deasserted.
+- */
+-void btldr_parc_prepare(void)
+-{
+-	regmap_writel(0, mmIO_0_CFG_HALF_0_PSOC_ARC_MISC_ARC_BASE + mmARC_ARC_RST);
+-}
+-
+-static void btldr_copy_preboot_app(void)
+-{
+-	int err;
+-	u32 val;
+-
+-	/*
+-	 * Clean copy of the application is stored in MNG ICCM. In case the application binary
+-	 * exceeds MNG ICCM size (256kb), the rest is stored in MISC ICCM.
+-	 * An efuse bit is controlling whether the application binary is larger than MNG ICCM size.
+-	 */
+-	fs1_mem_copy(ARC_MNG_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, ARC_MNG_ICCM_SIZE, false);
+-
+-	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
+-	if (err)
+-		val = BLOADER_COPY_LARGE_APP;
+-
+-	val &= BLOADER_COPY_LARGE_APP;
+-
+-	if (!val)
+-		return;
+-
+-	fs1_mem_copy(ARC_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL + ARC_MNG_ICCM_SIZE,
+-		     ARC_MISC_ICCM_SIZE, false);
+-}
+-
+-static void btldr_copy_bootinfo(void)
+-{
+-	int err;
+-	u32 val;
+-
+-	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
+-	if (err)
+-		val = BLOADER_COPY_BOOTINFO;
+-
+-	val &= BLOADER_COPY_BOOTINFO;
+-
+-	if (!val)
+-		return;
+-
+-	/*
+-	 * Normally bootinfo is first written to spsram by the arcboot, so preboot rtos expects some
+-	 * bootinfo data to be available when it runs. On PLDM, when running standalone preboot,
+-	 * pre-recorded boot info data is loaded to the SPSRAM.
+-	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in MISC DCCM and copied
+-	 * back to the SPSRAM as part of the preparation to run preboot rtos.
+-	 */
+-	fs1_mem_copy(ARC_MISC_DCCM_FULL_BASE, HL_SP_SRAM_BASE, BOOT_INFO_SIZE, false);
+-}
+-
+-void btldr_copy_data(void)
+-{
+-	btldr_copy_preboot_app();
+-	btldr_copy_bootinfo();
+-}
+-
+-#define APP_RST_VECTOR_ADDR	PREBOOT_TEXT_BASE_FULL
+-
+-void btldr_exec_app(void)
+-{
+-	preboot_puts("pldm-bloader resigned\n");
+-	image_start(APP_RST_VECTOR_ADDR);
+-}
+diff --git a/arch/fs1/arc/pldm_bloader.lds.S b/arch/fs1/arc/pldm_bloader.lds.S
+deleted file mode 100644
+index 367d883..0000000
+--- a/arch/fs1/arc/pldm_bloader.lds.S
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2024 HabanaLabs Ltd.
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
+-	SBROM	: ORIGIN = 0x78980000, LENGTH = 128K
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 128K
+-}
+-
+-REGION_ALIAS("REGION_IVT",	SBROM)
+-REGION_ALIAS("REGION_TEXT",	SBROM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	_dccm_begin = ORIGIN(DCCM);
+-	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+-
+-	.ivt : {
+-		KEEP (*(.ivt));
+-	} > REGION_IVT
+-
+-	.text : {
+-		crt0_rom.o (.text*)
+-		*(.text .text.* .rodata .rodata.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data_after_persist_sec = _etext;
+-		_data = .;
+-		_rom_non_persistent_dccm_start = .;
+-		*(.data .data.*)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + 2k;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+diff --git a/arch/gaudi2/arc/palad.c b/arch/gaudi2/arc/palad.c
+new file mode 100644
+index 0000000..6bbc8a3
+--- /dev/null
++++ b/arch/gaudi2/arc/palad.c
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * (C) Copyright 2021 HabanaLabs, Ltd.
++ *
++ */
++
++
++#include <baremetal.h>
++
++#define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
++
++u64 lkd_dev_spec_get_img_addr(uintptr_t base)
++{
++	return (base & ~SDRAM_BASE) | SDRAM_BASE_FULL;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 0;
++}
+diff --git a/arch/gaudi2/arc/pldm.c b/arch/gaudi2/arc/pldm.c
+deleted file mode 100644
+index 6bbc8a3..0000000
+--- a/arch/gaudi2/arc/pldm.c
++++ /dev/null
+@@ -1,21 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- *
+- * (C) Copyright 2021 HabanaLabs, Ltd.
+- *
+- */
+-
+-
+-#include <baremetal.h>
+-
+-#define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
+-
+-u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+-{
+-	return (base & ~SDRAM_BASE) | SDRAM_BASE_FULL;
+-}
+-
+-u32 hl_skip_pcie_init(void)
+-{
+-	return 0;
+-}
+diff --git a/arch/gaudi2/arm/palad.c b/arch/gaudi2/arm/palad.c
+new file mode 100644
+index 0000000..a1364f4
+--- /dev/null
++++ b/arch/gaudi2/arm/palad.c
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++
++#include <baremetal.h>
++
++#define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
++
++u64 lkd_dev_spec_get_img_addr(uintptr_t base)
++{
++	return ((base & ~SDRAM_BASE) | SDRAM_BASE_FULL);
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 1;
++}
++
++void preboot_sync_btl(void) {}
+diff --git a/arch/gaudi2/arm/pldm.c b/arch/gaudi2/arm/pldm.c
+deleted file mode 100644
+index a1364f4..0000000
+--- a/arch/gaudi2/arm/pldm.c
++++ /dev/null
+@@ -1,23 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-
+-#include <baremetal.h>
+-
+-#define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
+-
+-u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+-{
+-	return ((base & ~SDRAM_BASE) | SDRAM_BASE_FULL);
+-}
+-
+-u32 hl_skip_pcie_init(void)
+-{
+-	return 1;
+-}
+-
+-void preboot_sync_btl(void) {}
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 3513d91..deb55db 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -1,3 +1,8 @@
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/reset.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 9c797f3..03033bf 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -11,7 +11,7 @@
+ #include <limits.h>
+ #include <arc_farm_arc0_dccm0_regs.h>
+ 
+-#ifdef TARGET_IS_PLDM
++#ifdef TARGET_IS_PALAD
+ 	#define MME_MASK 0x0
+ 	#define EDMA_ENABLED_MASK 0xFF
+ 	#define ROTATOR_MASK 0x3
+diff --git a/arch/gaudi2/common/palad.c b/arch/gaudi2/common/palad.c
+new file mode 100644
+index 0000000..f79e51d
+--- /dev/null
++++ b/arch/gaudi2/common/palad.c
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ *
++ * (C) Copyright 2021 HabanaLabs, Ltd.
++ *
++ */
++
++#include <gaudi2_blocks_linux_driver.h>
++#include <baremetal.h>
++#include <psoc_global_conf_regs.h>
++#include <psoc_cpu_pll_ctrl_regs.h>
++#include <pll.h>
++#include <uart.h>
++
++
++#define SYS_CLOCK_FREQUENCY	155000ULL
++
++#define UART_CLOCK_FREQUENCY	11900ULL
++#define PALAD_UART_BAUDRATE	300
++
++/*
++ * This cfg specific to PALAD bumps up uart freq
++ * to 250 MHz while keeping other div's on refclk
++ */
++static struct hl_pll_cfg gaudi2_pll_cfg[] = {
++	{
++		.name = "CPU", .base = mmPSOC_CPU_PLL_CTRL_BASE,
++		.nr = 1, .nf = 60, .od = 2, .nb = 3,
++		.div_factor = { 0, 0, 4, 1 },
++		.div_sel = { HL_PLL_REF_CLK,
++			HL_PLL_REF_CLK,
++			HL_PLL_REF_CLK,
++			HL_PLL_DIV_PLL
++		},
++	}
++};
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return SYS_CLOCK_FREQUENCY;
++}
++
++u32 hl_skip_fw_cfg(void)
++{
++	/* Use DumpSel[3] to skip FW config */
++	return hl_is_debug_mode(HL_DEBUG_HW_DRAM);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor = 2; /* Min Divider */
++
++	/* baud rate doesn't support odd number */
++	return (factor + 1) & 0xFFFE;
++}
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_8);	/* UART0 RXD */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_9);	/* UART0 TXD */
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PALAD_UART_BAUDRATE);
++}
++
++void hl_dev_pll_init(void)
++{
++	/* Bump up UART frequency */
++	hl_pll_init(gaudi2_pll_cfg, 1);
++}
++
++void preboot_init_pcie_phy(void) {}
++
++void preboot_update_bar_sizes(void) {}
++
++void sha_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
++}
+diff --git a/arch/gaudi2/common/pldm.c b/arch/gaudi2/common/pldm.c
+deleted file mode 100644
+index e2b3430..0000000
+--- a/arch/gaudi2/common/pldm.c
++++ /dev/null
+@@ -1,77 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- *
+- * (C) Copyright 2021 HabanaLabs, Ltd.
+- *
+- */
+-
+-#include <gaudi2_blocks_linux_driver.h>
+-#include <baremetal.h>
+-#include <psoc_global_conf_regs.h>
+-#include <psoc_cpu_pll_ctrl_regs.h>
+-#include <pll.h>
+-#include <uart.h>
+-
+-
+-#define SYS_CLOCK_FREQUENCY	155000ULL
+-
+-#define UART_CLOCK_FREQUENCY	11900ULL
+-#define PLDM_UART_BAUDRATE	300
+-
+-/*
+- * This cfg specific to PLDM bumps up uart freq
+- * to 250 MHz while keeping other div's on refclk
+- */
+-static struct hl_pll_cfg gaudi2_pll_cfg[] = {
+-	{
+-		.name = "CPU", .base = mmPSOC_CPU_PLL_CTRL_BASE,
+-		.nr = 1, .nf = 60, .od = 2, .nb = 3,
+-		.div_factor = { 0, 0, 4, 1 },
+-		.div_sel = { HL_PLL_REF_CLK,
+-			HL_PLL_REF_CLK,
+-			HL_PLL_REF_CLK,
+-			HL_PLL_DIV_PLL
+-		},
+-	}
+-};
+-
+-u64 hl_pll_timestamp_freq_get(void)
+-{
+-	return SYS_CLOCK_FREQUENCY;
+-}
+-
+-u32 hl_skip_fw_cfg(void)
+-{
+-	/* Use DumpSel[3] to skip FW config */
+-	return hl_is_debug_mode(HL_DEBUG_HW_DRAM);
+-}
+-
+-u32 hl_spi_baudr_get(void)
+-{
+-	u32 factor = 2; /* Min Divider */
+-
+-	/* baud rate doesn't support odd number */
+-	return (factor + 1) & 0xFFFE;
+-}
+-
+-void hl_uart_init(void)
+-{
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_8);	/* UART0 RXD */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_9);	/* UART0 TXD */
+-	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
+-}
+-
+-void hl_dev_pll_init(void)
+-{
+-	/* Bump up UART frequency */
+-	hl_pll_init(gaudi2_pll_cfg, 1);
+-}
+-
+-void preboot_init_pcie_phy(void) {}
+-
+-void preboot_update_bar_sizes(void) {}
+-
+-void sha_csum(const unsigned char *input, unsigned int ilen,
+-		unsigned char *output)
+-{
+-}
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 17f5780..a73c897 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -7,6 +7,11 @@
+ 
+ CFLAGS += -I $(PREBOOT_ROOT_DIR)/lib/preboot
+ 
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ ifeq ($(HL_TARGET),onix)
+ 	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports_onix.elf
+ else
+@@ -17,8 +22,8 @@
+ PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/$(HL_TARGET).c)
+ PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/common.c)
+ 
+-PLDM_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/$(HL_TARGET).c)
+-PLDM_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/common.c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/$(HL_TARGET).c)
++PALAD_BLOADER_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/common.c)
+ 
+ PIF_ARC_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/$(HL_TARGET).c)
+ PIF_ARC_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(BASE_DEV_NAME)/common.c)
+diff --git a/arch/gaudi3/arc/palad.c b/arch/gaudi3/arc/palad.c
+new file mode 100644
+index 0000000..1d7da13
+--- /dev/null
++++ b/arch/gaudi3/arc/palad.c
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * (C) Copyright 2022 HabanaLabs, Ltd.
++ */
++#include <gaudi3_blocks_linux_driver.h>
++#include <gaudi3_reg_map.h>
++#include <global_conf_regs.h>
++#include <global_conf_masks.h>
++#include <arc_regs.h>
++#include <stddef.h>
++#include <bitops.h>
++#include <baremetal.h>
++#include <uart.h>
++#include <pll.h>
++#include <arcboot_export_dev.h>
++#include <boot_desc.h>
++#include <efuse.h>
++#include "hl.h"
++#include <fit.h>
++
++#define UART_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 SIMULATION CLK */
++
++#define PALAD_UART_BAUDRATE	300
++
++/*
++ * This cfg specific to PALAD bumps up uart freq
++ * to 250 MHz while keeping other div's on refclk
++ */
++static struct hl_pll_cfg gaudi3_cpu_pll_cfg[] = {
++	{
++		.name = "CPU", .base = mmD0_G4_PCI_PLL_CTRL_BASE,
++		.nr = 1, .nf = 240, .od = 2, .nb = 3,
++		.div_factor = { 0, 1, 9, 3 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL
++		},
++	}
++};
++
++static struct hl_pll_cfg gaudi3_nw_pll_cfg[] = {
++	{
++		.name = "G4NCH", .base = mmD0_G4_NCH_PLL_CTRL_BASE,
++		.nr = 1, .nf = 224, .od = 6, .nb = 0,
++		.div_factor = {0, 1, 1, 7},
++		.div_sel = {HL_PLL_PLL_CLK,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL
++		},
++	},
++	{
++		.name = "G0MSH", .base = mmD0_G0_MSH_PLL_CTRL_BASE,
++		.nr = 1, .nf = 224, .od = 6, .nb = 0,
++		.div_factor = {0, 1, 1, 7},
++		.div_sel = {HL_PLL_PLL_CLK,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL
++		},
++	},
++	{
++		.name = "G6MSH", .base = mmD0_G6_MSH_PLL_CTRL_BASE,
++		.nr = 1, .nf = 224, .od = 6, .nb = 0,
++		.div_factor = {0, 1, 1, 7},
++		.div_sel = {HL_PLL_PLL_CLK,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL
++		},
++	},
++};
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_48)); /* UART0 RXD */
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_49)); /* UART0 TXD */
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PALAD_UART_BAUDRATE);
++}
++
++#define SP_SRAM_INIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++
++/*
++ * Initialize scratch SRAM to avoid ECC exceptions.
++ * Normally bootrom takes care of that, but in palad when running without
++ * bootrom, let preboot initialize the spsram memory
++ */
++void preboot_sp_sram_init(void)
++{
++	unsigned int rst_src = hl_rst_src_get();
++	u32 init_sts;
++	u64 start;
++
++	if (rst_src != HL_COLD_RST)
++		return;
++
++	regmap_writel(GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_START_M,
++		      D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_SCRATCHPAD_INIT_CTRL));
++	start = timestamp_get_us();
++
++	while (1) {
++		init_sts =
++			regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_SCRATCHPAD_INIT_CTRL));
++		if (init_sts & GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_DONE_M)
++			break;
++
++		/*
++		 * If init does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, SP_SRAM_INIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for sp sram init\n");
++			break;
++		}
++	}
++}
++
++void hl_dev_cpu_pll_init(void)
++{
++	hl_pll_init(gaudi3_cpu_pll_cfg, 1);
++}
++
++void hl_dev_nw_pll_init(void)
++{
++	hl_pll_init(gaudi3_nw_pll_cfg, ARRAY_SIZE(gaudi3_nw_pll_cfg));
++}
++
++void ppboot_security_init(void)
++{
++	hl_dev_security_init();
++}
++
++bool hl_dev_is_valid_img_desc(struct boot_desc *desc)
++{
++	return true;
++}
++
++#define PCI_AUX_DIV_ID	2
++#define UART_DIV_ID	3
++
++/*
++ * pcie pll is initialized by the boot fsm to nominal values (in secured boot mode). In order to
++ * support uart prints on palad only div3 of the pci pll should be modified. Since div3 also impacts
++ * the baudrate of the d2d spi dma, pci pll of both dies should be carefully reconfigured first,
++ * before using the spi gw for data transfer.
++ * since pci pll div2 is not initialized by boot fsm, it is being set here as well.
++ */
++void btldr_pll_fixup(uint32_t die_id)
++{
++	gaudi3_cpu_pll_cfg[0].base = die_id ? mmD1_G4_PCI_PLL_CTRL_BASE : mmD0_G4_PCI_PLL_CTRL_BASE;
++
++	hl_pll_reconfig_div(gaudi3_cpu_pll_cfg, PCI_AUX_DIV_ID);
++	hl_pll_reconfig_div(gaudi3_cpu_pll_cfg, UART_DIV_ID);
++}
++
++void btldr_parc_prepare(void)
++{
++	/* ARC must not be in reset state when accessing the CCM modules */
++	regmap_writel(0, D0_PARC_ARC0_CFG_REG(mmARC_ARC_RST));
++	regmap_writel(0, mmD0_PARC_ARC2_CFG_BASE + mmARC_ARC_RST);
++}
++
++#define EFUSE_APP_SIZE_OFFSET	55
++#define EFUSE_APP_SIZE_MASK	0x1
++
++static void btldr_copy_preboot_app(void)
++{
++	int err;
++	u32 val;
++
++	/*
++	 * Clean copy of the application is stored in ICCM0. In case the application binary
++	 * exceeds ICCM0 size, the rest is stored in ICCM2.
++	 * An efuse bit is controlling whether the application binary is larger than ICCM0 size.
++	 */
++	gaudi3_hbw_memcpy(ARC0_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE, ARC0_ICCM_SIZE,
++		GAUDI3_HBW_MEM_CPY);
++
++	err = preboot_fuse_read(EFUSE_APP_SIZE_OFFSET, &val);
++	if (err)
++		val = EFUSE_APP_SIZE_MASK;
++
++	val &= EFUSE_APP_SIZE_MASK;
++
++	if (!val)
++		return;
++
++	gaudi3_hbw_memcpy(ARC2_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE + ARC0_ICCM_SIZE,
++			  ARC1_ICCM_SIZE - ARC0_ICCM_SIZE, GAUDI3_HBW_MEM_CPY);
++}
++
++static void btldr_copy_bootinfo(void)
++{
++	/*
++	 * Normally bootinfo is first written to spsram by the arcboot, so preboot rtos expects some
++	 * bootinfo data to be available when it runs. On PALAD, when running standalone preboot,
++	 * pre-recorded boot info data is loaded to the SPSRAM.
++	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in DCCM0 and copied
++	 * back to the SPSRAM as part of the preparation to run preboot rtos.
++	 */
++	gaudi3_hbw_memcpy(ARC0_DCCM_FULL_BASE, HL_SP_SRAM_BASE, ARC0_DCCM_SIZE,
++		GAUDI3_HBW_MEM_CPY);
++}
++
++void btldr_copy_data(void)
++{
++	btldr_copy_preboot_app();
++	btldr_copy_bootinfo();
++}
++
++#define APP_RST_VECTOR_ADDR	0 /* first address of the local ICCM */
++
++void btldr_exec_app(void)
++{
++	preboot_puts("palad-bloader resigned\n");
++	preboot_start_image(APP_RST_VECTOR_ADDR, true, FIT_CORE_ID_D0_PSOC_ARC1);
++}
+diff --git a/arch/gaudi3/arc/palad_bloader.lds.S b/arch/gaudi3/arc/palad_bloader.lds.S
+new file mode 100644
+index 0000000..4bfef04
+--- /dev/null
++++ b/arch/gaudi3/arc/palad_bloader.lds.S
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
++	SBROM	: ORIGIN = 0x23100000, LENGTH = 128K
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 64K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		crt0_rom.o (.text*)
++		*(.text .text.* .rodata .rodata.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext;
++		_data = .;
++		_rom_non_persistent_dccm_start = .;
++		*(.data .data.*)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + 2k;
++		__stack_top = . ;
++	} > REGION_STACK
++}
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+deleted file mode 100644
+index a1f5a2f..0000000
+--- a/arch/gaudi3/arc/pldm.c
++++ /dev/null
+@@ -1,218 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * (C) Copyright 2022 HabanaLabs, Ltd.
+- */
+-#include <gaudi3_blocks_linux_driver.h>
+-#include <gaudi3_reg_map.h>
+-#include <global_conf_regs.h>
+-#include <global_conf_masks.h>
+-#include <arc_regs.h>
+-#include <stddef.h>
+-#include <bitops.h>
+-#include <baremetal.h>
+-#include <uart.h>
+-#include <pll.h>
+-#include <arcboot_export_dev.h>
+-#include <boot_desc.h>
+-#include <efuse.h>
+-#include "hl.h"
+-#include <fit.h>
+-
+-#define UART_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 SIMULATION CLK */
+-
+-#define PLDM_UART_BAUDRATE	300
+-
+-/*
+- * This cfg specific to PLDM bumps up uart freq
+- * to 250 MHz while keeping other div's on refclk
+- */
+-static struct hl_pll_cfg gaudi3_cpu_pll_cfg[] = {
+-	{
+-		.name = "CPU", .base = mmD0_G4_PCI_PLL_CTRL_BASE,
+-		.nr = 1, .nf = 240, .od = 2, .nb = 3,
+-		.div_factor = { 0, 1, 9, 3 },
+-		.div_sel = { HL_PLL_PLL_CLK,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL
+-		},
+-	}
+-};
+-
+-static struct hl_pll_cfg gaudi3_nw_pll_cfg[] = {
+-	{
+-		.name = "G4NCH", .base = mmD0_G4_NCH_PLL_CTRL_BASE,
+-		.nr = 1, .nf = 224, .od = 6, .nb = 0,
+-		.div_factor = {0, 1, 1, 7},
+-		.div_sel = {HL_PLL_PLL_CLK,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL
+-		},
+-	},
+-	{
+-		.name = "G0MSH", .base = mmD0_G0_MSH_PLL_CTRL_BASE,
+-		.nr = 1, .nf = 224, .od = 6, .nb = 0,
+-		.div_factor = {0, 1, 1, 7},
+-		.div_sel = {HL_PLL_PLL_CLK,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL
+-		},
+-	},
+-	{
+-		.name = "G6MSH", .base = mmD0_G6_MSH_PLL_CTRL_BASE,
+-		.nr = 1, .nf = 224, .od = 6, .nb = 0,
+-		.div_factor = {0, 1, 1, 7},
+-		.div_sel = {HL_PLL_PLL_CLK,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL,
+-			HL_PLL_DIV_PLL
+-		},
+-	},
+-};
+-
+-void hl_uart_init(void)
+-{
+-	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_48)); /* UART0 RXD */
+-	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_49)); /* UART0 TXD */
+-	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
+-}
+-
+-#define SP_SRAM_INIT_TIMEOUT_US		(5 * USEC_PER_SEC)
+-
+-/*
+- * Initialize scratch SRAM to avoid ECC exceptions.
+- * Normally bootrom takes care of that, but in pldm when running without
+- * bootrom, let preboot initialize the spsram memory
+- */
+-void preboot_sp_sram_init(void)
+-{
+-	unsigned int rst_src = hl_rst_src_get();
+-	u32 init_sts;
+-	u64 start;
+-
+-	if (rst_src != HL_COLD_RST)
+-		return;
+-
+-	regmap_writel(GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_START_M,
+-		      D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_SCRATCHPAD_INIT_CTRL));
+-	start = timestamp_get_us();
+-
+-	while (1) {
+-		init_sts =
+-			regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_SCRATCHPAD_INIT_CTRL));
+-		if (init_sts & GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_DONE_M)
+-			break;
+-
+-		/*
+-		 * If init does not happen in 5 seconds
+-		 * timeout and return
+-		 */
+-		if (timeout_expired(start, SP_SRAM_INIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for sp sram init\n");
+-			break;
+-		}
+-	}
+-}
+-
+-void hl_dev_cpu_pll_init(void)
+-{
+-	hl_pll_init(gaudi3_cpu_pll_cfg, 1);
+-}
+-
+-void hl_dev_nw_pll_init(void)
+-{
+-	hl_pll_init(gaudi3_nw_pll_cfg, ARRAY_SIZE(gaudi3_nw_pll_cfg));
+-}
+-
+-void ppboot_security_init(void)
+-{
+-	hl_dev_security_init();
+-}
+-
+-bool hl_dev_is_valid_img_desc(struct boot_desc *desc)
+-{
+-	return true;
+-}
+-
+-#define PCI_AUX_DIV_ID	2
+-#define UART_DIV_ID	3
+-
+-/*
+- * pcie pll is initialized by the boot fsm to nominal values (in secured boot mode). In order to
+- * support uart prints on pldm only div3 of the pci pll should be modified. Since div3 also impacts
+- * the baudrate of the d2d spi dma, pci pll of both dies should be carefully reconfigured first,
+- * before using the spi gw for data transfer.
+- * since pci pll div2 is not initialized by boot fsm, it is being set here as well.
+- */
+-void btldr_pll_fixup(uint32_t die_id)
+-{
+-	gaudi3_cpu_pll_cfg[0].base = die_id ? mmD1_G4_PCI_PLL_CTRL_BASE : mmD0_G4_PCI_PLL_CTRL_BASE;
+-
+-	hl_pll_reconfig_div(gaudi3_cpu_pll_cfg, PCI_AUX_DIV_ID);
+-	hl_pll_reconfig_div(gaudi3_cpu_pll_cfg, UART_DIV_ID);
+-}
+-
+-void btldr_parc_prepare(void)
+-{
+-	/* ARC must not be in reset state when accessing the CCM modules */
+-	regmap_writel(0, D0_PARC_ARC0_CFG_REG(mmARC_ARC_RST));
+-	regmap_writel(0, mmD0_PARC_ARC2_CFG_BASE + mmARC_ARC_RST);
+-}
+-
+-#define EFUSE_APP_SIZE_OFFSET	55
+-#define EFUSE_APP_SIZE_MASK	0x1
+-
+-static void btldr_copy_preboot_app(void)
+-{
+-	int err;
+-	u32 val;
+-
+-	/*
+-	 * Clean copy of the application is stored in ICCM0. In case the application binary
+-	 * exceeds ICCM0 size, the rest is stored in ICCM2.
+-	 * An efuse bit is controlling whether the application binary is larger than ICCM0 size.
+-	 */
+-	gaudi3_hbw_memcpy(ARC0_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE, ARC0_ICCM_SIZE,
+-		GAUDI3_HBW_MEM_CPY);
+-
+-	err = preboot_fuse_read(EFUSE_APP_SIZE_OFFSET, &val);
+-	if (err)
+-		val = EFUSE_APP_SIZE_MASK;
+-
+-	val &= EFUSE_APP_SIZE_MASK;
+-
+-	if (!val)
+-		return;
+-
+-	gaudi3_hbw_memcpy(ARC2_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE + ARC0_ICCM_SIZE,
+-			  ARC1_ICCM_SIZE - ARC0_ICCM_SIZE, GAUDI3_HBW_MEM_CPY);
+-}
+-
+-static void btldr_copy_bootinfo(void)
+-{
+-	/*
+-	 * Normally bootinfo is first written to spsram by the arcboot, so preboot rtos expects some
+-	 * bootinfo data to be available when it runs. On PLDM, when running standalone preboot,
+-	 * pre-recorded boot info data is loaded to the SPSRAM.
+-	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in DCCM0 and copied
+-	 * back to the SPSRAM as part of the preparation to run preboot rtos.
+-	 */
+-	gaudi3_hbw_memcpy(ARC0_DCCM_FULL_BASE, HL_SP_SRAM_BASE, ARC0_DCCM_SIZE,
+-		GAUDI3_HBW_MEM_CPY);
+-}
+-
+-void btldr_copy_data(void)
+-{
+-	btldr_copy_preboot_app();
+-	btldr_copy_bootinfo();
+-}
+-
+-#define APP_RST_VECTOR_ADDR	0 /* first address of the local ICCM */
+-
+-void btldr_exec_app(void)
+-{
+-	preboot_puts("pldm-bloader resigned\n");
+-	preboot_start_image(APP_RST_VECTOR_ADDR, true, FIT_CORE_ID_D0_PSOC_ARC1);
+-}
+diff --git a/arch/gaudi3/arc/pldm_bloader.lds.S b/arch/gaudi3/arc/pldm_bloader.lds.S
+deleted file mode 100644
+index 4bfef04..0000000
+--- a/arch/gaudi3/arc/pldm_bloader.lds.S
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2023 HabanaLabs Ltd.
+- */
+-
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-
+-MEMORY
+-{
+-	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
+-	SBROM	: ORIGIN = 0x23100000, LENGTH = 128K
+-	DCCM	: ORIGIN = 0x80000000, LENGTH = 64K
+-}
+-
+-REGION_ALIAS("REGION_IVT",	SBROM)
+-REGION_ALIAS("REGION_TEXT",	SBROM)
+-REGION_ALIAS("REGION_DATA",	DCCM)
+-REGION_ALIAS("REGION_SDATA",	DCCM)
+-REGION_ALIAS("REGION_BSS",	DCCM)
+-REGION_ALIAS("REGION_STACK",	DCCM)
+-
+-ENTRY(__start)
+-
+-SECTIONS
+-{
+-	_dccm_begin = ORIGIN(DCCM);
+-	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
+-
+-	.ivt : {
+-		KEEP (*(.ivt));
+-	} > REGION_IVT
+-
+-	.text : {
+-		crt0_rom.o (.text*)
+-		*(.text .text.* .rodata .rodata.*)
+-		_etext = . ;
+-	} > REGION_TEXT
+-
+-	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
+-		_data_after_persist_sec = _etext;
+-		_data = .;
+-		_rom_non_persistent_dccm_start = .;
+-		*(.data .data.*)
+-	} > REGION_DATA
+-
+-	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
+-		__SDATA_BEGIN__ = .;
+-		*(.sdata .sdata.* .gnu.linkonce.s.*)
+-		_edata = .;
+-		PROVIDE (edata = .);
+-	} > REGION_SDATA
+-
+-	.bss : {
+-		*(.dynbss)
+-		*(.bss .bss.* .gnu.linkonce.b.*)
+-		*(COMMON)
+-		/* Align here to ensure that the .bss section occupies space up to
+-		_end. Align after .bss to ensure correct alignment even if the
+-		.bss section disappears because there are no input sections. */
+-		. = ALIGN(32 / 8);
+-		_end = .;
+-		PROVIDE (end = .);
+-	} > REGION_BSS
+-
+-	.stack : {
+-		. = ALIGN(32 / 8);
+-		__stack = . ;
+-		. = . + 2k;
+-		__stack_top = . ;
+-	} > REGION_STACK
+-}
+diff --git a/arch/gaudi3/common/Makefile b/arch/gaudi3/common/Makefile
+index 267877c..a25c5e3 100644
+--- a/arch/gaudi3/common/Makefile
++++ b/arch/gaudi3/common/Makefile
+@@ -4,6 +4,11 @@
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(DEV_PREFIX)
+ CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(DEV_PREFIX)/$(DEV_PREFIX)_reg_map.h
+ 
++# TODO: remove this after switching to palad target
++ifeq ($(HL_TARGET), pldm)
++    HL_TARGET = palad
++endif
++
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+diff --git a/arch/gaudi3/common/palad.c b/arch/gaudi3/common/palad.c
+new file mode 100644
+index 0000000..64e238b
+--- /dev/null
++++ b/arch/gaudi3/common/palad.c
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
+diff --git a/arch/gaudi3/common/pldm.c b/arch/gaudi3/common/pldm.c
+deleted file mode 100644
+index 64e238b..0000000
+--- a/arch/gaudi3/common/pldm.c
++++ /dev/null
+@@ -1,4 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2022 HabanaLabs Ltd.
+- */
+diff --git a/lib/common/pll.h b/lib/common/pll.h
+index ca32084..ea2c555 100644
+--- a/lib/common/pll.h
++++ b/lib/common/pll.h
+@@ -21,7 +21,7 @@
+ #define HL_PLL_MAX_WAIT_TIME	20	/* 20 us */
+ #define HL_PLL_LOCK_MAX_RETRY	3
+ 
+-#ifdef TARGET_IS_PLDM
++#ifdef TARGET_IS_PALAD
+ #define HL_PLL_LOCK_TOUT	10	/* 10 us */
+ #else
+ #define HL_PLL_LOCK_TOUT	5000	/* 5 ms */

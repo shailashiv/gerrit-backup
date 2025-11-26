@@ -1,0 +1,119 @@
+From 3d29b489a3c5cfc5322d4c470e6fdf6ea28e8925 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 22 Aug 2022 14:22:03 +0300
+Subject: [PATCH] [SW-69581] boot_desc: add init image desc from bootinfo
+
+So far the image descriptors were read directly from the flash.
+In gaudi3 the bootrom is reading and validating the image
+descriptors, and stores them in the bootinfo after validation.
+For security concerns, ppboot should use the already validated
+descriptors stored in the bootinfo.
+In order to use the same boot desc functionality and APIs,
+for each platform the relevant boot_desc_init() functionality
+is executed and the data is stored in the same structures.
+
+Change-Id: Ie28027d2882b7d1139071c4015c16e1094c04f77
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index d4bddea..96ce9da 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -487,3 +487,9 @@
+ 
+ 	return !ret;
+ }
++
++int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
++{
++	/* arcboot function call */
++	return boot_info_get_no_merge(type, data, max_size, copy_size);
++}
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 035d7e3..fd0b5e2 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -7,6 +7,7 @@
+ #define ARCH_GAUDI3_ARC_HL_H_
+ 
+ #define BOOT_DESC_MAX_IMGS	7
++#define READ_BOOT_DESC_FROM_BOOTINFO
+ 
+ enum gaudi3_rst_src {
+ 	HL_COLD_RST = 1,
+diff --git a/include/preboot.h b/include/preboot.h
+index dadbdb5..3da58cf 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -234,6 +234,7 @@
+ void ppboot_check_stack_mon_dev_specific(void);
+ void ppboot_pcie_drain_init(void);
+ void ppboot_security_init(void);
++int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
+ 
+ void preboot_main(void);
+ void preboot_version(void);
+diff --git a/lib/common/boot_desc.c b/lib/common/boot_desc.c
+index 82eb337..cc8f904 100644
+--- a/lib/common/boot_desc.c
++++ b/lib/common/boot_desc.c
+@@ -54,6 +54,49 @@
+ 	return true;
+ }
+ 
++__weak int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size) { return 1; }
++
++#ifdef READ_BOOT_DESC_FROM_BOOTINFO
++
++int boot_desc_init(void)
++{
++	struct hl_fw_desc_info desc_info;
++	uint32_t copy_sz;
++	unsigned int i;
++
++	/* Read the main boot pointers structure */
++	if (ppboot_boot_info_get(HL_BOOT_INFO_IMG_DESC_INFO, &desc_info,
++				  sizeof(struct hl_fw_desc_info), &copy_sz)) {
++		preboot_puts("Error reading desc info from bootinfo\n");
++		return 0;
++	}
++
++	boot_ptrs.img_desc_sz = desc_info.desc_size;
++	boot_ptrs.count = desc_info.count;
++
++	if (boot_ptrs.count > BOOT_DESC_MAX_IMGS) {
++		preboot_puts("Warning: Too many image descriptors, truncating\n");
++		boot_ptrs.count = BOOT_DESC_MAX_IMGS;
++	}
++
++	if (ppboot_boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA, (uint8_t *)(&img_desc),
++				  sizeof(img_desc), &copy_sz)) {
++		preboot_puts("Failed to copy image desc from bootinfo\n");
++		return 0;
++	}
++
++	for (i = 0; i < boot_ptrs.count; i++) {
++		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
++			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
++			return 0;
++		}
++	}
++
++	return boot_ptrs.count;
++}
++
++#else
++
+ int boot_desc_init(void)
+ {
+ 	unsigned int count, i;
+@@ -86,6 +129,8 @@
+ 	return count;
+ }
+ 
++#endif /* BOOT_DESC_SRC_BOOT_INFO */
++
+ #define MULTI_CSUM_BOOT_VER	3
+ u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+ 			   enum hl_fw_img_type type, struct boot_desc *desc)

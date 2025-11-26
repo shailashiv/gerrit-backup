@@ -1,0 +1,184 @@
+From 2ce5ed5889ef714e669b05cdf29552148130beb6 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 13 Apr 2022 10:19:03 +0300
+Subject: [PATCH] [SW-66329] module: pci: refactor check function
+
+The first part of the check function is common because module pci
+should always start executing after the pci blocks are initialized,
+or at least not in reset state.
+This patch moves the common portion to common code.
+In order to avoid breaking onix code for greco/gaudi2, function
+module_pci_do_setup() is now __weak, and empty implementation is
+added for the relevant platforms.
+Also the dbg printing function is __weak now, because not all clients
+of this module are able to use prints. It was moved to pci.c where it
+fits better.
+
+Change-Id: I2608cebc12562161769573677b44ce101bd5bb8b
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/onix.c b/arch/gaudi2/common/onix.c
+index f09f448..de5f98a 100644
+--- a/arch/gaudi2/common/onix.c
++++ b/arch/gaudi2/common/onix.c
+@@ -75,6 +75,8 @@
+ 	return NOT_FOUND;
+ }
+ 
++void module_pci_do_setup(void) {}
++
+ int preboot_get_dev_spec_mem_region(enum mem_region region,
+ 					   struct mem_desc *desc)
+ {
+diff --git a/arch/greco/common/onix.c b/arch/greco/common/onix.c
+index bb5eae7..2aeb7e3 100644
+--- a/arch/greco/common/onix.c
++++ b/arch/greco/common/onix.c
+@@ -34,6 +34,8 @@
+ 	return NOT_FOUND;
+ }
+ 
++void module_pci_do_setup(void) {}
++
+ void hl_uart_init(void)
+ {
+ 	regmap_writel(1, mmPSOC_GLOBAL_CONF_PAD_SEL_8);	/* UART0 RXD */
+diff --git a/lib/common/cmd_module.h b/lib/common/cmd_module.h
+index 5111742..9573925 100644
+--- a/lib/common/cmd_module.h
++++ b/lib/common/cmd_module.h
+@@ -74,6 +74,7 @@
+ void module_pci_run_fast(void);
+ void module_pci_enable(void);
+ void module_pci_teardown(void);
++void module_pci_do_setup(void);
+ void pci_dev_specific_setup(void);
+ void pci_dev_specific_disable(void);
+ void pci_dev_specific_enable(void);
+diff --git a/lib/common/module_pci.c b/lib/common/module_pci.c
+index fe8124b..0eede9e 100644
+--- a/lib/common/module_pci.c
++++ b/lib/common/module_pci.c
+@@ -71,7 +71,7 @@
+ __weak bool is_pcie_initialized(void) { return true; }
+ __weak void hl_dev_pci_pll_wa(void) {}
+ 
+-static void module_pci_do_setup(void)
++__weak void module_pci_do_setup(void)
+ {
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_setup();
+@@ -89,26 +89,6 @@
+ 	module_pci_do_setup();
+ }
+ 
+-#define DBG_TIMEOUT_US		1000000
+-#define DBG_LINE_SZ		80
+-
+-static unsigned int dbg_cnt;
+-static u64 dbg_ts;
+-
+-static void pci_init_wait_dbg(void)
+-{
+-	if (timeout_expired(dbg_ts, DBG_TIMEOUT_US)) {
+-		preboot_puts_raw_dbg("*");
+-		dbg_ts = timestamp_get_us();
+-		dbg_cnt++;
+-	}
+-
+-	if (dbg_cnt == DBG_LINE_SZ) {
+-		preboot_puts_dbg("\n");
+-		dbg_cnt = 0;
+-	}
+-}
+-
+ __weak u32 pci_dev_specific_hot_rst_check(void)
+ {
+ 	return regmap_readl(pci.core_hot_rst_reg) & BIT(0);
+@@ -116,18 +96,6 @@
+ 
+ __weak enum cmd_check_res dev_specific_module_pci_check(void)
+ {
+-	/*
+-	 * don't read pci status regs until PRSTn is deasserted and pci blocks
+-	 * are functional
+-	 */
+-	if (!is_pcie_initialized()) {
+-		pci_init_wait_dbg();
+-		return NOT_FOUND;
+-	}
+-
+-	if (!pci_sts.setup_done)
+-		module_pci_do_setup();
+-
+ 	pci_sts.flr_reg_val = regmap_readl(pci.aux_flr_int_reg);
+ 	pci_sts.hot_rst_reg_val = pci_dev_specific_hot_rst_check();
+ 	pci_sts.rdlh_link_reg_val = regmap_readl(pci.aux_rdlh_link_up_reg);
+@@ -157,6 +125,18 @@
+ 	if (hl_is_debug_mode(HL_DEBUG_HW_PCIE))
+ 		return NOT_FOUND;
+ 
++	/*
++	 * don't read pci status regs until PRSTn is deasserted and pci blocks
++	 * are functional
++	 */
++	if (!is_pcie_initialized()) {
++		pci_init_wait_dbg();
++		return NOT_FOUND;
++	}
++
++	if (!pci_sts.setup_done)
++		module_pci_do_setup();
++
+ 	return dev_specific_module_pci_check();
+ }
+ 
+diff --git a/lib/common/pci.c b/lib/common/pci.c
+index 26bdb80..fa3c021 100644
+--- a/lib/common/pci.c
++++ b/lib/common/pci.c
+@@ -11,6 +11,8 @@
+ #include <device.h>
+ #include <sizes.h>
+ #include "pci.h"
++#include "uart.h"
++#include "pll.h"
+ 
+ #define IATU_BAR_NUM_OFFSET		8
+ #define IATU_BAR_NUM_MASK		0x700
+@@ -235,3 +237,23 @@
+ 	uncorr_aer_mask_reg_val |= BIT(AER_UNCORR_ERR_MASK_CMPLT_ABORT_ERR_SHIFT);
+ 	regmap_writel(uncorr_aer_mask_reg_val, pci.dbi_uncorr_aer_mask);
+ }
++
++#define DBG_TIMEOUT_US		1000000
++#define DBG_LINE_SZ		80
++
++static unsigned int dbg_cnt;
++static u64 dbg_ts;
++
++__weak void pci_init_wait_dbg(void)
++{
++	if (timeout_expired(dbg_ts, DBG_TIMEOUT_US)) {
++		preboot_puts_raw_dbg("*");
++		dbg_ts = timestamp_get_us();
++		dbg_cnt++;
++	}
++
++	if (dbg_cnt == DBG_LINE_SZ) {
++		preboot_puts_dbg("\n");
++		dbg_cnt = 0;
++	}
++}
+diff --git a/lib/common/pci.h b/lib/common/pci.h
+index 2111a03..0b4cf15 100644
+--- a/lib/common/pci.h
++++ b/lib/common/pci.h
+@@ -23,5 +23,6 @@
+ void hl_pcie_enable_mem_access(void);
+ void hl_pcie_mask_ca_aer(void);
+ void hl_pcie_init(void);
++void pci_init_wait_dbg(void);
+ 
+ #endif /* _PCI_H_ */

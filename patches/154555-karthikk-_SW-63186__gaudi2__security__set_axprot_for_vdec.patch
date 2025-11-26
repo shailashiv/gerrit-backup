@@ -1,0 +1,93 @@
+From bfd1a76b08cf0c09ec348a168002f52749111729 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 08 Dec 2021 08:33:39 +0200
+Subject: [PATCH] [SW-63186] gaudi2: security: set axprot for vdec
+
+Set axprot for vdec rtr ifs as per values provided by the vlsi team.
+
+Change-Id: I315a94fcb00bb46ed5db11ee5831f4187ce337b5
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index e558a33..3de32e2 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -31,6 +31,8 @@
+ #include <pcie_elbi_rr_mstr_if_core_lbw_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_wrap_masks.h>
++#include <dcore0_vdec0_mstr_if_core_hbw_regs.h>
++#include <dcore0_vdec0_mstr_if_core_lbw_regs.h>
+ 
+ /*
+  * instances_num : Number of instances of RR to program.
+@@ -188,6 +190,10 @@
+ 	int rr;
+ 	u64 min;
+ 	u64 max;
++};
++
++enum preboot_sec_axprot_regs {
++	AXPROT_VDEC,
+ };
+ 
+ #define DCORE_DIST	0x200000
+@@ -901,9 +907,30 @@
+ 	u8 inst_num;
+ };
+ 
+-__unused static void preboot_axprot_regs_init(struct axprot_regs *reg)
++#define PROT_OVR_SECURE		0
++#define PROT_OVR_PRIV		BIT(0)
++#define PROT_OVR_USER		BIT(1)
++#define AXPROT_OVRD_EN		BIT(0)
++#define AXPROT_USER_VAL		((PROT_OVR_USER << 1) | AXPROT_OVRD_EN)
++#define AXPROT_SEC_VAL		((PROT_OVR_SECURE << 1) | AXPROT_OVRD_EN)
++#define VDEC_RTR_INST_NUM	2
++#define VDEC_RTR_INST_DIST	0x10000
++
++static struct axprot_regs axprot_reg[] = {
++	[AXPROT_VDEC] = {
++		.base_reg = mmDCORE0_VDEC0_MSTR_IF_CORE_HBW_AXPROT_OVRD,
++		.value = AXPROT_USER_VAL,
++		.dcore_dist = DCORE_DIST,
++		.dcore_num = NUM_OF_DCORES,
++		.inst_dist = VDEC_RTR_INST_DIST,
++		.inst_num = VDEC_RTR_INST_NUM,
++	},
++};
++
++static void preboot_axprot_regs_init(enum preboot_sec_axprot_regs idx)
+ {
+ 	int i, j, dcore_reg, rtr_reg;
++	struct axprot_regs *reg = &axprot_reg[idx];
+ 
+ 	for (i = 0; i < reg->dcore_num; i++) {
+ 		dcore_reg = reg->base_reg + i * reg->dcore_dist;
+@@ -914,6 +941,18 @@
+ 	}
+ }
+ 
++static void preboot_secure_vdec(void)
++{
++
++	/* HBW AXPROT */
++	preboot_axprot_regs_init(AXPROT_VDEC);
++
++	axprot_reg[AXPROT_VDEC].base_reg = mmDCORE0_VDEC0_MSTR_IF_CORE_LBW_AXPROT_OVRD;
++
++	/* LBW AXPROT */
++	preboot_axprot_regs_init(AXPROT_VDEC);
++}
++
+ void preboot_security_init(void)
+ {
+ 	preboot_secure_pcie();
+@@ -922,6 +961,7 @@
+ 	if (preboot_security_is_enabled()) {
+ 		preboot_lbw_rtr_preconfig();
+ 		hl_dev_prot_bits_init();
++		preboot_secure_vdec();
+ 		preboot_secure_lbw();
+ 		preboot_secure_hbw();
+ 		preboot_puts("Security enabled.\n");

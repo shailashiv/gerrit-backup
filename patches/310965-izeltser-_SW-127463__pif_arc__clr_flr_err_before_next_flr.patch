@@ -1,0 +1,67 @@
+From d622eb333aa64c5b38fca58dc86c1bd21b7f2eef Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 15 Mar 2023 17:32:33 +0200
+Subject: [PATCH] [SW-127463] pif_arc: clr flr err before next flr
+
+Some errors may be set during an FLR event handling.
+Error bits that are related to events happened in the previous FLR event
+are being cleared before the next FLR handling begin.
+
+Change-Id: Idc28d2cb2e25ec16d25cd3223494e4830dc44e13
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index f06426a..085a5bd 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -53,6 +53,15 @@
+ 	regmap_writel(reg_val, pif_arc.error_reg);
+ }
+ 
++void hl_pif_clear_err(u32 err_bit)
++{
++	u32 reg_val;
++
++	reg_val = regmap_readl(pif_arc.error_reg);
++	reg_val &= ~err_bit;
++	regmap_writel(reg_val, pif_arc.error_reg);
++}
++
+ void hl_pif_report_sts(u32 status_bit)
+ {
+ 	u32 reg_val;
+@@ -191,13 +200,16 @@
+ 	poll_flr_done();
+ }
+ 
++#define FLR_STS_CLR_MASK	(PIF_STAT_FLR_EVENT_FINISH | PIF_STAT_SEC_DIE_READY | \
++				 PIF_STAT_PCI_ACCESS_DISABLED | PIF_STAT_INT_RESET_ACTIVE | \
++				 PIF_STAT_FLR_DONE_REPORTED)
++#define FLR_ERR_CLR_MASK	(PIF_ERR_PCI_OUTBOUND_TIMEOUT | PIF_ERR_FLR_HW_RESET_TIMEOUT | \
++				 PIF_ERR_SEC_DIE_READY_TIMEOUT)
++
+ static void new_flr_sts_prepare(void)
+ {
+-	u32 clr_mask = PIF_STAT_FLR_EVENT_FINISH | PIF_STAT_SEC_DIE_READY |
+-		       PIF_STAT_PCI_ACCESS_DISABLED | PIF_STAT_INT_RESET_ACTIVE |
+-		       PIF_STAT_FLR_DONE_REPORTED;
+-
+-	hl_pif_clear_sts(clr_mask);
++	hl_pif_clear_sts(FLR_STS_CLR_MASK);
++	hl_pif_clear_err(FLR_ERR_CLR_MASK);
+ 	hl_pif_report_sts(PIF_STAT_FLR_EVENT_START);
+ }
+ 
+diff --git a/include/preboot.h b/include/preboot.h
+index 68b32b7..2aa2603 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -263,6 +263,7 @@
+ 
+ void hl_pif_report_err(u32 err_bit);
+ void hl_pif_report_sts(u32 status_bit);
++void hl_pif_clear_err(u32 err_bit);
+ void hl_pif_clear_sts(u32 status_bit);
+ void preboot_security_sp_sram_init(void);
+ u32 hl_get_pll_div_fix(void);

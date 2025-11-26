@@ -1,0 +1,88 @@
+From 70a6fd1416b2b1eb5de8d8ee4cc56b2ab073e0ed Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Tue, 24 Mar 2020 15:50:14 +0200
+Subject: [PATCH] [SW-0] hl: add weak hl_init_pcie_phy_fw()
+
+It is now override when ROM code is running at ARC
+Otherwise this is still done on BTL
+
+Later this can be moved from BTL also for Legacy flow
+Also for Goya2 if copy speedup is needed we might consider using DMA
+
+Change-Id: I7d88e02e3f507c70f75bd1345bdd88a7b08d4cf2
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index 92137f4..d46f216 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -133,11 +133,14 @@
+ 	regmap_writel(reg, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+ }
+ 
++__attribute__((weak)) void hl_init_pcie_phy_fw(void) {}
++
+ void ppboot_main(void)
+ {
+ 	void (*preboot_start)(void) = (void *)PREBOOT_TEXT_BASE;
+ 
+ 	hl_plat_init();
++	hl_init_pcie_phy_fw();
+ 	hl_jtag_init();
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+diff --git a/goya2_arc/asic.c b/goya2_arc/asic.c
+index c7ce08e..40e95fd 100644
+--- a/goya2_arc/asic.c
++++ b/goya2_arc/asic.c
+@@ -42,3 +42,35 @@
+ 
+ 	return factor > 2 ? factor : 2;
+ }
++
++/*
++ * FW_SRAM layout:
++ * ---------------
++ * CRC32 [4B]
++ * Signature [384B]
++ * Public Key [392B]
++ * PCIe PHY FW
++ * PPboot
++ * PPboot size [4B]
++ * FW Version [4B]
++ * Layout Size [4B]
++ */
++#define FW_SRAM_META_SIZE	(4 + 4 + 4 + 392 + 384 + 4)
++void hl_init_pcie_phy_fw(void)
++{
++	int i;
++	u32 *fw_sram_base = (u32 *)FW_SRAM_BASE;
++	u32 image_size = *fw_sram_base;
++	u32 ppboot_size = *(fw_sram_base + 2);
++	u32 size = image_size - ppboot_size - FW_SRAM_META_SIZE;
++	u32 *src = (u32 *)((char *)(fw_sram_base + 3) + ppboot_size);
++	u32 *dst = (u32 *)PCIE_FW_SRAM_BASE;
++	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++
++	if (rst_src != HL_COLD_RST)
++		return;
++
++	for (i = 0; i < size; i++)
++		*(dst + i) = *(src + i);
++}
++
+diff --git a/goya2_arc/common.h b/goya2_arc/common.h
+index a13067e..e05ab43 100644
+--- a/goya2_arc/common.h
++++ b/goya2_arc/common.h
+@@ -12,7 +12,9 @@
+ #define HL_SPI_PREBOOT_OFF	0xC0000
+ #define HL_SPI_UBOOT_OFF	0xD0000
+ 
+-#define PPBOOT_TEXT_BASE	0x1B05000C
++#define PCIE_FW_SRAM_BASE	0x1BFF0000
++#define FW_SRAM_BASE		0x1B050000
++#define PPBOOT_TEXT_BASE	(FW_SRAM_BASE + 0xC)
+ #define PREBOOT_TEXT_BASE	0x8
+ 
+ #define mmCPU_PLL_BASE		0x4A2000

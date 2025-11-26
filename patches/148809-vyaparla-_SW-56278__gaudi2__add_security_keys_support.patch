@@ -1,0 +1,190 @@
+From fb3c694ecd8e6596644f20e555f39d5f78399cf7 Mon Sep 17 00:00:00 2001
+From: Varun Kumar Reddy Yaparla <vyaparla@habana.ai>
+Date: Thu, 18 Nov 2021 15:34:24 +0200
+Subject: [PATCH] [SW-56278] gaudi2: add security keys support
+
+This change add security support by setting OTP
+boot info to use in later stages by reading OTP
+information from SPI flash in case of fake security
+or from efuse/rom in case of real security
+
+Change-Id: I8fb09a12b7de0c511efc6a766967e08572baf1f3
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index eb4279e..c205648 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -18,6 +18,9 @@
+ #include <hl_boot_desc.h>
+ #include <boot_info.h>
+ #include <spi_flash.h>
++#include <efuse.h>
++#include <psoc_security_regs.h>
++#include "sha.h"
+ #include <gaudi2/gaudi2_security.h>
+ #include <psoc_arc0_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc0_mstr_if_core_lbw_regs.h>
+@@ -149,6 +152,18 @@
+ static struct hl_sec_efuse_cache preboot_hl_sec_fuse_cache = {
+ 	.is_invalid = true,
+ };
++
++static struct hl_sec_otp_cache preboot_sec_otp_cache = {
++	.is_invalid = true,
++};
++
++static u32 sec_key_address[SEC_KEY_HASH_COUNT_IN_ROM] = {
++	mmPSOC_SECURITY_HABANA_KEY_0,
++	mmPSOC_SECURITY_PUBLIC_KEY_0_0,
++	mmPSOC_SECURITY_PUBLIC_KEY_1_0,
++	mmPSOC_SECURITY_PUBLIC_KEY_2_0,
++	mmPSOC_SECURITY_PUBLIC_KEY_3_0
++	};
+ 
+ static void hl_secure_update_hit_reg(int rr_idx, int inst_dist,
+ 		struct hit_regs *rr_reg, bool write_only)
+@@ -299,7 +314,9 @@
+ 
+ #define SZ_1K			1024
+ #define SZ_1M			(SZ_1K * SZ_1K)
++#define FAKE_OTP_OFFSET		(2 * SZ_1M)
+ #define FAKE_FUSE_OFFSET	(2 * SZ_1M + 64 * SZ_1K)
++
+ static const struct hl_sec_efuse *preboot_get_hl_sec_fake_efuse(void)
+ {
+ 	struct hl_sec_efuse *fuse;
+@@ -335,9 +352,124 @@
+ 	boot_info_set(HL_BOOT_INFO_SECURITY_FUSE, efuse, sizeof(*efuse));
+ }
+ 
++static const struct hl_sec_efuse *preboot_get_hl_sec_real_efuse(void)
++{
++	struct hl_sec_efuse *fuse;
++	u32 *val;
++	int i;
++
++	if (preboot_hl_sec_fuse_cache.is_invalid) {
++		fuse = &preboot_hl_sec_fuse_cache.fuse;
++
++		for (i = 0; i < ARRAY_SIZE(fuse->data); i++) {
++			val = &fuse->data[i];
++			if (preboot_fuse_read(EFUSE_SEC_OFFSET + i, val))
++				return NULL;
++		}
++		preboot_hl_sec_fuse_cache.is_invalid = false;
++	}
++
++	return &preboot_hl_sec_fuse_cache.fuse;
++}
++
+ static void preboot_security_sp_sram_write_efuse(void)
+ {
+ 	/* Do nothing for real eFuse */
++}
++
++static void preboot_security_copy_fake_otp(struct hl_sec_otp *otp)
++{
++	spi_flash_copy(otp, FAKE_OTP_OFFSET, sizeof(struct hl_sec_otp), "FAKE OTP");
++}
++
++/* Number of DWORDS available in PSOC registers to store security key hash */
++#define NUM_OF_DW_AVLBL_IN_PSOC_FOR_SEC_HASH	8
++static void preboot_sec_copy_otp_from_rom(struct hl_sec_otp *otp)
++{
++	u32 *dword;
++	u32 key_soc_location_base;
++	int i, j;
++
++	for (i = 0; i < SEC_KEY_HASH_COUNT_IN_ROM; i++) {
++		key_soc_location_base = sec_key_address[i];
++		for (j = 0; j < NUM_OF_DW_AVLBL_IN_PSOC_FOR_SEC_HASH; j++) {
++			dword = (u32 *)&otp->keys[j * sizeof(*dword) + i * SHA_SUM_LEN];
++			*dword = regmap_readl(key_soc_location_base);
++			key_soc_location_base += sizeof(*dword);
++		}
++	}
++}
++
++static int preboot_sec_copy_otp_from_efuse(struct hl_sec_otp *otp)
++{
++	u32 *dword;
++	int i, j;
++
++	for (i = 0; i < SEC_KEY_HASH_COUNT_IN_EFUSE; i++) {
++		for (j = 0; j < SECURITY_DWORD_PER_KEY; j++) {
++			dword = (u32 *)&otp->keys[j * sizeof(*dword) + i * SHA_SUM_LEN];
++			if (preboot_fuse_read(EFUSE_SEC_KEYS_WORD_OFFSET + j +
++						i * SECURITY_DWORD_PER_KEY, dword)) {
++				preboot_puts("fuse read failed\n");
++				return 1;
++			}
++		}
++	}
++	return 0;
++}
++
++static void preboot_security_copy_otp(struct hl_sec_otp *otp)
++{
++	const struct hl_sec_efuse *fuse;
++	int num_of_keys;
++
++	fuse = preboot_get_hl_sec_real_efuse();
++	if (fuse == NULL)
++		return;
++
++	if (fuse->keys_loc_selector == SEC_KEY_HASH_LOCATION_EFUSE) {
++		num_of_keys = SEC_KEY_HASH_COUNT_IN_EFUSE;
++		if (preboot_sec_copy_otp_from_efuse(otp))
++			return;
++
++	} else {
++		num_of_keys = SEC_KEY_HASH_COUNT_IN_ROM;
++		preboot_sec_copy_otp_from_rom(otp);
++	}
++
++	otp->magic_number = OTP_SEC_MAGIC;
++	otp->num_of_keys = num_of_keys;
++	otp->sha_rsa_type = SHA_384_RSA_3072;
++}
++
++static const struct hl_sec_otp *preboot_security_get_otp(void)
++{
++	struct hl_sec_otp *otp = &preboot_sec_otp_cache.otp;
++
++	if (preboot_sec_otp_cache.is_invalid) {
++		if (preboot_fake_security_is_enabled())
++			preboot_security_copy_fake_otp(otp);
++		else
++			preboot_security_copy_otp(otp);
++
++		if (otp->magic_number != OTP_SEC_MAGIC)
++			return NULL;
++
++		preboot_sec_otp_cache.is_invalid = false;
++	}
++
++	return otp;
++}
++
++static void preboot_security_write_otp(void)
++{
++	const struct hl_sec_otp *otp;
++
++	otp = preboot_security_get_otp();
++	if (!otp)
++		return;
++
++	boot_info_set(HL_BOOT_INFO_SECURITY_OTP, otp, sizeof(*otp));
+ }
+ 
+ void preboot_security_sp_sram_write_key_idx(u32 *key_idx)
+@@ -352,6 +484,8 @@
+ 		preboot_security_sp_sram_write_fake_efuse();
+ 	} else
+ 		preboot_security_sp_sram_write_efuse();
++
++	preboot_security_write_otp();
+ }
+ 
+ #define EN_ARC_SEC_PRIV				0x3

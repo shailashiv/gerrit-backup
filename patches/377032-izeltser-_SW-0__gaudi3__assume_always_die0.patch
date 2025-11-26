@@ -1,0 +1,235 @@
+From a4157318d25edb9779663597f722e76b1d4ec4f2 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 10 Dec 2023 20:34:26 +0200
+Subject: [PATCH] [SW-0] gaudi3: assume always die0
+
+since Pif Arc and Ppboot are running on die0 only, the code supporting
+die1 is removed
+
+pldm-bloader functionality is preserved as it is designed to run
+on both dies.
+
+Change-Id: Ia38b56dd61f34fb2dfeabf3df4dfac90b6a0785f
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index 30167dd..ab8d547 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -23,7 +23,6 @@
+ 	bool prstn_deasserted;
+ 	bool flr_sw_ctrl;
+ 	bool dual_die_sku;
+-	bool primary_die;
+ 	bool setup_done;
+ };
+ 
+@@ -219,12 +218,10 @@
+ 	terminate_pci_access();
+ 	trigger_flr_reset();
+ 
+-	if (flr_sts.primary_die) {
+-		if (flr_sts.dual_die_sku)
+-			wait_for_secondary_die();
++	if (flr_sts.dual_die_sku)
++		wait_for_secondary_die();
+ 
+-		flag_flr_done();
+-	}
++	flag_flr_done();
+ 
+ 	/* TODO: wait for confirmation from FW that security preparations have finished */
+ 
+@@ -241,7 +238,6 @@
+ 		return;
+ 
+ 	flr_sts.dual_die_sku = hl_is_dual_die_sku();
+-	flr_sts.primary_die = hl_get_die_id() ? false : true;
+ 	flr_sts.flr_sw_ctrl = true;
+ 	flr_sts.setup_done = true;
+ 	hl_pif_report_sts(PIF_STAT_FLR_INITIALIZED);
+@@ -264,10 +260,7 @@
+ 	if (!flr_sts.flr_sw_ctrl)
+ 		return NOT_FOUND;
+ 
+-	if (flr_sts.primary_die)
+-		flr_req = regmap_readl(pif_arc.pf_flr_active);
+-	else	/* running on secondary die in a dual die sku */
+-		flr_req = regmap_readl(pif_arc.psoc2pif_flr_req);
++	flr_req = regmap_readl(pif_arc.pf_flr_active);
+ 
+ 	if (flr_req) {
+ 		pif_ts_counter_arm();
+diff --git a/app/pldm_bloader/pldm_bloader.c b/app/pldm_bloader/pldm_bloader.c
+index 18c44c9..d048810 100644
+--- a/app/pldm_bloader/pldm_bloader.c
++++ b/app/pldm_bloader/pldm_bloader.c
+@@ -23,6 +23,8 @@
+ 	device_init_uart();
+ }
+ 
++__weak uint32_t hl_get_die_id(void) { return 0; }
++
+ void pldm_bloader_main(void)
+ {
+ 	uint32_t die_id = hl_get_die_id();
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 331815f..0ac2c75 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -135,19 +135,9 @@
+ 	return boot_info_set_no_merge(type, data, size);
+ }
+ 
+-u32 gaudi3_die_timestamp_base_get(u32 die_id)
+-{
+-	if (die_id == GAUDI3_SLAVE_DIE_ID)
+-		return mmD1_PSOC_TIMESTAMP_BASE;
+-
+-	return mmD0_PSOC_TIMESTAMP_BASE;
+-}
+-
+ u32 hl_pll_timestamp_base_get(void)
+ {
+-	uint32_t die_id = hl_get_die_id();
+-
+-	return gaudi3_die_timestamp_base_get(die_id);
++	return mmD0_PSOC_TIMESTAMP_BASE;
+ }
+ 
+ unsigned int get_cs_pad_sel_flash(void)
+@@ -465,7 +455,7 @@
+ 	image_entry();
+ }
+ 
+-u32 hl_get_die_id(void)
++uint32_t hl_get_die_id(void)
+ {
+ 	/*
+ 	 * same address space read by both dies will return a different value
+@@ -535,42 +525,22 @@
+ 
+ void device_init_pci(void)
+ {
+-
+-	if (!hl_get_die_id()) {
+-		/* DIE 0 */
+-		pci.dbi_bar0_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR0_REG);
+-		pci.dbi_bar2_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
+-		pci.dbi_bar4_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR4_REG);
+-		pci.dbi_status_command_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_STATUS_COMMAND_REG);
+-		pci.dbi_uncorr_aer_mask = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_UNCORR_ERR_MASK_OFF);
+-		pci.aux_dbi_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_DBI);
+-		pci.aux_mem_space_en_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_MEM_SPACE_EN);
+-		pci.aux_flr_ctrl_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_CTRL);
+-		pci.aux_ltssm_en_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN);
+-		pci.aux_pf_flr_active_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_ACTIVE);
+-		pci.aux_flr_int_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_INT);
+-		pci.aux_pf_flr_done_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_DONE);
+-		pci.aux_rdlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP);
+-		pci.aux_smlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP);
+-		pci.core_hot_rst_reg = D0_PCIE_CORE_REG(mmPCIE_CORE_HOT_RST);
+-	} else {
+-		/* DIE 1 */
+-		pci.dbi_bar0_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR0_REG);
+-		pci.dbi_bar2_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
+-		pci.dbi_bar4_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR4_REG);
+-		pci.dbi_status_command_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_STATUS_COMMAND_REG);
+-		pci.dbi_uncorr_aer_mask = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_UNCORR_ERR_MASK_OFF);
+-		pci.aux_dbi_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_DBI);
+-		pci.aux_mem_space_en_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_MEM_SPACE_EN);
+-		pci.aux_flr_ctrl_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_FLR_CTRL);
+-		pci.aux_ltssm_en_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN);
+-		pci.aux_pf_flr_active_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_ACTIVE);
+-		pci.aux_flr_int_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_FLR_INT);
+-		pci.aux_pf_flr_done_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_DONE);
+-		pci.aux_rdlh_link_up_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP);
+-		pci.aux_smlh_link_up_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP);
+-		pci.core_hot_rst_reg = D1_PCIE_CORE_REG(mmPCIE_CORE_HOT_RST);
+-	}
++	/* DIE 0 */
++	pci.dbi_bar0_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR0_REG);
++	pci.dbi_bar2_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
++	pci.dbi_bar4_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR4_REG);
++	pci.dbi_status_command_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_STATUS_COMMAND_REG);
++	pci.dbi_uncorr_aer_mask = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_UNCORR_ERR_MASK_OFF);
++	pci.aux_dbi_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_DBI);
++	pci.aux_mem_space_en_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_MEM_SPACE_EN);
++	pci.aux_flr_ctrl_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_CTRL);
++	pci.aux_ltssm_en_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN);
++	pci.aux_pf_flr_active_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_ACTIVE);
++	pci.aux_flr_int_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_INT);
++	pci.aux_pf_flr_done_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_DONE);
++	pci.aux_rdlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP);
++	pci.aux_smlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP);
++	pci.core_hot_rst_reg = D0_PCIE_CORE_REG(mmPCIE_CORE_HOT_RST);
+ }
+ 
+ void device_init_i2c_s(void)
+@@ -624,38 +594,21 @@
+ 
+ void device_init_pif_arc(void)
+ {
+-	if (!hl_get_die_id()) {	/* DIE0 */
+-		pif_arc.pf_flr_active = D0_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
+-		pif_arc.pf_flr_done = D0_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
+-		pif_arc.inbound_term = D0_PIF_ARC_REG(mmPIF_ARC_INBOUND_TERM);
+-		pif_arc.crs = D0_PIF_ARC_REG(mmPIF_ARC_CRS);
+-		pif_arc.outbound_iso = D0_PIF_ARC_REG(mmPIF_ARC_OUTBOUND_ISO);
+-		pif_arc.outstand_trans = D0_PIF_ARC_REG(mmPIF_ARC_OUTSTAND_TRANS);
+-		pif_arc.pif2psoc_flr_active = D0_PIF_ARC_REG(mmPIF_ARC_PIF2PSOC_FLR_ACTIVE);
+-		pif_arc.psoc2pif_flr_req = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_REQ);
+-		pif_arc.psoc2pif_flr_done = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_DONE);
+-		pif_arc.psoc2pif_die_ready = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_DIE_READY);
+-		pif_arc.timestamp_ctrl = D0_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CTRL);
+-		pif_arc.timestamp_cnt = D0_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CNT);
+-		pif_arc.error_reg = mmD0_PIF_ARC_ERROR;
+-		pif_arc.status_reg = mmD0_PIF_ARC_STATUS;
+-		pif_arc.control_reg = mmD0_PIF_ARC_CONTROL;
+-	} else {	/* DIE1 */
+-		pif_arc.pf_flr_active = D1_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
+-		pif_arc.pf_flr_done = D1_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
+-		pif_arc.inbound_term = D1_PIF_ARC_REG(mmPIF_ARC_INBOUND_TERM);
+-		pif_arc.crs = D1_PIF_ARC_REG(mmPIF_ARC_CRS);
+-		pif_arc.outbound_iso = D1_PIF_ARC_REG(mmPIF_ARC_OUTBOUND_ISO);
+-		pif_arc.outstand_trans = D1_PIF_ARC_REG(mmPIF_ARC_OUTSTAND_TRANS);
+-		pif_arc.pif2psoc_flr_active = D1_PIF_ARC_REG(mmPIF_ARC_PIF2PSOC_FLR_ACTIVE);
+-		pif_arc.psoc2pif_flr_req = D1_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_REQ);
+-		pif_arc.psoc2pif_flr_done = D1_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_DONE);
+-		pif_arc.psoc2pif_die_ready = D1_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_DIE_READY);
+-		pif_arc.timestamp_ctrl = D1_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CTRL);
+-		pif_arc.timestamp_cnt = D1_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CNT);
+-		pif_arc.error_reg = mmD1_PIF_ARC_ERROR;
+-		pif_arc.status_reg = mmD1_PIF_ARC_STATUS;
+-	}
++	pif_arc.pf_flr_active = D0_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
++	pif_arc.pf_flr_done = D0_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
++	pif_arc.inbound_term = D0_PIF_ARC_REG(mmPIF_ARC_INBOUND_TERM);
++	pif_arc.crs = D0_PIF_ARC_REG(mmPIF_ARC_CRS);
++	pif_arc.outbound_iso = D0_PIF_ARC_REG(mmPIF_ARC_OUTBOUND_ISO);
++	pif_arc.outstand_trans = D0_PIF_ARC_REG(mmPIF_ARC_OUTSTAND_TRANS);
++	pif_arc.pif2psoc_flr_active = D0_PIF_ARC_REG(mmPIF_ARC_PIF2PSOC_FLR_ACTIVE);
++	pif_arc.psoc2pif_flr_req = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_REQ);
++	pif_arc.psoc2pif_flr_done = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_DONE);
++	pif_arc.psoc2pif_die_ready = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_DIE_READY);
++	pif_arc.timestamp_ctrl = D0_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CTRL);
++	pif_arc.timestamp_cnt = D0_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CNT);
++	pif_arc.error_reg = mmD0_PIF_ARC_ERROR;
++	pif_arc.status_reg = mmD0_PIF_ARC_STATUS;
++	pif_arc.control_reg = mmD0_PIF_ARC_CONTROL;
+ }
+ 
+ void device_init_pll(void)
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 455ad9c..a642b0a 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -48,7 +48,6 @@
+ bool hl_is_dual_die_sku(void);
+ u64 gaudi3_dma_addr_fixup(u64 loadaddr);
+ void pif_arc_pcie_monitoring(void);
+-u32 gaudi3_die_timestamp_base_get(u32 die_id);
+ int gaudi3_hbw_memcpy(u64 src, u64 dst, u32 size);
+ void pif_arc_init_pcie(void);
+ void hl_pcie_clear_boot_termination(void);

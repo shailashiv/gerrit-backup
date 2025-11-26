@@ -1,0 +1,348 @@
+From 4503faf1a3aded17cde0e167d8b5cf5bf1f30407 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 23 May 2021 21:50:57 +0300
+Subject: [PATCH] [SW-43160] gaudi2: legacy: mon pci from second cpu
+
+PCI link may appear at any stage, not just on boot. It needs to be
+monitored and handled swiftly or else the link remains broken.
+Preboot contains a good number of routines which may cause a delay to
+pci link monitor polling module since they share the same core.
+
+This patch utilizes the secondary ARM core for PCI link monitoring. This
+way it can be done in parallel with the rest of preboot logic.
+
+Change-Id: Ifa265d70d07074c140ceae69ae96a0f1d05cc486
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index a781b1f..293383f 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -277,47 +277,6 @@
+ 	return true;
+ }
+ 
+-static void preboot_pcie_monitoring(void)
+-{
+-	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+-		;
+-
+-	/* Only after PRSTn is de-asserted */
+-	preboot_pcie_enable();
+-
+-	while (1) {
+-		unsigned int prstn, ltssm, smlh, rdlh;
+-
+-		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+-		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+-		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+-
+-		if (prstn && smlh && rdlh)
+-			break;
+-
+-		/*
+-		 * Some host assert prstn during link up while moving to GEN3
+-		 * This cause BAR size to be reset
+-		 * We stop link up process by disabling ltssm
+-		 * till BAR is reconfigured
+-		 */
+-		if (!prstn && ltssm) {
+-			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-
+-		if (prstn && !ltssm) {
+-			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-	}
+-
+-	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+ void secondary_main(void)
+ {
+ 	preboot_pcie_monitoring();
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index e12d0d7..52bfafb 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier:     GPL-2.0+
+ /*
+- * Copyright (C) 2020 HabanaLabs Ltd.
++ * Copyright (C) 2020-2021 HabanaLabs Ltd.
+  * All Rights Reserved.
+  *
+  */
+@@ -13,6 +13,8 @@
+ #include <pcie_wrap_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <cpu_ca53_cfg_masks.h>
+ 
+ #include <psoc_arc0_cfg_regs.h>
+ #include <psoc_arc0_cfg_masks.h>
+@@ -51,7 +53,12 @@
+ #define ARC1_DCCM_BASE_ADDR		0x1000007FF7060000ull
+ #define ARC1_DCCM_SIZE			0x8000			/* 32KB */
+ 
+-#define HL_PCIE_LINK_RETRIES		50
++#define CPU1_RST_CTRL							\
++	((BIT(1) << CPU_CA53_CFG_ARM_RST_CONTROL_NCPUPORESET_SHIFT) |	\
++	 (BIT(1) << CPU_CA53_CFG_ARM_RST_CONTROL_NCORERESET_SHIFT))
++
++#define CPU1_WFE_STAT (BIT(1) << CPU_CA53_CFG_ARM_PWR_STAT_0_STANDBYWFE_SHIFT)
++
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA	0x4C14F60
+ #define mmPCIE_WRAP_VUART_TX_STATUS	0x4C14F64
+@@ -325,65 +332,65 @@
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFFF;
+ }
+ 
++void preboot_secondary_cpu_stop(void)
++{
++	u32 rst_ctrl = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++
++	rst_ctrl &= ~CPU1_RST_CTRL; /* Reset CPU1 */
++	regmap_writel(rst_ctrl, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
++void secondary_main(void)
++{
++	preboot_pcie_monitoring();
++	ppboot_check_stack_mon_dev_specific();
++
++	/* Hang in WFE until further notice */
++	while (1)
++		wfe();
++}
++
+ void preboot_pcie_wait_for_link(void)
+ {
+-	u8 retry = HL_PCIE_LINK_RETRIES;
++	u32 rst_addr_lsb, rst_addr_msb, rst_ctrl;
+ 
+ 	/* init dev id as soon as possible, while waiting for prstn */
+ 	preboot_device_id_init();
+ 
+-	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+-		;
++	rst_addr_lsb = (u32)(uintptr_t)secondary_entry;
++	rst_addr_msb = (u32)(uintptr_t)(((uintptr_t)secondary_entry) >> 32);
++	regmap_writel(rst_addr_lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_1);
++	regmap_writel(rst_addr_msb, mmCPU_CA53_CFG_RST_ADDR_MSB_1);
+ 
+-	/* Only after PRSTn is de-asserted */
+-	preboot_pcie_enable();
++	rst_ctrl = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	rst_ctrl |= CPU1_RST_CTRL; /* Take CPU1 out of reset */
++	regmap_writel(rst_ctrl, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
+ 
+-	preboot_puts("Waiting for PCIe UP status\n");
++bool is_pcie_initialized(void)
++{
++	u32 rst_ctrl, wfe_stat;
+ 
+-	while (1) {
+-		unsigned int prstn, ltssm, smlh, rdlh;
++	rst_ctrl = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	rst_ctrl &= CPU1_RST_CTRL; /* reset signals are active low */
+ 
+-		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+-		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+-		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++	wfe_stat = regmap_readl(mmCPU_CA53_CFG_ARM_PWR_STAT_0);
++	wfe_stat &= CPU1_WFE_STAT;
+ 
+-		if (prstn && smlh && rdlh) {
+-			preboot_puts("PCIe link is UP!\n");
+-			break;
+-		}
++	/*
++	 * if CPU1 finished running (wfe) or didn't run at all (reset state)
++	 * pcie should be in operational state.
++	 */
++	return (!rst_ctrl || wfe_stat);
++}
+ 
+-		/*
+-		 * Do not wait indefinitely on PCIe link up status
+-		 * Wait for 5 seconds (50 retries with 100 milli-
+-		 * seconds sleep), else bailout.
+-		 */
+-		retry--;
+-		if (!retry) {
+-			preboot_puts("Timed-out waiting for PCIe link UP!\n");
+-			break;
+-		}
++void ppboot_init_stack_mon_dev_specific(void)
++{
++	__stack2 = STACK_CANARY_MAGIC_WORD;
++}
+ 
+-		udelay(100000);
+-
+-		/*
+-		 * Some host assert prstn during link up while moving to GEN3
+-		 * This cause BAR size to be reset
+-		 * We stop link up process by disabling ltssm
+-		 * till BAR is reconfigured
+-		 */
+-		if (!prstn && ltssm) {
+-			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-
+-		if (prstn && !ltssm) {
+-			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-	}
+-
+-	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++void ppboot_check_stack_mon_dev_specific(void)
++{
++	if (__stack2 != STACK_CANARY_MAGIC_WORD)
++		cpu_boot_err_set(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR);
+ }
+diff --git a/arch/gaudi2/arm/common.h b/arch/gaudi2/arm/common.h
+index 7fcc703..69108ca 100644
+--- a/arch/gaudi2/arm/common.h
++++ b/arch/gaudi2/arm/common.h
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier:     GPL-2.0+
+  *
+- * Copyright (C) 2020 HabanaLabs Ltd.
++ * Copyright (C) 2020-2021 HabanaLabs Ltd.
+  */
+ 
+ #ifndef COMMON_GAUDI2_ARM_H_
+@@ -121,5 +121,13 @@
+ #define MEM_CPY_TIMEOUT_US				(5 * USEC_PER_SEC)
+ #define SP_SRAM_INIT_TIMEOUT_US				(5 * USEC_PER_SEC)
+ 
++#ifndef __ASSEMBLY__
++#include <types.h>
++
++extern u32 __stack2;		/* stack2 last cell value */
++
++extern void secondary_entry(void);
++
++#endif /* __ASSEMBLY__ */
+ #endif /* COMMON_GAUDI2_ARM_H_ */
+ 
+diff --git a/arch/gaudi2/arm/ppboot.lds.S b/arch/gaudi2/arm/ppboot.lds.S
+index 57d6ad6..88d5084 100644
+--- a/arch/gaudi2/arm/ppboot.lds.S
++++ b/arch/gaudi2/arm/ppboot.lds.S
+@@ -32,5 +32,12 @@
+ 		__stack_top = . ;
+ 	} > .sram
+ 
++	.stack2 : {
++		. = ALIGN(8);
++		__stack2 = . ;
++		. = . + 512 ;
++		__stack_top2 = . ;
++	} > .sram
++
+ 	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+ }
+diff --git a/arch/gaudi2/arm/secondary.S b/arch/gaudi2/arm/secondary.S
+new file mode 100644
+index 0000000..5d68439
+--- /dev/null
++++ b/arch/gaudi2/arm/secondary.S
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++.global secondary_entry
++secondary_entry:
++	ldr	x0, =__stack_top2
++	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
++	mov	x29, sp		/* Set FP (x29) */
++	bl	secondary_main
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 6d85159..0682523 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -709,6 +709,51 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
++void preboot_pcie_monitoring(void)
++{
++	/* Wait for PRSTn */
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
++		;
++
++	/* Only after PRSTn is de-asserted */
++	preboot_pcie_enable();
++
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh;
++
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++		if (prstn && smlh && rdlh)
++			break;
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++
++	/*
++	 * W/A H/W bug (Gaudi1) that may lead to have a wrong mask (0x1)
++	 * in LTSSM. Probably can be removed for Gaudi2, but we keep it as it
++	 * does not hurt.
++	 */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
+ bool tpm_is_supported(void) { return true; }
+ 
+ unsigned int get_cs_pad_sel_flash(void)
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index c951c85..2479020 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -13,6 +13,7 @@
+ void set_slv_cfg_reg_val(void);
+ void halt_n_reset_arc(u8 id);
+ void run_arc(u8 id);
++void preboot_pcie_monitoring(void);
+ void init_arc_dccm(u8 id);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */

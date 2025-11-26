@@ -1,0 +1,227 @@
+From e80fc79e018acb617eaf141df5c57f6dbe1e6fb7 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 17 Jan 2021 17:22:18 +0200
+Subject: [PATCH] [SW-28857] i2c indirect: add control port
+
+Add I2C indirect control port with the following functionality:
+- Abort request
+- Get API vesion
+- Get OS state
+- Reset device
+
+The control port is accessed directly using I2C command 231 (control)
+and 237 (status).
+
+Change-Id: I2477daa8605e606fdd477949e41325685980a6e8
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+(cherry picked from commit 4733f6df66b330385cf39ea60d6a07f878e370b4)
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 50fb987..7e4715c 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -159,7 +159,7 @@
+ 	if (hl_is_debug_mode(HL_DEBUG_HW_I2C))
+ 		return NOT_FOUND;
+ 
+-	if (i2cslave_fit_is_checked())
++	if (i2cslave_fit_is_checked() || i2cslave_is_reset_dev())
+ 		return FOUND_NO_RETURN;
+ 
+ 	stat = i2cslave_dw_read_clear_intrbits_slave();
+@@ -357,5 +357,8 @@
+ void module_i2c_s_run_noret(void)
+ {
+ 	module_i2c_s_teardown();
+-	i2cslave_fit_run_image();
++	if (i2cslave_is_reset_dev())
++		i2cslave_reset_dev();
++	else
++		i2cslave_fit_run_image();
+ }
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index c8438f7..25adc9b 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -20,5 +20,7 @@
+ bool i2cslave_indirect_is_process_op(void);
+ bool i2cslave_indirect_op_is_fast(void);
+ void i2cslave_indirect_process_op(void);
++bool i2cslave_is_reset_dev(void);
++void i2cslave_reset_dev(void);
+ 
+ #endif /* _MODULE_I2C_SLAVE_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index d3ffb8e..0d21b06 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -65,6 +65,9 @@
+ static u32 op_memcpy_offset;
+ static struct hl_i2ci_memcpy_ctrl op_memcpy __aligned(8);
+ 
++static struct hl_i2ci_ctrl_cmd ctrl_cmd;
++static struct hl_i2ci_ctrl_sts ctrl_sts;
++
+ static void i2csi_req_config_access(void)
+ {
+ 	switch (op_config.command) {
+@@ -564,3 +567,68 @@
+ 		return false;
+ 	}
+ }
++
++u32 i2csi_ctrl_handle_command(u8 **data, u8 cnt)
++{
++	struct hl_i2ci_ctrl_cpsr *cpsr;
++
++	/* Command is expected */
++	if (!cnt) {
++		*data = ctrl_cmd.data;
++		return HL_I2CI_CTRL_CMD_LEN;
++	}
++
++	ctrl_sts.tag = ctrl_cmd.tag;
++	ctrl_sts.status = HL_I2CI_CTRL_STS_BUSY;
++	ctrl_sts.error = HL_I2CI_CTRL_ERR_NONE;
++	cpsr = &ctrl_sts.cpsr;
++
++	switch (ctrl_cmd.opcode) {
++	case HL_I2CI_CTRL_OP_ABORT:
++		i2csi_req_set_idle();
++		cpsr->abort.status = HL_I2CI_CTRL_ABORT_NONE;
++		break;
++	case HL_I2CI_CTRL_OP_GET_API_VER:
++		cpsr->version.major = HL_I2CI_API_VERSION_MAJOR;
++		cpsr->version.minor = HL_I2CI_API_VERSION_MINOR;
++		cpsr->version.patch = HL_I2CI_API_VERSION_PATCH;
++		break;
++	case HL_I2CI_CTRL_OP_GET_OS_STATE:
++		cpsr->os_state.pcie_access = HL_I2CI_CTRL_ACCESS_FULL;
++		cpsr->os_state.mgmt_access = HL_I2CI_CTRL_ACCESS_FULL;
++		cpsr->os_state.os_state = HL_I2CI_CTRL_OS_PREBOOT;
++		break;
++	case HL_I2CI_CTRL_OP_RESET_DEVICE:
++		/* Remain busy - action will take place from I2C SM */
++		return 0;
++	default:
++		ctrl_sts.error = HL_I2CI_CTRL_ERR_INVALID_OPCODE;
++	}
++
++	ctrl_sts.status = HL_I2CI_CTRL_STS_RESP_RDY;
++
++	return 0;
++}
++
++u8 i2csi_ctrl_handle_status(u8 cmd, u32 read_seq)
++{
++	register int idx = cmd + read_seq - HL_INDIRECT_CTRL_STS_DATA;
++	u8 ret;
++
++	if (idx >= HL_I2CI_CTRL_STS_LEN)
++		return 0;
++
++	ret = ctrl_sts.data[idx];
++
++	/* Read till the end - return to idle */
++	if (idx == HL_I2CI_CTRL_STS_LEN - 1)
++		memset(ctrl_sts.data, 0, HL_I2CI_CTRL_STS_LEN);
++
++	return ret;
++}
++
++bool i2csi_ctrl_is_rst_dev(void)
++{
++	return ctrl_sts.status == HL_I2CI_CTRL_STS_BUSY &&
++		ctrl_cmd.opcode == HL_I2CI_CTRL_OP_RESET_DEVICE;
++}
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+index 9833524..65101aa 100644
+--- a/preboot/i2cslave_indirect.h
++++ b/preboot/i2cslave_indirect.h
+@@ -12,10 +12,13 @@
+ u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
+ u32 i2csi_req_handle_wdata(u8 **data, u8 cnt);
+ u32 i2csi_req_handle_cfg(u8 **data, u8 cnt);
++u32 i2csi_ctrl_handle_command(u8 **data, u8 cnt);
++u8 i2csi_ctrl_handle_status(u8 cmd, u32 read_seq);
+ void i2csi_req_set_idle(void);
+ void i2csi_req_handle_sync_error(void);
+ void i2csi_req_handle_process_op(void);
+ bool i2csi_req_is_process_op(void);
+ bool i2csi_req_op_is_fast(void);
++bool i2csi_ctrl_is_rst_dev(void);
+ 
+ #endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 15714bf..d13a04b 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -9,6 +9,7 @@
+ #include <preboot.h>
+ #include <hl_i2c_slave_events.h>
+ #include <hl_i2c_indirect.h>
++#include <boot_if.h>
+ 
+ #include "thermal.h"
+ #include "module_i2c_slave.h"
+@@ -69,6 +70,20 @@
+ 	case HL_INDIRECT_REQ_RDATA_DATA_3:
+ 		ret = i2csi_req_handle_rdata(cmd, read_seq);
+ 		break;
++	case HL_INDIRECT_CTRL_CMD_CODE:
++		ret = HL_I2CI_CTRL_CMD_LEN;
++		break;
++	case HL_INDIRECT_CTRL_STS_CODE:
++		if (!read_seq) {
++			ret = HL_I2CI_CTRL_STS_LEN;
++			break;
++		}
++	case HL_INDIRECT_CTRL_STS_DATA:
++	case HL_INDIRECT_CTRL_STS_DATA_1:
++	case HL_INDIRECT_CTRL_STS_DATA_2:
++	case HL_INDIRECT_CTRL_STS_DATA_3:
++		ret = i2csi_ctrl_handle_status(cmd, read_seq);
++		break;
+ 	default:
+ 		/* NA */
+ 		ret = 0;
+@@ -85,6 +100,8 @@
+ 		return i2csi_req_handle_wdata(data, cnt);
+ 	case HL_INDIRECT_REQ_CFG_DATA:
+ 		return i2csi_req_handle_cfg(data, cnt);
++	case HL_INDIRECT_CTRL_CMD_DATA:
++		return i2csi_ctrl_handle_command(data, cnt);
+ 	case HL_INDIRECT_REQ_RDATA_DATA:
+ 		i2csi_req_set_idle();
+ 		/* Fall Though */
+@@ -127,3 +144,14 @@
+ {
+ 	return i2csi_req_op_is_fast();
+ }
++
++bool i2cslave_is_reset_dev(void)
++{
++	return i2csi_ctrl_is_rst_dev();
++}
++
++void i2cslave_reset_dev(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
++	hl_dev_reset();	/* should not return */
++}
+diff --git a/recovery/module_i2c_slave.c b/recovery/module_i2c_slave.c
+index 9d6d7d4..8068154 100644
+--- a/recovery/module_i2c_slave.c
++++ b/recovery/module_i2c_slave.c
+@@ -58,3 +58,10 @@
+ {
+ 	return false;
+ }
++
++bool i2cslave_is_reset_dev(void)
++{
++	return false;
++}
++
++void i2cslave_reset_dev(void) {}

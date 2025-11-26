@@ -1,0 +1,107 @@
+From bd10e714aab59c53836d44842380d586f7d1c0ba Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 14 Mar 2024 12:16:13 +0200
+Subject: [PATCH] [SW-179010] gaudi2: add support for hl225d
+
+To support gaudi2 HL225D variant, and continue supporting HL225C
+variant, the device revision ID is set according to the variant
+programmed in efuse.
+In addition, for security code, both those variants are considered
+bis compliant.
+
+Change-Id: I560558adddb19d3e1029201b8406844ec85a3a0c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 3b4f662..052267a 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -504,12 +504,33 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
++static enum gaudi2_bis_revision get_bis_rev_id(void)
++{
++	const struct hl_sec_efuse *fuse;
++
++	if (preboot_security_is_real_efuse_sec_en()) {
++		fuse = preboot_get_hl_sec_real_efuse();
++		if (!fuse)
++			return GAUDI2_BIS_REV_MAX - 1; /* assume the worst case */
++	} else {
++		fuse = preboot_get_hl_sec_fake_efuse();
++	}
++
++	if (fuse->bis_d_compliant)
++		return GAUDI2_BIS_REV_D;
++	else if (fuse->bis_compliant)
++		return GAUDI2_BIS_REV_C;
++	else
++		return GAUDI2_BIS_NONE;
++}
++
+ #define HL_PCIE_REVISION_ID_MASK	0xFF
+-#define HL225C_PCIE_REVISION_ID		0x3
++
+ static void preboot_pcie_device_id_vendor_id_set(void)
+ {
+ 	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+ 	u32 class_rev;
++	enum gaudi2_bis_revision rev_id;
+ 
+ 	/* Update Vendor ID */
+ 	regmap_writel(device_id_vendor_id,
+@@ -519,13 +540,14 @@
+ 	regmap_writel(device_id_vendor_id,
+ 		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+ 
+-	/* Update REV ID for HL225B */
++	/* Update REV ID for BIS device */
+ 	if (preboot_is_bis_compliant_mode()) {
+ 		class_rev = regmap_readl(mmPCIE_DBI_CLASS_CODE_REVISION_ID);
++		rev_id = get_bis_rev_id();
+ 
+ 		/* clear low byte in PCIE class low word */
+ 		class_rev &= ~(HL_PCIE_REVISION_ID_MASK);
+-		class_rev |= HL225C_PCIE_REVISION_ID;
++		class_rev |= rev_id;
+ 
+ 		regmap_writel(class_rev, mmPCIE_DBI_CLASS_CODE_REVISION_ID);
+ 	}
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index 9bc9354..184ca51 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -22,5 +22,6 @@
+ void run_arc(u8 id);
+ void preboot_pcie_monitoring(void);
+ void init_arc_mem(u8 id, u64 addr, u32 size);
++const struct hl_sec_efuse *preboot_get_hl_sec_real_efuse(void);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 9efe30e..c5e77f5 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -391,7 +391,7 @@
+ 	boot_info_set(HL_BOOT_INFO_SECURITY_FUSE, efuse, sizeof(*efuse));
+ }
+ 
+-static const struct hl_sec_efuse *preboot_get_hl_sec_real_efuse(void)
++const struct hl_sec_efuse *preboot_get_hl_sec_real_efuse(void)
+ {
+ 	struct hl_sec_efuse *fuse;
+ 	u32 *val;
+@@ -1600,9 +1600,9 @@
+ 		if (!fuse)
+ 			return true;
+ 
+-		return fuse->bis_compliant;
++		return fuse->bis_compliant || fuse->bis_d_compliant;
+ 	}
+ 
+ 	fuse = preboot_get_hl_sec_fake_efuse();
+-	return fuse->bis_compliant;
++	return fuse->bis_compliant || fuse->bis_d_compliant;
+ }

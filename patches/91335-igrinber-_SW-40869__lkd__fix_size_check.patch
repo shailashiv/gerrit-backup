@@ -1,0 +1,58 @@
+From 4663c9e053fbf3865e3657304ba9255d7834e4d3 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 28 Apr 2021 22:58:00 +0300
+Subject: [PATCH] [SW-40869] lkd: fix size check
+
+The LKD module has accidentally used the already wiped next FW
+component size (the state machine has moved to a new command).
+This can impose a wrong failure report if the actual size is larger
+than the allocated memory frame size.
+Save the actual size early enough (before state machine progress) and
+pass it for validation.
+
+Change-Id: I0dbe06651f90a6b5cce7b278e00ed3209129de22
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index a3a1418..2da311c 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -23,6 +23,7 @@
+ 	struct comms_command wfc_cmd;
+ 	struct comms_command do_cmd;
+ 	enum cmd_check_res exec_res;
++	unsigned int next_size;
+ };
+ 
+ static struct lkd_status sts;
+@@ -135,6 +136,7 @@
+ static void module_lkd_reset_state(void)
+ {
+ 	sts.exec_res = NOT_FOUND;
++	sts.next_size = 0;
+ 	sts.cmd.val = 0;
+ 	sts.wfc_cmd.val = 0;
+ 	sts.do_cmd.val = 0;
+@@ -235,9 +237,11 @@
+ 	case COMMS_NOOP:	/* NOOP is a special command */
+ 		res = module_lkd_check_noop();
+ 		break;
++	case COMMS_PREP_DESC:
++		sts.next_size = sts.cmd.size;
++		/* no break */
+ 	case COMMS_CLR_STS:
+ 	case COMMS_RST_STATE:
+-	case COMMS_PREP_DESC:
+ 	case COMMS_DATA_RDY:
+ 	case COMMS_EXEC:
+ 	case COMMS_RST_DEV:
+@@ -429,7 +433,7 @@
+ 	/* depending on the current state machine, perform action */
+ 	switch (sts.do_cmd.cmd) {
+ 	case COMMS_PREP_DESC:
+-		err = module_lkd_prep_desc(sts.wfc_cmd.size, &offset);
++		err = module_lkd_prep_desc(sts.next_size, &offset);
+ 		if (err)
+ 			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
+ 		else

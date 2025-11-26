@@ -1,0 +1,215 @@
+From 2d9f22aaf0da8fe330ed315202fdf2ea0f252eaa Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Wed, 27 Apr 2022 08:51:10 +0300
+Subject: [PATCH] [SW-79482] gaudi2: fake unsecurity in erom
+
+To support RMA debug in production, firmware needs support of
+disabling security and image validation across the flow. This
+scenario will be called fake unsecurity and detected based on
+following GPIOs:
+GPIO_77 = '1'
+GPIO_78 = '1'
+GPIO_57 = '0'
+
+In case of erom recovery mode when in fake unsecurity mode it
+needs to ignore recovery procedure and load ppboot which will
+allow for firmware flow to continue normally.
+
+Change-Id: I783776c528efabf6cf93e1b1b8d27212398d60d0
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index af3ee57..e064f69 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -26,7 +26,6 @@
+ EROM_RECOVERY_LD_SCRIPT := recovery_erom.lds
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+-LDFLAGS += -Wl,--just-symbols $(PREBOOT_ROOT_DIR)/../arcboot-custom/exports.elf
+ LDFLAGS_TPM := -g -static
+ LDFLAGS_TPM += -Wl,--gc-sections
+ LDLIBS := -lgcc
+@@ -43,6 +42,7 @@
+ 	EROM_PCIE_SRC := erom_pcie.o
+ 	EROM_TPM_SRC := erom_tpm.o
+ 	EROM_RECOVERY_SRC := erom_recovery.o
++	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports.elf
+ endif
+ 
+ EROM_PCIE_DEPS := \
+@@ -50,6 +50,8 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/pci.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/uart.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/spi.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/spi_flash.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/lib_common.o \
+ 	$(HL_DEV_ARCH)/$(HL_TARGET).o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+diff --git a/app/ext_rom/erom_pcie.c b/app/ext_rom/erom_pcie.c
+index 9b0c495..93b4956 100644
+--- a/app/ext_rom/erom_pcie.c
++++ b/app/ext_rom/erom_pcie.c
+@@ -10,7 +10,9 @@
+ #include <pll.h>
+ #include <pci.h>
+ #include <preboot.h>
++#include <security.h>
+ #include <device.h>
++#include <spi_flash.h>
+ #include <uart.h>
+ #include <common.h>
+ #include <boot_if.h>
+@@ -19,6 +21,26 @@
+ #include <pcie_dbi_regs.h>
+ #include <pcie_phy_regs.h>
+ #include <pcie_aux_regs.h>
++#include <arcboot_export.h>
++#include <gaudi2/gaudi2_security.h>
++#include <gaudi2/gaudi2_bootrom.h>
++
++#define ARCBOOT_PRIMARY			0
++#define ARCBOOT_SECONDARY		1
++#define ARCBOOT_STATUS_REG_SZ_BITS	32
++#define FLASH_64KB_PADD			65536
++#define FLASH_VALID_MASK		0x1FFFFF
++#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE	46080
++#define SPI_DMA_DST_FW_SRAM		BIT(1)
++#define HL_FWSRAM_OFFSET		0x3FD0000
++#define HL_GEN_MEM_BASE			0x24000000
++
++#define HL_FWSRAM_BASE			(HL_GEN_MEM_BASE + \
++					 HL_FWSRAM_OFFSET)
++#define PPBOOT_IMAGE_OFFSET		12
++#define PPBOOT_IMAGE_CODE_ALIGN		4
++#define PPBOOT_IMAGE_CODE_OFFSET	(PPBOOT_IMAGE_OFFSET + \
++					 PPBOOT_IMAGE_CODE_ALIGN)
+ 
+ static void device_init(void)
+ {
+@@ -148,8 +170,79 @@
+ 	preboot_pcie_wait_for_link();
+ }
+ 
++static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
++{
++	uint32_t flash_image_offset;
++	uint32_t flash_image_switch;
++
++	/* read if we need to switch order of primary/secondary image */
++	spi_flash_copy(&flash_image_switch, FLASH_IMAGE_SWITCH_OFFSET, 1,
++		       "EROM_RECOVERY");
++	if (flash_image_switch != 0) {
++		if (image_ptr != ARCBOOT_SECONDARY)
++			image_ptr = ARCBOOT_SECONDARY;
++		else
++			image_ptr = ARCBOOT_PRIMARY;
++	}
++
++	if (image_ptr == ARCBOOT_SECONDARY)
++		spi_flash_copy(&flash_image_offset, FLASH_SECONDARY_OFFSET, 1,
++			       "EROM_RECOVERY");
++	else
++		spi_flash_copy(&flash_image_offset, FLASH_PRIMARY_OFFSET, 1,
++			       "EROM_RECOVERY");
++
++	return flash_image_offset;
++}
++
++static int erom_get_ppboot_data(uint8_t image_ptr)
++{
++	uint32_t flash_image_offset;
++	uint32_t flash_ppboot_pcie_offset;
++	uint32_t ppboot_pcie_size;
++
++	flash_image_offset = arcboot_flash_image_offset(image_ptr);
++	/* check if offset is within safe limits */
++	if ((flash_image_offset + FLASH_64KB_PADD) >= FLASH_VALID_MASK) {
++		preboot_puts_hex("Flash image offset out-of-bounds:",
++				 flash_image_offset, false);
++		return -1;
++	}
++
++	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
++					      flash_image_offset);
++	spi_flash_copy(&ppboot_pcie_size, flash_ppboot_pcie_offset, 4,
++		       "EROM_RECOVERY");
++	if (ppboot_pcie_size > SECUREBOOT_MAX_PPBOOT_IMG_SIZE ||
++	    ppboot_pcie_size <= SECUREBOOT_IMG_HEAD_FOOTER) {
++		preboot_puts_hex("Invalid ppboot image size:",
++				 ppboot_pcie_size, false);
++		return -1;
++	}
++
++	/* check for safe limits */
++	if ((flash_ppboot_pcie_offset + ppboot_pcie_size) >= FLASH_VALID_MASK) {
++		preboot_puts_hex("Ppboot size out-of-bounds:",
++				 ppboot_pcie_size, false);
++		return -1;
++	}
++
++	dma_copy_image(ppboot_pcie_size, flash_ppboot_pcie_offset, 0,
++		       SPI_DMA_DST_FW_SRAM);
++
++	if (dma_wait_finish() == DMA_CRC_ERROR) {
++		preboot_puts("Ppboot image CRC Failure\n");
++		return -1;
++	}
++
++	return 0;
++}
++
+ void erom_main_function(void)
+ {
++	void (*ppboot)();
++	int ret;
++
+ 	device_init();
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+@@ -159,6 +252,20 @@
+ 
+ 	hl_uart_init();
+ 
++	if (preboot_security_fuse_override()) {
++		preboot_puts("Fake unsecurity fuse override enabled\n");
++		spi_flash_init();
++		ret = erom_get_ppboot_data(ARCBOOT_PRIMARY);
++		if (ret)
++			ret = erom_get_ppboot_data(ARCBOOT_SECONDARY);
++
++		if (!ret) {
++			ppboot = (void *)(HL_FWSRAM_BASE +
++					  PPBOOT_IMAGE_CODE_OFFSET);
++			ppboot();
++		}
++	}
++
+ 	cpu_boot_if_init();
+ 	hl_plat_early_init();
+ 	hl_pcie_init();
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index cc00d26..7b96330 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -812,7 +812,7 @@
+ #define GAUDI2_MOD_ID_3_GPIO		77
+ #define GAUDI2_MOD_ID_4_GPIO		78
+ 
+-static bool preboot_security_fuse_override(void)
++bool preboot_security_fuse_override(void)
+ {
+ 	u32 manf_mode, module_id_3, module_id_4;
+ 
+diff --git a/include/security.h b/include/security.h
+index ea1f6f4..d6d14d4 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -31,5 +31,6 @@
+ void preboot_security_hbm_pci_open_ro(void);
+ void preboot_security_sf_pci_set_ro(bool en);
+ void preboot_security_sram_pci_set_ro(bool en);
++bool preboot_security_fuse_override(void);
+ 
+ #endif /* _HL_SECURITY_H_ */

@@ -1,0 +1,72 @@
+From a69b2d43f3b0d70838074725723aa8d2ce0d3a43 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 25 Jul 2022 11:28:47 +0300
+Subject: [PATCH] [SW-86607] gaudi3: add arc address translation function
+
+Since preboot image is copied by a DMA, the full chip address
+is used. This address should be translated to the ARC view
+address when we want to access the preboot from ARC.
+At the moment the translation function supports SRAM address
+range only, additional address ranges can be added in the
+future as needed.
+
+Change-Id: Iedd1ca9d4c5c475d1684c172ce213a11a8c92ca3
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 0cc693d..36e3455 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -42,6 +42,7 @@
+ #include <memory.h>
+ #include <efuse.h>
+ #include <arcboot_export_dev.h>
++#include <address_space.h>
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -136,16 +137,29 @@
+ 	/* not relevant in case of arcboot */
+ }
+ 
++static u64 gaudi3_translate_arc_addr(u64 addr)
++{
++	if (addr >= SRAM_BASE_ADDR && addr < (SRAM_BASE_ADDR + (u64)SRAM_REGION_SIZE)) {
++		addr = (addr & ARC_ADDR_MASK) + SRAM_MEM_REGION_BASE;
++		goto ret_addr;
++	}
++
++	preboot_puts_hex64("warn: no address translation: ", addr, true);
++
++ret_addr:
++	return addr;
++}
++
+ void image_start(u64 loadaddr)
+ {
+-	u32 lsb = (u32) loadaddr;
++	u32 arc_addr = (u32)gaudi3_translate_arc_addr(loadaddr);
+ 	void (*image_entry)(void);
+ 
+ 	/*
+ 	 * Jump to __reset of zephyr. After image_entry, control is not
+ 	 * expected to return here and continue.
+ 	 */
+-	image_entry = (void *) (*(u32 *) lsb);
++	image_entry = (void *) (*(u32 *) arc_addr);
+ 
+ 	image_entry();
+ }
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 50ec748..44bccc4 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -30,6 +30,7 @@
+ #define ARC1_DCCM_FULL_BASE		0x300007FD3080000ull
+ #define ARC1_DCCM_SIZE			SZ_64K
+ 
++#define SRAM_MEM_REGION_BASE		0x10000000
+ #define FW_MEM_REGION_BASE		0x20000000
+ #define HL_CFG_BASE			0xF0000000
+ #define SDRAM_SIZE			(SZ_32M + SZ_16M) /* single die mode */

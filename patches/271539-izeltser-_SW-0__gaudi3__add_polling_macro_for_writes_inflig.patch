@@ -1,0 +1,82 @@
+From 7cfa24ee0772a422e965d2ae8e02bc26afed434c Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 09 Nov 2022 11:20:23 +0200
+Subject: [PATCH] [SW-0] gaudi3: add polling macro for writes inflight
+
+Since there is no coherency between write and reads in HL devices,
+and early write response is enabled, we should be very careful
+and make sure there are no writes inflight that might affect a register
+we about to read or some functionality we about to execute.
+A macro is added for waiting until there are no more writes inflight.
+The macro identifies the CPU on which it is executing, and polling on
+the relevant register.
+
+Change-Id: I414cc6c5392306b7183f5b86969d0c1e71b3012d
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 788fbf0..d4bd6b0 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -6,9 +6,32 @@
+ #ifndef ARCH_GAUDI3_ARC_HL_H_
+ #define ARCH_GAUDI3_ARC_HL_H_
+ 
++#include <iopoll.h>
++#include <preboot.h>
++#include <d0_parc_global_conf_regs.h>
++#include <d0_parc_global_conf_masks.h>
++
+ #define BOOT_DESC_MAX_IMGS	7
+ #define READ_BOOT_DESC_FROM_BOOTINFO
+ 
++#define HL_W_BARRIER_TIMEOUT_US	100000
++#define HL_ARC_W_BARRIER()									\
++({												\
++	u32 __val, __addr;									\
++	s8 __cpu_id = HL_ARC_V2_CORE_ID();							\
++	int err;										\
++												\
++	__addr = mmD0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_0 + __cpu_id * sizeof(u32);	\
++	err = readl_poll_timeout(__addr,							\
++			__val,									\
++			__val & D0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_NO_WR_INFLIGHT_M,	\
++			HL_W_BARRIER_TIMEOUT_US);						\
++	if (err)										\
++		preboot_puts("HL_ARC_W_BARRIER timeout");					\
++												\
++	err;											\
++})
++
+ #define HL_PLL_DIV_FACTOR	0x30
+ #define HL_PLL_DIV_FACTOR_CMD	0x40
+ #define HL_PLL_DIV_SEL		0x50
+diff --git a/include/preboot.h b/include/preboot.h
+index d914db7..54086c7 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -16,6 +16,23 @@
+ 
+ #ifdef __arc__
+ #define wfe()	__asm__ __volatile__("wevt\n\t" : : )
++
++#define ARC_V2_IDENTITY_REG	0x004
++
++/*
++ * ARC1 released from reset first, so its ID in HW is always default 0.
++ * other ARCs ID is set relatively to ARC1.
++ * return normalized cpu id: arc0 = 0, arc1 = 1, arc2 = 2
++ */
++#define HL_ARC_V2_CORE_ID()					\
++({								\
++	s8 __ret;						\
++	__asm__ __volatile__("lr %0, [%1]\n"			\
++			     "xbfu %0, %0, 0xe8\n"		\
++			     : "=r"(__ret)			\
++			     : "i"(ARC_V2_IDENTITY_REG));	\
++	++__ret;						\
++})
+ #endif
+ 
+ #ifdef __aarch64__

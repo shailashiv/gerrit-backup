@@ -1,0 +1,128 @@
+From 6a18660fb075b67ce798d1f1d903e64f6cc24ca3 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 15 Oct 2020 06:46:34 +0300
+Subject: [PATCH] [SW-21854] i2cslave: use slow return for read cmd
+
+In preboot and recovery, for processing read cmds
+received on i2c slave fast return was being used.
+This caused i2c slave to race other time sensitive
+modules as read command processing takes long ms.
+Instead now i2c slave check will return slow return
+for all commands which will cause other modules to
+be disabled before processing i2c slave cmd.
+
+Change-Id: I0b9942fafd2b17eb173634c193a052c07b0bebbf
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index b4eb64f..6e66ed8 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -91,7 +91,7 @@
+ void module_i2c_s_setup(void);
+ enum cmd_check_res module_i2c_s_check(void);
+ void module_i2c_s_disable(void);
+-void module_i2c_s_run_fast(void);
++void module_i2c_s_run(void);
+ void module_i2c_s_teardown(void);
+ 
+ void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index f560955..3b28551 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -118,7 +118,7 @@
+ 
+ 		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+ 			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-			module_i2c_s_run_fast();
++			module_i2c_s_run();
+ 
+ 		regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+ 
+@@ -126,7 +126,7 @@
+ 
+ 		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+ 			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-			module_i2c_s_run_fast();
++			module_i2c_s_run();
+ 	}
+ 
+ 	preboot_puts("I2C SLAVE initialized\n");
+@@ -145,7 +145,7 @@
+ 
+ 	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
+ 	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		res = FOUND_FAST_RETURN;
++		res = FOUND_SLOW_RETURN;
+ 
+ 	return res;
+ }
+@@ -159,7 +159,7 @@
+ 	/* Clear requests before disabling */
+ 	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+ 		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
++		module_i2c_s_run();
+ 
+ 	regmap_writel(0x0, mmPSOC_I2C_S_IC_ENABLE);
+ 
+@@ -168,7 +168,7 @@
+ 	/* Make sure all requests are handled after disable */
+ 	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+ 		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
++		module_i2c_s_run();
+ 
+ 	preboot_puts("I2C SLAVE: disabled\n");
+ }
+@@ -195,7 +195,7 @@
+ 	return ret;
+ }
+ 
+-void module_i2c_s_run_fast(void)
++void module_i2c_s_run(void)
+ {
+ 	unsigned int stat;
+ 	int ret;
+@@ -250,7 +250,7 @@
+ 	/* Make sure all requests are handled after disable */
+ 	if (val & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+ 		   PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
++		module_i2c_s_run();
+ 
+ 	preboot_puts("I2C SLAVE: tear down done\n");
+ }
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 5f9188a..e7b5b9a 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -64,9 +64,9 @@
+ 		.setup = module_i2c_s_setup,
+ 		.check = module_i2c_s_check,
+ 		.disable = module_i2c_s_disable,
+-		.run = noop,
++		.run = module_i2c_s_run,
+ 		.enable = module_i2c_s_setup,
+-		.run_fast = module_i2c_s_run_fast,
++		.run_fast = noop,
+ 		.teardown = module_i2c_s_teardown,
+ 		.run_noreturn = noop,
+ 	},
+diff --git a/recovery/recovery.c b/recovery/recovery.c
+index 5a9688b..561e189 100644
+--- a/recovery/recovery.c
++++ b/recovery/recovery.c
+@@ -16,9 +16,9 @@
+ 		.setup = module_i2c_s_setup,
+ 		.check = module_i2c_s_check,
+ 		.disable = module_i2c_s_disable,
+-		.run = noop,
++		.run = module_i2c_s_run,
+ 		.enable = module_i2c_s_setup,
+-		.run_fast = module_i2c_s_run_fast,
++		.run_fast = noop,
+ 		.teardown = module_i2c_s_teardown,
+ 		.run_noreturn = noop,
+ 	},

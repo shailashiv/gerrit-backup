@@ -1,0 +1,192 @@
+From b38295257196043dd0c9060e53cd890820554597 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 27 Dec 2020 22:58:12 +0200
+Subject: [PATCH] [SW-27979] i2c indirect: add config access op
+
+This commit adds config access op, which is needed by hl-fw-loadr OOB.
+
+Using this op, BMC can read/write configuration space registers. Since
+the LKD and FWUPD protocols are based on scrachpad registers which are
+part of the configuration space, this commit is part of the hl-fw-loader
+transport layer.
+
+In order to issue a config access command, the master must issue WDATA
+write command. This opcode defined field are mostly R/W but there is
+also a RO field (status) which is protected and cannot be written on.
+If master attempt to write over it, the RO field is considered as a hole
+and will not be written over.
+An error is issued if there are no writable fields in the request.
+
+Change-Id: If1c6b7a66b089ef06966376a24c314baed72ce15
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index b21a64e..7976d27 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -15,6 +15,7 @@
+ #include "fit.h"
+ 
+ #define SUPPORTED_OPCODES_MASK	(BIT(HL_I2CI_REQ_OP_DEVICE_STATUS) | \
++				BIT(HL_I2CI_REQ_OP_CONFIG_ACCESS) | \
+ 				BIT(HL_I2CI_REQ_OP_FW_LOADER))
+ 
+ struct i2csi_wdata_chunk_context {
+@@ -29,7 +30,8 @@
+ };
+ 
+ struct i2csi_wdata_write_context {
+-	u16 length;
++	u16 offset; /* Offset of overall written data */
++	u16 length; /* Length of bytes to write in a single iteration */
+ 	struct hl_i2ci_wdata_hdr hdr;
+ };
+ 
+@@ -47,6 +49,22 @@
+ 	.device_status = HL_I2CI_REQ_DEV_STS_PREBOOT,
+ 	.valid_opcode_map = SUPPORTED_OPCODES_MASK,
+ };
++
++static struct hl_i2ci_config_access op_config;
++
++static void i2csi_req_config_access(void)
++{
++	switch (op_config.command) {
++	case HL_I2CI_CONFIG_CMD_READ:
++		op_config.data = *(u32 *)(HL_CFG_BASE + op_config.address);
++		break;
++	case HL_I2CI_CONFIG_CMD_WRITE:
++		*(u32 *)(HL_CFG_BASE + op_config.address) = op_config.data;
++		break;
++	}
++
++	op_config.status = HL_I2CI_CONFIG_STS_SUCCESS;
++}
+ 
+ static void i2csi_req_load_fw(void)
+ {
+@@ -72,9 +90,53 @@
+ 
+ }
+ 
++static inline u8 *i2csi_req_buffer_get_writable(u16 rsize, u8 *data,
++						int dlow, int dhigh)
++{
++	int rlow = i2csi_req.wd.hdr.offset + i2csi_req.wd.offset;
++	int rhigh = i2csi_req.wd.hdr.offset + rsize;
++
++	/* Check out of bound */
++	if (rlow >= dhigh || rhigh <= dlow) {
++		/* If that is not a partial request, produce an error */
++		if (!i2csi_req.wd.offset)
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++
++		i2csi_req.wd.length = rhigh - rlow;
++		return NULL;
++	}
++
++	/*
++	 * Check if the lower part of the request tries to write before the
++	 * writable area. Ignore these bytes but don't produce an error since
++	 * the next iteration is valid.
++	 */
++	if (rlow < dlow) {
++		i2csi_req.wd.length = dlow - rlow;
++		return NULL;
++	}
++
++	/*
++	 * Check if the write request overshoots the upper writable limit and
++	 * make adjusments accordingly.
++	 */
++	if (rhigh > dhigh)
++		rhigh = dhigh;
++
++	i2csi_req.wd.length = rhigh - rlow;
++	return &data[rlow];
++}
++
+ static inline u8 *i2csi_req_opcode_get_buffer(u16 size)
+ {
++	int upper_bound;
++
+ 	switch (i2csi_req.wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++		upper_bound = offsetof(struct hl_i2ci_config_access, status);
++
++		return i2csi_req_buffer_get_writable(size, (u8 *)&op_config,
++						     0, upper_bound);
+ 	case HL_I2CI_REQ_OP_FW_LOADER:
+ 		/*
+ 		 * The firmware data is being placed directly to FIT base
+@@ -101,6 +163,10 @@
+ 		i2csi_req.rd.data = (u8 *)&op_status;
+ 		i2csi_req.rd.length = sizeof(op_status);
+ 		break;
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++		i2csi_req.rd.data = (u8 *)&op_config;
++		i2csi_req.rd.length = sizeof(op_config);
++		break;
+ 	default:
+ 		if ((BIT(i2csi_req.wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+ 			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
+@@ -113,6 +179,9 @@
+ static inline void i2csi_req_process_write_opcode(void)
+ {
+ 	switch (i2csi_req.wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++		i2csi_req_config_access();
++		break;
+ 	case HL_I2CI_REQ_OP_FW_LOADER:
+ 		i2csi_req_load_fw();
+ 		break;
+@@ -153,9 +222,18 @@
+ 	return 0;
+ }
+ 
++static inline bool i2csi_req_wdata_is_complete(void)
++{
++	u16 written = i2csi_req.wd.length + i2csi_req.wd.offset;
++
++	return written >= i2csi_req.wd.hdr.rqdl;
++}
++
+ static inline u32 i2csi_req_wdata_handle_payload(u8 **data, u8 cnt)
+ {
+-	if (cnt == 1) { /* Payload is expected */
++	/* Payload is expected */
++	if (cnt == 1 || !i2csi_req_wdata_is_complete()) {
++		i2csi_req.wd.offset += i2csi_req.wd.length;
+ 		*data = i2csi_req_opcode_get_buffer(i2csi_req.wd.hdr.rqdl);
+ 		return i2csi_req.wd.length;
+ 	}
+@@ -165,6 +243,16 @@
+ 	i2csi_req_process_write_opcode();
+ 	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
+ 	return 0;
++}
++
++static inline void i2csi_req_reset(void)
++{
++	i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
++	i2csi_req.chunk.hdr.rqcl = 0;
++	i2csi_req.rd.data = NULL;
++	i2csi_req.rd.length = 0;
++	i2csi_req.wd.length = 0;
++	i2csi_req.wd.offset = 0;
+ }
+ 
+ /*
+@@ -196,10 +284,7 @@
+ 	switch (cnt) {
+ 	case 0: /* Header is expected */
+ 		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
+-		i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
+-		i2csi_req.chunk.hdr.rqcl = 0;
+-		i2csi_req.rd.data = NULL;
+-		i2csi_req.rd.length = 0;
++		i2csi_req_reset();
+ 		*data = i2csi_req.wd.hdr.data;
+ 		return HL_I2CI_REQ_WDATA_LEN;
+ 	case 1: /* Chunk header or payload are expected */

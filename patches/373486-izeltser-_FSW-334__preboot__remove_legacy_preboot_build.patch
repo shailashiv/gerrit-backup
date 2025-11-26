@@ -1,0 +1,1111 @@
+From dbd14ca58f619e4a8639b47074d4c50fc1268188 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 26 Nov 2023 20:32:49 +0200
+Subject: [PATCH] [FSW-334] preboot: remove legacy preboot build
+
+Legacy baremetal preboot is not used anymore. the sources and
+makefile code is removed.
+Some of Preboot's code is used in erom recovery, preboot object was
+linked directly into erom. Instead the relevant code was moved to
+erom recovery source file.
+
+Change-Id: I03617ae78df7fbd3d46bb89dbcf4886dffdf4ed9
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index bb5b2bf..a1ea621 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,7 +15,6 @@
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)
+ CFLAGS += -I ${EMBEDDED_ROOT}/arcboot/arch
+-CFLAGS += -include app/preboot/preboot_app_defs.h
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c -fno-builtin
+ CFLAGS += -I ./include/ -I ./ -I ./lib/ -I ./lib/common/ -I ./$(HL_DEV_ARCH)/ -I ./$(HL_DEV_ARCH_COMMON)/
+@@ -32,52 +31,30 @@
+ endif
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
++CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)/$(SPECS_EMB_DEV)_reg_map.h
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+ 
+-PREBOOT_LD_SCRIPT := $(HL_DEV_ARCH)/preboot.lds
+ PPBOOT_LD_SCRIPT := $(HL_DEV_ARCH)/ppboot.lds
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+ LDLIBS := -lgcc
+-PREBOOT_LDLIBS = $(LDLIBS) -lfdt
+ 
+-PREBOOT_SRCS_C := $(shell ls lib/common/*.c)
+-PREBOOT_SRCS_C += $(shell ls lib/preboot/*.c)
+-PREBOOT_SRCS_C += $(shell ls lib/common/lzo/*.c)
+-PREBOOT_SRCS_C += $(shell ls app/preboot/*.c)
+-PREBOOT_SRCS_C := $(filter-out lib/preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
+ PPBOOT_SRCS_C := $(shell ls lib/common/*.c)
+ PPBOOT_SRCS_C += $(shell ls lib/preboot/memory.c)
+ PPBOOT_SRCS_C += $(shell ls app/ppboot/*.c)
+-
+-include $(HL_DEV_ARCH)/Makefile
+-CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(SPECS_EMB_DEV)/$(SPECS_EMB_DEV)_reg_map.h
+-
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
+-PREBOOT_APP_S := $(shell ls app/preboot/crt0_preboot.S)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
+ PPBOOT_APP_S := $(shell ls app/ppboot/crt0_ppboot.S)
+ PPBOOT_APP_S += $(shell ls $(HL_DEV_ARCH)/*.S | grep -v lds)
+ 
++include $(HL_DEV_ARCH)/Makefile
++
+ BINDIR = bin
+ PPBOOT_TARGET = $(BINDIR)/ppboot.bin
+-PREBOOT_TARGET = $(BINDIR)/preboot.bin
+ PCI_PHY_FW_TARGET = $(BINDIR)/pcie_phy_fw.bin
+ 
+-# compile binaries based on target
+-ifeq ($(HL_DEV),$(filter $(HL_DEV), greco_arc_elf32))
+-	BINARIES = $(PPBOOT_TARGET) $(PCI_PHY_FW_TARGET)
+-	LDFLAGS += -Wl,--just-symbols ${BR2_EXTERNAL}/board/habanalabs/$(HL_DEV)/exports.elf
+-else ifeq ($(HL_DEV),$(filter $(HL_DEV), greco_arc))
+-	BINARIES = $(PREBOOT_TARGET)
+-else
+-	BINARIES = $(PPBOOT_TARGET) $(PREBOOT_TARGET) $(PCI_PHY_FW_TARGET)
+-endif
++BINARIES = $(PPBOOT_TARGET) $(PCI_PHY_FW_TARGET)
+ 
+-PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+-PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
+ PPBOOT_OBJECTS := $(PPBOOT_SRCS_C:.c=.o)
+ PPBOOT_OBJECTS += $(PPBOOT_APP_S:.S=.o)
+ AUTO_GENERATED_FILE := auto_generated.h
+@@ -93,23 +70,13 @@
+ 		exit 1; \
+ 	fi
+ 
+-image_validation_preboot: preboot
+-	@sz=`stat -Lc "%s" $(PREBOOT_TARGET)`; \
+-	if [ $$sz -gt $(PREBOOT_BIN_MAX_SIZE) ]; then \
+-		echo "$(PREBOOT_TARGET) image size ($$sz) is too big (> $(PREBOOT_BIN_MAX_SIZE))"; \
+-		exit 1; \
+-	fi
+-
+ $(BINDIR)/%.bin: %
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $(BINDIR)/$< $@
+-
+-preboot: $(PREBOOT_OBJECTS) $(PREBOOT_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $(BINDIR)/$@ -Wl,--start-group $(PREBOOT_OBJECTS) $(PREBOOT_LDLIBS) -Wl,--end-group
+ 
+ ppboot: $(PPBOOT_OBJECTS) $(PPBOOT_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(PPBOOT_LD_SCRIPT) -o $(BINDIR)/$@ -Wl,--start-group $(PPBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
+ 
+-$(AUTO_GENERATED_FILE): localversion-habanalabs $(PREBOOT_SRCS_C)
++$(AUTO_GENERATED_FILE): localversion-habanalabs
+ 	@( printf '#define PREBOOT_VER "%s"\n' '$(shell cut -d- -f2- localversion-habanalabs)' ) > $@
+ 	@( printf '#define PREBOOT_MAJOR_VER %d\n' '$(shell cut -d'-' -f4 localversion-habanalabs | cut -d'.' -f1)' ) >> $@
+ 	@( printf '#define PREBOOT_MINOR_VER %d\n' '$(shell cut -d'-' -f4 localversion-habanalabs | cut -d'.' -f2)' ) >> $@
+@@ -139,6 +106,6 @@
+ 	@$(CC) $(SFLAGS) -o $@ $<
+ 
+ clean:
+-	rm -f $(PREBOOT_OBJECTS) $(AUTO_GENERATED_FILE) buildversion-habanalabs
++	rm -f $(PPBOOT_OBJECTS) $(AUTO_GENERATED_FILE) buildversion-habanalabs
+ 
+ .PHONY: clean
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 543a6b8..56ea42a 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -87,7 +87,6 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/module_pci.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_info.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/crc32.o \
+-	$(PREBOOT_ROOT_DIR)/app/preboot/preboot.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/fit_regions.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_fwupd.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_uart.o \
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index 7e97f95..bdf8a86 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -14,11 +14,40 @@
+ #include <security.h>
+ #include <spi_flash.h>
+ #include <device.h>
++#include <boot_info.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
+ 
+ #include <uart.h>
+ 
+ #include <hl_i2c_indirect_protocol.h>
+ #include <gaudi2/i2c_indirect_protocol.h>
++
++#define BTL_VER_PREFIX	"BTL version "
++#define FUSE_VER_PREFIX	"Fuse version "
++
++struct hl_rsp_err {
++	union {
++		struct {
++			u32 major;
++			u32 minor;
++		};
++		u64 error;
++	};
++};
++
++u8 hl_asic_sn[FUSE_DEVID_SIZE];
++struct hl_fw_info_compat fw_info;
++u32 err_sts_reg_val;
++static struct hl_rsp_err pending_error;
++static u8 eeprom_def_boot_en;
++static u64 preboot_en_caps;
++
++static const char *preboot_ver_str = HL_FW_COMP_NAME " " VERSION_STR;
++static char preboot_vers[][VERSION_MAX_LEN] = {
++	[PREBOOT_BTL_VER] = { BTL_VER_PREFIX },
++	[PREBOOT_EFUSE_VER] = { FUSE_VER_PREFIX },
++};
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+ 	{	/* PCI module */
+@@ -88,6 +117,87 @@
+ 	op_status.device_status = HL_I2CI_REQ_DEV_STS_RECOVERY;
+ }
+ 
++bool preboot_error_is_pending(void)
++{
++	return !!pending_error.error;
++}
++
++u32 preboot_error_read_and_clr(u32 *major, u32 *minor)
++{
++	*major = pending_error.major;
++	*minor = pending_error.minor;
++	pending_error.error = 0;
++	return *major;
++}
++
++bool preboot_error_inform(u32 major, u32 minor)
++{
++	/*
++	 * ensuring sending the first error occurrence
++	 * to reset the error just use the clr_on_read
++	 */
++	if (!pending_error.error) {
++		pending_error.major = major;
++		pending_error.minor = minor;
++		return true;
++	}
++	return false;
++}
++
++void preboot_finalize_enabled_caps(void)
++{
++	if (!preboot_en_caps)
++		return;
++	boot_info_set(HL_BOOT_INFO_EN_CAPS, &preboot_en_caps,
++		      sizeof(preboot_en_caps));
++}
++
++const char *preboot_get_version(enum preboot_vers ver)
++{
++	return preboot_vers[ver];
++}
++
++bool preboot_is_overlap_address_range(u64 addr, int len)
++{
++	if (addr + len <= (uintptr_t)&_start || addr >= (uintptr_t)&__stack_top)
++		return false;
++	return true;
++}
++
++void preboot_boot_info_set_eeprom_fw_info(void)
++{
++	fw_info.version = HL_FW_INFO_VERSION;
++	fw_info.eeprom_def_boot_en = eeprom_def_boot_en;
++	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
++}
++
++void preboot_finalize_uboot_override(void)
++{
++	if (eeprom_def_boot_en)
++		preboot_boot_info_set_eeprom_fw_info();
++}
++
++void preboot_version(void)
++{
++	int err;
++	int j, i = 0, btl_ver_sz = 0;
++
++	preboot_puts("\n");
++	preboot_puts_raw(preboot_ver_str);
++	preboot_puts("\n");
++	/* copy the preboot version */
++	for (j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
++		preboot_vers[PREBOOT_BTL_VER][i++] = preboot_ver_str[j];
++		if (preboot_ver_str[j] == '\0')
++			break;
++	}
++
++	err = boot_info_set(HL_BOOT_INFO_PREBOOT_BTL_VERSION, preboot_vers[PREBOOT_BTL_VER],
++			    VERSION_MAX_LEN);
++	if (err)
++		preboot_puts("Failed to pass preboot BTL version securely\n");
++}
++
+ __weak void preboot_recovery_flag(bool en) { }
+ 
+ void erom_main_function(void)
+diff --git a/app/preboot/crt0_preboot.S b/app/preboot/crt0_preboot.S
+deleted file mode 100644
+index 76bef06..0000000
+--- a/app/preboot/crt0_preboot.S
++++ /dev/null
+@@ -1,51 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-/*
+- * This is preboot entry point
+- * Setting sp/fp/lr and jumping to C code
+- */
+-.globl	_start
+-_start:
+-
+-#ifdef __arc__
+-/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
+-.global	lf2flt
+-lf2flt:
+-
+-	mov	sp, __stack_top
+-	mov	fp, sp
+-
+-	/* Disable un-aligned checks on data memory */
+-	lr r0, [STATUS32]
+-	bset r0, r0, 0x13
+-	kflag r0
+-
+-	/* Clear BSS and stack areas */
+-	mov	r5, __bss_start
+-	sub	r6, __stack_top, r5
+-	lsr.f	lp_count, r6, 2
+-	lpnz	1f
+-	st.ab	0, [r5, 4]
+-1:
+-#endif
+-
+-#ifdef __aarch64__
+-	ldr	x0, =__stack_top
+-	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
+-	mov	x29, sp		/* Set FP (x29) */
+-
+-	/* Clear BSS and stack areas */
+-	ldr	x0, =__bss_start
+-	ldr	x1, =__stack_top
+-clear_loop:
+-	str	xzr, [x0], #8
+-	cmp	x0, x1
+-	b.lo	clear_loop
+-#endif
+-
+-	bl	preboot_main	/* Set LR (x30) */
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+deleted file mode 100644
+index 1c6d59c..0000000
+--- a/app/preboot/preboot.c
++++ /dev/null
+@@ -1,588 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * (C) Copyright 2017-2020 HabanaLabs, Ltd.
+- * All rights reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-#include <stdint.h>
+-#include <time.h>	/* required for nvme data */
+-#include <string.h>	/* for memset */
+-
+-#include <bitops.h>
+-#include <preboot.h>
+-#include <device.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_if.h>
+-#include <boot_if.h>
+-#include <security.h>
+-#include <boot_info.h>
+-#include <hl_boot_desc.h>
+-#include <crc32.h>
+-#include <efuse.h>
+-#include <rma_if.h>	/* required for nvme data */
+-#include <hl_nvme_mi_data.h>
+-#include <hl_i2c_indirect_protocol.h>
+-#include <address_space.h>
+-
+-#include "common.h"
+-#include "uart.h"
+-#include "pll.h"
+-#include "cmd_module.h"
+-#include "i2cslave_indirect.h"
+-#include "hl_i2c_slave_events.h"
+-#include <spi_flash.h>
+-#include <hl.h>
+-
+-struct hl_rsp_err {
+-	union {
+-		struct {
+-			u32 major;
+-			u32 minor;
+-		};
+-		u64 error;
+-	};
+-};
+-
+-u8 hl_asic_sn[FUSE_DEVID_SIZE];
+-
+-struct hl_fw_info_compat fw_info;
+-
+-static struct hl_rsp_err pending_error;
+-static u64 preboot_en_caps;
+-static u8 eeprom_def_boot_en;
+-
+-static struct cmd_module_ops cmd_ops[] = {
+-	{	/* PCI module */
+-		.setup = module_pci_setup,
+-		.check = module_pci_check,
+-		.disable = module_pci_disable,
+-		.run = module_pci_run,
+-		.enable = module_pci_enable,
+-		.run_fast = module_pci_run_fast,
+-		.teardown = module_pci_teardown,
+-		.run_noreturn = noop,
+-	},
+-	{	/* FW UPD module */
+-		.setup = module_fwupd_setup,
+-		.check = module_fwupd_check,
+-		.disable = noop,
+-		.run = module_fwupd_run,
+-		.enable = noop,
+-		.run_fast = module_fwupd_run_fast,
+-		.teardown = noop,
+-		.run_noreturn = module_fwupd_run_noret,
+-	},
+-	{	/* I2C FW UPD module */
+-		.setup = module_i2c_fwupd_setup,
+-		.check = module_i2c_fwupd_check,
+-		.disable = noop,
+-		.run = module_i2c_fwupd_run,
+-		.enable = noop,
+-		.run_fast = module_i2c_fwupd_run_fast,
+-		.teardown = noop,
+-		.run_noreturn = module_i2c_fwupd_run_noret,
+-	},
+-	{	/* LKD module */
+-		.setup = module_lkd_setup,
+-		.check = module_lkd_check,
+-		.disable = module_lkd_disable,
+-		.run = module_lkd_run,
+-		.enable = module_lkd_enable,
+-		.run_fast = module_lkd_run_fast,
+-		.teardown = module_lkd_disable,
+-		.run_noreturn = module_lkd_run_noret,
+-	},
+-	{	/* UART module */
+-		.setup = module_uart_setup,
+-		.check = module_uart_check,
+-		.disable = noop,
+-		.run = noop,
+-		.enable = noop,
+-		.run_fast = module_uart_run,
+-		.teardown = module_uart_teardown,
+-		.run_noreturn = noop,
+-	},
+-	{	/* I2C SLAVE module */
+-		.setup = module_i2c_s_setup,
+-		.check = module_i2c_s_check,
+-		.disable = module_i2c_s_disable,
+-		.run = module_i2c_s_run,
+-		.enable = module_i2c_s_enable,
+-		.run_fast = module_i2c_s_run_fast,
+-		.teardown = module_i2c_s_teardown,
+-		.run_noreturn = module_i2c_s_run_noret,
+-	},
+-};
+-
+-static const char *preboot_ver_str = HL_FW_COMP_NAME " " VERSION_STR;
+-
+-#define BTL_VER_PREFIX	"BTL version "
+-#define FUSE_VER_PREFIX	"Fuse version "
+-
+-static char preboot_vers[][VERSION_MAX_LEN] = {
+-	[PREBOOT_BTL_VER] = { BTL_VER_PREFIX },
+-	[PREBOOT_EFUSE_VER] = { FUSE_VER_PREFIX },
+-};
+-
+-const char *preboot_get_version(enum preboot_vers ver)
+-{
+-	return preboot_vers[ver];
+-}
+-
+-__weak bool hl_is_legacy_boot(void)
+-{
+-	return true;
+-}
+-
+-/* Return size of btl version copied */
+-static int copy_btl_version(void)
+-{
+-	u32 btlver = regmap_readl(global_conf.preboot_ver_off_map);
+-	int i = 0;
+-
+-	/* get to the end of the predefined btl string */
+-	for (i = 0; i < VERSION_MAX_LEN; i++)
+-		if (preboot_vers[PREBOOT_BTL_VER][i] == '\0')
+-			break;
+-	/* convert and copy the btl version */
+-	i += preboot_uint2hexstring(&preboot_vers[PREBOOT_BTL_VER][i],
+-				    btlver, true);
+-
+-	/* separate the btl from preboot */
+-	preboot_vers[PREBOOT_BTL_VER][i++] = '\n';
+-
+-	return i;
+-}
+-
+-__weak void preboot_dev_spec_legacy_vers_setup(enum preboot_vers vers_type, u32 offset)
+-{
+-	u32 reg;
+-
+-	switch (vers_type) {
+-	case PREBOOT_BTL_VER:
+-		reg = global_conf.preboot_ver_off_map;
+-		break;
+-	case PREBOOT_EFUSE_VER:
+-		reg = global_conf.mmfuse_ver_off_map;
+-		break;
+-	default:
+-		return;
+-	}
+-
+-	regmap_writel(offset, reg);
+-}
+-
+-void preboot_version(void)
+-{
+-	int err;
+-	u32 btlver;
+-	unsigned long offset = (unsigned long) preboot_vers[PREBOOT_BTL_VER];
+-	int i = 0, btl_ver_sz = 0;
+-	bool is_legacy_boot = hl_is_legacy_boot();
+-
+-	preboot_puts("\n");
+-	if (is_legacy_boot) {
+-		btlver = regmap_readl(global_conf.preboot_ver_off_map);
+-		preboot_puts_raw(preboot_vers[PREBOOT_BTL_VER]);
+-		preboot_puth(btlver, true);
+-		i = btl_ver_sz = copy_btl_version();
+-		preboot_dev_spec_legacy_vers_setup(PREBOOT_BTL_VER, (u32)(offset & ~SDRAM_BASE));
+-	}
+-	preboot_puts_raw(preboot_ver_str);
+-	preboot_puts("\n");
+-
+-
+-	/* copy the preboot version */
+-	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
+-		preboot_vers[PREBOOT_BTL_VER][i++] = preboot_ver_str[j];
+-		if (preboot_ver_str[j] == '\0')
+-			break;
+-	}
+-
+-	err = boot_info_set(HL_BOOT_INFO_PREBOOT_BTL_VERSION, preboot_vers[PREBOOT_BTL_VER],
+-			VERSION_MAX_LEN);
+-	if (err)
+-		preboot_puts("Failed to pass preboot BTL version securely\n");
+-}
+-
+-#define FUSE_VER_NOT_IMPLEMENT	"not implemented"
+-__weak int hl_fuse_get_version(char *version, size_t size)
+-{
+-	int i, max_sz = sizeof(FUSE_VER_NOT_IMPLEMENT);
+-	const char *not_impl = FUSE_VER_NOT_IMPLEMENT;
+-
+-	max_sz = size < max_sz ? size : max_sz;
+-
+-	for (i = 0; i < max_sz; i++)
+-		version[i] = not_impl[i];
+-
+-	version[max_sz] = '\0';
+-
+-	return 0;
+-}
+-
+-struct preboot_str_size {
+-	char *str;
+-	size_t size;
+-};
+-
+-void preboot_fuse_version_serialize(char *ver, size_t size,
+-				    struct preboot_fuse_ver_data *ver_data,
+-				    bool is_reverse)
+-{
+-	struct preboot_str_size ver_str[] = {
+-		{ ver_data->table_ver, ver_data->table_ver_sz },
+-		{ ver_data->dev_id, ver_data->dev_id_sz },
+-		{ ver_data->fab, ver_data->fab_sz },
+-		{ ver_data->lot, ver_data->lot_sz },
+-		{ ver_data->wafer, ver_data->wafer_sz },
+-		{ ver_data->xaddr, ver_data->xaddr_sz },
+-		{ ver_data->yaddr, ver_data->yaddr_sz },
+-	};
+-	int i, j, str_index;
+-
+-	for (i = 0; i < ARRAY_SIZE(ver_str); i++) {
+-		for (j = 0; j < ver_str[i].size; j++) {
+-			if (!size)
+-				break;
+-			str_index = is_reverse ? ver_str[i].size - 1 - j : j;
+-			*ver++ = ver_str[i].str[str_index];
+-			size--;
+-		}
+-		if (!size)
+-			break;
+-		*ver++ = '-';
+-		size--;
+-	}
+-	/* Replace the last '-' with NULL terminator */
+-	ver[-1] = '\0';
+-}
+-
+-#define FUSE_VER_UNKNOWN	"unknown"
+-static void fuse_version(void)
+-{
+-	unsigned long offset = (unsigned long)preboot_vers[PREBOOT_EFUSE_VER];
+-	size_t ver_prefix_len = sizeof(FUSE_VER_PREFIX) - 1;
+-	char *version = preboot_vers[PREBOOT_EFUSE_VER] + ver_prefix_len;
+-	const char *unknown = FUSE_VER_UNKNOWN;
+-	int err, i;
+-
+-	err = hl_fuse_get_version(version, VERSION_MAX_LEN - ver_prefix_len);
+-	if (err)
+-		for (i = 0; i < sizeof(FUSE_VER_UNKNOWN); i++)
+-			version[i] = unknown[i];
+-
+-	preboot_puts_raw(preboot_vers[PREBOOT_EFUSE_VER]);
+-	preboot_puts("\n");
+-
+-	preboot_dev_spec_legacy_vers_setup(PREBOOT_EFUSE_VER, (u32)(offset & ~SDRAM_BASE));
+-
+-	err = boot_info_set(HL_BOOT_INFO_PREBOOT_EFUSE_VERSION, preboot_vers[PREBOOT_EFUSE_VER],
+-			VERSION_MAX_LEN);
+-	if (err)
+-		preboot_puts("Failed to pass EFUSE version securely\n");
+-}
+-
+-__weak void preboot_security_init(void) {}
+-__weak void preboot_security_dynamic_init(void) {}
+-__weak void preboot_security_dynamic_vers_init(u64 ver_off, u32 size) {}
+-__weak void preboot_security_dynamic_img_sram_open(
+-		enum mem_region img_reg,
+-		enum preboot_mem_access_mode mode)
+-{}
+-__weak void preboot_security_dynamic_img_sram_close(void) {}
+-__weak void preboot_security_dynamic_img_elbi_reg_open(void) {}
+-__weak void preboot_security_dynamic_img_elbi_reg_close(void) {}
+-__weak void preboot_dynamic_img_elbi_reg_cleanup(void *map_addr, u32 size) {}
+-__weak void preboot_security_cleanup_before_run(void) {}
+-__weak void preboot_led_on(void) {}
+-__weak void preboot_sp_sram_init(void) {}
+-__weak void hl_ram_init(void) {}
+-
+-bool preboot_is_overlap_address_range(u64 addr, int len)
+-{
+-	if (addr + len <= (uintptr_t)&_start || addr >= (uintptr_t)&__stack_top)
+-		return false;
+-
+-	return true;
+-}
+-
+-__weak bool preboot_sram_is_valid_address_range(u64 addr, int len)
+-{
+-	if (addr >= SDRAM_BASE && addr + len <= SDRAM_BASE + SRAM_SIZE)
+-		return !preboot_is_overlap_address_range(addr, len);
+-
+-	if (addr >= FIT_IMG_SPSRAM_BASE && addr + len <= FIT_IMG_SPSRAM_END)
+-		return true;
+-
+-	return false;
+-}
+-
+-__weak uintptr_t preboot_get_elbi_reg_base(void)
+-{
+-	return 0;
+-}
+-
+-__weak u32 preboot_get_elbi_reg_size(void)
+-{
+-	return 0;
+-}
+-
+-__weak bool preboot_is_valid_address_range(u64 addr, int len)
+-{
+-	return preboot_sram_is_valid_address_range(addr, len);
+-}
+-
+-__weak void preboot_dev_enable_caps(void) {}
+-
+-void preboot_set_enabled_cap(enum hl_fw_en_caps en_cap)
+-{
+-	preboot_en_caps |= BIT(en_cap);
+-}
+-
+-void preboot_finalize_enabled_caps(void)
+-{
+-	if (!preboot_en_caps)
+-		return;
+-
+-	boot_info_set(HL_BOOT_INFO_EN_CAPS, &preboot_en_caps,
+-		      sizeof(preboot_en_caps));
+-}
+-
+-__weak bool hl_is_watchdog_reset(void)
+-{
+-	return false;
+-}
+-
+-void preboot_boot_info_set_fw_info(void)
+-{
+-	fw_info.version = HL_FW_INFO_VERSION;
+-	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
+-}
+-
+-u32 err_sts_reg_val;
+-
+-static void preboot_process_last_boot_info(void)
+-{
+-	u32 boot_err = HL_FW_FIT_BOOT_ERR_NONE;
+-	u32 data_size, rst_src;
+-	u32 nic_en_local;
+-	u32 fw_upd_is_dis = 0;
+-
+-	if (!boot_info_get(HL_BOOT_INFO_FIT_BOOT_ERROR, &boot_err,
+-			   sizeof(boot_err), &data_size)) {
+-		switch (boot_err) {
+-		case HL_FW_FIT_BOOT_ERR_NONE:
+-			break;
+-		case HL_FW_FIT_BOOT_ERR_CORRUPTED:
+-		case HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION:
+-		case HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE:
+-			cpu_boot_err_set(CPU_BOOT_ERR_FIT_CORRUPTED);
+-			break;
+-		case HL_FW_FIT_BOOT_ERR_REVOKED_KEY:
+-		case HL_FW_FIT_BOOT_ERR_SVN:
+-		case HL_FW_FIT_BOOT_ERR_SIGNATURE:
+-			cpu_boot_err_set(CPU_BOOT_ERR_SECURITY_FAIL);
+-			break;
+-		}
+-
+-		i2csi_set_boot_err(boot_err, true);
+-	}
+-
+-	if (!boot_info_get(HL_BOOT_INFO_NIC_EN, &nic_en_local,
+-			   sizeof(nic_en_local), &data_size))
+-		preboot_nic_en(nic_en_local);
+-
+-	/*
+-	 * Preserve pci disable if exist, except for PRSTN, in which it is
+-	 * required to clear previous indication.
+-	 */
+-	rst_src = hl_rst_src_get();
+-	if (rst_src != HL_PRSTN_RST)
+-		boot_info_get(HL_BOOT_INFO_FW_UPD_CLOSURE, &fw_upd_is_dis,
+-			      sizeof(fw_upd_is_dis), &data_size);
+-
+-	/* device activity counter is cleared in power cycle or prstn */
+-	if (rst_src == HL_PRSTN_RST || rst_src == HL_COLD_RST)
+-		fw_info.device_activity_counter = 0;
+-
+-	module_fwupd_pcie_disable(fw_upd_is_dis);
+-
+-	if (!boot_info_get(HL_BOOT_INFO_FW_INFO, &fw_info,
+-			   sizeof(fw_info), &data_size)) {
+-		if (fw_info.version != HL_FW_INFO_VERSION) {
+-			preboot_puts_hex("Ignoring fw info with version: ",
+-					 fw_info.version, false);
+-			/* ignoring fw_info data */
+-			memset((void *)&fw_info, 0, sizeof(fw_info));
+-		}
+-
+-		/*
+-		 * Ignore reset cause that came from Linux as it is invalid to
+-		 * current reset sequence.
+-		 */
+-		fw_info.reset_cause = HL_FW_RESET_CAUSE_UNKNOWN;
+-	}
+-}
+-
+-static void device_init(void)
+-{
+-	device_init_efuse();
+-	device_init_uart();
+-	device_init_pci();
+-	device_init_i2c_s();
+-	device_init_global_conf();
+-	device_init_pll();
+-}
+-
+-__weak void hl_set_reset_cause(uint32_t reset_cause) {}
+-__weak u32 hl_skip_fw_cfg(void) { return 0; }
+-__weak void hl_dev_pll_init(void) {}
+-__weak void hl_clock_gating_init(void) {}
+-__weak void preboot_process_last_rma_info(void) {}
+-__weak void preboot_rate_limiter_init(void) {}
+-__weak void preboot_hbm_credits_init(void) {}
+-__weak void preboot_e2e_credits_init(void) {}
+-__weak void preboot_device_id_init(void) {}
+-__weak u32 preboot_device_id_get(void) { return 0; }
+-__weak void preboot_engines_init(void) {}
+-__weak void preboot_read_straps(void) {}
+-__weak void preboot_clear_wd_gpio(void) {}
+-__weak void preboot_read_test_mode(void) {}
+-__weak void preboot_reset_init(void) {}
+-__weak void preboot_cond_arc0_reset(void) {}
+-__weak void preboot_tpm_auth(void) {}
+-__weak void preboot_close_strap_eeprom_write(void) {}
+-
+-void preboot_main(void)
+-{
+-	u64 ver_off = (uintptr_t)preboot_vers;
+-	bool is_sec_en;
+-
+-	preboot_init_stack_monitor();
+-	device_init();
+-	/* Initialize internal if variables */
+-	cpu_boot_if_init();
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+-	/* Enable the errors communication */
+-	cpu_boot_err_set(CPU_BOOT_ERR_ENABLED);
+-	/* Enable the device status communication */
+-	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_ENABLED);
+-
+-	/*
+-	 * Note: we assume CPU frequency is not changed while CPU is running,
+-	 * so the udelay init is done once before we start.
+-	 */
+-	udelay_init();
+-
+-	hl_dev_pll_init();
+-
+-	hl_uart_init();
+-	preboot_fuse_init();
+-
+-	preboot_close_strap_eeprom_write();
+-
+-	preboot_cond_arc0_reset();
+-
+-	spi_flash_init();
+-	spi_flash_prot_late();
+-	spi_flash_prot_status();
+-
+-	preboot_sp_sram_init();
+-	preboot_reset_init();
+-
+-	preboot_device_id_init();
+-
+-	preboot_e2e_credits_init();
+-	preboot_hbm_credits_init();
+-	preboot_rate_limiter_init();
+-
+-	preboot_security_init();
+-	preboot_security_dynamic_init();
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_SECURITY_READY);
+-
+-	hl_ts_init();
+-
+-	/* Prepare boot FW versions and eFuse data for host */
+-	preboot_version();
+-	fuse_version();
+-	preboot_read_straps();
+-	preboot_read_test_mode();
+-	preboot_security_dynamic_vers_init(ver_off, sizeof(preboot_vers));
+-
+-	preboot_led_on();
+-	is_sec_en = preboot_security_is_enabled();
+-	if (!is_sec_en)
+-		hl_clock_gating_init();
+-
+-	hl_ram_init();
+-	preboot_dev_enable_caps();
+-
+-	preboot_process_last_boot_info();
+-	preboot_process_last_rma_info();
+-
+-	if (hl_is_watchdog_reset())
+-		i2csi_set_wd_err(HL_FW_RESET_CAUSE_WATCHDOG);
+-
+-	preboot_engines_init();
+-
+-	preboot_clear_wd_gpio();
+-
+-	preboot_tpm_auth();
+-
+-	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+-}
+-
+-bool preboot_error_inform(u32 major, u32 minor)
+-{
+-	/*
+-	 * ensuring sending the first error occurrence
+-	 * to reset the error just use the clr_on_read
+-	 */
+-	if (!pending_error.error) {
+-		pending_error.major = major;
+-		pending_error.minor = minor;
+-		return true;
+-	}
+-
+-	return false;
+-}
+-
+-bool preboot_error_is_pending(void)
+-{
+-	return !!pending_error.error;
+-}
+-
+-u32 preboot_error_read_and_clr(u32 *major, u32 *minor)
+-{
+-	*major = pending_error.major;
+-	*minor = pending_error.minor;
+-
+-	pending_error.error = 0;
+-	return *major;
+-}
+-
+-__weak int preboot_set_sram_sf_access(bool is_enable)
+-{
+-	return 1;
+-}
+-
+-void preboot_set_eeprom_defaults_en(u8 eeprom_defaults_on_err)
+-{
+-	eeprom_def_boot_en = eeprom_defaults_on_err;
+-}
+-
+-void preboot_boot_info_set_eeprom_fw_info(void)
+-{
+-	fw_info.version = HL_FW_INFO_VERSION;
+-	fw_info.eeprom_def_boot_en = eeprom_def_boot_en;
+-	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
+-}
+-
+-void preboot_finalize_uboot_override(void)
+-{
+-	if (eeprom_def_boot_en)
+-		preboot_boot_info_set_eeprom_fw_info();
+-}
+diff --git a/app/preboot/preboot_app_defs.h b/app/preboot/preboot_app_defs.h
+deleted file mode 100644
+index 0e09a02..0000000
+--- a/app/preboot/preboot_app_defs.h
++++ /dev/null
+@@ -1,12 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2023 HabanaLabs Ltd.
+- */
+-
+-#ifndef _PREBOOT_APP_DEFS_H_
+-#define _PREBOOT_APP_DEFS_H_
+-
+-#define HL_FW_COMP	HL_FW_COMP_PREBOOT
+-#define HL_FW_COMP_NAME	"Preboot"
+-
+-#endif /* _PREBOOT_APP_DEFS_H_ */
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+index ce60477..8b5bc36 100644
+--- a/arch/gaudi2/arc/Makefile
++++ b/arch/gaudi2/arc/Makefile
+@@ -2,11 +2,7 @@
+ 
+ PHY_FW_SIZE := 0x8000
+ PPBOOT_MAX_SIZE := 20480
+-PREBOOT_BIN_MAX_SIZE := 130048
+ 
+ LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports.elf
+ 
+-PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c)
+-
+ image_validation: image_validation_common
+-image_validation: image_validation_preboot
+diff --git a/arch/gaudi2/arc/preboot.lds.S b/arch/gaudi2/arc/preboot.lds.S
+deleted file mode 100644
+index 1bc858f..0000000
+--- a/arch/gaudi2/arc/preboot.lds.S
++++ /dev/null
+@@ -1,39 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+ */
+-/*
+- * (C) Copyright 2021 HabanaLabs, Ltd.
+- *
+- */
+-
+-#include "common.h"
+-
+-#ifdef __arc__
+-MEMORY { .sram : ORIGIN = PREBOOT_TEXT_BASE, LENGTH = PREBOOT_SIZE }
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-#endif
+-
+-ENTRY(_start)
+-SECTIONS
+-{
+-	.text : {
+-		. = ALIGN(8);
+-		app/preboot/crt0_preboot.o (.text*)
+-		* (.text*)
+-	} >.sram
+-
+-	.bss : {
+-		. = ALIGN(8);
+-		__bss_start = . ;
+-		*(.bss*)
+-		__bss_end = . ;
+-	} > .sram
+-
+-	.stack : {
+-		. = ALIGN(8);
+-		__stack = . ;
+-		. = . + 4096 ;
+-		__stack_top = . ;
+-	} > .sram
+-
+-	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+-}
+diff --git a/arch/gaudi2/arm/Makefile b/arch/gaudi2/arm/Makefile
+index ccbb115..f7346f0 100644
+--- a/arch/gaudi2/arm/Makefile
++++ b/arch/gaudi2/arm/Makefile
+@@ -2,10 +2,6 @@
+ 
+ PHY_FW_SIZE := 0x5400
+ PPBOOT_MAX_SIZE := 20480
+-PREBOOT_BIN_MAX_SIZE := 130048
+-
+-PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c)
+ 
+ CFLAGS += -mstrict-align
+ image_validation: image_validation_common
+-image_validation: image_validation_preboot
+diff --git a/arch/gaudi2/arm/preboot.lds.S b/arch/gaudi2/arm/preboot.lds.S
+deleted file mode 100644
+index 726b557..0000000
+--- a/arch/gaudi2/arm/preboot.lds.S
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2020 HabanaLabs Ltd.
+- */
+-
+-#include "common.h"
+-
+-MEMORY { .sram : ORIGIN = PREBOOT_TEXT_BASE, LENGTH = PREBOOT_SIZE }
+-
+-OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
+-OUTPUT_ARCH(aarch64)
+-ENTRY(_start)
+-SECTIONS
+-{
+-	.text : {
+-		. = ALIGN(8);
+-		app/preboot/crt0_preboot.o (.text*)
+-		* (.text*)
+-	} >.sram
+-
+-	.bss : {
+-		. = ALIGN(8);
+-		__bss_start = . ;
+-		*(.bss*)
+-		__bss_end = . ;
+-	} > .sram
+-
+-	.stack : {
+-		. = ALIGN(8);
+-		__stack = . ;
+-		. = . + 4096 ;
+-		__stack_top = . ;
+-	} > .sram
+-
+-	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+-}
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index cdc94c6..8e74f0f 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -2,7 +2,6 @@
+ include $(HL_DEV_ARCH_COMMON)/pcie_phy_fw.mk
+ 
+ PPBOOT_MAX_SIZE := 16384
+-PREBOOT_BIN_MAX_SIZE := 130048
+ 
+ ifeq ($(HL_TARGET),onix)
+ 	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports_onix.elf
+@@ -13,4 +12,3 @@
+ CFLAGS += -DPHY_FW_SIZE=$(PHY_FW_SIZE)
+ 
+ image_validation: image_validation_common
+-image_validation: image_validation_preboot
+diff --git a/arch/gaudi3/arc/preboot.lds.S b/arch/gaudi3/arc/preboot.lds.S
+deleted file mode 100644
+index 1d84c39..0000000
+--- a/arch/gaudi3/arc/preboot.lds.S
++++ /dev/null
+@@ -1,39 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+ */
+-/*
+- * (C) Copyright 2022 HabanaLabs, Ltd.
+- *
+- */
+-
+-#include "common.h"
+-
+-#ifdef __arc__
+-MEMORY { .sram : ORIGIN = PREBOOT_TEXT_BASE, LENGTH = PREBOOT_SIZE }
+-OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
+-OUTPUT_ARCH(arc)
+-#endif
+-
+-ENTRY(_start)
+-SECTIONS
+-{
+-	.text : {
+-		. = ALIGN(8);
+-		app/preboot/crt0_preboot.o (.text*)
+-		* (.text*)
+-	} >.sram
+-
+-	.bss : {
+-		. = ALIGN(8);
+-		__bss_start = . ;
+-		*(.bss*)
+-		__bss_end = . ;
+-	} > .sram
+-
+-	.stack : {
+-		. = ALIGN(8);
+-		__stack = . ;
+-		. = . + 4096 ;
+-		__stack_top = . ;
+-	} > .sram
+-
+-	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+-}

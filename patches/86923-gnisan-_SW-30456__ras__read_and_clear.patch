@@ -1,0 +1,145 @@
+From bf5d89cf960928b4616b6dfbf56434dcc36e9702 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 14 Mar 2021 10:59:24 +0200
+Subject: [PATCH] [SW-30456] ras: read and clear
+
+Apply RC fields on selected error status fields
+
+Change-Id: Ic002902d160aada7f363034385558af0d216408f
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index f3ee6e7..aab3c93 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -83,6 +83,11 @@
+ 	struct i2csi_block_write data;
+ };
+ 
++struct i2csi_read_clear {
++	u8 offset;
++	u8 size;
++};
++
+ struct i2csi_block_write_context block_write;
+ 
+ static struct hl_i2ci_req_cfg req_cfg;
+@@ -113,6 +118,21 @@
+ struct rma_failure i2c_rma_failure;
+ 
+ static bool err_chksum_avail;
++
++const static struct i2csi_read_clear op_err_status_rc[] = {
++	{
++		.offset = offsetof(struct hl_i2ci_error_status, security),
++		.size = sizeof(struct hl_i2ci_error_status_security),
++	},
++	{
++		.offset = offsetof(struct hl_i2ci_error_status, checksum),
++		.size = sizeof(struct hl_i2ci_error_status_checksum),
++	},
++	{
++		.offset = offsetof(struct hl_i2ci_error_status, wd),
++		.size = sizeof(struct hl_i2ci_error_status_wd),
++	},
++};
+ 
+ static u32 i2csi_block_wait_for(u8 block_cmd, u8 cmd, u8 len, u8 **data)
+ {
+@@ -727,6 +747,53 @@
+ 	return req_sts.data[idx];
+ }
+ 
++static void i2csi_req_handle_read_clear(void)
++{
++	const struct i2csi_read_clear *rc = NULL;
++	int i, sz;
++	int rel_off, rel_size;
++
++	if (!req_rd.data)
++		return;
++
++	switch (req_wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_ERROR_STATUS:
++		rc = op_err_status_rc;
++		sz = ARRAY_SIZE(op_err_status_rc);
++		break;
++	default:
++		return;
++	}
++
++	for (i = 0; i < sz; i++) {
++		if (req_wd.hdr.offset > rc[i].offset + rc[i].size)
++			continue;
++
++		if (req_wd.hdr.offset + req_wd.hdr.rqdl < rc[i].offset)
++			continue;
++
++		if (req_wd.hdr.offset > rc[i].offset) {
++			/* Reading started after the beginning of the field */
++			rel_off = req_wd.hdr.offset - rc[i].offset;
++			if (rc[i].size - rel_off < req_wd.hdr.rqdl)
++				rel_size = rc[i].size - rel_off;
++			else
++				rel_size = req_wd.hdr.rqdl;
++
++			memset(req_rd.data, 0, rel_size);
++		} else {
++			/* Reading started before the beginning of the field */
++			rel_off = rc[i].offset - req_wd.hdr.offset;
++			if (req_wd.hdr.rqdl - rel_off < rc[i].size)
++				rel_size = req_wd.hdr.rqdl - rel_off;
++			else
++				rel_size = rc[i].size;
++
++			memset(&req_rd.data[rel_off], 0, rel_size);
++		}
++	}
++}
++
+ /*
+  * Handle request port read request. Return the RDATA header, followed by the
+  * payload.
+@@ -734,7 +801,7 @@
+ u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq)
+ {
+ 	register int idx = cmd + read_seq - HL_INDIRECT_REQ_RDATA_DATA;
+-	u8 zero = 0;
++	u8 zero = 0, rd_data;
+ 
+ 	/* Header */
+ 	if (idx < HL_I2CI_REQ_RDATA_LEN)
+@@ -745,13 +812,29 @@
+ 
+ 	/* Payload */
+ 	idx -= HL_I2CI_REQ_RDATA_LEN;
+-	if (idx < req_rd.length)
+-		return req_rd.data[idx];
++	if (idx < req_rd.length) {
++		rd_data = req_rd.data[idx];
++
++		/*
++		 * Last byte, clear RC fields, unless CRC is needed. In that
++		 * case we should clear only after CRC is Calculated
++		 */
++		if (!req_wd.hdr.ic && idx + 1 == req_rd.length)
++			i2csi_req_handle_read_clear();
++
++		return rd_data;
++	}
+ 
+ 	if (req_wd.hdr.ic && idx < req_rd.hdr.rsdl + 4) {
+-		if (idx == req_rd.length)
++		if (idx == req_rd.length) {
+ 			req_rd.crc = crc32(req_rd.crc, req_rd.data,
+ 					   req_rd.length);
++			/*
++			 * Now that CRC is calculated, we can clear the read
++			 * data.
++			 */
++			i2csi_req_handle_read_clear();
++		}
+ 
+ 		/* CRC trivial read 0 for reading of out bound */
+ 		if (idx < req_rd.hdr.rsdl)

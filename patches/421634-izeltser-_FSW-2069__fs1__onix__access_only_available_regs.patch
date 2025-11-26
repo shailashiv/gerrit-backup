@@ -1,0 +1,117 @@
+From c12ceaa5472783123611a3f2f7b89799ffdb125c Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 06 Jun 2024 15:15:39 +0300
+Subject: [PATCH] [FSW-2069] fs1: onix: access only available regs
+
+On Onix most of the device blocks are not implemented, only PSOC blocks
+are available in the FPGA design. Code should avoid access to
+non-existing blocks.
+
+Change-Id: Ie9791332dcb968a239577871749b9b9642436453
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index d6b7549..4c84846 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -178,7 +178,7 @@
+ 		wd_cause_dump();
+ }
+ 
+-static bool hl_pcie_link_up(void)
++__weak bool hl_is_pcie_link_up(void)
+ {
+ 	unsigned int prstn, smlh, rdlh, rst_src;
+ 
+@@ -202,7 +202,7 @@
+ 
+ void hl_pcie_init(void)
+ {
+-	if (hl_pcie_link_up()) {
++	if (hl_is_pcie_link_up()) {
+ 		hl_pcie_enable_access();
+ 		link_is_up = true;
+ 		preboot_puts("PCIe link is already UP!\n");
+@@ -224,7 +224,7 @@
+ 	return true;
+ }
+ 
+-void hl_jtag_init(void)
++__weak void hl_jtag_init(void)
+ {
+ 	u32 reg;
+ 	bool is_debug_en;
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 03b941e..ea3164d 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -157,7 +157,7 @@
+ #define HBW_DRAIN_TIMEOUT	0x8000
+ #define LBW_DRAIN_TIMEOUT	0xF000
+ 
+-void ppboot_pcie_drain_init(void)
++__weak void plat_pcie_drain_init(void)
+ {
+ 	u32 val;
+ 
+@@ -184,6 +184,11 @@
+ 			   mmPMMU_PCIE_WRAP_LBW_DRAIN_CFG);
+ }
+ 
++void ppboot_pcie_drain_init(void)
++{
++	plat_pcie_drain_init();
++}
++
+ void preboot_sync_btl(void)
+ {
+ 	/* not relevant in case of secure boot flow */
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index dd88634..f6b54ed 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -74,5 +74,6 @@
+ 
+ void hl_dev_psoc_pll_init(void);
+ int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw);
++void plat_pcie_drain_init(void);
+ 
+ #endif /* ARCH_FS1_ARC_HL_H_ */
+diff --git a/arch/fs1/arc/onix.c b/arch/fs1/arc/onix.c
+index 1ceaa1f..a32f744 100644
+--- a/arch/fs1/arc/onix.c
++++ b/arch/fs1/arc/onix.c
+@@ -45,3 +45,12 @@
+ {
+ 	/* no PCI init required for Onix */
+ }
++
++/* link is managed by Zilinx IP, FW doesn't have control */
++bool hl_is_pcie_link_up(void) { return true; }
++
++/* JTAG is enabled by default */
++void hl_jtag_init(void) {}
++
++/* PCI blocks no Available on Onix */
++void plat_pcie_drain_init(void) {}
+diff --git a/include/baremetal.h b/include/baremetal.h
+index d40e4ed..dacd0f4 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -174,6 +174,7 @@
+ bool hl_is_debug_mode(enum hl_debug_hw_func func);
+ bool hl_dev_spec_debug_mode(enum hl_debug_hw_func func);
+ bool hl_is_jtag_enabled(void);
++void hl_jtag_init(void);
+ void hl_enter_recovery(void);
+ void hl_dev_reset(void);
+ void hl_esc_key_handle(void);
+@@ -241,6 +242,7 @@
+ void hl_pcie_disable_access(void);
+ void hl_pcie_enable_mem_access(void);
+ void hl_pcie_disable_mem_access(void);
++bool hl_is_pcie_link_up(void);
+ 
+ void preboot_finalize_fw_info(void);
+ void preboot_finalize_nic_en(void);

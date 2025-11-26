@@ -1,0 +1,84 @@
+From 73f706803dc88841aa6250de3cd7bd04d62843b6 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 25 May 2021 17:42:39 +0300
+Subject: [PATCH] [SW-43025] fwupd: fix preboot stuck after run cmd
+
+After RUN_SRAM command we used to have a call to reset state to indicate
+that the state machine returned to the start.
+Addition of the response FIT removed the reset state call so the memory
+holding the response FIT will be left open and host can read the
+response. This in turn also effectively removed the state machine reset
+and thus Preboot has gone wild with the state machine not updated
+correctly.
+To fix this, we split the reset state routine to "secured" and
+"unsescured" versions and call the unsecured version on on error thus
+enabling the response FIT sending to host.
+Additionally, to fix the state machine problem, we reset only the
+relevant variables of the state machine.
+
+Change-Id: Icb6556b9e58ff1b1b8925a2658e29fb108900a7b
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 6f2fba5..bb2ca43 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -351,15 +351,19 @@
+ 
+ static void module_fwupd_reset_state(struct fwupd_state *state)
+ {
+-	preboot_security_dynamic_img_sram_close();
+-	preboot_security_dynamic_img_spsram_close();
+-
+ 	state->cmd.val = 0;	/* NOOP */
+ 	state->wfc_cmd.val = 0;	/* NOOP */
+ 	state->exec_res = NOT_FOUND;
+ 	state->map_size = 0;
+ 	state->map_offset = NULL;
+ 	state->sending_error_flag = false;
++}
++
++static void module_fwupd_reset_state_secure(struct fwupd_state *state)
++{
++	module_fwupd_reset_state(state);
++	preboot_security_dynamic_img_sram_close();
++	preboot_security_dynamic_img_spsram_close();
+ }
+ 
+ void module_fwupd_pcie_disable(bool is_pcie_disabled)
+@@ -409,7 +413,7 @@
+ 	case HL_UPD_CLR_STS:
+ 		break;
+ 	case HL_UPD_RST_STATE:
+-		module_fwupd_reset_state(state);
++		module_fwupd_reset_state_secure(state);
+ 		module_fwupd_send_status(state, HL_UPD_STS_RST_OK, NULL);
+ 		break;
+ 	case HL_UPD_MAP_SRAM:
+@@ -624,14 +628,18 @@
+ 		preboot_puts(": default case - err\n");
+ 	}
+ 
+-	/* NOTE: at this point we used to have a code that
+-	 *       reset the protocol FSM state, on error,
+-	 *       and on NOT_FOUND result. As part of the operation,
+-	 *       It used to close the host's access to the response memory
+-	 *       the reset state at those cases are not a must.
+-	 *       and it may close the memory access, before an explicit
+-	 *       request for RST_STATE, invoked by the host.
++	/* NOTE: at this point we have code that reset the protocol FSM state,
++	 *       on error, and only registers on NOT_FOUND result.
++	 *       Do not run the secured version here. The response memory must
++	 *       be kept open until an explicit request for RST_STATE invoked
++	 *       by the host arrives.
+ 	 */
++	if (err) {
++		module_fwupd_reset_state(state);
++	} else if (state->exec_res == NOT_FOUND) {
++		state->wfc_cmd.val = 0;	/* NOOP - clear cmds state machine */
++		state->cmd.val = 0;	/* NOOP */
++	}
+ }
+ 
+ void module_fwupd_run(void)

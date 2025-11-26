@@ -1,0 +1,61 @@
+From acdfaa2666b8d29f1748ba7354df9e4ddd36b153 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 03 Jun 2019 15:38:18 +0300
+Subject: [PATCH] [SW-2891] uart: rework the preboot_puth_raw() func
+
+The printing of integers does not work while running in scratch pad
+SRAM. This is due to the fact that it has only aligned to 32 bit
+accesses.
+To W/A the problem, rewrite the preboot_puth_raw() function to not use
+the preboot_uint2hexstring() function, but instead use the new
+preboot_putc_raw() function.
+This also fixes the padding functionality of the preboot_puth_raw()
+function.
+
+Change-Id: I6b5c710edadc52a19999c26dcd8f792cbc7ee4d4
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/uart.c b/common/uart.c
+index 281f4e1..703ff41 100644
+--- a/common/uart.c
++++ b/common/uart.c
+@@ -12,6 +12,7 @@
+ 
+ #define UART_SR_TXFULL			(1 << 0) /* TX Buffer Full */
+ #define STR_UINT_SZ			8
++#define BITS_IN_SINGLE_CHAR		4
+ 
+ void preboot_uart_init(unsigned int val)
+ {
+@@ -93,13 +94,24 @@
+ 
+ void preboot_puth_raw(unsigned int val, bool pad)
+ {
+-	char str[STR_UINT_SZ + 1];
+-	int val_sz;
++	char ch;
++	int shift_start = (STR_UINT_SZ - 1) * BITS_IN_SINGLE_CHAR;
+ 
+-	val_sz = preboot_uint2hexstring(str, val, pad);
+-	val_sz = val_sz > STR_UINT_SZ ? STR_UINT_SZ : val_sz;
+-	str[val_sz] = '\0';
+-	preboot_puts_raw(str);
++	for (int i = shift_start; i >= 0; i -= BITS_IN_SINGLE_CHAR) {
++		ch = (val >> i) & 0xf;
++		/*
++		 * if char is a number [0..9] => use '0' as an offset
++		 * if char is a letter [0xa..0xf] => use 'a' as a base,
++		 * but since 'a' is not 0, we need to subtract
++		 * its base offset - 0xa.
++		 */
++		ch += ch >= 0xa ? 'a' - 0xa : '0';
++		if (!pad && ch == '0' && i != 0)
++			continue;
++
++		preboot_putc_raw(ch);
++		pad = true;
++	}
+ }
+ 
+ void preboot_puth(unsigned int val, bool pad)

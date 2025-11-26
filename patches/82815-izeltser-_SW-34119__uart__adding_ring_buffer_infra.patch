@@ -1,0 +1,95 @@
+From 54d1e1f9710f4e1e5c7e03f3f9b8026618982ff4 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 17 Mar 2021 13:41:48 +0200
+Subject: [PATCH] [SW-34119] uart: adding ring buffer infra
+
+In order to make printing a non blocking (fast running) operation,
+added ring buffer structure and api.
+in the future commits all the printing will go through this buffer.
+
+Change-Id: Icf41837f21bc4d926913a9630ea1775d3d4b16e4
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/uart.c b/common/uart.c
+index 1062fac..51105f5 100644
+--- a/common/uart.c
++++ b/common/uart.c
+@@ -15,6 +15,63 @@
+ #define UART_SR_RXFULL			(1 << 1) /* RX Buffer Full */
+ #define STR_UINT_SZ			8
+ #define BITS_IN_SINGLE_CHAR		4
++#define RING_BUFF_SIZE			256
++
++struct ring_buf_t {
++	char buf[RING_BUFF_SIZE];
++	unsigned int head;
++	unsigned int tail;
++	bool initialized;
++};
++
++static struct ring_buf_t tx_buf;
++
++void preboot_uart_rbuf_init(void)
++{
++	tx_buf.initialized = true;
++}
++
++/* TODO: make preboot_uart_rbuf_push static in next commit */
++void preboot_uart_rbuf_push(char ch)
++{
++	unsigned int head = tx_buf.head + 1;
++
++	head &= RING_BUFF_SIZE - 1;
++
++	/* if buffer is full, ignoring data */
++	if (head != tx_buf.tail) {
++		tx_buf.buf[tx_buf.head] = ch;
++		tx_buf.head = head;
++	}
++}
++
++void preboot_uart_rbuf_pop(void)
++{
++	unsigned int tail = tx_buf.tail;
++	char ch;
++
++	/* if buffer is empty do nothing */
++	if (tx_buf.head != tail) {
++		ch = tx_buf.buf[tail];
++		tail++;
++		tail &= RING_BUFF_SIZE - 1;
++
++		tx_buf.tail = tail;
++
++		/* transferring data directly to HW */
++		regmap_writel(ch, mmPSOC_UART_0_DATA);
++		preboot_putc_virt_uart(ch);
++	}
++}
++
++void preboot_uart_rbuf_flush(void)
++{
++	while (tx_buf.head != tx_buf.tail) {
++		while (regmap_readl(mmPSOC_UART_0_STATE) & UART_SR_TXFULL)
++			;
++		preboot_uart_rbuf_pop();
++	}
++}
+ 
+ static bool dbg_enabled; /* by default debug prints are disabled */
+ 
+diff --git a/common/uart.h b/common/uart.h
+index 598f059..bba76ee 100644
+--- a/common/uart.h
++++ b/common/uart.h
+@@ -22,6 +22,9 @@
+ void preboot_puts_char(const char *str, unsigned char val);
+ int preboot_uart_tstc(void);
+ int preboot_uart_getc(void);
++void preboot_uart_rbuf_init(void);
++void preboot_uart_rbuf_pop(void);
++void preboot_uart_rbuf_flush(void);
+ 
+ /* enable/disable emitting debug prints to the log */
+ void preboot_set_dbg_prints_ena(bool enable_dbg);

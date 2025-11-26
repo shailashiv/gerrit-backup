@@ -1,0 +1,389 @@
+From 1271cb01a95032c66a5f68bda94e7d5ea9248372 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 20 Jan 2022 11:36:15 +0200
+Subject: [PATCH] [SW-69581] efuse: use device struct for dev specific data
+
+Future devices we have multi-die architecture, common code should
+be able to handle those configurations. Including device specific
+headers from common code is not allowed anymore, and instead the
+device structures should be used.
+
+This patch paves the way for this architectural change, and moving
+the efuse common code to this method of work.
+
+Change-Id: I285f5c074f387ef8ba307aa54bf35e2f03469170
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index cb43fff..3665b55 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -12,6 +12,7 @@
+ #include <hl_boot_if.h>
+ #include <bitops.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <hl_fw_if.h> /* requires preboot.h for __packed */
+ 
+ #include "common.h"
+@@ -261,6 +262,11 @@
+ 	ppboot_check_stack_mon_dev_specific();
+ }
+ 
++static void device_init(void)
++{
++	device_init_efuse();
++}
++
+ __weak void ppboot_security_init(void) {}
+ __weak void ppboot_secure_arc(void) {}
+ 
+@@ -270,6 +276,7 @@
+ 	bool ret;
+ 
+ 	ppboot_init_stack_monitor();
++	device_init();
+ 	/* Set ARCs to privileged mode */
+ 	ppboot_secure_arc();
+ 
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 4aa20b5..4bc5b04 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -14,6 +14,7 @@
+ 
+ #include <bitops.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_if.h>
+ #include <boot_if.h>
+@@ -408,6 +409,11 @@
+ 	}
+ }
+ 
++static void device_init(void)
++{
++	device_init_efuse();
++}
++
+ __weak void hl_set_reset_cause(uint32_t reset_cause) {}
+ __weak u32 hl_skip_fw_cfg(void) { return 0; }
+ __weak void hl_dev_pll_init(void) {}
+@@ -432,6 +438,7 @@
+ 	bool is_sec_en;
+ 
+ 	preboot_init_stack_monitor();
++	device_init();
+ 	/* Initialize internal if variables */
+ 	cpu_boot_if_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index 571d007..d3d2fa4 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -37,6 +37,7 @@
+ 
+ #include <bitops.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <pll.h>
+ #include <uart.h>
+ #include <string.h>
+@@ -528,11 +529,6 @@
+ 	preboot_set_enabled_cap(HL_FW_EN_CAPS_HARD_RESET);
+ }
+ 
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+-}
+-
+ #define GAUDI_IRQ_SIZE	512
+ void preboot_ack_razwi_irq(void)
+ {
+@@ -646,3 +642,12 @@
+ 
+ 	return boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_BTL_EN_MASK;
+ }
++
++void device_init_efuse(void)
++{
++	efuse.read_address_reg = mmPSOC_EFUSE_READ_ADDRESS;
++	efuse.data_0_reg = mmPSOC_EFUSE_DATA_0;
++	efuse.read_reg = mmPSOC_EFUSE_READ;
++	efuse.addr_range = EFUSE_READ_RANGE_ALL;
++	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0b0ac90..79fd2cf 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -52,6 +52,7 @@
+ 
+ #include <common/pci_ids.h>
+ 
++#include <device.h>
+ #include <uart.h>
+ #include <pll.h>
+ #include <pci.h>
+@@ -60,6 +61,7 @@
+ #include <spi_flash.h>
+ #include <boot_info.h>
+ #include <hl_boot_desc.h>
++#include <efuse.h>
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+@@ -314,11 +316,6 @@
+ 	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
+ 		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
+ 	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
+-}
+-
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ_CTRL;
+ }
+ 
+ static u32 pci_dev_id;
+@@ -1214,3 +1211,12 @@
+ 
+ 	return 0;
+ }
++
++void device_init_efuse(void)
++{
++	efuse.read_address_reg = mmPSOC_EFUSE_READ_ADDRESS;
++	efuse.data_0_reg = mmPSOC_EFUSE_DATA_0;
++	efuse.read_reg = mmPSOC_EFUSE_READ_CTRL;
++	efuse.addr_range = EFUSE_READ_RANGE_ALL;
++	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 4ecde35..ccce479 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -17,6 +17,7 @@
+ 
+ #include "common.h"
+ #include <preboot.h>
++#include <device.h>
+ #include <boot_if.h>
+ #include <uart.h>
+ #include <spi_flash.h>
+@@ -128,16 +129,22 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmD0_PSOC_EFUSE_RD;
+-}
+-
+ u16 hl_get_boot_info_ver(void)
+ {
+ 	return HL_BOOT_INFO_VERSION;
+ }
+ 
++#define GAUDI3_EFUSE_READ_RANGE_ALL	0xff00
++
++void device_init_efuse(void)
++{
++	efuse.read_address_reg = mmD0_PSOC_EFUSE_READ_ADDRESS;
++	efuse.data_0_reg = mmD0_PSOC_EFUSE_DATA_0;
++	efuse.read_reg = mmD0_PSOC_EFUSE_RD;
++	efuse.addr_range = GAUDI3_EFUSE_READ_RANGE_ALL;
++	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
++}
++
+ void lkd_dev_specific_setup(void)
+ {
+ 	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_HARD_RST_EN);
+diff --git a/arch/goya/arm/common.c b/arch/goya/arm/common.c
+index c8a4ca4..a92ee08 100644
+--- a/arch/goya/arm/common.c
++++ b/arch/goya/arm/common.c
+@@ -22,6 +22,7 @@
+ 
+ #include <bitops.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <pll.h>
+ #include <uart.h>
+ #include <string.h>
+@@ -30,17 +31,13 @@
+ #include <preboot/fit.h>
+ #include <preboot/thermal.h>
+ #include <string.h>
++#include <efuse.h>
+ 
+ #include "common.h"
+ 
+ #define BTL_COUNTER_MAX		BIT(22)
+ 
+ void pci_dev_flr_enable(bool enable) {}
+-
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+-}
+ 
+ bool hl_is_debug_mode(enum hl_debug_hw_func func)
+ {
+@@ -303,3 +300,12 @@
+ 
+ 	return boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_BTL_EN_MASK;
+ }
++
++void device_init_efuse(void)
++{
++	efuse.read_address_reg = mmPSOC_EFUSE_READ_ADDRESS;
++	efuse.data_0_reg = mmPSOC_EFUSE_DATA_0;
++	efuse.read_reg = mmPSOC_EFUSE_READ;
++	efuse.addr_range = EFUSE_READ_RANGE_ALL;
++	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
++}
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 027e028..f7e221d 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -29,6 +29,7 @@
+ #include <cpu_if_regs.h>
+ #include <cpu_if_masks.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <uart.h>
+ #include <bitops.h>
+ #include <string.h>
+@@ -127,11 +128,6 @@
+ 	 */
+ 	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
+ 	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
+-}
+-
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+ }
+ 
+ unsigned int get_cs_pad_sel_flash(void)
+@@ -584,3 +580,12 @@
+ {
+ 	return HL_BOOT_INFO_VERSION;
+ }
++
++void device_init_efuse(void)
++{
++	efuse.read_address_reg = mmPSOC_EFUSE_READ_ADDRESS;
++	efuse.data_0_reg = mmPSOC_EFUSE_DATA_0;
++	efuse.read_reg = mmPSOC_EFUSE_READ;
++	efuse.addr_range = EFUSE_READ_RANGE_ALL;
++	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
++}
+diff --git a/include/device.h b/include/device.h
+new file mode 100644
+index 0000000..46810c0
+--- /dev/null
++++ b/include/device.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++struct device_efuse {
++	u32 read_address_reg;
++	u32 data_0_reg;
++	u32 read_reg;
++	u32 addr_range;
++	u32 words_per_bank;
++};
++
++extern struct device_efuse efuse;
++
++void device_init_efuse(void);
+diff --git a/lib/common/efuse.c b/lib/common/efuse.c
+index 8f31909..dab173a 100644
+--- a/lib/common/efuse.c
++++ b/lib/common/efuse.c
+@@ -6,8 +6,8 @@
+  */
+ 
+ #include <unistd.h>
+-#include <psoc_efuse_regs.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <boot_if.h>
+ #include "efuse.h"
+ #include "common.h"
+@@ -23,26 +23,23 @@
+ #define FUSE_TIMEOUT_US		100000
+ #define FUSE_DELAY_US		20
+ #define FUSE_RETRIES		(FUSE_TIMEOUT_US / FUSE_DELAY_US)
+-#define FUSE_ALL_ADDRESSES	0x3F80
++
++struct device_efuse efuse;
+ 
+ static int efuse_init;
+ 
+ int preboot_fuse_init(void)
+ {
+ 	int i;
+-	u32 read_reg;
+ 
+ 	if (efuse_init == 1)
+ 		return -1;
+ 
+-	regmap_writel(FUSE_ALL_ADDRESSES, mmPSOC_EFUSE_READ_ADDRESS);
+-
+-	read_reg = get_efuse_read_reg();
+-
+-	regmap_writel(1, read_reg);
++	regmap_writel(efuse.addr_range, efuse.read_address_reg);
++	regmap_writel(1, efuse.read_reg);
+ 
+ 	for (i = 0; i < FUSE_RETRIES; i++)
+-		if (regmap_readl(read_reg))
++		if (regmap_readl(efuse.read_reg))
+ 			udelay(FUSE_DELAY_US);
+ 		else
+ 			break;
+@@ -59,7 +56,7 @@
+ 	int offset, ret;
+ 	u32 read_val;
+ 
+-	if (word >= FUSE_WORDS_PER_BANK) {
++	if (word >= efuse.words_per_bank) {
+ 		cpu_boot_err_set(CPU_BOOT_ERR_EFUSE_FAIL);
+ 		preboot_puts("Invalid efuse word offset\n");
+ 		return -1;
+@@ -74,11 +71,11 @@
+ 
+ 	/* read value from bank0 */
+ 	offset = (word * sizeof(u32));
+-	read_val = regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
++	read_val = regmap_readl(efuse.data_0_reg + offset);
+ 
+ 	/* read value from bank1 and OR with value from bank0 */
+-	offset = ((FUSE_WORDS_PER_BANK + word) * sizeof(u32));
+-	read_val |= regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
++	offset = ((efuse.words_per_bank + word) * sizeof(u32));
++	read_val |= regmap_readl(efuse.data_0_reg + offset);
+ 
+ 	*val = read_val;
+ 
+diff --git a/lib/common/efuse.h b/lib/common/efuse.h
+index 2a5cd15..df78b04 100644
+--- a/lib/common/efuse.h
++++ b/lib/common/efuse.h
+@@ -18,6 +18,5 @@
+ 
+ int preboot_fuse_init(void);
+ int preboot_fuse_read(u32 word, u32 *val);
+-u32 get_efuse_read_reg(void);
+ 
+ #endif /* _EFUSE_H_ */

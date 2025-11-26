@@ -1,0 +1,353 @@
+From 809ce3b9aaadcb05ff377f10b3cad786c1b82ea6 Mon Sep 17 00:00:00 2001
+From: Moria Zuberi <moria.zuberi@tandemg.com>
+Date: Sun, 19 Sep 2021 11:23:07 +0300
+Subject: [PATCH] [SW-55777] gaudi2: gcm: enable clock gating
+
+Init clock gating for gaudi2.
+Move security check into gaudi1 specific code.
+
+NOTE: Increasing sram size to 63K in order to support
+this feature.
+
+Change-Id: Ide0e5a110e42f3566fafe7031c3a4b889a4edc6d
+Signed-off-by: Moria Zuberi <moria.zuberi@tandemg.com>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index de7671f..d72e910 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -386,7 +386,6 @@
+ void preboot_main(void)
+ {
+ 	u64 ver_off = (uintptr_t)preboot_vers;
+-	bool is_sec_en;
+ 
+ 	preboot_init_stack_monitor();
+ 	/* Initialize internal if variables */
+@@ -437,9 +436,8 @@
+ 	preboot_security_dynamic_vers_init(ver_off, sizeof(preboot_vers));
+ 
+ 	preboot_led_on();
+-	is_sec_en = preboot_security_is_enabled();
+-	if (!is_sec_en)
+-		hl_clock_gating_init();
++
++	hl_clock_gating_init();
+ 
+ 	hl_ram_init();
+ 	preboot_dev_enable_caps();
+diff --git a/arch/gaudi/arm/asic.c b/arch/gaudi/arm/asic.c
+index 13ee112..c5462e6 100644
+--- a/arch/gaudi/arm/asic.c
++++ b/arch/gaudi/arm/asic.c
+@@ -222,6 +222,10 @@
+ void hl_clock_gating_init(void)
+ {
+ 	u32 i, base = 0, reg, val;
++	bool is_sec_en = preboot_security_is_enabled();
++
++	if (is_sec_en)
++		return;
+ 
+ 	for (i = PCI_DMA_1; i < GAUDI_DMA_MAX ; i++) {
+ 		base = i * DMA_QMAN_DIFF;
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index a1bb2e6..b546ff8 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -9,7 +9,7 @@
+ #include <bitops.h>
+ 
+ #define PPBOOT_SIZE			0x4000		/* 16KB */
+-#define PREBOOT_SIZE			0xE400		/* 57KB */
++#define PREBOOT_SIZE			0xFC00		/* 63KB */
+ 
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 87e3908..43317d6 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -42,6 +42,25 @@
+ #include <psoc_arc0_cfg_masks.h>
+ #include <psoc_arc1_cfg_regs.h>
+ #include <psoc_arc1_cfg_masks.h>
++#include <bitops.h>
++#include <dcore0_tpc0_qm_cgm_regs.h>
++#include <dcore0_tpc0_cfg_regs.h>
++#include <dcore0_sram0_bank_regs.h>
++#include <dcore0_sram1_bank_regs.h>
++#include <dcore0_mme_qm_cgm_regs.h>
++#include <dcore0_mme_ctrl_lo_regs.h>
++#include <dcore0_mme_acc_regs.h>
++#include <dcore0_mme_sbte0_regs.h>
++#include <rot0_qm_cgm_regs.h>
++#include <rot1_qm_cgm_regs.h>
++#include <dcore0_edma0_qm_cgm_regs.h>
++#include <arc_farm_kdma_kdma_cgm_regs.h>
++#include <pdma0_qm_cgm_regs.h>
++#include <pdma1_qm_cgm_regs.h>
++#include <dcore0_hif0_regs.h>
++#include <dcore0_hmmu0_scramb_out_regs.h>
++#include <pmmu_pif_regs.h>
++#include <dcore0_vdec0_brdg_ctrl_regs.h>
+ 
+ #include "hl.h"
+ 
+@@ -61,6 +80,26 @@
+ #define ARC_HALT_ACK_RETRIES		100
+ #define ARC_RUN_ACK_TIMEOUT_US		100
+ #define ARC_IS_RUNNING			BIT(0) /* arc's "is running" sts bit */
++
++#define TPC_CFG_CGU_CPE_CNT		8
++#define DCORE0_TPC0_CFG_CGU_CPE_SB_DISABLE_MASK	0x2000
++#define DCORE0_TPC0_QM_CGM_CFG_IDLE_TH_MASK	0xFFF
++#define DCORE0_TPC0_QM_CGM_CFG_G2F_TH_MASK	0xFF0000
++#define DCORE0_TPC0_QM_CGM_CFG_EN_MASK		0x80000000
++
++#define GAUDI2_TPC_CFG_CGU_CPE_MASK \
++	FIELD_PREP(DCORE0_TPC0_CFG_CGU_CPE_SB_DISABLE_MASK, 0x1)
++
++#define GAUDI2_QM_CGM_CFG_MASK \
++	(FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_IDLE_TH_MASK, 0x100) | \
++	FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_G2F_TH_MASK, 0x10) | \
++	FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_EN_MASK, 0x1))
++
++#define GAUDI2_KDMA_CGM_CFG_MASK \
++	(FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_IDLE_TH_MASK, 0x80) | \
++	FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_G2F_TH_MASK, 0x10) | \
++	FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_EN_MASK, 0x1))
++
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+ {
+ 	regs->cpu_pq_base_addr_low = mmCPU_IF_PQ_BASE_ADDR_LOW;
+@@ -321,6 +360,167 @@
+ 	return !!(dump_sel & DUMP_SEL_SSC_MASK);
+ }
+ 
++static void gaudi2_enable_tpc_clk_gating(int dcore, int inst, u32 offset)
++{
++	int j;
++
++	regmap_writel(GAUDI2_QM_CGM_CFG_MASK, mmDCORE0_TPC0_QM_CGM_CFG + offset);
++
++	/* H6-3040 keep CGU CPE SB disabled */
++	for (j = 0; j < TPC_CFG_CGU_CPE_CNT; j++)
++		regmap_writel(GAUDI2_TPC_CFG_CGU_CPE_MASK,
++			      mmDCORE0_TPC0_CFG_CGU_CPE_0 + (j * 4) + offset);
++}
++
++static void gaudi2_enable_all_tpcs_clk_gating(void)
++{
++	int dcore, inst, instances, tpc_seq = -1;
++	u32 offset;
++
++	for (dcore = 0; dcore < NUM_OF_DCORES; dcore++) {
++		instances = (dcore == 0) ?
++				NUM_DCORE0_TPC : NUM_OF_TPC_PER_DCORE;
++
++		for (inst = 0; inst < instances; inst++) {
++			tpc_seq++;
++
++			if (!(TPC_ENABLED_MASK & BIT(tpc_seq)))
++				continue;
++
++			offset = (DCORE_OFFSET * dcore) +
++				 (DCORE_TPC_OFFSET * inst);
++			gaudi2_enable_tpc_clk_gating(dcore, inst, offset);
++		}
++	}
++}
++
++void gaudi2_init_mme_clk_gating(void)
++{
++	int i, j, dcore_offs = 0;
++
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++		if (!(MME_MASK & (1 << i)))
++			continue;
++
++		dcore_offs = i * DCORE_OFFSET;
++
++		regmap_writel(GAUDI2_QM_CGM_CFG_MASK, mmDCORE0_MME_QM_CGM_CFG +
++			      dcore_offs);
++		regmap_writel(0x210006, mmDCORE0_MME_CTRL_LO_EU + dcore_offs);
++		regmap_writel(0, mmDCORE0_MME_ACC_CLK_GATE_EN + dcore_offs);
++
++		for (j = 0; j < NUM_OF_MME_SBTE_PORTS; j++) {
++			regmap_writel(0x11, mmDCORE0_MME_SBTE0_ENABLE_CGATE +
++				dcore_offs + (j * DCORE_MME_SBTE_OFFSET));
++		}
++	}
++}
++
++void gaudi2_init_rotator_clk_gating(void)
++{
++	if (ROTATOR_MASK & BIT(0))
++		regmap_writel(GAUDI2_QM_CGM_CFG_MASK, mmROT0_QM_CGM_CFG);
++
++	if (ROTATOR_MASK & BIT(1))
++		regmap_writel(GAUDI2_QM_CGM_CFG_MASK, mmROT1_QM_CGM_CFG);
++}
++
++void gaudi2_init_sram_banks_clk_gating(void)
++{
++	int i, j;
++	u32 reg;
++
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++		for (j = 0; j < NUM_OF_SRAM_BANK_PER_DCORE; j++) {
++			reg = mmDCORE0_SRAM0_BANK_CG_CTRL + (i * DCORE_OFFSET) +
++				(j * DCORE_SRAM_BANK_OFFSET);
++			regmap_writel(0xE00003, reg);
++		}
++	}
++}
++
++void gaudi2_init_edma_clk_gating(void)
++{
++	int i, j;
++	u32 reg;
++
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++		if (!(EDMA_ENABLED_MASK & BIT(i)))
++			continue;
++
++		for (j = 0; j < NUM_OF_EDMA_PER_DCORE; j++) {
++			reg = mmDCORE0_EDMA0_QM_CGM_CFG +
++				(i * DCORE_OFFSET) + (j * DCORE_EDMA_OFFSET);
++			regmap_writel(GAUDI2_QM_CGM_CFG_MASK, reg);
++		}
++	}
++}
++
++void gaudi2_init_hif_clk_gating(void)
++{
++	int i, j;
++	u8 seq;
++	u32 reg;
++
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++		for (j = 0; j < NUM_OF_HIF_PER_DCORE; j++) {
++			seq = i * NUM_OF_HIF_PER_DCORE + j;
++
++			if (!(HMMU_HIF_ENABLED_MASK & BIT(seq)))
++				continue;
++
++			reg = mmDCORE0_HIF0_CLOCK_GATE_CONFIG +
++				(i * DCORE_OFFSET) + (j * DCORE_HIF_OFFSET);
++			regmap_writel(0x5, reg);
++
++			reg = mmDCORE0_HMMU0_SCRAMB_OUT_CG_CONFIG +
++				(i * DCORE_OFFSET) + (j * DCORE_HMMU_OFFSET);
++			regmap_writel(0x33, reg);
++		}
++	}
++}
++
++void gaudi2_init_vdec_clk_gating(void)
++{
++	int i, j;
++	u32 reg;
++
++	for (i = 0; i < NUM_OF_DCORES; i++) {
++		for (j = 0; j < NUM_OF_VDEC_PER_DCORE; j++) {
++			if (!(DECODER_ENABLED_MASK & (1 << ((i * 2) + j))))
++				continue;
++
++			reg = mmDCORE0_VDEC0_BRDG_CTRL_CGM_DISABLE +
++				(i * DCORE_OFFSET) + (j * DCORE_VDEC_OFFSET);
++			regmap_writel(0, reg);
++		}
++	}
++}
++
++void hl_clock_gating_init(void)
++{
++	gaudi2_enable_all_tpcs_clk_gating();
++
++	gaudi2_init_mme_clk_gating();
++
++	gaudi2_init_rotator_clk_gating();
++
++	gaudi2_init_sram_banks_clk_gating();
++
++	gaudi2_init_edma_clk_gating();
++
++	regmap_writel(GAUDI2_QM_CGM_CFG_MASK, mmPDMA0_QM_CGM_CFG);
++	regmap_writel(GAUDI2_QM_CGM_CFG_MASK, mmPDMA1_QM_CGM_CFG);
++
++	regmap_writel(GAUDI2_KDMA_CGM_CFG_MASK, mmARC_FARM_KDMA_KDMA_CGM_CFG);
++
++	gaudi2_init_hif_clk_gating();
++
++	regmap_writel(0x1b, mmPMMU_PIF_CLOCK_GATE_CONFIG);
++
++	gaudi2_init_vdec_clk_gating();
++}
++
+ uint8_t get_sris_mode_from_strap(void)
+ {
+ 	uint32_t boot_strap;
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 5423566..6b472bb 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -23,13 +23,15 @@
+ 	#define DECODER_ENABLED_MASK 0x1AB
+ 	#define NIC_PORTS_MASK 0x0
+ 	#define TPC_ENABLED_MASK 0x1020101
++	#define HMMU_HIF_ENABLED_MASK 0xFFFF
+ #elif TARGET_IS_ONIX
+ 	#define MME_MASK 0
+ 	#define EDMA_ENABLED_MASK 0x0
+-	#define ROTATOR_MASK 0x3
+-	#define DECODER_ENABLED_MASK 0x1AB
++	#define ROTATOR_MASK 0x0
++	#define DECODER_ENABLED_MASK 0x0
+ 	#define NIC_PORTS_MASK 0
+-	#define TPC_ENABLED_MASK 0x1020101
++	#define TPC_ENABLED_MASK 0x0
++	#define HMMU_HIF_ENABLED_MASK 0x0
+ #else /* ASIC */
+ 	#define MME_MASK 0xF
+ 	#define EDMA_ENABLED_MASK 0xFF
+@@ -37,6 +39,7 @@
+ 	#define DECODER_ENABLED_MASK 0x1FF
+ 	#define NIC_PORTS_MASK 0xFFFFFF
+ 	#define TPC_ENABLED_MASK 0x1FFFFFF
++	#define HMMU_HIF_ENABLED_MASK 0xFFFF
+ #endif
+ 
+ #define NUM_OF_DCORES			4
+@@ -52,6 +55,8 @@
+ #define NUM_OF_PCIE_VDEC		2
+ #define NUM_OF_MME_SBTE_PORTS		5
+ #define NUM_OF_MME_WB_PORTS		2
++#define NUM_OF_SRAM_BANK_PER_DCORE	8
++
+ 
+ enum nic_mac_lane {
+ 	NIC_MAC_LANE_0,
+@@ -94,6 +99,9 @@
+ #define DCORE_HMMU_OFFSET		(mmDCORE0_HMMU1_MMU_BASE - \
+ 						mmDCORE0_HMMU0_MMU_BASE)
+ 
++#define DCORE_HIF_OFFSET		(mmDCORE0_HIF1_BASE - \
++						mmDCORE0_HIF0_BASE)
++
+ #define NIC_OFFSET			(mmNIC1_MSTR_IF_RR_SHRD_HBW_BASE - \
+ 					 mmNIC0_MSTR_IF_RR_SHRD_HBW_BASE)
+ 
+@@ -115,6 +123,10 @@
+ 		(mmDCORE0_VDEC1_MSTR_IF_RR_SHRD_HBW_BASE - \
+ 		 mmDCORE0_VDEC0_MSTR_IF_RR_SHRD_HBW_BASE)
+ 
++#define DCORE_SRAM_BANK_OFFSET	\
++		(mmDCORE0_SRAM1_BANK_CG_CTRL - \
++		 mmDCORE0_SRAM0_BANK_CG_CTRL)
++
+ enum gaudi2_edma_id {
+ 	EDMA_ID_DCORE0_INSTANCE0,
+ 	EDMA_ID_DCORE0_INSTANCE1,

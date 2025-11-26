@@ -1,0 +1,534 @@
+From 20b3e44328beb6d94975072cf24e5191f6b0fcb8 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 16 Jun 2021 12:09:43 +0300
+Subject: [PATCH] [SW-45099] pci: init device id while waiting for prstn
+
+This patch solves 2 issues:
+1. for some devices the efuse is read in order to assemble the
+   device id. efuse reading is a fairly long operation and shouldn't
+   be performed in time critical points in the code. for those
+   devices the pci id is initialized while we are waiting for prstn
+   de-assertion, and used later on when required.
+2. Tests show that accessing pci_dbi registers during link
+   establishment might cause the cpu to hang. because of that, it's
+   risky to fetch the pci dev id from the pci_dbi block. instead,
+   the pci dev id is initialized during preboot boot sequence and
+   used later on when required.
+
+Change-Id: I356f8af536296aa0635b290841fb00bc5fae24a2
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index adafc93..577c372 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -16,6 +16,7 @@
+ #include <preboot/thermal.h>
+ #include <hl_i2c_slave_events.h>
+ #include <crc8.h>
++#include <common/pci_ids.h>
+ 
+ #include "cmd_module.h"
+ #include "pll.h"
+@@ -224,24 +225,20 @@
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd)
+ {
+ 	u8 ret;
+-	u32 data = device_id_vendor_id;
++	u32 dev_id = preboot_device_id_get();
+ 
+ 	switch (cmd) {
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+-		data &= 0xFFFF;
+-		ret = (data & 0xFF00) >> 8;
++		ret = PCI_VENDOR_ID_HABANALABS >> 8;
+ 		break;
+ 	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		data &= 0xFFFF;
+-		ret = data & 0xFF;
++		ret = PCI_VENDOR_ID_HABANALABS & 0xFF;
+ 		break;
+ 	case HL_PCIE_DEVICE_ID_VAL_LOW:
+-		data >>= 16;
+-		ret = (data & 0xFF00) >> 8;
++		ret = (u8)(dev_id >> 8);
+ 		break;
+ 	case HL_PCIE_DEVICE_ID_VAL_HIGH:
+-		data >>= 16;
+-		ret = data & 0xFF;
++		ret = (u8)dev_id;
+ 		break;
+ 	default:
+ 		ret = 0;
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index bbd7ed0..685bedd 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -13,7 +13,6 @@
+ 		(cmd) <= HL_INDIRECT_REQ_RDATA_DATA_3	\
+ 	)
+ 
+-extern u32 device_id_vendor_id;
+ extern u32 err_sts_reg_val;
+ 
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd);
+diff --git a/common/pci.c b/common/pci.c
+index d4ef70a..e9c844c 100644
+--- a/common/pci.c
++++ b/common/pci.c
+@@ -7,6 +7,7 @@
+ 
+ #include <pcie_dbi_regs.h>
+ #include <pcie_aux_regs.h>
++#include <common/pci_ids.h>
+ #include <bitops.h>
+ #include "pci.h"
+ 
+@@ -183,3 +184,10 @@
+ 
+ 	return !!mem_space_ena_reg;
+ }
++
++u32 hl_pci_get_ven_id_dev_id(void)
++{
++	u32 dev_id = preboot_device_id_get();
++
++	return (dev_id << 16) | PCI_VENDOR_ID_HABANALABS;
++}
+diff --git a/common/pci.h b/common/pci.h
+index 9498ac0..55ffac8 100644
+--- a/common/pci.h
++++ b/common/pci.h
+@@ -65,5 +65,6 @@
+ int hl_pci_get_bar_phys_addr(enum hl_pci_bar_id bar_id, u64 *bar_phys_addr);
+ bool hl_pci_is_mem_enabled(void);
+ u32 dev_pci_dbi_cfg_offset_get(void);
++u32 hl_pci_get_ven_id_dev_id(void);
+ 
+ #endif /* _PCI_H_ */
+diff --git a/gaudi/common.c b/gaudi/common.c
+index dc8d701..e648613 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -44,6 +44,7 @@
+ #include <hl_fw_if.h>
+ #include <security.h>
+ #include <hl_boot_desc.h>
++#include <pci.h>
+ 
+ #include "common.h"
+ 
+@@ -118,16 +119,18 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
+-#define FUSE_DEV_ID_WORD_OFFSET	1
+ #define GAUDI_SECURE_PCI_ID_EXT	BIT(4)
+ 
+-u32 preboot_get_vendor_id_device_id(void)
++static u32 pci_dev_id;
++
++void preboot_device_id_init(void)
+ {
+-	u32 pci_dev_id = PCI_IDS_GAUDI;
+ 	char devid[5];
+ 
++	pci_dev_id = PCI_IDS_GAUDI;
++
+ 	/* Read the second part of the device ID which contains the step */
+-	if (!preboot_fuse_read(FUSE_DEV_ID_WORD_OFFSET + 1, (u32 *)devid)) {
++	if (!preboot_fuse_read(EFUSE_PRODUCT_ID_OFFSET + 1, (u32 *)devid)) {
+ 		devid[4] = '\0';
+ 		/* Check for device type B1 and set the PCI ID accordingly */
+ 		if (!strcmp(&devid[2], "B1"))
+@@ -143,13 +146,23 @@
+ 	if (preboot_security_is_enabled())
+ 		pci_dev_id |= GAUDI_SECURE_PCI_ID_EXT;
+ 
+-	return (pci_dev_id << 16) | PCI_VENDOR_ID_HABANALABS;
++	/* using vendor id as a magic number */
++	pci_dev_id |= (PCI_VENDOR_ID_HABANALABS << 16);
++}
++
++u32 preboot_device_id_get(void)
++{
++	/* using vendor id as a magic number */
++	if ((pci_dev_id >> 16) != PCI_VENDOR_ID_HABANALABS)
++		return 0;
++
++	return pci_dev_id;
+ }
+ 
+ void preboot_init_pcie(void)
+ {
+ 	u64 start;
+-	u32 ven_id_dev_id = preboot_get_vendor_id_device_id();
++	u32 ven_id_dev_id = hl_pci_get_ven_id_dev_id();
+ 
+ 	preboot_init_pcie_phy();
+ 
+@@ -302,6 +315,12 @@
+ 	 */
+ 	(void)preboot_security_is_enabled();
+ 
++	/*
++	 * Initializing device id early by CPU0, while it is used by CPU1,
++	 * for same reasons mentioned obove.
++	 */
++	preboot_device_id_init();
++
+ 	rst_addr_lsb = (u32)(uintptr_t)secondary_entry;
+ 	rst_addr_msb = (u32)(uintptr_t)(((uintptr_t)secondary_entry) >> 32);
+ 	regmap_writel(rst_addr_lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_1);
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index a58575b..c6fb2f5 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -1784,11 +1784,8 @@
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 ctrl_rddv_sel = 4;
+ 	u32 rdatvld_dly;
+-	u32 dev_id;
++	u32 dev_id = preboot_device_id_get();
+ 	int ch;
+-
+-	/* bits [31:16] are the device id */
+-	dev_id = preboot_get_vendor_id_device_id() >> 16;
+ 
+ 	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
+ 		switch (dev_id) {
+diff --git a/gaudi2_arc_gnu/common.c b/gaudi2_arc_gnu/common.c
+index 41347b4..f768acd 100644
+--- a/gaudi2_arc_gnu/common.c
++++ b/gaudi2_arc_gnu/common.c
+@@ -36,6 +36,7 @@
+ #include "common.h"
+ #include <bitops.h>
+ #include "preboot/thermal.h"
++#include <pci.h>
+ 
+ #define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ #define PRODUCT_ID_STR_SIZE	0x8
+@@ -112,14 +113,15 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
++u32 preboot_device_id_get(void)
++{
++	/* TODO: remove hard coding */
++	return PCI_IDS_GAUDI2;
++}
++
+ static void preboot_pcie_device_id_vendor_id_set(void)
+ {
+-	u32 device_id, device_id_vendor_id;
+-
+-	/* TODO: remove hard coding */
+-	device_id = 0x1020;
+-
+-	device_id_vendor_id = (device_id << 16) | PCI_VENDOR_ID_HABANALABS;
++	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+ 
+ 	/* Update Vendor ID */
+ 	regmap_writel(device_id_vendor_id,
+@@ -158,6 +160,9 @@
+ {
+ 	u8 retry = HL_PCIE_LINK_RETRIES;
+ 
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+ 		;
+diff --git a/gaudi2_arm/common.c b/gaudi2_arm/common.c
+index 469198d..30c41e0 100644
+--- a/gaudi2_arm/common.c
++++ b/gaudi2_arm/common.c
+@@ -26,6 +26,7 @@
+ #include <stdint.h>
+ #include <hl_boot_if.h>	/* requires stdint.h */
+ #include <gaudi2/gaudi2_reg_map.h>
++#include <common/pci_ids.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+@@ -35,6 +36,7 @@
+ #include <spi.h>
+ #include <preboot/fit.h>
+ #include <boot_if.h>
++#include <pci.h>
+ 
+ #include "common.h"
+ 
+@@ -226,15 +228,21 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
++u32 preboot_device_id_get(void)
++{
++	return PCI_IDS_GAUDI2;
++}
++
+ void preboot_init_pcie(void)
+ {
+ 	preboot_init_pcie_phy();
++	u32 ven_id_dev_id = hl_pci_get_ven_id_dev_id();
+ 
+ 	/* Update Vendor ID */
+-	regmap_writel(0x10201DA3, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++	regmap_writel(ven_id_dev_id, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+ 
+ 	/* Update subsystem Vendor ID */
+-	regmap_writel(0x10201DA3,
++	regmap_writel(ven_id_dev_id,
+ 		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+ 
+ 	/* Disable the EQ REDO */
+@@ -258,6 +266,9 @@
+ {
+ 	u8 retry = HL_PCIE_LINK_RETRIES;
+ 
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+ 		;
+diff --git a/goya/common.c b/goya/common.c
+index f5967fe..3d152a9 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -13,6 +13,7 @@
+ #include <pcie_core_regs.h>
+ #include <cpu_timestamp_regs.h>
+ #include <pcie_db_rsv_regs.h>
++#include <common/pci_ids.h>
+ 
+ #include <cpu_timestamp_regs.h>
+ 
+@@ -272,3 +273,8 @@
+ {
+ 	return false;
+ }
++
++u32 preboot_device_id_get(void)
++{
++	return PCI_IDS_GOYA;
++}
+diff --git a/greco/common.c b/greco/common.c
+index a53324d..e6a71ce 100644
+--- a/greco/common.c
++++ b/greco/common.c
+@@ -29,6 +29,7 @@
+ #include <greco/greco_reg_map.h>
+ #include <dcon0_tstd_masks.h>
+ #include <dcon0_tstd_regs.h>
++#include <common/pci_ids.h>
+ #include "preboot/thermal.h"
+ 
+ #include <bitops.h>
+@@ -40,6 +41,7 @@
+ #include <preboot/fit.h>
+ #include <efuse.h>
+ #include <boot_if.h>
++#include <pci.h>
+ 
+ #include "common.h"
+ 
+@@ -230,16 +232,23 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
++u32 preboot_device_id_get(void)
++{
++	return PCI_IDS_GRECO;
++}
++
+ void preboot_init_pcie(void)
+ {
+ 	u64 start;
++	u32 ven_id_dev_id = hl_pci_get_ven_id_dev_id();
++
+ 	preboot_init_pcie_phy();
+ 
+ 	/* Update Vendor ID */
+-	regmap_writel(0x00201DA3, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++	regmap_writel(ven_id_dev_id, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+ 
+ 	/* Update subsystem Vendor ID */
+-	regmap_writel(0x00201DA3,
++	regmap_writel(ven_id_dev_id,
+ 		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+ 
+ 	/* Disable the EQ REDO */
+@@ -274,6 +283,9 @@
+ {
+ 	u64 start = timestamp_get_us();
+ 
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
+ 		/* If PRSTn does not happen in 5 seconds
+diff --git a/greco_arc/common.c b/greco_arc/common.c
+index 3889373..7ecc334 100644
+--- a/greco_arc/common.c
++++ b/greco_arc/common.c
+@@ -30,6 +30,7 @@
+ #include <uart.h>
+ #include <efuse.h>
+ #include <string.h>
++#include <pci.h>
+ 
+ #include "common.h"
+ 
+@@ -79,14 +80,15 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
+-static u32 preboot_pcie_device_id_get(void)
++static u32 pcie_dev_id;
++
++void preboot_device_id_init(void)
+ {
+-	u32 device_id;
+ 	int ret;
+ 	char product_str[PRODUCT_ID_STR_SIZE];
+ 
+ 	/* Default device id for addin card */
+-	device_id = PCI_IDS_GRECO_ADDIN;
++	pcie_dev_id = PCI_IDS_GRECO_ADDIN;
+ 
+ 	/*
+ 	 * Efuse stores "product id + rev" as 7 chars of which
+@@ -99,29 +101,31 @@
+ 	ret = preboot_fuse_read(EFUSE_PRODUCT_ID_OFFSET,
+ 				(u32 *)&product_str[0]);
+ 	if (!ret)
+-		return device_id;
++		return;
+ 
+ 	ret = preboot_fuse_read(EFUSE_PRODUCT_ID_OFFSET + 1,
+ 				(u32 *)&product_str[4]);
+ 	if (!ret)
+-		return device_id;
++		return;
+ 
+ 	/* Remove product revision */
+ 	product_str[PRODUCT_ID_STR_SIZE - 2] = '\0';
+ 
+ 	if (strcmp(product_str, "HL1120") == 0)
+-		device_id = PCI_IDS_GRECO_M2;
++		pcie_dev_id = PCI_IDS_GRECO_M2;
++}
+ 
+-	return device_id;
++u32 preboot_device_id_get(void)
++{
++	if (!pcie_dev_id)
++		preboot_puts("dev_id is not initialized");
++
++	return pcie_dev_id;
+ }
+ 
+ static void preboot_pcie_device_id_vendor_id_set(void)
+ {
+-	u32 device_id, device_id_vendor_id;
+-
+-	device_id = preboot_pcie_device_id_get();
+-
+-	device_id_vendor_id = (device_id << 16) | PCI_VENDOR_ID_HABANALABS;
++	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+ 
+ 	/* Update Vendor ID */
+ 	regmap_writel(device_id_vendor_id,
+@@ -158,6 +162,9 @@
+ 
+ void preboot_pcie_wait_for_link(void)
+ {
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+ 		;
+diff --git a/include/preboot.h b/include/preboot.h
+index 00bdd84..336e155 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -199,6 +199,10 @@
+ void preboot_hbm_credits_init(void);
+ void preboot_rate_limiter_init(void);
+ void preboot_e2e_credits_init(void);
++
++void preboot_device_id_init(void);
++u32 preboot_device_id_get(void);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+index f2e6661..90c7746 100644
+--- a/ppboot/ppboot.c
++++ b/ppboot/ppboot.c
+@@ -101,6 +101,7 @@
+ }
+ 
+ __weak void preboot_init_pcie(void) {}
++__weak void preboot_device_id_init(void) {}
+ 
+ void preboot_pcie_enable(void)
+ {
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index b87fff8..d070b74 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -522,7 +522,7 @@
+ 	switch (req_wd.hdr.opcode) {
+ 	case HL_I2CI_REQ_OP_DEVICE_INFO:
+ 		if (!op_info.device_id)
+-			op_info.device_id = (u16)(device_id_vendor_id >> 16);
++			op_info.device_id = (u16)preboot_device_id_get();
+ 
+ 		if (!op_info.asic_sn)
+ 			memcpy((u8 *)&op_info.asic_sn, hl_asic_sn, sizeof(op_info.asic_sn));
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 1274637..27a038d 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -297,13 +297,7 @@
+ 	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
+ }
+ 
+-u32 device_id_vendor_id;
+ u32 err_sts_reg_val;
+-
+-static inline void preboot_retrieve_device_id_from_pcie(void)
+-{
+-	device_id_vendor_id = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+-}
+ 
+ static void preboot_process_last_boot_info(void)
+ {
+@@ -364,6 +358,8 @@
+ __weak void preboot_rate_limiter_init(void) {}
+ __weak void preboot_hbm_credits_init(void) {}
+ __weak void preboot_e2e_credits_init(void) {}
++__weak void preboot_device_id_init(void) {}
++__weak u32 preboot_device_id_get(void) { return 0; }
+ 
+ void preboot_main(void)
+ {
+@@ -392,8 +388,7 @@
+ 
+ 	preboot_sp_sram_init();
+ 
+-	/* Get the VendorID before we lock the access to configuration space */
+-	preboot_retrieve_device_id_from_pcie();
++	preboot_device_id_init();
+ 
+ 	preboot_e2e_credits_init();
+ 	preboot_hbm_credits_init();

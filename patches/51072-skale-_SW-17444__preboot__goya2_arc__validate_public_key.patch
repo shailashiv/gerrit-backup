@@ -1,0 +1,233 @@
+From f17e85e0083927b7d9cee516728c40cb66bbf62f Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 11 Sep 2020 23:40:33 +0300
+Subject: [PATCH] [SW-17444] preboot: goya2_arc: validate public key hash
+
+This patch adds support to verify hash of public key received as
+part of fit image against stored hash of public key.
+
+In ARC based goya2 boot flow, arcboot performs hash validation for key
+size of 392 bytes which includes modulus of 384 bytes and montgomery
+information of 8 bytes.
+
+Currently, preboot performs hash computation on complete public key
+received as part of fit image and compare it against stored hash.
+However, for goya2 ARC based flow, the hash needs to be computed with
+modulus information of 384 bytes and montgomery information of 8 bytes.
+
+Above mentioned hash computation support is added for goya2 ARC based
+flow along with hash validation against stored hash.
+
+Change-Id: I93a6f3178ed0213649c990aa0d8df7c975c9fbed
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index bbdc256..f4d18a7 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -111,7 +111,8 @@
+ }
+ 
+ bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+-				   int pub_key_len)
++				   int pub_key_len, const void *pub_key_ext,
++				   int pub_key_ext_len)
+ {
+ 	const struct hl_sec_otp *otp = preboot_security_get_otp();
+ 	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
+diff --git a/goya2_arc_gnu/security.c b/goya2_arc_gnu/security.c
+index c9b8564..4ef7d0c 100644
+--- a/goya2_arc_gnu/security.c
++++ b/goya2_arc_gnu/security.c
+@@ -17,6 +17,56 @@
+ 	return reg;
+ }
+ 
++bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
++			 int pub_key_len, const void *pub_key_ext,
++			 int pub_key_ext_len)
++{
++	u32 key_revoke, key_base, hash_calculated, hash_stored;
++	u8 bytes_per_dword = sizeof(u32);
++	u8 value[SHA256_SUM_LEN];
++	u8 key[KEY_SIZE];
++	u8 i;
++
++	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
++		return false;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	if (key_revoke & BIT(key_idx)) {
++		preboot_puts_hex("Key revoked: ", key_idx, 0);
++		return false;
++	}
++
++	if (pub_key_len != (KEY_SIZE - KEY_EXT_SIZE)) {
++		preboot_puts_hex("Invalid pub key length: ", pub_key_len, 0);
++		return false;
++	}
++
++	if (pub_key_ext_len != KEY_EXT_SIZE) {
++		preboot_puts_hex("Invalid pub key ext length: ",
++				pub_key_ext_len, 0);
++		return false;
++	}
++
++	/* Concanate public key and public key extension */
++	memcpy(key, pub_key, pub_key_len);
++	memcpy((key + pub_key_len), pub_key_ext, pub_key_ext_len);
++
++	sha256_csum(key, pub_key_len + pub_key_ext_len, value);
++
++	key_base = (key_idx * bytes_per_dword * SECURITY_DWORD_PER_KEY)
++			+ SECURITY_EFUSE_KEYS_OFFSET;
++
++	for (i = 0; i < SECURITY_DWORD_PER_KEY; i++) {
++		memcpy(&hash_calculated, value + (i * bytes_per_dword),
++			bytes_per_dword);
++		hash_stored = sp_sram_readl(key_base + (i * bytes_per_dword));
++		if (hash_calculated != hash_stored)
++			return false;
++	}
++
++	return true;
++}
++
+ bool preboot_security_svn_is_valid(int sec_ver)
+ {
+ 	u8 sec_fw_ver, sec_valid_fw_ver;
+@@ -31,3 +81,8 @@
+ 
+ 	return sec_fw_ver >= sec_valid_fw_ver;
+ }
++
++bool preboot_security_key_montgomery_is_valid(void)
++{
++	return true;
++}
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 67f1ba3..afffd9d 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -30,6 +30,7 @@
+ #define FIT_ALGO_PROP		"algo"
+ #define FIT_KEY_NAME_HINT	"key-name-hint"
+ #define FIT_PUB_KEY_PROP	"pub-key"
++#define FIT_PUB_KEY_EXT_PROP	"pub-key-ext"
+ 
+ #define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+ 
+@@ -46,12 +47,19 @@
+ }
+ 
+ __weak bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+-					  int pub_key_len)
++					  int pub_key_len,
++					  const void *pub_key_ext,
++					  int pub_key_ext_len)
+ {
+ 	return false;
+ }
+ 
+ __weak bool preboot_security_svn_is_valid(int sec_ver)
++{
++	return false;
++}
++
++__weak bool preboot_security_key_montgomery_is_valid(void)
+ {
+ 	return false;
+ }
+@@ -291,11 +299,28 @@
+ 	return -1;
+ }
+ 
+-static int fit_get_pub_key(const void *fit, int noffset,
++static int fit_pub_key_ext_node_get(const void *fit, int conf)
++{
++	int images, prop_len;
++	const char *uname;
++
++	uname = fdt_getprop(fit, conf, FIT_PUB_KEY_EXT_PROP, &prop_len);
++
++	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	if (uname)
++		return fdt_subnode_offset(fit, images, uname);
++
++	return -1;
++}
++
++static int fit_get_pub_key(const void *fit, int noffset, int sig_sub_node,
+ 			   const void **pub_key_fit)
+ {
+-	int node, key_idx, key_len;
++	int node, key_idx, key_len, pub_key_node;
++	const void *key_ext_data = NULL;
+ 	const void *key_data;
++	const char *key_name;
++	int key_ext_len = 0;
+ 
+ 	node = fit_pub_key_node_get(fit, noffset);
+ 	if (node < 0) {
+@@ -315,12 +340,50 @@
+ 		return 1;
+ 	}
+ 
+-	if (!preboot_security_key_is_valid(key_idx, key_data, key_len)) {
++	*pub_key_fit = key_data;
++	if (!preboot_security_key_montgomery_is_valid())
++		goto key_validation;
++
++	/* Get modulus from public key */
++	if (fdt_check_header(*pub_key_fit)) {
++		preboot_puts("FITkey header check failed\n");
++		return 1;
++	}
++
++	if (get_key_name(fit, sig_sub_node, &key_name))
++		return 1;
++
++	pub_key_node = get_pub_key_node(*pub_key_fit, key_name);
++	if (pub_key_node < 0) {
++		preboot_puts("Wrong FITkey format: no key node\n");
++		return 1;
++	}
++
++	/* Update key data and key length with 384 bytes modulus */
++	key_data = fdt_getprop(*pub_key_fit, pub_key_node,
++			"rsa,modulus", &key_len);
++
++	/* Get montgomery from public key extension */
++	node = fit_pub_key_ext_node_get(fit, noffset);
++	if (node < 0) {
++		preboot_puts("Wrong FIT format missing ext pubkey\n");
++		return 1;
++	}
++
++	key_ext_data = fdt_getprop(fit, node, FIT_DATA_PROP,
++			&key_ext_len);
++	if (!key_ext_data) {
++		preboot_puts("Wrong FIT format: missing ext pubkey fit\n");
++		return 1;
++	}
++
++key_validation:
++	if (!preboot_security_key_is_valid(key_idx, key_data, key_len,
++				key_ext_data, key_ext_len)) {
+ 		preboot_puts("Key validation failed\n");
+ 		return 1;
+ 	}
+ 
+-	*pub_key_fit = key_data;
+ 	return 0;
+ }
+ 
+@@ -366,7 +429,7 @@
+ 		return 1;
+ 	}
+ 
+-	if (fit_get_pub_key(fit, noffset, &pub_key_fit))
++	if (fit_get_pub_key(fit, noffset, sig_sub_node, &pub_key_fit))
+ 		return 1;
+ 
+ 	hashed_node_prop = fit_get_hashed_nodes(fit, sig_sub_node, &count,

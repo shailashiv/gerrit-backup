@@ -1,0 +1,111 @@
+From ab8b0eac8474a37dd9b2aacd1a0bdbba711d6ddb Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Tue, 23 Mar 2021 10:26:56 +0200
+Subject: [PATCH] [SW-32460] gaudi: security: fake sec no ifdef in function
+
+Simplifies code
+
+Change-Id: I4a070c4547ed9e1b79c3960319e6d618fa016739
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 6e86dc6..c0c76e2 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -110,31 +110,13 @@
+ 	.is_invalid = true,
+ };
+ 
+-static const struct hl_sec_otp *preboot_security_get_otp(void)
+-{
+-	struct hl_sec_otp *otp = &preboot_security_otp_cache.otp;
+-
+-	if (preboot_security_otp_cache.is_invalid) {
+-
+ #ifdef FAKE_SECURITY
+ #define FAKE_OTP_OFFSET	(2 * 1024 * 1024)
+-		spi_copy(otp, FAKE_OTP_OFFSET, sizeof(struct hl_sec_otp),
+-			 "FAKE OTP");
+-#else
+-		spi_copy_otp(otp, OTP_SECURITY_OFFSET,
+-			     sizeof(struct hl_sec_otp));
+-#endif
+-
+-		if (otp->magic_number != OTP_SECURITY_MAGIC)
+-			return NULL;
+-
+-		preboot_security_otp_cache.is_invalid = false;
+-	}
+-
+-	return otp;
++static void preboot_security_copy_otp(struct hl_sec_otp *otp)
++{
++	spi_copy(otp, FAKE_OTP_OFFSET, sizeof(struct hl_sec_otp), "FAKE OTP");
+ }
+ 
+-#ifdef FAKE_SECURITY
+ #define FAKE_FUSE_OFFSET ((2 * 1024 * 1024) + (64 * 1024))
+ static const struct hl_sec_efuse *preboot_security_get_fuse(void)
+ {
+@@ -173,6 +155,11 @@
+ }
+ 
+ #else
++static void preboot_security_copy_otp(struct hl_sec_otp *otp)
++{
++	spi_copy_otp(otp, OTP_SECURITY_OFFSET, sizeof(struct hl_sec_otp));
++}
++
+ static const struct hl_sec_efuse *preboot_security_get_fuse(void)
+ {
+ 	struct hl_sec_efuse *fuse;
+@@ -200,6 +187,21 @@
+ 
+ #endif /* FAKE_SECURITY */
+ 
++static const struct hl_sec_otp *preboot_security_get_otp(void)
++{
++	struct hl_sec_otp *otp = &preboot_security_otp_cache.otp;
++
++	if (preboot_security_otp_cache.is_invalid) {
++		preboot_security_copy_otp(otp);
++		if (otp->magic_number != OTP_SECURITY_MAGIC)
++			return NULL;
++
++		preboot_security_otp_cache.is_invalid = false;
++	}
++
++	return otp;
++}
++
+ static void preboot_security_sp_sram_write_otp(void)
+ {
+ 	const struct hl_sec_otp *otp;
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 560f4ed..d8dcb86 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -423,6 +423,11 @@
+ 	preboot_security_sp_sram_write_key_hash((u8 *)hash_value, hash_len);
+ 	return 0;
+ }
++#else
++static int fit_pub_key_value_node_get(const void *fit)
++{
++	return 0;
++}
+ #endif
+ 
+ static int fit_pub_key_ext_node_get(const void *fit, int conf)
+@@ -695,10 +700,9 @@
+ 	if (fit_verify_security(fit, conf, res))
+ 		return FIT_LOAD_SEC_FAILED;
+ 
+-#ifdef FAKE_SECURITY
+ 	if (fit_pub_key_value_node_get(fit))
+ 		return FIT_LOAD_SEC_FAILED;
+-#endif
++
+ 	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
+ 	if (num_images > FIT_MAX_IMAGES) {
+ 		preboot_puts_hex("Images in fit exceeds max limit: ",

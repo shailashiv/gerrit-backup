@@ -1,0 +1,316 @@
+From cb2c4ffdb0694e7244042128087a425a5085dc3d Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Mon, 04 Feb 2019 06:23:06 +0200
+Subject: [PATCH] [SW-2799]: move uart code into dedicated file
+
+This is making preboot.c more readable
+
+Change-Id: I2e59a687a5bf10aff915a298256f398f644c7787
+---
+
+diff --git a/preboot.c b/preboot.c
+index e34c0b6..5476e47 100644
+--- a/preboot.c
++++ b/preboot.c
+@@ -15,12 +15,10 @@
+ #include <stddef.h>
+ #include <stdbool.h>
+ #include "pll.h"
++#include "uart.h"
+ 
+ #define SYS_REF_CLOCK			50000000
+ #define BTL_COUNTER_MAX			BIT(22)
+-#define mmPSOC_UART_0_DATA		(HL_CFG_BASE + 0xC45000)
+-#define mmPSOC_UART_0_STATUS		(HL_CFG_BASE + 0xC45004)
+-#define UART_SR_TXFULL			(1 << 0) /* TX Buffer Full */
+ #define mmPSOC_SPI_CTRLR0		(HL_CFG_BASE + 0xC43000)
+ #define mmPSOC_SPI_SSIENR		(HL_CFG_BASE + 0xC43008)
+ #define mmPSOC_SPI_SER			(HL_CFG_BASE + 0xC43010)
+@@ -49,122 +47,9 @@
+ #define frame_size_bits(b)		((b) << 16)
+ 
+ #define VERSION_MAX_LEN	128
+-#define STR_UINT_SZ	8
+ 
+ #define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+ 	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
+-
+-#ifdef DEV_IS_GOYA
+-static void preboot_putc_virt_uart(const char c)
+-{
+-	/*
+-	 * update vUART to HOST
+-	 * DATA: mmPCIE_DB_RSV_RSV_0
+-	 * STATUS: mmPCIE_DB_RSV_RSV_1
+-	 */
+-	writel(c, mmPCIE_DB_RSV_RSV_0);
+-	writel(1, mmPCIE_DB_RSV_RSV_1);
+-}
+-#else
+-static inline void preboot_putc_virt_uart(const char c) {}
+-#endif
+-
+-void preboot_puts_raw(const char* str)
+-{
+-	int i;
+-
+-	for (i=0; str[i] && (i < 128); i++) {
+-		while (readl(mmPSOC_UART_0_STATUS) & UART_SR_TXFULL) ;
+-		writel(str[i], mmPSOC_UART_0_DATA);
+-		preboot_putc_virt_uart(str[i]);
+-	}
+-}
+-
+-static inline void preboot_puts(const char* str)
+-{
+-	preboot_puts_raw(str);
+-	preboot_puts_raw("\r");
+-}
+-
+-/*
+- * preboot_byte2char	- convert half byte to char.
+- *
+- * This function takes a byte number and converts its value to
+- * a character representing the value (e.g. 0x8c can be converted to
+- * '8' or 'c').
+- */
+-static inline char preboot_byte2char(u8 byte, bool upper)
+-{
+-	/* upper or lower 4 bits of the byte */
+-	byte = upper ? byte >> 4 : byte & 0xf;
+-
+-	/*
+-	 * convert: if half byte is a number [0..9] => use '0' as an offset
+-	 * 	    if half byte is a letter [0xa..0xf] => use 'a' as a base,
+-	 * 	    but since 'a' is not 0, we need to subtract
+-	 * 	    its base offset - 0xa.
+-	 */
+-	return byte + ((byte >= 0xa) ? 'a' - 0xa : '0');
+-}
+-
+-/*
+- * preboot_uint2hexstring	- convert uint to a hex values string.
+- *
+- * Take a number and provide its hexadecimal string representation.
+- */
+-static int preboot_uint2hexstring(char *str, unsigned int num, bool pad)
+-{
+-	int j = 0;
+-	char tmp;
+-
+-	/*
+-	 * Here we walk on each byte of uint num in the reverse order, so
+-	 * we build the string in the correct order.
+-	 */
+-	for (int i = 3; i >= 0; i--) {
+-		u8 byte = (u8)((num >> (i * 8)) & 0xff);
+-		/* here we run the loop on 2 parts of byte: upper and lower */
+-		for (int k = 0; k < 2; k++) {
+-			tmp = preboot_byte2char(byte, !k);
+-			if (tmp == '0')	/* care of the leading zeroes (pad) */
+-				pad = true;
+-			if (pad)
+-				str[j++] = tmp;
+-		}
+-	}
+-
+-	/* for !pad, return how many characters were actually written */
+-	return j;
+-}
+-
+-static void preboot_puth_raw(unsigned int val, bool pad)
+-{
+-	char str[STR_UINT_SZ + 1];
+-	int val_sz;
+-
+-	val_sz = preboot_uint2hexstring(str, val, pad);
+-	val_sz = val_sz > STR_UINT_SZ ? STR_UINT_SZ : val_sz;
+-	str[val_sz] = '\0';
+-	preboot_puts_raw(str);
+-}
+-
+-static inline void preboot_puth(unsigned int val, bool pad)
+-{
+-	preboot_puth_raw(val, pad);
+-	preboot_puts("\n");
+-}
+-
+-static inline void preboot_puts_hex(const char* log, unsigned int val, bool pad)
+-{
+-	preboot_puts_raw(log);
+-	preboot_puts_raw("0x");
+-	preboot_puth(val, pad);
+-}
+-
+-static inline void preboot_puts_char(const char* str, unsigned char val)
+-{
+-	preboot_puts_hex(str, val, false);
+-}
+ 
+ /*
+  * Using scratchpad registers for
+diff --git a/uart.c b/uart.c
+new file mode 100644
+index 0000000..92e8221
+--- /dev/null
++++ b/uart.c
+@@ -0,0 +1,127 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <linux/io.h>
++#include <mach/hl_regs.h>
++
++#define mmPSOC_UART_0_DATA		(HL_CFG_BASE + 0xC45000)
++#define mmPSOC_UART_0_STATUS		(HL_CFG_BASE + 0xC45004)
++#define UART_SR_TXFULL			(1 << 0) /* TX Buffer Full */
++#define STR_UINT_SZ			8
++
++#ifdef DEV_IS_GOYA
++static void preboot_putc_virt_uart(const char c)
++{
++	/*
++	 * update vUART to HOST
++	 * DATA: mmPCIE_DB_RSV_RSV_0
++	 * STATUS: mmPCIE_DB_RSV_RSV_1
++	 */
++	writel(c, mmPCIE_DB_RSV_RSV_0);
++	writel(1, mmPCIE_DB_RSV_RSV_1);
++}
++#else
++static inline void preboot_putc_virt_uart(const char c) {}
++#endif
++
++void preboot_puts_raw(const char* str)
++{
++	int i;
++
++	for (i=0; str[i] && (i < 128); i++) {
++		while (readl(mmPSOC_UART_0_STATUS) & UART_SR_TXFULL) ;
++		writel(str[i], mmPSOC_UART_0_DATA);
++		preboot_putc_virt_uart(str[i]);
++	}
++}
++
++void preboot_puts(const char* str)
++{
++	preboot_puts_raw(str);
++	preboot_puts_raw("\r");
++}
++
++/*
++ * preboot_byte2char	- convert half byte to char.
++ *
++ * This function takes a byte number and converts its value to
++ * a character representing the value (e.g. 0x8c can be converted to
++ * '8' or 'c').
++ */
++static inline char preboot_byte2char(u8 byte, bool upper)
++{
++	/* upper or lower 4 bits of the byte */
++	byte = upper ? byte >> 4 : byte & 0xf;
++
++	/*
++	 * convert: if half byte is a number [0..9] => use '0' as an offset
++	 * 	    if half byte is a letter [0xa..0xf] => use 'a' as a base,
++	 * 	    but since 'a' is not 0, we need to subtract
++	 * 	    its base offset - 0xa.
++	 */
++	return byte + ((byte >= 0xa) ? 'a' - 0xa : '0');
++}
++
++/*
++ * preboot_uint2hexstring	- convert uint to a hex values string.
++ *
++ * Take a number and provide its hexadecimal string representation.
++ */
++int preboot_uint2hexstring(char *str, unsigned int num, bool pad)
++{
++	int j = 0;
++	char tmp;
++
++	/*
++	 * Here we walk on each byte of uint num in the reverse order, so
++	 * we build the string in the correct order.
++	 */
++	for (int i = 3; i >= 0; i--) {
++		u8 byte = (u8)((num >> (i * 8)) & 0xff);
++		/* here we run the loop on 2 parts of byte: upper and lower */
++		for (int k = 0; k < 2; k++) {
++			tmp = preboot_byte2char(byte, !k);
++			if (tmp == '0')	/* care of the leading zeroes (pad) */
++				pad = true;
++			if (pad)
++				str[j++] = tmp;
++		}
++	}
++
++	/* for !pad, return how many characters were actually written */
++	return j;
++}
++
++void preboot_puth_raw(unsigned int val, bool pad)
++{
++	char str[STR_UINT_SZ + 1];
++	int val_sz;
++
++	val_sz = preboot_uint2hexstring(str, val, pad);
++	val_sz = val_sz > STR_UINT_SZ ? STR_UINT_SZ : val_sz;
++	str[val_sz] = '\0';
++	preboot_puts_raw(str);
++}
++
++void preboot_puth(unsigned int val, bool pad)
++{
++	preboot_puth_raw(val, pad);
++	preboot_puts("\n");
++}
++
++static inline void preboot_puts_hex(const char* log, unsigned int val, bool pad)
++{
++	preboot_puts_raw(log);
++	preboot_puts_raw("0x");
++	preboot_puth(val, pad);
++}
++
++static inline void preboot_puts_char(const char* str, unsigned char val)
++{
++	preboot_puts_hex(str, val, false);
++}
++
+diff --git a/uart.h b/uart.h
+new file mode 100644
+index 0000000..3b1c380
+--- /dev/null
++++ b/uart.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _HL_UART_H_
++#define _HL_UART_H_
++
++
++#ifdef DEV_IS_GOYA
++void preboot_puts_raw(const char* str);
++void preboot_puts(const char* str);
++int preboot_uint2hexstring(char *str, unsigned int num, bool pad);
++void preboot_puth_raw(unsigned int val, bool pad);
++void preboot_puth(unsigned int val, bool pad);
++#else
++static inline void preboot_puts_raw(const char* str) {}
++static inline void preboot_puts(const char* str) {}
++static inline int preboot_uint2hexstring(char *str, unsigned int num, bool pad) { return 0;}
++static inline void preboot_puth_raw(unsigned int val, bool pad) {}
++static inline void preboot_puth(unsigned int val, bool pad) {}
++#endif
++
++#endif /* _HL_UART_H_ */

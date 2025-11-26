@@ -1,0 +1,132 @@
+From 6bc62f1d4661d4f3951a99d038be24090be5ed87 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Thu, 11 Apr 2024 13:10:26 +0300
+Subject: [PATCH] [SW-180536] gaudi3: tpm: remove preboot pcr extend
+
+This patches removes the preboot pcr extend in ppboot
+for gaudi3.
+Also, get hash function is renamed to correctly reflect
+that the manifest hash is extended to tpm instead of
+ppboot and preboot hash
+
+Change-Id: I84ace3472728392d1dba92b5f88864192ba0dacf
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 2944043..d6b7549 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -91,7 +91,6 @@
+ 	ret = ppboot_try_candidate_img(image_pending, &desc, true);
+ 	if (ret) {
+ 		*loadaddr = desc.loadaddr;
+-		preboot_tpm_extend(desc.chksum);
+ 		return true;
+ 	}
+ 
+@@ -101,7 +100,6 @@
+ 	ret = ppboot_try_candidate_img(image_pending, &desc, false);
+ 	if (ret) {
+ 		*loadaddr = desc.loadaddr;
+-		preboot_tpm_extend(desc.chksum);
+ 		return true;
+ 	}
+ 
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 23233ce..f0a86b9 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -939,7 +939,7 @@
+ 	return !!(reg & BIT(mask));
+ }
+ 
+-uint8_t get_ppboot_pcr_index(void)
++uint8_t get_first_pcr_index(void)
+ {
+ 	return TPM2_PPBOOT_PCR_IDX;
+ }
+@@ -1058,6 +1058,11 @@
+ 	return true;
+ }
+ 
++bool get_first_img_hash(u8 *hash)
++{
++	return get_ppboot_img_hash(hash);
++}
++
+ void hl_erom_boot_info_set_version(u32 type, void *data, u32 size)
+ {
+ 	if (hl_boot_info_set(type, data, size))
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 2e84640..7b6c57e 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1522,7 +1522,7 @@
+ 	sha384_csum((void *)(uintptr_t)IMG_PTRS_OFFSET, img_plus_key_len, hash, 0);
+ }
+ 
+-bool get_ppboot_img_hash(u8 *hash)
++bool get_img_ptr_hash(u8 *hash)
+ {
+ 	bool is_valid;
+ 
+@@ -1545,6 +1545,24 @@
+ 	return is_valid;
+ }
+ 
++bool get_first_img_hash(u8 *hash)
++{
++	/*
++	 * For Gaudi3, instead of separately extending PCRs for individual ppboot
++	 * and preboot images, the process is consolidated by extending the
++	 * PCR of the manifest. Given that, hashes of all images are embedded in
++	 * the manifest, this approach would effectively extend the PCR for all
++	 * images in SPI flash.
++	 */
++	return get_img_ptr_hash(hash);
++}
++
++uint8_t get_first_pcr_index(void)
++{
++	return TPM2_MANIFEST_PCR_IDX;
++}
++
++
+ void preboot_boot_info_init(void)
+ {
+ 	/* boot info finalize does not merge old data hence copy and set it explicitly */
+diff --git a/lib/common/tpm.c b/lib/common/tpm.c
+index aa0e1df..d759c00 100644
+--- a/lib/common/tpm.c
++++ b/lib/common/tpm.c
+@@ -48,9 +48,14 @@
+ 	return 1;
+ }
+ 
+-__weak uint8_t get_ppboot_pcr_index(void)
++__weak uint8_t get_first_pcr_index(void)
+ {
+ 	return 0;
++}
++
++__weak bool get_first_img_hash(u8 *hash)
++{
++	return false;
+ }
+ 
+ void preboot_tpm_extend(uint8_t *hash)
+@@ -94,11 +99,11 @@
+ 
+ 	tpm_startup_done = true;
+ 
+-	is_valid = get_ppboot_img_hash(hash);
++	is_valid = get_first_img_hash(hash);
+ 	if (!is_valid)
+ 		goto enable_early_write_resp;
+ 
+-	ppboot_pcr_idx = get_ppboot_pcr_index();
++	ppboot_pcr_idx = get_first_pcr_index();
+ 
+ 	tpm_pcr_extend(ppboot_pcr_idx, hash);
+ 

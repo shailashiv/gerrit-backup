@@ -1,0 +1,217 @@
+From 4113fdd624143b412cc14f59a04952eafb0fb53e Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Wed, 09 Jun 2021 07:27:33 +0300
+Subject: [PATCH] Revert "[SW-43635] lkd: remove legacy protocol"
+
+This reverts commit 44fa70ae7218950d0acb1e65cc105bdea89859c3.
+
+Change-Id: I54d21fcebdc7c78ef285b7d84d91cc892fb5d145
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index c67e44e..33c6e13 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -20,6 +20,8 @@
+ #include "fit.h"
+ 
+ struct lkd_status {
++	bool is_fit_checked;
++	bool is_fit_ready_ignored;
+ 	struct comms_command cmd;
+ 	struct comms_command wfc_cmd;
+ 	struct comms_command do_cmd;
+@@ -39,6 +41,8 @@
+ void module_lkd_setup(void)
+ {
+ 	lkd_dev_specific_setup();
++	/* TODO: remove the below img open once we remove the old protocol */
++	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 	module_lkd_enable();
+ }
+ 
+@@ -63,13 +67,55 @@
+ 
+ static enum cmd_check_res module_lkd_check_legacy(void)
+ {
+-	preboot_puts("legacy LKD not supported.\n");
++	enum cmd_check_res res;
+ 
+-	/* clear command register */
+-	cpu_boot_cmd_clr_before_wfe();
+-	sts.cmd.val = 0;
++	switch (sts.cmd.val) {
++	case KMD_MSG_GOTO_WFE:
++		preboot_puts("LKD WFE received\n");
++		if (preboot_security_is_enabled()) {
++			cpu_boot_rsp_set(CPU_MSG_ERR);
++			preboot_puts("Security is enabled - WFE refused!\n");
++			res = NOT_FOUND;
++		} else {
++			/* WFE - we should clear the message/cmd register */
++			cpu_boot_cmd_clr_before_wfe();
++			cpu_boot_rsp_set(CPU_MSG_OK);
++			res = FOUND_NO_RETURN;
++		}
++		break;
++	case KMD_MSG_FIT_RDY:
++		if (sts.is_fit_ready_ignored)
++			return NOT_FOUND;
+ 
+-	return NOT_FOUND;
++		res = FOUND_SLOW_RETURN;
++		/* Tell LKD we got the message */
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD FIT RDY received\n");
++		break;
++	case KMD_MSG_RST_DEV:
++		res = FOUND_NO_RETURN;
++		/* RST DEV - we should clear the message/cmd register */
++		cpu_boot_cmd_clr_before_wfe();
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD RST DEV received\n");
++		break;
++	case KMD_MSG_SKIP_BMC:
++		cpu_boot_rsp_set(CPU_MSG_ERR);
++		preboot_puts("LKD SKIP BMC received\n");
++		/* no break */
++	default:
++		res = NOT_FOUND;
++	}
++
++	/*
++	 * Allows handling of any future FIT_RDY
++	 * command. Cause it means that the current command is any
++	 * but FIT_RDY. In this case there is no danger of a repeat
++	 * FIT_RDY command loop. It allows taking care of a FIT_RDY
++	 * at the FIT_RDY switch case and in the module run command
++	 */
++	sts.is_fit_ready_ignored = false;
++	return res;
+ }
+ 
+ static int module_lkd_msg_reset_cause(struct lkd_fw_comms_msg *mcomms)
+@@ -117,7 +163,11 @@
+ 
+ 	mcomms = (struct lkd_fw_comms_msg *)desc.base;
+ 
+-	return module_lkd_msg_process(mcomms);
++	err = module_lkd_msg_process(mcomms);
++	if (err)
++		preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
++
++	return err;
+ }
+ 
+ static void module_lkd_reset_state(void)
+@@ -200,9 +250,22 @@
+ {
+ 	enum cmd_check_res res = NOT_FOUND;
+ 
++	/* we already have the FIT and it is good */
++	if (sts.is_fit_checked)
++		return FOUND_NO_RETURN;
++
+ 	sts.cmd.val = cpu_boot_cmd_get();
+ 	if (is_legacy_comms(sts.cmd.val))
+ 		return module_lkd_check_legacy();
++
++	/*
++	 * Allows handling of any future FIT_RDY
++	 * command. Cause it means that the current command is any
++	 * but FIT_RDY. In this case there is no danger of a repeat
++	 * FIT_RDY command loop. It allows taking care of a FIT_RDY
++	 * at the FIT_RDY switch case and in the module run command
++	 */
++	sts.is_fit_ready_ignored = false;
+ 
+ 	if (sts.cmd.cmd == sts.wfc_cmd.cmd)
+ 		return NOT_FOUND;
+@@ -305,6 +368,26 @@
+ 	preboot_puts(" command\n");
+ }
+ 
++static void module_lkd_run_legacy(void)
++{
++	int err;
++	struct mem_desc desc;
++
++	preboot_security_dynamic_img_sram_close();
++
++	preboot_get_mem_region(MEM_LKD_PCI, &desc);
++
++	err = fit_load_images((void *)desc.base);
++	if (err) {
++		sts.is_fit_ready_ignored = true;
++		preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
++		return;
++	}
++
++	sts.is_fit_checked = true;
++}
++
++
+ static int module_lkd_msg_validate(uintptr_t offset)
+ {
+ 	struct lkd_fw_comms_msg *mcomms = (struct lkd_fw_comms_msg *)offset;
+@@ -341,8 +424,10 @@
+ 
+ 	/* shared mem doesn't contain fit image. */
+ 	err = module_lkd_msg_validate(desc.base);
+-	if (err)
++	if (err) {
++		preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 		sts.exec_res = NOT_FOUND;
++	}
+ 
+ 	return err;
+ }
+@@ -350,6 +435,8 @@
+ static int module_lkd_run_exec(void)
+ {
+ 	/* Placeholder - empty for now */
++
++	/* on error do preboot_security_dynamic_img_open(); */
+ 
+ 	return 1;
+ }
+@@ -404,6 +491,9 @@
+ {
+ 	int err = 0;
+ 	u32 offset = 0;
++
++	if (is_legacy_comms(sts.cmd.val))
++		return module_lkd_run_legacy();
+ 
+ 	/* depending on the current state machine, perform action */
+ 	switch (sts.do_cmd.cmd) {
+@@ -483,8 +573,28 @@
+ 	wfe();
+ }
+ 
++static void module_lkd_run_noret_legacy(void)
++{
++	switch (sts.cmd.val) {
++	case KMD_MSG_GOTO_WFE:
++		module_lkd_run_noret_wfe();
++		break;
++	case KMD_MSG_RST_DEV:
++		module_lkd_run_noret_reset();
++		break;
++	case KMD_MSG_FIT_RDY:
++		module_lkd_run_noret_exec();
++		/* no break */
++	default:
++		break;
++	}
++}
++
+ void module_lkd_run_noret(void)
+ {
++	if (is_legacy_comms(sts.cmd.val))
++		return module_lkd_run_noret_legacy();
++
+ 	/* we are not returning - clear comms status */
+ 	module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
+ 

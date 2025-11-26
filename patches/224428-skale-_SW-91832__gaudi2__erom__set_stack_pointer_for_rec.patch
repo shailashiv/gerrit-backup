@@ -1,0 +1,95 @@
+From d75a0e75c96254b3b286a4d29597bacd587a4e27 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 24 Jun 2022 09:27:38 +0300
+Subject: [PATCH] [SW-91832] gaudi2: erom: set stack pointer for recovery image
+
+Currently, erom recovery image is running on SRAM and uses stack
+assigned by arcboot rom in DCCM. After loading erom recovery image, it is
+not expected that control will go back to arcboot rom as erom recovery
+image will perform secured firmware update and will wait for commands
+from firmware loader. This patch seperates .S file for erom recovery
+and sets stack pointer to be used from SRAM.
+
+Change-Id: I2dcf60e07dc92bf0ed095f9e2c9dbffca0febe1a
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 263d408..7c591f5 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -33,6 +33,9 @@
+ EROM_APP_S := $(shell ls crt0_common_erom.S)
+ EROM_APP_OBJECTS := $(EROM_APP_S:.S=.o)
+ 
++EROM_RECOVERY_APP_S := $(shell ls crt0_recovery_erom.S)
++EROM_RECOVERY_APP_OBJECTS := $(EROM_RECOVERY_APP_S:.S=.o)
++
+ # TODO: Revert as a part of gaudi3 erom implementation
+ ifeq ($(BASE_DEV_NAME),gaudi3)
+ 	EROM_PCIE_SRC := $(HL_DEV_ARCH)/erom_pcie.o
+@@ -122,7 +125,7 @@
+ 	$(MAKE) erom_pcie
+ 	$(MAKE) erom_tpm
+ 
+-erom_recovery: $(EROM_RECOVERY_SRC) $(EROM_RECOVERY_DEPS) $(EROM_APP_OBJECTS) $(EROM_RECOVERY_LD_SCRIPT)
++erom_recovery: $(EROM_RECOVERY_SRC) $(EROM_RECOVERY_DEPS) $(EROM_RECOVERY_APP_OBJECTS) $(EROM_RECOVERY_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(EROM_RECOVERY_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_RECOVERY_DEPS) $(LDLIBS) $(EROM_RECOVERY_EXTRA_LIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+@@ -144,6 +147,6 @@
+ 	@$(CC) $(SFLAGS) -o $@ $<
+ 
+ clean:
+-	rm -f $(EROM_APP_OBJECTS) $(EROM_TPM_DEPS) $(EROM_RECOVERY_DEPS) $(EROM_PCIE_DEPS)
++	rm -f $(EROM_APP_OBJECTS) $(EROM_RECOVERY_APP_OBJECTS) $(EROM_TPM_DEPS) $(EROM_RECOVERY_DEPS) $(EROM_PCIE_DEPS)
+ 
+ .PHONY: clean
+diff --git a/app/ext_rom/crt0_recovery_erom.S b/app/ext_rom/crt0_recovery_erom.S
+new file mode 100644
+index 0000000..3ab0bf9
+--- /dev/null
++++ b/app/ext_rom/crt0_recovery_erom.S
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2022 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++/*
++ * This is ext_rom recovery code entry point
++ * Clearing bss,setting lr and jumping to C code
++ */
++.globl  _start
++_start:
++
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global lf2flt
++lf2flt:
++	mov     sp, __stack_top
++	mov     fp, sp
++
++	/* Clear BSS */
++	mov     r5, __bss_start
++	sub     r6, __bss_end, r5
++	lsr.f   lp_count, r6, 2
++	lpnz    1f
++	st.ab   0, [r5, 4]
++1:
++	push_s  blink
++	bl      erom_main_function
++	pop_s   blink
++	j_s     [blink]
+diff --git a/app/ext_rom/recovery_erom.lds.S b/app/ext_rom/recovery_erom.lds.S
+index 8585216..11cb7e5 100644
+--- a/app/ext_rom/recovery_erom.lds.S
++++ b/app/ext_rom/recovery_erom.lds.S
+@@ -14,7 +14,7 @@
+ SECTIONS
+ {
+ 	.text : ALIGN(4) {
+-		crt0_common_erom.o (.text*)
++		crt0_recovery_erom.o (.text*)
+ 		* (.text*)
+ 	} > .sram
+ 

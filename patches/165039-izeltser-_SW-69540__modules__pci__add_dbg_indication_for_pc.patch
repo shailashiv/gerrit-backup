@@ -1,0 +1,61 @@
+From 844c24e9f5039ed1cd47ca8f0a310e3bb767a36e Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 09 Jan 2022 18:17:01 +0200
+Subject: [PATCH] [SW-69540] modules: pci: add dbg indication for pci init wait
+
+In case the CPU handling the PCI init is stuck for some reason,
+for example because the prst_n signal is stuck low, the developer
+doesn't get any indication about it aside from the absence of
+the pci link.
+This patch adds a periodic print indicating that the PCI
+initialization still not finished by the relevant CPU.
+The user will not see those prints unless debug mode is intentionally
+enabled (by typing "dbg").
+
+Change-Id: I4e9fb817ce66e4859d23f106cbc3ba08da06ec4b
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/lib/preboot/module_pci.c b/lib/preboot/module_pci.c
+index 5c705ff..b778713 100644
+--- a/lib/preboot/module_pci.c
++++ b/lib/preboot/module_pci.c
+@@ -77,6 +77,26 @@
+ 	}
+ }
+ 
++#define DBG_TIMEOUT_US		1000000
++#define DBG_LINE_SZ		80
++
++static unsigned int dbg_cnt;
++static u64 dbg_ts;
++
++static void pci_init_wait_dbg(void)
++{
++	if (timeout_expired(dbg_ts, DBG_TIMEOUT_US)) {
++		preboot_puts_raw_dbg("*");
++		dbg_ts = timestamp_get_us();
++		dbg_cnt++;
++	}
++
++	if (dbg_cnt == DBG_LINE_SZ) {
++		preboot_puts_dbg("\n");
++		dbg_cnt = 0;
++	}
++}
++
+ __weak u32 pci_dev_specific_hot_rst_check(void)
+ {
+ 	return regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
+@@ -88,8 +108,10 @@
+ 	 * don't read pci status regs until PRSTn is deasserted and pci blocks
+ 	 * are functional
+ 	 */
+-	if (!is_pcie_initialized())
++	if (!is_pcie_initialized()) {
++		pci_init_wait_dbg();
+ 		return NOT_FOUND;
++	}
+ 
+ 	pci_sts.flr_reg_val = regmap_readl(mmPCIE_AUX_FLR_INT);
+ 	pci_sts.hot_rst_reg_val = pci_dev_specific_hot_rst_check();

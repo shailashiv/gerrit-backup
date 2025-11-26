@@ -1,0 +1,83 @@
+From 9d7fb9a98f586cb67a07903a539d2d3b3f94cf86 Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Wed, 31 May 2023 06:41:47 +0300
+Subject: [PATCH] [SW-145263] h6: sec: dont use cold reset flop bits
+
+To align fake security close to real security, it is decided to use
+sec_en only from CPUCP packet.
+
+After fake security is enabled, required fuse contents are programmed
+using internal or release itbs. All FW components use efuse bits that
+are read from SPI flash when fake security is enabled
+
+fake_sig_validation_en and fake_bis_compliant are removed from cold reset
+flop register. The efuse bit values are read from SPI flash
+
+Change-Id: I7713a95e8c7d74ad6dc18518f2f59144fef20e13
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 42103e2..0ce1ebb 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -145,11 +145,9 @@
+ 
+ bool preboot_fake_security_is_sig_validation_enabled(void)
+ {
+-	struct gaudi2_cold_rst_data cold_rst_data;
++	const struct hl_sec_efuse *efuse = preboot_get_hl_sec_fake_efuse();
+ 
+-	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
+-
+-	return cold_rst_data.fake_sig_validation_en;
++	return efuse->en_sig_validation;
+ }
+ 
+ bool preboot_is_image_sig_supported(void)
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 732d8a0..c53fc12 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -204,5 +204,6 @@
+ uint32_t gaudi2_gpio_read(uint32_t gpio_pin);
+ bool preboot_fake_security_is_enabled(void);
+ bool preboot_fake_security_is_sig_validation_enabled(void);
++const struct hl_sec_efuse *preboot_get_hl_sec_fake_efuse(void);
+ uint8_t get_sris_mode_from_strap(void);
+ #endif /* ARCH_GAUDI2_COMMON_COMMON_H_ */
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 087b6c3..5099175 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -348,7 +348,7 @@
+ 				     &hl_sec_hbw_psoc_rrs);
+ }
+ 
+-static const struct hl_sec_efuse *preboot_get_hl_sec_fake_efuse(void)
++const struct hl_sec_efuse *preboot_get_hl_sec_fake_efuse(void)
+ {
+ 	struct hl_sec_efuse *fuse;
+ 	u32 *val;
+@@ -1583,15 +1583,17 @@
+ __weak bool preboot_is_bis_compliant_mode(void)
+ {
+ 	const struct hl_sec_efuse *fuse;
+-	struct gaudi2_cold_rst_data cold_rst_data;
+ 
+ 	if (preboot_security_is_real_efuse_sec_en()) {
+ 		fuse = preboot_get_hl_sec_real_efuse();
++		if (fuse) {
++			preboot_puts("failed to read efuse, forcing bis compliant mode.\n");
++			return true;
++		}
+ 
+ 		return fuse->bis_compliant;
+ 	}
+ 
+-	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
+-
+-	return !!cold_rst_data.fake_bis_compliant;
++	fuse = preboot_get_hl_sec_fake_efuse();
++	return fuse->bis_compliant;
+ }

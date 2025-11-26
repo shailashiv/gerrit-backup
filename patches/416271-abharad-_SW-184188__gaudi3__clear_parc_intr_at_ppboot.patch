@@ -1,0 +1,93 @@
+From c725190f5ea3288daadd298ddc931d2011767809 Mon Sep 17 00:00:00 2001
+From: Akshay Pradip Bharad <apbharad@habana.ai>
+Date: Mon, 13 May 2024 20:38:00 +0300
+Subject: [PATCH] [SW-184188] gaudi3: clear parc intr at ppboot
+
+At bootup, PARC SEI interrupt is set due to invalid register access
+by BOOT FSM [H9-5613]. Currently this was being cleared
+at preboot but is moved to ppboot to avoid intr detection at early
+preboot.
+
+Change-Id: If4dcd6657b8ba7d504d32a31d7bf81a8e8e0b12a
+Signed-off-by: Akshay Pradip Bharad <apbharad@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index a76bb57..9ae0f06 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -73,6 +73,10 @@
+ #include <hl_pif_arc_if.h>
+ #include <hl_fw_upd_if.h>
+ #include <gaudi3_efuse.h>
++#include <int_agg_shared_sei_int_msg_regs.h>
++#include <mstr_if_v1_xresp_lbw_regs.h>
++#include <mstr_if_v1_xresp_lbw_masks.h>
++#include <rtr_ctrl_lbw_2_ch_razwi_lbw_ch1_regs.h>
+ 
+ #define PIF_ARC_NUM_OF_MEM	2
+ 
+@@ -372,11 +376,63 @@
+ 	hl_dev_cpu_pll_init();
+ 	hl_init_cpu_ids();
+ }
++
++#define AGG_SEI_PARC_INT_IDX_STS			BIT(25)
++
++static void clear_parc_interrupt(void)
++{
++	uint32_t cause, cause_offset, clr_offset, rz_clr_offset, mstrif_clr_offset;
++	uint32_t die_offset = mmD1_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE -
++				mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE;
++
++	/*
++	 * PARC interrupt is generated due to invalid register
++	 * access in boot FSM [H9-5613].
++	 * Clear it in early preboot stage
++	 */
++	cause_offset =
++		D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_SEI_INTR_CTRL_CAUSE);
++	clr_offset =
++		D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_SEI_INTR_CTRL_CLEAR);
++	rz_clr_offset =
++		D0_NRTR0_2CH_CTRL0_LBW_CH_RAZWI_LBW_CH1_REG(
++			mmRTR_CTRL_LBW_2_CH_RAZWI_LBW_CH1_ADEC_RAZWI_AW_CLR);
++	mstrif_clr_offset =
++		D0_PARC_MSTR_IF_XRESP_LBW_REG(mmMSTR_IF_V1_XRESP_LBW_INTR_CTRL_CLEAR);
++
++	/* Die 0 */
++	cause = regmap_readl(cause_offset);
++	/* Clear interrupt (W1C) */
++	regmap_writel(BIT(0), rz_clr_offset);
++	regmap_writel(MSTR_IF_V1_XRESP_LBW_INTR_CTRL_CLEAR_BRESP_ERR_M,
++		      mstrif_clr_offset);
++	regmap_writel(cause, clr_offset);
++	/* Clear interrupt at agg */
++	regmap_writel(AGG_SEI_PARC_INT_IDX_STS,
++		      mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE +
++		      mmINT_AGG_SHARED_SEI_INT_MSG_STS_0);
++
++	if (hl_is_dual_die_sku()) {
++		/* Die 1 */
++		cause = mirror_readl(cause_offset + die_offset);
++		/* Clear interrupt (W1C) */
++		mirror_writel(BIT(0), rz_clr_offset + die_offset);
++		mirror_writel(MSTR_IF_V1_XRESP_LBW_INTR_CTRL_CLEAR_BRESP_ERR_M,
++			      mstrif_clr_offset + die_offset);
++		mirror_writel(cause, clr_offset + die_offset);
++		/* Clear interrupt at agg */
++		mirror_writel(AGG_SEI_PARC_INT_IDX_STS,
++			      mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE +
++			      mmINT_AGG_SHARED_SEI_INT_MSG_STS_0 + die_offset);
++	}
++}
++
+ __weak void hl_dev_nw_pll_init(void) {}
+ 
+ void hl_plat_init(void)
+ {
+ 	hl_dev_nw_pll_init();
++	clear_parc_interrupt();
+ }
+ 
+ void preboot_sync_btl(void)

@@ -1,0 +1,107 @@
+From 3de853e456cac8777d8dada013f34cf2e62b8388 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 08 May 2019 15:04:51 +0300
+Subject: [PATCH] [SW-4185] pll: rework the to/from ref clk sequence
+
+Commit
+10632f8 ([SW-0] pll: split the clock select programming)
+has fixed the sequence: ref clk => pll clk, but it appears that both
+ways (to and from ref clk) should be done correctly.
+This commit separates and reworks the sequences for both clock
+transition ways.
+
+Change-Id: I4c3883eece4d818380a62e2d2e4b2aae05aab902
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 3a7633c..8b427b7 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -71,24 +71,60 @@
+ 	return 0;
+ }
+ 
+-static void hl_pll_bypass(struct hl_pll_cfg *cfg, bool bypass)
++static void hl_pll_clk_switch_to_ref(struct hl_pll_cfg *cfg)
++{
++	int sel;
++	u64 reg;
++
++	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
++		if (cfg->div_sel[sel] == HL_PLL_SKIP)
++			continue;
++
++		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
++		switch (regmap_readl(reg)) {
++		case HL_PLL_DIV_PLL:
++			/* first change DIV_REF, then DIV_PLL */
++			regmap_writel(HL_PLL_DIV_REF, reg);
++			hl_pll_udelay(1);
++			/* no break */
++		case HL_PLL_PLL_CLK:
++		case HL_PLL_DIV_REF:
++			regmap_writel(HL_PLL_REF_CLK, reg);
++			break;
++		case HL_PLL_REF_CLK:
++		default:
++			break;
++		}
++	}
++
++	/* just to be on a safe side, wait for bypass to propagate */
++	hl_pll_udelay(1);
++}
++
++static void hl_pll_clk_switch_to_pll(struct hl_pll_cfg *cfg)
+ {
+ 	int sel;
+ 	u64 reg;
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+ 		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-		if (cfg->div_sel[sel] == HL_PLL_SKIP)
+-			continue;
+-
+-		if (cfg->div_sel[sel] == HL_PLL_REF_CLK || bypass)
+-			regmap_writel(HL_PLL_REF_CLK, reg);
+-		else if (cfg->div_sel[sel] == HL_PLL_PLL_CLK)
++		switch (cfg->div_sel[sel]) {
++		case HL_PLL_DIV_REF:
++			regmap_writel(HL_PLL_DIV_REF, reg);
++			break;
++		case HL_PLL_PLL_CLK:
+ 			regmap_writel(HL_PLL_PLL_CLK, reg);
+-		else { /* first change DIV_REF, then DIV_PLL */
++			break;
++		case HL_PLL_DIV_PLL:
++			/* first change DIV_REF, then DIV_PLL */
+ 			regmap_writel(HL_PLL_DIV_REF, reg);
+ 			hl_pll_udelay(1);
+ 			regmap_writel(HL_PLL_DIV_PLL, reg);
++			break;
++		case HL_PLL_REF_CLK:
++		case HL_PLL_SKIP:
++		default:
++			break;
+ 		}
+ 	}
+ 
+@@ -141,7 +177,7 @@
+ {
+ 	int ret;
+ 
+-	hl_pll_bypass(cfg, true);
++	hl_pll_clk_switch_to_ref(cfg);
+ 
+ 	ret = hl_pll_cfg(cfg);
+ 
+@@ -155,7 +191,7 @@
+ 
+ 	hl_pll_ack_int(cfg);
+ 
+-	hl_pll_bypass(cfg, false);
++	hl_pll_clk_switch_to_pll(cfg);
+ 
+ 	return ret;
+ }

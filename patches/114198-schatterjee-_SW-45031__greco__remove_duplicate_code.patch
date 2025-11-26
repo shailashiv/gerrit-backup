@@ -1,0 +1,1313 @@
+From bc56da6343ecd8626be29ca0b5ccd31015408579 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Fri, 23 Jul 2021 10:44:04 +0300
+Subject: [PATCH] [SW-45031] greco: remove duplicate code
+
+Target is to avoid duplicate code accorss different
+greco targets(i.e. arm, arc and arc_elf32). In this
+patch many functions primarily from arc/common.c which are common
+across other targets moved to common/common.c.
+
+Also as preboot_init_pcie_phy_fw_update() function is now non-static
+so did the necessary change for gaudi and gaudi2 as well.
+
+Change-Id: Ib2a5778379c819d0f2b381f3d3fdeb84d6546056
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/app/recovery/Makefile b/app/recovery/Makefile
+index cceb955..29f0bf4 100644
+--- a/app/recovery/Makefile
++++ b/app/recovery/Makefile
+@@ -7,6 +7,7 @@
+ 	BASE_DEV_NAME := goya2
+ endif
+ 
++CFLAGS += -I$(SPECS_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+ CFLAGS += -Wall -Werror
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index cbaad5b..cdb7ee7 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -102,7 +102,7 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
+-static void preboot_init_pcie_phy_fw_update(void)
++void preboot_init_pcie_phy_fw_update(void)
+ {
+ 	/* Configure FW update size */
+ 	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index ec0a36a..c860c5b 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -79,7 +79,7 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
+-static void preboot_init_pcie_phy_fw_update(void)
++void preboot_init_pcie_phy_fw_update(void)
+ {
+ 	/* Configure FW update size */
+ 	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 648aa6f..9544254 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -232,7 +232,7 @@
+ 	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
+ }
+ 
+-static void preboot_init_pcie_phy_fw_update(void)
++void preboot_init_pcie_phy_fw_update(void)
+ {
+ 	/* Configure FW update size */
+ 	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index ede9a67..381172e 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -10,22 +10,14 @@
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_global_conf_masks.h>
+-#include <psoc_gpio1_regs.h>
+ #include <psoc_gpio2_regs.h>
+-#include <psoc_qspi_regs.h>
+ #include <psoc_efuse_regs.h>
+-#include <psoc_arc0_cfg_regs.h>
+-#include <psoc_arc0_cfg_masks.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+ #include <cpu_ca53_cfg_regs.h>
+-#include <cpu_timestamp_regs.h>
+-#include <cpu_if_regs.h>
+-#include <cpu_if_masks.h>
+-
+ #include <cpu_timestamp_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+ #include <psoc_arc0_cfg_masks.h>
+@@ -34,8 +26,8 @@
+ 
+ #include <hl_boot_if.h>				/* requires stdint.h */
+ #include <greco/greco_reg_map.h>
+-#include <common/pci_ids.h>
+ #include <goya2/goya2.h>
++#include <common/pci_ids.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+@@ -49,66 +41,15 @@
+ 
+ #include <dcon0_tstd_masks.h>
+ #include <dcon0_tstd_regs.h>
+-#include "preboot/thermal.h"
++#include <greco.h>
+ 
+-#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ 
+-#define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+-#define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
+ #define HOST_GPIO_I2C_DEBUG	44
+ 
+ u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+ {
+ 	/* Return full address */
+ 	return (base | SDRAM_FULL_BASE);
+-}
+-
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+-}
+-
+-bool hl_is_debug_mode(enum hl_debug_hw_func func)
+-{
+-	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+-	u32 strap_mask;
+-
+-	switch (func) {
+-	case HL_DEBUG_HW_DBG_CARD:
+-		strap_mask = BIT(11); /* Dump Select[3] */
+-		break;
+-	case HL_DEBUG_HW_PCIE:
+-		strap_mask = BIT(10); /* Dump Select[2] */
+-		break;
+-	case HL_DEBUG_HW_DRAM:
+-		strap_mask = BIT(8); /* Dump Select[0] */
+-		break;
+-	case HL_DEBUG_HW_I2C:
+-		strap_mask = BIT(9); /* Dump Select[1] */
+-		break;
+-	default:
+-		preboot_puts_hex("Unknown H/W function ", func, false);
+-		return 0;
+-	}
+-
+-	return boot_strap & strap_mask;
+-}
+-
+-static void preboot_init_pcie_phy_fw_update(void)
+-{
+-	/* Configure FW update size */
+-	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
+-
+-	/*
+-	 * PHY FW FSM EN and Direct FW write mechanism enable
+-	 * FW FSM assumes that the data is present in the SRAM
+-	 * The FSM will wait for SRAM init done before updating
+-	 * the SRAM contents
+-	 */
+-	regmap_writel(9, mmPCIE_WRAP_PHY_FW_FSM);
+-
+-	/* Take the PHY out of reset */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ }
+ 
+ __weak void preboot_init_pcie_phy(void)
+@@ -136,39 +77,6 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
+-void preboot_delay(void) {}
+-
+-void preboot_putc_virt_uart(const char c)
+-{
+-	/*
+-	 * update vUART to HOST
+-	 * DATA: mmPCIE_WRAP_VUART_TX_DATA
+-	 * STATUS: mmPCIE_WRAP_VUART_TX_STATUS
+-	 */
+-	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
+-	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
+-}
+-
+-unsigned int get_cs_pad_sel(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+-}
+-
+-void preboot_sync_btl(void) {}
+-
+-void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
+-		     unsigned int *out_en_offset)
+-{
+-	*mask = BIT(19 % 16);
+-	*data_offset = mmPSOC_GPIO1_DATAOUT;
+-	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
+-}
+-
+-void spi_base_get(unsigned int *regs)
+-{
+-	*regs = mmPSOC_QSPI_CTRLR0;
+-}
+-
+ void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	/* Prepare the ARC SRAM address */
+@@ -182,46 +90,6 @@
+ {
+ 	preboot_puts("Compression is not supported\n");
+ 	return 1;
+-}
+-
+-/*
+- * Set ARC in running state
+- * 1. Set run bit in RUN_HALT_REQ register
+- * 2. Wait for ACK from core in RUN_HALT_ACK register
+- * 3. Clear run bit in RUN_HALT_REQ register
+- */
+-static void run_arc(u8 id)
+-{
+-	u32 run_ack_offset, run_req_offset;
+-	u32 run_ack_mask;
+-	u64 start;
+-
+-	if (id) {
+-		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+-		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+-		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
+-
+-	} else {
+-		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+-		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+-		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
+-
+-	}
+-
+-	/* Set ARC in running state */
+-	regmap_writel(BIT(0), run_req_offset);
+-
+-	start = timestamp_get_us();
+-	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
+-
+-		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
+-			preboot_puts_hex("No running state ack from ARC ",
+-					id, false);
+-			break;
+-		}
+-	}
+-
+-	regmap_writel(0x0, run_req_offset);
+ }
+ 
+ void preboot_start_image(u64 startaddr)
+@@ -252,39 +120,6 @@
+ 	image_entry();
+ }
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+-{
+-	/* Not implemented - ARC BootROM copies and validates preboot */
+-}
+-
+-u32 hl_pll_timestamp_base_get(void)
+-{
+-	return mmCPU_TIMESTAMP_CNTCR;
+-}
+-
+-void pci_dev_specific_hot_rst(void)
+-{
+-	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+-void pci_dev_specific_flr(void)
+-{
+-	regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
+-	regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
+-	regmap_writel(1, mmPCIE_AUX_FLR_INT);
+-
+-	/*
+-	 * Clear PCIe SPI INTR. This is required to clear
+-	 * FLR interrupt as recommended by HW team.
+-	 */
+-	regmap_writel(CPU_IF_PCIE_SPI_INTR_CLR_VAL_MASK,
+-			mmCPU_IF_PCIE_SPI_INTR_CLR);
+-}
+-
+-#define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+-#define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+-
+ bool preboot_sram_is_valid_address_range(u64 addr, int len)
+ {
+ 	/* Prepare the ARC SRAM address */
+@@ -299,93 +134,7 @@
+ 	return false;
+ }
+ 
+-bool preboot_is_valid_address_range(u64 addr, int len)
+-{
+-	if (addr >= HL_SP_SRAM_BASE &&
+-	    addr + len < HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE) {
+-		return true;
+-	}
+-
+-	if (preboot_sram_is_valid_address_range(addr, len)) {
+-		return true;
+-	}
+-
+-	if (addr >= ARC0_ICCM_BASE_ADDR &&
+-	    addr + len < ARC0_ICCM_BASE_ADDR + ARC0_MEM_SIZE) {
+-		return true;
+-	}
+-
+-	if (addr >= ARC1_ICCM_BASE_ADDR &&
+-	    addr + len < ARC1_ICCM_BASE_ADDR + ARC1_MEM_SIZE) {
+-		return true;
+-	}
+-
+-	return false;
+-}
+-
+-static struct hl_ts_cfg greco_hl_ts_data[] = {
+-	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
+-		.use_calib = false, .calib_offset = 10, .hl_tmp_data = { 0 }},
+-	{.base = mmDCON0_TSTD_BASE, .alarm_a = 90, .alarm_b =  115,
+-		.use_calib = false, .calib_offset = 9, .hl_tmp_data = { 0 }},
+-	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
+-		.use_calib = false, .calib_offset = 8, .hl_tmp_data = { 0 }},
+-	{.base = mmDCON2_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
+-		.use_calib = false, .calib_offset = 7, .hl_tmp_data = { 0 }}
+-};
+-
+-void hl_ts_data_init(void)
+-{
+-	greco_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	greco_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	greco_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	greco_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	memcpy(hl_ts_data, greco_hl_ts_data,
+-			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+-}
+-
+ u32 dev_pci_dbi_cfg_offset_get(void)
+ {
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
+-}
+-
+-/*
+- * This function makes sure no access is done from host to the SoC's PCIe IF.
+- * The inbound memory requests are disabled. The ELBI access gets "retry"
+- * response. All channels provide responses to the host and PCIe
+- * link will not break.
+- */
+-void hl_pcie_disable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Disable the ELBI access */
+-	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Disable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg &= ~BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+-}
+-
+-void hl_pcie_enable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Enable the ELBI access */
+-	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Enable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+-}
+-
+-void lkd_dev_specific_setup(void)
+-{
+-	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN, true);
+ }
+diff --git a/arch/greco/arc/common.h b/arch/greco/arc/common.h
+index 356c48a..b381f4c 100644
+--- a/arch/greco/arc/common.h
++++ b/arch/greco/arc/common.h
+@@ -27,6 +27,9 @@
+ #define HL_SP_SRAM_BASE		0x7FFBFE0000
+ #define HL_SP_SRAM_SIZE		0x10000
+ 
++#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
++
++
+ /*
+  * TODO: this address is wrong, a good address must be set in order to use
+  * boot info API.
+@@ -48,7 +51,5 @@
+ 
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+-
+-#define ARC_RUN_ACK_TIMEOUT_US		100
+ 
+ #endif /* COMMON_GRECO_ARC_GNU_H_ */
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index 72564d5..dcbf634 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -9,16 +9,14 @@
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_global_conf_masks.h>
+-#include <psoc_gpio1_regs.h>
+-#include <psoc_qspi_regs.h>
+ #include <psoc_efuse_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_core_regs.h>
++#include <cpu_ca53_cfg_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+-#include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
+ #include <dcon0_hbw_rtr_if0_rtr_h3_regs.h>
+ #include <dcon0_hbw_rtr_if1_rtr_h3_regs.h>
+@@ -50,36 +48,10 @@
+ 
+ #include "common.h"
+ 
+-#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ #define PRODUCT_ID_STR_SIZE	0x8
+-
+-#define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+-#define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+-
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+-}
+-
+-static void preboot_init_pcie_phy_fw_update(void)
+-{
+-	/* Configure FW update size */
+-	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
+-
+-	/*
+-	 * PHY FW FSM EN and Direct FW write mechanism enable
+-	 * FW FSM assumes that the data is present in the SRAM
+-	 * The FSM will wait for SRAM init done before updating
+-	 * the SRAM contents
+-	 */
+-	regmap_writel(9, mmPCIE_WRAP_PHY_FW_FSM);
+-
+-	/* Take the PHY out of reset */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+-}
+ 
+ __weak void preboot_init_pcie_phy(void)
+ {
+@@ -276,26 +248,6 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+-void preboot_delay(void) {}
+-
+-void preboot_putc_virt_uart(const char c)
+-{
+-	/*
+-	 * update vUART to HOST
+-	 * DATA: mmPCIE_WRAP_VUART_TX_DATA
+-	 * STATUS: mmPCIE_WRAP_VUART_TX_STATUS
+-	 */
+-	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
+-	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
+-}
+-
+-unsigned int get_cs_pad_sel(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+-}
+-
+-void preboot_sync_btl(void) {}
+-
+ void init_prstn(void)
+ {
+ 	/* Configure PRSTN to reset entire SoC */
+@@ -427,35 +379,12 @@
+ 	sw_all_rst_init();
+ }
+ 
+-void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
+-		     unsigned int *out_en_offset)
+-{
+-	*mask = BIT(19 % 16);
+-	*data_offset = mmPSOC_GPIO1_DATAOUT;
+-	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
+-}
+-
+-void spi_base_get(unsigned int *regs)
+-{
+-	*regs = mmPSOC_QSPI_CTRLR0;
+-}
+-
+ void image_start(u64 loadaddr)
+ {
+ 	u32 lsb = (u32) loadaddr;
+ 	void (*image_entry)(void) = (void *) lsb;
+ 
+ 	image_entry();
+-}
+-
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+-{
+-	/* Not implemented - ARC BootROM copies and validates preboot */
+-}
+-
+-u32 hl_pll_timestamp_base_get(void)
+-{
+-	return mmCPU_TIMESTAMP_CNTCR;
+ }
+ 
+ static u32 ppboot_flash_image_offset(u8 image_ptr)
+@@ -531,36 +460,4 @@
+ {
+ 	*loadaddr = copy_preboot();
+ 	return true;
+-}
+-
+-/*
+- * This function makes sure no access is done from host to the SoC's PCIe IF.
+- * The inbound memory requests are disabled. The ELBI access gets "retry"
+- * response. All channels provide responses to the host and PCIe
+- * link will not break.
+- */
+-void hl_pcie_disable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Disable the ELBI access */
+-	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Disable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg &= ~BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+-}
+-
+-void hl_pcie_enable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Enable the ELBI access */
+-	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Enable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+ }
+diff --git a/arch/greco/arc_elf32/common.h b/arch/greco/arc_elf32/common.h
+index 76c9933..3c4bc59 100644
+--- a/arch/greco/arc_elf32/common.h
++++ b/arch/greco/arc_elf32/common.h
+@@ -22,8 +22,12 @@
+ #define PCIE_FW_SRAM_BASE	0x1BFF0000
+ #define FW_SRAM_BASE		0x1B050000
+ #define SP_SRAM_BASE		0x1BFE0000
++#define HL_SP_SRAM_SIZE		0x10000
+ #define PPBOOT_TEXT_BASE	(FW_SRAM_BASE + 0xC)
+ #define PREBOOT_TEXT_BASE	(SDRAM_BASE + PPBOOT_SIZE + 0x8)
++
++#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
++
+ /* In order not to conflict with ARC BOOTROM's usage of DCCM,
+  * Let PPBoot start from the offset of 8544 bytes, for using DCCM
+  * for its own BSS and Stack.
+diff --git a/arch/greco/arm/asic.c b/arch/greco/arm/asic.c
+index f9cb4a6..888fbf2 100644
+--- a/arch/greco/arm/asic.c
++++ b/arch/greco/arm/asic.c
+@@ -144,3 +144,23 @@
+ 	regs->gic_host_ints_irq  = mmGIC_HOST_INTS_IRQ_POLL_REG;
+ 	regs->gic_host_soft_rst_irq = mmGIC_HOST_SOFT_RST_IRQ_POLL_REG;
+ }
++
++/*
++ * Wait for Boot Manager to complete PCIe image execution
++ * and return to idle state, so it won't initiate UART access anymore
++ */
++__weak void preboot_sync_btl(void)
++{
++	u64 start = timestamp_get_us();
++
++	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM)) {
++		/*
++		 * Boot manager is supposed to complete entire execution
++		 * of FSM, BTL primary/secondary at this point. Though
++		 * It should not take more than 100ms for it to finish
++		 * timeout of half second is used here.
++		 */
++		if (timeout_expired(start, BTL_SYNC_TIMEOUT_US))
++			break;
++	}
++}
+diff --git a/arch/greco/arm/common.c b/arch/greco/arm/common.c
+index a35b106..01cfe89 100644
+--- a/arch/greco/arm/common.c
++++ b/arch/greco/arm/common.c
+@@ -7,8 +7,6 @@
+ 
+ #include <stdint.h>
+ 
+-#include <psoc_gpio1_regs.h>
+-#include <psoc_qspi_regs.h>
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_global_conf_masks.h>
+ #include <psoc_efuse_regs.h>
+@@ -21,22 +19,17 @@
+ #include <pcie_phy_masks.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+-#include <cpu_if_regs.h>
+-#include <cpu_if_masks.h>
+-
+ #include <cpu_timestamp_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+ #include <psoc_arc0_cfg_masks.h>
+ #include <psoc_arc1_cfg_regs.h>
+ #include <psoc_arc1_cfg_masks.h>
+-#include <pcie_dbi_masks.h>
+ 
+ #include <hl_boot_if.h>			 /* requires stdint.h */
+ #include <greco/greco_reg_map.h>
+ #include <dcon0_tstd_masks.h>
+ #include <dcon0_tstd_regs.h>
+ #include <common/pci_ids.h>
+-#include "preboot/thermal.h"
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+@@ -50,59 +43,11 @@
+ #include <pci.h>
+ 
+ #include "common.h"
++#include <greco.h>
+ 
+-#define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+ #define HOST_GPIO_I2C_DEBUG	44
+-
+-u32 get_efuse_read_reg(void)
+-{
+-	return mmPSOC_EFUSE_READ;
+-}
+-
+-bool hl_is_debug_mode(enum hl_debug_hw_func func)
+-{
+-	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+-	u32 strap_mask;
+-
+-	switch (func) {
+-	case HL_DEBUG_HW_DBG_CARD:
+-		strap_mask = BIT(11); /* Dump Select[3] */
+-		break;
+-	case HL_DEBUG_HW_PCIE:
+-		strap_mask = BIT(10); /* Dump Select[2] */
+-		break;
+-	case HL_DEBUG_HW_DRAM:
+-		strap_mask = BIT(8); /* Dump Select[0] */
+-		break;
+-	case HL_DEBUG_HW_I2C:
+-		strap_mask = BIT(9); /* Dump Select[1] */
+-		break;
+-	default:
+-		preboot_puts_hex("Unknown H/W function ", func, false);
+-		return 0;
+-	}
+-
+-	return boot_strap & strap_mask;
+-}
+-
+-static void preboot_init_pcie_phy_fw_update(void)
+-{
+-	/* Configure FW update size */
+-	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
+-
+-	/*
+-	 * PHY FW FSM EN and Direct FW write mechanism enable
+-	 * FW FSM assumes that the data is present in the SRAM
+-	 * The FSM will wait for SRAM init done before updating
+-	 * the SRAM contents
+-	 */
+-	regmap_writel(9, mmPCIE_WRAP_PHY_FW_FSM);
+-
+-	/* Take the PHY out of reset */
+-	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+-}
+ 
+ static void pcie_update_reg_range(u32 addr, u32 addr_end, u32 value)
+ {
+@@ -375,8 +320,6 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+-void preboot_delay(void) {}
+-
+ #define mmPCIE_WRAP_VUART_TX_DATA	0xC14F60
+ #define mmPCIE_WRAP_VUART_TX_STATUS	0xC14F64
+ void preboot_putc_virt_uart(const char c)
+@@ -388,31 +331,6 @@
+ 	 */
+ 	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
+ 	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
+-}
+-
+-unsigned int get_cs_pad_sel(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+-}
+-
+-/*
+- * Wait for Boot Manager to complete PCIe image execution
+- * and return to idle state, so it won't initiate UART access anymore
+- */
+-__weak void preboot_sync_btl(void)
+-{
+-	u64 start = timestamp_get_us();
+-
+-	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM)) {
+-		/*
+-		 * Boot manager is supposed to complete entire execution
+-		 * of FSM, BTL primary/secondary at this point. Though
+-		 * It should not take more than 100ms for it to finish
+-		 * timeout of half second is used here.
+-		 */
+-		if (timeout_expired(start, BTL_SYNC_TIMEOUT_US))
+-			break;
+-	}
+ }
+ 
+ static void halt_n_reset_arc(u8 id)
+@@ -570,64 +488,6 @@
+ 	preboot_puts("5\n");
+ }
+ 
+-void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
+-		     unsigned int *out_en_offset)
+-{
+-	*mask = BIT(19 % 16);
+-	*data_offset = mmPSOC_GPIO1_DATAOUT;
+-	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
+-}
+-
+-void spi_base_get(unsigned int *regs)
+-{
+-	*regs = mmPSOC_QSPI_CTRLR0;
+-}
+-
+-/*
+- * Set ARC in running state
+- * 1. Set run bit in RUN_HALT_REQ register
+- * 2. Wait for ACK from core in RUN_HALT_ACK register
+- * 3. Clear run bit in RUN_HALT_REQ register
+- */
+-static void run_arc(u8 id)
+-{
+-	u32 run_ack_offset, run_req_offset;
+-	u32 run_ack_mask;
+-	u64 start;
+-	u32 cpu_boot_err_val;
+-
+-	if (id) {
+-		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+-		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+-		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
+-
+-	} else {
+-		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+-		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+-		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
+-
+-	}
+-
+-	/* Set ARC in running state */
+-	regmap_writel(BIT(0), run_req_offset);
+-
+-	start = timestamp_get_us();
+-	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
+-
+-		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
+-			preboot_puts_hex("No running state ack from ARC ",
+-					id, false);
+-			cpu_boot_err_val = (!id) ?
+-				CPU_BOOT_ERR0_ARC0_RUN_ACK_NOT_RCVD :
+-				CPU_BOOT_ERR0_ARC1_RUN_ACK_NOT_RCVD;
+-			cpu_boot_err_clrset(cpu_boot_err_val, true);
+-			break;
+-		}
+-	}
+-
+-	regmap_writel(0x0, run_req_offset);
+-}
+-
+ void image_start(u64 loadaddr)
+ {
+ 	void (*image_entry)(void) = (void *)loadaddr;
+@@ -707,114 +567,7 @@
+ 	spi_copy((void *)loadaddr, offset, size, name);
+ }
+ 
+-u32 hl_pll_timestamp_base_get(void)
+-{
+-	return mmCPU_TIMESTAMP_CNTCR;
+-}
+-
+-void pci_dev_specific_hot_rst(void)
+-{
+-	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+-void pci_dev_specific_flr(void)
+-{
+-	regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
+-	regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
+-	regmap_writel(1, mmPCIE_AUX_FLR_INT);
+-
+-	/*
+-	 * Clear PCIe SPI INTR. This is required to clear
+-	 * FLR interrupt as recommended by HW team.
+-	 */
+-	regmap_writel(CPU_IF_PCIE_SPI_INTR_CLR_VAL_MASK,
+-			mmCPU_IF_PCIE_SPI_INTR_CLR);
+-}
+-
+-bool preboot_is_valid_address_range(u64 addr, int len)
+-{
+-	if (addr >= HL_SP_SRAM_BASE &&
+-	    addr + len < HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE)
+-		return true;
+-
+-	if (preboot_sram_is_valid_address_range(addr, len))
+-		return true;
+-
+-	if (addr >= ARC0_ICCM_BASE_ADDR &&
+-	    addr + len < ARC0_ICCM_BASE_ADDR + ARC0_MEM_SIZE)
+-		return true;
+-
+-	if (addr >= ARC1_ICCM_BASE_ADDR &&
+-	    addr + len < ARC1_ICCM_BASE_ADDR + ARC1_MEM_SIZE)
+-		return true;
+-
+-	return false;
+-}
+-
+-static struct hl_ts_cfg greco_hl_ts_data[] = {
+-	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
+-		.use_calib = false, .calib_offset = 10, .hl_tmp_data = { 0 }},
+-	{.base = mmDCON0_TSTD_BASE, .alarm_a = 90, .alarm_b =  115,
+-		.use_calib = false, .calib_offset = 9, .hl_tmp_data = { 0 }},
+-	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
+-		.use_calib = false, .calib_offset = 8, .hl_tmp_data = { 0 }},
+-	{.base = mmDCON2_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
+-		.use_calib = false, .calib_offset = 7, .hl_tmp_data = { 0 }}
+-};
+-
+-void hl_ts_data_init(void)
+-{
+-	greco_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	greco_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	greco_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	greco_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
+-						HL_PLL_DIV3);
+-	memcpy(hl_ts_data, greco_hl_ts_data,
+-			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+-}
+-
+ u32 dev_pci_dbi_cfg_offset_get(void)
+ {
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
+-}
+-
+-/*
+- * This function makes sure no access is done from host to the SoC's PCIe IF.
+- * The inbound memory requests are disabled. The ELBI access gets "retry"
+- * response. All channels provide responses to the host and PCIe
+- * link will not break.
+- */
+-void hl_pcie_disable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Disable the ELBI access */
+-	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Disable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg &= ~BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+-}
+-
+-void hl_pcie_enable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Enable the ELBI access */
+-	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Enable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+-}
+-
+-void lkd_dev_specific_setup(void)
+-{
+-	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN, true);
+ }
+diff --git a/arch/greco/arm/common.h b/arch/greco/arm/common.h
+index 58b7d36..f08a5c4 100644
+--- a/arch/greco/arm/common.h
++++ b/arch/greco/arm/common.h
+@@ -6,7 +6,6 @@
+ #ifndef COMMON_GRECO_H_
+ #define COMMON_GRECO_H_
+ 
+-#include <goya2/goya2.h>
+ #include <goya2_blocks_linux_driver.h>
+ #include <bitops.h>
+ 
+@@ -38,6 +37,8 @@
+ #define BOOT_ROM_SIZE			0x10000
+ #define FW_SRAM_SIZE			0x10000
+ 
++#define FW_WORD_NUM			0x2000	/* FW_SIZE / 2 */
++
+ #define HOST_PHYS_BASE			0x2000000000000ull
+ #define HOST_PHYS_SIZE			0x2000000000000ull
+ 
+@@ -49,9 +50,6 @@
+ #define ARC_RST_VALUE			0x110
+ #define ARC_RST_VEC_ADDR		0x0
+ #define ARC_HALT_ACK_RETRIES		10
+-#define ARC_RUN_ACK_TIMEOUT_US		100
+-#define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+-#define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+ 
+ #define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
+ #define BTL_SYNC_TIMEOUT_US		(USEC_PER_SEC / 2)
+diff --git a/arch/greco/arm/onix.c b/arch/greco/arm/onix.c
+index de1219e..1d93e28 100644
+--- a/arch/greco/arm/onix.c
++++ b/arch/greco/arm/onix.c
+@@ -49,6 +49,4 @@
+ 	return NOT_FOUND;
+ }
+ 
+-void preboot_sync_btl(void) {}
+-
+ void hl_dev_ts_init(void) {}
+diff --git a/arch/greco/arm/pldm.c b/arch/greco/arm/pldm.c
+index fe13594..4b9e506 100644
+--- a/arch/greco/arm/pldm.c
++++ b/arch/greco/arm/pldm.c
+@@ -38,6 +38,5 @@
+ 	return (factor + 1) & 0xFFFE;
+ }
+ 
+-void preboot_sync_btl(void) {}
+ void preboot_init_pcie_phy(void) {}
+ 
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 71ac1a0..5a3d933 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -5,10 +5,38 @@
+  *
+  */
+ 
++#include <stdint.h>
++
+ #include <psoc_global_conf_regs.h>
++#include <pcie_wrap_regs.h>
++#include <psoc_efuse_regs.h>
++#include <pcie_aux_regs.h>
++#include <psoc_gpio1_regs.h>
++#include <psoc_qspi_regs.h>
++#include <psoc_arc0_cfg_regs.h>
++#include <psoc_arc0_cfg_masks.h>
++#include <psoc_arc1_cfg_regs.h>
++#include <psoc_arc1_cfg_masks.h>
++#include <pcie_core_regs.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
++#include <cpu_timestamp_regs.h>
++#include <cpu_if_regs.h>
++#include <cpu_if_masks.h>
+ #include <preboot.h>
+-#include <pll.h>
+ #include <uart.h>
++#include <bitops.h>
++#include <string.h>
++#include <hl_boot_if.h>				/* requires stdint.h */
++#include <pll.h>
++#include <boot_if.h>
++#include <preboot/thermal.h>
++
++#include <greco.h>
++
++
++#define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
++#define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
+ 
+ #define UNIT_RST_N_L_MSK		0xF0000
+ #define UNIT_RST_N_M_MSK		0x0
+@@ -29,3 +57,241 @@
+ 	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
+ 	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
+ }
++
++bool hl_is_debug_mode(enum hl_debug_hw_func func)
++{
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++	u32 strap_mask;
++
++	switch (func) {
++	case HL_DEBUG_HW_DBG_CARD:
++		strap_mask = BIT(11); /* Dump Select[3] */
++		break;
++	case HL_DEBUG_HW_PCIE:
++		strap_mask = BIT(10); /* Dump Select[2] */
++		break;
++	case HL_DEBUG_HW_DRAM:
++		strap_mask = BIT(8); /* Dump Select[0] */
++		break;
++	case HL_DEBUG_HW_I2C:
++		strap_mask = BIT(9); /* Dump Select[1] */
++		break;
++	default:
++		preboot_puts_hex("Unknown H/W function ", func, false);
++		return 0;
++	}
++
++	return boot_strap & strap_mask;
++}
++
++void preboot_init_pcie_phy_fw_update(void)
++{
++	/* Configure FW update size */
++	regmap_writel(FW_WORD_NUM, mmPCIE_WRAP_PHY_FW_FSM_SIZE);
++
++	/*
++	 * PHY FW FSM EN and Direct FW write mechanism enable
++	 * FW FSM assumes that the data is present in the SRAM
++	 * The FSM will wait for SRAM init done before updating
++	 * the SRAM contents
++	 */
++	regmap_writel(9, mmPCIE_WRAP_PHY_FW_FSM);
++
++	/* Take the PHY out of reset */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++}
++
++__weak void preboot_putc_virt_uart(const char c)
++{
++	/*
++	 * update vUART to HOST
++	 * DATA: mmPCIE_WRAP_VUART_TX_DATA
++	 * STATUS: mmPCIE_WRAP_VUART_TX_STATUS
++	 */
++	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
++	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
++}
++
++u32 get_efuse_read_reg(void)
++{
++	return mmPSOC_EFUSE_READ;
++}
++
++void preboot_delay(void) {}
++
++unsigned int get_cs_pad_sel(void)
++{
++	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
++}
++
++__weak void preboot_sync_btl(void) {}
++
++void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset)
++{
++	*mask = BIT(19 % 16);
++	*data_offset = mmPSOC_GPIO1_DATAOUT;
++	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
++}
++
++void spi_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_QSPI_CTRLR0;
++}
++
++/*
++ * Set ARC in running state
++ * 1. Set run bit in RUN_HALT_REQ register
++ * 2. Wait for ACK from core in RUN_HALT_ACK register
++ * 3. Clear run bit in RUN_HALT_REQ register
++ */
++void run_arc(u8 id)
++{
++	u32 run_ack_offset, run_req_offset;
++	u32 run_ack_mask;
++	u64 start;
++	u32 cpu_boot_err_val;
++
++	if (id) {
++		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	} else {
++		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	}
++
++	/* Set ARC in running state */
++	regmap_writel(BIT(0), run_req_offset);
++
++	start = timestamp_get_us();
++	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
++
++		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
++			preboot_puts_hex("No running state ack from ARC ",
++					id, false);
++			cpu_boot_err_val = (!id) ?
++				CPU_BOOT_ERR0_ARC0_RUN_ACK_NOT_RCVD :
++				CPU_BOOT_ERR0_ARC1_RUN_ACK_NOT_RCVD;
++			cpu_boot_err_clrset(cpu_boot_err_val, true);
++			break;
++		}
++	}
++
++	regmap_writel(0x0, run_req_offset);
++}
++
++__weak void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	/* Not implemented - ARC BootROM copies and validates preboot */
++}
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmCPU_TIMESTAMP_CNTCR;
++}
++
++void pci_dev_specific_hot_rst(void)
++{
++	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++void pci_dev_specific_flr(void)
++{
++	regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
++	regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
++	regmap_writel(1, mmPCIE_AUX_FLR_INT);
++
++	/*
++	 * Clear PCIe SPI INTR. This is required to clear
++	 * FLR interrupt as recommended by HW team.
++	 */
++	regmap_writel(CPU_IF_PCIE_SPI_INTR_CLR_VAL_MASK,
++			mmCPU_IF_PCIE_SPI_INTR_CLR);
++}
++
++bool preboot_is_valid_address_range(u64 addr, int len)
++{
++	if (addr >= HL_SP_SRAM_BASE &&
++	    addr + len < HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE)
++		return true;
++
++	if (preboot_sram_is_valid_address_range(addr, len))
++		return true;
++
++	if (addr >= ARC0_ICCM_BASE_ADDR &&
++	    addr + len < ARC0_ICCM_BASE_ADDR + ARC0_MEM_SIZE)
++		return true;
++
++	if (addr >= ARC1_ICCM_BASE_ADDR &&
++	    addr + len < ARC1_ICCM_BASE_ADDR + ARC1_MEM_SIZE)
++		return true;
++
++	return false;
++}
++
++static struct hl_ts_cfg greco_hl_ts_data[] = {
++	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
++		.use_calib = false, .calib_offset = 10, .hl_tmp_data = { 0 }},
++	{.base = mmDCON0_TSTD_BASE, .alarm_a = 90, .alarm_b =  115,
++		.use_calib = false, .calib_offset = 9, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
++		.use_calib = false, .calib_offset = 8, .hl_tmp_data = { 0 }},
++	{.base = mmDCON2_TSTD_BASE, .alarm_a = 90, .alarm_b = 115,
++		.use_calib = false, .calib_offset = 7, .hl_tmp_data = { 0 }}
++};
++
++void hl_ts_data_init(void)
++{
++	greco_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	greco_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	greco_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	greco_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	memcpy(hl_ts_data, greco_hl_ts_data,
++			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
++
++/*
++ * This function makes sure no access is done from host to the SoC's PCIe IF.
++ * The inbound memory requests are disabled. The ELBI access gets "retry"
++ * response. All channels provide responses to the host and PCIe
++ * link will not break.
++ */
++void hl_pcie_disable_access(void)
++{
++	u32 reg;
++
++	/* Disable the ELBI access */
++	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Disable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg &= ~BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
++
++void hl_pcie_enable_access(void)
++{
++	u32 reg;
++
++	/* Enable the ELBI access */
++	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Enable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg |= BIT(PCIE_DBI_STATUS_COMMAND_REG_PCI_TYPE0_MEM_SPACE_EN_SHIFT);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
++
++void lkd_dev_specific_setup(void)
++{
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN, true);
++}
+diff --git a/arch/greco/common/greco.h b/arch/greco/common/greco.h
+new file mode 100644
+index 0000000..b4f755d
+--- /dev/null
++++ b/arch/greco/common/greco.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#ifndef ARCH_GRECO_COMMON_H_
++#define ARCH_GRECO_COMMON_H_
++
++#include <goya2/goya2.h>
++
++#define ARC_RUN_ACK_TIMEOUT_US		100
++
++#define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
++#define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
++
++void run_arc(u8 id);
++
++#endif /* ARCH_GRECO_COMMON_H_ */
+diff --git a/include/preboot.h b/include/preboot.h
+index 668f7f9..8a06503 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -211,6 +211,7 @@
+ void preboot_device_id_init(void);
+ u32 preboot_device_id_get(void);
+ bool is_pcie_initialized(void);
++void preboot_init_pcie_phy_fw_update(void);
+ 
+ #endif /* __ASSEMBLY__ */
+ 

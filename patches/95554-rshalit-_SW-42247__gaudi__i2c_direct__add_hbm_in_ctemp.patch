@@ -1,0 +1,85 @@
+From 181378ed99fcf4532dc0c7ec2bccd299b4d28d39 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Thu, 13 May 2021 13:43:55 +0300
+Subject: [PATCH] [SW-42247] gaudi: i2c_direct: add hbm in ctemp
+
+CTemp, composite temperature is defined as maximum temperature
+of all onchip sensors and all HBM sensors. As to HBM sensors
+it is a bit more tricky: CTemp is actually an indication for
+critical temperature (so that BMC can operate fans for example),
+and since HBM critical temperature is lower than onchip sensors,
+it need a "delta addition" first to be added to the real temperaure.
+
+Change-Id: Id6b85b668fad0c417b2af418340bf5ae8c6581aa
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index 7ad3cb7..a58575b 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -10,6 +10,7 @@
+ #include <gaudi_blocks.h>
+ #include <rma_info.h>
+ #include <psoc_global_conf_regs.h>
++#include <gaudi/gaudi_fw_if.h>
+ 
+ #include <types.h>
+ #include <bitops.h>
+@@ -2579,3 +2580,16 @@
+ 
+ 	return 0;
+ }
++
++int hl_dram_get_adjusted_max_temp(void)
++{
++	int dev, temp, max = 0;
++
++	for (dev = 0; dev < GAUDI_HBM_DEVICES; dev++) {
++		temp = temperature_read(dev);
++		if (temp > max)
++			max = temp;
++	}
++
++	return max + HBM_TEMP_ADJUST_COEFF;
++}
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 35b90ad..84cb35e 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -24,17 +24,31 @@
+ 
+ static bool is_fit_checked;
+ 
++__weak int hl_dram_get_adjusted_max_temp(void)
++{
++	return 0;
++}
++
++int get_composite_temp(void)
++{
++	int max_dram_adjusted_temp = hl_dram_get_adjusted_max_temp();
++	int max_onchip_temp = hl_ts_get_max_temp();
++
++	/* Convert from mC to C */
++	max_onchip_temp /= 1000;
++
++	return (max_dram_adjusted_temp > max_onchip_temp) ? max_dram_adjusted_temp :
++							max_onchip_temp;
++}
++
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+ {
+-	int max_tmp;
+ 	u8 ret;
+ 
+ 	switch (cmd) {
+ 	case HL_ASIC_TEMP_CMD_CODE:
+ 	case HL_ASIC_TEMP_MAX_VAL:
+-		max_tmp = hl_ts_get_max_temp();
+-		/* Convert from mC to C */
+-		ret = max_tmp / 1000;
++		ret = get_composite_temp();
+ 		break;
+ 	case HL_DEVICE_STATUS_CMD_CODE:
+ 		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;

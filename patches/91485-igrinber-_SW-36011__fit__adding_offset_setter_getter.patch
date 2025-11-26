@@ -1,0 +1,222 @@
+From 7771bb3e10463575a76344f745fcf248e5cb6697 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Sun, 18 Apr 2021 11:12:20 +0300
+Subject: [PATCH] [SW-36011] fit: adding offset setter/getter
+
+When added the ELBI/SPSRAM secured data transfer. The
+offset is not constant any more. In the initial implementation
+it was using a global variable directly. This patch
+wraps the access with getter/setter, allowing checking and sync if
+needed.
+
+Change-Id: I45c299921f1207db781eb99ab96683e156d2e061
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/include/preboot.h b/include/preboot.h
+index 63e70a2..5669a89 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -172,6 +172,8 @@
+ void preboot_finalize_nic_en(void);
+ void preboot_boot_info_set_fw_info(void);
+ 
++uintptr_t preboot_shm_get_offset(void);
++void preboot_shm_set_offset(uintptr_t offset);
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index b875aae..eba13db 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -853,8 +853,8 @@
+ int fit_load_images(void)
+ {
+ 	enum fit_sec_failure sec_res = FIT_SEC_NONE;
+-	void *fit = (void *)fit_base_offset;
+ 	int err;
++	void *fit = (void *)preboot_shm_get_offset();
+ 
+ 	memset(&images, 0x0, sizeof(images));
+ 
+@@ -909,7 +909,7 @@
+ 
+ int fit_validate_size(int len)
+ {
+-	const void *fit = (void *)fit_base_offset;
++	const void *fit = (const void *)preboot_shm_get_offset();
+ 
+ 	if (fdt_check_header(fit)) {
+ 		preboot_puts("Bad FIT header\n");
+@@ -921,7 +921,7 @@
+ 
+ int fit_get_load_type(u32 *load_type)
+ {
+-	const void *fit = (const void *)fit_base_offset;
++	const void *fit = (const void *)preboot_shm_get_offset();
+ 	const u32 *cell;
+ 	u32 type = FIT_LOAD_TYPE_RUN;
+ 	int ret, len, conf;
+diff --git a/preboot/fit.h b/preboot/fit.h
+index 3a71c93..e350f4f 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -8,7 +8,13 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
+-extern uintptr_t fit_base_offset;
++/*
++ * FIXME: the included libfdt.h doesn't declared those functions
++ * which defined in the lib object, and can be used
++ */
++
++int fdt_property(void *fdt, const char *name, const void *val, int len);
++int fdt_property_u32(void *fdt, const char *name, u32 val);
+ 
+ int fit_load_images(void);
+ void fit_run_image(void);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 5c09bb1..6e672eb 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -365,7 +365,7 @@
+ 		 * the offset int the header an index.
+ 		 * Integrity check is not supported for opcode 12 (fw load)
+ 		 */
+-		data = (u8 *)fit_base_offset +
++		data = (u8 *)preboot_shm_get_offset() +
+ 			(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
+ 		i2csi_req_wdata_wait_for(data, size);
+ 		break;
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index dbbc105..1e40057 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -26,8 +26,6 @@
+ static unsigned int map_size;
+ static bool sending_error_flag;
+ 
+-uintptr_t fit_base_offset;
+-
+ void module_fwupd_setup(void)
+ {
+ 	struct hl_upd_status status  = { .val = 0 };
+@@ -110,12 +108,15 @@
+ {
+ 	int err;
+ 	enum hl_upd_sts sts;
++	uintptr_t base_offset;
+ 
+-	fit_base_offset = (cmd == HL_UPD_MAP_SRAM) ? FIT_IMG_BASE :
++	base_offset = (cmd == HL_UPD_MAP_SRAM) ? FIT_IMG_BASE :
+ 						FIT_IMG_SPSRAM_BASE;
+-	module_fwupd_send_status(HL_UPD_STS_MAP_ACK, 0);
+ 
+-	err = !preboot_is_valid_address_range(fit_base_offset, size);
++	preboot_shm_set_offset(base_offset);
++	module_fwupd_send_status(HL_UPD_STS_MAP_ACK, 0);
++	base_offset = preboot_shm_get_offset();
++	err = !preboot_is_valid_address_range(base_offset, size);
+ 	if (err) {
+ 		sts = HL_UPD_STS_VALID_ERR;
+ 		preboot_puts("Mapped address range is invalid\n");
+@@ -133,7 +134,7 @@
+ 	if (err)
+ 		goto fwupd_map_wfc_t;
+ 
+-	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)fit_base_offset);
++	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)base_offset);
+ 	return;
+ 
+ fwupd_map_wfc_t:
+@@ -185,7 +186,7 @@
+ static int module_fwupd_load_type(void)
+ {
+ 	u32 load_type;
+-	void *fit = (void *)fit_base_offset;
++	void *fit = (void *)preboot_shm_get_offset();
+ 	int ret = fit_get_load_type(&load_type);
+ 
+ 	if (ret)
+@@ -209,6 +210,7 @@
+ {
+ 	int err;
+ 	enum hl_upd_sts sts;
++	uintptr_t base_offset = preboot_shm_get_offset();
+ 
+ 	module_fwupd_send_status(HL_UPD_STS_RUN_ACK, 0);
+ 
+@@ -220,7 +222,7 @@
+ 	err = module_fwupd_load_type();
+ 
+ 	if (cmd == HL_UPD_RUN_SPSRAM)
+-		memset((void *)fit_base_offset, 0, ROUND_UP4(map_size));
++		memset((void *)base_offset, 0, ROUND_UP4(map_size));
+ 
+ 	if (err) {
+ 		sts = HL_UPD_STS_VALID_ERR;
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 080f4bd..a2e37f3 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -16,8 +16,6 @@
+ #include "uart.h"
+ #include "fit.h"
+ 
+-extern uintptr_t fit_base_offset;
+-
+ struct lkd_status {
+ 	bool is_fit_checked;
+ 	bool is_fit_ready_ignored;
+@@ -89,7 +87,7 @@
+ 		if (sts.is_fit_ready_ignored)
+ 			return NOT_FOUND;
+ 
+-		fit_base_offset = FIT_IMG_BASE;
++		preboot_shm_set_offset(FIT_IMG_BASE);
+ 
+ 		res = FOUND_SLOW_RETURN;
+ 		/* Tell LKD we got the message */
+@@ -330,7 +328,7 @@
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
+-	fit_base_offset = FIT_IMG_BASE;
++	preboot_shm_set_offset(FIT_IMG_BASE);
+ 	err = fit_load_images();
+ 	if (err) {
+ 		sts.is_fit_ready_ignored = true;
+@@ -352,7 +350,7 @@
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
+-	fit_base_offset = FIT_IMG_BASE;
++	preboot_shm_set_offset(FIT_IMG_BASE);
+ 	err = fit_load_images();
+ 	if (err)
+ 		preboot_security_dynamic_img_sram_open();
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 0d9f3ac..679c2f0 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -323,6 +323,18 @@
+ 	}
+ }
+ 
++static uintptr_t shm_base_offset;
++
++uintptr_t preboot_shm_get_offset(void)
++{
++	return shm_base_offset ? shm_base_offset : FIT_IMG_BASE;
++}
++
++void preboot_shm_set_offset(uintptr_t offset)
++{
++	shm_base_offset = offset;
++}
++
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_conf_iatu_access(bool enable) {}

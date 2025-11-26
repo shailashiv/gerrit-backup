@@ -1,0 +1,171 @@
+From 2af63c6473a74b0324f0fc2a9d0668dada5257d6 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 04 Sep 2020 12:31:40 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: set + protect nic role
+
+Implement NICs engines roles setting to user and secured levels and
+protect this configuration and its protection bits.
+
+Change-Id: Id8d6626f50f2ea683413eb7ec63b7893c7986f28
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 4b079a7..8ce32a1 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -16,6 +16,12 @@
+ #include <mme0_sbab_regs.h>
+ #include <mme0_ctrl_regs.h>
+ #include <tpc0_cfg_regs.h>
++#include <nic0_qpc0_regs.h>
++#include <nic0_rxb_regs.h>
++#include <nic0_rxe0_regs.h>
++#include <nic0_txs0_regs.h>
++#include <nic0_txe0_regs.h>
++#include <nic0_tmr_regs.h>
+ #include <sif_rtr_ctrl_7_regs.h>
+ #include <psoc_global_conf_regs.h>
+ 
+@@ -26,6 +32,12 @@
+ #include <mme0_sbab_masks.h>
+ #include <mme0_ctrl_masks.h>
+ #include <tpc0_cfg_masks.h>
++#include <nic0_qpc0_masks.h>
++#include <nic0_rxb_masks.h>
++#include <nic0_rxe0_masks.h>
++#include <nic0_txs0_masks.h>
++#include <nic0_txe0_masks.h>
++#include <nic0_tmr_masks.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
+@@ -56,7 +68,8 @@
+  */
+ 
+ /* Protection bits helpers */
+-#define PROT_REG_BASE(x, off)	(((x) & 0xFFF000) + (off))
++#define PAGE_BASE(x)		((x) & 0xFFF000)
++#define PROT_REG_BASE(x, off)	((PAGE_BASE(x)) + (off))
+ #define PROT_REG_OFF(x)		(((x) & 0xF80) / 32)
+ #define PRIV_PROT_REG(x)	(PROT_REG_BASE((x), 0xE80) + PROT_REG_OFF(x))
+ #define SEC_PROT_REG(x)		(PROT_REG_BASE((x), 0xF80) + PROT_REG_OFF(x))
+@@ -548,6 +561,110 @@
+ 	}
+ }
+ 
++#define NICS_NUM	5
++#define NICS_DIST	0x40000
++#define NIC_ENGS_DIST	0x1000
++static void preboot_secure_set_nic_eng_role(u32 prot_reg, u32 mask, int eng_cnt)
++{
++	int i, j;
++	u32 reg;
++
++	for (i = 0; i < NICS_NUM; i++) {
++		for (j = 0; j < eng_cnt; j++) {
++			/* Set the engine role (security level) */
++			reg = prot_reg + NICS_DIST * i + NIC_ENGS_DIST * j;
++			regmap_writel(mask, reg);
++		}
++	}
++}
++
++/*
++ * preboot_secure_prot_nics_engs_regs	- protects several registers (up to 32)
++ *					  that are protected by the same
++ *					  protection register
++ *
++ * @base_reg	- one of the registers to protect - used for calculating the
++ *		  protection register offset.
++ * @mask	- the mask to write into the protection register
++ * @eng_cnt	- amount of engines to work on (usually 1, or 2)
++ */
++static void preboot_secure_prot_nics_engs_regs(u32 base_reg,
++					       u32 mask, int eng_cnt)
++{
++	int i, j;
++	u32 reg;
++
++	for (i = 0; i < NICS_NUM; i++) {
++		for (j = 0; j < eng_cnt; j++) {
++			reg = base_reg + NICS_DIST * i + NIC_ENGS_DIST * j;
++			/* Protect the engine configuration */
++			regmap_writel(mask, PRIV_PROT_REG(reg));
++			/* Protect the private prot bits and config space */
++			set_prot_bits_priv_int_conf(PAGE_BASE(reg));
++		}
++	}
++}
++
++/* This function only suitable for single PROT OVR register protection */
++static void preboot_secure_nic_role_single(u32 reg, u32 mask, int eng_cnt)
++{
++	u32 prot_mask = PROT_BIT(reg);
++
++	preboot_secure_set_nic_eng_role(reg, mask, eng_cnt);
++	preboot_secure_prot_nics_engs_regs(reg, prot_mask, eng_cnt);
++}
++
++static void preboot_secure_nic(void)
++{
++	u32 reg, mask;
++
++	/* QPC */
++	reg = mmNIC0_QPC0_AXI_PROT;
++	mask = PROT_OVR_SECURE << NIC0_QPC0_AXI_PROT_R_SHIFT;
++	preboot_secure_nic_role_single(reg, mask, 2);
++
++	/* RXB */
++	reg = mmNIC0_RXB_AXI_AXPROT_PRIV;
++	mask = PROT_OVR_SECURE << NIC0_RXB_AXI_AXPROT_PRIV_AXPROT_SHIFT;
++	preboot_secure_nic_role_single(reg, mask, 1);
++
++	/* TXS */
++	reg = mmNIC0_TXS0_AXI_PROT;
++	mask = PROT_OVR_SECURE << NIC0_TXS0_AXI_PROT_R_SHIFT;
++	preboot_secure_nic_role_single(reg, mask, 2);
++
++	/* TXE DATA, TXE WQE */
++	reg = mmNIC0_TXE0_DATA_FETCH_AXI_PROT;
++	mask = PROT_OVR_USER << NIC0_TXE0_DATA_FETCH_AXI_PROT_UNSECURED_SHIFT;
++	preboot_secure_nic_role_single(reg, mask, 2);
++	reg = mmNIC0_TXE0_WQE_FETCH_AXI_PROT;
++	mask = PROT_OVR_USER << NIC0_TXE0_WQE_FETCH_AXI_PROT_UNSECURED_SHIFT;
++	preboot_secure_nic_role_single(reg, mask, 2);
++
++	/* RXE AW LBW, RXE AR HBW */
++	reg = mmNIC0_RXE0_AWPROT_LBW;
++	mask = PROT_OVR_USER << NIC0_RXE0_AWPROT_LBW_AWPROT_LBW_UNSECURED_SHIFT;
++	preboot_secure_set_nic_eng_role(reg, mask, 2);
++	reg = mmNIC0_RXE0_ARPROT_HBW;
++	mask = PROT_OVR_USER << NIC0_RXE0_ARPROT_HBW_ARPROT_HBW_UNSECURED_SHIFT;
++	mask |= PROT_OVR_USER << NIC0_RXE0_ARPROT_HBW_ARPROT_HBW_SECURED_SHIFT;
++	mask |= PROT_OVR_USER <<
++		NIC0_RXE0_ARPROT_HBW_ARPROT_HBW_PRIVILEGED_SHIFT;
++	preboot_secure_set_nic_eng_role(reg, mask, 2);
++	mask = PROT_BIT(mmNIC0_RXE0_AWPROT_LBW) & PROT_BIT(reg);
++	preboot_secure_prot_nics_engs_regs(reg, mask, 2);
++
++	/* TMR LIST, TMR STATE */
++	reg = mmNIC0_TMR_TMR_LIST_AXI_PROT;
++	mask = PROT_OVR_SECURE << NIC0_TMR_TMR_LIST_AXI_PROT_R_SHIFT;
++	preboot_secure_set_nic_eng_role(reg, mask, 1);
++	reg = mmNIC0_TMR_TMR_STATE_AXI_PROT;
++	mask = PROT_OVR_SECURE << NIC0_TMR_TMR_STATE_AXI_PROT_R_SHIFT;
++	preboot_secure_set_nic_eng_role(reg, mask, 1);
++	mask = PROT_BIT(mmNIC0_TMR_TMR_LIST_AXI_PROT) & PROT_BIT(reg);
++	preboot_secure_prot_nics_engs_regs(reg, mask, 1);
++}
++
+ static void preboot_security_pci_disable(void)
+ {
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
+@@ -599,6 +716,7 @@
+ 	preboot_secure_mme();
+ 	preboot_secure_tpc();
+ 	preboot_secure_pll();
++	preboot_secure_nic();
+ 
+ 	/* TODO: implement the rest of security enablement */
+ 

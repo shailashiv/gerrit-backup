@@ -1,0 +1,168 @@
+From 7cf6ea3664ce5f9c3a93c616db8f58499ea68368 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 06 Nov 2024 16:27:34 +0200
+Subject: [PATCH] [SW-195710] g3: set bis device in erom
+
+In Gaudi3 (unlike G2) EROM is not disabled in BIS mode, so it should
+be able to identify BIS mode and set the PCI revision respectively.
+
+To maintain the logic for gaudi2, the BIS check function definition is
+separated for G2 and G3.
+
+Change-Id: Ica51b3425404279ab4d834151bd896419a939fff
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ext_rom/erom_pcie.c b/app/ext_rom/erom_pcie.c
+index 8dc23c2..472d5d6 100644
+--- a/app/ext_rom/erom_pcie.c
++++ b/app/ext_rom/erom_pcie.c
+@@ -200,12 +200,12 @@
+ }
+ 
+ /*
+- * There is no eROM for bis compliant, hence no need to check
++ * There is no eROM for bis compliant in Gaudi2, hence no need to check
+  * bis compliant as part of eROM. Therefore, this function is declared
+  * here as a strong function with an empty implementation, and
+  * in security module the function is declared as a weak function.
+  */
+-bool preboot_is_bis_compliant_mode(void)
++bool gaudi2_is_bis_compliant_mode(void)
+ {
+ 	return false;
+ }
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c57c82f..919cb61 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -884,7 +884,7 @@
+ 	 * On HL225B cards, no debug features are allowed.
+ 	 * Enabling RMA on HL225B card, should not disable security
+ 	 */
+-	if (preboot_is_bis_compliant_mode())
++	if (gaudi2_is_bis_compliant_mode())
+ 		return false;
+ 
+ 	module_id_3 = gaudi2_gpio_read(GAUDI2_MOD_ID_3_GPIO);
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index f3cc25f..90c099e 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -541,7 +541,7 @@
+ 		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+ 
+ 	/* Update REV ID for BIS device */
+-	if (preboot_is_bis_compliant_mode()) {
++	if (gaudi2_is_bis_compliant_mode()) {
+ 		class_rev = regmap_readl(mmPCIE_DBI_CLASS_CODE_REVISION_ID);
+ 		rev_id = get_bis_rev_id();
+ 
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index 184ca51..f495f73 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -23,5 +23,6 @@
+ void preboot_pcie_monitoring(void);
+ void init_arc_mem(u8 id, u64 addr, u32 size);
+ const struct hl_sec_efuse *preboot_get_hl_sec_real_efuse(void);
++bool gaudi2_is_bis_compliant_mode(void);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index b1cc8ce..2125e9f 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -1487,7 +1487,7 @@
+ 	reset_arc_farm_arc0();
+ }
+ 
+-__weak bool preboot_is_bis_compliant_mode(void)
++__weak bool gaudi2_is_bis_compliant_mode(void)
+ {
+ 	const struct hl_sec_efuse *fuse;
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 5b6561c..1bfdb3f 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -979,6 +979,13 @@
+ 
+ #define BIS_DEVICE_PCIE_REVISION	0x4
+ 
++void set_bis_compliant_device_pci_rev(void)
++{
++	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_CLASS_CODE_REVISION_ID),
++			BIS_DEVICE_PCIE_REVISION,
++			PCIE_DBI_CLASS_CODE_REVISION_ID_REVISION_ID_M);
++}
++
+ static void pif_arc_pcie_device_id_vendor_id_set(void)
+ {
+ 	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+@@ -991,9 +998,7 @@
+ 			D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG));
+ 
+ 	if (pif_is_bis_compliant_device())
+-		regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_CLASS_CODE_REVISION_ID),
+-				BIS_DEVICE_PCIE_REVISION,
+-				PCIE_DBI_CLASS_CODE_REVISION_ID_REVISION_ID_M);
++		set_bis_compliant_device_pci_rev();
+ }
+ 
+ #define EMR_PWR_M	PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP2_EMERGENCY_PWR_RED_SUPPORT_M
+@@ -1122,7 +1127,7 @@
+ 		.die_id = GAUDI3_MASTER_DIE_ID,
+ 	};
+ 
+-	if (preboot_is_bis_compliant_mode())
++	if (gaudi3_is_bis_compliant_mode())
+ 		pif_set_bis_compliant_device();
+ 
+ 	ppboot_load_and_run_pif_arc(&load_data);
+@@ -1615,7 +1620,7 @@
+ 	return true;
+ }
+ 
+-__weak bool preboot_is_bis_compliant_mode(void)
++bool gaudi3_is_bis_compliant_mode(void)
+ {
+ 	return ppboot_sys_cfg_efuse_is_set(EFUSE_BIS_COMPLIANT_EN_MASK);
+ }
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 5fbcb1c..469257e 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -71,5 +71,7 @@
+ u32 gaudi3_count_set_bit(u32 n);
+ void gaudi3_clean_hot_reset_intr(void);
+ int ppboot_boot_info_set(u32 type, void *data, u32 size);
++void set_bis_compliant_device_pci_rev(void);
++bool gaudi3_is_bis_compliant_mode(void);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/common/pci.c b/arch/gaudi3/common/pci.c
+index c97cb57..b0633be 100644
+--- a/arch/gaudi3/common/pci.c
++++ b/arch/gaudi3/common/pci.c
+@@ -142,6 +142,8 @@
+ 		pcie_phy_set_sram_ext_ld_done();
+ 
+ 		pcie_set_pcie_device_vendor_id();
++		if (gaudi3_is_bis_compliant_mode())
++			set_bis_compliant_device_pci_rev();
+ 
+ 		hl_pcie_clear_boot_termination();
+ 
+diff --git a/include/baremetal.h b/include/baremetal.h
+index e256fbe..3d764c3 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -239,7 +239,6 @@
+ void preboot_dynamic_img_elbi_reg_cleanup(void *map_addr, u32 size);
+ bool preboot_is_overlap_address_range(u64 addr, int len);
+ 
+-bool preboot_is_bis_compliant_mode(void);
+ enum hl_fw_en_caps;
+ 
+ void preboot_dev_enable_caps(void);

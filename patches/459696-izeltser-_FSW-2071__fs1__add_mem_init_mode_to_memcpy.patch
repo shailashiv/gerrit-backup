@@ -1,0 +1,108 @@
+From b55c2071ffb5db4a8a9ab7b3f632da1d0bff9361 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 30 Oct 2024 15:31:11 +0200
+Subject: [PATCH] [FSW-2071] fs1: add mem init mode to memcpy
+
+PSOC MEM_CPY engine has the ability to initialize memory blocks
+by writing a constant value to all the destination adddress range.
+
+Change-Id: Id9ae867d2bf88b54e53dcbedf2bb8022099fbbc2
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 04c3718..ca3055b 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -463,7 +463,7 @@
+ #define MEM_CPY_HBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_HBW_SIZE_SHIFT) - 1)
+ #define HL_MEM_CPY_TIMEOUT_US		10000
+ 
+-int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw)
++int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw, bool const_data)
+ {
+ 	u64 start = timestamp_get_us();
+ 	u32 cpy_sts, copy_sz;
+@@ -505,6 +505,15 @@
+ 	regmap_writel(copy_sz, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
+ 			       mmMEM_COPY_COPY_SIZE);
+ 
++	/* use constant value write mode for memory init */
++	if (const_data)
++		regmap_writel(MEM_COPY_CONST_VAL_WR_MODE_VAL_M,
++			      mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_CONST_VAL_WR_MODE);
++	else
++		regmap_writel(0, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++				 mmMEM_COPY_CONST_VAL_WR_MODE);
++
+ 	/* disable LBW size check per H15-255 */
+ 	regmap_rmwritel(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_MSTR_IF_LBW_TRAN_CHK_BASE +
+ 			mmTRAN_CHK_LBW_CHECK_EN, 0, TRAN_CHK_LBW_CHECK_EN_SIZE_CHK_M);
+@@ -544,6 +553,11 @@
+ 	return 0;
+ }
+ 
++int fs1_mem_init(uint64_t dst, uint32_t size, bool is_hbw)
++{
++	return fs1_mem_copy(0, dst, size, is_hbw, true);
++}
++
+ u32 dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
+ 			  struct boot_desc *desc)
+ {
+@@ -580,7 +594,7 @@
+ 	/* Copy SRAM_LOCATIONS to IO0_PCIE_FW_SRAM_FULL_BASE */
+ 	fs1_mem_copy(get_64bit_addr_from_32bit_addr(sram_loc_addr),
+ 		    IO0_PCIE_FW_SRAM_FULL_BASE,
+-		    (uint32_t)PHY_FW_SIZE, false);
++		    (uint32_t)PHY_FW_SIZE, false, false);
+ 
+ 	/* Copy CSR_LOC_DATA to IO0_PCIE_FW_CSR_BASE */
+ 	memcpy((void *)IO0_PCIE_FW_CSR_BASE, (const void *)csr_loc_data, get_csr_locations_data_size());
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index c41a696..3988e13 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -73,7 +73,8 @@
+ #endif /* USE_BOOTROM_SPI_DMA */
+ 
+ void hl_plat_pll_init(void);
+-int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw);
++int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw, bool const_data);
++int fs1_mem_init(uint64_t dst, uint32_t size, bool is_hbw);
+ void plat_pcie_drain_init(void);
+ size_t get_csr_locations_data_size(void);
+ 
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+index e0627a5..86f06af 100644
+--- a/arch/fs1/arc/palad.c
++++ b/arch/fs1/arc/palad.c
+@@ -313,7 +313,8 @@
+ 	 * exceeds MISC ICCM size (256kb), the rest is stored in MISC DCCM.
+ 	 * An efuse bit is controlling whether the application binary is larger than MISC ICCM size.
+ 	 */
+-	fs1_mem_copy(IO0_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, IO_MISC_ICCM_SIZE, false);
++	fs1_mem_copy(IO0_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, IO_MISC_ICCM_SIZE, false,
++		     false);
+ 
+ 	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
+ 	if (err)
+@@ -325,7 +326,7 @@
+ 		return;
+ 
+ 	fs1_mem_copy(IO0_MISC_DCCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL + IO_MISC_ICCM_SIZE,
+-		     IO_MISC_DCCM_SIZE, false);
++		     IO_MISC_DCCM_SIZE, false, false);
+ }
+ 
+ static void btldr_copy_bootinfo(void)
+@@ -349,7 +350,7 @@
+ 	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in MISC DCCM and copied
+ 	 * back to the SPSRAM as part of the preparation to run preboot rtos.
+ 	 */
+-	fs1_mem_copy(IO0_MISC_DCCM_FULL_BASE, IO0_SP_SRAM_FULL_BASE, BOOT_INFO_SIZE, false);
++	fs1_mem_copy(IO0_MISC_DCCM_FULL_BASE, IO0_SP_SRAM_FULL_BASE, BOOT_INFO_SIZE, false, false);
+ }
+ 
+ void btldr_copy_data(void)

@@ -1,0 +1,149 @@
+From 6dae21a22f5b14ce53717ef1ac958c2a7f75b08a Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Mon, 09 Nov 2020 19:05:35 +0200
+Subject: [PATCH] [SW-19714] gaudi: add clock gating initialization
+
+Until now, clock gating was enabled in LKD only.
+Clock gating reduce power in HBW, and uses qman to
+"auto" enable gating whenever there is a job.
+But all this comes with a cost:
+CG should have been done in HBW only,
+but because of HW bug, CG always disables LBW too.
+This flow prevent register access, and might even
+result in PCIe deadlock, and host reset.
+Therefore, it is considered as a security risk.
+This patch solve it, by doing the following:
+1. If security is not enabled, than we enable clock
+gating already in preboot, to save power for cases
+where device stays in preboot.
+2. If security is enabled we boot with CG disabled
+(default), and we also disable access to CG
+registers, in order to prevent the security hole.
+On enabling clock gating, we also enable a clock gating
+status bit in status register, so that host shall know
+if clock gating is done in FW or not.
+
+Change-Id: I7ddc0c2c3bc0b6217038c3b9e56318cf3da4f86f
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index f88879f..a41d695 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -8,6 +8,12 @@
+ #include <gaudi_blocks.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_wrap_regs.h>
++#include <dma0_qm_regs.h>
++#include <dma1_qm_regs.h>
++#include <mme0_qm_regs.h>
++#include <mme1_qm_regs.h>
++#include <tpc0_qm_regs.h>
++#include <tpc1_qm_regs.h>
+ 
+ #include <string.h>
+ #include <preboot.h>
+@@ -16,6 +22,7 @@
+ #include <efuse.h>
+ #include <sha256.h>
+ #include <boot_desc.h>
++#include <boot_if.h>
+ 
+ #include "common.h"
+ 
+@@ -162,3 +169,54 @@
+ 	return !memcmp(hash, desc->chksum, ARRAY_SIZE(hash));
+ }
+ 
++enum gaudi_dma_channels {
++	PCI_DMA_1,
++	PCI_DMA_2,
++	HBM_DMA_1,
++	HBM_DMA_2,
++	HBM_DMA_3,
++	HBM_DMA_4,
++	HBM_DMA_5,
++	HBM_DMA_6,
++	GAUDI_DMA_MAX
++};
++
++#define DMA_QMAN_DIFF			(mmDMA1_QM_CGM_CFG - mmDMA0_QM_CGM_CFG)
++#define MME_QM_CFG_DIFF			(mmMME1_QM_CGM_CFG - mmMME0_QM_CGM_CFG)
++#define TPC_QMAN_OFFSET			(mmTPC1_QM_CGM_CFG - mmTPC0_QM_CGM_CFG)
++#define QMAN_CMN_PWR_GATE_EN		0x8F0A0020
++#define QMAN_UPR_PWR_GATE_EN		0x900A0020
++#define QMAN_PWR_GATE_EN		0xA
++
++void hl_clock_gating_init(void)
++{
++	u32 i, base = 0, reg, val;
++
++	for (i = PCI_DMA_1; i < GAUDI_DMA_MAX ; i++) {
++		base = i * DMA_QMAN_DIFF;
++		/* Skipping of HBM_DMA_4 is workaround required by HCL */
++		val = (i == HBM_DMA_4) ? 0 : QMAN_PWR_GATE_EN;
++		regmap_writel(val, mmDMA0_QM_CGM_CFG1 + base);
++		reg = (i >= HBM_DMA_1) ? QMAN_CMN_PWR_GATE_EN :
++			QMAN_UPR_PWR_GATE_EN;
++		val = (i == HBM_DMA_4) ? 0 : reg;
++		regmap_writel(val, mmDMA0_QM_CGM_CFG + base);
++	}
++
++	for (i = 0 ; i < GAUDI_QM_CGM_NUM ; i++) {
++		base = MME_QM_CFG_DIFF * 2 * i;
++		reg = base + mmMME0_QM_CGM_CFG1;
++		regmap_writel(QMAN_PWR_GATE_EN, reg);
++		reg = base + mmMME0_QM_CGM_CFG;
++		regmap_writel(QMAN_CMN_PWR_GATE_EN, reg);
++	}
++
++	base = 0;
++	for (i = 0; i < GAUDI_TPCS_NUM; i++) {
++		regmap_writel(QMAN_PWR_GATE_EN, mmTPC0_QM_CGM_CFG1 + base);
++		regmap_writel(QMAN_CMN_PWR_GATE_EN, mmTPC0_QM_CGM_CFG + base);
++		base += TPC_QMAN_OFFSET;
++	}
++
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_CLK_GATE_EN, true);
++}
+diff --git a/gaudi/common.h b/gaudi/common.h
+index f58b515..f3f9910 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -32,6 +32,7 @@
+ #define GAUDI_TPCS_NUM			8
+ #define GAUDI_MMES_NUM			4
+ #define GAUDI_DMA_CHANNELS_NUM		8
++#define GAUDI_QM_CGM_NUM		2
+ 
+ #ifndef __ASSEMBLY__
+ #include <spi.h>
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 09ccce1..13904e6 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -246,9 +246,12 @@
+ 		      sizeof(preboot_en_caps));
+ }
+ 
++__weak void hl_clock_gating_init(void) {}
++
+ void preboot_main(void)
+ {
+ 	u64 ver_off = (uintptr_t)preboot_vers;
++	bool is_sec_en;
+ 
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+ 	/* Enable the errors communication */
+@@ -278,6 +281,10 @@
+ 	preboot_security_dynamic_vers_init(ver_off, sizeof(preboot_vers));
+ 
+ 	preboot_led_on();
++	is_sec_en = preboot_security_is_enabled();
++	if (is_sec_en)
++		hl_clock_gating_init();
++
+ 	sram_scrambling_init();
+ 	preboot_dev_enable_caps();
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));

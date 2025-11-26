@@ -1,0 +1,554 @@
+From abf9a7d01d488a5fe283918343b7866cab901fe5 Mon Sep 17 00:00:00 2001
+From: Arie Brown <abrown@habana.ai>
+Date: Sun, 12 Jul 2020 11:47:57 +0300
+Subject: [PATCH] [SW-16001] fit: verify config node signature
+
+switching from verify image to verify signature. by that we can
+cover properites and several images in one signature.
+for that the api of sha and rsa module had to be updated for using
+regions.
+
+Change-Id: I351cb17d3e13402e4d81610397fdc9b97d1cd2ab
+Signed-off-by: Arie Brown <abrown@habana.ai>
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 9552ff8..d22d078 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -10,7 +10,7 @@
+ #include "uart.h"
+ #include "fit.h"
+ #include "fit_rsa.h"
+-
++#include "fit_regions.h"
+ 
+ #define FIT_IMAGES_PATH		"/images"
+ #define FIT_CONFS_PATH		"/configurations"
+@@ -18,6 +18,7 @@
+ #define FIT_CONF_NAME		"preboot-conf"
+ #define FIT_DESC_PROP		"description"
+ #define FIT_LOADABLE_PROP	"loadables"
++#define FIT_HASHED_NODES_PROP	"hashed-nodes"
+ #define FIT_DATA_PROP		"data"
+ #define FIT_LOADADDR_PROP	"loadaddr"
+ #define FIT_ARCH_PROP		"arch"
+@@ -30,7 +31,14 @@
+ 
+ #define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+ 
+-__weak int fit_need_image_verification(void)
++#define FIT_MAX_PATH		200
++#define MAX_FDT_REGIONS		10
++#define IMAGE_MAX_HASHED_NODES	10
++
++struct fdt_region fdt_regions[MAX_FDT_REGIONS];
++struct image_region region[MAX_FDT_REGIONS];
++
++__weak int fit_need_verification(void)
+ {
+ 	return 0;
+ }
+@@ -208,13 +216,9 @@
+ 	return 0;
+ }
+ 
+-/* based on :
+- * int fit_config_check_sig(const void *fit, int noffset, int required_keynode,
+- * char **err_msgp)
+- * from u-boot: u-boot/common/image-sig.c
+- */
+-int fit_check_sig(const void *fit, int noffset, const u8 *data, int data_len,
+-		  const void *pub_key_fit)
++static int fit_config_check_sig(const void *fit, int noffset,
++				const struct image_region region[],
++				int region_count, const void *pub_key_fit)
+ {
+ 	const u8 *algo_prop = NULL;
+ 	const u8 *hash_value = NULL;
+@@ -234,7 +238,32 @@
+ 	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
+ 		return 1;
+ 
+-	return rsa_verify(data, data_len, hash_value, hash_len, &prop);
++	return rsa_verify_regions(region, region_count, hash_value, hash_len,
++				  &prop);
++}
++
++static const char *fit_get_hashed_nodes(const void *fit, int noffset,
++					int *hashed_node_count, char **node_inc)
++{
++	const char *prop, *end, *name;
++	int prop_len;
++	int count;
++	int i;
++
++	/* Count the number of strings in the property */
++	count = fdt_stringlist_count(fit, noffset, FIT_HASHED_NODES_PROP);
++	if ((count == 0) || (count > IMAGE_MAX_HASHED_NODES)) {
++		preboot_puts_hex("FIT: bad hashed-node: ", count, false);
++		return NULL;
++	}
++
++	prop = fdt_getprop(fit, noffset, FIT_HASHED_NODES_PROP, &prop_len);
++	end = prop ? prop + prop_len : prop;
++	*hashed_node_count = count;
++	for (name = prop, i = 0; name < end; name += strlen(name) + 1, i++)
++		node_inc[i] = (char *)name;
++
++	return prop;
+ }
+ 
+ static int fit_pub_key_node_get(const void *fit, int conf)
+@@ -270,14 +299,29 @@
+ 	return 0;
+ }
+ 
+-int fit_verify_image(const void *fit, int node, const u8 *buf, int buf_len,
+-		     int noffset)
++static int fit_verify_config_regions(const void *fit,
++				     struct fdt_region *fdt_regions,
++				     int count, int sig_sub_node,
++				     const void *pub_key_fit)
++{
++	fit_region_make_list(fit, fdt_regions, count, region);
++
++	return fit_config_check_sig(fit, sig_sub_node, region, count,
++				    pub_key_fit);
++}
++
++static int fit_verify_config(const void *fit, int noffset)
+ {
+ 	int sig_sub_node;
++	const char *hashed_node_prop;
++	int count;
++	char *node_inc[IMAGE_MAX_HASHED_NODES];
++	char * const exc_prop[] = { FIT_DATA_PROP };
++	char path[FIT_MAX_PATH];
++	const uint32_t *strings;
+ 	const void *pub_key_fit;
+-	int ret = 1;
+ 
+-	sig_sub_node = fdt_subnode_offset(fit, node, FIT_SIG_NODENAME);
++	sig_sub_node = fdt_subnode_offset(fit, noffset, FIT_SIG_NODENAME);
+ 	if (sig_sub_node < 0) {
+ 		preboot_puts("Wrong FIT format: missing signature\n");
+ 		return 1;
+@@ -287,20 +331,36 @@
+ 		preboot_puts("Wrong FIT format: missing pub_key\n");
+ 		return 1;
+ 	}
++	hashed_node_prop = fit_get_hashed_nodes(fit, sig_sub_node, &count,
++						node_inc);
++	if (!hashed_node_prop)
++		return 1;
+ 
+-	if (!fit_check_sig(fit, sig_sub_node, buf, buf_len, pub_key_fit)) {
+-		preboot_puts("fit_check_sig OK\n");
+-		ret = 0;
+-	} else {
+-		preboot_puts("fit_check_sig failed\n");
+-		ret = 1;
++	/* Get a list of regions to hash */
++	count = fdt_find_regions(fit, node_inc, count, exc_prop,
++				 ARRAY_SIZE(exc_prop), fdt_regions,
++				 MAX_FDT_REGIONS - 1, path, sizeof(path), 0);
++
++	if ((count <= 0) || (count >= MAX_FDT_REGIONS - 1)) {
++		preboot_puts_hex("FIT: bad regions count: ", count, 0);
++		return 1;
+ 	}
+-	return ret;
++
++	/* Add the strings */
++	strings = fdt_getprop(fit, sig_sub_node, "hashed-strings", NULL);
++	if (strings) {
++		fdt_regions[count].offset = fdt_off_dt_strings(fit);
++		fdt_regions[count].size = fdt32_to_cpu(strings[1]);
++		count++;
++	}
++
++	return fit_verify_config_regions(fit, fdt_regions, count, sig_sub_node,
++					 pub_key_fit);
+ }
+ 
+ int fit_load_images(const void *fit, struct fit_image *images)
+ {
+-	int node, len, copy_image = 1;
++	int node, len;
+ 	int conf, num_images, i;
+ 	const u8 *buf;
+ 	const u32 *loadaddr;
+@@ -310,6 +370,10 @@
+ 	conf = fit_find_config_node(fit);
+ 	if (conf < 0)
+ 		return 1;
++
++	if (fit_need_verification())
++		if (fit_verify_config(fit, conf))
++			return 1;
+ 
+ 	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
+ 	if (num_images > FIT_MAX_IMAGES) {
+@@ -347,18 +411,9 @@
+ 			return 1;
+ 		}
+ 
+-		if (fit_need_image_verification())
+-			copy_image = !fit_verify_image(fit, node, buf, len,
+-						       conf);
+-
+ 		images[i].loadaddr = dst;
+ 
+-		if (copy_image) {
+-			fit_copy_image(dst, buf, len);
+-		} else {
+-			preboot_puts_hex("Verification failed for image: ", i, false);
+-			return 1;
+-		}
++		fit_copy_image(dst, buf, len);
+ 	}
+ 
+ 	return 0;
+diff --git a/preboot/fit_regions.c b/preboot/fit_regions.c
+new file mode 100644
+index 0000000..d32c448
+--- /dev/null
++++ b/preboot/fit_regions.c
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ */
++
++#include <libfdt.h>
++#include "common.h"
++#include "fit_rsa.h"
++#include "fit_regions.h"
++#include "sha256.h"
++
++#define FDT_MAX_DEPTH	8
++
++/*
++ * from u-boot/common/image-sig.c
++ */
++struct image_region *fit_region_make_list(const void *fit,
++					  struct fdt_region *fdt_regions,
++					  int count,
++					  struct image_region *region)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		region[i].data = fit + fdt_regions[i].offset;
++		region[i].size = fdt_regions[i].size;
++	}
++
++	return region;
++}
++
++static int str_in_list(const char *str, char * const list[], int count)
++{
++	int i;
++
++	for (i = 0; i < count; i++)
++		if (!strcmp(list[i], str))
++			return 1;
++
++	return 0;
++}
++
++/*
++ * from u-boot/lib/libfdt/fdt_region.c
++ */
++int fdt_find_regions(const void *fdt, char * const inc[], int inc_count,
++		     char * const exc_prop[], int exc_prop_count,
++		     struct fdt_region region[], int max_regions,
++		     char *path, int path_len, int add_string_tab)
++{
++	int stack[FDT_MAX_DEPTH] = { 0 };
++	char *end;
++	int nextoffset = 0;
++	u32 tag;
++	int count = 0;
++	int start = -1;
++	int depth = -1;
++	int want = 0;
++	int base = fdt_off_dt_struct(fdt);
++
++	end = path;
++	*end = '\0';
++	do {
++		const struct fdt_property *prop;
++		const char *name;
++		const char *str;
++		int include = 0;
++		int stop_at = 0;
++		int offset;
++		int len;
++
++		offset = nextoffset;
++		tag = fdt_next_tag(fdt, offset, &nextoffset);
++		stop_at = nextoffset;
++
++		switch (tag) {
++		case FDT_PROP:
++			include = want >= 2;
++			stop_at = offset;
++			prop = fdt_get_property_by_offset(fdt, offset, NULL);
++			str = fdt_string(fdt, fdt32_to_cpu(prop->nameoff));
++			if (str_in_list(str, exc_prop, exc_prop_count))
++				include = 0;
++			break;
++
++		case FDT_NOP:
++			include = want >= 2;
++			stop_at = offset;
++			break;
++
++		case FDT_BEGIN_NODE:
++			depth++;
++			if (depth == FDT_MAX_DEPTH)
++				return -FDT_ERR_BADSTRUCTURE;
++			name = fdt_get_name(fdt, offset, &len);
++			if (end - path + 2 + len >= path_len)
++				return -FDT_ERR_NOSPACE;
++			if (end != path + 1)
++				*end++ = '/';
++			memcpy(end, name, len+1);
++			end += len;
++			stack[depth] = want;
++			if (want == 1)
++				stop_at = offset;
++			if (str_in_list(path, inc, inc_count))
++				want = 2;
++			else if (want)
++				want--;
++			else
++				stop_at = offset;
++			include = want;
++			break;
++
++		case FDT_END_NODE:
++			/* Depth must never go below -1 */
++			if (depth < 0)
++				return -FDT_ERR_BADSTRUCTURE;
++			include = want;
++			want = stack[depth--];
++			while (end > path && *--end != '/')
++				;
++			*end = '\0';
++			break;
++
++		case FDT_END:
++			include = 1;
++			break;
++		}
++
++		if (include && start == -1) {
++			/* Should we merge with previous? */
++			if (count && count <= max_regions &&
++			    offset == region[count - 1].offset +
++					region[count - 1].size - base)
++				start = region[--count].offset - base;
++			else
++				start = offset;
++		}
++
++		if (!include && start != -1) {
++			if (count < max_regions) {
++				region[count].offset = base + start;
++				region[count].size = stop_at - start;
++			}
++			count++;
++			start = -1;
++		}
++	} while (tag != FDT_END);
++
++	if (nextoffset != fdt_size_dt_struct(fdt))
++		return -FDT_ERR_BADLAYOUT;
++
++	/* Add a region for the END tag and the string table */
++	if (count < max_regions) {
++		region[count].offset = base + start;
++		region[count].size = nextoffset - start;
++		if (add_string_tab)
++			region[count].size += fdt_size_dt_strings(fdt);
++	}
++	count++;
++
++	return count;
++}
++
++void sha256_csum_regions(const struct image_region region[], int region_count,
++			 u8 *output)
++{
++	struct sha256_context ctx;
++	int i;
++
++	sha256_starts(&ctx);
++	for (i = 0; i < region_count; i++)
++		sha256_update(&ctx, region[i].data, region[i].size);
++	sha256_finish(&ctx, output);
++}
+diff --git a/preboot/fit_regions.h b/preboot/fit_regions.h
+new file mode 100644
+index 0000000..0feead5
+--- /dev/null
++++ b/preboot/fit_regions.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2020 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_FIT_REGIONS_H_
++#define COMMON_FIT_REGIONS_H_
++
++struct fdt_region {
++	int offset;
++	int size;
++};
++
++struct image_region *fit_region_make_list(const void *fit,
++					  struct fdt_region *fdt_regions,
++					  int count,
++					  struct image_region *region);
++
++int fdt_find_regions(const void *fdt, char * const inc[], int inc_count,
++		     char * const exc_prop[], int exc_prop_count,
++		     struct fdt_region region[], int max_regions,
++		     char *path, int path_len, int add_string_tab);
++
++void sha256_csum_regions(const struct image_region region[], int region_count,
++			 u8 *output);
++
++
++#endif /* COMMON_FIT_REGIONS_H_ */
+diff --git a/preboot/fit_rsa.c b/preboot/fit_rsa.c
+index dcc199d..83bf73e 100644
+--- a/preboot/fit_rsa.c
++++ b/preboot/fit_rsa.c
+@@ -8,6 +8,7 @@
+ #include "sha256.h"
+ #include "uart.h"
+ #include "fit_rsa.h"
++#include "fit_regions.h"
+ 
+ struct rsa_public_key {
+ 	u32 len;	/* len of modulus[] in number of u32 */
+@@ -246,17 +247,24 @@
+ 		dst[i] = fdt32_to_cpu(src[len - 1 - i]);
+ }
+ 
+-int rsa_mod_exp_sw(const u8 *sig, struct rsa_key_prop *prop, u32 *out)
++static int rsa_mod_exp_sw(const u8 *sig, struct rsa_key_prop *prop, u32 *out)
+ {
+ 	struct rsa_public_key key;
+ 	int ret;
+ 
+ 	key.n0inv = prop->n0inv;
+ 	key.len = prop->num_bits / (sizeof(u32) * 8);
+-	if (prop->public_exponent)
+-		key.exponent = fdt64_to_cpu(*(prop->public_exponent));
+-	else
++	if (prop->public_exponent) {
++		u32 *pubexp = (u32 *)&(key.exponent);
++
++		/* the value property is 4 bytes align. trying to read 64bit
++		 * value aligned to 4bytes by fdt64_to_cpu lead to crash
++		 */
++		pubexp[0] = fdt32_to_cpu(((u32 *)prop->public_exponent)[1]);
++		pubexp[1] = fdt32_to_cpu(((u32 *)prop->public_exponent)[0]);
++	} else {
+ 		key.exponent = RSA_DEFAULT_PUBEXP;
++	}
+ 
+ 	u32 key1[key.len], key2[key.len];
+ 
+@@ -334,10 +342,10 @@
+  *		uint8_t *sig, uint sig_len)
+  * from: u-boot/lib/rsa/rsa-verify.c
+  */
+-int rsa_verify(const u8 *data, int data_len, const u8 *sig, u32 sig_len,
+-	       struct rsa_key_prop *prop)
++int rsa_verify_regions(const struct image_region region[], int region_count,
++		       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop)
+ {
+-	u8 hash[CRYPTO_RSA_LENGTH];
++	u32 hash[CRYPTO_RSA_LENGTH >> 2];
+ 	int ret;
+ 
+ 	if (sig_len != (prop->num_bits >> 3)) {
+@@ -345,8 +353,8 @@
+ 		return 1;
+ 	}
+ 
+-	sha256_csum(data, data_len, hash);
+-
+-	ret = rsa_verify_key(prop, sig, sig_len, hash, CRYPTO_RSA_LENGTH);
++	sha256_csum_regions(region, region_count, (u8 *)hash);
++	ret = rsa_verify_key(prop, sig, sig_len, (u8 *)hash, CRYPTO_RSA_LENGTH);
++	preboot_puts_hex("rsa_verify_regions ret: ", ret, 0);
+ 	return ret;
+ }
+diff --git a/preboot/fit_rsa.h b/preboot/fit_rsa.h
+index 7dd6c23..6adeeac 100644
+--- a/preboot/fit_rsa.h
++++ b/preboot/fit_rsa.h
+@@ -14,8 +14,13 @@
+ 	int num_bits;			/* Key length in bits */
+ };
+ 
++struct image_region {
++	const void *data;
++	int size;
++};
+ 
+-int rsa_verify(const u8 *data, int data_len,
+-	       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop);
++
++int rsa_verify_regions(const struct image_region region[], int region_count,
++		       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop);
+ 
+ #endif /* COMMON_FIT_RSA_H_ */
+diff --git a/preboot/sha256.c b/preboot/sha256.c
+index 1cfb109..12682d9 100644
+--- a/preboot/sha256.c
++++ b/preboot/sha256.c
+@@ -9,12 +9,6 @@
+ #include <string.h>
+ #include "sha256.h"
+ 
+-struct sha256_context {
+-	u32 total[2];
+-	u32 state[8];
+-	u8 buffer[64];
+-};
+-
+ /*----------------------------------------------------------------*/
+ 
+ const u8 sha256_der_prefix[SHA256_DER_LEN] = {
+diff --git a/preboot/sha256.h b/preboot/sha256.h
+index 2cc1fd9..7df24ca 100644
+--- a/preboot/sha256.h
++++ b/preboot/sha256.h
+@@ -8,8 +8,18 @@
+ #define SHA256_SUM_LEN	32
+ #define SHA256_DER_LEN	19
+ 
++struct sha256_context {
++	u32 total[2];
++	u32 state[8];
++	u8 buffer[64];
++};
++
+ extern const u8 sha256_der_prefix[];
+ 
++void sha256_starts(struct sha256_context *ctx);
++void sha256_update(struct sha256_context *ctx, const u8 *input, u32 length);
++void sha256_finish(struct sha256_context *ctx, u8 digest[32]);
++
+ void sha256_csum(const u8 *input, u32 ilen, u8 *output);
+ 
+ #endif /* _SHA256_H */

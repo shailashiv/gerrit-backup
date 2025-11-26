@@ -1,0 +1,254 @@
+From 89c816ea38a0edef599d00589bab9c75282cf59a Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 09 Mar 2021 13:35:30 +0200
+Subject: [PATCH] [SW-25019] fit: report boot error
+
+Add support for failed boot attempt of FIT by preboot to be reported to
+BMC
+
+Change-Id: I136842c1ad7445fe5b70c2bbeaac032582005c54
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 69246a4..7c7109b 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -14,12 +14,14 @@
+ #include <fit_load_type.h>
+ #include <boot_info.h>
+ #include <lzo/lzo.h>
++#include <hl_fw_if.h>
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
+ #include "fit_rsa.h"
+ #include "fit_regions.h"
+ #include "cmd_module.h"
++#include "i2cslave_indirect.h"
+ 
+ #define FIT_IMAGES_PATH		"/images"
+ #define FIT_CONFS_PATH		"/configurations"
+@@ -72,7 +74,16 @@
+ enum fit_load_result {
+ 	FIT_LOAD_SUCCESS = 0,
+ 	FIT_LOAD_CORRUPTED,
++	FIT_LOAD_BAD_LOAD_ADDR,
++	FIT_LOAD_NOT_RUNNABLE,
+ 	FIT_LOAD_SEC_FAILED,
++};
++
++enum fit_sec_failure {
++	FIT_SEC_NONE = 0,
++	FIT_SEC_SVN_INVALID,
++	FIT_SEC_KEY_REVOKED,
++	FIT_SEC_SIGN_FAILED,
+ };
+ 
+ struct fit_image images[FIT_MAX_IMAGES];
+@@ -427,7 +438,7 @@
+ static u32 preboot_key_idx;
+ 
+ static int fit_get_pub_key(const void *fit, int noffset, int sig_sub_node,
+-			   const void **pub_key_fit)
++			   const void **pub_key_fit, enum fit_sec_failure *res)
+ {
+ 	int node, key_len, pub_key_node;
+ 	const void *key_ext_data = NULL;
+@@ -493,12 +504,14 @@
+ key_validation:
+ 	if (preboot_security_key_is_revoked(preboot_key_idx)) {
+ 		preboot_puts_hex("Key revoked: ", preboot_key_idx, false);
++		*res = FIT_SEC_KEY_REVOKED;
+ 		return 1;
+ 	}
+ 
+ 	if (!preboot_security_key_is_valid(preboot_key_idx, key_data, key_len,
+ 				key_ext_data, key_ext_len)) {
+ 		preboot_puts("Key validation failed\n");
++		*res = FIT_SEC_SIGN_FAILED;
+ 		return 1;
+ 	}
+ 
+@@ -530,11 +543,12 @@
+ }
+ 
+ /* Checks the signed FIT and validate it againts the public key */
+-static int fit_verify_config(const void *fit, int noffset)
++static int fit_verify_config(const void *fit, int noffset,
++			     enum fit_sec_failure *res)
+ {
+ 	int sig_sub_node;
+ 	const char *hashed_node_prop;
+-	int count;
++	int count, err;
+ 	char *node_inc[IMAGE_MAX_HASHED_NODES];
+ 	char * const exc_prop[] = { FIT_DATA_PROP };
+ 	char path[FIT_MAX_PATH];
+@@ -547,7 +561,7 @@
+ 		return 1;
+ 	}
+ 
+-	if (fit_get_pub_key(fit, noffset, sig_sub_node, &pub_key_fit))
++	if (fit_get_pub_key(fit, noffset, sig_sub_node, &pub_key_fit, res))
+ 		return 1;
+ 
+ 	hashed_node_prop = fit_get_hashed_nodes(fit, sig_sub_node, &count,
+@@ -573,22 +587,31 @@
+ 		count++;
+ 	}
+ 
+-	return fit_verify_config_regions(fit, fdt_regions, count, sig_sub_node,
+-					 pub_key_fit);
++	err = fit_verify_config_regions(fit, fdt_regions, count, sig_sub_node,
++					pub_key_fit);
++	if (err) {
++		*res = FIT_SEC_SIGN_FAILED;
++		return err;
++	}
++
++	return 0;
+ }
+ 
+-static int fit_verify_security(const void *fit, int noffset)
++static int fit_verify_security(const void *fit, int noffset,
++			       enum fit_sec_failure *res)
+ {
+ 	if (!preboot_security_is_enabled())
+ 		return 0;
+ 
+-	if (!fit_svn_is_valid(fit))
++	if (!fit_svn_is_valid(fit)) {
++		*res = FIT_SEC_SVN_INVALID;
+ 		return 1;
++	}
+ 
+ 	/* Security in enabled and SV is valid all thats left is to check the
+ 	 * signature on the FIT.
+ 	 */
+-	return fit_verify_config(fit, noffset);
++	return fit_verify_config(fit, noffset, res);
+ }
+ 
+ static int fit_getprop_u64(const void *fit, int node, const char *name,
+@@ -648,7 +671,8 @@
+ 	return type == FIT_LOAD_TYPE_RUN;
+ }
+ 
+-static enum fit_load_result fit_copy_images(const void *fit)
++static enum fit_load_result fit_copy_images(const void *fit,
++					    enum fit_sec_failure *res)
+ {
+ 	int node, len, image_len;
+ 	int conf, num_images, i;
+@@ -668,8 +692,9 @@
+ 	if (!fit_load_is_runnable(fit, conf))
+ 		return FIT_LOAD_CORRUPTED;
+ 
+-	if (fit_verify_security(fit, conf))
++	if (fit_verify_security(fit, conf, res))
+ 		return FIT_LOAD_SEC_FAILED;
++
+ #ifdef FAKE_SECURITY
+ 	if (fit_pub_key_value_node_get(fit))
+ 		return FIT_LOAD_SEC_FAILED;
+@@ -689,12 +714,12 @@
+ 		node = fit_loadables_node_get(fit, i);
+ 		if (node < 0) {
+ 			preboot_puts_hex("Wrong FIT format: loadable image not found: ", i, false);
+-			return FIT_LOAD_CORRUPTED;
++			return FIT_LOAD_NOT_RUNNABLE;
+ 		}
+ 
+ 		if (fit_getprop_u64(fit, node, FIT_LOADADDR_PROP, &load)) {
+ 			preboot_puts_hex("Wrong FIT format: loadaddr not found for image: ", i, false);
+-			return FIT_LOAD_CORRUPTED;
++			return FIT_LOAD_BAD_LOAD_ADDR;
+ 		}
+ 		if (fit_getprop_u64(fit, node, FIT_STARTADDR_PROP, &start))
+ 			start = load;
+@@ -724,7 +749,7 @@
+ 
+ 		if (!preboot_is_valid_address_range(load, image_len)) {
+ 			preboot_puts_hex("FIT: invalid load address for image: ", i, false);
+-			return FIT_LOAD_CORRUPTED;
++			return FIT_LOAD_BAD_LOAD_ADDR;
+ 		}
+ 
+ 		images[i].arch = (const char *)fdt_getprop(fit, node,
+@@ -746,8 +771,48 @@
+ 	return FIT_LOAD_SUCCESS;
+ }
+ 
++static void fit_report_err(enum fit_load_result err,
++			   enum fit_sec_failure sec_res)
++{
++	enum hl_fw_fit_boot_error boot_err = HL_FW_FIT_BOOT_ERR_NONE;
++
++	switch (err) {
++	case FIT_LOAD_BAD_LOAD_ADDR:
++		boot_err = HL_FW_FIT_BOOT_ERR_ADDRESS_VIOLATION;
++		break;
++	case FIT_LOAD_NOT_RUNNABLE:
++		boot_err = HL_FW_FIT_BOOT_ERR_NOT_RUNNABLE;
++		break;
++	case FIT_LOAD_CORRUPTED:
++		boot_err = HL_FW_FIT_BOOT_ERR_CORRUPTED;
++		break;
++	case FIT_LOAD_SEC_FAILED:
++
++		switch (sec_res) {
++		case FIT_SEC_SVN_INVALID:
++			boot_err = HL_FW_FIT_BOOT_ERR_SVN;
++			break;
++		case FIT_SEC_KEY_REVOKED:
++			boot_err = HL_FW_FIT_BOOT_ERR_REVOKED_KEY;
++			break;
++		case FIT_SEC_SIGN_FAILED:
++			boot_err = HL_FW_FIT_BOOT_ERR_SIGNATURE;
++			break;
++		default:
++			break;
++		}
++
++		break;
++	default:
++		break;
++	};
++
++	i2csi_set_boot_err(boot_err, false);
++}
++
+ int fit_load_images(void)
+ {
++	enum fit_sec_failure sec_res = FIT_SEC_NONE;
+ 	void *fit = (void *)FIT_IMG_BASE;
+ 	int err;
+ 
+@@ -755,13 +820,16 @@
+ 
+ 	err = !fit_check_format(fit);
+ 	if (!err)
+-		err = fit_copy_images(fit);
++		err = fit_copy_images(fit, &sec_res);
+ 
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED |
+ 			    CPU_BOOT_ERR0_SECURITY_FAIL, false);
+ 	switch (err) {
+ 	case FIT_LOAD_SUCCESS:
+ 		return 0;
++
++	case FIT_LOAD_BAD_LOAD_ADDR:
++	case FIT_LOAD_NOT_RUNNABLE:
+ 	case FIT_LOAD_CORRUPTED:
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+ 		preboot_puts("FIT loading failed, Retrying...\n");
+@@ -772,6 +840,8 @@
+ 		break;
+ 	}
+ 
++	fit_report_err(err, sec_res);
++
+ 	return 1;
+ }
+ 

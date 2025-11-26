@@ -1,0 +1,104 @@
+From 29fa0620b68bf753991094cd3828392670339524 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 29 Nov 2022 10:08:40 +0200
+Subject: [PATCH] [SW-87517] gaudi3: configure spi dma mmu bypass for sram dest
+
+As per Errata GAUDI3_0301, SPI DMA AXI attributes should not be
+changed during traffic. HW team has recommended to perform MMU BYPASS
+configuration for non-PSOC memory as DMA destination. This patch
+add changes to configure MMU bypass before DMA transfer based on
+destination type.
+
+Change-Id: Ia195546845de32a0d80c11ab16412872326d4ca7
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index bdd9fae..66c6c03 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -25,6 +25,8 @@
+ #include <d0_pif_arc_regs.h>
+ #include <d0_parc_global_conf_regs.h>
+ #include <d0_parc_global_conf_masks.h>
++#include <d0_parc_global_conf_spy_dma_hbw_attr_ctrl_regs.h>
++#include <d0_parc_global_conf_spy_dma_hbw_attr_ctrl_masks.h>
+ #include <d0_pif_arc_special_regs.h>
+ #include <d0_g4_pci_pll_ctrl_regs.h>
+ #include <d0_pif_arc_masks.h>
+@@ -103,6 +105,26 @@
+ 
+ __weak u64 gaudi3_dma_addr_fixup(u64 loadaddr) { return loadaddr; }
+ 
++static void preboot_cfg_dma_mmu_bypass(bool set)
++{
++	u32 val = 0x0;
++
++	if (set)
++		val = (D0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS_WR_M |
++			D0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS_RD_M);
++
++	regmap_writel(val, mmD0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS);
++}
++
++static bool preboot_is_dma_dest_psoc_mem(uint64_t addr)
++{
++	if (addr >= HL_FW_MEM_BASE_FULL &&
++	    addr < HL_FW_MEM_BASE_FULL + HL_FW_MEM_SIZE)
++		return true;
++
++	return false;
++}
++
+ static enum dma_dest_type preboot_get_dma_dest_type(uint64_t addr)
+ {
+ 	if (addr >= HL_FW_SRAM_FULL_BASE &&
+@@ -117,14 +139,23 @@
+ 	u64 dma_dest_addr;
+ 	enum dma_error dma_err;
+ 	enum dma_dest_type dma_type;
++	bool is_psoc_mem;
+ 
+ 	preboot_puts_hex64("Preboot loadaddr: ", loadaddr, false);
+ 
+ 	dma_dest_addr = gaudi3_dma_addr_fixup(loadaddr);
+ 	dma_type = preboot_get_dma_dest_type(dma_dest_addr);
++	is_psoc_mem = preboot_is_dma_dest_psoc_mem(dma_dest_addr);
++
++	if (!is_psoc_mem)
++		preboot_cfg_dma_mmu_bypass(true);
++
+ 	dma_err = dma_copy_image_v2(size, offset, dma_dest_addr, dma_type, false);
+ 	if (dma_err != DMA_SUCCESS)
+ 		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
++
++	if (!is_psoc_mem)
++		preboot_cfg_dma_mmu_bypass(false);
+ }
+ 
+ __weak u32 gaudi3_rst_src_fixup(u32 rst_src) { return rst_src; }
+@@ -656,6 +687,7 @@
+ 	enum dma_dest_type dma_type;
+ 	enum hl_fw_img_type img_type;
+ 	u32 idx;
++	bool is_psoc_mem;
+ 
+ 	img_type = data->img_type[data->img_idx];
+ 	idx = boot_desc_get_img_desc(FLOPS_UPD_NOOP, img_type, &desc);
+@@ -665,8 +697,17 @@
+ 	}
+ 
+ 	dma_type = preboot_get_dma_dest_type(data->inter_buffer_addr);
++	is_psoc_mem = preboot_is_dma_dest_psoc_mem(data->inter_buffer_addr);
++
++	if (!is_psoc_mem)
++		preboot_cfg_dma_mmu_bypass(true);
++
+ 	dma_err = dma_copy_image_v2(desc.img_size, desc.spi_offset, data->inter_buffer_addr,
+ 				    dma_type, false);
++
++	if (!is_psoc_mem)
++		preboot_cfg_dma_mmu_bypass(false);
++
+ 	if (dma_err != DMA_SUCCESS) {
+ 		preboot_puts("failed copying pif fw from flash\n");
+ 		return -1;

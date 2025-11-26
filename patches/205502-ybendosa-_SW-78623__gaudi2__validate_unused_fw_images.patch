@@ -1,0 +1,265 @@
+From 40ab8a17630350156ce7ef84bb39e98825d5f8cf Mon Sep 17 00:00:00 2001
+From: Yotam Ben Dosa <ybendosa@habana.ai>
+Date: Tue, 03 May 2022 16:45:57 +0300
+Subject: [PATCH] [SW-78623] gaudi2: validate unused fw images
+
+Secondary ppboot and preboot images should also be validated, even when
+booting from the primary flash.
+
+Signed-off-by: Yotam Ben Dosa <ybendosa@habana.ai>
+Change-Id: Iae0fb6a0e415e0b8f8a92b148abf091251189c9b
+---
+
+diff --git a/Makefile b/Makefile
+index 4cc1f4d..1d8c457 100644
+--- a/Makefile
++++ b/Makefile
+@@ -51,6 +51,7 @@
+ PREBOOT_SRCS_C += $(shell ls app/preboot/*.c)
+ PREBOOT_SRCS_C := $(filter-out lib/preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
+ PPBOOT_SRCS_C := $(shell ls lib/common/*.c)
++PPBOOT_SRCS_C += $(shell ls lib/preboot/memory.c)
+ PPBOOT_SRCS_C += $(shell ls app/ppboot/*.c)
+ 
+ include $(HL_DEV_ARCH)/Makefile
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index df3df71..2e982df 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -24,7 +24,9 @@
+ 
+ #include <stdint.h>
+ #include <hl_boot_if.h>		/* requires stdint.h */
++#include <gaudi2/gaudi2_bootrom.h>
+ #include <gaudi2/gaudi2_reg_map.h>
++#include <psoc_security_regs.h>
+ #include <common/pci_ids.h>
+ #include <gaudi2_blocks_linux_driver.h>
+ #include <arcboot_export.h>
+@@ -47,6 +49,7 @@
+ #include <gaudi2/gaudi2_security.h>
+ #include <tpm2.h>
+ #include <errno.h>
++#include <memory.h>
+ 
+ #define PRODUCT_ID_STR_SIZE			0x8
+ 
+@@ -65,6 +68,35 @@
+ #define IATU_INBOUND_LOW_OFFSET_ADDR		0x0
+ #define IATU_INBOUND_HI_OFFSET_ADDR		0xC0080000
+ #define DBI_ENABLE				0x300000
++
++#define ARCBOOT_STATUS_REG_SZ_BITS		32
++#define FLASH_64KB_PADD				65536
++#define FLASH_VALID_SZ(s)			((s) < SZ_2M)
++#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE		46080
++#define SPI_DMA_DST_FW_SRAM			BIT(1)
++
++/*
++ * preboot_get_mem_region doesn't provide the full memory address,
++ * which is required for dma ops, and thus needs to be converted
++ * in order for the dma to deploy the fw to the correct location.
++ */
++#define SDRAM_MEM_REGION_FULL_ADDR(a)		((a) - SDRAM_BASE + SDRAM_FULL_BASE)
++
++enum image_type {
++	PPBOOT,
++	PREBOOT,
++};
++
++const u32 fw_spi_addr[2][2] = {
++	[PPBOOT] = {
++		[ARCBOOT_PRIMARY] =	FLASH_PRIMARY_OFFSET,
++		[ARCBOOT_SECONDARY] =	FLASH_SECONDARY_OFFSET
++	},
++	[PREBOOT] = {
++		[ARCBOOT_PRIMARY] =	FLASH_PREBOOT_PRIMARY_OFFSET,
++		[ARCBOOT_SECONDARY] =	FLASH_PREBOOT_SECONDARY_OFFSET
++	},
++};
+ 
+ void pcie_phy_set_ext_tx_rx_ctrl(void) {}
+ void pcie_phy_set_protocol0_ext_tx_rx(void) {}
+@@ -273,7 +305,19 @@
+ 	/* Not implemented - ARC BootROM copies and validates preboot */
+ }
+ 
+-static u32 ppboot_flash_image_offset(u8 image_ptr)
++static void ppboot_status_update(enum arcboot_rom_progress progress)
++{
++	uint32_t reg, offset;
++
++	offset = progress / ARCBOOT_STATUS_REG_SZ_BITS;
++	progress = progress % ARCBOOT_STATUS_REG_SZ_BITS;
++
++	reg = regmap_readl((mmPSOC_SECURITY_SW_STATUS_0 + offset * 4));
++	reg |= BIT(progress);
++	regmap_writel(reg, (mmPSOC_SECURITY_SW_STATUS_0 + offset * 4));
++}
++
++static u32 get_flash_image_offset(u8 image_ptr, enum image_type type)
+ {
+ 	u8 flash_image_switch;
+ 
+@@ -285,10 +329,7 @@
+ 			image_ptr = ARCBOOT_PRIMARY;
+ 	}
+ 
+-	if (image_ptr == ARCBOOT_SECONDARY)
+-		return spi_flash_readl(FLASH_PREBOOT_SECONDARY_OFFSET);
+-	else
+-		return spi_flash_readl(FLASH_PREBOOT_PRIMARY_OFFSET);
++	return spi_flash_readl(fw_spi_addr[type][image_ptr]);
+ }
+ 
+ __weak int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
+@@ -318,6 +359,119 @@
+ 	return 0;
+ }
+ 
++static int validate_secondary_ppboot_fw(void)
++{
++	uint16_t ppboot_pcie_size;
++	uint32_t flash_image_offset, flash_ppboot_pcie_offset;
++	int ret;
++	struct mem_desc mdesc;
++
++	flash_image_offset = get_flash_image_offset(ARCBOOT_SECONDARY, PPBOOT);
++
++	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
++					      flash_image_offset);
++
++	ppboot_pcie_size = (uint16_t)spi_flash_readl(flash_ppboot_pcie_offset);
++	if (ppboot_pcie_size > SECUREBOOT_MAX_PPBOOT_IMG_SIZE)
++		return -1;
++
++	/* check for min size as we are subtracting SECUREBOOT_IMG_HEAD_FOOTER */
++	if (ppboot_pcie_size <= SECUREBOOT_IMG_HEAD_FOOTER)
++		return -1;
++
++	/* check for safe limits */
++	if (!FLASH_VALID_SZ(flash_ppboot_pcie_offset + ppboot_pcie_size))
++		return -1;
++
++	ret = preboot_get_mem_region(MEM_GP, &mdesc);
++	if (ret) {
++		preboot_puts("Failed to get memory for ppboot fw validation\n");
++		return -1;
++	}
++
++	if (ppboot_pcie_size > mdesc.size) {
++		preboot_puts("ppboot fw size exceeds allocated mem region!\n");
++		return -1;
++	}
++
++	ret = ppboot_dma_copy(ppboot_pcie_size, flash_ppboot_pcie_offset,
++			SDRAM_MEM_REGION_FULL_ADDR(mdesc.base),
++			SPI_DMA_DST_HBW);
++	if (ret)
++		return -1;
++
++	return 0;
++}
++
++static int ppboot_validate_secondary_preboot(void)
++{
++	u32 image_size;
++	u32 num_cycles;
++	u32 flash_offset, payload_size, copy_size;
++	int ret, i;
++	struct mem_desc mdesc;
++
++	flash_offset = get_flash_image_offset(ARCBOOT_SECONDARY, PREBOOT);
++	image_size = spi_flash_readl(flash_offset);
++	num_cycles = (image_size / (MAX_DMA_SIZE + CRC_SIZE));
++	if (image_size % (MAX_DMA_SIZE + CRC_SIZE))
++		num_cycles++;
++
++	payload_size = image_size - (num_cycles * CRC_SIZE);
++
++	ret = preboot_get_mem_region(MEM_GP, &mdesc);
++	if (ret) {
++		preboot_puts("Failed to get memory for ppboot fw validation\n");
++		return -1;
++	}
++
++	/*
++	 * when image_size >= 64KB, preboot binary is divided into 2 chunks
++	 * image_size = payload_size + 2*4 (for 2 CRCs)
++	 * bin_part1: (MAX_DMA_SIZE) + CRC              @flash offs 0x0
++	 * bin_part2: (payload_size - MAX_DMA_SIZE) + CRC    @flash offs 0x10000
++	 *
++	 * Approach:
++	 * 1) copy bin_part1 from flash_offs=0 to SRAM_offs=0 (size1 = MAX_DMA_SIZE + CRC)
++	 * 2) copy bin_part2 from flash_offs=0x10000 to ICCM_offs=0..
++	 *   (size2 = payload_size - MAX_DMA_SIZE + CRC)
++	 * 3) memcpy from ICCM_offs = 0 to SRAM_offs=MAX_DMA_SIZE
++	 *   (size3 = payload_size - MAX_DMA_SIZE)
++	 *
++	 * Reasons for this approach:
++	 * 1) SPI DMA transfer destination start and end offset shouldn't
++	 *   include 64KB boundary.
++	 * 2) Flash offset to SPI DMA must be 1KB granuality
++	 * 3) CRC word wont be copied from flash to SRAM
++	 * 4) SPI DMA transfer size (excluding CRC) must be 16 byte aligned.
++	 */
++	copy_size = (num_cycles == 1) ? image_size : (MAX_DMA_SIZE + CRC_SIZE);
++	if (copy_size > mdesc.size) {
++		preboot_puts("preboot fw size exceeds allocated mem region!\n");
++		return -1;
++	}
++
++	ret = ppboot_dma_copy(copy_size, flash_offset,
++			SDRAM_MEM_REGION_FULL_ADDR(mdesc.base),
++			SPI_DMA_DST_HBW);
++	if (ret)
++		return ARCBOOT_BRINGUP_ERROR;
++
++	for (i = 1; i < num_cycles; i++) {
++		copy_size = (i == (num_cycles - 1)) ?
++			(payload_size - MAX_DMA_SIZE * i + CRC_SIZE) :
++				(MAX_DMA_SIZE + CRC_SIZE);
++
++		ret = ppboot_dma_copy(copy_size, (flash_offset + OFFSET_64KB * i),
++					SDRAM_MEM_REGION_FULL_ADDR(mdesc.base),
++					SPI_DMA_DST_HBW);
++		if (ret)
++			return ARCBOOT_BRINGUP_ERROR;
++	}
++
++	return ARCBOOT_BRINGUP_OK;
++}
++
+ static int ppboot_bringup_preboot(u8 image_ptr)
+ {
+ 	u32 image_size, payload_size, copy_size;
+@@ -326,7 +480,12 @@
+ 	int ret;
+ 	uint8_t hash[SHA384_SUM_LEN];
+ 
+-	flash_offset = ppboot_flash_image_offset(image_ptr);
++	if (image_ptr == ARCBOOT_PRIMARY) {
++		if (!validate_secondary_ppboot_fw())
++			ppboot_status_update(PROGRESS_BRINGUP_PCI_SEC);
++	}
++
++	flash_offset = get_flash_image_offset(image_ptr, PREBOOT);
+ 	image_size = spi_flash_readl(flash_offset);
+ 	num_cycles = (image_size / (MAX_DMA_SIZE + CRC_SIZE));
+ 	if (image_size % (MAX_DMA_SIZE + CRC_SIZE))
+@@ -396,6 +555,15 @@
+ 		preboot_puts("PPBOOT: TPM is not supported\n");
+ 	}
+ 
++	/* check PRI or SEC and set PROGRESS_BRINGUP_RAM_PRI/SEC appropriately */
++	if (image_ptr == ARCBOOT_PRIMARY) {
++		ppboot_status_update(PROGRESS_BRINGUP_RAM_PRI);
++		if (ppboot_validate_secondary_preboot() == ARCBOOT_BRINGUP_OK)
++			ppboot_status_update(PROGRESS_BRINGUP_RAM_SEC);
++	} else {
++		ppboot_status_update(PROGRESS_BRINGUP_RAM_SEC);
++	}
++
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+ 

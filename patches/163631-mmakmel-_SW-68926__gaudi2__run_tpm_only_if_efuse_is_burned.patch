@@ -1,0 +1,150 @@
+From c31132d37e6bbeadc43f06ea1c31325d3a99bc9a Mon Sep 17 00:00:00 2001
+From: Alona Solntseva <alona.solntseva@tandemg.com>
+Date: Tue, 04 Jan 2022 11:56:28 +0200
+Subject: [PATCH] [SW-68926] gaudi2: run tpm only if efuse is burned
+
+Run TPM only if sys cfg efuse is burned and tpm bit is set.
+If they are not, TPM functions exit on the beginning.
+Add EOPNOTSUPP errno.
+Return EOPNOTSUPP if TPM is not enabled.
+On ppboot notify if TPM is not enabled.
+
+Change-Id: Ib0ec53270e40c6b41161f02a10d6224d33649fdc
+Signed-off-by: Alona Solntseva <alona.solntseva@tandemg.com>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 8cd8630..cb7c0e7 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -67,6 +67,7 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/pll.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/sha512.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
+ 	$(HL_DEV_ARCH_COMMON)/tpm2.o \
+ 	$(HL_DEV_ARCH_COMMON)/tpm_auth.o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index bf78845..d330898 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -41,6 +41,7 @@
+ #include <address_space.h>
+ #include <gaudi2/gaudi2_security.h>
+ #include <tpm2.h>
++#include <errno.h>
+ 
+ #define PRODUCT_ID_STR_SIZE	0x8
+ 
+@@ -250,6 +251,7 @@
+ {
+ 	u32 flash_offset;
+ 	u16 image_size;
++	int ret;
+ 
+ 	flash_offset = ppboot_flash_image_offset(image_ptr);
+ 	image_size = (u16) spi_flash_readl(flash_offset);
+@@ -270,10 +272,14 @@
+ 			== SECUREBOOT_VERIFY_FAILED)
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
+-	if (!tpm_init())
++	ret = tpm_init();
++	if (!ret) {
+ 		if (tpm_hash_and_pcr_extend(TPM2_PREBOOT_PCR_IDX, (SDRAM_BASE + IMG_LEN_SIZE),
+ 					    image_size))
+ 			preboot_puts("PPBOOT: pcr extend failed\n");
++	} else if (ret == -EOPNOTSUPP) {
++		preboot_puts("PPBOOT: TPM is not supported\n");
++	}
+ 
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index 8f5ed39..8e734c6 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -11,9 +11,11 @@
+ #include <uart.h>
+ #include <sha.h>
+ #include <boot_desc.h>
++#include <errno.h>
+ #include "lzo/unaligned.h"
+ 
+-#define TPM_NV_DEV_SN_ADDRESS	0x01c10100
++#define TPM_NV_DEV_SN_ADDRESS		0x01c10100
++#define EFUSE_SYSCFG_ENABLE_TPM_MASK	BIT(11)
+ 
+ struct tpm_dev_id {
+ 	union {
+@@ -37,9 +39,28 @@
+ 	return 0;
+ }
+ 
++static int tpm_is_enabled(void)
++{
++	u32 config_fuse;
++	int ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
++
++	if (ret)
++		return ret;
++
++	if ((config_fuse & EFUSE_SYSCFG_ENABLE_TPM_MASK) != 0)
++		ret = 0;
++	else
++		ret = -1;
++
++	return ret;
++}
++
+ int tpm_init(void)
+ {
+ 	int ret;
++
++	if (tpm_is_enabled() != 0)
++		return -EOPNOTSUPP;
+ 
+ 	ret = tpm2_init();
+ 	if (ret) {
+@@ -54,6 +75,9 @@
+ {
+ 	int ret;
+ 
++	if (tpm_is_enabled() != 0)
++		return -EOPNOTSUPP;
++
+ 	ret = tpm2_startup(TPM2_SU_CLEAR);
+ 	if (ret) {
+ 		preboot_puts("TPM: tpm2_startup failed\n");
+@@ -66,6 +90,9 @@
+ int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
+ {
+ 	int ret;
++
++	if (tpm_is_enabled() != 0)
++		return -EOPNOTSUPP;
+ 
+ 	if (hash == NULL)
+ 		return -1;
+@@ -102,6 +129,9 @@
+ 
+ 	efuse_dev_id.tpm_data = 0x0;
+ 
++	if (tpm_is_enabled() != 0)
++		return;
++
+ 	if (cpu_boot_err_get(CPU_BOOT_ERR_TPM_FAIL))
+ 		return;
+ 
+diff --git a/include/errno.h b/include/errno.h
+index 6181fae..488a2a4 100644
+--- a/include/errno.h
++++ b/include/errno.h
+@@ -13,5 +13,6 @@
+ #define EBUSY 16	/* Mount device busy */
+ #define EINVAL 22       /* Invalid argument */
+ #define ETIMEDOUT 60    /* Connection timed out */
++#define EOPNOTSUPP 95	/* Operation not supported */
+ 
+ #endif /* _HL_ERRNO_H_ */

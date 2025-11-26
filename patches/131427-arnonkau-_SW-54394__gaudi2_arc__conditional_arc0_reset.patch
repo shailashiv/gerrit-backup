@@ -1,0 +1,120 @@
+From beaa00e5279b4ea8f687707dc4ff0e35ca9bc9c2 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Wed, 22 Sep 2021 10:42:30 +0300
+Subject: [PATCH] [SW-54394] gaudi2,arc: conditional arc0 reset
+
+When running the preboot directly without arc cores initialization
+the iccm and dccm associated with those cores are not accessible.
+
+That is usually handled by the ppboot. but this weak function allows
+adjustments when the preboot starts. In this case allows running
+the preboot without pre-loading the ppboot.
+
+The operation invoked only if the arc0 is not running yet.
+
+Change-Id: I0b69870d1d7a5f1adecdd3d0c10b3d5e1c9a570a
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 70f23f8..b53ea7d 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -381,6 +381,7 @@
+ __weak void preboot_clear_wd_gpio(void) {}
+ __weak void preboot_read_test_mode(void) {}
+ __weak void preboot_reset_init(void) {}
++__weak void preboot_cond_arc0_reset(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -406,6 +407,8 @@
+ 
+ 	hl_uart_init();
+ 
++	preboot_cond_arc0_reset();
++
+ 	spi_init();
+ 	spi_prot_late();
+ 	spi_prot_status();
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 6c72bfa..eb01936 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -60,7 +60,7 @@
+ 
+ #define ARC_HALT_ACK_RETRIES		100
+ #define ARC_RUN_ACK_TIMEOUT_US		100
+-
++#define ARC_IS_RUNNING			BIT(0) /* arc's "is running" sts bit */
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+ {
+ 	regs->cpu_pq_base_addr_low = mmCPU_IF_PQ_BASE_ADDR_LOW;
+@@ -553,6 +553,33 @@
+ 	preboot_puts("\n");
+ }
+ 
++u32 preboot_read_halt_status(u8 id)
++{
++	u32 halt_reg_addr[] = {
++		mmPSOC_ARC0_CFG_RUN_HALT_ACK,
++		mmPSOC_ARC1_CFG_RUN_HALT_ACK,
++	};
++
++	if (id >= ARRAY_SIZE(halt_reg_addr)) {
++		preboot_puts_hex("wrong arc id = ", id, true);
++		return (u32)-1;
++	}
++
++	return halt_reg_addr[id];
++}
++
++void preboot_cond_arc0_reset(void)
++{
++	u32 halt_arc0_status = preboot_read_halt_status(0);
++
++	if (halt_arc0_status & ARC_IS_RUNNING)
++		return;
++
++	halt_n_reset_arc(0);
++	regmap_writel(0x0, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
++	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
++}
++
+ void halt_n_reset_arc(u8 id)
+ {
+ 	u32 val, halt_ack_offset, halt_req_offset;
+@@ -562,20 +589,19 @@
+ 	u32 cpu_boot_err_val;
+ 
+ 	if (id) {
+-		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+ 		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+ 		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
+ 		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+ 		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+ 
+ 	} else {
+-		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+ 		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+ 		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
+ 		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+ 		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+ 	}
+ 
++	halt_ack_offset = preboot_read_halt_status(id);
+ 	val = regmap_readl(halt_ack_offset);
+ 	if (val & halt_mask) {
+ 		preboot_puts_hex("Skipping halt for ARC", id, false);
+diff --git a/include/preboot.h b/include/preboot.h
+index 4c1981c..8b4ec8d 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -153,6 +153,7 @@
+ void preboot_nic_en(u32 nic_en_);
+ bool preboot_host_gpio_asserted(void);
+ void preboot_sp_sram_init(void);
++void preboot_cond_arc0_reset(void);
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);

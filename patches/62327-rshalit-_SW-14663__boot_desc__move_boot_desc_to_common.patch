@@ -1,0 +1,374 @@
+From d5926b0a1ae910e7171f6ed362fc50741fbc582c Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Thu, 26 Nov 2020 14:45:27 +0200
+Subject: [PATCH] [SW-14663] boot_desc: move boot_desc to common
+
+Move boot_desc to common folder, done as as a preparation
+to allow usage and build of boot_desc in specific device
+files.
+
+Change-Id: Ic982a21add2e3c90320fe622b86a514c0b3cd23b
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+(cherry picked from commit 0ba4bbbec2819d2676734a5fcf8b14f2b08ef577)
+---
+
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+new file mode 100644
+index 0000000..1131480
+--- /dev/null
++++ b/common/boot_desc.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <string.h>
++#include <stdbool.h>
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++
++#include "boot_desc.h"
++#include <spi.h>
++#include "uart.h"
++
++#define MAX_IMGS		5
++
++#define BOOT_PTRS_SZ		sizeof(struct hl_fw_boot_ptrs)
++#define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
++
++static struct hl_fw_boot_ptrs boot_ptrs;
++static struct hl_fw_img_desc img_desc[MAX_IMGS];
++
++static void boot_desc_print_magic(char *name, struct hl_fw_boot_magic *magic)
++{
++	int i;
++
++	preboot_puts_raw(name);
++	preboot_puts_raw(" magic: ");
++	/* Strings do not obey endianness - print in reverse order */
++	for (i = ARRAY_SIZE(magic->name) - 1; i >= 0; i--)
++		preboot_putc_raw(magic->name[i]);
++
++	preboot_puts_hex_raw(" type: ", magic->type, false);
++	preboot_puts_hex(" value: ", magic->val, true);
++}
++
++static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
++
++	if ((img_desc->magic.val & 0xFFFFFF00) != HL_FW_IMG_DESC_MAGIC)
++		return false;
++
++	if (img_desc->desc_ver == 0 || img_desc->desc_ver == ~0)
++		return false;
++
++	if (img_desc->idx >= 2)
++		return false;
++
++	return true;
++}
++
++int boot_desc_init(void)
++{
++	unsigned int count, i;
++	u32 spi_off = HL_FW_BOOT_PTRS_BASE;
++	u32 desc_offs[MAX_IMGS] = { 0 };
++
++	/* Read the main boot pointers structure */
++	spi_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
++	boot_desc_print_magic("FW boot PTRs", &boot_ptrs.magic);
++
++	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
++		return 0;
++
++	count = boot_ptrs.count;
++
++	/* Read all the descriptors offsets */
++	spi_off += sizeof(struct hl_fw_boot_ptrs);
++	spi_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
++
++	/* Read all descriptors */
++	for (i = 0; i < count; i++) {
++		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
++		spi_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
++		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
++			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
++			return 0;
++		}
++	}
++
++	return count;
++}
++
++u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
++			   enum hl_fw_img_type type, struct boot_desc *desc)
++{
++	int i, idx;
++
++	preboot_puts_hex_raw("Looking for image type: ", type, false);
++	for (i = 0; i < boot_ptrs.count; i++) {
++		if (img_desc[i].magic.type != type)
++			continue;
++
++		idx = img_desc[i].idx;
++		if (upd_status == FLOPS_UPD_PENDING)
++			idx = (idx + 1) % 2;
++
++		preboot_puts_hex(" - found! using index: ", idx, false);
++		desc->spi_offset = img_desc[i].offset[idx];
++		desc->img_size = img_desc[i].size[idx];
++		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
++					img_desc[i].load_low[idx];
++		desc->desc_ver = img_desc[i].desc_ver;
++
++		/*
++		 * Disable chksum copy temporarily, until alignment issue
++		 * is resolved.
++		 */
++		/* memcpy(desc->chksum, img_desc[i].chksum[idx], */
++		/* ARRAY_SIZE(desc->chksum)); */
++
++		return idx;
++	}
++
++	preboot_puts(" - not found!\n");
++	return HL_FW_IMG_NOT_FOUND;
++}
+diff --git a/include/boot_desc.h b/include/boot_desc.h
+new file mode 100644
+index 0000000..67f261a
+--- /dev/null
++++ b/include/boot_desc.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#ifndef _BOOT_DESC_H_
++#define _BOOT_DESC_H_
++
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
++#include <sha256.h>
++
++#define HL_FW_IMG_NOT_FOUND	((u32)-1)
++
++struct boot_desc {
++	u32 desc_ver;
++	u32 spi_offset;
++	u32 img_size;
++	u64 loadaddr;
++	u8 chksum[SHA256_SUM_LEN];
++};
++
++/*
++ * boot_desc_init() - read and initialize the boot image pointers structures
++ *
++ * Returns: the amount of images available, or 0 - no images available - legacy
++ */
++int boot_desc_init(void);
++
++/*
++ * boot_desc_get_img_desc() - get the struct boot_desc of the requested image
++ *
++ * @upd_status	- FLOPS_UPD_PENDING - for modifiable image offset,
++ *		  other values - for stable image offset
++ * @type	- the image type to look for
++ * @desc	- pointer to the struct boot_desc for placing the image data
++ *
++ * Returns:
++ * On success: the index of the image to load
++ * On failure: (u32)-1 (no image by the requested type)
++ */
++u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
++			   enum hl_fw_img_type type, struct boot_desc *desc);
++
++#endif /* _BOOT_DESC_H_ */
+diff --git a/ppboot/boot_desc.c b/ppboot/boot_desc.c
+deleted file mode 100644
+index 1131480..0000000
+--- a/ppboot/boot_desc.c
++++ /dev/null
+@@ -1,121 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-#include <string.h>
+-#include <stdbool.h>
+-#include <preboot.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_desc.h>
+-#include <common.h>
+-
+-#include "boot_desc.h"
+-#include <spi.h>
+-#include "uart.h"
+-
+-#define MAX_IMGS		5
+-
+-#define BOOT_PTRS_SZ		sizeof(struct hl_fw_boot_ptrs)
+-#define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
+-
+-static struct hl_fw_boot_ptrs boot_ptrs;
+-static struct hl_fw_img_desc img_desc[MAX_IMGS];
+-
+-static void boot_desc_print_magic(char *name, struct hl_fw_boot_magic *magic)
+-{
+-	int i;
+-
+-	preboot_puts_raw(name);
+-	preboot_puts_raw(" magic: ");
+-	/* Strings do not obey endianness - print in reverse order */
+-	for (i = ARRAY_SIZE(magic->name) - 1; i >= 0; i--)
+-		preboot_putc_raw(magic->name[i]);
+-
+-	preboot_puts_hex_raw(" type: ", magic->type, false);
+-	preboot_puts_hex(" value: ", magic->val, true);
+-}
+-
+-static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+-{
+-	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
+-
+-	if ((img_desc->magic.val & 0xFFFFFF00) != HL_FW_IMG_DESC_MAGIC)
+-		return false;
+-
+-	if (img_desc->desc_ver == 0 || img_desc->desc_ver == ~0)
+-		return false;
+-
+-	if (img_desc->idx >= 2)
+-		return false;
+-
+-	return true;
+-}
+-
+-int boot_desc_init(void)
+-{
+-	unsigned int count, i;
+-	u32 spi_off = HL_FW_BOOT_PTRS_BASE;
+-	u32 desc_offs[MAX_IMGS] = { 0 };
+-
+-	/* Read the main boot pointers structure */
+-	spi_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
+-	boot_desc_print_magic("FW boot PTRs", &boot_ptrs.magic);
+-
+-	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
+-		return 0;
+-
+-	count = boot_ptrs.count;
+-
+-	/* Read all the descriptors offsets */
+-	spi_off += sizeof(struct hl_fw_boot_ptrs);
+-	spi_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
+-
+-	/* Read all descriptors */
+-	for (i = 0; i < count; i++) {
+-		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
+-		spi_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
+-		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
+-			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+-			return 0;
+-		}
+-	}
+-
+-	return count;
+-}
+-
+-u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+-			   enum hl_fw_img_type type, struct boot_desc *desc)
+-{
+-	int i, idx;
+-
+-	preboot_puts_hex_raw("Looking for image type: ", type, false);
+-	for (i = 0; i < boot_ptrs.count; i++) {
+-		if (img_desc[i].magic.type != type)
+-			continue;
+-
+-		idx = img_desc[i].idx;
+-		if (upd_status == FLOPS_UPD_PENDING)
+-			idx = (idx + 1) % 2;
+-
+-		preboot_puts_hex(" - found! using index: ", idx, false);
+-		desc->spi_offset = img_desc[i].offset[idx];
+-		desc->img_size = img_desc[i].size[idx];
+-		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
+-					img_desc[i].load_low[idx];
+-		desc->desc_ver = img_desc[i].desc_ver;
+-
+-		/*
+-		 * Disable chksum copy temporarily, until alignment issue
+-		 * is resolved.
+-		 */
+-		/* memcpy(desc->chksum, img_desc[i].chksum[idx], */
+-		/* ARRAY_SIZE(desc->chksum)); */
+-
+-		return idx;
+-	}
+-
+-	preboot_puts(" - not found!\n");
+-	return HL_FW_IMG_NOT_FOUND;
+-}
+diff --git a/ppboot/boot_desc.h b/ppboot/boot_desc.h
+deleted file mode 100644
+index 67f261a..0000000
+--- a/ppboot/boot_desc.h
++++ /dev/null
+@@ -1,47 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-#ifndef _BOOT_DESC_H_
+-#define _BOOT_DESC_H_
+-
+-#include <preboot.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_desc.h>
+-#include <sha256.h>
+-
+-#define HL_FW_IMG_NOT_FOUND	((u32)-1)
+-
+-struct boot_desc {
+-	u32 desc_ver;
+-	u32 spi_offset;
+-	u32 img_size;
+-	u64 loadaddr;
+-	u8 chksum[SHA256_SUM_LEN];
+-};
+-
+-/*
+- * boot_desc_init() - read and initialize the boot image pointers structures
+- *
+- * Returns: the amount of images available, or 0 - no images available - legacy
+- */
+-int boot_desc_init(void);
+-
+-/*
+- * boot_desc_get_img_desc() - get the struct boot_desc of the requested image
+- *
+- * @upd_status	- FLOPS_UPD_PENDING - for modifiable image offset,
+- *		  other values - for stable image offset
+- * @type	- the image type to look for
+- * @desc	- pointer to the struct boot_desc for placing the image data
+- *
+- * Returns:
+- * On success: the index of the image to load
+- * On failure: (u32)-1 (no image by the requested type)
+- */
+-u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+-			   enum hl_fw_img_type type, struct boot_desc *desc);
+-
+-#endif /* _BOOT_DESC_H_ */

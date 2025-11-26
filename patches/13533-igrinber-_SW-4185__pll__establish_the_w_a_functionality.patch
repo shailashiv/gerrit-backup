@@ -1,0 +1,323 @@
+From a953106d92a2a3be08e590f73e839fb3e7042333 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 04 Jun 2019 18:00:36 +0300
+Subject: [PATCH] [SW-4185] pll: establish the w/a functionality
+
+Current code only permits to have one value per divisor output clock
+select - either the clock switch value, or the W/A flag.
+To implement the W/A functionality for more divider outputs, we need to
+have the original clock switch values at hand while also need to be able
+to specify that the W/A is needed.
+Introduce a new enum hl_pll_wa_sel for W/A implementation specific
+values and also add a new array field to struct hl_pll_cfg, so SoC
+specific implementation can specify the W/A type while keeping the
+original clock switch values along.
+
+Change-Id: Ib27d3ffc1e5e1ebcef863b464ea8ba5e523b2b35
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 3e96b9d..6e22c16 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -105,6 +105,14 @@
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+ 		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
++		switch (cfg->div_wa[sel]) {
++		case HL_PLL_WA_INIT:
++			continue;
++		case HL_PLL_WA_NOWA:
++		default:
++			break;
++		}
++
+ 		switch (cfg->div_sel[sel]) {
+ 		case HL_PLL_DIV_REF:
+ 			regmap_writel(HL_PLL_DIV_REF, reg);
+@@ -119,7 +127,6 @@
+ 			regmap_writel(HL_PLL_DIV_PLL, reg);
+ 			break;
+ 		case HL_PLL_REF_CLK:
+-		case HL_PLL_WA_INIT:
+ 		default:
+ 			break;
+ 		}
+diff --git a/common/pll.h b/common/pll.h
+index e788edb..2bd0927 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -37,6 +37,10 @@
+ 	HL_PLL_PLL_CLK,
+ 	HL_PLL_DIV_REF,
+ 	HL_PLL_DIV_PLL,
++};
++
++enum hl_pll_wa_sel {
++	HL_PLL_WA_NOWA = 0,
+ 	HL_PLL_WA_INIT,
+ };
+ 
+@@ -57,6 +61,7 @@
+ 	u32	nb;
+ 	int	div_factor[HL_PLL_DIV_SIZE];
+ 	int	div_sel[HL_PLL_DIV_SIZE];
++	int	div_wa[HL_PLL_DIV_SIZE];
+ };
+ 
+ enum hl_pll_bypass_val hl_pll_bypass_get(u64 pll_base,
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 7798a41..acd3c6c 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -20,82 +20,127 @@
+ 		.name = "DMA_W", .base = mmDMA_W_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+ 		.div_factor = { 0, 1, -1, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "IF_W", .base = mmIF_W_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "IF_E", .base = mmIF_E_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "DMA_E", .base = mmDMA_E_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+ 		.div_factor = { 0, 1, -1, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "MESH_W", .base = mmMESH_W_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "SRAM_W", .base = mmSRAM_W_PLL_BASE,
+ 		.nr = 0, .nf = 35, .od = 1, .nb = 17, /* 900 */
+ 		.div_factor = { 0, -1, -1, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "MESH_E", .base = mmMESH_E_PLL_BASE,
+ 		.nr = 0, .nf = 59, .od = 1, .nb = 29, /* 1500 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "SRAM_E", .base = mmSRAM_E_PLL_BASE,
+ 		.nr = 0, .nf = 35, .od = 1, .nb = 17, /* 900 */
+ 		.div_factor = { 0, -1, -1, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "MME", .base = mmPSOC_MME_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "PCI", .base = mmPSOC_PCI_PLL_BASE,
+@@ -107,41 +152,66 @@
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
+ 		},
++		.div_wa = { HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
++		},
+ 	}, {
+ 		.name = "TPC", .base = mmPSOC_TPC_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "HBM", .base = mmPSOC_HBM_PLL_BASE,
+ 		.nr = 0, .nf = 37, .od = 1, .nb = 18, /* 950 MHz */
+ 		.div_factor = { 0, 1, -1, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "NIC0", .base = mmNIC0_PLL_BASE,
+ 		.nr = 24, .nf = 1665, .od = 3, .nb = 832, /* 833 MHz */
+ 		.div_factor = { 0, 4, 8, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "NIC1", .base = mmNIC1_PLL_BASE,
+ 		.nr = 24, .nf = 1665, .od = 3, .nb = 832, /* 833 MHz */
+ 		.div_factor = { 0, 4, 8, -1 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "NIC2_HBM", .base = mmNIC2_HBM_PLL_BASE,
+@@ -152,24 +222,39 @@
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
+ 		},
++		.div_wa = { HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
++		},
+ 	}, {
+ 		.name = "NIC2_MME", .base = mmNIC2_MME_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
++		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
+ 		},
+ 	}, {
+ 		.name = "NIC2_TPC", .base = mmNIC2_TPC_PLL_BASE,
+ 		.nr = 0, .nf = 63, .od = 1, .nb = 31, /* 1600 */
+ 		.div_factor = { 0, 1, 2, 7 },
+-		.div_sel = { HL_PLL_WA_INIT,
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK,
+ 			     HL_PLL_REF_CLK
+ 		},
++		.div_wa = { HL_PLL_WA_INIT,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA,
++			    HL_PLL_WA_NOWA
++		},
+ 	},
+ };
+ 

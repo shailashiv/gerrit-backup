@@ -1,0 +1,131 @@
+From 1417e92bb3073f5cbc391c48df16db02520a161b Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Fri, 10 Jun 2022 12:01:57 +0300
+Subject: [PATCH] [SW-70527] gaudi2: ras: hmmu_mc sram rings repair
+
+This patch added support for BIRA, BISR and BIST operations
+for few HMMU HIF, HBM_MC  and EDMA SRAM rings.
+
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+Change-Id: Iec78b55203e7a59677f34cbfb8af6ff89b832ece
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 7c92c92..da695c9 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -819,6 +819,72 @@
+ 	}
+ }
+ 
++static void gaudi2_hmmu_mc_ring_pattern(enum gaudi2_sram_self_repair_op op)
++{
++	uint32_t expected_ones, expected_zeros;
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL53, mmPSOC_DFT_APB_WORD0);
++	if (op == SRAM_SELF_REPAIR_OP_BIRA) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL24, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL25, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
++		udelay(DELAY_8K_USEC);
++	} else if (op == SRAM_SELF_REPAIR_OP_BISR) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL27, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL28, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
++		udelay(DELAY_104_USEC);
++	} else if (op == SRAM_SELF_REPAIR_OP_BIST) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL30, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL31, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
++		udelay(DELAY_7P5K_USEC);
++	} else {
++		preboot_puts("Invalid sram repair operation\n");
++		return;
++	}
++	regmap_writel(GAUDI2_RING_PATTERN_VAL55, mmPSOC_DFT_APB_WORD0);
++	regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++
++	expected_ones = 0b00000000010100000010100000010100;
++	expected_zeros = 0b00000000001011100001011100001011;
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++
++	expected_ones = 0b00001010000001010000001010000001;
++	expected_zeros = 0b10000101110000101110000101110000;
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	if (op == SRAM_SELF_REPAIR_OP_BIST)
++		regmap_writel(GAUDI2_RING_PATTERN_VAL6, mmPSOC_DFT_APB_WORD1);
++	else
++		regmap_writel(GAUDI2_RING_PATTERN_VAL7, mmPSOC_DFT_APB_WORD1);
++
++	if (op == SRAM_SELF_REPAIR_OP_BIRA) {
++		expected_ones = 0b00000000000001010000001010000000;
++		expected_zeros = 0b00000000010000101110000101110000;
++	} else {
++		expected_ones = 0b00000000000000000000000010000000;
++		expected_zeros = 0b00000000000000000000000101110000;
++	}
++	gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++
++	if (op == SRAM_SELF_REPAIR_OP_BIST) {
++		regmap_writel(GAUDI2_RING_PATTERN_VAL53, mmPSOC_DFT_APB_WORD0);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL0, mmPSOC_DFT_APB_WORD1);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
++
++		regmap_writel(GAUDI2_RING_PATTERN_VAL54, mmPSOC_DFT_APB_WORD0);
++		regmap_writel(GAUDI2_RING_PATTERN_VAL7, mmPSOC_DFT_APB_WORD1);
++
++		expected_ones = 0b00000000000000000000000000000000;
++		expected_zeros = 0b00000000010010010010010010010000;
++		gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++	}
++}
++
+ static void gaudi2_sram_ring_sel(uint32_t dfx_val, uint32_t ring)
+ {
+ 	uint32_t ring_value = BIT(8) | (ring << 3) | 0x5;
+@@ -868,7 +934,7 @@
+ 				[SRAM_RING_TYPE_HMMU_XBAR] = gaudi2_hmmu_xbar_edge_mc_ring_pattern,
+ 				[SRAM_RING_TYPE_HMMU_2] = gaudi2_hmmu_2_ring_pattern,
+ 				[SRAM_RING_TYPE_EDMA1_HMMU3] = gaudi2_edma1_hmmu3_ring_pattern,
+-				[SRAM_RING_TYPE_HMMU_MC] = NULL
++				[SRAM_RING_TYPE_HMMU_MC] = gaudi2_hmmu_mc_ring_pattern
+ };
+ 
+ static void gaudi2_sram_self_repair(enum gaudi2_sram_self_repair_op op)
+@@ -881,17 +947,7 @@
+ 	for (dfx = 0; dfx < ARRAY_SIZE(dfx_value_table); dfx++) {
+ 		for (ring = 0; ring < ring_count_table[dfx]; ring++) {
+ 			ring_type = gauid2_ring_type_table[dfx][ring];
+-			if (ring_type == SRAM_RING_TYPE_SRAM ||
+-				ring_type == SRAM_RING_TYPE_TPC ||
+-				ring_type == SRAM_RING_TYPE_SOB_ROT ||
+-				ring_type == SRAM_RING_TYPE_XBAR_MID ||
+-				ring_type == SRAM_RING_TYPE_VDEC ||
+-				ring_type == SRAM_RING_TYPE_SOB_XDMA ||
+-				ring_type == SRAM_RING_TYPE_NIC ||
+-				ring_type == SRAM_RING_TYPE_MME ||
+-				ring_type == SRAM_RING_TYPE_HMMU_XBAR ||
+-				ring_type == SRAM_RING_TYPE_HMMU_2 ||
+-				ring_type == SRAM_RING_TYPE_EDMA1_HMMU3) {
++			if (ring_type != SRAM_RING_TYPE_MAX) {
+ 				gaudi2_sram_id_sel();
+ 				gaudi2_sram_ring_sel(dfx_value_table[dfx], ring + 1);
+ 				gaudi2_sram_region_ring_pattern[ring_type](op);
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index e9c2984..834d3c7 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -275,6 +275,9 @@
+ #define GAUDI2_RING_PATTERN_VAL50		0x100001a
+ #define GAUDI2_RING_PATTERN_VAL51		0x100001c
+ #define GAUDI2_RING_PATTERN_VAL52		0x1000010
++#define GAUDI2_RING_PATTERN_VAL53		0x1000042
++#define GAUDI2_RING_PATTERN_VAL54		0x100001f
++#define GAUDI2_RING_PATTERN_VAL55		0x1000049
+ 
+ 
+ void gaudi2_axi_drain_ena(void);

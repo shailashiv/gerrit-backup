@@ -1,0 +1,127 @@
+From f95f624f267ebfcab22a611f2f25f934c7acdad4 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 05 Dec 2018 23:44:51 +0200
+Subject: [PATCH] printing: rework the whole printing system
+
+This simplifies, reuses, and add some more functionality to the
+printing subsystem.
+The basic printing functions are unchanged.
+
+Change-Id: Id8a7f4a6add1a4cc8f4a3f7bec6393a11db95e67
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot.c b/preboot.c
+index 62ec0a6..57d9d5d 100644
+--- a/preboot.c
++++ b/preboot.c
+@@ -53,6 +53,8 @@
+ #define SKIP_PCIE_INIT BIT(16)
+ #endif
+ 
++#define STR_UINT_SZ	8
++
+ #define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+ 	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
+ 
+@@ -72,33 +74,84 @@
+ 	preboot_puts_raw("\r");
+ }
+ 
+-static void preboot_puts_num(const char* log, unsigned int val, size_t size)
++/*
++ * preboot_byte2char	- convert half byte to char.
++ *
++ * This function takes a byte number and converts its value to
++ * a character representing the value (e.g. 0x8c can be converted to
++ * '8' or 'c').
++ */
++static inline char preboot_byte2char(u8 byte, bool upper)
+ {
+-	int i;
+-	char str[16], c;
++	/* upper or lower 4 bits of the byte */
++	byte = upper ? byte >> 4 : byte & 0xf;
+ 
+-	str[0] = '0';
+-	str[1] = 'x';
++	/*
++	 * convert: if half byte is a number [0..9] => use '0' as an offset
++	 * 	    if half byte is a letter [0xa..0xf] => use 'a' as a base,
++	 * 	    but since 'a' is not 0, we need to subtract
++	 * 	    its base offset - 0xa.
++	 */
++	return byte + ((byte >= 0xa) ? 'a' - 0xa : '0');
++}
+ 
+-	for (i=0; i < size; i++) {
+-		int shift = (size - i - 1) * 4;
++/*
++ * preboot_uint2hexstring	- convert uint to a hex values string.
++ *
++ * Take a number and provide its hexadecimal string representation.
++ */
++static int preboot_uint2hexstring(char *str, unsigned int num, bool pad)
++{
++	int j = 0;
++	char tmp;
+ 
+-		c = (val >> shift) & 0xF;
+-		if (c > 9)
+-			str[i+2] = 'A' + c - 10;
+-		else
+-			str[i+2] = '0' + c;
++	/*
++	 * Here we walk on each byte of uint num in the reverse order, so
++	 * we build the string in the correct order.
++	 */
++	for (int i = 3; i >= 0; i--) {
++		u8 byte = (u8)((num >> (i * 8)) & 0xff);
++		/* here we run the loop on 2 parts of byte: upper and lower */
++		for (int k = 0; k < 2; k++) {
++			tmp = preboot_byte2char(byte, !k);
++			if (tmp == '0')	/* care of the leading zeroes (pad) */
++				pad = true;
++			if (pad)
++				str[j++] = tmp;
++		}
+ 	}
+-	str[i+2] = '\n';
+-	str[i+3] = '\0';
+ 
++	/* for !pad, return how many characters were actually written */
++	return j;
++}
++
++static void preboot_puth_raw(unsigned int val, bool pad)
++{
++	char str[STR_UINT_SZ + 1];
++	int val_sz;
++
++	val_sz = preboot_uint2hexstring(str, val, pad);
++	val_sz = val_sz > STR_UINT_SZ ? STR_UINT_SZ : val_sz;
++	str[val_sz] = '\0';
++	preboot_puts_raw(str);
++}
++
++static inline void preboot_puth(unsigned int val, bool pad)
++{
++	preboot_puth_raw(val, pad);
++	preboot_puts("\n");
++}
++
++static inline void preboot_puts_hex(const char* log, unsigned int val, bool pad)
++{
+ 	preboot_puts_raw(log);
+-	preboot_puts(str);
++	preboot_puts_raw("0x");
++	preboot_puth(val, pad);
+ }
+ 
+ static inline void preboot_puts_char(const char* str, unsigned char val)
+ {
+-	preboot_puts_num(str, val, sizeof(val) * 2);
++	preboot_puts_hex(str, val, false);
+ }
+ 
+ /*

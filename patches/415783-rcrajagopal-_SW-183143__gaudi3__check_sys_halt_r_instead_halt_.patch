@@ -1,0 +1,70 @@
+From 93323341a2c65adf7d8ebd6666db8603a9de28b2 Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Fri, 10 May 2024 13:23:25 +0300
+Subject: [PATCH] [SW-183143] gaudi3: check sys_halt_r instead halt_run_ack
+
+ARC never updates the status register for "0" value on arc_run_ack
+and arc_halt_ack signals til next reset.
+
+So, after halt or run requested we should check sys_halt_r instead of
+halt_ack or run_ack bit.
+
+Change-Id: Ida15aeb20cdc900a1ed7a072ca2aea99c930f009
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 9ae0f06..26eb13b 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -892,6 +892,7 @@
+ 	return 0;
+ }
+ 
++#define PIF_ARC_RST_OFF		mmPIF_ARC_ARC_RST
+ #define PIF_RUN_HALT_REQ_OFF	mmPIF_ARC_RUN_HALT_REQ
+ #define PIF_RUN_HALT_ACK_OFF	mmPIF_ARC_RUN_HALT_ACK
+ #define ARC_RUN_ACK_TIMEOUT_US	100
+@@ -900,13 +901,24 @@
+ {
+ 	u32 run_ack_reg = data->cpu_cfg_base + PIF_RUN_HALT_ACK_OFF;
+ 	u32 run_req_reg = data->cpu_cfg_base + PIF_RUN_HALT_REQ_OFF;
++	u32 rst_reg = data->cpu_cfg_base + PIF_ARC_RST_OFF;
+ 	u64 start;
++
++	/*
++	 * Since SYS_HALT_R bit at reset and ARC runnig state value is 0.
++	 * So, before putting ARC in running state and check SYS_HALT_R,
++	 * ensure that ARC is out of reset.
++	 */
++	if (regmap_readl(rst_reg) & PIF_ARC_ARC_RST_CORE_M) {
++		preboot_puts("Still PIF ARC is in reset state\n");
++		return;
++	}
+ 
+ 	/* Set ARC in running state */
+ 	regmap_writel(PIF_ARC_RUN_HALT_REQ_RUN_REQ_M, run_req_reg);
+ 
+ 	start = timestamp_get_us();
+-	while (!(regmap_readl(run_ack_reg) & PIF_ARC_RUN_HALT_ACK_RUN_ACK_M)) {
++	while ((regmap_readl(run_ack_reg) & PIF_ARC_RUN_HALT_ACK_SYS_HALT_R_M)) {
+ 		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
+ 			preboot_puts_hex("No running state ack from PIF ARC ",
+ 					 data->die_id, false);
+@@ -917,7 +929,6 @@
+ 	regmap_writel(0x0, run_req_reg);
+ }
+ 
+-#define PIF_ARC_RST_OFF		mmPIF_ARC_ARC_RST
+ #define ARC_HALT_ACK_TIMEOUT_US	100
+ 
+ static void ppboot_halt_n_reset_pif_arc(u32 cpu_cfg_base)
+@@ -940,7 +951,7 @@
+ 		start = timestamp_get_us();
+ 		while (true) {
+ 			val = regmap_readl(halt_ack_reg);
+-			if (val & PIF_ARC_RUN_HALT_ACK_HALT_ACK_M)
++			if (val & PIF_ARC_RUN_HALT_ACK_SYS_HALT_R_M)
+ 				break;
+ 
+ 			if (timeout_expired(start, ARC_HALT_ACK_TIMEOUT_US)) {

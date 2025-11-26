@@ -1,0 +1,264 @@
+From 0d63be0da782420998f8239ba905602075ce38f6 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 10 Mar 2021 21:58:32 +0200
+Subject: [PATCH] [SW-34719] gaudi: rma: support to get rma info
+
+Added a function rma_info_get() which reads rma
+information from flash.
+
+This function expect a valid buffer. On success,
+this function fill the buffer of desired rma table type,
+updates size argument with actual table size read from flash
+and returns 0. On failure, it returns non-zero value.
+
+To avoid compilation error __attribute((unused))__ used for
+rma_info_get() in this patch. This will be removed in a patch which
+use rma_info_get().
+
+Change-Id: Ic9ddd6aac62650ce4995033cf61fb8530f85ad71
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/gaudi/Makefile b/gaudi/Makefile
+index 699aa0f..e9fe78b 100644
+--- a/gaudi/Makefile
++++ b/gaudi/Makefile
+@@ -5,6 +5,7 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/security.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/hbm.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/reset.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/rma_info.c)
+ 
+ CFLAGS += -mstrict-align
+ 
+diff --git a/gaudi/rma_info.c b/gaudi/rma_info.c
+new file mode 100644
+index 0000000..3f700f0
+--- /dev/null
++++ b/gaudi/rma_info.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <common.h>
++#include <sha256.h>
++#include <hl_boot_desc.h>
++#include <string.h>
++#include "uart.h"
++#include "rma_if.h"
++
++#define ROUND_UP4(n)	(((n) + sizeof(u32) - 1) & ~(sizeof(u32) - 1))
++#define MAX_SIZE_ONE_RMA_TABLE	sizeof(struct rma_sram_ecc_entry)
++#define RMA_TABLE_HEADER_SIZE	sizeof(struct table_header)
++
++#define MAX_INFO_DESC_DATA	\
++	((MAX_SRAM_ECC_ENTRIES * MAX_SIZE_ONE_RMA_TABLE) + RMA_TABLE_HEADER_SIZE)
++
++#define FLASH_STORAGE_BLOCK0	0x100000
++#define FLASH_STORAGE_BLOCK1	(FLASH_STORAGE_BLOCK0 + 0x10000)
++#define FLASH_SECTOR_SIZE	0x10000
++#define FLASH_NUM_FLASH_INFO	2
++#define FLASH_SECTOR_MAGIC	0xAA55AA55
++
++struct flash_header {
++	union {
++		struct {
++			u32 magic;
++			u32 stamp;
++			u32 reserved[6];
++		} __packed;
++		u32 data[8];
++	};
++} __packed;
++
++struct flash_mem_context {
++	u32 base[FLASH_NUM_FLASH_INFO];
++	u32 flash_size[FLASH_NUM_FLASH_INFO];
++};
++
++struct flash_mem_context flash_mem_context = {
++	.base = { FLASH_STORAGE_BLOCK0, FLASH_STORAGE_BLOCK1 },
++	.flash_size = { FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE },
++};
++
++static int flash_read(size_t offset, void *data, size_t size)
++{
++	int flash_select = -1;
++	u32 flash_offset;
++	struct flash_header header0, header1;
++
++	if (size + offset > flash_mem_context.flash_size[0])
++		return 1;
++
++	/* on every read we first choose a valid sector to read from */
++	spi_copy(&header0, flash_mem_context.base[0],
++				sizeof(struct flash_header), "Flash sector validity");
++
++	spi_copy(&header1, flash_mem_context.base[1],
++				sizeof(struct flash_header), "Flash sector validity");
++
++	if (header0.magic == FLASH_SECTOR_MAGIC &&
++	    header1.magic == FLASH_SECTOR_MAGIC) {
++		if (header1.stamp > header0.stamp)
++			flash_select = 1;
++		else
++			flash_select = 0;
++	} else if (header0.magic == FLASH_SECTOR_MAGIC) {
++		flash_select = 0;
++	} else if (header1.magic == FLASH_SECTOR_MAGIC) {
++		flash_select = 1;
++	}
++
++	if (flash_select < 0) {
++		/*
++		 * if no magic found returns a dummy zero, because framework requires
++		 * a success return. In this case framework will than try to search
++		 * for the boot-pointer validity, and return failure if not valid.
++		 */
++		memset(data, 0, size);
++		return 0;
++	}
++
++	flash_offset = flash_mem_context.base[flash_select] + offset
++						+ sizeof(struct flash_header);
++	spi_copy(data, flash_offset, size, "Flash Read");
++
++	return 0;
++}
++
++/* TODO: __attribute__((unused)) to be removed in a patch which would use this function */
++__attribute__((unused)) static int rma_info_get(u32 type, void *data, u32 *size)
++{
++	struct hl_boot_info_ptrs ptrs;
++	struct hl_boot_info_desc desc;
++	u32 i;
++	u8 chksum[HL_CHKSUM_SIZE];
++	int err;
++	u32 desc_offset, desc_start = sizeof(struct hl_boot_info_ptrs);
++
++	err = flash_read(0, &ptrs, sizeof(struct hl_boot_info_ptrs));
++	if (err)
++		return err;
++
++	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
++		return 1;
++
++	for (i = 0; i < ptrs.count; i++) {
++		err = flash_read(desc_start + i * sizeof(u32),
++					&desc_offset, sizeof(desc_offset));
++		if (err)
++			return err;
++
++		err = flash_read(desc_offset,
++				    &desc, sizeof(struct hl_boot_info_desc));
++		if (err)
++			return err;
++
++		if (type != desc.type)
++			continue;
++
++		if (desc.magic != (HL_BOOT_INFO_DESC_MAGIC | type))
++			return 1;
++
++		if (desc.size > *size)
++			return 1;
++
++		err = flash_read(desc.offset, data, ROUND_UP4(desc.size));
++		if (err)
++			return err;
++
++		sha256_csum((u8 *)data, desc.size, chksum);
++		if (memcmp(chksum, desc.chksum, HL_CHKSUM_SIZE))
++			return 1;
++
++		*size = desc.size;
++		return 0;
++	}
++
++	return 1;
++}
+diff --git a/include/i2cslave_indirect.h b/include/i2cslave_indirect.h
+new file mode 100644
+index 0000000..2ad5023
+--- /dev/null
++++ b/include/i2cslave_indirect.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _I2CSLAVE_INDIRECT_H_
++#define _I2CSLAVE_INDIRECT_H_
++
++#include <hl_fw_if.h>
++
++u8 i2csi_req_handle_sts(u8 cmd);
++u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
++u32 i2csi_req_handle_wdata(u8 cmd, u8 **data, u8 cnt);
++u32 i2csi_req_handle_cfg(u8 cmd, u8 **data, u8 cnt);
++u32 i2csi_ctrl_handle_command(u8 cmd, u8 **data, u8 cnt);
++u8 i2csi_ctrl_handle_status(u8 cmd);
++void i2csi_req_set_idle(void);
++void i2csi_req_handle_sync_error(void);
++void i2csi_req_handle_process_op(void);
++bool i2csi_req_is_process_op(void);
++bool i2csi_req_op_is_fast(void);
++bool i2csi_ctrl_is_rst_dev(void);
++void i2csi_set_boot_err(enum hl_fw_fit_boot_error err,
++			bool is_linux_boot_fail);
++
++#endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+deleted file mode 100644
+index 2ad5023..0000000
+--- a/preboot/i2cslave_indirect.h
++++ /dev/null
+@@ -1,28 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+ */
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _I2CSLAVE_INDIRECT_H_
+-#define _I2CSLAVE_INDIRECT_H_
+-
+-#include <hl_fw_if.h>
+-
+-u8 i2csi_req_handle_sts(u8 cmd);
+-u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
+-u32 i2csi_req_handle_wdata(u8 cmd, u8 **data, u8 cnt);
+-u32 i2csi_req_handle_cfg(u8 cmd, u8 **data, u8 cnt);
+-u32 i2csi_ctrl_handle_command(u8 cmd, u8 **data, u8 cnt);
+-u8 i2csi_ctrl_handle_status(u8 cmd);
+-void i2csi_req_set_idle(void);
+-void i2csi_req_handle_sync_error(void);
+-void i2csi_req_handle_process_op(void);
+-bool i2csi_req_is_process_op(void);
+-bool i2csi_req_op_is_fast(void);
+-bool i2csi_ctrl_is_rst_dev(void);
+-void i2csi_set_boot_err(enum hl_fw_fit_boot_error err,
+-			bool is_linux_boot_fail);
+-
+-#endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 112c08b..3888d02 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -306,6 +306,8 @@
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_conf_iatu_access(bool enable) {}
++__weak void preboot_process_last_rma_info(void) {}
++
+ void preboot_main(void)
+ {
+ 	u64 ver_off = (uintptr_t)preboot_vers;

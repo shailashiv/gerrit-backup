@@ -1,0 +1,135 @@
+From 0ce3ddb9c036795f0b14cdeef087df45bf634834 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 31 May 2021 15:47:04 +0300
+Subject: [PATCH] [SW-44018] gaudi: adding rate limiters init sequence
+
+Copying rate limiters initialization logic from uboot to preboot.
+
+Change-Id: I436886bcf7d0f8245beb692c7cdaf9ea14fbadf2
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index df6fa69..a6d6aca 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -16,6 +16,9 @@
+ #include <tpc1_qm_regs.h>
+ #include <cpu_if_regs.h>
+ #include <psoc_efuse_regs.h>
++#include <dma_if_w_s_down_regs.h>
++#include <dma_if_w_s_down_ch0_regs.h>
++#include <dma_if_w_s_down_ch1_regs.h>
+ 
+ #include <string.h>
+ #include <bitops.h>
+@@ -451,3 +454,75 @@
+ 
+ 	return true;
+ }
++
++/*
++ * rate limiter parameters for 800MHz clock. that's the only clock currently
++ * supported for gaudi hbm in preboot
++ */
++#define GAUDI_HBM_RL_SAT		4
++#define GAUDI_HBM_RL_RST		11
++#define GAUDI_HBM_RL_TIMEOUT		15
++
++#define GAUDI_HBM_MID_WGHT		0x111
++#define GAUDI_HBM_CH_DIST		0x20000
++#define GAUDI_HBM_NUM_DEVICES		4
++#define GAUDI_FUSE_DEV_ID_WORD_OFFSET	2
++
++void preboot_rate_limiter_init(void)
++{
++	int i, ret;
++	u32 base, dev_type;
++	char dev_maj, dev_min;
++
++	ret = preboot_fuse_read(GAUDI_FUSE_DEV_ID_WORD_OFFSET, &dev_type);
++	if (ret)
++		return;
++
++	dev_type = __builtin_bswap32(dev_type);
++	dev_maj = (u8)((dev_type >> 8) & 0xff);
++	dev_min = (u8)(dev_type & 0xff);
++	if (!dev_min)
++		dev_min = '0';
++
++	/* rate limiters are initialized for A0 and B0 devices only */
++	if ((dev_min != '0') || ((dev_maj != 'A') && (dev_maj != 'B')))
++		return;
++
++	for (i = 0; i < GAUDI_HBM_NUM_DEVICES; i++) {
++		base = i * GAUDI_HBM_CH_DIST;
++		regmap_writel(GAUDI_HBM_MID_WGHT,
++			      base + mmDMA_IF_W_S_DOWN_RSP_MID_WGHT_0);
++		regmap_writel(GAUDI_HBM_MID_WGHT,
++			      base + mmDMA_IF_W_S_DOWN_RSP_MID_WGHT_1);
++		regmap_writel(GAUDI_HBM_RL_SAT,
++			      base + mmDMA_IF_W_S_DOWN_CH0_RL_HBM_SAT);
++		regmap_writel(GAUDI_HBM_RL_SAT,
++			      base + mmDMA_IF_W_S_DOWN_CH1_RL_HBM_SAT);
++		regmap_writel(GAUDI_HBM_RL_RST,
++			      base + mmDMA_IF_W_S_DOWN_CH0_RL_HBM_RST);
++		regmap_writel(GAUDI_HBM_RL_RST,
++			      base + mmDMA_IF_W_S_DOWN_CH1_RL_HBM_RST);
++		regmap_writel(GAUDI_HBM_RL_TIMEOUT,
++			      base + mmDMA_IF_W_S_DOWN_CH0_RL_HBM_TIMEOUT);
++		regmap_writel(GAUDI_HBM_RL_TIMEOUT,
++			      base + mmDMA_IF_W_S_DOWN_CH1_RL_HBM_TIMEOUT);
++		regmap_writel(1, base + mmDMA_IF_W_S_DOWN_CH0_RL_HBM_EN);
++		regmap_writel(1, base + mmDMA_IF_W_S_DOWN_CH1_RL_HBM_EN);
++		regmap_writel(GAUDI_HBM_RL_SAT,
++			      base + mmDMA_IF_W_S_DOWN_CH0_RL_SRAM_SAT);
++		regmap_writel(GAUDI_HBM_RL_SAT,
++			      base + mmDMA_IF_W_S_DOWN_CH1_RL_SRAM_SAT);
++		regmap_writel(GAUDI_HBM_RL_RST,
++			      base + mmDMA_IF_W_S_DOWN_CH0_RL_SRAM_RST);
++		regmap_writel(GAUDI_HBM_RL_RST,
++			      base + mmDMA_IF_W_S_DOWN_CH1_RL_SRAM_RST);
++		regmap_writel(GAUDI_HBM_RL_TIMEOUT,
++			      base + mmDMA_IF_W_S_DOWN_CH0_RL_SRAM_TIMEOUT);
++		regmap_writel(GAUDI_HBM_RL_TIMEOUT,
++			      base + mmDMA_IF_W_S_DOWN_CH1_RL_SRAM_TIMEOUT);
++		regmap_writel(1, base + mmDMA_IF_W_S_DOWN_CH0_RL_SRAM_EN);
++		regmap_writel(1, base + mmDMA_IF_W_S_DOWN_CH1_RL_SRAM_EN);
++	}
++
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_RL_EN, true);
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 2766364..56a0832 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -195,6 +195,8 @@
+ u32 preboot_error_read_and_clr(u32 *major, u32 *minor);
+ bool preboot_error_inform(u32 major, u32 minor);
+ bool preboot_error_is_pending(void);
++
++void preboot_rate_limiter_init(void);
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index d099eb6..7e5cb79 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -361,6 +361,7 @@
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_process_last_rma_info(void) {}
++__weak void preboot_rate_limiter_init(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -392,6 +393,8 @@
+ 	/* Get the VendorID before we lock the access to configuration space */
+ 	preboot_retrieve_device_id_from_pcie();
+ 
++	preboot_rate_limiter_init();
++
+ 	preboot_security_init();
+ 	preboot_security_dynamic_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_SECURITY_READY);

@@ -1,0 +1,63 @@
+From d7ed61bd57bd438aaefc2cbf380656f04cc159bc Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Mon, 24 May 2021 18:40:33 +0300
+Subject: [PATCH] [SW-43147] gaudi: ras: protect efuse region
+
+PSOC EFUSE memory region is protected from being
+accessed using "CONFIG_ACCESS" opcode 7.
+
+Change-Id: I1afc0895603050cd6501baa80f76a642fe97ca3f
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index fb2fe26..e04ed2b 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -15,6 +15,7 @@
+ #include <tpc0_qm_regs.h>
+ #include <tpc1_qm_regs.h>
+ #include <cpu_if_regs.h>
++#include <psoc_efuse_regs.h>
+ 
+ #include <string.h>
+ #include <bitops.h>
+@@ -432,3 +433,13 @@
+ 
+ 	return (btl_id & 0x3) - 1;
+ }
++
++bool i2c_config_is_address_valid(u32 addr)
++{
++	/* Check if address falls in EFUSE SPACE */
++	if (addr >= mmPSOC_EFUSE_READ &&
++		(addr < (mmPSOC_EFUSE_READ + PSOC_EFUSE_SECTION)))
++		return false;
++
++	return true;
++}
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 2217fef..f529609 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -571,11 +571,19 @@
+ 	}
+ }
+ 
++__weak bool i2c_config_is_address_valid(u32 addr)
++{
++	return true;
++}
++
+ static inline void i2csi_req_process_write_opcode(void)
+ {
+ 	switch (req_wd.hdr.opcode) {
+ 	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
+-		i2csi_req_config_access();
++		if (i2c_config_is_address_valid(op_config.address))
++			i2csi_req_config_access();
++		else
++			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
+ 		break;
+ 	case HL_I2CI_REQ_OP_FW_LOADER:
+ 		i2csi_req_load_fw();

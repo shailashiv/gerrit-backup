@@ -1,0 +1,105 @@
+From 891d2137925e557f50c783d5aaf652c29b81d8b8 Mon Sep 17 00:00:00 2001
+From: Peleg Vigodny <peleg.vigodny@tandemg.com>
+Date: Tue, 06 Jul 2021 15:12:07 +0300
+Subject: [PATCH] [SW-48529] erom: implement recovery function
+
+Implement the recovery function which will be stored in EROM (extended
+ROM). This function will be called in the event of failure during boot,
+setting up basic I2C and PCI backends which will allow performing FW
+update.
+
+Change-Id: Iaa826a70b2809fbcd3d4e506cd1a2e581dc75719
+Signed-off-by: Peleg Vigodny <peleg.vigodny@tandemg.com>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index eb6f897..01639f9 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -4,12 +4,16 @@
+ HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
+ PREBOOT_ROOT_DIR := ../..
+ HL_DEV_ARCH := $(PREBOOT_ROOT_DIR)/arch/$(BASE_DEV_NAME)/$(HL_DEV_SUBTYPE)
++HL_DEV_ARCH_COMMON := $(PREBOOT_ROOT_DIR)/arch/$(BASE_DEV_NAME)/common
++SPECS_DEV := $(shell echo $(HL_DEV) | cut -d'_' -f1)
+ 
++CFLAGS += -I$(SPECS_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c
+ CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(HL_DEV_ARCH)/
++CFLAGS += -include $(SPECS_EMBEDDED_DIR)/$(SPECS_DEV)/$(SPECS_DEV)_reg_map.h
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+@@ -32,11 +36,27 @@
+ 	$(HL_DEV_ARCH)/../common/common.o \
+ 	$(HL_DEV_ARCH)/common.o
+ 
++PREBOOT_SRCS_C := $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
++PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/*.c)
++PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/lzo/*.c)
++PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/app/preboot/*.c)
++PREBOOT_SRCS_C := $(filter-out $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
++
++include $(HL_DEV_ARCH)/Makefile
++
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
++PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
++
++EROM_RECOVERY_DEPS := ${PREBOOT_OBJECTS} # EROM recovery image contains entire preboot image
++
++EROM_RECOVERY_EXTRA_LIBS := "-lfdt"
++
+ .PHONY: all
+ all: erom_recovery erom_pcie erom_tpm
+ 
+-erom_recovery: erom_recovery.o $(EROM_APP_OBJECTS) $(EROM_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(EROM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(LDLIBS) -Wl,--end-group
++erom_recovery: erom_recovery.o $(EROM_RECOVERY_DEPS) $(EROM_APP_OBJECTS) $(EROM_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(EROM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_RECOVERY_DEPS) $(LDLIBS) $(EROM_RECOVERY_EXTRA_LIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+ erom_pcie: erom_pcie.o $(EROM_APP_OBJECTS) $(EROM_PCIE_DEPS) $(EROM_LD_SCRIPT)
+diff --git a/app/ext_rom/erom_recovery.c b/app/ext_rom/erom_recovery.c
+index 5fc6ae0..5fa69c0 100644
+--- a/app/ext_rom/erom_recovery.c
++++ b/app/ext_rom/erom_recovery.c
+@@ -5,20 +5,9 @@
+  *
+  */
+ 
+-#include <stdint.h>
+-#include <psoc_global_conf_regs.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_if.h>
+-
+-#define ADDR_SW_STATUS_3_REG	0xFCC6020C
+-
+-void erom_recovery(void)
+-{
+-	/* Updating the SW status 3 register */
+-	*(uint32_t *)(ADDR_SW_STATUS_3_REG) = 1;
+-}
++#include "preboot.h"
+ 
+ void erom_main_function(void)
+ {
+-	erom_recovery();
++	preboot_main();
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index 94c7b52..56254fe 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -208,6 +208,8 @@
+ void preboot_init_pcie_phy(void);
+ void preboot_engines_init(void);
+ 
++void preboot_main(void);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */

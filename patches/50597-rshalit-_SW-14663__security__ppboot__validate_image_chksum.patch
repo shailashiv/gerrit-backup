@@ -1,0 +1,218 @@
+From 249261c65fbbb90ebdc460066ab43a9179a411d4 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Mon, 12 Oct 2020 16:51:46 +0300
+Subject: [PATCH] [SW-14663] security: ppboot: validate image chksum
+
+Validate SHA256 of preboot image, if checksum fails,
+try the other image, and in case that both images
+fail checksum, shall enter recovery mode.
+
+Change-Id: Ie623d9eff29e5c7a17e3043143c6320897cd8b3e
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/ppboot/boot_desc.c b/ppboot/boot_desc.c
+index 8c07667..e8550d1 100644
+--- a/ppboot/boot_desc.c
++++ b/ppboot/boot_desc.c
+@@ -4,6 +4,7 @@
+  * All Rights Reserved.
+  *
+  */
++#include <string.h>
+ #include <stdbool.h>
+ #include <preboot.h>
+ #include <hl_fw_if.h>
+@@ -103,6 +104,10 @@
+ 		desc->img_size = img_desc[i].size[idx];
+ 		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
+ 					img_desc[i].load_low[idx];
++		desc->desc_ver = img_desc[i].desc_ver;
++		memcpy(desc->chksum, img_desc[i].chksum[idx],
++		       ARRAY_SIZE(desc->chksum));
++
+ 		return idx;
+ 	}
+ 
+diff --git a/ppboot/boot_desc.h b/ppboot/boot_desc.h
+index ef52ef0..67f261a 100644
+--- a/ppboot/boot_desc.h
++++ b/ppboot/boot_desc.h
+@@ -10,13 +10,16 @@
+ #include <preboot.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_desc.h>
++#include <sha256.h>
+ 
+ #define HL_FW_IMG_NOT_FOUND	((u32)-1)
+ 
+ struct boot_desc {
++	u32 desc_ver;
+ 	u32 spi_offset;
+ 	u32 img_size;
+ 	u64 loadaddr;
++	u8 chksum[SHA256_SUM_LEN];
+ };
+ 
+ /*
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+index d05fa03..5e77e43 100644
+--- a/ppboot/ppboot.c
++++ b/ppboot/ppboot.c
+@@ -5,6 +5,7 @@
+  *
+  */
+ 
++#include <string.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <cpu_ca53_cfg_regs.h>
+@@ -19,46 +20,88 @@
+ #include "pll.h"
+ #include <boot_if.h>
+ 
+-static enum fw_post_reset_cmd preboot_image_offset(struct boot_desc *desc)
++static bool ppboot_is_valid_img_desc(struct boot_desc *desc)
+ {
+-	u32 image_pending = regmap_readl(mmUPD_PENDING_STS);
+-	u32 idx;
++	u8 hash[SHA256_SUM_LEN];
+ 
+-	if (boot_desc_init()) {
+-		idx = boot_desc_get_img_desc(image_pending,
+-					     HL_FW_IMG_PREBOOT, desc);
+-		if (idx != HL_FW_IMG_NOT_FOUND)
+-			return image_pending;
+-	}
++	sha256_csum((void *)desc->loadaddr, desc->img_size, hash);
+ 
+-	preboot_puts("No boot descriptors detected, need recovery!!!\n");
+-	preboot_puts("Trying hard coded Preboot offsets (might hang)...\n");
+-
+-	desc->spi_offset = HL_SPI_LEGACY_PREBOOT_OFF;
+-	desc->img_size = PREBOOT_SIZE;
+-	desc->loadaddr = PREBOOT_TEXT_BASE;
+-
+-	return image_pending;
++	return !memcmp(hash, desc->chksum, ARRAY_SIZE(hash));
+ }
+ 
+-__weak u64 copy_preboot(void)
++static bool ppboot_try_candidate_img(enum fw_post_reset_cmd image_pending,
++				     struct boot_desc *desc, bool isPri)
+ {
+-	char *name = "PREBOOT";
+-	struct boot_desc desc;
+-	enum fw_post_reset_cmd upd_pending = preboot_image_offset(&desc);
++	bool is_valid = true;
++	u32 idx, bit;
++	char *msg;
++
++	idx = boot_desc_get_img_desc(image_pending,
++				     HL_FW_IMG_PREBOOT, desc);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return false;
+ 
+ 	preboot_puts_raw("Preparing to run Preboot ");
+-	if (upd_pending != FLOPS_UPD_PENDING)
++	if (image_pending != FLOPS_UPD_PENDING)
+ 		preboot_puts_raw("stable");
+ 	else
+ 		preboot_puts_raw("candidate");
+ 
+-	preboot_puts_hex_raw(" (offset: ", desc.spi_offset, false);
+-	preboot_puts_hex_raw(", size: ", desc.img_size, false);
++	preboot_puts_hex_raw(" (offset: ", desc->spi_offset,
++			false);
++	preboot_puts_hex_raw(", size: ", desc->img_size, false);
+ 	preboot_puts(")\n");
+ 
+-	ppboot_cp_preboot(desc.loadaddr, desc.spi_offset, desc.img_size, name);
+-	return desc.loadaddr;
++	ppboot_cp_preboot(desc->loadaddr, desc->spi_offset,
++			desc->img_size, "PREBOOT");
++	if (desc->desc_ver > 1) {
++		is_valid  = ppboot_is_valid_img_desc(desc);
++		if (!is_valid)
++			preboot_puts("Checksum is not valid.\n");
++	}
++	if (!is_valid) {
++		if (!isPri) {
++			bit = CPU_BOOT_ERR0_SEC_IMG_VER_FAIL;
++			msg = "Secondary is not a valid image.";
++		} else {
++			bit = CPU_BOOT_ERR0_PRI_IMG_VER_FAIL;
++			msg = "Primary is not a valid image.";
++		}
++		cpu_boot_err_clrset(bit, true);
++		preboot_puts_raw(msg);
++	}
++
++	return is_valid;
++}
++
++static bool ppboot_load_preboot_img(u64 *loadaddr)
++{
++	struct boot_desc desc;
++	bool ret;
++	enum fw_post_reset_cmd image_pending = regmap_readl(mmUPD_PENDING_STS);
++
++	/* Initialize load address with illegal value */
++	if (!boot_desc_init()) {
++		preboot_puts_raw("Not a valid boot desc.");
++		return false;
++	}
++
++	ret = ppboot_try_candidate_img(image_pending, &desc, true);
++	if (ret) {
++		*loadaddr = desc.loadaddr;
++		return true;
++	}
++
++	/* Try the secondary image by toggling image_pending argument */
++	image_pending = (image_pending == FLOPS_UPD_PENDING) ? FLOPS_UPD_NOOP :
++			 FLOPS_UPD_PENDING;
++	ret = ppboot_try_candidate_img(image_pending, &desc, false);
++	if (ret) {
++		*loadaddr = desc.loadaddr;
++		return true;
++	}
++
++	return false;
+ }
+ 
+ static void rst_src_dump(void)
+@@ -162,9 +205,22 @@
+ 	preboot_puts("Ppboot " VERSION_STR "\n");
+ }
+ 
++static u64 load_legacy_image(void)
++{
++	u64 loadaddr = PREBOOT_TEXT_BASE;
++
++	preboot_puts("No boot descriptors detected, need recovery!!!\n");
++	preboot_puts("Trying hard coded Preboot offsets (might hang)...\n");
++	ppboot_cp_preboot(loadaddr, HL_SPI_LEGACY_PREBOOT_OFF,
++			  PREBOOT_SIZE, "PREBOOT");
++
++	return loadaddr;
++}
++
+ void ppboot_main(void)
+ {
+ 	u64 loadaddr;
++	bool ret;
+ 
+ 	hl_plat_init();
+ 	hl_init_pcie_phy_fw();
+@@ -183,7 +239,9 @@
+ 	rst_src_dump();
+ 
+ 	preboot_delay();
+-	loadaddr = copy_preboot();
++	ret = ppboot_load_preboot_img(&loadaddr);
++	if (!ret)
++		loadaddr = load_legacy_image();
+ 
+ 	image_start(loadaddr);
+ }

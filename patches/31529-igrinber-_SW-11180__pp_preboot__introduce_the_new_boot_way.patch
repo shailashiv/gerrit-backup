@@ -1,0 +1,280 @@
+From f1c3f269763b482c37fc607ae12f0ca8fe6c9b4d Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 02 Apr 2020 01:57:41 +0300
+Subject: [PATCH] [SW-11180] pp/preboot: introduce the new boot way
+
+The new boot way uses the image descriptors to obtain information about
+the next image that should be loaded from SPI flash and run.
+The root image pointers structure and the image descriptors providing a
+flexible approach to the FW images offsets on flash.
+This way each image has its own 2 offsets: one for stable image and one
+for modifiable (candidate) and thus each image can be updated on its own
+w/o having to update the rest of the images.
+This patch adds a backward compatible ability to boot with the new image
+descriptors. Currently used images are Preboot and U-Boot.
+
+Change-Id: I0675090e9c0da7dd3def00f50ec6dd4daeec8d02
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index 5961977..ea26897 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -10,6 +10,7 @@
+ #include <cpu_ca53_cfg_regs.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_if.h>
++#include <boot_desc.h>
+ 
+ #include "common.h"
+ #include "preboot.h"
+@@ -28,10 +29,9 @@
+ 	return (id == 1) ? HL_SPI_SECONDARY_BASE : HL_SPI_PRIMARY_BASE;
+ }
+ 
+-static enum fw_post_reset_cmd preboot_image_offset(u32 *offset)
++static enum fw_post_reset_cmd preboot_image_offset_legacy(u32 image_pending,
++							  u32 *offset)
+ {
+-	u32 upd_pending_reg = get_upd_pending_sts_reg();
+-	u32 image_pending = regmap_readl(upd_pending_reg);
+ 	u32 next_img_off = HL_SPI_NEXT_IMAGE_OFF;
+ 	char *name = "NEXT";
+ 
+@@ -43,10 +43,27 @@
+ 
+ 	*offset = next_image_base_offset(next_img_off, name) +
+ 						HL_SPI_LEGACY_PREBOOT_OFF;
+-
+ 	return image_pending;
+ }
+ 
++static enum fw_post_reset_cmd preboot_image_offset(u32 *offset)
++{
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++	u32 image_pending = regmap_readl(upd_pending_reg);
++	u32 off;
++
++	if (boot_desc_init()) {
++		off = boot_desc_get_offset(image_pending, HL_FW_IMG_PREBOOT);
++		if (off != HL_FW_IMG_NOT_FOUND) {
++			*offset = off;
++			return image_pending;
++		}
++	}
++
++	preboot_puts("No boot descriptors detected, falling back to legacy\n");
++	return preboot_image_offset_legacy(image_pending, offset);
++}
++
+ static void copy_preboot(void)
+ {
+ 	char *name = "PREBOOT";
+diff --git a/app/preboot.c b/app/preboot.c
+index a398b27..4571a71 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -13,6 +13,7 @@
+ #include <preboot.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_if.h>
++#include <boot_desc.h>
+ 
+ #include "common.h"
+ #include "uart.h"
+@@ -64,10 +65,8 @@
+ 	return ret;
+ }
+ 
+-static u32 next_image_offset(bool *pending)
++static u32 next_image_offset_legacy(u32 image_pending, bool *pending)
+ {
+-	u32 upd_pending_reg = get_upd_pending_sts_reg();
+-	u32 image_pending = regmap_readl(upd_pending_reg);
+ 	u32 base_off;
+ 
+ 	/* Check for normal boot */
+@@ -79,6 +78,24 @@
+ 	return base_off + HL_SPI_LEGACY_UBOOT_OFF;
+ }
+ 
++static u32 next_image_offset(bool *pending)
++{
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++	u32 image_pending = regmap_readl(upd_pending_reg);
++	u32 offset;
++
++	if (boot_desc_init()) {
++		offset = boot_desc_get_offset(image_pending, HL_FW_IMG_UBOOT);
++		if (offset != HL_FW_IMG_NOT_FOUND) {
++			*pending = image_pending;
++			return offset;
++		}
++	}
++
++	preboot_puts("No boot descriptors detected, falling back to legacy\n");
++	return next_image_offset_legacy(image_pending, pending);
++}
++
+ static void preboot_copy_uboot(void)
+ {
+ 	char *name = "U-Boot";
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+new file mode 100644
+index 0000000..ed3258c
+--- /dev/null
++++ b/common/boot_desc.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <stdbool.h>
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++
++#include "boot_desc.h"
++#include "spi.h"
++#include "uart.h"
++
++#define MAX_IMGS		5
++#define HL_FW_BOOT_PTRS_BASE	HL_SPI_NEXT_IMAGE_OFF
++
++#define BOOT_PTRS_SZ		sizeof(struct hl_fw_boot_ptrs)
++#define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
++
++static struct hl_fw_boot_ptrs boot_ptrs;
++static struct hl_fw_img_desc img_desc[MAX_IMGS];
++
++static void boot_desc_print_magic(char *name, struct hl_fw_boot_magic *magic)
++{
++	int i;
++
++	preboot_puts_raw(name);
++	preboot_puts_raw(" magic: ");
++	/* Strings do not obey endianness - print in reverse order */
++	for (i = ARRAY_SIZE(magic->name) - 1; i >= 0; i--)
++		preboot_putc_raw(magic->name[i]);
++
++	preboot_puts_hex_raw(" type: ", magic->type, false);
++	preboot_puts_hex(" value: ", magic->val, true);
++}
++
++static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
++
++	if ((img_desc->magic.val & 0xFFFFFF00) != HL_FW_IMG_DESC_MAGIC)
++		return false;
++
++	if (img_desc->desc_ver > HL_FW_IMG_DESC_CUR_VER)
++		return false;
++
++	if (img_desc->idx >= 2)
++		return false;
++
++	return true;
++}
++
++int boot_desc_init(void)
++{
++	unsigned int count, i;
++	u32 spi_off = HL_FW_BOOT_PTRS_BASE;
++	u32 desc_offs[MAX_IMGS] = { 0 };
++
++	/* Read the main boot pointers structure */
++	spi_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
++	boot_desc_print_magic("FW boot PTRs", &boot_ptrs.magic);
++
++	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
++		return 0;
++
++	count = boot_ptrs.count;
++
++	/* Read all the descriptors offsets */
++	spi_off += sizeof(struct hl_fw_boot_ptrs);
++	spi_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
++
++	/* Read all descriptors */
++	for (i = 0; i < count; i++) {
++		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
++		spi_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
++		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
++			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
++			return 0;
++		}
++	}
++
++	return count;
++}
++
++u32 boot_desc_get_offset(enum fw_post_reset_cmd upd_status,
++			 enum hl_fw_img_type type)
++{
++	int i, idx;
++
++	preboot_puts_hex_raw("Looking for image type: ", type, false);
++	for (i = 0; i < boot_ptrs.count; i++) {
++		if (img_desc[i].magic.type != type)
++			continue;
++
++		idx = img_desc[i].idx;
++		if (upd_status == FLOPS_UPD_PENDING)
++			idx = (idx + 1) % 2;
++
++		preboot_puts_hex(" - found! using index: ", idx, false);
++
++		return img_desc[i].offset[idx];
++	}
++
++	preboot_puts(" - not found!\n");
++	return HL_FW_IMG_NOT_FOUND;
++}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+new file mode 100644
+index 0000000..b64e0f1
+--- /dev/null
++++ b/common/boot_desc.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#ifndef _BOOT_DESC_H_
++#define _BOOT_DESC_H_
++
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
++
++#define HL_FW_IMG_NOT_FOUND	((u32)-1)
++
++/*
++ * boot_desc_init() - read and initialize the boot image pointers structures
++ *
++ * Returns: the amount of images available, or 0 - no images available - legacy
++ */
++int boot_desc_init(void);
++
++/*
++ * boot_desc_get_offset() - get the offset of the requested image
++ *
++ * @upd_status	- FLOPS_UPD_PENDING - for modifiable image offset,
++ *		  other values - for stable image offset
++ * @type	- the image type to look for
++ *
++ * Returns:
++ * On success: the offset to the requested image
++ * On failure: (u32)-1 (no image by the requested type)
++ */
++u32 boot_desc_get_offset(enum fw_post_reset_cmd upd_status,
++			 enum hl_fw_img_type type);
++
++#endif /* _BOOT_DESC_H_ */

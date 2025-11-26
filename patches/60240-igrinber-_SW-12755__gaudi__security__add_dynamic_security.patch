@@ -1,0 +1,411 @@
+From e59f5ef4e3add3deb955cb32c4d26b42f902d61f Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 16 Nov 2020 18:17:11 +0200
+Subject: [PATCH] [SW-12755] gaudi: security: add dynamic security
+
+The dynamic security is the concept when the FW dynamically open and
+close memory windows for writing and reading by the non-privileged
+entities.
+Here the dynamic security is implemented according to host requests and
+the predefined number of windows.
+
+In addition the SRAM security involves the a W/A to H/W limitation.
+The main limitation is the sharing of the same SRAM access router by
+PCIe initiator and the TPC3 initiator. So to prevent TPC3 from accessing
+the SRAM during the FW sensitive boot time, the "secured" Range
+Registers are used (because TPC3 is user level of privilege) and the
+privileged RRs of the same router are dynamically opened. This is
+becaues the HBW routers uses the base + mask concept for protecting
+memory regions and thus have a limitation of protecting sizes of maximum
+the base aligned size. Yet to prevent the PCIe initiator to access
+sensible memory regions, the "in PCIe_IF" RRs are used that are
+implemented using the min/max concept - providing the needed flexibility
+to handle various scenarios for access windows requirements.
+
+To spare the dependencies between FW boot components, we cleanup before
+loading the next component. The cleanup undoes the W/A and closes the
+SRAM using the regular HBW router RRs.
+
+Change-Id: Id465416d0bd8a4a52ed4d247731c12b65bdbc33f
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 2883c73..b0c2631 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1230,20 +1230,63 @@
+ 	}
+ }
+ 
++static void preboot_secure_hbw_tpc3_seclvl_rr(u64 base, u64 mask, bool close)
++{
++	u32 base_l = (u32)base, base_h = (u32)(base >> BITS_IN_REG);
++	u32 mask_l = (u32)mask, mask_h = (u32)(mask >> BITS_IN_REG);
++	u32 hit;
++
++	regmap_writel(base_l, mmSIF_RTR_CTRL_7_RANGE_SEC_BASE_LOW_AW_0);
++	regmap_writel(base_h, mmSIF_RTR_CTRL_7_RANGE_SEC_BASE_HIGH_AW_0);
++	regmap_writel(mask_l, mmSIF_RTR_CTRL_7_RANGE_SEC_MASK_LOW_AW_0);
++	regmap_writel(mask_h, mmSIF_RTR_CTRL_7_RANGE_SEC_MASK_HIGH_AW_0);
++	regmap_writel(base_l, mmSIF_RTR_CTRL_7_RANGE_SEC_BASE_LOW_AR_0);
++	regmap_writel(base_h, mmSIF_RTR_CTRL_7_RANGE_SEC_BASE_HIGH_AR_0);
++	regmap_writel(mask_l, mmSIF_RTR_CTRL_7_RANGE_SEC_MASK_LOW_AR_0);
++	regmap_writel(mask_h, mmSIF_RTR_CTRL_7_RANGE_SEC_MASK_HIGH_AR_0);
++
++	/* Enable (hit) RR */
++	hit = regmap_readl(mmSIF_RTR_CTRL_7_RANGE_SEC_HIT_AW) & ~BIT(0);
++	if (close)
++		hit |= BIT(0);
++	regmap_writel(hit, mmSIF_RTR_CTRL_7_RANGE_SEC_HIT_AW);
++
++	hit = regmap_readl(mmSIF_RTR_CTRL_7_RANGE_SEC_HIT_AR) & ~BIT(0);
++	if (close)
++		hit |= BIT(0);
++	regmap_writel(hit, mmSIF_RTR_CTRL_7_RANGE_SEC_HIT_AR);
++}
++
++static void preboot_secure_hbw_tpc3_seclvl_close(void)
++{
++	u32 prot_base = mmSIF_RTR_CTRL_7_BASE & ~HL_CFG_BASE;
++
++	/* secure protection bits */
++	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX);
++
++	/* Define mask of 32MB, so we close the SRAM in one shot */
++	preboot_secure_hbw_tpc3_seclvl_rr(SDRAM_BASE, 0x3FFFFE000000, true);
++}
++
++static void preboot_secure_hbw_tpc3_seclvl_open(void)
++{
++	u32 prot_base = mmSIF_RTR_CTRL_7_BASE & ~HL_CFG_BASE;
++
++	preboot_secure_hbw_tpc3_seclvl_rr(0, 0, false);
++
++	/* secure protection bits */
++	preboot_secure_set_prot_bits_if_rtr_ctrl(prot_base);
++}
++
+ static void preboot_secure_hbw_sram(void)
+ {
+-	/*
+-	 * TODO: The below (both SRAM parts) are commented out temporarily
+-	 * until the dynamic SRAM RR protection is in place.
+-	 */
+ 	/* SRAM RR 0x7F_F000_0000 - 0x7F_F100_0000 (16MB) */
+-/*	preboot_secure_hbw_rr(HBW_RR_SRAM_BGN,
++	preboot_secure_hbw_rr(HBW_RR_SRAM_BGN,
+ 			      HBW_RR_SRAM_BGN_BASE, HBW_RR_SRAM_BGN_MASK);
+-*/
++
+ 	/* SRAM RR 0x7F_F100_0000 - 0x7F_F140_0000 (4MB) */
+-/*	preboot_secure_hbw_rr(HBW_RR_SRAM_END,
++	preboot_secure_hbw_rr(HBW_RR_SRAM_END,
+ 			      HBW_RR_SRAM_END_BASE, HBW_RR_SRAM_END_MASK);
+-*/
+ }
+ 
+ #define mmSTM_BASE	0x7FF4000000ULL
+@@ -1366,3 +1409,140 @@
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, false);
+ 	preboot_puts("Security init finished.\n");
+ }
++
++#define SRAM_SIZE	0x1400000	/* 20MB */
++#define SRAM_END	(SDRAM_BASE + SRAM_SIZE)
++#define BOOT_FIT_START	(SDRAM_BASE + BOOT_FIT_SRAM_OFFSET)
++#define BOOT_FIT_MAX_SZ	0x100000	/* 1MB */
++#define BOOT_FIT_END	(BOOT_FIT_START + BOOT_FIT_MAX_SZ)
++
++enum preboot_sec_rr_names {
++	SRAM_BGN_TO_VERS = 0,
++	VERSION,
++	VERS_END_TO_IMG,
++	IMAGE,
++	IMG_END_TO_SRAM_END,
++};
++
++struct preboot_sec_dyn_pcie_rr_cfg {
++	int rr;
++	u64 min;
++	u64 max;
++};
++
++static struct preboot_sec_dyn_pcie_rr_cfg preboot_sec_dyn_cfg[] = {
++	[SRAM_BGN_TO_VERS] = {
++		.rr = PCIE_DYN_RR_SRAM_BGN,
++		.min = SDRAM_BASE - 1,
++		.max = 0,	/* version start */
++	},
++	[VERSION] = {
++		.rr = PCIE_DYN_RR_SRAM_R1,
++		.min = 0,	/* version start */
++		.max = 0,	/* version end */
++	},
++	[VERS_END_TO_IMG] = {
++		.rr = PCIE_DYN_RR_SRAM_R2,
++		.min = 0,	/* version end */
++		.max = BOOT_FIT_START,
++	},
++	[IMAGE] = {
++		.rr = PCIE_DYN_RR_SRAM_R3,
++		.min = BOOT_FIT_START - 1,
++		.max = BOOT_FIT_END,
++	},
++	[IMG_END_TO_SRAM_END] = {
++		.rr = PCIE_DYN_RR_SRAM_END,
++		.min = BOOT_FIT_END - 1,
++		.max = SRAM_END,
++	}
++};
++
++void preboot_security_dynamic_img_close(void)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg = &preboot_sec_dyn_cfg[IMAGE];
++
++	/* TODO: uncomment for release */
++/*	if (!preboot_security_is_enabled())
++		return;
++*/
++	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
++}
++
++void preboot_security_dynamic_img_open(void)
++{
++	preboot_secure_pcie_rr(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
++}
++
++void preboot_security_dynamic_vers_init(u64 vers_off, u32 size)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	u64 vers_max = vers_off + size;
++	int i;
++
++	/* TODO: uncomment for release */
++/*	if (!preboot_security_is_enabled())
++		return;
++*/
++	/* Set PCIe RRs to allow read access to versions */
++	preboot_sec_dyn_cfg[SRAM_BGN_TO_VERS].max = vers_off;
++	preboot_sec_dyn_cfg[VERSION].min = vers_off - 1;
++	preboot_sec_dyn_cfg[VERSION].max = vers_max;
++	preboot_sec_dyn_cfg[VERS_END_TO_IMG].min = vers_max - 1;
++
++	/* Apply the versions RRs configuration */
++	for (i = SRAM_BGN_TO_VERS; i <= VERS_END_TO_IMG; i++) {
++		cfg = &preboot_sec_dyn_cfg[i];
++		if (i == VERSION) {	/* keep the version read only */
++			preboot_secure_pcie_rr_wr(cfg->rr, cfg->min, cfg->max);
++			preboot_secure_pcie_rr_rd(cfg->rr, 0, 0);
++			continue;
++		}
++
++		preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
++	}
++}
++
++void preboot_security_dynamic_init(void)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	int i;
++
++	/* TODO: uncomment for release */
++/*	if (!preboot_security_is_enabled())
++		return;
++*/
++	/*
++	 * TPC_3 is sharing SIF_7 RTR with PCIe, so we close its access to SRAM
++	 * via the secured level RRs. This is to prevent it from
++	 * accessing SRAM while opening part of SRAM to PCIe access.
++	 */
++	preboot_secure_hbw_tpc3_seclvl_close();
++
++	/* Start of init - close SRAM for PCIe access */
++	preboot_secure_pcie_rr(PCIE_DYN_RR_SRAM_END, SDRAM_BASE - 1, SRAM_END);
++
++	/* Apply all already known configurations */
++	for (i = SRAM_BGN_TO_VERS; i <= IMG_END_TO_SRAM_END; i++) {
++		cfg = &preboot_sec_dyn_cfg[i];
++
++		if (cfg->rr >= 0 && cfg->min && cfg->max)
++			preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
++	}
++
++	/* Disable the SIF7 HBW SRAM_IF_DYN_RR_BGN - SRAM_IF_DYN_RR_END */
++	for (i = HBW_RR_SRAM_BGN; i <= HBW_RR_SRAM_END; i++)
++		preboot_security_pci_rtr_disable(i);
++}
++
++void preboot_security_cleanup_before_run(void)
++{
++	/* TODO: uncomment for release */
++/*	if (!preboot_security_is_enabled())
++		return;
++*/
++	/* Enable the SIF7 HBW SRAM_IF_DYN_RR_BGN - SRAM_IF_DYN_RR_END */
++	preboot_secure_hbw_sram();
++
++	preboot_secure_hbw_tpc3_seclvl_open();
++}
+diff --git a/include/security.h b/include/security.h
+index 47fd2c2..8f26059 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -11,5 +11,10 @@
+ 
+ bool preboot_security_is_enabled(void);
+ void preboot_security_init(void);
++void preboot_security_dynamic_init(void);
++void preboot_security_dynamic_vers_init(u64 ver_off, u32 size);
++void preboot_security_dynamic_img_close(void);
++void preboot_security_dynamic_img_open(void);
++void preboot_security_cleanup_before_run(void);
+ 
+ #endif /* _HL_SECURITY_H_ */
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index f25fee4..9dc8314 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -12,6 +12,7 @@
+ #include <hl_fw_if.h>
+ #include <preboot.h>
+ #include <fit_load_type.h>
++#include <security.h>
+ 
+ #include "cmd_module.h"
+ #include "uart.h"
+@@ -79,6 +80,9 @@
+ static void module_fwupd_reset_state(void)
+ {
+ 	module_fwupd_send_status(HL_UPD_STS_RST_ACK, 0);
++
++	preboot_security_dynamic_img_close();
++
+ 	/* reset state should never fail */
+ 	module_fwupd_wfc(WFC_TIMEOUT_MS);
+ 	module_fwupd_send_status(HL_UPD_STS_RST_OK, 0);
+@@ -98,6 +102,8 @@
+ 		goto fwupd_map_err;
+ 	}
+ 
++	preboot_security_dynamic_img_open();
++
+ 	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
+ 	if (err)
+ 		goto fwupd_map_wfc_t;
+@@ -109,6 +115,8 @@
+ 	sts = HL_UPD_STS_TIMEOUT_ERR;
+ 	preboot_puts("Timeout error\n");
+ 
++	preboot_security_dynamic_img_close();
++
+ fwupd_map_err:
+ 	module_fwupd_send_status(sts, 0);
+ }
+@@ -119,6 +127,8 @@
+ 	enum hl_upd_sts sts;
+ 
+ 	module_fwupd_send_status(HL_UPD_STS_RUN_ACK, 0);
++
++	preboot_security_dynamic_img_close();
+ 
+ 	is_fit_checked = !fit_load_images();
+ 	if (!is_fit_checked) {
+@@ -140,6 +150,8 @@
+ 
+ fwupd_run_err:
+ 	module_fwupd_send_status(sts, 0);
++
++	preboot_security_dynamic_img_open();
+ }
+ 
+ void module_fwupd_run(void)
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 6e6c2ae..2993751 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -8,6 +8,7 @@
+ #include <hl_boot_if.h>
+ #include <preboot.h>
+ #include <boot_if.h>
++#include <security.h>
+ 
+ #include "cmd_module.h"
+ #include "uart.h"
+@@ -27,6 +28,7 @@
+ 
+ void module_lkd_setup(void)
+ {
++	preboot_security_dynamic_img_open();
+ 	module_lkd_enable();
+ }
+ 
+@@ -71,7 +73,17 @@
+ 
+ void module_lkd_run(void)
+ {
+-	sts.is_fit_checked = !fit_load_images();
++	int err;
++
++	preboot_security_dynamic_img_close();
++
++	err = fit_load_images();
++	if (err) {
++		preboot_security_dynamic_img_open();
++		return;
++	}
++
++	sts.is_fit_checked = true;
+ }
+ 
+ void module_lkd_run_noret(void)
+@@ -82,6 +94,7 @@
+ 		wfe();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
++		preboot_security_cleanup_before_run();
+ 		fit_run_image();
+ 		/* no break */
+ 	default:
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 78f38a9..577a264 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -196,6 +196,11 @@
+ }
+ 
+ __weak void preboot_security_init(void) {}
++__weak void preboot_security_dynamic_init(void) {}
++__weak void preboot_security_dynamic_vers_init(u64 ver_off, u32 size) {}
++__weak void preboot_security_dynamic_img_open(void) {}
++__weak void preboot_security_dynamic_img_close(void) {}
++__weak void preboot_security_cleanup_before_run(void) {}
+ __weak void preboot_led_on(void) {}
+ __weak void sram_scrambling_init(void) {}
+ 
+@@ -222,6 +227,8 @@
+ 
+ void preboot_main(void)
+ {
++	u64 ver_off = (uintptr_t)preboot_vers;
++
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+ 	/* Enable the errors communication */
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_ENABLED, true);
+@@ -237,11 +244,16 @@
+ 	hl_uart_init();
+ 
+ 	preboot_security_init();
++	preboot_security_dynamic_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_SECURITY_READY);
+ 
+ 	hl_ts_init();
++
++	/* Prepare boot FW versions and eFuse data for host */
+ 	preboot_version();
+ 	fuse_version();
++	preboot_security_dynamic_vers_init(ver_off, sizeof(preboot_vers));
++
+ 	preboot_led_on();
+ 	sram_scrambling_init();
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));

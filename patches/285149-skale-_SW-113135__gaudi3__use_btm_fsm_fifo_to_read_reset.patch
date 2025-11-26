@@ -1,0 +1,70 @@
+From a57feb25a427e88c8dec199b7420b77653563e58 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Tue, 20 Dec 2022 19:56:32 +0200
+Subject: [PATCH] [SW-113135] gaudi3: use btm fsm fifo to read reset source
+
+Currently ppboot makes use of rst_src register to get information
+about last reset source. FW needs to write this register to clear
+reset source. However as per Errata GAUDI3_0325, rst_src register
+is used by boot FSM and FW should avoid writing to register. This
+patch implements workaround and make use of BTM FSM FIFO to retrieve
+reset source information. Upon reading reset source information from
+BTM_FSM FIFO, it is copied to local structure and also needs to be
+copied to boot info which will be added in later patches.
+
+Change-Id: Ic1f1371fc3deb33d9b18d8c34898e237e9f09e4b
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 766d2fc..ae357b3 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -81,6 +81,13 @@
+ 	u8 img_idx;
+ };
+ 
++struct rst_src_data {
++	u8 src;
++	bool initialized;
++};
++
++static struct rst_src_data rst_src;
++
+ static struct hl_boot_info_desc *hl_boot_info_get_desc(int idx)
+ {
+ 	struct hl_boot_info_desc *desc = NULL;
+@@ -258,9 +265,32 @@
+ 
+ u32 hl_rst_src_get(void)
+ {
+-	u32 rst_src = regmap_readl(mmD0_PSOC_GLOBAL_CONF_RST_SRC);
++	u32 fifo_sts, fill_level;
+ 
+-	return rst_src;
++	if (rst_src.initialized)
++		return rst_src.src;
++
++	fifo_sts = regmap_readl(mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_STS);
++	if (fifo_sts & D0_PSOC_BOOT_CONF_BTM_RST_FIFO_STS_EMPTY_M) {
++		rst_src.src = HL_UNKNOWN_RST;
++		goto out;
++	}
++
++	fill_level = fifo_sts >> D0_PSOC_BOOT_CONF_BTM_RST_FIFO_STS_FILL_LEVEL_S;
++	for (; fill_level > 1; fill_level--)
++		regmap_writel(D0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL_POP_M,
++				mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL);
++
++	rst_src.src = regmap_readl(mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_HEAD) &
++					BTM_FSM_FIFO_HEAD_RST_SRC_MASK;
++
++	/* pop the last entry from FIFO */
++	regmap_writel(D0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL_POP_M,
++			mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL);
++
++	rst_src.initialized = true;
++out:
++	return rst_src.src;
+ }
+ 
+ void init_prstn(void)

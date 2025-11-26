@@ -1,0 +1,643 @@
+From 3b045e49e6304d6bd56ec2e067d49d4ea2d0c3ab Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 29 Jul 2020 11:12:19 +0300
+Subject: [PATCH] [SW-16674] preboot: move i2c slave functionality to common
+
+With the introduction of recovery image, it is expected to support
+i2c slave communication where it will respond to multiple command
+request from BMC end.
+
+This patch move i2c slave functionality to common folder which can
+be also used by recovery image
+
+Change-Id: I861c1d7efedb30948e706ac2b1553450d9dec9d9
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+new file mode 100644
+index 0000000..547e8d2
+--- /dev/null
++++ b/common/module_i2c_slave.c
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stddef.h>
++#include <psoc_global_conf_regs.h>
++#include <psoc_i2c_s_regs.h>
++#include <psoc_i2c_s_masks.h>
++#include <hl_fw_if.h>
++#include <pcie_dbi_regs.h>
++#include <preboot.h>
++#include <preboot/thermal.h>
++
++#include "cmd_module.h"
++#include "pll.h"
++#include "uart.h"
++#include "common.h"
++
++#define I2C_SLAVE_ADDRESS_DBG		0x47
++#define HL_DEVICE_STATUS_LINUX		0x0
++#define HL_DEVICE_STATUS_PREBOOT	0x1
++
++#define HL_DEVICE_STATUS_CMD_CODE_LEN		0x1
++#define HL_PCIE_VENDOR_ID_CMD_CODE_LEN		0x16
++
++static unsigned int cmd;
++static unsigned int read_bytes_count;
++
++enum preboot_i2c_slave_event_id {
++	HL_ASIC_TEMP_CMD_CODE = 0,
++	HL_ASIC_TEMP_MAX_VAL = 3,
++	HL_PCIE_VENDOR_ID_VAL_LOW = 9,
++	HL_PCIE_VENDOR_ID_VAL_HIGH = 10,
++	HL_DEVICE_STATUS_CMD_CODE = 165,
++	HL_DEVICE_STATUS = 166,
++};
++
++static void hl_i2c_slave_init(bool debug_mode)
++{
++	/* Check if already enabled */
++	if (regmap_readl(mmPSOC_I2C_S_IC_ENABLE)) {
++		preboot_puts("I2C SLAVE already initialized\n");
++		return;
++	}
++
++	if (debug_mode) {
++		regmap_writel(I2C_SLAVE_ADDRESS_DBG, mmPSOC_I2C_S_IC_SAR);
++	} else {
++		/* Program IC_SAR with address to which slave responds */
++		regmap_writel(I2C_SLAVE_ADDRESS, mmPSOC_I2C_S_IC_SAR);
++
++		/* Enable I2C Slave */
++		regmap_writel(0x1, mmPSOC_GLOBAL_CONF_I2C_SLV);
++
++		/* Enable I2C Slave interrupts */
++		regmap_writel(0x0, mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK);
++	}
++
++	/* Program IC_CON */
++	regmap_writel(0x22, mmPSOC_I2C_S_IC_CON);
++
++	/* Write to IC_INTR_MASK to enable all interrupts */
++	if (!debug_mode)
++		regmap_writel(0x7FFF, mmPSOC_I2C_S_IC_INTR_MASK);
++
++	/* Write to IC_RX_TL to set Rx FIFO threshold level */
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_RX_TL);
++
++	/* Write to IC_TX_TL to set Tx FIFO threshold level */
++	regmap_writel(0x7, mmPSOC_I2C_S_IC_TX_TL);
++
++	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
++	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
++}
++
++static u32 i2c_dw_read_clear_intrbits_slave(void)
++{
++	u32 stat;
++
++	/*
++	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
++	 * Ths unmasked raw version of interrupt status bits are available
++	 * in the IC_RAW_INTR_STAT register.
++	 *
++	 * That is,
++	 *   stat = regmap_readl(IC_INTR_STAT);
++	 * equals to,
++	 *   stat = regmap_readl(IC_RAW_INTR_STAT) & regmap_readl(IC_INTR_MASK);
++	 *
++	 * The raw version might be useful for debugging purposes.
++	 */
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/*
++	 * Do not use the IC_CLR_INTR register to clear interrupts, or
++	 * you'll miss some interrupts, triggered during the period from
++	 * regmap_readl(IC_INTR_STAT) to regmap_readl(IC_CLR_INTR).
++	 *
++	 * Instead, use the separately-prepared IC_CLR_* registers.
++	 */
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_ABRT_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_ABRT);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_UNDER_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_OVER_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_OVER);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_OVER_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_OVER);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_DONE_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_DONE);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_ACTIVITY_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_ACTIVITY);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_STOP_DET_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_STOP_DET);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_START_DET_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_START_DET);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_GEN_CALL_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_GEN_CALL);
++
++	return stat;
++}
++
++void module_i2c_s_setup(void)
++{
++	unsigned int stat;
++	bool debug_mode;
++
++	debug_mode = hl_is_debug_mode(HL_DEBUG_HW_I2C);
++
++	hl_i2c_slave_init(debug_mode);
++
++	if (!debug_mode) {
++		stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++			module_i2c_s_run_fast();
++
++		regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
++
++		stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++			module_i2c_s_run_fast();
++	}
++
++	preboot_puts("I2C SLAVE initialized\n");
++}
++
++enum cmd_check_res module_i2c_s_check(void)
++{
++	enum cmd_check_res res = NOT_FOUND;
++	unsigned int stat;
++
++	if (hl_is_debug_mode(HL_DEBUG_HW_I2C))
++		return res;
++
++	i2c_dw_read_clear_intrbits_slave();
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
++	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)) {
++		preboot_puts("I2C SLAVE: read request received\n");
++		res = FOUND_FAST_RETURN;
++	}
++
++	return res;
++}
++
++void module_i2c_s_disable(void)
++{
++	unsigned int stat;
++
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/* Clear requests before disabling */
++	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++		module_i2c_s_run_fast();
++
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_ENABLE);
++
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/* Make sure all requests are handled after disable */
++	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++		module_i2c_s_run_fast();
++
++	preboot_puts("I2C SLAVE: disabled\n");
++}
++
++static char i2cslave_pcie_vendor_id_cmd(int command_idx, int bytes_count)
++{
++	char ret;
++	unsigned int data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++
++	switch (command_idx + bytes_count) {
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++		data &= 0xFFFF;
++		ret = (data & 0xFF00) >> 8;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++		data &= 0xFFFF;
++		ret = data & 0xFF;
++		break;
++	default:
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
++static int i2cslave_handle_read_req(void)
++{
++	int max_tmp, ret;
++
++	switch (cmd) {
++	case HL_ASIC_TEMP_CMD_CODE:
++	case HL_ASIC_TEMP_MAX_VAL:
++		max_tmp = hl_ts_get_max_temp();
++		/* Convert from mC to C */
++		ret = max_tmp / 1000;
++		break;
++	case HL_DEVICE_STATUS_CMD_CODE:
++		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
++		break;
++	case HL_DEVICE_STATUS:
++		ret = HL_DEVICE_STATUS_PREBOOT;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++		ret = i2cslave_pcie_vendor_id_cmd(cmd, read_bytes_count);
++		break;
++	default:
++		/* NA */
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
++void module_i2c_s_run_fast(void)
++{
++	unsigned int stat;
++	int ret;
++
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) {
++		if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK) {
++			read_bytes_count = 0;
++
++			cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
++
++			/* clear read request */
++			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
++			stat = i2c_dw_read_clear_intrbits_slave();
++		} else {
++			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
++			regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
++			stat = i2c_dw_read_clear_intrbits_slave();
++		}
++
++		ret = i2cslave_handle_read_req();
++		read_bytes_count++;
++		regmap_writel(ret, mmPSOC_I2C_S_IC_DATA_CMD);
++		preboot_puts("I2C SLAVE: read request processed\n");
++	}
++}
++
++void module_i2c_s_teardown(void)
++{
++	unsigned int val;
++
++	/* Write 0 to IC_ENABLE to disable DW_apb_i2c */
++	regmap_writel(0, mmPSOC_I2C_S_IC_ENABLE);
++
++	/* wait for disable to impact */
++	udelay(100);
++
++	/* Disable all interrupts */
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_INTR_MASK);
++	regmap_readl(mmPSOC_I2C_S_IC_CLR_INTR);
++
++	/* Write IC_SLAVE_DISABLE to IC_CON */
++	val = regmap_readl(mmPSOC_I2C_S_IC_CON);
++	val |= PSOC_I2C_S_IC_CON_IC_SLAVE_DISABLE_MASK;
++	regmap_writel(val, mmPSOC_I2C_S_IC_CON);
++
++	/* Make sure all transactions arrived */
++	udelay(1000);
++
++	val = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/* Make sure all requests are handled after disable */
++	if (val & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++		   PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++		module_i2c_s_run_fast();
++
++	preboot_puts("I2C SLAVE: tear down done\n");
++}
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+deleted file mode 100644
+index 919185b..0000000
+--- a/preboot/module_i2c_slave.c
++++ /dev/null
+@@ -1,308 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-#include <psoc_global_conf_regs.h>
+-#include <psoc_i2c_s_regs.h>
+-#include <psoc_i2c_s_masks.h>
+-#include <hl_fw_if.h>
+-#include <pcie_dbi_regs.h>
+-#include <preboot.h>
+-
+-#include "thermal.h"
+-#include "cmd_module.h"
+-#include "pll.h"
+-#include "uart.h"
+-#include "common.h"
+-
+-#define I2C_SLAVE_ADDRESS_DBG		0x47
+-#define HL_DEVICE_STATUS_LINUX		0x0
+-#define HL_DEVICE_STATUS_PREBOOT	0x1
+-
+-#define HL_DEVICE_STATUS_CMD_CODE_LEN		0x1
+-#define HL_PCIE_VENDOR_ID_CMD_CODE_LEN		0x16
+-
+-static unsigned int cmd;
+-static unsigned int read_bytes_count;
+-
+-enum preboot_i2c_slave_event_id {
+-	HL_ASIC_TEMP_CMD_CODE = 0,
+-	HL_ASIC_TEMP_MAX_VAL = 3,
+-	HL_PCIE_VENDOR_ID_VAL_LOW = 9,
+-	HL_PCIE_VENDOR_ID_VAL_HIGH = 10,
+-	HL_DEVICE_STATUS_CMD_CODE = 165,
+-	HL_DEVICE_STATUS = 166,
+-};
+-
+-static void hl_i2c_slave_init(bool debug_mode)
+-{
+-	/* Check if already enabled */
+-	if (regmap_readl(mmPSOC_I2C_S_IC_ENABLE)) {
+-		preboot_puts("I2C SLAVE already initialized\n");
+-		return;
+-	}
+-
+-	if (debug_mode) {
+-		regmap_writel(I2C_SLAVE_ADDRESS_DBG, mmPSOC_I2C_S_IC_SAR);
+-	} else {
+-		/* Program IC_SAR with address to which slave responds */
+-		regmap_writel(I2C_SLAVE_ADDRESS, mmPSOC_I2C_S_IC_SAR);
+-
+-		/* Enable I2C Slave */
+-		regmap_writel(0x1, mmPSOC_GLOBAL_CONF_I2C_SLV);
+-
+-		/* Enable I2C Slave interrupts */
+-		regmap_writel(0x0, mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK);
+-	}
+-
+-	/* Program IC_CON */
+-	regmap_writel(0x22, mmPSOC_I2C_S_IC_CON);
+-
+-	/* Write to IC_INTR_MASK to enable all interrupts */
+-	if (!debug_mode)
+-		regmap_writel(0x7FFF, mmPSOC_I2C_S_IC_INTR_MASK);
+-
+-	/* Write to IC_RX_TL to set Rx FIFO threshold level */
+-	regmap_writel(0x0, mmPSOC_I2C_S_IC_RX_TL);
+-
+-	/* Write to IC_TX_TL to set Tx FIFO threshold level */
+-	regmap_writel(0x7, mmPSOC_I2C_S_IC_TX_TL);
+-
+-	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
+-	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+-}
+-
+-static u32 i2c_dw_read_clear_intrbits_slave(void)
+-{
+-	u32 stat;
+-
+-	/*
+-	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
+-	 * Ths unmasked raw version of interrupt status bits are available
+-	 * in the IC_RAW_INTR_STAT register.
+-	 *
+-	 * That is,
+-	 *   stat = regmap_readl(IC_INTR_STAT);
+-	 * equals to,
+-	 *   stat = regmap_readl(IC_RAW_INTR_STAT) & regmap_readl(IC_INTR_MASK);
+-	 *
+-	 * The raw version might be useful for debugging purposes.
+-	 */
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/*
+-	 * Do not use the IC_CLR_INTR register to clear interrupts, or
+-	 * you'll miss some interrupts, triggered during the period from
+-	 * regmap_readl(IC_INTR_STAT) to regmap_readl(IC_CLR_INTR).
+-	 *
+-	 * Instead, use the separately-prepared IC_CLR_* registers.
+-	 */
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_ABRT_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_ABRT);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_UNDER_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_OVER_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_OVER);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_OVER_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_OVER);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_DONE_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_DONE);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_ACTIVITY_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_ACTIVITY);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_STOP_DET_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_STOP_DET);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_START_DET_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_START_DET);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_GEN_CALL_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_GEN_CALL);
+-
+-	return stat;
+-}
+-
+-void module_i2c_s_setup(void)
+-{
+-	unsigned int stat;
+-	bool debug_mode;
+-
+-	debug_mode = hl_is_debug_mode(HL_DEBUG_HW_I2C);
+-
+-	hl_i2c_slave_init(debug_mode);
+-
+-	if (!debug_mode) {
+-		stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-			module_i2c_s_run_fast();
+-
+-		regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+-
+-		stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-			module_i2c_s_run_fast();
+-	}
+-
+-	preboot_puts("I2C SLAVE initialized\n");
+-}
+-
+-enum cmd_check_res module_i2c_s_check(void)
+-{
+-	enum cmd_check_res res = NOT_FOUND;
+-	unsigned int stat;
+-
+-	if (hl_is_debug_mode(HL_DEBUG_HW_I2C))
+-		return res;
+-
+-	i2c_dw_read_clear_intrbits_slave();
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
+-	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)) {
+-		preboot_puts("I2C SLAVE: read request received\n");
+-		res = FOUND_FAST_RETURN;
+-	}
+-
+-	return res;
+-}
+-
+-void module_i2c_s_disable(void)
+-{
+-	unsigned int stat;
+-
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/* Clear requests before disabling */
+-	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
+-
+-	regmap_writel(0x0, mmPSOC_I2C_S_IC_ENABLE);
+-
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/* Make sure all requests are handled after disable */
+-	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
+-
+-	preboot_puts("I2C SLAVE: disabled\n");
+-}
+-
+-static char i2cslave_pcie_vendor_id_cmd(int command_idx, int bytes_count)
+-{
+-	char ret;
+-	unsigned int data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+-
+-	switch (command_idx + bytes_count) {
+-	case HL_PCIE_VENDOR_ID_VAL_LOW:
+-		data &= 0xFFFF;
+-		ret = (data & 0xFF00) >> 8;
+-		break;
+-	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		data &= 0xFFFF;
+-		ret = data & 0xFF;
+-		break;
+-	default:
+-		ret = 0;
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+-static int i2cslave_handle_read_req(void)
+-{
+-	int max_tmp, ret;
+-
+-	switch (cmd) {
+-	case HL_ASIC_TEMP_CMD_CODE:
+-	case HL_ASIC_TEMP_MAX_VAL:
+-		max_tmp = hl_ts_get_max_temp();
+-		/* Convert from mC to C */
+-		ret = max_tmp / 1000;
+-		break;
+-	case HL_DEVICE_STATUS_CMD_CODE:
+-		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
+-		break;
+-	case HL_DEVICE_STATUS:
+-		ret = HL_DEVICE_STATUS_PREBOOT;
+-		break;
+-	case HL_PCIE_VENDOR_ID_VAL_LOW:
+-	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		ret = i2cslave_pcie_vendor_id_cmd(cmd, read_bytes_count);
+-		break;
+-	default:
+-		/* NA */
+-		ret = 0;
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+-void module_i2c_s_run_fast(void)
+-{
+-	unsigned int stat;
+-	int ret;
+-
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) {
+-		if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK) {
+-			read_bytes_count = 0;
+-
+-			cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
+-
+-			/* clear read request */
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+-			stat = i2c_dw_read_clear_intrbits_slave();
+-		} else {
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
+-			stat = i2c_dw_read_clear_intrbits_slave();
+-		}
+-
+-		ret = i2cslave_handle_read_req();
+-		read_bytes_count++;
+-		regmap_writel(ret, mmPSOC_I2C_S_IC_DATA_CMD);
+-		preboot_puts("I2C SLAVE: read request processed\n");
+-	}
+-}
+-
+-void module_i2c_s_teardown(void)
+-{
+-	unsigned int val;
+-
+-	/* Write 0 to IC_ENABLE to disable DW_apb_i2c */
+-	regmap_writel(0, mmPSOC_I2C_S_IC_ENABLE);
+-
+-	/* wait for disable to impact */
+-	udelay(100);
+-
+-	/* Disable all interrupts */
+-	regmap_writel(0x0, mmPSOC_I2C_S_IC_INTR_MASK);
+-	regmap_readl(mmPSOC_I2C_S_IC_CLR_INTR);
+-
+-	/* Write IC_SLAVE_DISABLE to IC_CON */
+-	val = regmap_readl(mmPSOC_I2C_S_IC_CON);
+-	val |= PSOC_I2C_S_IC_CON_IC_SLAVE_DISABLE_MASK;
+-	regmap_writel(val, mmPSOC_I2C_S_IC_CON);
+-
+-	/* Make sure all transactions arrived */
+-	udelay(1000);
+-
+-	val = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/* Make sure all requests are handled after disable */
+-	if (val & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-		   PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
+-
+-	preboot_puts("I2C SLAVE: tear down done\n");
+-}

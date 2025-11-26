@@ -1,0 +1,155 @@
+From 4cfcd7b23cd04e0c92d8f326b74f010dc0b6165d Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 27 Oct 2021 08:53:53 +0300
+Subject: [PATCH] [SW-36216] gaudi2: ppboot: configure lbw rr
+
+As per the gaudi2 lbw spec we close non-privileged access to lbw cfg
+and debug space before the pcie linkup.
+
+Change-Id: I4b2d929ba0af0b65f0e5adf9ace9922f3ef875ef
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index bc09dec..02798a4 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -261,6 +261,8 @@
+ 	ppboot_check_stack_mon_dev_specific();
+ }
+ 
++__weak void ppboot_security_init(void) {}
++
+ void ppboot_main(void)
+ {
+ 	u64 loadaddr;
+@@ -281,6 +283,7 @@
+ 	preboot_sync_btl();
+ 	hl_uart_init();
+ 	spi_flash_prot_early();
++	ppboot_security_init();
+ 	hl_pcie_init();
+ 	ppboot_pcie_drain_init();
+ 	ppboot_version();
+diff --git a/arch/gaudi2/arc/Makefile b/arch/gaudi2/arc/Makefile
+index e63d810..cd2501f 100644
+--- a/arch/gaudi2/arc/Makefile
++++ b/arch/gaudi2/arc/Makefile
+@@ -9,5 +9,6 @@
+ PREBOOT_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/preboot/thermal_v2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
+ 
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/security.c)
+ image_validation: image_validation_common
+ image_validation: image_validation_preboot
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 9564cfe..b95e0e5 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -11,13 +11,14 @@
+ #include <security.h>
+ #include <uart.h>
+ #include <hl_protbits_fw_if.h>
++#include <string.h>
+ #include <psoc_arc0_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc0_mstr_if_core_lbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_lbw_regs.h>
+ #include <dcore0_rtr0_mstr_if_rr_shrd_lbw_regs.h>
+ #include <pcie_lbw_rr_mstr_if_rr_shrd_lbw_regs.h>
+-#include <psoc_mstr_if_rr_shrd_lbw_regs.h>
++#include <jt_mstr_if_rr_shrd_lbw_regs.h>
+ #include <sft0_lbw_rtr_if_mstr_if_rr_shrd_lbw_regs.h>
+ 
+ /*
+@@ -95,6 +96,8 @@
+  * transactions for the input address range.
+  */
+ enum gaudi2_sec_if_lbw_rrs {
++	HL_SEC_LBW_DBG_CFG_SPACE = 0,
++	HL_SEC_LBW_PSOC_GLBL_CONF = 1,
+ 	HL_SEC_LBW_MAX_RR_IDX = 18,
+ };
+ 
+@@ -102,7 +105,7 @@
+ #define SFT_DIST	0x10000
+ #define IF_RTR_DIST	0x8000
+ #define PCIE_INST_NUM	1
+-#define PSOC_INST_NUM	PCIE_INST_NUM
++#define PSOC_INST_NUM	3 /* JTAG, SMI, I2C */
+ #define SFT_INST_NUM	PCIE_INST_NUM
+ #define SHIFT_4K_POS	12
+ 
+@@ -129,13 +132,13 @@
+ 	},
+ 	[HL_SEC_ENGINE_PSOC] = {
+ 		.instances_num = PSOC_INST_NUM,
+-		.instances_dist = 0,
+-		.min_short_breg = mmPSOC_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_SHORT_0,
+-		.max_short_breg = mmPSOC_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_SHORT_0,
+-		.min_full_breg = mmPSOC_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
+-		.max_full_breg = mmPSOC_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0,
+-		.hit_wr_breg = mmPSOC_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW,
+-		.hit_rd_breg = mmPSOC_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR,
++		.instances_dist = 0x1000,
++		.min_short_breg = mmJT_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmJT_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmJT_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmJT_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmJT_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmJT_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR,
+ 	},
+ 	[HL_SEC_ENGINE_SFT] = {
+ 		.instances_num = SFT_INST_NUM,
+@@ -213,7 +216,7 @@
+ 		hl_secure_update_rr_reg(rr_idx, cfg->instances_dist * i, &rr_reg);
+ }
+ 
+-__unused static void hl_secure_lbw_rr(int rr_idx, u64 min, u64 max, struct hl_rr_eng_select rr_sel)
++static void hl_secure_lbw_rr(int rr_idx, u64 min, u64 max, struct hl_rr_eng_select rr_sel)
+ {
+ 	int i;
+ 
+@@ -314,6 +317,31 @@
+ 	preboot_puts("gaudi2 protection bits configured\n");
+ }
+ 
++static void ppboot_secure_lbw(void)
++{
++	u64 min, max;
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++
++	/* Block only pcie RR in ppboot */
++	rr_sel.pcie = true;
++
++	/* CFG SPACE: 0x1000007FF8000000 - 0x1000007FFFFFFFFF */
++	min = CFG_BASE;
++	max = CFG_BASE + CFG_SIZE - 1;
++	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
++}
++
++void ppboot_security_init(void)
++{
++	/* Initialize only if security is enabled */
++	if (!preboot_security_is_enabled())
++		return;
++
++	ppboot_secure_lbw();
++}
++
+ void preboot_security_init(void)
+ {
+ 	preboot_secure_arc();
+diff --git a/include/preboot.h b/include/preboot.h
+index 9671826..9ebdc00 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -239,6 +239,7 @@
+ void ppboot_init_stack_mon_dev_specific(void);
+ void ppboot_check_stack_mon_dev_specific(void);
+ void ppboot_pcie_drain_init(void);
++void ppboot_security_init(void);
+ 
+ void preboot_main(void);
+ 

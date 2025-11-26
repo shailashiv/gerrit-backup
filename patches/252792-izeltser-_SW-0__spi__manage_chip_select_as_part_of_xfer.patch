@@ -1,0 +1,66 @@
+From 8c9a225d561d56ea417fd974013409d1f76244aa Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 08 Sep 2022 14:57:00 +0300
+Subject: [PATCH] [SW-0] spi: manage chip select as part of xfer
+
+The spi driver was taken from u-boot but it was changed so the
+bus claim/release functionality in not managed by spi_xfer()
+and the SPI_XFER_BEGIN SPI_XFER_END flags are ignored.
+This creates a bug in the TPM implementation (also taken from uboot),
+in a scenario of a long packet that is being split into several
+shorter packets, the bus is released in the middle of the
+transaction.
+This patch is fixing this bug by using the same method as UBOOT:
+managing the bus claim/release from spi_xfer().
+
+Change-Id: I8d0dce90c3b15e35b0588f756c7015e5a69909de
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+index c5fda69..0517b03 100644
+--- a/arch/gaudi2/common/tpm2.c
++++ b/arch/gaudi2/common/tpm2.c
+@@ -298,8 +298,6 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	spi_tpm_claim_bus();
+-
+ 	while (len) {
+ 		/* Request */
+ 		transfer_len = min_t(u16, len, MAX_SPI_FRAMESIZE);
+@@ -353,8 +351,6 @@
+ 			preboot_puts("TPM2: spi read transfer failed\n");
+ 			goto release_bus;
+ 		}
+-
+-		spi_tpm_release_bus();
+ 
+ 		if (in) {
+ 			memcpy(in, rx_buf, transfer_len);
+diff --git a/lib/common/spi.c b/lib/common/spi.c
+index d4a9dc8..8db05c1 100644
+--- a/lib/common/spi.c
++++ b/lib/common/spi.c
+@@ -337,6 +337,9 @@
+ 
+ 	priv.ctx = ctx;
+ 
++	if ((flags & SPI_XFER_BEGIN) && (priv.ctx->claim_bus))
++		priv.ctx->claim_bus();
++
+ 	/* spi core configured to do 8 bit transfers */
+ 	if (bitlen % 8) {
+ 		preboot_puts("Non byte aligned SPI transfer.\n");
+@@ -393,6 +396,10 @@
+ 		ret = -1;
+ 	}
+ 
++	/* Stop the transaction */
++	if ((flags & SPI_XFER_END) && (priv.ctx->release_bus))
++		priv.ctx->release_bus();
++
+ 	return ret;
+ }
+ 

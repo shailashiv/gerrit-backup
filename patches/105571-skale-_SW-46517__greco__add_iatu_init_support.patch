@@ -1,0 +1,113 @@
+From 098dee4c3195aed0ffaeb429a909eaf4d12e2bde Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 23 Jun 2021 20:02:16 +0300
+Subject: [PATCH] [SW-46517] greco: add iatu init support
+
+This patch adds IATU init support in preboot for secureboot
+flow. This changes are ported from legacy flow.
+
+Change-Id: Idb99906c475b42714e99021d945c532328597e0a
+---
+
+diff --git a/arch/greco_arc/common.c b/arch/greco_arc/common.c
+index 1ae5b23..2457972 100644
+--- a/arch/greco_arc/common.c
++++ b/arch/greco_arc/common.c
+@@ -46,6 +46,7 @@
+ #include <efuse.h>
+ #include <string.h>
+ #include <pci.h>
++#include <boot_if.h>
+ 
+ #include "common.h"
+ 
+@@ -325,6 +326,8 @@
+ 	/* Functionality used to be done in BTL */
+ 	init_prstn();
+ 
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_IATU_CONF_EN, true);
++
+ 	/*
+ 	 * Upon MANUAL, WATCHDOG, SW ALL, PRSTN, FLR and FW reset
+ 	 * restart boot sequence.
+diff --git a/arch/greco_arc_gnu/asic.c b/arch/greco_arc_gnu/asic.c
+index aee6d37..40e76e1 100644
+--- a/arch/greco_arc_gnu/asic.c
++++ b/arch/greco_arc_gnu/asic.c
+@@ -7,11 +7,13 @@
+ 
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_gpio0_regs.h>
++#include <cpu_if_regs.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <pci.h>
+ 
+ #include "common.h"
+ 
+@@ -60,3 +62,30 @@
+ 
+ 	return factor > 2 ? factor : 2;
+ }
++
++void hl_pci_iatu_init(void)
++{
++	struct hl_pci_inbound_region inbound_region;
++	struct hl_pci_outbound_region outbound_region;
++
++	hl_pcie_disable_access();
++
++	/* Inbound Region 0 - Bar - - Point to SRAM and CFG */
++	inbound_region.mode = PCI_BAR_MATCH_MODE;
++	inbound_region.bar = PCI_BAR_ID_0;
++	inbound_region.addr = SDRAM_FULL_BASE;
++	hl_pci_set_inbound_region(0, &inbound_region);
++
++	/* Inbound Region 1 - Bar 4 - Point to DRAM */
++	inbound_region.mode = PCI_BAR_MATCH_MODE;
++	inbound_region.bar = PCI_BAR_ID_4;
++	inbound_region.addr = DRAM_BASE;
++	hl_pci_set_inbound_region(1, &inbound_region);
++
++	/* Outbound Region 0 - Point to Host */
++	outbound_region.addr = HOST_PHYS_BASE;
++	outbound_region.size = HOST_PHYS_SIZE;
++	hl_pci_set_outbound_region(&outbound_region);
++
++	hl_pcie_enable_access();
++}
+diff --git a/arch/greco_arc_gnu/common.c b/arch/greco_arc_gnu/common.c
+index 836f220..f262d72 100644
+--- a/arch/greco_arc_gnu/common.c
++++ b/arch/greco_arc_gnu/common.c
+@@ -284,6 +284,11 @@
+ 			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+ }
+ 
++u32 dev_pci_dbi_cfg_offset_get(void)
++{
++	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
++}
++
+ /*
+  * This function makes sure no access is done from host to the SoC's PCIe IF.
+  * The inbound memory requests are disabled. The ELBI access gets "retry"
+diff --git a/arch/greco_arc_gnu/common.h b/arch/greco_arc_gnu/common.h
+index 0550e25..b85e34f 100644
+--- a/arch/greco_arc_gnu/common.h
++++ b/arch/greco_arc_gnu/common.h
+@@ -42,6 +42,11 @@
+ #define RECOVERY_SIZE		0x4000
+ 
+ #define SDRAM_BASE		0x10000000
++#define SDRAM_FULL_BASE		0x7FF0000000ull
++#define DRAM_BASE		0x1000000000000ull
++#define HOST_PHYS_BASE		0x2000000000000ull
++#define HOST_PHYS_SIZE		0x2000000000000ull
++
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+ 

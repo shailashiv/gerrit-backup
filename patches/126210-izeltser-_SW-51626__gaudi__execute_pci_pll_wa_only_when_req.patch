@@ -1,0 +1,101 @@
+From 75bcbbb0bb8a24eadfc7638dbd86b58b30b8cef6 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 02 Sep 2021 14:35:20 +0300
+Subject: [PATCH] [SW-51626] gaudi: execute pci pll wa only when required
+
+As a result of the warm reboot investigation [SW-47213] a pci pll
+workaround was implemented in order to fulfill 2 demands:
+1. pci pll div0 <= div2 during pci phy fw upgrade
+2. pci pll div0 = ~200Mhz for communication with the BMC.
+
+This workaround is required only during warm reboot and cold start,
+because only then the pci phy fw is being upgraded.
+performing this workaround at all times might be problematic
+since pci pll div2 is configured to a clock above it's specification,
+which can cause issues if a hot reset is being excuted at the same
+time.
+
+This patch performs the pci pll workaround only when it's really
+needed (cold start / warm reboot).
+
+Change-Id: I0fda0f10e92a90037ab9c34da5198d08004e0e13
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi/arm/pll.c b/arch/gaudi/arm/pll.c
+index b708e98..14f84fc 100644
+--- a/arch/gaudi/arm/pll.c
++++ b/arch/gaudi/arm/pll.c
+@@ -8,11 +8,14 @@
+ 
+ #include <gaudi_blocks.h>
+ #include <psoc_pci_pll_regs.h>
++#include <psoc_global_conf_regs.h>
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ 
+ #include "common.h"
++#include "hl.h"
++#include "string.h"
+ 
+ #define PCI_TMP_DIV	3	/* temporary divider setting for pci pll */
+ #define PCI_DIV2_FACTOR	7
+@@ -75,8 +78,8 @@
+ 	}, {
+ 		.name = "PCI", .base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE,
+ 		.nr = 4, .nf = 331, .od = 3, .nb = 165, /* 830 */
+-		.div_factor = { PCI_TMP_DIV, 0, PCI_TMP_DIV, 9 },
+-		.div_sel = { HL_PLL_DIV_PLL,	/* temporary setting */
++		.div_factor = { 0, 0, PCI_DIV2_FACTOR, 9 },
++		.div_sel = { HL_PLL_PLL_CLK,
+ 			     HL_PLL_PLL_CLK,
+ 			     HL_PLL_DIV_PLL,
+ 			     HL_PLL_DIV_PLL
+@@ -123,6 +126,7 @@
+ void hl_dev_pll_init(void)
+ {
+ 	int i;
++	unsigned int rst_src;
+ 
+ 	/* PLLs list to be set back to ref clock */
+ 	struct hl_pll_cfg gaudi_pll_ref_cfg[] =  {
+@@ -132,6 +136,20 @@
+ 		{ .base = mmNIC2_TPC_PLL_BASE & ~HL_CFG_BASE },
+ 	};
+ 
++	/* execute pci pll WA only when required */
++	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST)) {
++		for (i = 0; i < ARRAY_SIZE(gaudi_pll_cfg); i++) {
++			if (strcmp(gaudi_pll_cfg[i].name, "PCI") != 0)
++				continue;
++
++			gaudi_pll_cfg[i].div_factor[0] = PCI_TMP_DIV;
++			gaudi_pll_cfg[i].div_factor[2] = PCI_TMP_DIV;
++			gaudi_pll_cfg[i].div_sel[0] = HL_PLL_DIV_PLL;
++			break;
++		}
++	}
++
+ 	hl_pll_init(gaudi_pll_cfg, ARRAY_SIZE(gaudi_pll_cfg));
+ 
+ 	for (i = 0; i < ARRAY_SIZE(gaudi_pll_ref_cfg); i++)
+diff --git a/lib/preboot/module_pci.c b/lib/preboot/module_pci.c
+index 5d62e2c..cafbefb 100644
+--- a/lib/preboot/module_pci.c
++++ b/lib/preboot/module_pci.c
+@@ -128,8 +128,12 @@
+ 
+ void module_pci_run(void)
+ {
++	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++
+ 	if (!pci_sts.pci_pll_initialized) {
+-		hl_dev_pci_pll_wa();
++		if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
++			hl_dev_pci_pll_wa();
++
+ 		pci_sts.pci_pll_initialized = true;
+ 	}
+ }

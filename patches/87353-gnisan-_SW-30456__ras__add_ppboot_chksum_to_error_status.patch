@@ -1,0 +1,148 @@
+From e908a7cee4e3a4f7c863be5026c46d6fe7e1a1ca Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 06 Apr 2021 22:44:05 +0300
+Subject: [PATCH] [SW-30456] ras: add ppboot chksum to error status
+
+Check ppboot primary and secondary checksum for error status
+
+Change-Id: I64075a0c856824356e0ffaafcad171c963591a10
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 2e43694..78ccc3a 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -25,6 +25,7 @@
+ #include <boot_desc.h>
+ #include <boot_if.h>
+ #include <hl_fw_if.h>
++#include <crc32.h>
+ 
+ #include "common.h"
+ 
+@@ -242,3 +243,80 @@
+ {
+ 	preboot_boot_info_set_fw_info();
+ }
++
++#define PPBOOT_OFFSET_PRIMARY	0x00000
++#define PPBOOT_OFFSET_SECONDARY	0x20000
++#define PPBOOT_MAX_SIZE		0x20000
++#define BTL_CMD_SIZE		8 /* Followed by 4 bytes CRC */
++#define BTL_CMD_MEM		4
++#define BTL_CMD_END		2
++#define BTL_CMD_CRC		4
++#define BTL_BLK_MUL		16
++/* Op is the last nibble in command */
++#define BTL_OP_OFFSET		3
++#define BTL_OP_SHIFT		4
++/* Mem commnad number of blocks */
++#define BTL_BLK_OFFSET_LOW	4
++#define BTL_BLK_OFFSET_HIGH	5
++
++u32 btl_crc32(u32 crc, unsigned char const *p, size_t len)
++{
++	u32 data;
++
++	while (len >= sizeof(u32)) {
++		data = __builtin_bswap32(*(u32 const *)p);
++		crc = crc32(crc, (unsigned char const *)&data, sizeof(u32));
++		len -= sizeof(u32);
++		p += sizeof(u32);
++	}
++
++	return crc;
++}
++
++bool hl_ppboot_is_valid(bool is_prime)
++{
++	u8 *buf = (u8 *)FIT_IMG_BASE; /* Use fit base as playground */
++	u32 offset, memoff, memsz, crc_calc, crc_cmd;
++	u16 blk_num;
++	int i, op;
++
++	if (is_prime)
++		offset = PPBOOT_OFFSET_PRIMARY;
++	else
++		offset = PPBOOT_OFFSET_SECONDARY;
++
++	spi_copy(buf, offset, PPBOOT_MAX_SIZE, NULL);
++
++	i = 0;
++	while (i < PPBOOT_MAX_SIZE) {
++		crc_calc = btl_crc32(0, &buf[i], BTL_CMD_SIZE);
++		crc_cmd = __builtin_bswap32(*(u32 *)(&buf[i] + BTL_CMD_SIZE));
++		if (crc_calc != crc_cmd)
++			return false;
++
++		op = buf[i + BTL_OP_OFFSET] >> BTL_OP_SHIFT;
++		switch (op) {
++		case BTL_CMD_MEM:
++			blk_num = (buf[i + BTL_BLK_OFFSET_HIGH] << 8) |
++				buf[i + BTL_BLK_OFFSET_LOW];
++			memsz = blk_num * BTL_BLK_MUL;
++			memoff = BTL_CMD_SIZE + BTL_CMD_CRC;
++
++			crc_calc = btl_crc32(0, &buf[i] + memoff, memsz);
++			crc_cmd = __builtin_bswap32(*(u32 *)(&buf[i] + memoff +
++							     memsz));
++			if (crc_calc != crc_cmd)
++				return false;
++
++			i += memsz;
++		case BTL_CMD_END:
++			return true;
++		default:
++			break;
++		}
++
++		i += BTL_CMD_SIZE + BTL_CMD_CRC;
++	}
++
++	return false; /* No end */
++}
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 76b1128..f3ee6e7 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -398,9 +398,15 @@
+ 	fw_info.reset_cause = HL_FW_RESET_CAUSE_UNKNOWN;
+ }
+ 
++__weak bool hl_ppboot_is_valid(bool is_prime)
++{
++	return true;
++}
++
+ static void i2csi_err_chksum_validate(void)
+ {
+ 	struct boot_desc desc;
++	struct hl_i2ci_error_status_checksum_spi *spi;
+ 	enum fw_post_reset_cmd role[] = {
+ 		FLOPS_UPD_NOOP,		/* Primary */
+ 		FLOPS_UPD_PENDING,	/* Secondary */
+@@ -409,6 +415,11 @@
+ 	bool is_valid, is_prime;
+ 	u32 idx;
+ 	int i;
++
++	spi = &op_err_status.checksum.spi;
++
++	spi->ppboot_primary = !hl_ppboot_is_valid(true);
++	spi->ppboot_secondary = !hl_ppboot_is_valid(false);
+ 
+ 	if (!boot_desc_init()) {
+ 		preboot_puts_raw("Not a valid boot desc.");
+@@ -428,9 +439,9 @@
+ 		is_valid = !memcmp(hash, desc.chksum, ARRAY_SIZE(hash));
+ 
+ 		if (is_prime)
+-			op_err_status.checksum.spi.preboot_primary = !is_valid;
++			spi->preboot_primary = !is_valid;
+ 		else
+-			op_err_status.checksum.spi.preboot_secondary = !is_valid;
++			spi->preboot_secondary = !is_valid;
+ 	}
+ 
+ 	err_chksum_avail = true;

@@ -1,0 +1,314 @@
+From 3714db6e69b28dcbc8026ecc4a6d33be3c7de115 Mon Sep 17 00:00:00 2001
+From: Alona Solntseva <alona.solntseva@tandemg.com>
+Date: Wed, 09 Feb 2022 19:23:06 +0200
+Subject: [PATCH] [SW-67906] gaudi2: erom pcie: change arc0 code
+
+Adjust arc0 code to arcboot
+
+Change-Id: I311b65937fe08fb64d2831af1fdeaaa4ded0e17a
+Signed-off-by: Alona Solntseva <alona.solntseva@tandemg.com>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c4c7997..cff35e4 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -7,12 +7,15 @@
+ 
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <psoc_gpio1_regs.h>
+ #include <psoc_efuse_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+ #include <psoc_arc0_cfg_masks.h>
+ #include <pcie_aux_regs.h>
++#include <pcie_aux_masks.h>
+ #include <pcie_wrap_regs.h>
++#include <pcie_wrap_masks.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+@@ -41,10 +44,55 @@
+ #include <address_space.h>
+ #include <gaudi2/gaudi2_security.h>
+ 
+-#define PRODUCT_ID_STR_SIZE	0x8
++#define PRODUCT_ID_STR_SIZE			0x8
+ 
+-#define mmPCIE_WRAP_VUART_TX_DATA       0x4C15F60
+-#define mmPCIE_WRAP_VUART_TX_STATUS     0x4C15F64
++#define mmPCIE_WRAP_VUART_TX_DATA		0x4C15F60
++#define mmPCIE_WRAP_VUART_TX_STATUS		0x4C15F64
++
++#define PCIE_PRSTN_ASSERT			0
++
++#define IATU_REGION_CTRL_1_OFF_INBOUND_OFF	0x100
++#define IATU_REGION_CTRL_2_OFF_INBOUND_OFF	0x104
++#define IATU_LWR_TARGET_ADDR_OFF_INBOUND_OFF	0x114
++#define IATU_UPPER_TARGET_ADDR_OFF_INBOUND_OFF	0x118
++
++#define IATU_LOWER_TARGET_ADDR			0xF0000000
++#define IATU_HIGHER_TARGET_ADDR			0x1000007F
++#define IATU_INBOUND_LOW_OFFSET_ADDR		0x0
++#define IATU_INBOUND_HI_OFFSET_ADDR		0xC0080000
++#define DBI_ENABLE				0x300000
++
++void pcie_phy_set_ext_tx_rx_ctrl(void) {}
++void pcie_phy_set_protocol0_ext_tx_rx(void) {}
++
++void pcie_phy_set_mpll_a_b_mul_bw(uint8_t separate_reference)
++{
++	uint32_t reg;
++
++	if (separate_reference) {
++		reg = 0xA0;
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x00250025,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = 0x50;
++		regmap_writel(0x00530053,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++		regmap_writel(0x01C301C3,
++			      mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(0x7D, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++}
++
++void pcie_update_reg_range(uint32_t addr, uint32_t addr_end,
++			   uint32_t value)
++{
++	for (; addr <= addr_end ; addr += 4)
++		regmap_writel(value, addr);
++}
+ 
+ void preboot_putc_virt_uart(const char c)
+ {
+@@ -379,9 +427,212 @@
+ 	return true;
+ }
+ 
++static void pcie_loop_while_prstn(uint8_t assert)
++{
++	uint8_t pcie_prstn;
++
++	do {
++		pcie_prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		pcie_prstn &= PSOC_GLOBAL_CONF_PRSTN_MASK_IND_MASK;
++	} while (pcie_prstn == assert);
++}
++
++void pcie_phy_para_sel_set(void)
++{
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
++}
++
++#define DUMP_SEL_SRNS_MASK      0x1
++#define DUMP_SEL_SSC_MASK       0x2
++
++uint8_t get_srns_mode_from_strap(uint32_t boot_strap)
++{
++	uint32_t dump_sel = (boot_strap &
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
++
++	/* dumpsel[0] is SRNS */
++	return (dump_sel & DUMP_SEL_SRNS_MASK);
++}
++
++uint8_t get_ssc_en_from_strap(uint32_t boot_strap)
++{
++	uint32_t dump_sel = (boot_strap &
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_MASK) >>
++		PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_DUMP_SEL_SHIFT;
++
++	/* dumpsel[1] is SSC EN */
++	return !!(dump_sel & DUMP_SEL_SSC_MASK);
++}
++
++void pcie_phy_set_mpll_a_b_ssc_enable(void)
++{
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++			      mmPCIE_PHY_PHYX_MPLLB_SSC_EN_3, 0x1);
++	pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++			      mmPCIE_PHY_PHYX_MPLLA_SSC_EN_3, 0x1);
++}
++
++#define EFUSE_SYSCFG_WA_SNPS_CASE_01038891    BIT(23)
++#define EFUSE_SYSCFG_PCIE_GEN_LIMIT           BIT(18)
++
++static void pcie_wa_snps_case_01038891(uint32_t boot_strap)
++{
++	uint8_t separate_reference = 0;
++	uint8_t ssc_en = 0, srns = 0;
++	u32 config_fuse = sp_sram_readl(EFUSE_SYSCFG_OFFSET);
++
++	separate_reference = get_sris_mode_from_strap();
++
++	/* SRNS mode enable */
++	srns = get_srns_mode_from_strap(boot_strap);
++
++	if (!srns)
++		separate_reference = 1;
++
++	/* spread spectum clock enable */
++	ssc_en = get_ssc_en_from_strap(boot_strap);
++
++	if ((config_fuse & EFUSE_SYSCFG_WA_SNPS_CASE_01038891) == 0) {
++		if (ssc_en) {
++			pcie_phy_set_mpll_a_b_ssc_enable();
++
++			regmap_writel(0x5000, mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
++			regmap_writel(0x19CE, mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
++			regmap_writel(0x6666, mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
++			regmap_writel(0x2108, mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
++		}
++
++		pcie_phy_set_ext_tx_rx_ctrl();
++
++		pcie_phy_set_mpll_a_b_mul_bw(separate_reference);
++
++		pcie_phy_set_protocol0_ext_tx_rx();
++
++		regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
++	}
++}
++
++void pcie_wait_for_sram_init_done(void)
++{
++	uint8_t sram_init_done = 0;
++
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2);
++	} while (sram_init_done != 1);
++
++	sram_init_done = 0;
++	do {
++		sram_init_done =
++			regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3);
++	} while (sram_init_done != 1);
++}
++
++void pcie_phy_set_sram_ext_ld_done(void)
++{
++	regmap_writel(1, mmPCIE_PHY_PHY_SRAM_EXT_LD_DONE);
++}
++
++void pcie_config_iatu(void)
++{
++	uint32_t pci_dbi_base = (mmPCIE_DBI_BASE & 0x7FFFFFF);
++
++	regmap_writel(DBI_ENABLE, mmPCIE_AUX_DBI);
++	regmap_writel(IATU_LOWER_TARGET_ADDR,
++		      (pci_dbi_base + IATU_LWR_TARGET_ADDR_OFF_INBOUND_OFF));
++	regmap_writel(IATU_HIGHER_TARGET_ADDR,
++		      (pci_dbi_base + IATU_UPPER_TARGET_ADDR_OFF_INBOUND_OFF));
++	regmap_writel(IATU_INBOUND_LOW_OFFSET_ADDR,
++		      (pci_dbi_base + IATU_REGION_CTRL_1_OFF_INBOUND_OFF));
++	regmap_writel(IATU_INBOUND_HI_OFFSET_ADDR,
++		      (pci_dbi_base + IATU_REGION_CTRL_2_OFF_INBOUND_OFF));
++}
++
++void enable_flr_handling_fsm(void)
++{
++	/* No HW FSM bits in Gaudi2, No need to set anything */
++}
++
++static void pcie_config(void)
++{
++	uint32_t boot_strap, link_ctrl;
++	uint8_t ltssm_en;
++	u32 config_fuse = sp_sram_readl(EFUSE_SYSCFG_OFFSET);
++
++	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
++	ltssm_en = regmap_readl(mmPCIE_AUX_LTSSM_EN) &
++				PCIE_AUX_LTSSM_EN_IND_MASK;
++
++	if (!ltssm_en) {
++		regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++		pcie_phy_para_sel_set();
++
++		/* gpio bootstrap pin gpio17 = 0 */
++		boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++		if (get_sris_mode_from_strap()) {
++			regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++			regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
++		}
++
++		pcie_wa_snps_case_01038891(boot_strap);
++		regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++		pcie_wait_for_sram_init_done();
++
++		pcie_phy_set_sram_ext_ld_done();
++
++		if ((config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0) { /* this if */
++			/* limit PCIe link gen to 1 */
++			link_ctrl = regmap_readl(mmPCIE_DBI_LINK_CAPABILITIES_REG);
++			link_ctrl &=
++				~PCIE_DBI_LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_MASK;
++			link_ctrl |=
++				(1 << PCIE_DBI_LINK_CAPABILITIES_REG_PCIE_CAP_MAX_LINK_SPEED_SHIFT);
++			regmap_writel(link_ctrl, mmPCIE_DBI_LINK_CAPABILITIES_REG);
++
++			link_ctrl = regmap_readl(mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG);
++			link_ctrl &=
++				~PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_MASK;
++			link_ctrl |= (1 <<
++				PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_SHIFT);
++			regmap_writel(link_ctrl, mmPCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG);
++		}
++
++		/* Configure IATU */
++		pcie_config_iatu();
++
++		/* enable flr handling by HW state machine */
++		enable_flr_handling_fsm();
++
++		/* disable HOT reset handling by HW state machine */
++		regmap_writel(PCIE_WRAP_CPU_HOT_RST_CTRL_MASK,
++			      mmPCIE_WRAP_CPU_HOT_RST);
++
++		regmap_writel(0x3, mmPCIE_AUX_LTSSM_EN);
++	}
++}
++
+ void secondary_main(void)
+ {
+-	preboot_pcie_monitoring();
++	pcie_config();
+ 
+ 	/* Put secondary CPU in sleep state until further notice */
+ 	sleep();
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 02f070a..b9af41b 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -199,4 +199,5 @@
+ void gaudi2_axi_drain_ena(void);
+ bool preboot_fake_security_is_enabled(void);
+ bool preboot_fake_security_is_sig_validation_enabled(void);
++uint8_t get_sris_mode_from_strap(void);
+ #endif /* ARCH_GAUDI2_COMMON_COMMON_H_ */

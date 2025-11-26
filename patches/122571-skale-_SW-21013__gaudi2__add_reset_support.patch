@@ -1,0 +1,116 @@
+From cab66fa8186144fcf0b16313c80a61baf70491eb Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Fri, 20 Aug 2021 12:56:38 +0300
+Subject: [PATCH] [SW-21013] gaudi2: add reset support
+
+Compared to previous platform, multiple registers needs to be
+configure to configure mask for given reset. This patch implements
+hl_dev_reset routine for gaudi2 which configures mask and issues
+sw_all reset as part of reset routine.
+
+Change-Id: I7c50db58a6c14100cb183b3c17e742ec333ef94d
+---
+
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 08210b0..0049c22 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -1,4 +1,5 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/reset.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ 
+diff --git a/arch/gaudi2/common/reset.c b/arch/gaudi2/common/reset.c
+new file mode 100644
+index 0000000..7706737
+--- /dev/null
++++ b/arch/gaudi2/common/reset.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2021 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <psoc_reset_conf_regs.h>
++
++#include <bitops.h>
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++
++#include <common.h>
++
++struct gaudi2_rst_mask {
++	u32 val;
++	u32 offset;
++};
++
++static const struct gaudi2_rst_mask sw_rst[] = {
++	{0x0, mmPSOC_RESET_CONF_PSOC_SW_RST_CFG},
++	{0x1, mmPSOC_RESET_CONF_CPU_SW_RST_CFG},
++	{0x3, mmPSOC_RESET_CONF_ARC_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_SIF_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_SRAM_SW_RST_CFG},
++	{0x0, mmPSOC_RESET_CONF_PCIE_CTRL_SW_RST_CFG},
++	{0x0, mmPSOC_RESET_CONF_PCIE_PHY_CFG_SW_RST_CFG},
++	{0x0, mmPSOC_RESET_CONF_PCIE_IF_SW_RST_CFG},
++	{0x1F, mmPSOC_RESET_CONF_TPC_DIV_SW_RST_CFG},
++	{0x3F, mmPSOC_RESET_CONF_HBM_DIV_SW_RST_CFG},
++	{0x1, mmPSOC_RESET_CONF_PMMU_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_PM_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_TS_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_TS_IF_SW_RST_CFG},
++	{0x0, mmPSOC_RESET_CONF_PLL_L_SW_RST_CFG},
++	{0x0, mmPSOC_RESET_CONF_PLL_H_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_MME_EUS_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_MSS_CLS_SW_RST_CFG},
++	{0x1FFFFFF, mmPSOC_RESET_CONF_TPC_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_HIF_HMMU_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_XBAR_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_SFT_XFT_TFT_SW_RST_CFG},
++	{0xFF, mmPSOC_RESET_CONF_DDMA_SW_RST_CFG},
++	{0x1, mmPSOC_RESET_CONF_KDMA_SW_RST_CFG},
++	{0x3, mmPSOC_RESET_CONF_PDMA_SW_RST_CFG},
++	{0x1F, mmPSOC_RESET_CONF_ARC_SS_SW_RST_CFG},
++	{0x3, mmPSOC_RESET_CONF_ROTATOR_SW_RST_CFG},
++	{0xF, mmPSOC_RESET_CONF_SM_SW_RST_CFG},
++	{0x3FF, mmPSOC_RESET_CONF_VIDEO_DEC_SW_RST_CFG},
++	{0x3F, mmPSOC_RESET_CONF_HBM_MC_SW_RST_CFG},
++	{0xFFF, mmPSOC_RESET_CONF_NIC_SW_RST_CFG},
++	{0xFFF, mmPSOC_RESET_CONF_NIC_PRT_SW_RST_CFG},
++	{0x7, mmPSOC_RESET_CONF_NIC_CH_SW_RST_CFG},
++};
++
++static void gaudi2_hw_fini(void)
++{
++	u32 i, count;
++
++	/* Restart BTL/BLR upon hard-reset */
++	regmap_writel(0x770, mmPSOC_GLOBAL_CONF_BOOT_SEQ_RE_START);
++
++	udelay(1000);
++
++	/*
++	 * Note: Currently FW updates mask to all registers of
++	 * software reset. Once gaudi2 FW/SW is stabilized and all
++	 * resets are done by FW, optimize this loop to update
++	 * mask regsiters for which default value needs to be
++	 * change.
++	 */
++	count = sizeof(sw_rst) / sizeof(struct gaudi2_rst_mask);
++	for (i = 0; i < count; i++)
++		regmap_writel(sw_rst[i].val, sw_rst[i].offset);
++
++	regmap_writel(1, mmPSOC_RESET_CONF_SW_ALL_RST);
++}
++
++void hl_dev_reset(void)
++{
++	hl_pcie_disable_access();
++
++	gaudi2_hw_fini();
++	wfe();
++}

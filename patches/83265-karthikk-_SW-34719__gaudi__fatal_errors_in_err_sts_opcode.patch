@@ -1,0 +1,297 @@
+From b2dba9c0c0000b139d8eb59b052bca66fa4f3e93 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 18 Mar 2021 22:44:07 +0200
+Subject: [PATCH] [SW-34719] gaudi: fatal errors in err_sts opcode
+
+preboot fetches values of rma events from flash
+and the same needs to be stored in nvme mi
+opcode 11 (Error Status).
+
+This patch adds changes to update rma events termed
+as fatal errors classified into sram_ecc, hbm_ecc
+and hbm_parity errors respectively.
+
+Change-Id: Ibd0b7a4490c9bc8983c1003625e9dbb9d88c6d60
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/gaudi/rma_info.c b/gaudi/rma_info.c
+index c02367a..fd72ae0 100644
+--- a/gaudi/rma_info.c
++++ b/gaudi/rma_info.c
+@@ -12,6 +12,7 @@
+ #include "uart.h"
+ #include "rma_if.h"
+ #include "boot_if.h"
++#include "rma_info.h"
+ #include "module_i2c_slave.h"
+ #include "hl_i2c_slave_events.h"
+ #include "i2cslave_indirect.h"
+@@ -36,6 +37,8 @@
+ #define FLASH_SECTOR_SIZE	0x10000
+ #define FLASH_NUM_FLASH_INFO	2
+ #define FLASH_SECTOR_MAGIC	0xAA55AA55
++
++u8 err_sts_rma_buf[MAX_INFO_DESC_DATA]__aligned(4);
+ 
+ struct flash_header {
+ 	union {
+@@ -160,15 +163,13 @@
+ {
+ 	u32 size = MAX_RMA_HEADER_DATA;
+ 	int ret;
+-	/* Buffer to store RMA info from flash */
+-	u8 rma_buf[MAX_RMA_HEADER_DATA];
+ 	struct rma_entry *rma_header;
+ 
+-	ret = rma_info_get(RMA_HEADER_TABLE, rma_buf, &size);
++	ret = rma_info_get(RMA_HEADER_TABLE, err_sts_rma_buf, &size);
+ 	if (ret)
+ 		return;
+ 
+-	rma_header = (struct rma_entry *) &rma_buf[RMA_TABLE_HEADER_SIZE];
++	rma_header = (struct rma_entry *) &err_sts_rma_buf[RMA_TABLE_HEADER_SIZE];
+ 	/* Update ERR_STS if any error */
+ 	if (rma_header->rma_failure.sram_ecc ||
+ 		rma_header->rma_failure.hbm_ecc ||
+@@ -180,10 +181,113 @@
+ 		/* set boot error bit for RMA */
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_DEVICE_UNUSABLE_FAIL, true);
+ 		preboot_puts_hex("Fatal error:", rma_header->rma_failure.data, 0);
++		i2c_rma_failure = rma_header->rma_failure;
+ 	}
++
++	/* Clear out the data for buffer re-use */
++	memset(err_sts_rma_buf, 0, size);
+ }
+ 
+ void preboot_process_last_rma_info(void)
+ {
+ 	preboot_process_rma_header();
+ }
++
++void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op)
++{
++	int table_info_size, ret;
++	u32 size = MAX_INFO_DESC_DATA;
++	struct rma_sram_ecc_entry *sram_ecc_entry;
++	u16 offset;
++
++	ret = rma_info_get(RMA_SRAM_ECC_TABLE, err_sts_rma_buf, &size);
++	if (ret)
++		return;
++
++	table_info_size = size - RMA_TABLE_HEADER_SIZE;
++	op->total_err =  table_info_size / RMA_SRAM_ECC_ENTRY_SIZE;
++
++	/*
++	 * Opcode's query of error status must
++	 * be an index within the total errors
++	 * that are currently active.
++	 */
++	if (op->entry_index < op->total_err) {
++		offset = RMA_TABLE_HEADER_SIZE + (op->entry_index * RMA_SRAM_ECC_ENTRY_SIZE);
++		sram_ecc_entry = (struct rma_sram_ecc_entry *)&err_sts_rma_buf[offset];
++		op->sram_index = sram_ecc_entry->sram_index;
++		op->sram_address = sram_ecc_entry->address;
++		op->cause.multiple_serr = sram_ecc_entry->header.serr_cause;
++		op->cause.derr = sram_ecc_entry->header.derr_cause;
++	}
++
++	/* Clear out the data for buffer re-use */
++	memset(err_sts_rma_buf, 0, size);
++}
++
++void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op)
++{
++	int table_info_size, ret;
++	u32 size = MAX_INFO_DESC_DATA;
++	struct rma_hbm_ecc_entry *hbm_ecc_entry;
++	u16 offset;
++
++	ret = rma_info_get(RMA_HBM_ECC_TABLE, err_sts_rma_buf, &size);
++	if (ret)
++		return;
++
++	table_info_size = size - RMA_TABLE_HEADER_SIZE;
++	op->total_err =  table_info_size / RMA_HBM_ECC_ENTRY_SIZE;
++
++	/*
++	 * Opcode's query of error status must
++	 * be an index within the total errors
++	 * that are currently active.
++	 */
++	if (op->entry_index < op->total_err) {
++		offset = RMA_TABLE_HEADER_SIZE + (op->entry_index * RMA_HBM_ECC_ENTRY_SIZE);
++		hbm_ecc_entry = (struct rma_hbm_ecc_entry *)&err_sts_rma_buf[offset];
++		op->device = hbm_ecc_entry->device;
++		op->pc = hbm_ecc_entry->pc;
++		op->sid = hbm_ecc_entry->sid;
++		op->bank = hbm_ecc_entry->bank;
++		op->cause.multiple_serr = hbm_ecc_entry->header.serr_cause;
++		op->cause.derr = hbm_ecc_entry->header.derr_cause;
++	}
++
++	/* Clear out the data for buffer re-use */
++	memset(err_sts_rma_buf, 0, size);
++}
++
++void rma_info_hbm_par_err_sts(struct hl_i2ci_error_status_hbm_parity *op)
++{
++	int table_info_size, ret;
++	u32 size = MAX_INFO_DESC_DATA;
++	struct rma_hbm_parity_entry *hbm_par_entry;
++	u16 offset;
++
++	ret = rma_info_get(RMA_HBM_PARITY_TABLE, err_sts_rma_buf, &size);
++	if (ret)
++		return;
++
++	table_info_size = size - RMA_TABLE_HEADER_SIZE;
++	op->total_err =  table_info_size / RMA_HBM_PARITY_ENTRY_SIZE;
++
++	/*
++	 * Opcode's query of error status must
++	 * be an index within the total errors
++	 * that are currently active.
++	 */
++	if (op->entry_index < op->total_err) {
++		offset = RMA_TABLE_HEADER_SIZE + (op->entry_index * RMA_HBM_PARITY_ENTRY_SIZE);
++		hbm_par_entry = (struct rma_hbm_parity_entry *)&err_sts_rma_buf[offset];
++		op->device = hbm_par_entry->device;
++		op->pc = hbm_par_entry->pc;
++		op->cause.ca = hbm_par_entry->header.ca_cause;
++		op->cause.data_rd = hbm_par_entry->header.rd_cause;
++		op->cause.data_wr = hbm_par_entry->header.wr_cause;
++	}
++
++	/* Clear out the data for buffer re-use */
++	memset(err_sts_rma_buf, 0, size);
++}
+diff --git a/include/i2cslave_indirect.h b/include/i2cslave_indirect.h
+index c63660f..b57fcd4 100644
+--- a/include/i2cslave_indirect.h
++++ b/include/i2cslave_indirect.h
+@@ -26,4 +26,5 @@
+ void i2csi_set_boot_err(enum hl_fw_fit_boot_error err,
+ 			bool is_linux_boot_fail);
+ void i2csi_update_smbus_alert(struct rma_entry *rma_header);
++extern struct rma_failure i2c_rma_failure;
+ #endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/include/rma_info.h b/include/rma_info.h
+index 2bceb9b..dc1eca5 100644
+--- a/include/rma_info.h
++++ b/include/rma_info.h
+@@ -7,6 +7,11 @@
+ #ifndef _RMA_INFO_H_
+ #define _RMA_INFO_H_
+ 
++#include <hl_i2c_indirect.h>
++
+ void preboot_process_last_rma_info(void);
++void rma_info_hbm_par_err_sts(struct hl_i2ci_error_status_hbm_parity *op);
++void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op);
++void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op);
+ 
+ #endif /* _RMA_INFO_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index cd7e015..9267023 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -17,6 +17,8 @@
+ #include <hl_fw_if.h>
+ #include "fit.h"
+ #include "i2cslave_indirect.h"
++#include <rma_if.h>
++#include "rma_info.h"
+ 
+ #define SUPPORTED_OPCODES_MASK	( \
+ 				BIT(HL_I2CI_REQ_OP_DEVICE_INFO) | \
+@@ -101,11 +103,12 @@
+ static u32 op_memcpy_offset;
+ static struct hl_i2ci_memcpy_ctrl op_memcpy __aligned(8);
+ 
+-static struct hl_i2ci_error_status op_err_status;
+ static struct hl_i2ci_smbus_alert smbus_alert;
++struct hl_i2ci_error_status op_err_status;
+ 
+ static struct hl_i2ci_ctrl_cmd ctrl_cmd;
+ static struct hl_i2ci_ctrl_sts ctrl_sts;
++struct rma_failure i2c_rma_failure;
+ 
+ static u32 i2csi_block_wait_for(u8 block_cmd, u8 cmd, u8 len, u8 **data)
+ {
+@@ -276,6 +279,44 @@
+ 	i2csi_req_wdata_wait_for(&data[rlow], rhigh - rlow);
+ }
+ 
++static void i2csi_req_err_sts_check(u16 size)
++{
++
++	switch (req_wd.hdr.offset) {
++	/* Opcode has write permission only for the entry index */
++	case offsetof(struct hl_i2ci_error_status, fatal_sram_ecc.entry_index):
++	case offsetof(struct hl_i2ci_error_status, fatal_hbm_ecc.entry_index):
++	case offsetof(struct hl_i2ci_error_status, fatal_hbm_parity.entry_index):
++		/* Lower and upper bounds make sure only entry index is being written */
++		i2csi_req_buffer_get_writable(size, (u8 *)&op_err_status, req_wd.hdr.offset,
++			req_wd.hdr.offset + sizeof(op_err_status.fatal_sram_ecc.entry_index));
++		break;
++	default:
++		/* Attempting to write a read-only parameter */
++		req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++		break;
++	}
++}
++
++/* rma_info API's are device specific */
++__weak void rma_info_hbm_par_err_sts(struct hl_i2ci_error_status_hbm_parity *op) {}
++__weak void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op) {}
++__weak void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op) {}
++
++static void i2csi_update_rma_entry(void)
++{
++	if (i2c_rma_failure.data) {
++		if (i2c_rma_failure.sram_ecc)
++			rma_info_sram_ecc_err_sts(&op_err_status.fatal_sram_ecc);
++
++		if (i2c_rma_failure.hbm_ecc)
++			rma_info_hbm_ecc_err_sts(&op_err_status.fatal_hbm_ecc);
++
++		if (i2c_rma_failure.hbm_parity)
++			rma_info_hbm_par_err_sts(&op_err_status.fatal_hbm_parity);
++	}
++}
++
+ static void i2csi_req_opcode_get_buffer(u16 size)
+ {
+ 	int upper_bound;
+@@ -317,7 +358,9 @@
+ 		data = i2csi_req_memcpy_rw(&size);
+ 		i2csi_req_wdata_wait_for(data, size);
+ 		break;
+-
++	case HL_I2CI_REQ_OP_ERROR_STATUS:
++		i2csi_req_err_sts_check(size);
++		break;
+ 	default:
+ 		/* Data will be consumed from HW but not stored anywhere */
+ 		i2csi_req_wdata_wait_for(NULL, size);
+@@ -359,6 +402,7 @@
+ 		req_rd.data = i2csi_req_memcpy_rw(&req_rd.length);
+ 		break;
+ 	case HL_I2CI_REQ_OP_ERROR_STATUS:
++		i2csi_update_rma_entry();
+ 		req_rd.data = (u8 *)&op_err_status;
+ 		req_rd.length = sizeof(op_err_status);
+ 		break;
+@@ -386,6 +430,9 @@
+ 	case HL_I2CI_REQ_OP_MEMCPY_DATA:
+ 		/* Do nothing */
+ 		break;
++	case HL_I2CI_REQ_OP_ERROR_STATUS:
++		/* Do nothing */
++		break;
+ 	default:
+ 		if ((BIT(req_wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+ 			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;

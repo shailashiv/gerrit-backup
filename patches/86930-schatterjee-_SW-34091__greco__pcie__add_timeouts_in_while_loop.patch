@@ -1,0 +1,146 @@
+From 8e82b2fe68b55c595ca8a15b0dddd15b5b2b5ff5 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Mon, 22 Mar 2021 04:06:26 +0200
+Subject: [PATCH] [SW-34091] greco: pcie: add timeouts in while loop
+
+Currently we are waiting indefinitely for PRSTn and using retry
+based mechanism with delay in between to wait for PCIe link up
+status and the control doesn't reach to preboot in case PCIe link
+up is not up for any reasons. In such scenario, there is requirement
+to reach control to preboot to handle i2c commands even if PCIe link
+is not established.
+This patch add changes to add timeout of 5 seconds for PRSTn assert
+and 5 seconds for PCIe link up and proceed with preboot in case link
+is not up within defined timeout.
+Two more infinite while loops are replaced with finite timeout:
+-Wait for BTL sync which waits for boot manager execution
+ to finish. Timeout of half second.
+-Wait for PCIe phy external load complete. This wait is
+ required for applying synopsys WA and should happen in
+ 300 us. Overall timeout of 576us.
+
+Change-Id: Ie65d71faaf2a1529b3c89bf664b8da7afbe23168
+---
+
+diff --git a/greco/common.c b/greco/common.c
+index c0b2380..80689e5 100644
+--- a/greco/common.c
++++ b/greco/common.c
+@@ -231,6 +231,7 @@
+ 
+ void preboot_init_pcie(void)
+ {
++	u64 start;
+ 	preboot_init_pcie_phy();
+ 
+ 	/* Update Vendor ID */
+@@ -243,10 +244,21 @@
+ 	/* Disable the EQ REDO */
+ 	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+ 
++	start = timestamp_get_us();
++
+ 	/* Wait for init_done before executing W/A */
+ 	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0) &&
+-		regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1)))
+-		;
++		 regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1))) {
++		/*
++		 * PCIe external load complete should take maximum of 300us
++		 * to complete. Including some grace period 576us of
++		 * timeout is used
++		 */
++		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for ext_ld_done!");
++			break;
++		}
++	}
+ 
+ 	/* Execute the Synopsys W/A */
+ 	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
+@@ -259,16 +271,26 @@
+ 
+ void preboot_pcie_wait_for_link(void)
+ {
+-	u8 retry = HL_PCIE_LINK_RETRIES;
++	u64 start = timestamp_get_us();
+ 
+ 	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+-		;
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
++		/* If PRSTn does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PRSTn!\n");
++			return;
++		}
++	}
+ 
+ 	/* Only after PRSTn is de-asserted */
+ 	preboot_pcie_enable();
+ 
+ 	preboot_puts("Waiting for PCIe UP status\n");
++
++	/* Reset start timer */
++	start = timestamp_get_us();
+ 
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+@@ -283,18 +305,10 @@
+ 			break;
+ 		}
+ 
+-		/*
+-		 * Do not wait indefinitely on PCIe link up status
+-		 * Wait for 5 seconds (50 retries with 100 milli-
+-		 * seconds sleep), else bailout.
+-		 */
+-		retry--;
+-		if (!retry) {
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+ 			preboot_puts("Timed-out waiting for PCIe link UP!\n");
+ 			break;
+ 		}
+-
+-		udelay(100000);
+ 
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+@@ -343,8 +357,18 @@
+  */
+ __weak void preboot_sync_btl(void)
+ {
+-	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM))
+-		;
++	u64 start = timestamp_get_us();
++
++	while (regmap_readl(mmPSOC_GLOBAL_CONF_BTM_FSM)) {
++		/*
++		 * Boot manager is supposed to complete entire execution
++		 * of FSM, BTL primary/secondary at this point. Though
++		 * It should not take more than 100ms for it to finish
++		 * timeout of half second is used here.
++		 */
++		if (timeout_expired(start, BTL_SYNC_TIMEOUT_US))
++			break;
++	}
+ }
+ 
+ static void halt_n_reset_arc(u8 id)
+diff --git a/greco/common.h b/greco/common.h
+index 5d0fd80..9e657e0 100644
+--- a/greco/common.h
++++ b/greco/common.h
+@@ -45,7 +45,9 @@
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+ 
+-#define HL_PCIE_LINK_RETRIES		50
++#define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++#define BTL_SYNC_TIMEOUT_US		(USEC_PER_SEC / 2)
++#define PCIE_EXT_LD_TIMEOUT_US		576
+ #define HL_INIT_SP_SRAM_RETRIES		50
+ 
+ /*

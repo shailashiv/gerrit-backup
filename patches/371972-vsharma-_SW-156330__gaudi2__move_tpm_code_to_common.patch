@@ -1,0 +1,3346 @@
+From a3b4c1c9363a1f29bf74fba993043ff0201369a5 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Thu, 09 Nov 2023 10:32:19 +0200
+Subject: [PATCH] [SW-156330] gaudi2: move tpm code to common
+
+This patch moves tpm code to common so that it can be used
+for future platforms like gaudi3 also.
+
+Change-Id: I948bfd7676e9c4e7a7710a0fc613280512023f36
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 5e3849a..58ea82f 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -27,6 +27,7 @@
+ #include <parc_global_conf_regs.h>
+ #include <parc_global_conf_masks.h>
+ #include <fs1_blocks_linux_driver.h>
++#include <fs1_security.h>
+ 
+ #include <baremetal.h>
+ #include <bitops.h>
+@@ -390,3 +391,8 @@
+ {
+ 	preboot_pcie_wait_for_link();
+ }
++
++uint8_t get_ppboot_pcr_index(void)
++{
++	return TPM2_PPBOOT_PCR_IDX;
++}
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 628bcb3..ffc622e 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -315,16 +315,6 @@
+ 		return spi_flash_readl(FLASH_PREBOOT_PRIMARY_OFFSET);
+ }
+ 
+-__weak int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
+-{
+-	return -1;
+-}
+-
+-__weak int tpm_init(bool print)
+-{
+-	return -1;
+-}
+-
+ /* SPI DMA can transfer max of data (64KB-8) = 0xFFF8 + (additional CRC)
+  * But destination is 16 byte aligned. So, setting max as (64K-16) (excluding CRC)
+  */
+@@ -944,22 +934,7 @@
+ 	security_enable_jtag_if();
+ }
+ 
+-static void gaudi2_get_ppboot_data(uint8_t **offset)
+-{
+-	uint32_t ppboot_pcie_size;
+-
+-	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
+-
+-	ppboot_pcie_size -= SIG_SIZE;
+-	ppboot_pcie_size -= CRC32_SIZE;
+-	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
+-	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
+-	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
+-
+-	*offset = (uint8_t *)(HL_FWSRAM_BASE + ppboot_pcie_size);
+-}
+-
+-static bool is_ppboot_tpm_extend_done(void)
++bool is_ppboot_tpm_extend_done(void)
+ {
+ 	uint32_t reg = regmap_readl(mmPSOC_SECURITY_SW_STATUS_1);
+ 	uint32_t mask = (PROGRESS_ARCBOOT_EROM_TPM_FINISH & 0x1F);
+@@ -967,34 +942,9 @@
+ 	return !!(reg & BIT(mask));
+ }
+ 
+-void ppboot_tpm_extend(void)
++uint8_t get_ppboot_pcr_index(void)
+ {
+-	uint8_t *data;
+-	uint32_t magic;
+-	uint8_t hash[SHA384_SUM_LEN] = { 0 };
+-
+-	/* return if erom has already done ppboot tpm extend */
+-	if (is_ppboot_tpm_extend_done())
+-		return;
+-
+-	if (tpm_init(true))
+-		return;
+-
+-	if (tpm_startup())
+-		return;
+-
+-	gaudi2_get_ppboot_data(&data);
+-
+-	memcpy(&magic, data, PPBOOT_HASH_MAGIC_SIZE);
+-
+-	if (magic != PPBOOT_SHA_MAGIC) {
+-		preboot_puts("no ppboot sha magic found\n");
+-		return;
+-	}
+-
+-	memcpy(hash, data + PPBOOT_HASH_MAGIC_SIZE, SHA384_SUM_LEN);
+-
+-	tpm_pcr_extend(TPM2_PPBOOT_PCR_IDX, hash);
++	return TPM2_PPBOOT_PCR_IDX;
+ }
+ 
+ struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx)
+diff --git a/arch/gaudi2/common/Makefile b/arch/gaudi2/common/Makefile
+index 55cb01d..584b162 100644
+--- a/arch/gaudi2/common/Makefile
++++ b/arch/gaudi2/common/Makefile
+@@ -3,16 +3,12 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/sha.c)
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm2.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/security.c)
+-PREBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm_auth.c)
+ 
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/pll.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/security.c)
+-PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm2.c)
+-PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH_COMMON)/tpm_auth.c)
+ 
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+ CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(DEV_PREFIX)
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+deleted file mode 100644
+index 47af4d8..0000000
+--- a/arch/gaudi2/common/tpm2.c
++++ /dev/null
+@@ -1,1051 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-#include <stdarg.h>
+-#include <tpm2.h>
+-#include <uart.h>
+-#include <baremetal.h>
+-#include <types.h>
+-#include <string.h>
+-#include <pll.h>
+-#include <spi.h>
+-#include <errno.h>
+-
+-#include "lzo/unaligned.h"
+-#include "tpm_internal.h"
+-
+-/* Number of wait states to wait for */
+-#define TPM_WAIT_STATES 100
+-
+-#define TPM_ACCESS(l)			(0x0000 | ((l) << 12))
+-#define TPM_INT_ENABLE(l)               (0x0008 | ((l) << 12))
+-#define TPM_STS(l)			(0x0018 | ((l) << 12))
+-#define TPM_DATA_FIFO(l)		(0x0024 | ((l) << 12))
+-#define TPM_DID_VID(l)			(0x0F00 | ((l) << 12))
+-#define TPM_RID(l)			(0x0F04 | ((l) << 12))
+-
+-#define MAX_SPI_FRAMESIZE 32
+-
+-#define COMMAND_BUFFER_SIZE 256
+-
+-/* Internal error of TPM command library */
+-#define TPM_LIB_ERROR ((u32)~0u)
+-
+-/* To make strings of commands more easily */
+-#define __MSB(x) ((x) >> 8)
+-#define __LSB(x) ((x) & 0xFF)
+-#define tpm_u16(x) __MSB(x), __LSB(x)
+-#define tpm_u32(x) tpm_u16((x) >> 16), tpm_u16((x) & 0xFFFF)
+-
+-#define TPM_HEADER_SIZE		10
+-
+-/* Max buffer size supported by our tpm */
+-#define TPM_DEV_BUFSIZE		1260
+-
+-#define MS_TO_US(m) ((m) * 1000)
+-
+-#define min_t(type, x, y) ({			\
+-	type __min1 = (x);			\
+-	type __min2 = (y);			\
+-	__min1 < __min2 ? __min1 : __min2; })
+-
+-
+-#define le32_to_cpu(x) ((__force __u32)(__le32)(x))
+-
+-/**
+- * TPM2 permanent handles.
+- *
+- * @TPM2_RH_OWNER: refers to the 'owner' hierarchy.
+- * @TPM2_RS_PW: indicates a password.
+- * @TPM2_RH_LOCKOUT: refers to the 'lockout' hierarchy.
+- * @TPM2_RH_ENDORSEMENT: refers to the 'endorsement' hierarchy.
+- * @TPM2_RH_PLATFORM: refers to the 'platform' hierarchy.
+- */
+-enum {
+-	/* Secure storage for firmware settings */
+-	TPM_HT_PCR = 0,
+-	TPM_HT_NV_INDEX,
+-	TPM_HT_HMAC_SESSION,
+-	TPM_HT_POLICY_SESSION,
+-
+-	HR_SHIFT		= 24,
+-	HR_PCR			= TPM_HT_PCR << HR_SHIFT,
+-	HR_HMAC_SESSION		= TPM_HT_HMAC_SESSION << HR_SHIFT,
+-	HR_POLICY_SESSION	= TPM_HT_POLICY_SESSION << HR_SHIFT,
+-	HR_NV_INDEX		= TPM_HT_NV_INDEX << HR_SHIFT,
+-};
+-
+-/* Max tpm xfer buffer size + addr */
+-static u8 tpm_xfer_buf[TPM_DEV_BUFSIZE + sizeof(u8)];
+-static u8 response_buffer[COMMAND_BUFFER_SIZE];
+-static struct spi_ctx tpm_spi = {0};
+-static int locality;
+-
+-__weak bool tpm_is_supported(void) { return false; }
+-
+-__weak unsigned int get_cs_pad_sel_tpm(void) { return 0; }
+-
+-__weak unsigned int get_miso_pad_sel_tpm(void) { return 0; }
+-
+-__weak unsigned int get_mosi_pad_sel_tpm(void) { return 0; }
+-
+-__weak unsigned int get_sclk_out_pad_sel_tpm(void) { return 0; }
+-
+-__weak void spi_tpm_base_get(unsigned int *regs) {}
+-
+-__weak void spi_ssi_cs1_get(unsigned int *mask, unsigned int *data_offset,
+-				unsigned int *out_en_offset)
+-{}
+-
+-static void spi_ssi_cs_init(void)
+-{
+-	unsigned int reg, mask, data, out_en;
+-
+-	spi_ssi_cs1_get(&mask, &data, &out_en);
+-
+-	reg  = regmap_readl(data);
+-	reg  &= ~mask;
+-	regmap_writel(reg, data);
+-
+-	reg = regmap_readl(out_en);
+-	reg |= mask;
+-	regmap_writel(reg, out_en);
+-
+-	regmap_writel(1, get_miso_pad_sel_tpm());
+-	regmap_writel(1, get_mosi_pad_sel_tpm());
+-	regmap_writel(1, get_sclk_out_pad_sel_tpm());
+-}
+-
+-static void spi_tpm_claim_bus(void)
+-{
+-	regmap_writel(0, get_cs_pad_sel_tpm());
+-}
+-
+-static void spi_tpm_release_bus(void)
+-{
+-	regmap_writel(1, get_cs_pad_sel_tpm());
+-}
+-
+-static void tpm_spi_init(void)
+-{
+-	spi_tpm_base_get(&tpm_spi.spi_base);
+-	tpm_spi.spi_initialized = false;
+-	tpm_spi.spi_access_is_locked = false;
+-	tpm_spi.cs_init = spi_ssi_cs_init;
+-	tpm_spi.claim_bus = spi_tpm_claim_bus;
+-	tpm_spi.release_bus = spi_tpm_release_bus;
+-	tpm_spi.fifo_len = 0;
+-	spi_init(&tpm_spi);
+-}
+-
+-static inline int tpm_command_size(const void *command)
+-{
+-	const size_t command_size_offset = 2;
+-
+-	/* get unaligned be32 */
+-	return get_unaligned_be32((__be32 *)(command + command_size_offset));
+-}
+-
+-static u32 tpm_return_code(const void *response)
+-{
+-	const size_t return_code_offset = 6;
+-
+-	return get_unaligned_be32(response + return_code_offset);
+-}
+-
+-/* Returns max number of milliseconds to wait */
+-static u64 tpm_tis_calc_ordinal_duration(u32 ordinal)
+-{
+-	int duration_idx = TPM_UNDEFINED;
+-	int duration = 0;
+-
+-	duration_ms[TPM_SHORT] = TIS_SHORT_TIMEOUT_MS;
+-	duration_ms[TPM_MEDIUM] = TIS_LONG_TIMEOUT_MS;
+-	duration_ms[TPM_LONG] = TIS_LONG_TIMEOUT_MS;
+-
+-	if (ordinal < TPM_MAX_ORDINAL) {
+-		duration_idx = tpm_ordinal_duration[ordinal];
+-	} else if ((ordinal & TPM_PROTECTED_ORDINAL_MASK) <
+-			TPM_MAX_PROTECTED_ORDINAL) {
+-		duration_idx = tpm_protected_ordinal_duration[
+-				ordinal & TPM_PROTECTED_ORDINAL_MASK];
+-	}
+-
+-	if (duration_idx != TPM_UNDEFINED)
+-		duration = duration_ms[duration_idx];
+-
+-	if (duration <= 0)
+-		return 2 * 60 * 1000; /* Two minutes timeout */
+-	else
+-		return duration;
+-}
+-
+-/**
+- * tpm_tis_spi_read() - Read from TPM register
+- *
+- * @addr: register address to read from
+- * @buffer: provided by caller
+- * @len: number of bytes to read
+- * @silent: Do not issue an error message in case of timeout
+- *
+- * Read len bytes from TPM register and put them into
+- * buffer (little-endian format, i.e. first byte is put into buffer[0]).
+- *
+- * NOTE: TPM is big-endian for multi-byte values. Multi-byte
+- * values have to be swapped.
+- *
+- * @return 0 on success or negative error code on failure
+- */
+-static int tpm_tis_spi_xfer(u32 addr, const u8 *out, u8 *in, u16 len, bool silent)
+-{
+-	int transfer_len, ret;
+-	u8 tx_buf[MAX_SPI_FRAMESIZE];
+-	u8 rx_buf[MAX_SPI_FRAMESIZE];
+-
+-	if (in && out) {
+-		preboot_puts("TPM2: can't do full duplex\n");
+-		return -EINVAL;
+-	}
+-
+-	while (len) {
+-		/* Request */
+-		transfer_len = min_t(u16, len, MAX_SPI_FRAMESIZE);
+-		tx_buf[0] = (in ? BIT(7) : 0) | (transfer_len - 1);
+-		tx_buf[1] = 0xD4;
+-		tx_buf[2] = addr >> 8;
+-		tx_buf[3] = addr;
+-
+-		ret = spi_xfer(&tpm_spi, 4 * 8, tx_buf, rx_buf, SPI_XFER_BEGIN);
+-		if (ret < 0) {
+-			preboot_puts("TPM2: spi request transfer failed\n");
+-			goto release_bus;
+-		}
+-
+-		/* Wait state */
+-		if (!(rx_buf[3] & 0x1)) {
+-			int i;
+-
+-			for (i = 0; i < TPM_WAIT_STATES; i++) {
+-				ret = spi_xfer(&tpm_spi, 1 * 8, NULL, rx_buf,
+-						0);
+-				if (ret) {
+-					preboot_puts_hex("TPM2: wait state failed: ",
+-								ret, true);
+-					goto release_bus;
+-				}
+-
+-				if (rx_buf[0] & 0x1)
+-					break;
+-			}
+-
+-			if (i == TPM_WAIT_STATES) {
+-				if (!silent)
+-					preboot_puts("TPM2: timeout on wait state\n");
+-				ret = -ETIMEDOUT;
+-				goto release_bus;
+-			}
+-		}
+-
+-		/* Read/Write */
+-		if (out) {
+-			memcpy(tx_buf, out, transfer_len);
+-			out += transfer_len;
+-		}
+-
+-		ret = spi_xfer(&tpm_spi, transfer_len * 8,
+-			       out ? tx_buf : NULL,
+-			       in ? rx_buf : NULL,
+-			       SPI_XFER_END);
+-		if (ret) {
+-			preboot_puts("TPM2: spi read transfer failed\n");
+-			goto release_bus;
+-		}
+-
+-		if (in) {
+-			memcpy(in, rx_buf, transfer_len);
+-			in += transfer_len;
+-		}
+-
+-		len -= transfer_len;
+-	}
+-
+-	return ret;
+-
+-release_bus:
+-	/* If an error occurred, release the chip by deasserting the CS */
+-	spi_tpm_release_bus();
+-
+-	return ret;
+-}
+-
+-static int tpm_tis_spi_read(u16 addr, u8 *in, u16 len)
+-{
+-	return tpm_tis_spi_xfer(addr, NULL, in, len, false);
+-}
+-
+-static int tpm_tis_spi_read_silent(u16 addr, u8 *in, u16 len)
+-{
+-	return tpm_tis_spi_xfer(addr, NULL, in, len, true);
+-}
+-
+-static int tpm_tis_spi_read32(u32 addr, u32 *result)
+-{
+-	__le32 result_le;
+-	int ret;
+-
+-	ret = tpm_tis_spi_read(addr, (u8 *)&result_le, sizeof(u32));
+-	if (!ret)
+-		*result = le32_to_cpu(result_le);
+-
+-	return ret;
+-}
+-
+-static u8 tpm_spi_status(u8 *status)
+-{
+-	return tpm_tis_spi_read(TPM_STS(locality), status, 1);
+-}
+-
+-static int tpm_spi_wait_for_stat(u8 mask, unsigned long timeout, u8 *status)
+-{
+-	u64 start = timestamp_get_us();
+-	u64 stop = timeout;
+-	int ret;
+-
+-	do {
+-		mdelay(TPM_TIMEOUT_MS);
+-		ret = tpm_spi_status(status);
+-		if (ret)
+-			return ret;
+-
+-		if ((*status & mask) == mask)
+-			return 0;
+-	} while (!timeout_expired(start, MS_TO_US(stop)));
+-
+-	return -1;
+-}
+-
+-static int tpm_spi_get_burstcount(void)
+-{
+-	u64 start, stop;
+-	u32 burstcount, ret;
+-
+-	/* wait for burstcount */
+-	start = timestamp_get_us();
+-	stop = TIS_SHORT_TIMEOUT_MS;
+-	do {
+-		ret = tpm_tis_spi_read32(TPM_STS(locality),
+-					 &burstcount);
+-		if (ret)
+-			return -1;
+-
+-		burstcount = (burstcount >> 8) & 0xFFFF;
+-		if (burstcount)
+-			return burstcount;
+-
+-		mdelay(TPM_TIMEOUT_MS);
+-	} while (!timeout_expired(start, MS_TO_US(stop)));
+-
+-	return -1;
+-}
+-
+-static int tpm_spi_recv_data(u8 *buf, size_t count)
+-{
+-	int size = 0, burstcnt, len, ret;
+-	u8 status;
+-
+-	while (size < count &&
+-	       tpm_spi_wait_for_stat(TPM_STS_DATA_AVAIL | TPM_STS_VALID,
+-					 TIS_SHORT_TIMEOUT_MS, &status) == 0) {
+-		burstcnt = tpm_spi_get_burstcount();
+-		if (burstcnt < 0)
+-			return burstcnt;
+-
+-		len = min_t(int, burstcnt, count - size);
+-		ret = tpm_tis_spi_read(TPM_DATA_FIFO(locality),
+-				       buf + size, len);
+-		if (ret < 0)
+-			return ret;
+-
+-		size += len;
+-	}
+-
+-	return size;
+-}
+-
+-static int tpm_tis_spi_write(u16 addr, const u8 *out, u16 len)
+-{
+-	return tpm_tis_spi_xfer(addr, out, NULL, len, false);
+-}
+-
+-static int tpm_tis_spi_cancel(void)
+-{
+-	u8 data = TPM_STS_COMMAND_READY;
+-
+-	return tpm_tis_spi_write(TPM_STS(locality), &data, 1);
+-}
+-
+-static void tpm_tis_spi_release_locality(int loc, bool force)
+-{
+-	const u8 mask = TPM_ACCESS_REQUEST_PENDING | TPM_ACCESS_VALID;
+-	u8 buf;
+-
+-	if (tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1) < 0)
+-		return;
+-
+-	if (force || (buf & mask) == mask) {
+-		buf = TPM_ACCESS_ACTIVE_LOCALITY;
+-		tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
+-	}
+-}
+-
+-static int tpm_spi_recv(u8 *buf, size_t count)
+-{
+-	int size, expected;
+-
+-	if (count < TPM_HEADER_SIZE) {
+-		size = -1;
+-		goto out;
+-	}
+-
+-	size = tpm_spi_recv_data(buf, TPM_HEADER_SIZE);
+-	if (size < TPM_HEADER_SIZE) {
+-		preboot_puts("TPM error, unable to read header\n");
+-		goto out;
+-	}
+-
+-	expected = get_unaligned_be32(buf + 2);
+-	if (expected > count) {
+-		size = -1;
+-		goto out;
+-	}
+-
+-	size += tpm_spi_recv_data(&buf[TPM_HEADER_SIZE],
+-				   expected - TPM_HEADER_SIZE);
+-	if (size < expected) {
+-		preboot_puts("TPM error, unable to read remaining bytes of result\n");
+-		size = -1;
+-		goto out;
+-	}
+-
+-out:
+-	tpm_tis_spi_cancel();
+-	tpm_tis_spi_release_locality(locality, false);
+-
+-	return size;
+-}
+-
+-static int tpm_tis_spi_check_locality(int loc)
+-{
+-	const u8 mask = TPM_ACCESS_ACTIVE_LOCALITY | TPM_ACCESS_VALID;
+-	u8 buf;
+-	int ret;
+-
+-	ret = tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1);
+-	if (ret)
+-		return ret;
+-
+-	if ((buf & mask) == mask) {
+-		locality = loc;
+-		return 0;
+-	}
+-
+-	return -ENOENT;
+-}
+-
+-static int tpm_tis_spi_request_locality(int loc)
+-{
+-	unsigned long start, stop;
+-	u8 buf = TPM_ACCESS_REQUEST_USE;
+-	int ret;
+-
+-	ret = tpm_tis_spi_check_locality(loc);
+-	if (!ret)
+-		return 0;
+-
+-	if (ret != -ENOENT) {
+-		preboot_puts("TPM2: Failed to get locality\n");
+-		return ret;
+-	}
+-
+-	ret = tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
+-	if (ret) {
+-		preboot_puts("TPM2: Failed to write to TPM\n");
+-		return ret;
+-	}
+-
+-	start = timestamp_get_us();
+-	stop = TIS_SHORT_TIMEOUT_MS;
+-	do {
+-		ret = tpm_tis_spi_check_locality(loc);
+-		if (!ret)
+-			return 0;
+-
+-		if (ret != -ENOENT) {
+-			preboot_puts("TPM2: Failed to get locality\n");
+-			return ret;
+-		}
+-
+-		mdelay(TPM_TIMEOUT_MS);
+-	} while (!timeout_expired(start, MS_TO_US(stop)));
+-
+-	preboot_puts("TPM2: Timeout getting locality\n");
+-
+-	return ret;
+-}
+-
+-static u8 tpm_tis_spi_valid_status(u8 *status)
+-{
+-	return tpm_spi_wait_for_stat(TPM_STS_VALID, TIS_SHORT_TIMEOUT_MS,
+-					status);
+-}
+-
+-static int tpm_spi_send(const u8 *buf, size_t len)
+-{
+-	u32 i, size;
+-	u8 status;
+-	int burstcnt, ret;
+-	u8 data;
+-
+-	if (len > TPM_DEV_BUFSIZE)
+-		return -E2BIG;  /* Command is too long for our tpm, sorry */
+-
+-	ret = tpm_tis_spi_request_locality(0);
+-	if (ret < 0)
+-		return -EBUSY;
+-
+-	/*
+-	 * Check if the TPM is ready. If not, if not, cancel the pending command
+-	 * and poll on the status to be finally ready.
+-	 */
+-	ret = tpm_spi_status(&status);
+-	if (ret)
+-		return ret;
+-
+-	if (!(status & TPM_STS_COMMAND_READY)) {
+-		/* Force the transition, usually this will be done at startup */
+-		ret = tpm_tis_spi_cancel();
+-		if (ret) {
+-			preboot_puts("TPM2: Could not cancel previous operation\n");
+-			goto out_err;
+-		}
+-
+-		ret = tpm_spi_wait_for_stat(TPM_STS_COMMAND_READY,
+-						TIS_LONG_TIMEOUT_MS, &status);
+-		if (ret < 0 || !(status & TPM_STS_COMMAND_READY)) {
+-			preboot_puts("status not ready after wait for stat returned err\n");
+-			goto out_err;
+-		}
+-	}
+-
+-	for (i = 0; i < len - 1;) {
+-		burstcnt = tpm_spi_get_burstcount();
+-		if (burstcnt < 0)
+-			return burstcnt;
+-
+-		size = min_t(int, len - i - 1, burstcnt);
+-		ret = tpm_tis_spi_write(TPM_DATA_FIFO(locality),
+-					buf + i, size);
+-		if (ret < 0)
+-			goto out_err;
+-
+-		i += size;
+-	}
+-
+-	ret = tpm_tis_spi_valid_status(&status);
+-	if (ret)
+-		goto out_err;
+-
+-	if ((status & TPM_STS_DATA_EXPECT) == 0) {
+-		ret = -EIO;
+-		goto out_err;
+-	}
+-
+-	ret = tpm_tis_spi_write(TPM_DATA_FIFO(locality),
+-				buf + len - 1, 1);
+-	if (ret)
+-		goto out_err;
+-
+-	ret = tpm_tis_spi_valid_status(&status);
+-	if (ret)
+-		goto out_err;
+-
+-	if ((status & TPM_STS_DATA_EXPECT) != 0) {
+-		ret = -EIO;
+-		goto out_err;
+-	}
+-
+-	data = TPM_STS_GO;
+-	ret = tpm_tis_spi_write(TPM_STS(locality), &data, 1);
+-	if (ret)
+-		goto out_err;
+-
+-	return len;
+-
+-out_err:
+-	tpm_tis_spi_cancel();
+-	tpm_tis_spi_release_locality(locality, false);
+-
+-	return ret;
+-}
+-
+-static int tpm_spi_cleanup(void)
+-{
+-	tpm_tis_spi_cancel();
+-	/*
+-	 * The TPM needs some time to clean up here,
+-	 * so we sleep rather than keeping the bus busy
+-	 */
+-	mdelay(2);
+-	tpm_tis_spi_release_locality(locality, false);
+-
+-	return 0;
+-}
+-
+-static int tpm_xfer(const uint8_t *sendbuf, size_t send_size,
+-	uint8_t *recvbuf, size_t *recv_size)
+-{
+-	u64 start, stop;
+-	unsigned int count, ordinal;
+-	int ret = 0;
+-
+-	/* switch endianness: big->little */
+-	count = get_unaligned_be32(sendbuf + TPM_CMD_COUNT_BYTE);
+-	ordinal = get_unaligned_be32(sendbuf + TPM_CMD_ORDINAL_BYTE);
+-
+-	if (count == 0) {
+-		preboot_puts("TPM2: no data\n");
+-		return -1;
+-	}
+-	if (count > send_size) {
+-		preboot_puts("TPM2: invalid count value\n");
+-		return -1;
+-	}
+-
+-	ret = tpm_spi_send(sendbuf, send_size);
+-	if (ret < 0)
+-		return ret;
+-
+-	start = timestamp_get_us();
+-	stop = tpm_tis_calc_ordinal_duration(ordinal);
+-	do {
+-		ret = tpm_spi_recv(tpm_xfer_buf, sizeof(tpm_xfer_buf));
+-		if (ret >= 0) {
+-			if (ret > *recv_size)
+-				return -1;
+-			memcpy(recvbuf, tpm_xfer_buf, ret);
+-			*recv_size = ret;
+-			ret = 0;
+-			break;
+-		} else if (ret != -1) {
+-			return ret;
+-		}
+-
+-		mdelay(TPM_TIMEOUT_MS);
+-		if (timeout_expired(start, MS_TO_US(stop))) {
+-			preboot_puts("TPM2: timeout expired\n");
+-			ret = -1;
+-			break;
+-		}
+-	} while (ret);
+-
+-	if (ret)
+-		tpm_spi_cleanup();
+-
+-	return 0;
+-}
+-
+-static int tpm_spi_sendrecv_command(const void *command,
+-			 void *response, size_t *size_ptr)
+-{
+-	int err, ret;
+-	size_t response_length;
+-
+-	if (response) {
+-		response_length = *size_ptr;
+-	} else {
+-		response = response_buffer;
+-		response_length = sizeof(response_buffer);
+-	}
+-
+-	err = tpm_xfer(command, tpm_command_size(command),
+-		       response, &response_length);
+-
+-	if (err < 0)
+-		return err;
+-
+-	if (size_ptr)
+-		*size_ptr = response_length;
+-
+-	ret = tpm_return_code(response);
+-
+-	return ret;
+-}
+-
+-int tpm2_startup(enum tpm2_startup_types mode)
+-{
+-	const u8 command_v2[12] = {
+-		tpm_u16(TPM2_ST_NO_SESSIONS),
+-		tpm_u32(12),
+-		tpm_u32(TPM2_CC_STARTUP),
+-		tpm_u16(mode),
+-	};
+-	int ret;
+-
+-	/*
+-	 * Note TPM2_Startup command will return RC_SUCCESS the first time,
+-	 * but will return RC_INITIALIZE otherwise.
+-	 */
+-	ret = tpm_spi_sendrecv_command(command_v2, NULL, NULL);
+-	if (ret && ret != TPM2_RC_INITIALIZE) {
+-		preboot_puts("ret != TPM2_RC_INITIALIZE");
+-		return ret;
+-	}
+-
+-	return 0;
+-}
+-
+-static int tpm2_unpack_byte_string(const u8 *str, size_t size,
+-					const char *format, ...)
+-{
+-	va_list args;
+-	size_t offset = 0, length = 0;
+-	u8 *ptr8 = NULL;
+-	u16 *ptr16 = NULL;
+-	u32 *ptr32 = NULL;
+-
+-	va_start(args, format);
+-	for (; *format; format++) {
+-		switch (*format) {
+-		case 'b':
+-			offset = va_arg(args, size_t);
+-			ptr8 = va_arg(args, u8 *);
+-			length = 1;
+-			break;
+-		case 'w':
+-			offset = va_arg(args, size_t);
+-			ptr16 = va_arg(args, u16 *);
+-			length = 2;
+-			break;
+-		case 'd':
+-			offset = va_arg(args, size_t);
+-			ptr32 = va_arg(args, u32 *);
+-			length = 4;
+-			break;
+-		case 's':
+-			offset = va_arg(args, size_t);
+-			ptr8 = va_arg(args, u8 *);
+-			length = va_arg(args, u32);
+-			break;
+-		default:
+-			va_end(args);
+-			preboot_puts("TPM2: Couldn't recognize format string\n");
+-			return -1;
+-		}
+-
+-		if (offset + length > size) {
+-			va_end(args);
+-			preboot_puts("TPM2: Failed to read\n");
+-			return -1;
+-		}
+-
+-		switch (*format) {
+-		case 'b':
+-			*ptr8 = str[offset];
+-			break;
+-		case 'w':
+-			*ptr16 = get_unaligned_be16(str + offset);
+-			break;
+-		case 'd':
+-			*ptr32 = get_unaligned_be32(str + offset);
+-			break;
+-		case 's':
+-			memcpy(ptr8, str + offset, length);
+-			break;
+-		}
+-	}
+-	va_end(args);
+-
+-	return 0;
+-}
+-
+-static int tpm2_pack_byte_string(u8 *str, size_t size, const char *format, ...)
+-{
+-	va_list args;
+-	size_t offset = 0, length = 0;
+-	u8 *data = NULL;
+-	u32 value = 0;
+-
+-	va_start(args, format);
+-	for (; *format; format++) {
+-		switch (*format) {
+-		case 'b':
+-			offset = va_arg(args, size_t);
+-			value = va_arg(args, int);
+-			length = 1;
+-			break;
+-		case 'w':
+-			offset = va_arg(args, size_t);
+-			value = va_arg(args, int);
+-			length = 2;
+-			break;
+-		case 'd':
+-			offset = va_arg(args, size_t);
+-			value = va_arg(args, u32);
+-			length = 4;
+-			break;
+-		case 's':
+-			offset = va_arg(args, size_t);
+-			data = va_arg(args, u8 *);
+-			length = va_arg(args, u32);
+-			break;
+-		default:
+-			preboot_puts("TPM2: Couldn't recognize format string\n");
+-			va_end(args);
+-			return -1;
+-		}
+-
+-		if (offset + length > size) {
+-			va_end(args);
+-			return -1;
+-		}
+-
+-		switch (*format) {
+-		case 'b':
+-			str[offset] = value;
+-			break;
+-		case 'w':
+-			put_unaligned_be16(value, str + offset);
+-			break;
+-		case 'd':
+-			put_unaligned_be32(value, str + offset);
+-			break;
+-		case 's':
+-			memcpy(str + offset, data, length);
+-			break;
+-		}
+-	}
+-	va_end(args);
+-
+-	return 0;
+-}
+-
+-int tpm2_nv_read(u32 index, void *data, u32 count)
+-{
+-	u8 command_v2[COMMAND_BUFFER_SIZE] = {
+-		/* header 10 bytes */
+-		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
+-		tpm_u32(10 + 8 + 4 + 9 + 4),	/* Length */
+-		tpm_u32(TPM2_CC_NV_READ),	/* Command code */
+-
+-		/* handles 8 bytes */
+-		tpm_u32(TPM2_RH_PLATFORM),	/* Primary platform seed */
+-		tpm_u32(index),	/* Password authorisation */
+-
+-		/* AUTH_SESSION */
+-		tpm_u32(9),			/* Authorization size */
+-		tpm_u32(TPM2_RS_PW),		/* Session handle */
+-		tpm_u16(0),			/* Size of <nonce> */
+-						/* <nonce> (if any) */
+-		0,				/* Attributes: Cont/Excl/Rst */
+-		tpm_u16(0),			/* Size of <hmac/password> */
+-						/* <hmac/password> (if any) */
+-
+-		tpm_u16(count),			/* Number of bytes */
+-		tpm_u16(0),			/* Offset */
+-	};
+-	size_t response_len = COMMAND_BUFFER_SIZE;
+-	int ret;
+-	u16 tag;
+-	u32 size, code;
+-
+-	ret = tpm_spi_sendrecv_command(command_v2, response_buffer, &response_len);
+-	if (ret)
+-		return ret;
+-	if (tpm2_unpack_byte_string(response_buffer, response_len, "wdds", 0, &tag, 2,
+-					&size, 6, &code, 16, data, count))
+-		return TPM_LIB_ERROR;
+-
+-	return 0;
+-}
+-
+-int tpm2_pcr_extend(u32 index, u32 algorithm, const u8 *digest, u32 digest_len)
+-{
+-	/* Length of the message header, up to start of digest */
+-	u32 offset = 33;
+-	u8 command_v2[COMMAND_BUFFER_SIZE] = {
+-		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
+-		tpm_u32(offset + digest_len),	/* Length */
+-		tpm_u32(TPM2_CC_PCR_EXTEND),	/* Command code */
+-
+-		/* HANDLE */
+-		tpm_u32(index),			/* Handle (PCR Index) */
+-
+-		/* AUTH_SESSION */
+-		tpm_u32(9),			/* Authorization size */
+-		tpm_u32(TPM2_RS_PW),		/* Session handle */
+-		tpm_u16(0),			/* Size of <nonce> */
+-						/* <nonce> (if any) */
+-		0,				/* Attributes: Cont/Excl/Rst */
+-		tpm_u16(0),			/* Size of <hmac/password> */
+-						/* <hmac/password> (if any) */
+-
+-		/* hashes */
+-		tpm_u32(1),			/* Count (number of hashes) */
+-		tpm_u16(algorithm),	/* Algorithm of the hash */
+-		/* STRING(digest)		   Digest */
+-	};
+-	int ret;
+-
+-	/*
+-	 * Fill the command structure starting from the first buffer:
+-	 *     - the digest
+-	 */
+-	ret = tpm2_pack_byte_string(command_v2, sizeof(command_v2), "s",
+-			       offset, digest, digest_len);
+-	if (ret)
+-		return TPM_LIB_ERROR;
+-
+-	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
+-}
+-
+-#define TPM2_GET_CAPAB_CMD_SIZE	22
+-
+-int tpm2_get_capability(u32 capability, u32 property, void *data, size_t *data_len)
+-{
+-	const u8 command_v2[TPM2_GET_CAPAB_CMD_SIZE] = {
+-		tpm_u16(TPM2_ST_NO_SESSIONS),		/* TAG */
+-		tpm_u32(TPM2_GET_CAPAB_CMD_SIZE),	/* Length */
+-		tpm_u32(TPM2_CC_GET_CAPABILITY),	/* Command code */
+-
+-		tpm_u32(capability),			/* Capability */
+-		tpm_u32(property),			/* Property */
+-		tpm_u32(1),				/* Property count */
+-	};
+-	size_t response_len = COMMAND_BUFFER_SIZE;
+-	int ret;
+-	/*
+-	 * In the response buffer, the properties are located after the:
+-	 * tag (u16), response size (u32), response code (u32),
+-	 * YES/NO flag (u8), TPM_CAP (u32).
+-	 */
+-	const size_t properties_off = sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint32_t) +
+-				      sizeof(uint8_t) + sizeof(uint32_t);
+-
+-	ret = tpm_spi_sendrecv_command(command_v2, response_buffer, &response_len);
+-	if (ret)
+-		return TPM_LIB_ERROR;
+-
+-	response_len -= properties_off;
+-	memcpy(data, &response_buffer[properties_off], response_len);
+-
+-	if (data_len)
+-		*data_len = response_len;
+-
+-	return ret;
+-}
+-
+-int tpm2_pcr384_allocate(void)
+-{
+-	uint8_t command_v2[COMMAND_BUFFER_SIZE] = {
+-		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
+-		tpm_u32(10 + 4 + 13 + 16),	/* Length */
+-		tpm_u32(TPM2_CC_PCR_ALLOCATE),	/* Command code */
+-
+-		/* handles 4 bytes */
+-		tpm_u32(TPM2_RH_PLATFORM),	/* Primary platform seed */
+-
+-		/* session header 13 bytes */
+-		tpm_u32(9),			/* Header size */
+-		tpm_u32(TPM2_RS_PW),		/* Password authorisation */
+-		tpm_u16(0),			/* nonce_size */
+-		0,				/* session_attrs */
+-		tpm_u16(0),			/* auth_size */
+-
+-		/* TPML_PCR_SELECTION  16 bytes*/
+-		tpm_u32(2),			/* num of PCR banks */
+-		/* deallocate SHA1 bank*/
+-		tpm_u16(TPM2_ALG_SHA1),		/* alg */
+-		3,				/* Size of PCR mask */
+-		tpm_u16(0x0),			/* 24 PCRs mask */
+-		0x0,
+-		/* allocate SHA384 bank */
+-		tpm_u16(TPM2_ALG_SHA384),	/* alg */
+-		3,				/* Size of PCR mask */
+-		tpm_u16(0xFFFF),		/* 24 PCRs mask */
+-		0xFF,
+-	};
+-
+-	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
+-}
+-
+-static int tpm_tis_wait_init(int loc)
+-{
+-	unsigned long start, stop;
+-	u8 status;
+-	int ret;
+-
+-	start = timestamp_get_us();
+-	stop = TIS_LONG_TIMEOUT_MS;
+-	do {
+-		mdelay(TPM_TIMEOUT_MS);
+-
+-		ret = tpm_tis_spi_read_silent(TPM_ACCESS(loc), &status, 1);
+-		if (ret == -ETIMEDOUT)
+-			continue;
+-		else if (ret != 0)
+-			break;
+-
+-		if (status & TPM_ACCESS_VALID && status != 0xff)
+-			return 0;
+-	} while (!timeout_expired(start, MS_TO_US(stop)));
+-
+-	return -EIO;
+-}
+-
+-int tpm2_init(bool print)
+-{
+-	int ret;
+-	u32 vend_dev;
+-	u8 rid;
+-
+-	locality = 0;
+-
+-	if (!tpm_is_supported())
+-		return 0;
+-
+-	tpm_spi_init();
+-
+-	ret = tpm_tis_wait_init(locality);
+-	if (ret) {
+-		preboot_puts("TPM2: no device found\n");
+-		return ret;
+-	}
+-
+-	ret = tpm_tis_spi_request_locality(locality);
+-	if (ret) {
+-		preboot_puts("TPM2: could not request locality\n");
+-		return ret;
+-	}
+-
+-	ret = tpm_tis_spi_read32(TPM_DID_VID(locality), &vend_dev);
+-	if (ret) {
+-		preboot_puts("TPM2: could not retrieve VendorID/DeviceID\n");
+-		return ret;
+-	}
+-
+-	ret = tpm_tis_spi_read(TPM_RID(locality), &rid, 1);
+-	if (ret) {
+-		preboot_puts("TPM2: could not retrieve RevisionID\n");
+-		return ret;
+-	}
+-
+-	if (print)
+-		preboot_puts("SPI TPMv2.0 found\n");
+-
+-	return 0;
+-}
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+deleted file mode 100644
+index 0adfc82..0000000
+--- a/arch/gaudi2/common/tpm_auth.c
++++ /dev/null
+@@ -1,154 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <efuse.h>
+-#include <boot_if.h>
+-#include <tpm2.h>
+-#include <uart.h>
+-#include <sha512.h>
+-#include <boot_desc.h>
+-#include <errno.h>
+-#include "lzo/unaligned.h"
+-
+-#define TPM_NV_DEV_SN_ADDRESS		0x01c10100
+-
+-struct tpm_dev_id {
+-	union {
+-		u32 efuse_data[2];
+-		u64 tpm_data;
+-	};
+-};
+-
+-static int preboot_get_efuse_dev_id(struct tpm_dev_id *efuse_dev_id_ret)
+-{
+-	int ret;
+-
+-	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_1, &efuse_dev_id_ret->efuse_data[0]);
+-	if (ret)
+-		return ret;
+-
+-	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_2, &efuse_dev_id_ret->efuse_data[1]);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
+-}
+-
+-int tpm_init(bool print)
+-{
+-	int ret;
+-
+-	ret = tpm2_init(print);
+-	if (ret) {
+-		preboot_puts("TPM: tpm2_init failed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	return ret;
+-}
+-
+-#define TPM2_CAP_PCRS		5
+-#define TPM2_CAP_SIZE		32
+-#define BANK1_ALG_OFFSET	5
+-#define BANK2_ALG_OFFSET	11
+-
+-int tpm_startup(void)
+-{
+-	u8 capabilities[TPM2_CAP_SIZE];
+-	int ret;
+-
+-	ret = tpm2_startup(TPM2_SU_CLEAR);
+-	if (ret) {
+-		preboot_puts("TPM: tpm2_startup failed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-		return ret;
+-	}
+-
+-	ret = tpm2_get_capability(TPM2_CAP_PCRS, 0, capabilities, NULL);
+-	if (ret) {
+-		preboot_puts("TPM: tpm2_getcap failed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	/* check if sha384 bank is allocated */
+-	if ((capabilities[BANK1_ALG_OFFSET] == TPM2_ALG_SHA384) ||
+-	    (capabilities[BANK2_ALG_OFFSET] == TPM2_ALG_SHA384))
+-		return ret;
+-
+-	ret = tpm2_pcr384_allocate();
+-	if (ret) {
+-		preboot_puts("TPM: failed to alloc sha384 bank\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-		return ret;
+-	}
+-
+-	/* TODO: reset the TPM by togglind the CPLD request gpio (SW-102141) */
+-
+-	ret = tpm2_startup(TPM2_SU_CLEAR);
+-	if (ret) {
+-		preboot_puts("TPM: tpm2_startup failed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	return ret;
+-}
+-
+-int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
+-{
+-	int ret;
+-
+-	if (hash == NULL)
+-		return -1;
+-
+-	ret = tpm2_pcr_extend(image_index, TPM2_ALG_SHA384, hash, SHA384_SUM_LEN);
+-	if (ret) {
+-		preboot_puts("preboot_pcr_extend: pcr extend failed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	return ret;
+-}
+-
+-void preboot_tpm_auth(void)
+-{
+-	int ret;
+-	u64 tpm_dev_id = 0;
+-	struct tpm_dev_id efuse_dev_id;
+-
+-	efuse_dev_id.tpm_data = 0x0;
+-
+-	if (cpu_boot_err_get(CPU_BOOT_ERR_TPM_FAIL))
+-		return;
+-
+-	tpm_init(true);
+-
+-	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
+-	if (ret) {
+-		preboot_puts_hex("TPM: NV_READ failed. ret = ", ret, true);
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-
+-	/* tpm device id returns as Big Endian, need to convert */
+-	tpm_dev_id = get_unaligned_be64(&tpm_dev_id);
+-	preboot_puts_hex64("TPM device ID: ", tpm_dev_id, true);
+-
+-	ret = preboot_get_efuse_dev_id(&efuse_dev_id);
+-	if (ret) {
+-		preboot_puts_hex("TPM flow: efuse read failed. ret = ", ret, true);
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	} else {
+-		preboot_puts_hex64("EFUSE device ID: ", efuse_dev_id.tpm_data, true);
+-	}
+-
+-	if (efuse_dev_id.tpm_data == 0) {
+-		preboot_puts("TPM flow: error: efuse device ID not programed\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	} else if (efuse_dev_id.tpm_data != tpm_dev_id) {
+-		preboot_puts("TPM flow: error: efuse device ID is different than TPM device ID\n");
+-		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-	}
+-}
+diff --git a/arch/gaudi2/common/tpm_auth.h b/arch/gaudi2/common/tpm_auth.h
+deleted file mode 100644
+index df6dfc0..0000000
+--- a/arch/gaudi2/common/tpm_auth.h
++++ /dev/null
+@@ -1,33 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#ifndef _HL_TPM_AUTH_H_
+-#define _HL_TPM_AUTH_H_
+-
+-#include <sizes.h>
+-
+-#define ARCBOOT_PRIMARY			0
+-#define ARCBOOT_SECONDARY		1
+-#define ARCBOOT_STATUS_REG_SZ_BITS	32
+-#define FLASH_64KB_PADD			SZ_64K
+-#define FLASH_VALID_MASK		(SZ_2M - 1)
+-#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE	46080
+-#define HL_FWSRAM_OFFSET		0x3FD0000
+-#define HL_GEN_MEM_BASE			0x24000000
+-
+-#define HL_FWSRAM_BASE			(HL_GEN_MEM_BASE + \
+-					 HL_FWSRAM_OFFSET)
+-
+-#define PPBOOT_SHA_MAGIC		0x1cca566a
+-#define PPBOOT_HASH_MAGIC_SIZE		4
+-#define PPBOOT_SHA384_FOOTER		SHA384_SUM_LEN
+-
+-int tpm_init(bool print);
+-int tpm_startup(void);
+-int tpm_pcr_extend(uint32_t image_index, uint8_t *hash);
+-
+-#endif /* _HL_TPM_AUTH_H_ */
+diff --git a/arch/gaudi2/common/tpm_internal.h b/arch/gaudi2/common/tpm_internal.h
+deleted file mode 100644
+index 4d4af81..0000000
+--- a/arch/gaudi2/common/tpm_internal.h
++++ /dev/null
+@@ -1,280 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0+ */
+-/*
+- * Copyright (c) 2015 Google, Inc
+- */
+-
+-#ifndef __tpm_internal_h
+-#define __tpm_internal_h
+-
+-static unsigned int duration_ms[TPM_DURATION_COUNT];
+-
+-/*
+- * Array with one entry per ordinal defining the maximum amount
+- * of time the chip could take to return the result.  The ordinal
+- * designation of short, medium or long is defined in a table in
+- * TCG Specification TPM Main Part 2 TPM Structures Section 17. The
+- * values of the SHORT, MEDIUM, and LONG durations are retrieved
+- * from the chip during initialization with a call to tpm_get_timeouts.
+- */
+-static const u8 tpm_protected_ordinal_duration[TPM_MAX_PROTECTED_ORDINAL] = {
+-	TPM_UNDEFINED,		/* 0 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 5 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 10 */
+-	TPM_SHORT,
+-};
+-
+-static const u8 tpm_ordinal_duration[TPM_MAX_ORDINAL] = {
+-	TPM_UNDEFINED,		/* 0 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 5 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 10 */
+-	TPM_SHORT,
+-	TPM_MEDIUM,
+-	TPM_LONG,
+-	TPM_LONG,
+-	TPM_MEDIUM,		/* 15 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_MEDIUM,
+-	TPM_LONG,
+-	TPM_SHORT,		/* 20 */
+-	TPM_SHORT,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_SHORT,		/* 25 */
+-	TPM_SHORT,
+-	TPM_MEDIUM,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_MEDIUM,		/* 30 */
+-	TPM_LONG,
+-	TPM_MEDIUM,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 35 */
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,		/* 40 */
+-	TPM_LONG,
+-	TPM_MEDIUM,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 45 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_LONG,
+-	TPM_MEDIUM,		/* 50 */
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 55 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,		/* 60 */
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_MEDIUM,		/* 65 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 70 */
+-	TPM_SHORT,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 75 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_LONG,		/* 80 */
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,
+-	TPM_LONG,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,		/* 85 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 90 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,		/* 95 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,		/* 100 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 105 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 110 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 115 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_LONG,		/* 120 */
+-	TPM_LONG,
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 125 */
+-	TPM_SHORT,
+-	TPM_LONG,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 130 */
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,		/* 135 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 140 */
+-	TPM_SHORT,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 145 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 150 */
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,		/* 155 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 160 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 165 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_LONG,		/* 170 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 175 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,		/* 180 */
+-	TPM_SHORT,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,		/* 185 */
+-	TPM_SHORT,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 190 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 195 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 200 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 205 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_MEDIUM,		/* 210 */
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,		/* 215 */
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,
+-	TPM_SHORT,		/* 220 */
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_SHORT,
+-	TPM_UNDEFINED,		/* 225 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 230 */
+-	TPM_LONG,
+-	TPM_MEDIUM,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,		/* 235 */
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_UNDEFINED,
+-	TPM_SHORT,		/* 240 */
+-	TPM_UNDEFINED,
+-	TPM_MEDIUM,
+-};
+-
+-#endif
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index adac7de..2811d0d 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -41,6 +41,7 @@
+ #include <pcie_dbi_masks.h>
+ #include <efuse_masks.h>
+ #include <arcboot_export.h>
++#include <gaudi3/gaudi3_security.h>
+ #include <hl_sec_if.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+@@ -1461,3 +1462,8 @@
+ 
+ 	return count;
+ }
++
++uint8_t get_ppboot_pcr_index(void)
++{
++	return TPM2_PPBOOT_PCR_IDX;
++}
+diff --git a/include/tpm2.h b/include/tpm2.h
+index 0932f7c..28bc93f 100644
+--- a/include/tpm2.h
++++ b/include/tpm2.h
+@@ -10,6 +10,7 @@
+ 
+ #include <types.h>
+ #include <stdbool.h>
++#include <stddef.h>
+ #include <hl_tpm2.h>
+ 
+ #define TPM2_SHA384_DIGEST_SIZE 48
+diff --git a/lib/common/tpm.c b/lib/common/tpm.c
+new file mode 100644
+index 0000000..1cd64d6
+--- /dev/null
++++ b/lib/common/tpm.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * (C) Copyright 2023 HabanaLabs, Ltd.
++ */
++
++#include <string.h>
++#include <stdbool.h>
++#include <tpm2.h>
++#include <tpm_auth.h>
++#include <baremetal.h>
++#include <bitops.h>
++#include <hl_fw_if.h>
++#include <hl_sec_if.h>
++#include <uart.h>
++
++#define TOTAL_PUB_KEY_PROPS_SZ  (PUB_KEY_SZ + KEY_PROP_HDR_SZ)
++#define SIG_SIZE		384
++#define CRC32_SIZE		4
++
++__weak bool tpm_is_supported(void) { return false; }
++
++__weak int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
++{
++	return -1;
++}
++
++__weak int tpm_init(bool print)
++{
++	return -1;
++}
++
++__weak bool is_ppboot_tpm_extend_done(void)
++{
++	return false;
++}
++
++static uintptr_t hl_get_ppboot_data(void)
++{
++	uint32_t ppboot_pcie_size;
++
++	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
++
++	ppboot_pcie_size -= SIG_SIZE;
++	ppboot_pcie_size -= CRC32_SIZE;
++	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
++	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
++	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
++
++	return (uintptr_t)(HL_FWSRAM_BASE + ppboot_pcie_size);
++}
++
++__weak uint8_t get_ppboot_pcr_index(void)
++{
++	return 0;
++}
++
++void ppboot_tpm_extend(void)
++{
++	uintptr_t data;
++	uint32_t magic;
++	uint8_t hash[SHA384_SUM_LEN] = { 0 };
++	uint8_t ppboot_pcr_idx;
++
++	if (!tpm_is_supported())
++		return;
++
++	/* return if erom has already done ppboot tpm extend */
++	if (is_ppboot_tpm_extend_done())
++		return;
++
++	if (tpm_init(true))
++		return;
++
++	if (tpm_startup())
++		return;
++
++	data = hl_get_ppboot_data();
++
++	memcpy(&magic, (void *)data, PPBOOT_HASH_MAGIC_SIZE);
++
++	if (magic != PPBOOT_SHA_MAGIC) {
++		preboot_puts("no ppboot sha magic found\n");
++		return;
++	}
++
++	memcpy(hash, (void *)(data + PPBOOT_HASH_MAGIC_SIZE), SHA384_SUM_LEN);
++
++	ppboot_pcr_idx = get_ppboot_pcr_index();
++
++	tpm_pcr_extend(ppboot_pcr_idx, hash);
++}
+diff --git a/lib/common/tpm2.c b/lib/common/tpm2.c
+new file mode 100644
+index 0000000..595bb32
+--- /dev/null
++++ b/lib/common/tpm2.c
+@@ -0,0 +1,1046 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stddef.h>
++#include <stdarg.h>
++#include <tpm2.h>
++#include <uart.h>
++#include <baremetal.h>
++#include <types.h>
++#include <string.h>
++#include <pll.h>
++#include <spi.h>
++#include <errno.h>
++
++#include "lzo/unaligned.h"
++#include "tpm_internal.h"
++
++/* Number of wait states to wait for */
++#define TPM_WAIT_STATES 100
++
++#define TPM_ACCESS(l)			(0x0000 | ((l) << 12))
++#define TPM_INT_ENABLE(l)               (0x0008 | ((l) << 12))
++#define TPM_STS(l)			(0x0018 | ((l) << 12))
++#define TPM_DATA_FIFO(l)		(0x0024 | ((l) << 12))
++#define TPM_DID_VID(l)			(0x0F00 | ((l) << 12))
++#define TPM_RID(l)			(0x0F04 | ((l) << 12))
++
++#define MAX_SPI_FRAMESIZE 32
++
++#define COMMAND_BUFFER_SIZE 256
++
++/* Internal error of TPM command library */
++#define TPM_LIB_ERROR ((u32)~0u)
++
++/* To make strings of commands more easily */
++#define __MSB(x) ((x) >> 8)
++#define __LSB(x) ((x) & 0xFF)
++#define tpm_u16(x) __MSB(x), __LSB(x)
++#define tpm_u32(x) tpm_u16((x) >> 16), tpm_u16((x) & 0xFFFF)
++
++#define TPM_HEADER_SIZE		10
++
++/* Max buffer size supported by our tpm */
++#define TPM_DEV_BUFSIZE		1260
++
++#define MS_TO_US(m) ((m) * 1000)
++
++#define min_t(type, x, y) ({			\
++	type __min1 = (x);			\
++	type __min2 = (y);			\
++	__min1 < __min2 ? __min1 : __min2; })
++
++
++#define le32_to_cpu(x) ((__force __u32)(__le32)(x))
++
++/**
++ * TPM2 permanent handles.
++ *
++ * @TPM2_RH_OWNER: refers to the 'owner' hierarchy.
++ * @TPM2_RS_PW: indicates a password.
++ * @TPM2_RH_LOCKOUT: refers to the 'lockout' hierarchy.
++ * @TPM2_RH_ENDORSEMENT: refers to the 'endorsement' hierarchy.
++ * @TPM2_RH_PLATFORM: refers to the 'platform' hierarchy.
++ */
++enum {
++	/* Secure storage for firmware settings */
++	TPM_HT_PCR = 0,
++	TPM_HT_NV_INDEX,
++	TPM_HT_HMAC_SESSION,
++	TPM_HT_POLICY_SESSION,
++
++	HR_SHIFT		= 24,
++	HR_PCR			= TPM_HT_PCR << HR_SHIFT,
++	HR_HMAC_SESSION		= TPM_HT_HMAC_SESSION << HR_SHIFT,
++	HR_POLICY_SESSION	= TPM_HT_POLICY_SESSION << HR_SHIFT,
++	HR_NV_INDEX		= TPM_HT_NV_INDEX << HR_SHIFT,
++};
++
++/* Max tpm xfer buffer size + addr */
++static u8 tpm_xfer_buf[TPM_DEV_BUFSIZE + sizeof(u8)];
++static u8 response_buffer[COMMAND_BUFFER_SIZE];
++static struct spi_ctx tpm_spi = {0};
++static int locality;
++
++__weak unsigned int get_cs_pad_sel_tpm(void) { return 0; }
++
++__weak unsigned int get_miso_pad_sel_tpm(void) { return 0; }
++
++__weak unsigned int get_mosi_pad_sel_tpm(void) { return 0; }
++
++__weak unsigned int get_sclk_out_pad_sel_tpm(void) { return 0; }
++
++__weak void spi_tpm_base_get(unsigned int *regs) {}
++
++__weak void spi_ssi_cs1_get(unsigned int *mask, unsigned int *data_offset,
++				unsigned int *out_en_offset)
++{}
++
++static void spi_ssi_cs_init(void)
++{
++	unsigned int reg, mask, data, out_en;
++
++	spi_ssi_cs1_get(&mask, &data, &out_en);
++
++	reg  = regmap_readl(data);
++	reg  &= ~mask;
++	regmap_writel(reg, data);
++
++	reg = regmap_readl(out_en);
++	reg |= mask;
++	regmap_writel(reg, out_en);
++
++	regmap_writel(1, get_miso_pad_sel_tpm());
++	regmap_writel(1, get_mosi_pad_sel_tpm());
++	regmap_writel(1, get_sclk_out_pad_sel_tpm());
++}
++
++static void spi_tpm_claim_bus(void)
++{
++	regmap_writel(0, get_cs_pad_sel_tpm());
++}
++
++static void spi_tpm_release_bus(void)
++{
++	regmap_writel(1, get_cs_pad_sel_tpm());
++}
++
++static void tpm_spi_init(void)
++{
++	spi_tpm_base_get(&tpm_spi.spi_base);
++	tpm_spi.spi_initialized = false;
++	tpm_spi.spi_access_is_locked = false;
++	tpm_spi.cs_init = spi_ssi_cs_init;
++	tpm_spi.claim_bus = spi_tpm_claim_bus;
++	tpm_spi.release_bus = spi_tpm_release_bus;
++	tpm_spi.fifo_len = 0;
++	spi_init(&tpm_spi);
++}
++
++static inline int tpm_command_size(const void *command)
++{
++	const size_t command_size_offset = 2;
++
++	/* get unaligned be32 */
++	return get_unaligned_be32((__be32 *)(command + command_size_offset));
++}
++
++static u32 tpm_return_code(const void *response)
++{
++	const size_t return_code_offset = 6;
++
++	return get_unaligned_be32(response + return_code_offset);
++}
++
++/* Returns max number of milliseconds to wait */
++static u64 tpm_tis_calc_ordinal_duration(u32 ordinal)
++{
++	int duration_idx = TPM_UNDEFINED;
++	int duration = 0;
++
++	duration_ms[TPM_SHORT] = TIS_SHORT_TIMEOUT_MS;
++	duration_ms[TPM_MEDIUM] = TIS_LONG_TIMEOUT_MS;
++	duration_ms[TPM_LONG] = TIS_LONG_TIMEOUT_MS;
++
++	if (ordinal < TPM_MAX_ORDINAL) {
++		duration_idx = tpm_ordinal_duration[ordinal];
++	} else if ((ordinal & TPM_PROTECTED_ORDINAL_MASK) <
++			TPM_MAX_PROTECTED_ORDINAL) {
++		duration_idx = tpm_protected_ordinal_duration[
++				ordinal & TPM_PROTECTED_ORDINAL_MASK];
++	}
++
++	if (duration_idx != TPM_UNDEFINED)
++		duration = duration_ms[duration_idx];
++
++	if (duration <= 0)
++		return 2 * 60 * 1000; /* Two minutes timeout */
++	else
++		return duration;
++}
++
++/**
++ * tpm_tis_spi_read() - Read from TPM register
++ *
++ * @addr: register address to read from
++ * @buffer: provided by caller
++ * @len: number of bytes to read
++ * @silent: Do not issue an error message in case of timeout
++ *
++ * Read len bytes from TPM register and put them into
++ * buffer (little-endian format, i.e. first byte is put into buffer[0]).
++ *
++ * NOTE: TPM is big-endian for multi-byte values. Multi-byte
++ * values have to be swapped.
++ *
++ * @return 0 on success or negative error code on failure
++ */
++static int tpm_tis_spi_xfer(u32 addr, const u8 *out, u8 *in, u16 len, bool silent)
++{
++	int transfer_len, ret;
++	u8 tx_buf[MAX_SPI_FRAMESIZE];
++	u8 rx_buf[MAX_SPI_FRAMESIZE];
++
++	if (in && out) {
++		preboot_puts("TPM2: can't do full duplex\n");
++		return -EINVAL;
++	}
++
++	while (len) {
++		/* Request */
++		transfer_len = min_t(u16, len, MAX_SPI_FRAMESIZE);
++		tx_buf[0] = (in ? BIT(7) : 0) | (transfer_len - 1);
++		tx_buf[1] = 0xD4;
++		tx_buf[2] = addr >> 8;
++		tx_buf[3] = addr;
++
++		ret = spi_xfer(&tpm_spi, 4 * 8, tx_buf, rx_buf, SPI_XFER_BEGIN);
++		if (ret < 0) {
++			preboot_puts("TPM2: spi request transfer failed\n");
++			goto release_bus;
++		}
++
++		/* Wait state */
++		if (!(rx_buf[3] & 0x1)) {
++			int i;
++
++			for (i = 0; i < TPM_WAIT_STATES; i++) {
++				ret = spi_xfer(&tpm_spi, 1 * 8, NULL, rx_buf,
++						0);
++				if (ret) {
++					preboot_puts_hex("TPM2: wait state failed: ",
++								ret, true);
++					goto release_bus;
++				}
++
++				if (rx_buf[0] & 0x1)
++					break;
++			}
++
++			if (i == TPM_WAIT_STATES) {
++				if (!silent)
++					preboot_puts("TPM2: timeout on wait state\n");
++				ret = -ETIMEDOUT;
++				goto release_bus;
++			}
++		}
++
++		/* Read/Write */
++		if (out) {
++			memcpy(tx_buf, out, transfer_len);
++			out += transfer_len;
++		}
++
++		ret = spi_xfer(&tpm_spi, transfer_len * 8,
++			       out ? tx_buf : NULL,
++			       in ? rx_buf : NULL,
++			       SPI_XFER_END);
++		if (ret) {
++			preboot_puts("TPM2: spi read transfer failed\n");
++			goto release_bus;
++		}
++
++		if (in) {
++			memcpy(in, rx_buf, transfer_len);
++			in += transfer_len;
++		}
++
++		len -= transfer_len;
++	}
++
++	return ret;
++
++release_bus:
++	/* If an error occurred, release the chip by deasserting the CS */
++	spi_tpm_release_bus();
++
++	return ret;
++}
++
++static int tpm_tis_spi_read(u16 addr, u8 *in, u16 len)
++{
++	return tpm_tis_spi_xfer(addr, NULL, in, len, false);
++}
++
++static int tpm_tis_spi_read_silent(u16 addr, u8 *in, u16 len)
++{
++	return tpm_tis_spi_xfer(addr, NULL, in, len, true);
++}
++
++static int tpm_tis_spi_read32(u32 addr, u32 *result)
++{
++	__le32 result_le;
++	int ret;
++
++	ret = tpm_tis_spi_read(addr, (u8 *)&result_le, sizeof(u32));
++	if (!ret)
++		*result = le32_to_cpu(result_le);
++
++	return ret;
++}
++
++static u8 tpm_spi_status(u8 *status)
++{
++	return tpm_tis_spi_read(TPM_STS(locality), status, 1);
++}
++
++static int tpm_spi_wait_for_stat(u8 mask, unsigned long timeout, u8 *status)
++{
++	u64 start = timestamp_get_us();
++	u64 stop = timeout;
++	int ret;
++
++	do {
++		mdelay(TPM_TIMEOUT_MS);
++		ret = tpm_spi_status(status);
++		if (ret)
++			return ret;
++
++		if ((*status & mask) == mask)
++			return 0;
++	} while (!timeout_expired(start, MS_TO_US(stop)));
++
++	return -1;
++}
++
++static int tpm_spi_get_burstcount(void)
++{
++	u64 start, stop;
++	u32 burstcount, ret;
++
++	/* wait for burstcount */
++	start = timestamp_get_us();
++	stop = TIS_SHORT_TIMEOUT_MS;
++	do {
++		ret = tpm_tis_spi_read32(TPM_STS(locality),
++					 &burstcount);
++		if (ret)
++			return -1;
++
++		burstcount = (burstcount >> 8) & 0xFFFF;
++		if (burstcount)
++			return burstcount;
++
++		mdelay(TPM_TIMEOUT_MS);
++	} while (!timeout_expired(start, MS_TO_US(stop)));
++
++	return -1;
++}
++
++static int tpm_spi_recv_data(u8 *buf, size_t count)
++{
++	int size = 0, burstcnt, len, ret;
++	u8 status;
++
++	while (size < count &&
++	       tpm_spi_wait_for_stat(TPM_STS_DATA_AVAIL | TPM_STS_VALID,
++					 TIS_SHORT_TIMEOUT_MS, &status) == 0) {
++		burstcnt = tpm_spi_get_burstcount();
++		if (burstcnt < 0)
++			return burstcnt;
++
++		len = min_t(int, burstcnt, count - size);
++		ret = tpm_tis_spi_read(TPM_DATA_FIFO(locality),
++				       buf + size, len);
++		if (ret < 0)
++			return ret;
++
++		size += len;
++	}
++
++	return size;
++}
++
++static int tpm_tis_spi_write(u16 addr, const u8 *out, u16 len)
++{
++	return tpm_tis_spi_xfer(addr, out, NULL, len, false);
++}
++
++static int tpm_tis_spi_cancel(void)
++{
++	u8 data = TPM_STS_COMMAND_READY;
++
++	return tpm_tis_spi_write(TPM_STS(locality), &data, 1);
++}
++
++static void tpm_tis_spi_release_locality(int loc, bool force)
++{
++	const u8 mask = TPM_ACCESS_REQUEST_PENDING | TPM_ACCESS_VALID;
++	u8 buf;
++
++	if (tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1) < 0)
++		return;
++
++	if (force || (buf & mask) == mask) {
++		buf = TPM_ACCESS_ACTIVE_LOCALITY;
++		tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
++	}
++}
++
++static int tpm_spi_recv(u8 *buf, size_t count)
++{
++	int size, expected;
++
++	if (count < TPM_HEADER_SIZE) {
++		size = -1;
++		goto out;
++	}
++
++	size = tpm_spi_recv_data(buf, TPM_HEADER_SIZE);
++	if (size < TPM_HEADER_SIZE) {
++		preboot_puts("TPM error, unable to read header\n");
++		goto out;
++	}
++
++	expected = get_unaligned_be32(buf + 2);
++	if (expected > count) {
++		size = -1;
++		goto out;
++	}
++
++	size += tpm_spi_recv_data(&buf[TPM_HEADER_SIZE],
++				   expected - TPM_HEADER_SIZE);
++	if (size < expected) {
++		preboot_puts("TPM error, unable to read remaining bytes of result\n");
++		size = -1;
++		goto out;
++	}
++
++out:
++	tpm_tis_spi_cancel();
++	tpm_tis_spi_release_locality(locality, false);
++
++	return size;
++}
++
++static int tpm_tis_spi_check_locality(int loc)
++{
++	const u8 mask = TPM_ACCESS_ACTIVE_LOCALITY | TPM_ACCESS_VALID;
++	u8 buf;
++	int ret;
++
++	ret = tpm_tis_spi_read(TPM_ACCESS(loc), &buf, 1);
++	if (ret)
++		return ret;
++
++	if ((buf & mask) == mask) {
++		locality = loc;
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++static int tpm_tis_spi_request_locality(int loc)
++{
++	unsigned long start, stop;
++	u8 buf = TPM_ACCESS_REQUEST_USE;
++	int ret;
++
++	ret = tpm_tis_spi_check_locality(loc);
++	if (!ret)
++		return 0;
++
++	if (ret != -ENOENT) {
++		preboot_puts("TPM2: Failed to get locality\n");
++		return ret;
++	}
++
++	ret = tpm_tis_spi_write(TPM_ACCESS(loc), &buf, 1);
++	if (ret) {
++		preboot_puts("TPM2: Failed to write to TPM\n");
++		return ret;
++	}
++
++	start = timestamp_get_us();
++	stop = TIS_SHORT_TIMEOUT_MS;
++	do {
++		ret = tpm_tis_spi_check_locality(loc);
++		if (!ret)
++			return 0;
++
++		if (ret != -ENOENT) {
++			preboot_puts("TPM2: Failed to get locality\n");
++			return ret;
++		}
++
++		mdelay(TPM_TIMEOUT_MS);
++	} while (!timeout_expired(start, MS_TO_US(stop)));
++
++	preboot_puts("TPM2: Timeout getting locality\n");
++
++	return ret;
++}
++
++static u8 tpm_tis_spi_valid_status(u8 *status)
++{
++	return tpm_spi_wait_for_stat(TPM_STS_VALID, TIS_SHORT_TIMEOUT_MS,
++					status);
++}
++
++static int tpm_spi_send(const u8 *buf, size_t len)
++{
++	u32 i, size;
++	u8 status;
++	int burstcnt, ret;
++	u8 data;
++
++	if (len > TPM_DEV_BUFSIZE)
++		return -E2BIG;  /* Command is too long for our tpm, sorry */
++
++	ret = tpm_tis_spi_request_locality(0);
++	if (ret < 0)
++		return -EBUSY;
++
++	/*
++	 * Check if the TPM is ready. If not, if not, cancel the pending command
++	 * and poll on the status to be finally ready.
++	 */
++	ret = tpm_spi_status(&status);
++	if (ret)
++		return ret;
++
++	if (!(status & TPM_STS_COMMAND_READY)) {
++		/* Force the transition, usually this will be done at startup */
++		ret = tpm_tis_spi_cancel();
++		if (ret) {
++			preboot_puts("TPM2: Could not cancel previous operation\n");
++			goto out_err;
++		}
++
++		ret = tpm_spi_wait_for_stat(TPM_STS_COMMAND_READY,
++						TIS_LONG_TIMEOUT_MS, &status);
++		if (ret < 0 || !(status & TPM_STS_COMMAND_READY)) {
++			preboot_puts("status not ready after wait for stat returned err\n");
++			goto out_err;
++		}
++	}
++
++	for (i = 0; i < len - 1;) {
++		burstcnt = tpm_spi_get_burstcount();
++		if (burstcnt < 0)
++			return burstcnt;
++
++		size = min_t(int, len - i - 1, burstcnt);
++		ret = tpm_tis_spi_write(TPM_DATA_FIFO(locality),
++					buf + i, size);
++		if (ret < 0)
++			goto out_err;
++
++		i += size;
++	}
++
++	ret = tpm_tis_spi_valid_status(&status);
++	if (ret)
++		goto out_err;
++
++	if ((status & TPM_STS_DATA_EXPECT) == 0) {
++		ret = -EIO;
++		goto out_err;
++	}
++
++	ret = tpm_tis_spi_write(TPM_DATA_FIFO(locality),
++				buf + len - 1, 1);
++	if (ret)
++		goto out_err;
++
++	ret = tpm_tis_spi_valid_status(&status);
++	if (ret)
++		goto out_err;
++
++	if ((status & TPM_STS_DATA_EXPECT) != 0) {
++		ret = -EIO;
++		goto out_err;
++	}
++
++	data = TPM_STS_GO;
++	ret = tpm_tis_spi_write(TPM_STS(locality), &data, 1);
++	if (ret)
++		goto out_err;
++
++	return len;
++
++out_err:
++	tpm_tis_spi_cancel();
++	tpm_tis_spi_release_locality(locality, false);
++
++	return ret;
++}
++
++static int tpm_spi_cleanup(void)
++{
++	tpm_tis_spi_cancel();
++	/*
++	 * The TPM needs some time to clean up here,
++	 * so we sleep rather than keeping the bus busy
++	 */
++	mdelay(2);
++	tpm_tis_spi_release_locality(locality, false);
++
++	return 0;
++}
++
++static int tpm_xfer(const uint8_t *sendbuf, size_t send_size,
++	uint8_t *recvbuf, size_t *recv_size)
++{
++	u64 start, stop;
++	unsigned int count, ordinal;
++	int ret = 0;
++
++	/* switch endianness: big->little */
++	count = get_unaligned_be32(sendbuf + TPM_CMD_COUNT_BYTE);
++	ordinal = get_unaligned_be32(sendbuf + TPM_CMD_ORDINAL_BYTE);
++
++	if (count == 0) {
++		preboot_puts("TPM2: no data\n");
++		return -1;
++	}
++	if (count > send_size) {
++		preboot_puts("TPM2: invalid count value\n");
++		return -1;
++	}
++
++	ret = tpm_spi_send(sendbuf, send_size);
++	if (ret < 0)
++		return ret;
++
++	start = timestamp_get_us();
++	stop = tpm_tis_calc_ordinal_duration(ordinal);
++	do {
++		ret = tpm_spi_recv(tpm_xfer_buf, sizeof(tpm_xfer_buf));
++		if (ret >= 0) {
++			if (ret > *recv_size)
++				return -1;
++			memcpy(recvbuf, tpm_xfer_buf, ret);
++			*recv_size = ret;
++			ret = 0;
++			break;
++		} else if (ret != -1) {
++			return ret;
++		}
++
++		mdelay(TPM_TIMEOUT_MS);
++		if (timeout_expired(start, MS_TO_US(stop))) {
++			preboot_puts("TPM2: timeout expired\n");
++			ret = -1;
++			break;
++		}
++	} while (ret);
++
++	if (ret)
++		tpm_spi_cleanup();
++
++	return 0;
++}
++
++static int tpm_spi_sendrecv_command(const void *command,
++			 void *response, size_t *size_ptr)
++{
++	int err, ret;
++	size_t response_length;
++
++	if (response) {
++		response_length = *size_ptr;
++	} else {
++		response = response_buffer;
++		response_length = sizeof(response_buffer);
++	}
++
++	err = tpm_xfer(command, tpm_command_size(command),
++		       response, &response_length);
++
++	if (err < 0)
++		return err;
++
++	if (size_ptr)
++		*size_ptr = response_length;
++
++	ret = tpm_return_code(response);
++
++	return ret;
++}
++
++int tpm2_startup(enum tpm2_startup_types mode)
++{
++	const u8 command_v2[12] = {
++		tpm_u16(TPM2_ST_NO_SESSIONS),
++		tpm_u32(12),
++		tpm_u32(TPM2_CC_STARTUP),
++		tpm_u16(mode),
++	};
++	int ret;
++
++	/*
++	 * Note TPM2_Startup command will return RC_SUCCESS the first time,
++	 * but will return RC_INITIALIZE otherwise.
++	 */
++	ret = tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++	if (ret && ret != TPM2_RC_INITIALIZE) {
++		preboot_puts("ret != TPM2_RC_INITIALIZE");
++		return ret;
++	}
++
++	return 0;
++}
++
++static int tpm2_unpack_byte_string(const u8 *str, size_t size,
++					const char *format, ...)
++{
++	va_list args;
++	size_t offset = 0, length = 0;
++	u8 *ptr8 = NULL;
++	u16 *ptr16 = NULL;
++	u32 *ptr32 = NULL;
++
++	va_start(args, format);
++	for (; *format; format++) {
++		switch (*format) {
++		case 'b':
++			offset = va_arg(args, size_t);
++			ptr8 = va_arg(args, u8 *);
++			length = 1;
++			break;
++		case 'w':
++			offset = va_arg(args, size_t);
++			ptr16 = va_arg(args, u16 *);
++			length = 2;
++			break;
++		case 'd':
++			offset = va_arg(args, size_t);
++			ptr32 = va_arg(args, u32 *);
++			length = 4;
++			break;
++		case 's':
++			offset = va_arg(args, size_t);
++			ptr8 = va_arg(args, u8 *);
++			length = va_arg(args, u32);
++			break;
++		default:
++			va_end(args);
++			preboot_puts("TPM2: Couldn't recognize format string\n");
++			return -1;
++		}
++
++		if (offset + length > size) {
++			va_end(args);
++			preboot_puts("TPM2: Failed to read\n");
++			return -1;
++		}
++
++		switch (*format) {
++		case 'b':
++			*ptr8 = str[offset];
++			break;
++		case 'w':
++			*ptr16 = get_unaligned_be16(str + offset);
++			break;
++		case 'd':
++			*ptr32 = get_unaligned_be32(str + offset);
++			break;
++		case 's':
++			memcpy(ptr8, str + offset, length);
++			break;
++		}
++	}
++	va_end(args);
++
++	return 0;
++}
++
++static int tpm2_pack_byte_string(u8 *str, size_t size, const char *format, ...)
++{
++	va_list args;
++	size_t offset = 0, length = 0;
++	u8 *data = NULL;
++	u32 value = 0;
++
++	va_start(args, format);
++	for (; *format; format++) {
++		switch (*format) {
++		case 'b':
++			offset = va_arg(args, size_t);
++			value = va_arg(args, int);
++			length = 1;
++			break;
++		case 'w':
++			offset = va_arg(args, size_t);
++			value = va_arg(args, int);
++			length = 2;
++			break;
++		case 'd':
++			offset = va_arg(args, size_t);
++			value = va_arg(args, u32);
++			length = 4;
++			break;
++		case 's':
++			offset = va_arg(args, size_t);
++			data = va_arg(args, u8 *);
++			length = va_arg(args, u32);
++			break;
++		default:
++			preboot_puts("TPM2: Couldn't recognize format string\n");
++			va_end(args);
++			return -1;
++		}
++
++		if (offset + length > size) {
++			va_end(args);
++			return -1;
++		}
++
++		switch (*format) {
++		case 'b':
++			str[offset] = value;
++			break;
++		case 'w':
++			put_unaligned_be16(value, str + offset);
++			break;
++		case 'd':
++			put_unaligned_be32(value, str + offset);
++			break;
++		case 's':
++			memcpy(str + offset, data, length);
++			break;
++		}
++	}
++	va_end(args);
++
++	return 0;
++}
++
++int tpm2_nv_read(u32 index, void *data, u32 count)
++{
++	u8 command_v2[COMMAND_BUFFER_SIZE] = {
++		/* header 10 bytes */
++		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
++		tpm_u32(10 + 8 + 4 + 9 + 4),	/* Length */
++		tpm_u32(TPM2_CC_NV_READ),	/* Command code */
++
++		/* handles 8 bytes */
++		tpm_u32(TPM2_RH_PLATFORM),	/* Primary platform seed */
++		tpm_u32(index),	/* Password authorisation */
++
++		/* AUTH_SESSION */
++		tpm_u32(9),			/* Authorization size */
++		tpm_u32(TPM2_RS_PW),		/* Session handle */
++		tpm_u16(0),			/* Size of <nonce> */
++						/* <nonce> (if any) */
++		0,				/* Attributes: Cont/Excl/Rst */
++		tpm_u16(0),			/* Size of <hmac/password> */
++						/* <hmac/password> (if any) */
++
++		tpm_u16(count),			/* Number of bytes */
++		tpm_u16(0),			/* Offset */
++	};
++	size_t response_len = COMMAND_BUFFER_SIZE;
++	int ret;
++	u16 tag;
++	u32 size, code;
++
++	ret = tpm_spi_sendrecv_command(command_v2, response_buffer, &response_len);
++	if (ret)
++		return ret;
++	if (tpm2_unpack_byte_string(response_buffer, response_len, "wdds", 0, &tag, 2,
++					&size, 6, &code, 16, data, count))
++		return TPM_LIB_ERROR;
++
++	return 0;
++}
++
++int tpm2_pcr_extend(u32 index, u32 algorithm, const u8 *digest, u32 digest_len)
++{
++	/* Length of the message header, up to start of digest */
++	u32 offset = 33;
++	u8 command_v2[COMMAND_BUFFER_SIZE] = {
++		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
++		tpm_u32(offset + digest_len),	/* Length */
++		tpm_u32(TPM2_CC_PCR_EXTEND),	/* Command code */
++
++		/* HANDLE */
++		tpm_u32(index),			/* Handle (PCR Index) */
++
++		/* AUTH_SESSION */
++		tpm_u32(9),			/* Authorization size */
++		tpm_u32(TPM2_RS_PW),		/* Session handle */
++		tpm_u16(0),			/* Size of <nonce> */
++						/* <nonce> (if any) */
++		0,				/* Attributes: Cont/Excl/Rst */
++		tpm_u16(0),			/* Size of <hmac/password> */
++						/* <hmac/password> (if any) */
++
++		/* hashes */
++		tpm_u32(1),			/* Count (number of hashes) */
++		tpm_u16(algorithm),	/* Algorithm of the hash */
++		/* STRING(digest)		   Digest */
++	};
++	int ret;
++
++	/*
++	 * Fill the command structure starting from the first buffer:
++	 *     - the digest
++	 */
++	ret = tpm2_pack_byte_string(command_v2, sizeof(command_v2), "s",
++			       offset, digest, digest_len);
++	if (ret)
++		return TPM_LIB_ERROR;
++
++	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++}
++
++#define TPM2_GET_CAPAB_CMD_SIZE	22
++
++int tpm2_get_capability(u32 capability, u32 property, void *data, size_t *data_len)
++{
++	const u8 command_v2[TPM2_GET_CAPAB_CMD_SIZE] = {
++		tpm_u16(TPM2_ST_NO_SESSIONS),		/* TAG */
++		tpm_u32(TPM2_GET_CAPAB_CMD_SIZE),	/* Length */
++		tpm_u32(TPM2_CC_GET_CAPABILITY),	/* Command code */
++
++		tpm_u32(capability),			/* Capability */
++		tpm_u32(property),			/* Property */
++		tpm_u32(1),				/* Property count */
++	};
++	size_t response_len = COMMAND_BUFFER_SIZE;
++	int ret;
++	/*
++	 * In the response buffer, the properties are located after the:
++	 * tag (u16), response size (u32), response code (u32),
++	 * YES/NO flag (u8), TPM_CAP (u32).
++	 */
++	const size_t properties_off = sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint32_t) +
++				      sizeof(uint8_t) + sizeof(uint32_t);
++
++	ret = tpm_spi_sendrecv_command(command_v2, response_buffer, &response_len);
++	if (ret)
++		return TPM_LIB_ERROR;
++
++	response_len -= properties_off;
++	memcpy(data, &response_buffer[properties_off], response_len);
++
++	if (data_len)
++		*data_len = response_len;
++
++	return ret;
++}
++
++int tpm2_pcr384_allocate(void)
++{
++	uint8_t command_v2[COMMAND_BUFFER_SIZE] = {
++		tpm_u16(TPM2_ST_SESSIONS),	/* TAG */
++		tpm_u32(10 + 4 + 13 + 16),	/* Length */
++		tpm_u32(TPM2_CC_PCR_ALLOCATE),	/* Command code */
++
++		/* handles 4 bytes */
++		tpm_u32(TPM2_RH_PLATFORM),	/* Primary platform seed */
++
++		/* session header 13 bytes */
++		tpm_u32(9),			/* Header size */
++		tpm_u32(TPM2_RS_PW),		/* Password authorisation */
++		tpm_u16(0),			/* nonce_size */
++		0,				/* session_attrs */
++		tpm_u16(0),			/* auth_size */
++
++		/* TPML_PCR_SELECTION  16 bytes*/
++		tpm_u32(2),			/* num of PCR banks */
++		/* deallocate SHA1 bank*/
++		tpm_u16(TPM2_ALG_SHA1),		/* alg */
++		3,				/* Size of PCR mask */
++		tpm_u16(0x0),			/* 24 PCRs mask */
++		0x0,
++		/* allocate SHA384 bank */
++		tpm_u16(TPM2_ALG_SHA384),	/* alg */
++		3,				/* Size of PCR mask */
++		tpm_u16(0xFFFF),		/* 24 PCRs mask */
++		0xFF,
++	};
++
++	return tpm_spi_sendrecv_command(command_v2, NULL, NULL);
++}
++
++static int tpm_tis_wait_init(int loc)
++{
++	unsigned long start, stop;
++	u8 status;
++	int ret;
++
++	start = timestamp_get_us();
++	stop = TIS_LONG_TIMEOUT_MS;
++	do {
++		mdelay(TPM_TIMEOUT_MS);
++
++		ret = tpm_tis_spi_read_silent(TPM_ACCESS(loc), &status, 1);
++		if (ret == -ETIMEDOUT)
++			continue;
++		else if (ret != 0)
++			break;
++
++		if (status & TPM_ACCESS_VALID && status != 0xff)
++			return 0;
++	} while (!timeout_expired(start, MS_TO_US(stop)));
++
++	return -EIO;
++}
++
++int tpm2_init(bool print)
++{
++	int ret;
++	u32 vend_dev;
++	u8 rid;
++
++	locality = 0;
++
++	tpm_spi_init();
++
++	ret = tpm_tis_wait_init(locality);
++	if (ret) {
++		preboot_puts("TPM2: no device found\n");
++		return ret;
++	}
++
++	ret = tpm_tis_spi_request_locality(locality);
++	if (ret) {
++		preboot_puts("TPM2: could not request locality\n");
++		return ret;
++	}
++
++	ret = tpm_tis_spi_read32(TPM_DID_VID(locality), &vend_dev);
++	if (ret) {
++		preboot_puts("TPM2: could not retrieve VendorID/DeviceID\n");
++		return ret;
++	}
++
++	ret = tpm_tis_spi_read(TPM_RID(locality), &rid, 1);
++	if (ret) {
++		preboot_puts("TPM2: could not retrieve RevisionID\n");
++		return ret;
++	}
++
++	if (print)
++		preboot_puts("SPI TPMv2.0 found\n");
++
++	return 0;
++}
+diff --git a/lib/common/tpm_auth.c b/lib/common/tpm_auth.c
+new file mode 100644
+index 0000000..0adfc82
+--- /dev/null
++++ b/lib/common/tpm_auth.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <efuse.h>
++#include <boot_if.h>
++#include <tpm2.h>
++#include <uart.h>
++#include <sha512.h>
++#include <boot_desc.h>
++#include <errno.h>
++#include "lzo/unaligned.h"
++
++#define TPM_NV_DEV_SN_ADDRESS		0x01c10100
++
++struct tpm_dev_id {
++	union {
++		u32 efuse_data[2];
++		u64 tpm_data;
++	};
++};
++
++static int preboot_get_efuse_dev_id(struct tpm_dev_id *efuse_dev_id_ret)
++{
++	int ret;
++
++	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_1, &efuse_dev_id_ret->efuse_data[0]);
++	if (ret)
++		return ret;
++
++	ret = preboot_fuse_read(EFUSE_DEV_ID_BACKUP_OFFSET_2, &efuse_dev_id_ret->efuse_data[1]);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++int tpm_init(bool print)
++{
++	int ret;
++
++	ret = tpm2_init(print);
++	if (ret) {
++		preboot_puts("TPM: tpm2_init failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	return ret;
++}
++
++#define TPM2_CAP_PCRS		5
++#define TPM2_CAP_SIZE		32
++#define BANK1_ALG_OFFSET	5
++#define BANK2_ALG_OFFSET	11
++
++int tpm_startup(void)
++{
++	u8 capabilities[TPM2_CAP_SIZE];
++	int ret;
++
++	ret = tpm2_startup(TPM2_SU_CLEAR);
++	if (ret) {
++		preboot_puts("TPM: tpm2_startup failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return ret;
++	}
++
++	ret = tpm2_get_capability(TPM2_CAP_PCRS, 0, capabilities, NULL);
++	if (ret) {
++		preboot_puts("TPM: tpm2_getcap failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	/* check if sha384 bank is allocated */
++	if ((capabilities[BANK1_ALG_OFFSET] == TPM2_ALG_SHA384) ||
++	    (capabilities[BANK2_ALG_OFFSET] == TPM2_ALG_SHA384))
++		return ret;
++
++	ret = tpm2_pcr384_allocate();
++	if (ret) {
++		preboot_puts("TPM: failed to alloc sha384 bank\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++		return ret;
++	}
++
++	/* TODO: reset the TPM by togglind the CPLD request gpio (SW-102141) */
++
++	ret = tpm2_startup(TPM2_SU_CLEAR);
++	if (ret) {
++		preboot_puts("TPM: tpm2_startup failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	return ret;
++}
++
++int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
++{
++	int ret;
++
++	if (hash == NULL)
++		return -1;
++
++	ret = tpm2_pcr_extend(image_index, TPM2_ALG_SHA384, hash, SHA384_SUM_LEN);
++	if (ret) {
++		preboot_puts("preboot_pcr_extend: pcr extend failed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	return ret;
++}
++
++void preboot_tpm_auth(void)
++{
++	int ret;
++	u64 tpm_dev_id = 0;
++	struct tpm_dev_id efuse_dev_id;
++
++	efuse_dev_id.tpm_data = 0x0;
++
++	if (cpu_boot_err_get(CPU_BOOT_ERR_TPM_FAIL))
++		return;
++
++	tpm_init(true);
++
++	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
++	if (ret) {
++		preboot_puts_hex("TPM: NV_READ failed. ret = ", ret, true);
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++
++	/* tpm device id returns as Big Endian, need to convert */
++	tpm_dev_id = get_unaligned_be64(&tpm_dev_id);
++	preboot_puts_hex64("TPM device ID: ", tpm_dev_id, true);
++
++	ret = preboot_get_efuse_dev_id(&efuse_dev_id);
++	if (ret) {
++		preboot_puts_hex("TPM flow: efuse read failed. ret = ", ret, true);
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	} else {
++		preboot_puts_hex64("EFUSE device ID: ", efuse_dev_id.tpm_data, true);
++	}
++
++	if (efuse_dev_id.tpm_data == 0) {
++		preboot_puts("TPM flow: error: efuse device ID not programed\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	} else if (efuse_dev_id.tpm_data != tpm_dev_id) {
++		preboot_puts("TPM flow: error: efuse device ID is different than TPM device ID\n");
++		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
++	}
++}
+diff --git a/lib/common/tpm_auth.h b/lib/common/tpm_auth.h
+new file mode 100644
+index 0000000..61192e6
+--- /dev/null
++++ b/lib/common/tpm_auth.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _HL_TPM_AUTH_H_
++#define _HL_TPM_AUTH_H_
++
++#include <sizes.h>
++
++#define ARCBOOT_PRIMARY			0
++#define ARCBOOT_SECONDARY		1
++#define ARCBOOT_STATUS_REG_SZ_BITS	32
++#define FLASH_64KB_PADD			SZ_64K
++#define FLASH_VALID_MASK		(SZ_2M - 1)
++#define SECUREBOOT_MAX_PPBOOT_IMG_SIZE	46080
++#define HL_FWSRAM_OFFSET		0x3FD0000
++#define HL_GEN_MEM_BASE			0x24000000
++
++#define HL_FWSRAM_BASE			(HL_GEN_MEM_BASE + \
++					 HL_FWSRAM_OFFSET)
++
++#define PPBOOT_SHA_MAGIC		0x1cca566a
++#define PPBOOT_HASH_MAGIC_SIZE		4
++#define PPBOOT_SHA384_FOOTER		SHA384_SUM_LEN
++
++int tpm_init(bool print);
++int tpm_startup(void);
++int tpm_pcr_extend(uint32_t image_index, uint8_t *hash);
++bool is_ppboot_tpm_extend_done(void);
++
++#endif /* _HL_TPM_AUTH_H_ */
+diff --git a/lib/common/tpm_internal.h b/lib/common/tpm_internal.h
+new file mode 100644
+index 0000000..4d4af81
+--- /dev/null
++++ b/lib/common/tpm_internal.h
+@@ -0,0 +1,280 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (c) 2015 Google, Inc
++ */
++
++#ifndef __tpm_internal_h
++#define __tpm_internal_h
++
++static unsigned int duration_ms[TPM_DURATION_COUNT];
++
++/*
++ * Array with one entry per ordinal defining the maximum amount
++ * of time the chip could take to return the result.  The ordinal
++ * designation of short, medium or long is defined in a table in
++ * TCG Specification TPM Main Part 2 TPM Structures Section 17. The
++ * values of the SHORT, MEDIUM, and LONG durations are retrieved
++ * from the chip during initialization with a call to tpm_get_timeouts.
++ */
++static const u8 tpm_protected_ordinal_duration[TPM_MAX_PROTECTED_ORDINAL] = {
++	TPM_UNDEFINED,		/* 0 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 5 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 10 */
++	TPM_SHORT,
++};
++
++static const u8 tpm_ordinal_duration[TPM_MAX_ORDINAL] = {
++	TPM_UNDEFINED,		/* 0 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 5 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 10 */
++	TPM_SHORT,
++	TPM_MEDIUM,
++	TPM_LONG,
++	TPM_LONG,
++	TPM_MEDIUM,		/* 15 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_MEDIUM,
++	TPM_LONG,
++	TPM_SHORT,		/* 20 */
++	TPM_SHORT,
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_SHORT,		/* 25 */
++	TPM_SHORT,
++	TPM_MEDIUM,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_MEDIUM,		/* 30 */
++	TPM_LONG,
++	TPM_MEDIUM,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,		/* 35 */
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_MEDIUM,		/* 40 */
++	TPM_LONG,
++	TPM_MEDIUM,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,		/* 45 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_LONG,
++	TPM_MEDIUM,		/* 50 */
++	TPM_MEDIUM,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 55 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_MEDIUM,		/* 60 */
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_MEDIUM,		/* 65 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 70 */
++	TPM_SHORT,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 75 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_LONG,		/* 80 */
++	TPM_UNDEFINED,
++	TPM_MEDIUM,
++	TPM_LONG,
++	TPM_SHORT,
++	TPM_UNDEFINED,		/* 85 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 90 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_UNDEFINED,		/* 95 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_MEDIUM,		/* 100 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 105 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 110 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,		/* 115 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_LONG,		/* 120 */
++	TPM_LONG,
++	TPM_MEDIUM,
++	TPM_UNDEFINED,
++	TPM_SHORT,
++	TPM_SHORT,		/* 125 */
++	TPM_SHORT,
++	TPM_LONG,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,		/* 130 */
++	TPM_MEDIUM,
++	TPM_UNDEFINED,
++	TPM_SHORT,
++	TPM_MEDIUM,
++	TPM_UNDEFINED,		/* 135 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 140 */
++	TPM_SHORT,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 145 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 150 */
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_UNDEFINED,		/* 155 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 160 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 165 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_LONG,		/* 170 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 175 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_MEDIUM,		/* 180 */
++	TPM_SHORT,
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_MEDIUM,		/* 185 */
++	TPM_SHORT,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 190 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 195 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 200 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,
++	TPM_SHORT,		/* 205 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_MEDIUM,		/* 210 */
++	TPM_UNDEFINED,
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_MEDIUM,
++	TPM_UNDEFINED,		/* 215 */
++	TPM_MEDIUM,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,
++	TPM_SHORT,		/* 220 */
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_SHORT,
++	TPM_UNDEFINED,		/* 225 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 230 */
++	TPM_LONG,
++	TPM_MEDIUM,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,		/* 235 */
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_UNDEFINED,
++	TPM_SHORT,		/* 240 */
++	TPM_UNDEFINED,
++	TPM_MEDIUM,
++};
++
++#endif

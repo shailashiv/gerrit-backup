@@ -1,0 +1,41 @@
+From 10632f82037b774cbfb8ab30864000cfe9495654 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 05 May 2019 10:24:35 +0300
+Subject: [PATCH] [SW-0] pll: split the clock select programming
+
+The clock select programming is not done correctly as it moves both
+selectors at the same time.
+Those selectors are independent entities and are not synchronized in
+any way.
+Moving them both at the same time might result in a fast clock
+propagating to a slow fabric which cannot receive that fast clock.
+The solution is to change the selectors one at a time in the correct
+order.
+First we change to divided reference clock and only then we move to
+divided PLL.
+
+Change-Id: Icdebda551e17fed038097f05c16ef7b143d9f27c
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index f390cbd..8684593 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -110,9 +110,13 @@
+ 		/* -1 means always bypass */
+ 		if (cfg->div_factor[sel] == -1 || bypass)
+ 			regmap_writel(HL_PLL_REF_CLK, reg);
+-		else
+-			regmap_writel(cfg->div_factor[sel] ?
+-					HL_PLL_DIV_PLL : HL_PLL_PLL_CLK, reg);
++		else if (cfg->div_factor[sel] == 0)
++			regmap_writel(HL_PLL_PLL_CLK, reg);
++		else { /* first change DIV_REF, then DIV_PLL */
++			regmap_writel(HL_PLL_DIV_REF, reg);
++			hl_pll_udelay(HL_PLL_MAX_WAIT_TIME);
++			regmap_writel(HL_PLL_DIV_PLL, reg);
++		}
+ 	}
+ 
+ 	/* just to be on a safe side, wait for bypass to propagate */

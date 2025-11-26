@@ -1,0 +1,137 @@
+From 4aeebf19960ed24990ed2c83bc2879e1627dfd07 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 19 Oct 2020 16:51:41 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: protect open pages
+
+Add protection for privilege protection bits and internal configuration
+space of pages that do not need privilege protection, but yet the
+protection bits themselves and internal configuration space must be
+protected.
+
+Change-Id: If8373815a93f56df16f84c645e24d5398a13f8e6
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 900d7fd..9cf5490 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -422,7 +422,7 @@
+ 
+ #define DMA_DIST		0x20000
+ #define DMA_ENGINES		4
+-
++#define DMA_CHANNELS		8
+ static void preboot_secure_dma(void)
+ {
+ 	u32 i, base, prot_base;
+@@ -437,6 +437,13 @@
+ 		preboot_secure_dma_if_down_regs(prot_base);
+ 		prot_base = base + (mmDMA_IF_W_S_DOWN_CH1_BASE & ~HL_CFG_BASE);
+ 		preboot_secure_dma_if_down_regs(prot_base);
++	}
++
++	/* Protect open pages of DMA CORE and DMA QM */
++	for (i = 0; i < DMA_CHANNELS; i++) {
++		base = i * DMA_DIST;
++		set_prot_bits_priv_int_conf(mmDMA0_CORE_BASE + base);
++		set_prot_bits_priv_int_conf(mmDMA0_QM_BASE + base);
+ 	}
+ }
+ 
+@@ -790,6 +797,12 @@
+ 	/* Protect PCIE_WRAP - 4K */
+ 	preboot_secure_pci_wrap();
+ 
++	/* protect MMU UP priv and conf bits */
++	set_prot_bits_priv_int_conf(mmMMU_UP_BASE);
++
++	/* protect STLB priv and conf bits */
++	set_prot_bits_priv_int_conf(mmSTLB_BASE);
++
+ 	/* The rest is protected by RRs */
+ }
+ 
+@@ -822,6 +835,25 @@
+ 		/* Protect the CTRL configuration */
+ 		regmap_writel(PROT_BIT(mmMME0_CTRL_PROT), PRIV_PROT_REG(reg));
+ 		set_prot_bits_priv_int_conf(mmMME0_CTRL_BASE + MMES_DIST * i);
++
++		/*
++		 * For MME1 and MME3 QMANs configuration the LBW clock
++		 * is disabled by default, so we have to enable the LBW clock
++		 * before accessing, otherwise we stuck.
++		 */
++		if (i & BIT(0)) {
++			reg = mmMME0_CTRL_QM_SLV_LBW_CLK_EN + MMES_DIST * i;
++			regmap_writel(1, reg);
++		}
++
++		/* protect QM priv and conf bits */
++		set_prot_bits_priv_int_conf(mmMME0_QM_BASE + MMES_DIST * i);
++
++		/* close the clock back */
++		if (i & BIT(0)) {
++			reg = mmMME0_CTRL_QM_SLV_LBW_CLK_EN + MMES_DIST * i;
++			regmap_writel(0, reg);
++		}
+ 	}
+ }
+ 
+@@ -846,6 +878,9 @@
+ 		/* Protect the E2E Creds */
+ 		reg = mmTPC0_E2E_CRED_BASE & ~HL_CFG_BASE;
+ 		set_prot_bits_range_all(reg + TPCS_DIST * i, PROT_SIZE_MAX);
++
++		/* Protect the QM priv and int conf bits */
++		set_prot_bits_priv_int_conf(mmTPC0_QM_BASE + TPCS_DIST * i);
+ 	}
+ }
+ 
+@@ -902,10 +937,46 @@
+ 	preboot_secure_prot_nics_engs_regs(reg, prot_mask, eng_cnt);
+ }
+ 
++#define NIC_QM_DIST	0x2000
++static void preboot_secure_nic_open_pages(void)
++{
++	int i;
++	u32 nic_off;
++	u64 base;
++
++	for (i = 0; i < NICS_NUM; i++) {
++		nic_off = NICS_DIST * i;
++
++		/* STAT */
++		base = nic_off + mmNIC0_STAT_BASE;
++		set_prot_bits_priv_int_conf(base);
++
++		/* MAC CORE */
++		base = nic_off + mmNIC0_MAC_CORE_BASE;
++		set_prot_bits_priv_int_conf(base);
++
++		/* MAC AUX */
++		base = nic_off + mmNIC0_MAC_AUX_BASE;
++		set_prot_bits_priv_int_conf(base);
++
++		/* QM[0-1] */
++		base = nic_off + mmNIC0_QM0_BASE;
++		set_prot_bits_priv_int_conf(base);
++		set_prot_bits_priv_int_conf(base + NIC_QM_DIST);
++
++		/* TXB */
++		base = nic_off + mmNIC0_TXB_BASE;
++		set_prot_bits_priv_int_conf(base);
++	}
++}
++
+ static void preboot_secure_nic(void)
+ {
+ 	u32 reg, mask;
+ 
++	/* STAT, MAC CORE/AUX, QMs, TXB */
++	preboot_secure_nic_open_pages();
++
+ 	/* QPC */
+ 	reg = mmNIC0_QPC0_AXI_PROT;
+ 	mask = PROT_OVR_SECURE << NIC0_QPC0_AXI_PROT_R_SHIFT;

@@ -1,0 +1,93 @@
+From 76a4c49796bfb4d94b121ca64eba4534d608478b Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Thu, 22 Feb 2024 07:04:01 +0200
+Subject: [PATCH] [SW-156330] gaudi3: early wr resp disable during tpm access
+
+When early write response is enabled in Gaudi3, reads from
+TPM SPI controller are incorrect causing failure or
+incorrect transaction on SPI bus. This patch disables
+early write response during TPM access and enables it
+once tpm access is done.
+
+Change-Id: Ib85d5c226079ff9c5502ebdb537d63abde933f6c
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 0d228d4..de49fb4 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -285,16 +285,21 @@
+ 
+ #define EARLY_WRITE_RESP_MASK	\
+ 	(1 << PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_AWCACHE_OVRD_EN_S | \
+-	 1 << PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_ARCACHE_OVRD_EN_S | \
+-	 PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_FORCE_WR_BUF_M)
++	 1 << PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_ARCACHE_OVRD_EN_S)
+ 
+-static void hl_lbw_early_write_resp_enable(void)
++void hl_lbw_early_write_resp_enable(bool enable)
+ {
+ 	u32 axi_split_val, val;
+ 
+ 	axi_split_val = regmap_readl(
+ 			D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1));
+-	val = axi_split_val | EARLY_WRITE_RESP_MASK;
++
++	if (enable)
++		val = axi_split_val | EARLY_WRITE_RESP_MASK;
++	else
++		val = axi_split_val & ~EARLY_WRITE_RESP_MASK;
++
++	val = val | PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_FORCE_WR_BUF_M;
+ 	regmap_writel(val, D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1));
+ }
+ 
+@@ -359,7 +364,7 @@
+ void hl_plat_early_init(void)
+ {
+ 	hl_psoc_drain_init();
+-	hl_lbw_early_write_resp_enable();
++	hl_lbw_early_write_resp_enable(true);
+ 	init_prstn();
+ 	hl_dev_cpu_pll_init();
+ 	hl_init_cpu_ids();
+diff --git a/lib/common/tpm.c b/lib/common/tpm.c
+index d97782c..59c0c22 100644
+--- a/lib/common/tpm.c
++++ b/lib/common/tpm.c
+@@ -38,6 +38,8 @@
+ 	return false;
+ }
+ 
++__weak void hl_lbw_early_write_resp_enable(bool enable) {};
++
+ __weak uint8_t get_ppboot_pcr_index(void)
+ {
+ 	return 0;
+@@ -56,17 +58,22 @@
+ 	if (is_ppboot_tpm_extend_done())
+ 		return;
+ 
++	hl_lbw_early_write_resp_enable(false);
+ 	if (tpm_init(true))
+-		return;
++		goto enable_early_write_resp;
+ 
+ 	if (tpm_startup())
+-		return;
++		goto enable_early_write_resp;
+ 
+ 	is_valid = get_ppboot_img_hash(hash);
+ 	if (!is_valid)
+-		return;
++		goto enable_early_write_resp;
+ 
+ 	ppboot_pcr_idx = get_ppboot_pcr_index();
+ 
+ 	tpm_pcr_extend(ppboot_pcr_idx, hash);
++
++enable_early_write_resp:
++	hl_lbw_early_write_resp_enable(true);
++	return;
+ }

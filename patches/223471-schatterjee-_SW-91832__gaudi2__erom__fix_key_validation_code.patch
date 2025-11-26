@@ -1,0 +1,119 @@
+From 0927aabc17d20bbf6fe9bba24c95d751ea8e98d7 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Wed, 22 Jun 2022 07:41:39 +0300
+Subject: [PATCH] [SW-91832] gaudi2: erom: fix key validation code
+
+In Gaudi2, ROM and eFUSE store hash of public key properties.
+The public key received as part of fit is the complete public
+key dtb. Currently hash was calculated on complete key. But
+it should be done only on the key properties. So extracted key
+properties and computed hash on 784 bytes of key properties
+to compare with stored ROM/eFUSE hash.
+
+This is align with key validation code with proboot-rtos code.
+
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+Change-Id: Ie8fe4e9c9eda03171238bfb2b288487afd9688c0
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 0ec4eb7..93cbb68 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -24,6 +24,7 @@
+ #include <sha256.h>
+ #include <gaudi2/gaudi2_security.h>
+ #include <preboot/fit.h>
++#include <preboot/fit_rsa.h>
+ #include <hl_fw_if.h>
+ #include <psoc_arc0_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc0_mstr_if_core_lbw_regs.h>
+@@ -598,22 +599,46 @@
+ 	u8 value[SHA_SUM_LEN];
+ 	u32 hash_compare_len = SHA_SUM_LEN;
+ 	const struct hl_sec_otp *otp = preboot_security_get_otp();
++	u8 key_props[PUB_KEY_SZ];
++	struct rsa_key_prop prop;
++	const char *key_name = HL_SEC_KEY_NAME;
+ 
+-	if (otp == NULL)
++	if (otp == NULL || otp->magic_number != OTP_SEC_MAGIC)
+ 		return false;
+ 
+ 	if (key_idx < 0 || key_idx >= otp->num_of_keys)
+ 		return false;
+ 
+ 	/*
++	 * ROM and eFUSE stores hash of public key properties. The public
++	 * key received as part of fit is the complete public key dtb of
++	 * 3144-bytes. Extract key properties and compute hash on 784 bytes
++	 * of key properties to compare with stored ROM/eFUSE hash.
++	 */
++	if (fit_get_key_prop(pub_key, key_name, &prop)) {
++		preboot_puts("Failed to get key properties\n");
++		return false;
++	}
++
++	memset(key_props, 0, sizeof(key_props));
++	memcpy(key_props, prop.rr, KEY_PROP_RR_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ), prop.modulus, KEY_PROP_MOD_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ), prop.public_exponent,
++		KEY_PROP_EXP_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + KEY_PROP_EXP_SZ),
++		&prop.n0inv, KEY_PROP_INV_SZ);
++	memcpy((key_props + KEY_PROP_RR_SZ + KEY_PROP_MOD_SZ + KEY_PROP_EXP_SZ +
++		KEY_PROP_INV_SZ), &prop.num_bits, KEY_PROP_NB_SZ);
++
++	sha_csum(key_props, PUB_KEY_SZ, value);
++
++	/*
+ 	 * In case of real security, if security keys hash location is ROM then only the first
+ 	 * 256 bits are compared against the hash calculated. Since there are only 256 bits
+ 	 * available in PSOC registers to store keys hash
+ 	 */
+-	if (!preboot_fake_security_is_enabled() && otp->num_of_keys == SEC_KEY_HASH_COUNT_IN_ROM)
++	if (otp->num_of_keys == SEC_KEY_HASH_COUNT_IN_ROM)
+ 		hash_compare_len = SHA256_SUM_LEN;
+-
+-	sha_csum(pub_key, pub_key_len, value);
+ 
+ 	return !memcmp(&otp->keys[key_idx * SHA_SUM_LEN], value, hash_compare_len);
+ }
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 96e3db3..7a41dc9 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -291,7 +291,7 @@
+ 	return fdt_subnode_offset(pub_key_fit, sig_node, key_node_name);
+ }
+ 
+-static int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
+ 			    struct rsa_key_prop *prop)
+ {
+ 	int pub_key_node = 0;
+diff --git a/lib/preboot/fit.h b/lib/preboot/fit.h
+index fa1f484..516a6fb 100644
+--- a/lib/preboot/fit.h
++++ b/lib/preboot/fit.h
+@@ -8,6 +8,8 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
++#define HL_SEC_KEY_NAME		"hl_rsa3072"
++
+ enum fit_load_result {
+ 	FIT_LOAD_SUCCESS = 0,
+ 	FIT_LOAD_CORRUPTED,
+diff --git a/lib/preboot/fit_rsa.h b/lib/preboot/fit_rsa.h
+index be94aca..0efa956 100644
+--- a/lib/preboot/fit_rsa.h
++++ b/lib/preboot/fit_rsa.h
+@@ -24,5 +24,7 @@
+ 
+ int rsa_verify_regions(const struct image_region region[], int region_count,
+ 		       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop);
++int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++			    struct rsa_key_prop *prop);
+ 
+ #endif /* COMMON_FIT_RSA_H_ */

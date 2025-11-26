@@ -1,0 +1,81 @@
+From 70b194539ead9ae6917ade3d09d1efc1a2d33e03 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 10 Nov 2022 14:26:19 +0200
+Subject: [PATCH] [SW-105079] gaudi3: pldm: configure pcie pll
+
+In order to get uart print on pldm starting from ppboot, this patch
+perform pcie pll to bump up uart frequency.
+
+Change-Id: I8d50b5acd428fda6cecc7306189b834a6b42948d
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index d101894..c214089 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -161,10 +161,13 @@
+ 	regmap_writel(val, mmD0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1);
+ }
+ 
++__weak void hl_dev_cpu_pll_init(void) {}
++
+ void hl_plat_early_init(void)
+ {
+ 	hl_lbw_early_write_resp_enable();
+ 	init_prstn();
++	hl_dev_cpu_pll_init();
+ }
+ 
+ void preboot_sync_btl(void)
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index 6c95de6..0e4ea91 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -2,10 +2,11 @@
+ /*
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
+-
++#include <gaudi3_blocks_linux_driver.h>
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_psoc_global_conf_masks.h>
+-
++#include <stddef.h>
++#include <bitops.h>
+ #include <preboot.h>
+ #include <uart.h>
+ #include <pll.h>
+@@ -15,6 +16,23 @@
+ 
+ #define UART_CLOCK_FREQUENCY	SYS_CLOCK_FREQUENCY
+ #define PLDM_UART_BAUDRATE	300
++
++/*
++ * This cfg specific to PLDM bumps up uart freq
++ * to 250 MHz while keeping other div's on refclk
++ */
++static struct hl_pll_cfg gaudi3_cpu_pll_cfg[] = {
++	{
++		.name = "CPU", .base = mmD0_G4_PCI_PLL_CTRL_BASE,
++		.nr = 1, .nf = 240, .od = 2, .nb = 3,
++		.div_factor = { 0, 1, 9, 3 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL,
++			HL_PLL_DIV_PLL
++		},
++	}
++};
+ 
+ u64 hl_pll_timestamp_freq_get(void)
+ {
+@@ -93,3 +111,9 @@
+ 
+ 	return rst_src;
+ }
++
++void hl_dev_cpu_pll_init(void)
++{
++	hl_pll_init(gaudi3_cpu_pll_cfg, 1);
++}
++

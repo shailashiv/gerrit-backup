@@ -1,0 +1,113 @@
+From 0ee3193efb047c37930a825d2ff80c9b955ce35c Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 24 Mar 2021 09:35:47 +0200
+Subject: [PATCH] [SW-30456] boot info: add fw info
+
+Read and write fw info for transferring data to and from different
+components (preboot, uboot, linux, zephyr). Verify version to keep
+compatibility.
+
+Change-Id: Ia0c7b834f369ef54d4a1909ce73d3237d0c48820
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index e055903..9f8c231 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -229,3 +229,8 @@
+ 		preboot_puts("finished\n");
+ 	}
+ }
++
++void preboot_finalize_fw_info(void)
++{
++	preboot_boot_info_set_fw_info();
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index aeb8d5a..473e4d6 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -70,6 +70,8 @@
+ extern uintptr_t _start;	/* Start of ppboot/preboot region */
+ extern uintptr_t __stack_top;	/* End of ppboot/preboot region */
+ 
++extern struct hl_fw_info_compat fw_info;
++
+ static inline u8 regmap_readb(u32 offset)
+ {
+ 	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
+@@ -150,6 +152,9 @@
+ const char *preboot_get_version(enum preboot_vers ver);
+ void hl_ram_init(void);
+ 
++void preboot_finalize_fw_info(void);
++void preboot_boot_info_set_fw_info(void);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index d8dcb86..e3dff17 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -862,6 +862,7 @@
+ 		break;
+ 	}
+ 
++	preboot_finalize_fw_info();
+ 	preboot_finalize_enabled_caps();
+ 	boot_info_finalize();
+ 	preboot_start_image(startaddr);
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index b7ac680..69c39ba 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -32,6 +32,8 @@
+ #include "hl_i2c_slave_events.h"
+ #include "rma_info.h"
+ 
++struct hl_fw_info_compat fw_info;
++
+ static u64 preboot_en_caps;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+@@ -255,6 +257,14 @@
+ 		      sizeof(preboot_en_caps));
+ }
+ 
++__weak void preboot_finalize_fw_info(void) {}
++
++void preboot_boot_info_set_fw_info(void)
++{
++	fw_info.version = HL_FW_INFO_VERSION;
++	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
++}
++
+ u32 device_id_vendor_id;
+ u32 err_sts_reg_val;
+ 
+@@ -265,6 +275,7 @@
+ 
+ static void preboot_process_last_boot_info(void)
+ {
++	struct hl_fw_info_compat fw_info_local = {};
+ 	u32 boot_err = HL_FW_FIT_BOOT_ERR_NONE;
+ 	u32 data_size;
+ 
+@@ -287,6 +298,15 @@
+ 
+ 		i2csi_set_boot_err(boot_err, true);
+ 	}
++
++	if (!boot_info_get(HL_BOOT_INFO_FW_INFO, &fw_info_local,
++			   sizeof(fw_info_local), &data_size)) {
++		if (fw_info_local.version == HL_FW_INFO_VERSION)
++			fw_info = fw_info_local;
++		else
++			preboot_puts_hex("Ignoring fw info with version: ",
++					 fw_info_local.version, false);
++	}
+ }
+ 
+ __weak void hl_dev_pll_init(void) {}

@@ -1,0 +1,72 @@
+From 06a351e5964ef71cfeb69624105e1891e4a322bf Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 26 Jul 2021 19:07:47 +0300
+Subject: [PATCH] [SW-50527] gaudi: security: add dbg protection
+
+Add protection for the DBG areas (TPC related) that can be protected
+with privilege protection bits.
+For TPC_CFG and TPC QMAN, protect only the privilege protection bits
+registers and the internal configuration registers areas.
+The regular registers in these pages cannot do any harm.
+
+Change-Id: I48f7d6b3e27cc079f0ced68b0d17fe4d0c0317e7
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi/arm/security.c b/arch/gaudi/arm/security.c
+index e1042c5..079d542 100644
+--- a/arch/gaudi/arm/security.c
++++ b/arch/gaudi/arm/security.c
+@@ -1009,6 +1009,44 @@
+ 	}
+ }
+ 
++#define DBG_TPC_DIST		0x200000
++#define PRIV_PROT_REGS_OFF	0xE80
++#define INT_CFG_REGS_OFF	0xF00
++static void preboot_secure_dbg(void)
++{
++	int i;
++	u32 prot_base, base;
++
++	for (i = 0; i < TPCS_NUM; i++) {
++		base = DBG_TPC_DIST * i;
++
++		/* Protect DBG TPC_EML_CFG */
++		prot_base = (mmTPC0_EML_CFG_BASE & ~HL_CFG_BASE) + base;
++		set_prot_bits_range_all(prot_base, SNGL_REG_PROT_SIZE * 29);
++		regmap_writel(0, PRIV_PROT_REG(prot_base + INT_CFG_REGS_OFF));
++		/*
++		 * The Protection Bits register protecting the privilege bits
++		 * must be accessed the last due to apparent bug in h/w, which
++		 * according to observation changes (strips?) the privilege
++		 * level from or access transaction, so further accesses result
++		 * in exception.
++		 */
++		regmap_writel(0, PRIV_PROT_REG(prot_base + PRIV_PROT_REGS_OFF));
++
++		/* Protect DBG TPC_CFG - only Priv protection and int bits */
++		prot_base = (mmTPC0_EML_TPC_CFG_BASE & ~HL_CFG_BASE) + base;
++		regmap_writel(0, PRIV_PROT_REG(prot_base + INT_CFG_REGS_OFF));
++		/* same reason as above */
++		regmap_writel(0, PRIV_PROT_REG(prot_base + PRIV_PROT_REGS_OFF));
++
++		/* Protect DBG TPC QMAN - only Priv protection and int bits */
++		prot_base = (mmTPC0_EML_TPC_QM_BASE & ~HL_CFG_BASE) + base;
++		regmap_writel(0, PRIV_PROT_REG(prot_base + INT_CFG_REGS_OFF));
++		/* same reason as above */
++		regmap_writel(0, PRIV_PROT_REG(prot_base + PRIV_PROT_REGS_OFF));
++	}
++}
++
+ static void preboot_secure_set_nic_eng_role(u32 prot_reg, u32 mask, int eng_cnt)
+ {
+ 	int i, j;
+@@ -1715,6 +1753,7 @@
+ 		preboot_secure_if();
+ 		preboot_secure_sram_cfg();
+ 		preboot_secure_dma();
++		preboot_secure_dbg();
+ 
+ 		preboot_secure_lbw();
+ 		preboot_secure_hbw();

@@ -1,0 +1,84 @@
+From dd8baaf75d288b2b5fb9f38aa3ffa2e1f0d3d36a Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Tue, 07 Dec 2021 15:26:11 +0200
+Subject: [PATCH] [SW-36216] gaudi2: security: unlock rr in preboot
+
+To reduce processing in ppboot pre-linkup, pcie rrs are blocked
+unconditionally in ppboot, and based on the security enable
+criteria, it opens up these rrs in case secuirty is disabled and
+continues other rr configurations in case security is enabled.
+
+The strategy is a carry over from gaudi1.
+
+Change-Id: I1a2d2f7b32ef761817d8f7b566ed12096e0a71af
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 53085d2..64db12c 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -876,13 +876,31 @@
+ void ppboot_security_init(void)
+ {
+ 	ppboot_secure_elbi();
+-
+-	/* Initialize only if security is enabled */
+-	if (!preboot_security_is_enabled())
+-		return;
+-
+ 	ppboot_secure_lbw();
+ 	ppboot_secure_hbw();
++}
++
++static void preboot_unlock_pcie_rr(void)
++{
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++	/* select pcie rr */
++	rr_sel.pcie = true;
++
++	/*
++	 * Open LBW RR that was closed in ppboot.
++	 */
++	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, 0, 0, rr_sel);
++
++	/*
++	 * Open HBW RR that was closed in ppboot.
++	 */
++	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_RAZWI, 0, 0, rr_sel);
++	hl_secure_hbw_rr(HL_SEC_HBW_STM, 0, 0, rr_sel);
++	hl_secure_hbw_rr(HL_SEC_HBW_SRAM, 0, 0, rr_sel);
++	hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, 0, 0, rr_sel);
++	hl_secure_hbw_rr(HL_SEC_HBW_HBM, 0, 0, rr_sel);
+ }
+ 
+ void preboot_security_init(void)
+@@ -890,13 +908,20 @@
+ 	preboot_secure_pcie();
+ 
+ 	/* Do security related initializations only if security is enabled */
+-	if (!preboot_security_is_enabled())
+-		return;
+-
+-	preboot_lbw_rtr_preconfig();
+-	hl_dev_prot_bits_init();
+-	preboot_secure_lbw();
+-	preboot_secure_hbw();
++	if (preboot_security_is_enabled()) {
++		preboot_lbw_rtr_preconfig();
++		hl_dev_prot_bits_init();
++		preboot_secure_lbw();
++		preboot_secure_hbw();
++		preboot_puts("Security enabled.\n");
++	} else {
++		/*
++		 * As in ppboot we lock only pcie RR, we need to unlock the same
++		 * in preboot in case security is not enabled.
++		 */
++		preboot_unlock_pcie_rr();
++		preboot_puts("Security disabled.\n");
++	}
+ }
+ 
+ void preboot_security_sram_pci_set_ro(bool en)

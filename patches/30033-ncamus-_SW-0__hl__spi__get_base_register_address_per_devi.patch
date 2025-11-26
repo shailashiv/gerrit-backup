@@ -1,0 +1,176 @@
+From 5dac23c69fd628b4550991b54bf0a15fd311418d Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Mon, 16 Mar 2020 08:19:41 +0200
+Subject: [PATCH] [SW-0] hl: spi: get base register address per device
+
+In goya and gaudi we use SPI block while in goya2 is QSPI block
+
+Change-Id: Ib0f8c543319a842d173bd5652425a5b57ba6e7a4
+---
+
+diff --git a/common/spi.c b/common/spi.c
+index d190934..44e057b 100644
+--- a/common/spi.c
++++ b/common/spi.c
+@@ -14,6 +14,18 @@
+ #include "spi.h"
+ #include "uart.h"
+ 
++/* Registers */
++#define CTRLR0				0x0
++#define SSIENR				0x8
++#define SER				0x10
++#define BAUDR				0x14
++#define TXFTLR				0x18
++#define RXFTLR				0x1C
++#define TXFLR				0x20
++#define RXFLR				0x24
++#define IMR				0x2C
++#define DR0				0x60
++
+ #define CMD_WRITE_STATUS		0x01
+ #define CMD_READ			0x03
+ #define CMD_WRITE_DISABLE		0x04
+@@ -31,6 +43,7 @@
+ #define PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
+ #define frame_size_bits(b)		((b) << 16)
+ 
++static unsigned int spi_regs;
+ /*
+  * SSI device Chip Select (CS0) is combined with GPIO53
+  * Using this we can really do SSI bus claim/release
+@@ -73,9 +86,9 @@
+ 
+ static inline void spi_dev_update_frame_size(unsigned int len)
+ {
+-	regmap_writel(0, mmPSOC_SPI_SSIENR);
+-	regmap_writel(frame_size_bits((len * 8) - 1), mmPSOC_SPI_CTRLR0);
+-	regmap_writel(1, mmPSOC_SPI_SSIENR);
++	regmap_writel(0, spi_regs + SSIENR);
++	regmap_writel(frame_size_bits((len * 8) - 1), spi_regs + CTRLR0);
++	regmap_writel(1, spi_regs + SSIENR);
+ }
+ 
+ static inline int spi_fifo_is_empty(unsigned int level_reg)
+@@ -87,13 +100,13 @@
+ {
+ 	unsigned int tmp;
+ 
+-	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR))
++	while (!spi_fifo_is_empty(spi_regs + TXFLR))
+ 		;
+-	regmap_writel(cmd, mmPSOC_SPI_DR0);
++	regmap_writel(cmd, spi_regs + DR0);
+ 
+-	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR))
++	while (spi_fifo_is_empty(spi_regs + RXFLR))
+ 		;
+-	tmp = regmap_readl(mmPSOC_SPI_DR0);
++	tmp = regmap_readl(spi_regs + DR0);
+ 
+ 	if (val)
+ 		*val = tmp;
+@@ -105,13 +118,13 @@
+ 
+ 	spi_dev_update_frame_size(sizeof(tmp));
+ 
+-	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR))
++	while (!spi_fifo_is_empty(spi_regs + TXFLR))
+ 		;
+-	regmap_writeb(cmd, mmPSOC_SPI_DR0);
++	regmap_writeb(cmd, spi_regs + DR0);
+ 
+-	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR))
++	while (spi_fifo_is_empty(spi_regs + RXFLR))
+ 		;
+-	tmp = regmap_readb(mmPSOC_SPI_DR0);
++	tmp = regmap_readb(spi_regs + DR0);
+ 
+ 	if (val)
+ 		*val = tmp;
+@@ -138,22 +151,22 @@
+ 
+ 	spi_dev_update_frame_size(sizeof(*val));
+ 
+-	while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR))
++	while (!spi_fifo_is_empty(spi_regs + TXFLR))
+ 		;
+-	regmap_writeb(cmd, mmPSOC_SPI_DR0);
++	regmap_writeb(cmd, spi_regs + DR0);
+ 	for (i = 0; i < size; i++) {
+-		while (!spi_fifo_is_empty(mmPSOC_SPI_TXFLR))
++		while (!spi_fifo_is_empty(spi_regs + TXFLR))
+ 			;
+-		regmap_writeb(val[i], mmPSOC_SPI_DR0);
++		regmap_writeb(val[i], spi_regs + DR0);
+ 	}
+ 
+-	while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR))
++	while (spi_fifo_is_empty(spi_regs + RXFLR))
+ 		;
+-	regmap_readb(mmPSOC_SPI_DR0);
++	regmap_readb(spi_regs + DR0);
+ 	for (i = 0; i < size; i++) {
+-		while (spi_fifo_is_empty(mmPSOC_SPI_RXFLR))
++		while (spi_fifo_is_empty(spi_regs + RXFLR))
+ 			;
+-		regmap_readb(mmPSOC_SPI_DR0);
++		regmap_readb(spi_regs + DR0);
+ 	}
+ 
+ 	spi_release_bus();
+@@ -198,6 +211,11 @@
+ 	spi_release_bus();
+ }
+ 
++__attribute__((weak)) void spi_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_SPI_CTRLR0;
++}
++
+ static void spi_init(void)
+ {
+ 	u32 baudr = hl_spi_baudr_get();
+@@ -205,14 +223,15 @@
+ 	/* Validate that baudr is even */
+ 	baudr = (baudr + 1) & ~1;
+ 
++	spi_base_get(&spi_regs);
+ 	spi_ssi_cs0_init();
+-	regmap_writel(0x00000000, mmPSOC_SPI_SSIENR);
+-	regmap_writel(baudr, mmPSOC_SPI_BAUDR);
+-	regmap_writel(0x00000000, mmPSOC_SPI_RXFTLR);
+-	regmap_writel(0x00000000, mmPSOC_SPI_TXFTLR);
+-	regmap_writel(0x0000003F, mmPSOC_SPI_IMR);	/* Disable Interrupts */
+-	regmap_writel(0x00000001, mmPSOC_SPI_SER);
+-	regmap_writel(0x00000001, mmPSOC_SPI_SSIENR);
++	regmap_writel(0x00000000, spi_regs + SSIENR);
++	regmap_writel(baudr, spi_regs + BAUDR);
++	regmap_writel(0x00000000, spi_regs + RXFTLR);
++	regmap_writel(0x00000000, spi_regs + TXFTLR);
++	regmap_writel(0x0000003F, spi_regs + IMR);	/* Disable Interrupts */
++	regmap_writel(0x00000001, spi_regs + SER);
++	regmap_writel(0x00000001, spi_regs + SSIENR);
+ }
+ 
+ void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name)
+diff --git a/goya2/common.c b/goya2/common.c
+index 1f7fa33..062e399 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <psoc_gpio1_regs.h>
++#include <psoc_qspi_regs.h>
+ #include <psoc_global_conf_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+@@ -212,3 +213,7 @@
+ 	*out_en_offset = mmPSOC_GPIO1_OUTENSET;
+ }
+ 
++void spi_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_QSPI_CTRLR0;
++}

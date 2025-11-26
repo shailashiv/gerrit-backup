@@ -1,0 +1,284 @@
+From 89c5aa2cb7a0bb8521fbd9bfb2820cd494e5cd59 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 11 Apr 2022 16:50:30 +0300
+Subject: [PATCH] [SW-66329] pif_arc: add flr handling implementation
+
+Pif Arc is an Arc CPU positioned as part of the PciE block, and used
+for FLR request handling.
+This patch adds monitoring and handling sequence of an FLR event by
+the PIF ARC cpu, as the device specific implementation of module pci
+functions.
+Error reporting and progress status via dedicated registers will be
+added in future patches.
+
+Change-Id: I55b7ef2058a5f583ae375f6995a6404acfa090f3
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index 4c56565..6a477e6 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -8,7 +8,25 @@
+ #include <stddef.h>
+ #include <preboot.h>
+ #include <device.h>
++#include <hl.h>
++#include <bitops.h>
+ #include "cmd_module.h"
++#include "pif_ts.h"
++#include "pll.h"
++
++#define FLR_SPEC_TIMEOUT_US	100000				/* 100msec */
++#define FLR_SAFE_TIMEOUT_US	(FLR_SPEC_TIMEOUT_US - 1000)	/* 99msec */
++#define FLR_ACTIVE_SIG_WIDTH_US	2
++
++struct flr_status {
++	bool prstn_deasserted;
++	bool flr_sw_ctrl;
++	bool dual_die_sku;
++	bool primary_die;
++	bool setup_done;
++};
++
++static struct flr_status flr_sts;
+ 
+ struct device_pif_arc pif_arc;
+ 
+@@ -25,12 +43,179 @@
+ 	},
+ };
+ 
++bool is_pcie_initialized(void)
++{
++	/* avoid reading psoc register after init phase */
++	if (flr_sts.prstn_deasserted)
++		return true;
++
++	if (regmap_readl(global_conf.prstn_reg))
++		flr_sts.prstn_deasserted = true;
++
++	return flr_sts.prstn_deasserted;
++}
++
++static void flag_flr_done(void)
++{
++	regmap_writel(1, pif_arc.pf_flr_done);
++	pif_ts_delay(FLR_ACTIVE_SIG_WIDTH_US);
++	regmap_writel(0, pif_arc.pf_flr_done);
++}
++
++static void wait_for_secondary_die(void)
++{
++	while (!regmap_readl(pif_arc.psoc2pif_die_ready)) {
++		/* meassuring timeout from FLR event start */
++		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US))
++			/* TODO: set error bit */
++			break;
++	}
++
++	regmap_writel(0, pif_arc.psoc2pif_die_ready);
++}
++
++static void set_flr_active(void)
++{
++	regmap_writel(1, pif_arc.pif2psoc_flr_active);
++	pif_ts_delay(FLR_ACTIVE_SIG_WIDTH_US);
++	regmap_writel(0, pif_arc.pif2psoc_flr_active);
++}
++
++static void poll_flr_done(void)
++{
++	/* wait for FLR reset done from HW */
++	while (!regmap_readl(pif_arc.psoc2pif_flr_done)) {
++		/* meassuring timeout from FLR event start */
++		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US))
++			/* TODO: set error bit */
++			break;
++	}
++
++	regmap_writel(0, pif_arc.psoc2pif_flr_done);
++}
++
++#define PIF_ISOLATE_OUTBOUND	BIT(0)
++
++static void terminate_pci_access(void)
++{
++	u32 regval;
++
++	regmap_writel(1, pif_arc.inbound_term);
++	regmap_writel(1, pif_arc.crs);
++
++	regval = regmap_readl(pif_arc.outbound_iso);
++	regval |= PIF_ISOLATE_OUTBOUND;
++	regmap_writel(regval, pif_arc.outbound_iso);
++
++	/* wait for outstanding outbound transactions to complete */
++	while (!regmap_readl(pif_arc.outstand_trans)) {
++		/* meassuring timeout from FLR event start */
++		if (pif_ts_timeout_expired(0, FLR_SAFE_TIMEOUT_US))
++			/* TODO: set error bit */
++			break;
++	}
++}
++
++static void enable_pci_access(void)
++{
++	u32 regval;
++
++	regmap_writel(0, pif_arc.inbound_term);
++	regmap_writel(0, pif_arc.crs);
++
++	regval = regmap_readl(pif_arc.outbound_iso);
++	regval &= ~PIF_ISOLATE_OUTBOUND;
++	regmap_writel(regval, pif_arc.outbound_iso);
++}
++
++static void trigger_flr_reset(void)
++{
++	/* make sure HW ACK flag is cleared */
++	regmap_writel(0, pif_arc.psoc2pif_flr_done);
++
++	set_flr_active();
++	poll_flr_done();
++}
++
++void pci_dev_specific_run(void)
++{
++	terminate_pci_access();
++	trigger_flr_reset();
++
++	if (flr_sts.primary_die) {
++		if (flr_sts.dual_die_sku)
++			wait_for_secondary_die();
++
++		flag_flr_done();
++	}
++
++	/* TODO: wait for confirmation from FW that security preparations have finished */
++
++	enable_pci_access();
++
++	pif_ts_rearm_enable(true);
++}
++
++void pci_dev_specific_setup(void)
++{
++	/* avoid reading psoc register after init phase */
++	if (flr_sts.setup_done)
++		return;
++
++	flr_sts.dual_die_sku = hl_is_dual_die_sku();
++	flr_sts.primary_die = hl_get_die_id() ? false : true;
++	flr_sts.flr_sw_ctrl = true;
++	flr_sts.setup_done = true;
++}
++
++void pci_dev_specific_disable(void)
++{
++	flr_sts.flr_sw_ctrl = false;
++}
++
++void pci_dev_specific_enable(void)
++{
++	flr_sts.flr_sw_ctrl = true;
++}
++
++enum cmd_check_res dev_specific_module_pci_check(void)
++{
++	u32 flr_req = 0;
++
++	if (!flr_sts.flr_sw_ctrl)
++		return NOT_FOUND;
++
++	if (flr_sts.primary_die)
++		flr_req = regmap_readl(pif_arc.pf_flr_active);
++	else	/* running on secondary die in a dual die sku */
++		flr_req = regmap_readl(pif_arc.psoc2pif_flr_req);
++
++	if (flr_req) {
++		pif_ts_counter_arm();
++		pif_ts_rearm_enable(false);
++		return FOUND_SLOW_RETURN;
++	}
++
++	return NOT_FOUND;
++}
++
++/*
++ * In order to avoid resource collision with other CPUs, assuming that
++ * EFUSE data was already fetched to the shadow registers by other SW
++ * components (arcboot/ppboot) prior to running the pif arc code. So
++ * efuse initialization is not required here.
++ */
++int preboot_fuse_init(void) { return 0; }
++void fuse_notify_init_fail(void) {}
++void fuse_notify_invalid_offset(void) {}
++
+ bool hl_dev_spec_debug_mode(enum hl_debug_hw_func func) { return false; }
+ 
+ static void device_init(void)
+ {
+ 	device_init_global_conf();
+ 	device_init_pci();
++	device_init_efuse();
+ 	device_init_pif_arc();
+ }
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index f146b7b..6e68f5a 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -37,6 +37,7 @@
+ #include <uart.h>
+ #include <spi_flash.h>
+ #include <memory.h>
++#include <efuse.h>
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -217,7 +218,7 @@
+ 	image_entry();
+ }
+ 
+-static u32 hl_get_die_id(void)
++u32 hl_get_die_id(void)
+ {
+ 	/*
+ 	 * same address space read by both dies will return a different value
+@@ -226,6 +227,23 @@
+ 	return regmap_readl(mmD0_PARC_LOCAL_CFG_DIE_ID);
+ }
+ 
++#define EFUSE_SKU_OFFSET	58
++#define EFUSE_SKU_SHIFT		26
++
++bool hl_is_dual_die_sku(void)
++{
++	u32 val;
++	int err;
++
++	err = preboot_fuse_read(EFUSE_SKU_OFFSET, &val);
++	if (err)
++		return false;
++
++	val = (val >> EFUSE_SKU_SHIFT) & 0x1;
++
++	return !!val;
++}
++
+ #define GAUDI3_EFUSE_READ_RANGE_ALL	0xff00
+ 
+ void device_init_efuse(void)
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 1f674af..f71ce03 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -18,4 +18,7 @@
+ 	HL_ECC_DERR_RST = 256
+ };
+ 
++u32 hl_get_die_id(void);
++bool hl_is_dual_die_sku(void);
++
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */

@@ -1,0 +1,373 @@
+From 937d322a2e2a3160c72a8158bd70a3901da4b851 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 30 Nov 2020 00:39:52 +0200
+Subject: [PATCH] [SW-1833] gaudi: security: utilize sp sram
+
+Use SP SRAM in order to store the OTP and eFuse security information.
+This is needed in order to provide u-boot with security data in early
+boot stages when flash driver access is limited.
+
+This review uses boot info descriptors instead of known offset.
+
+Change-Id: I95b30577dcf20eebb95a8657645c73b9d7e84090
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+(cherry picked from commit 88389a890093d64010f83922dc347c9028c60723)
+---
+
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 0cf5524..f58b515 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -14,6 +14,8 @@
+ #define HL_SP_SRAM_BASE			0x7FFBFE0000
+ #define HL_SP_SRAM_SIZE			0x10000
+ 
++#define BOOT_INFO_BASE			HL_SP_SRAM_BASE
++
+ #define HL_FW_BOOT_PTRS_BASE		0x60000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xA0000
+ 
+diff --git a/gaudi/security.c b/gaudi/security.c
+index fe84029..ebfa699 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -47,7 +47,9 @@
+ #include <preboot.h>
+ #include <uart.h>
+ #include <hl_boot_if.h>
++#include <hl_boot_desc.h>
+ #include <boot_if.h>
++#include <boot_info.h>
+ #include <string.h>
+ #include <efuse.h>
+ #include <gaudi/gaudi_security.h>
+@@ -125,13 +127,13 @@
+ 	return otp;
+ }
+ 
++#ifdef FUSE_SUPPORT
+ static const struct hl_sec_efuse *preboot_security_get_fuse(void)
+ {
+ 	struct hl_sec_efuse *fuse;
+ 	u32 *val;
+ 	int i;
+ 
+-#ifdef FUSE_SUPPORT
+ 	if (preboot_security_fuse_cache.is_invalid) {
+ 		fuse = &preboot_security_fuse_cache.fuse;
+ 
+@@ -142,8 +144,24 @@
+ 		}
+ 		preboot_security_fuse_cache.is_invalid = false;
+ 	}
+-#else
++
++	return &preboot_security_fuse_cache.fuse;
++}
++
++static void preboot_security_sp_sram_write_efuse(void)
++{
++	/* Do nothing for real eFuse */
++}
++
++#else /* FUSE_SUPPORT */
++
+ #define FAKE_FUSE_OFFSET ((2 * 1024 * 1024) + (64 * 1024))
++static const struct hl_sec_efuse *preboot_security_get_fuse(void)
++{
++	struct hl_sec_efuse *fuse;
++	u32 *val;
++	int i;
++
+ 	if (preboot_security_fuse_cache.is_invalid) {
+ 		fuse = &preboot_security_fuse_cache.fuse;
+ 
+@@ -159,9 +177,37 @@
+ 
+ 		preboot_security_fuse_cache.is_invalid = false;
+ 	}
+-#endif
+ 
+ 	return &preboot_security_fuse_cache.fuse;
++}
++
++static void preboot_security_sp_sram_write_efuse(void)
++{
++	const struct hl_sec_efuse *efuse;
++
++	efuse = preboot_security_get_fuse();
++	if (!efuse)
++		return;
++
++	boot_info_set(HL_BOOT_INFO_SECURITY_FUSE, efuse, sizeof(*efuse));
++}
++#endif /* FUSE_SUPPORT */
++
++static void preboot_security_sp_sram_write_otp(void)
++{
++	const struct hl_sec_otp *otp;
++
++	otp = preboot_security_get_otp();
++	if (!otp)
++		return;
++
++	boot_info_set(HL_BOOT_INFO_SECURITY_OTP, otp, sizeof(*otp));
++}
++
++static void preboot_security_sp_sram_init(void)
++{
++	preboot_security_sp_sram_write_otp();
++	preboot_security_sp_sram_write_efuse();
+ }
+ 
+ bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+@@ -1363,6 +1409,10 @@
+ 		preboot_security_pci_disable();
+ 		preboot_puts("Security is disabled\n");
+ 	}
++
++	/* Store security info to be used by the booted image */
++	preboot_security_sp_sram_init();
++
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_SECURITY_EN, is_sec_en);
+ 
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, false);
+diff --git a/goya/common.h b/goya/common.h
+index 5bfcc1e..265e0f1 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -15,6 +15,12 @@
+ #define PPBOOT_TEXT_BASE	0x7FF0000000
+ #define PREBOOT_TEXT_BASE	(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
++/* Scratchpad SRAM (32KB) */
++#define HL_SP_SRAM_BASE		0x7FF9000000
++#define HL_SP_SRAM_SIZE		0x8000
++
++#define BOOT_INFO_BASE		HL_SP_SRAM_BASE
++
+ #define FUSE_WORDS_PER_BANK	0x10
+ #define I2C_SLAVE_ADDRESS	0x4f
+ #define I2C_SLAVE_ADDRESS_DBG	0x47
+diff --git a/goya2/common.h b/goya2/common.h
+index 0df56d6..910682c 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -19,6 +19,12 @@
+ #define PPBOOT_TEXT_BASE		0x7FF0000000
+ #define PREBOOT_TEXT_BASE		(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
++/*
++ * TODO: this address is wrong, a good address must be set in order to use
++ * boot info API.
++ */
++#define BOOT_INFO_BASE			HL_SP_SRAM_BASE
++
+ #define FUSE_WORDS_PER_BANK		0x40
+ #define I2C_SLAVE_ADDRESS		0x6A
+ #define I2C_SLAVE_ADDRESS_DBG		0x47
+diff --git a/goya2_arc_gnu/common.h b/goya2_arc_gnu/common.h
+index f70fc39..79c5fe7 100644
+--- a/goya2_arc_gnu/common.h
++++ b/goya2_arc_gnu/common.h
+@@ -21,6 +21,12 @@
+ #define PPBOOT_TEXT_BASE	(FW_SRAM_BASE + 0xC)
+ #define PREBOOT_TEXT_BASE	(SP_SRAM_BASE + SP_SRAM_PREBOOT_OFFSET + 0x8)
+ 
++/*
++ * TODO: this address is wrong, a good address must be set in order to use
++ * boot info API.
++ */
++#define BOOT_INFO_BASE		SP_SRAM_BASE
++
+ #define FUSE_WORDS_PER_BANK	0x40
+ #define I2C_SLAVE_ADDRESS	0x6A
+ #define I2C_SLAVE_ADDRESS_DBG	I2C_SLAVE_ADDRESS
+diff --git a/include/boot_info.h b/include/boot_info.h
+new file mode 100644
+index 0000000..9d5558e
+--- /dev/null
++++ b/include/boot_info.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#ifndef _BOOT_INFO_H_
++#define _BOOT_INFO_H_
++
++#include <preboot.h>
++
++void boot_info_finalize(void);
++int boot_info_set(u32 type, const void *data, u32 size);
++
++#endif /* _BOOT_INFO_H_ */
+diff --git a/preboot/boot_info.c b/preboot/boot_info.c
+new file mode 100644
+index 0000000..4e27182
+--- /dev/null
++++ b/preboot/boot_info.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <string.h>
++#include <stdbool.h>
++#include <preboot.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++#include <sha256.h>
++
++#include "boot_info.h"
++#include "uart.h"
++
++#define MAX_INFO_DESCS	5
++
++#define ROUND_UP4(n)	(((n) + sizeof(u32) - 1) & ~(sizeof(u32) - 1))
++#define BOOT_INFO_SZ	(sizeof(struct hl_boot_info_ptrs) + \
++			sizeof(struct hl_boot_info_desc) * MAX_INFO_DESCS)
++
++struct boot_info {
++	union {
++		struct {
++			struct hl_boot_info_ptrs ptrs;
++			struct hl_boot_info_desc descs[MAX_INFO_DESCS];
++		};
++		u32 data[ROUND_UP4(BOOT_INFO_SZ) / sizeof(u32)];
++	};
++};
++
++static struct boot_info boot_info = { .ptrs = { .count = 0 } };
++
++static inline void *offset2ptr(u32 offset, uintptr_t base)
++{
++	return (void *)(base + offset);
++}
++
++static inline u32 ptr2offset(const void *ptr, uintptr_t base)
++{
++	return (u32)((uintptr_t)ptr) - base;
++}
++
++static bool boot_info_type_is_exists(u32 type)
++{
++	int i;
++
++	for (i = 0; i < boot_info.ptrs.count; i++)
++		if (boot_info.descs[i].type == type)
++			return true;
++
++	return false;
++}
++
++void boot_info_finalize(void)
++{
++	struct hl_boot_info_desc *desc;
++	u32 offsets[MAX_INFO_DESCS];
++	u32 offset, copy_sz;
++	const u32 *src;
++	u32 *dst;
++	int i, j;
++
++	if (!boot_info.ptrs.count)
++		return;
++
++	boot_info.ptrs.magic = HL_BOOT_INFO_MAGIC;
++
++	/* Data offset */
++	offset = sizeof(struct hl_boot_info_ptrs) +
++		(sizeof(struct hl_boot_info_desc) + sizeof(u32)) *
++		boot_info.ptrs.count;
++
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++
++	/* Store data */
++	for (i = 0; i < boot_info.ptrs.count; i++) {
++		desc = &boot_info.descs[i];
++		src = offset2ptr(desc->offset, PREBOOT_TEXT_BASE);
++		sha256_csum((u8 *)src, desc->size, desc->chksum);
++		copy_sz = ROUND_UP4(desc->size);
++
++		for (j = 0; j < copy_sz / sizeof(u32); j++)
++			dst[j] = src[j];
++
++		desc->offset = ptr2offset(dst, BOOT_INFO_BASE);
++		dst += j;
++	}
++
++	/* Store descriptors */
++	offset = sizeof(struct hl_boot_info_ptrs) +
++		(sizeof(u32)) * boot_info.ptrs.count;
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++	for (i = 0; i < boot_info.ptrs.count; i++) {
++		src = (u32 *)&boot_info.descs[i];
++		copy_sz = ROUND_UP4(sizeof(struct hl_boot_info_desc));
++
++		for (j = 0; j < copy_sz / sizeof(u32); j++)
++			dst[j] = src[j];
++
++		offsets[i] = ptr2offset(dst, BOOT_INFO_BASE);
++		dst += j;
++	}
++
++	/* Store offsets array */
++	offset = sizeof(struct hl_boot_info_ptrs);
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++	for (i = 0; i < boot_info.ptrs.count; i++)
++		dst[i] = offsets[i];
++
++	/* Store the ptr */
++	dst = offset2ptr(0, BOOT_INFO_BASE);
++	for (i = 0; i < sizeof(boot_info.ptrs) / sizeof(u32); i++)
++		dst[i] = boot_info.data[i];
++}
++
++int boot_info_set(u32 type, const void *data, u32 size)
++{
++	struct hl_boot_info_desc *desc;
++
++	if (boot_info.ptrs.count >= MAX_INFO_DESCS) {
++		preboot_puts_hex("No room to store boot info type: ", type, 0);
++		return 1;
++	}
++
++	if (boot_info_type_is_exists(type)) {
++		preboot_puts_hex("Boot info type already exists: ", type, 0);
++		return 1;
++	}
++
++	desc = &boot_info.descs[boot_info.ptrs.count];
++	desc->type = type;
++	desc->size = size;
++	desc->magic = HL_BOOT_INFO_DESC_MAGIC | type;
++	/* Store offset relative to preboot text */
++	desc->offset = ptr2offset(data, PREBOOT_TEXT_BASE);
++	boot_info.ptrs.count++;
++
++	return 0;
++}
+diff --git a/preboot/fit.c b/preboot/fit.c
+index b7b3179..6bccd43 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -11,6 +11,7 @@
+ #include <preboot.h>
+ #include <boot_if.h>
+ #include <fit_load_type.h>
++#include <boot_info.h>
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
+@@ -649,6 +650,7 @@
+ 		break;
+ 	}
+ 
++	boot_info_finalize();
+ 	preboot_start_image(startaddr);
+ }
+ 

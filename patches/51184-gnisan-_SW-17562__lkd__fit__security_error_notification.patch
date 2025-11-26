@@ -1,0 +1,135 @@
+From 93be09e15e76e0bcf3e99dfd3f251506ebf68ea8 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 13 Sep 2020 17:24:31 +0300
+Subject: [PATCH] [SW-17562] lkd: fit: security error notification
+
+Add security error notification to LKD which indicates the provided FIT
+did not pass the security checks and failed to boot.
+
+Change-Id: I4d41ab857654685cd3b6547d332cf7e977b580e8
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index e0e0a42..dcac2df 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -410,7 +410,7 @@
+ 	return fit_verify_config(fit, noffset);
+ }
+ 
+-int fit_load_images(const void *fit, struct fit_image *images)
++enum fit_load_result fit_load_images(const void *fit, struct fit_image *images)
+ {
+ 	int node, len;
+ 	int conf, num_images, i;
+@@ -421,29 +421,29 @@
+ 	/* Get number of images in preboot configuration */
+ 	conf = fit_find_config_node(fit);
+ 	if (conf < 0)
+-		return 1;
++		return FIT_LOAD_CORRUPTED;
+ 
+ 	if (fit_verify_security(fit, conf))
+-		return 1;
++		return FIT_LOAD_SEC_FAILED;
+ 
+ 	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
+ 	if (num_images > FIT_MAX_IMAGES) {
+ 		preboot_puts_hex("Images in fit exceeds max limit: ",
+ 					FIT_MAX_IMAGES, false);
+-		return 1;
++		return FIT_LOAD_CORRUPTED;
+ 	}
+ 
+ 	for (i = 0; i < num_images; i++) {
+ 		node = fit_loadables_node_get(fit, i);
+ 		if (node < 0) {
+ 			preboot_puts_hex("Wrong FIT format: loadable image not found: ", i, false);
+-			return 1;
++			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
+ 		loadaddr = fdt_getprop(fit, node, FIT_LOADADDR_PROP, &len);
+ 		if (!loadaddr || len != sizeof(u64)) {
+ 			preboot_puts_hex("Wrong FIT format: loadaddr not found for image: ", i, false);
+-			return 1;
++			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
+ 		dst = ((u64)fdt32_to_cpu(loadaddr[0])) << 32;
+@@ -452,14 +452,14 @@
+ 		buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
+ 		if (!buf) {
+ 			preboot_puts_hex("Wrong FIT format: data empty for image: ", i, false);
+-			return 1;
++			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
+ 		images[i].arch = (const char *)fdt_getprop(fit, node,
+ 							FIT_ARCH_PROP, NULL);
+ 		if (!images[i].arch) {
+ 			preboot_puts_hex("Wrong FIT format: arch empty for image: ", i, false);
+-			return 1;
++			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
+ 		images[i].loadaddr = dst;
+@@ -467,5 +467,5 @@
+ 		fit_copy_image(dst, buf, len);
+ 	}
+ 
+-	return 0;
++	return FIT_LOAD_SUCCESS;
+ }
+diff --git a/preboot/fit.h b/preboot/fit.h
+index 59eaef5..dda3787 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -15,7 +15,13 @@
+ 	const char *arch;
+ };
+ 
+-int fit_load_images(const void *fit, struct fit_image *images);
++enum fit_load_result {
++	FIT_LOAD_SUCCESS = 0,
++	FIT_LOAD_CORRUPTED,
++	FIT_LOAD_SEC_FAILED,
++};
++
++enum fit_load_result fit_load_images(const void *fit, struct fit_image *images);
+ int fit_check_format(const void *fit);
+ void fit_copy_image(u64 dst, const void *buf, int len);
+ void preboot_fit_start_images(struct fit_image *image);
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 95fa879..84613d2 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -78,15 +78,21 @@
+ 	if (!err)
+ 		err = fit_load_images(fit, sts.images);
+ 
+-	if (err) {/* Report the FIT is bad */
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED |
++			    CPU_BOOT_ERR0_SECURITY_FAIL, false);
++	switch (err) {
++	case FIT_LOAD_SUCCESS:
++		sts.fit_not_checked = 0;
++		break;
++	case FIT_LOAD_CORRUPTED:
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+ 		preboot_puts("FIT loading failed, Retrying...\n");
+-		return;
++		break;
++	case FIT_LOAD_SEC_FAILED:
++		cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_FAIL, true);
++		preboot_puts("FIT security validation failed, Retrying...\n");
++		break;
+ 	}
+-
+-	sts.fit_not_checked = 0;
+-	/* Report the FIT is good */
+-	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, false);
+ }
+ 
+ void module_lkd_run_noret(void)

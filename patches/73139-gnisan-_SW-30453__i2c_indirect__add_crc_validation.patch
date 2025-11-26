@@ -1,0 +1,182 @@
+From a4c3baad1dc830cad3a046e97b4e724152d0d3c3 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 26 Jan 2021 21:59:07 +0200
+Subject: [PATCH] [SW-30453] i2c indirect: add crc validation
+
+Add CRC integrity check to I2C indirect.
+
+CRC is only active when IC bit is set in WDATA header.
+In validates both header and payload alike.
+
+For write request, CRC is following the payload of WDATA:
+  [WDATA w=1 ic=1][Payload][CRC]
+
+For read request, CRC follows the WDATA header:
+  [WDATA w=0 ic=1][CRC]
+
+When validation fails, integrity error (10) is set to status.
+
+RDATA CRC is calculated in the same way (header + payload) while CRC
+follows the payload:
+  [RDATA ic=1][Payload][CRC]
+
+Change-Id: I8a3ccfe376e501994f3d6c87d9bbda1c72c32d42
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index a526ce7..a0407e3 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -13,6 +13,7 @@
+ #include <common/module_i2c_slave.h>
+ #include <hl_i2c_indirect.h>
+ #include <hl_i2c_slave_events.h>
++#include <crc32.h>
+ #include "fit.h"
+ 
+ #define SUPPORTED_OPCODES_MASK	( \
+@@ -32,13 +33,23 @@
+ struct i2csi_wdata_read_context {
+ 	u8 *data; /* Pointer to data to be read */
+ 	u16 length;
++	union {
++		u32 crc;
++		u8 req_crc_data[4];
++	};
+ 	struct hl_i2ci_rdata_hdr hdr;
+ };
+ 
+ struct i2csi_wdata_write_context {
+-	u8 *data;   /* Pointer to written data */
+-	u16 offset; /* Offset of overall written data */
+-	u16 length; /* Length of bytes to write in a single iteration */
++	u8 *data;	/* Pointer to written data */
++	u16 offset;	/* Offset of overall written data */
++	u16 length;	/* Length of bytes to write in a single iteration */
++	u32 crc;	/* Calculated CRC */
++	union {
++		u32 req_crc;		/* Request CRC from master */
++		u8 req_crc_data[4];
++		u8 unused[4];		/* For unused data needed for CRC */
++	};
+ 	struct hl_i2ci_wdata_hdr hdr;
+ };
+ 
+@@ -162,8 +173,17 @@
+ 
+ static inline void i2csi_req_wdata_wait_for(u8 *data, u16 length)
+ {
+-	req_wd.data = data;
+-	req_wd.length = length;
++	if (req_wd.hdr.ic && !data && req_wd.offset < req_wd.hdr.rqdl) {
++		/* Data is coming but its unused, we still need to calc CRC */
++		req_wd.data = req_wd.unused;
++		if (length > sizeof(req_wd.unused))
++			length = sizeof(req_wd.unused);
++
++		req_wd.length = length;
++	} else {
++		req_wd.data = data;
++		req_wd.length = length;
++	}
+ }
+ 
+ static inline void i2csi_req_wdata_done(void)
+@@ -348,6 +368,19 @@
+ 		return;
+ 	}
+ 
++	/* The payload has arrived, wait for CRC */
++	if (req_wd.hdr.ic) {
++		if (req_wd.offset < req_wd.hdr.rqdl + 4) {
++			i2csi_req_wdata_wait_for(req_wd.req_crc_data, 4);
++			return;
++		} else if (req_wd.req_crc != req_wd.crc) {
++			req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++			req_sts.err = HL_I2CI_REQ_ERR_INTEGRITY;
++			i2csi_req_wdata_done();
++			return;
++		}
++	}
++
+ 	/* Payload received */
+ 	req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+ 	i2csi_req_wdata_done();
+@@ -362,6 +395,8 @@
+ 	req_rd.length = 0;
+ 	req_wd.length = 0;
+ 	req_wd.offset = 0;
++	req_wd.crc = 0;
++	req_wd.hdr.ic = 0;
+ }
+ 
+ void i2csi_req_wdata_handle_write(u8 cnt)
+@@ -369,14 +404,38 @@
+ 	if (cnt > 1) /* Skip the header */
+ 		req_wd.offset += req_wd.length;
+ 
+-	if (req_chunk.hdr.rqcl)
++	if (req_chunk.hdr.rqcl) {
+ 		i2csi_req_wdata_handle_chunk(cnt);
+-	else
+-		i2csi_req_wdata_handle_payload();
++		return;
++	}
++
++	if (req_wd.hdr.ic && req_wd.length && req_wd.offset <= req_wd.hdr.rqdl)
++		req_wd.crc = crc32(req_wd.crc, req_wd.data, req_wd.length);
++
++	i2csi_req_wdata_handle_payload();
+ }
+ 
+ void i2csi_req_wdata_handle_read(u8 cnt)
+ {
++	if (req_wd.hdr.ic) {
++		switch (cnt) {
++		case 1: /* Header received, wait for CRC */
++			req_wd.crc = crc32(req_wd.crc, req_wd.data,
++					   req_wd.length);
++			i2csi_req_wdata_wait_for(req_wd.req_crc_data, 4);
++			return;
++
++		case 2: /* CRC received, validate it */
++			if (req_wd.req_crc != req_wd.crc) {
++				req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++				req_sts.err = HL_I2CI_REQ_ERR_INTEGRITY;
++				i2csi_req_wdata_done();
++				return;
++			}
++			/* Fall through */
++		}
++	}
++
+ 	req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+ 
+ 	/* Data read with chunks is not supported */
+@@ -492,11 +551,25 @@
+ 	if (idx < HL_I2CI_REQ_RDATA_LEN)
+ 		return req_rd.hdr.data[idx];
+ 
++	if (req_wd.hdr.ic && idx == HL_I2CI_REQ_RDATA_LEN)
++		req_rd.crc = crc32(0, req_rd.hdr.data, HL_I2CI_REQ_RDATA_LEN);
++
+ 	/* Payload */
+ 	idx -= HL_I2CI_REQ_RDATA_LEN;
+ 	if (idx < req_rd.length)
+ 		return req_rd.data[idx];
+ 
++	if (req_wd.hdr.ic) {
++		if (idx == req_rd.length)
++			req_rd.crc = crc32(req_rd.crc, req_rd.data,
++					   req_rd.length);
++
++		/* CRC */
++		idx -= req_rd.length;
++		if (idx < sizeof(req_rd.req_crc_data))
++			return req_rd.req_crc_data[idx];
++	}
++
+ 	return 0;
+ }
+ 

@@ -1,0 +1,95 @@
+From c89217e5442730d72ec48329ea5d490a85bd658a Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Wed, 04 Jan 2023 06:43:03 +0200
+Subject: [PATCH] [SW-103768] gaudi2: bist: add mrr2inbr stage
+
+This patch add mrr2inbr stage before bira.
+This stage shifts the repair data from the efuse
+to the repair registers inside the memory. This enables
+us to execute accumulative repair, add repair data without
+overriding the fuse repair data
+
+Change-Id: I67b1096067161cc95435947e0d47a23580ac02af
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 71e0b85..9c14a06 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -207,6 +207,25 @@
+ 	return ret;
+ }
+ 
++static int gaudi2_sram_mrr2inbr_pattern(void)
++{
++	uint32_t expected_ones, expected_zeros;
++	int err;
++
++	regmap_writel(GAUDI2_RING_PATTERN_VAL1, mmPSOC_DFT_APB_WORD0);
++	regmap_writel(GAUDI2_RING_PATTERN_VAL56, mmPSOC_DFT_APB_WORD1);
++	udelay(DELAY_5K_USEC);
++	regmap_writel(GAUDI2_RING_PATTERN_VAL5, mmPSOC_DFT_APB_WORD0);
++	regmap_writel(GAUDI2_RING_PATTERN_VAL6, mmPSOC_DFT_APB_WORD1);
++	expected_ones = 0b00000000000000000000001010000000;
++	expected_zeros = 0b00000000000000000000000101110000;
++	err = gaudi2_sms_read_and_check_pattern(expected_ones, expected_zeros);
++	if (err)
++		return 1;
++
++	return 0;
++}
++
+ static void gaudi2_sram_ring_sel(uint32_t dfx_val, uint32_t ring)
+ {
+ 	uint32_t ring_value = BIT(8) | (ring << 3) | 0x5;
+@@ -244,18 +263,12 @@
+ 	regmap_writel(GAUDI2_RING_PATTERN_VAL9, mmPSOC_DFT_APB_WORD1);
+ }
+ 
+-static int sram_op_specific_pattern(enum gaudi2_sram_self_repair_op op, uint8_t dfx, uint8_t ring)
++static int sram_run_mrr2inbr(uint8_t dfx, uint8_t ring)
+ {
+-	int ret;
++	gaudi2_sram_id_sel();
++	gaudi2_sram_ring_sel(dfx_value_table[dfx], ring);
+ 
+-	if (op == SRAM_SELF_REPAIR_OP_BIRA) {
+-		gaudi2_sram_id_sel();
+-		gaudi2_sram_ring_sel(dfx_value_table[dfx], ring);
+-	}
+-
+-	ret = gaudi2_sram_ring_pattern(op);
+-
+-	return ret;
++	return gaudi2_sram_mrr2inbr_pattern();
+ }
+ 
+ #define GAUDI2_DFX_SHIFT_VAL		5
+@@ -273,7 +286,11 @@
+ 		ring = gaudi2_sram_rings[ring_index].ring;
+ 		val = (dfx << GAUDI2_DFX_SHIFT_VAL) | ring;
+ 
+-		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BIRA, dfx, ring);
++		ret = sram_run_mrr2inbr(dfx, ring);
++		if (ret)
++			preboot_puts_hex("mrr2inbr failed val: ", val, 0);
++
++		ret = gaudi2_sram_ring_pattern(SRAM_SELF_REPAIR_OP_BIRA);
+ 		if (ret > 0) {
+ 			num = bist_data->num_prebist_failed_rings;
+ 			bist_data->pre_bist_failed_rings[num] = val;
+@@ -283,11 +300,11 @@
+ 			continue;
+ 		}
+ 
+-		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BISR, dfx, ring);
++		ret = gaudi2_sram_ring_pattern(SRAM_SELF_REPAIR_OP_BISR);
+ 		if (ret > 0)
+ 			preboot_puts_hex("bisr failed val: ", val, 0);
+ 
+-		ret = sram_op_specific_pattern(SRAM_SELF_REPAIR_OP_BIST, dfx, ring);
++		ret = gaudi2_sram_ring_pattern(SRAM_SELF_REPAIR_OP_BIST);
+ 		if (ret > 0) {
+ 			num = bist_data->num_postbist_failed_rings;
+ 			bist_data->post_bist_failed_rings[num] = val;

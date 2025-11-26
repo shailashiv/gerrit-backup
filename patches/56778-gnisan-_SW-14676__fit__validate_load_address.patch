@@ -1,0 +1,161 @@
+From 8e57fb8902368617152a132ec42e6a3ecd3569ff Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Thu, 22 Oct 2020 10:29:08 +0300
+Subject: [PATCH] [SW-14676] fit: validate load address
+
+Add overlap protection with preboot and validate SRAM bounderies
+before deploying the FIT binary image using its load address
+
+Change-Id: I0076d1cce28ab4dc470d886d5699fb15da2bef6b
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 132277a..275300c 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -9,6 +9,8 @@
+ 
+ #include <preboot.h>
+ 
++#define SRAM_SIZE			0x1400000	/* 20MB */
++
+ #define HL_FW_BOOT_PTRS_BASE		0x60000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xA0000
+ 
+diff --git a/goya/common.h b/goya/common.h
+index 7bf6f9c..66089f4 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -7,6 +7,8 @@
+ 
+ #include <preboot.h>
+ 
++#define SRAM_SIZE			0x32A0000	/* 50.625MB */
++
+ #define HL_FW_BOOT_PTRS_BASE		0x60000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xA0000
+ 
+diff --git a/goya2/common.c b/goya2/common.c
+index 6b514b5..6c1222b 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -486,3 +486,12 @@
+ 	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
++
++bool preboot_is_valid_address_range(u64 addr, int len)
++{
++	if (addr >= HL_SP_SRAM_BASE &&
++	    addr + len < HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE)
++		return true;
++
++	return preboot_sram_is_valid_address_range(addr, len);
++}
+diff --git a/goya2/common.h b/goya2/common.h
+index f4d4907..d2a73b2 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -8,6 +8,9 @@
+ #include <preboot.h>
+ #include <goya2_blocks_linux_driver.h>
+ 
++#define SRAM_SIZE			0x8000000	/* 128MB */
++#define HL_SP_SRAM_SIZE			0x10000
++
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+ 
+diff --git a/goya2_arc_gnu/common.h b/goya2_arc_gnu/common.h
+index a42e133..f70fc39 100644
+--- a/goya2_arc_gnu/common.h
++++ b/goya2_arc_gnu/common.h
+@@ -8,6 +8,8 @@
+ #include <preboot.h>
+ #include <goya2_blocks_linux_driver.h>
+ 
++#define SRAM_SIZE			0x8000000	/* 128MB */
++
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+ 
+diff --git a/include/preboot.h b/include/preboot.h
+index 9b81139..90850d6 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -74,6 +74,9 @@
+ 	HL_DEBUG_HW_DBG_CARD,
+ };
+ 
++extern void *_start;		/* Start of preboot region */
++extern void *__stack_top;	/* End of preboot region */
++
+ static inline u8 regmap_readb(u32 offset)
+ {
+ 	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
+@@ -134,6 +137,8 @@
+ 
+ void preboot_fuse_version_serialize(char *ver, size_t size,
+ 				    struct preboot_fuse_ver_data *fuse_data);
++bool preboot_sram_is_valid_address_range(u64 addr, int len);
++bool preboot_is_valid_address_range(u64 addr, int len);
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index cff802e..8d06dfc 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -555,6 +555,11 @@
+ 			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
++		if (!preboot_is_valid_address_range(load, len)) {
++			preboot_puts_hex("FIT: invalid load address for image: ", i, false);
++			return FIT_LOAD_CORRUPTED;
++		}
++
+ 		images[i].arch = (const char *)fdt_getprop(fit, node,
+ 							FIT_ARCH_PROP, NULL);
+ 		if (!images[i].arch) {
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index c2d722b..e40cb27 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ #include <psoc_global_conf_regs.h>
+ 
+@@ -198,6 +199,27 @@
+ __weak void preboot_led_on(void) {}
+ __weak void sram_scrambling_init(void) {}
+ 
++static bool preboot_is_overlap_address_range(u64 addr, int len)
++{
++	void *addrptr = (void *)(uintptr_t)addr;
++
++	if (addrptr + len <= _start || addrptr > __stack_top)
++		return false;
++
++	return true;
++}
++
++bool preboot_sram_is_valid_address_range(u64 addr, int len)
++{
++	if (addr >= SDRAM_BASE && addr + len < SDRAM_BASE + SRAM_SIZE)
++		return !preboot_is_overlap_address_range(addr, len);
++
++	return false;
++}
++
++bool preboot_is_valid_address_range(u64 addr, int len)
++	__attribute__((weak, alias("preboot_sram_is_valid_address_range")));
++
+ void preboot_main(void)
+ {
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);

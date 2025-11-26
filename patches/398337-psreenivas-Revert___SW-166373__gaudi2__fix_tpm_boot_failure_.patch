@@ -1,0 +1,52 @@
+From 859d48190f48fff16d93b48147d8a240940edd6f Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Thu, 22 Feb 2024 05:57:57 +0200
+Subject: [PATCH] Revert "[SW-166373] gaudi2: fix tpm boot failure"
+
+This reverts commit e71e3c04514da8ff1ccad89267f8021feb41aca6.
+Due to HW bug, it is decided to delay de-assertion of perst
+by 20 seconds after power good. Hence waiting for prstn will
+always result in failure in cold and prstn reset and pcr extend
+will fail. however an additional hard reset is issued in preboot
+after running BIST test post pcie link up and tpm_init should succeed
+and tpm pcr extends will pass. This patch removes waiting for prstn in
+tpm_init.
+
+Change-Id: Ide6ca73c41dabbc945fecb3cd0af0011a01d7307
+---
+
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index 27021c2..0adfc82 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -13,9 +13,6 @@
+ #include <boot_desc.h>
+ #include <errno.h>
+ #include "lzo/unaligned.h"
+-#include <pll.h>
+-#include <gaudi2_fw_if.h>
+-#include <psoc_global_conf_regs.h>
+ 
+ #define TPM_NV_DEV_SN_ADDRESS		0x01c10100
+ 
+@@ -41,20 +38,9 @@
+ 	return 0;
+ }
+ 
+-#define TPM_PRSTN_TIMEOUT_US	200000	/* 200msec */
+ int tpm_init(bool print)
+ {
+ 	int ret;
+-	u64 start = timestamp_get_us();
+-
+-	/* TPM is held in reset until PRSTN is de-asserted */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
+-		if (timeout_expired(start, TPM_PRSTN_TIMEOUT_US)) {
+-			preboot_puts("TPM: Timeout waiting for PRSTN\n");
+-			cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+-			return -ETIMEDOUT;
+-		}
+-	}
+ 
+ 	ret = tpm2_init(print);
+ 	if (ret) {

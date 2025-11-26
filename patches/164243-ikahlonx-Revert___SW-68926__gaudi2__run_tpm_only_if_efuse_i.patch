@@ -1,0 +1,145 @@
+From 2f673f436d356f5bdcc59c3798c132d4faadfd8e Mon Sep 17 00:00:00 2001
+From: Idan Kahlon <idan.kahlon@tandemg.com>
+Date: Thu, 06 Jan 2022 11:04:39 +0200
+Subject: [PATCH] Revert "[SW-68926] gaudi2: run tpm only if efuse is burned"
+
+This reverts commit 5c82dfa67ae7db798a18673f74480e997328e305.
+
+Change-Id: Iefb8e945df9db6be7ab57a6667071b8f046ff115
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index cb7c0e7..8cd8630 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -67,7 +67,6 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/pll.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/sha512.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
+ 	$(HL_DEV_ARCH_COMMON)/tpm2.o \
+ 	$(HL_DEV_ARCH_COMMON)/tpm_auth.o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index d330898..bf78845 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -41,7 +41,6 @@
+ #include <address_space.h>
+ #include <gaudi2/gaudi2_security.h>
+ #include <tpm2.h>
+-#include <errno.h>
+ 
+ #define PRODUCT_ID_STR_SIZE	0x8
+ 
+@@ -251,7 +250,6 @@
+ {
+ 	u32 flash_offset;
+ 	u16 image_size;
+-	int ret;
+ 
+ 	flash_offset = ppboot_flash_image_offset(image_ptr);
+ 	image_size = (u16) spi_flash_readl(flash_offset);
+@@ -272,14 +270,10 @@
+ 			== SECUREBOOT_VERIFY_FAILED)
+ 		return ARCBOOT_BRINGUP_ERROR;
+ 
+-	ret = tpm_init();
+-	if (!ret) {
++	if (!tpm_init())
+ 		if (tpm_hash_and_pcr_extend(TPM2_PREBOOT_PCR_IDX, (SDRAM_BASE + IMG_LEN_SIZE),
+ 					    image_size))
+ 			preboot_puts("PPBOOT: pcr extend failed\n");
+-	} else if (ret == -EOPNOTSUPP) {
+-		preboot_puts("PPBOOT: TPM is not supported\n");
+-	}
+ 
+ 	return ARCBOOT_BRINGUP_OK;
+ }
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index 8e734c6..8f5ed39 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -11,11 +11,9 @@
+ #include <uart.h>
+ #include <sha.h>
+ #include <boot_desc.h>
+-#include <errno.h>
+ #include "lzo/unaligned.h"
+ 
+-#define TPM_NV_DEV_SN_ADDRESS		0x01c10100
+-#define EFUSE_SYSCFG_ENABLE_TPM_MASK	BIT(11)
++#define TPM_NV_DEV_SN_ADDRESS	0x01c10100
+ 
+ struct tpm_dev_id {
+ 	union {
+@@ -39,28 +37,9 @@
+ 	return 0;
+ }
+ 
+-static int tpm_is_enabled(void)
+-{
+-	u32 config_fuse;
+-	int ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
+-
+-	if (ret)
+-		return ret;
+-
+-	if ((config_fuse & EFUSE_SYSCFG_ENABLE_TPM_MASK) != 0)
+-		ret = 0;
+-	else
+-		ret = -1;
+-
+-	return ret;
+-}
+-
+ int tpm_init(void)
+ {
+ 	int ret;
+-
+-	if (tpm_is_enabled() != 0)
+-		return -EOPNOTSUPP;
+ 
+ 	ret = tpm2_init();
+ 	if (ret) {
+@@ -75,9 +54,6 @@
+ {
+ 	int ret;
+ 
+-	if (tpm_is_enabled() != 0)
+-		return -EOPNOTSUPP;
+-
+ 	ret = tpm2_startup(TPM2_SU_CLEAR);
+ 	if (ret) {
+ 		preboot_puts("TPM: tpm2_startup failed\n");
+@@ -90,9 +66,6 @@
+ int tpm_pcr_extend(uint32_t image_index, uint8_t *hash)
+ {
+ 	int ret;
+-
+-	if (tpm_is_enabled() != 0)
+-		return -EOPNOTSUPP;
+ 
+ 	if (hash == NULL)
+ 		return -1;
+@@ -128,9 +101,6 @@
+ 	struct tpm_dev_id efuse_dev_id;
+ 
+ 	efuse_dev_id.tpm_data = 0x0;
+-
+-	if (tpm_is_enabled() != 0)
+-		return;
+ 
+ 	if (cpu_boot_err_get(CPU_BOOT_ERR_TPM_FAIL))
+ 		return;
+diff --git a/include/errno.h b/include/errno.h
+index 488a2a4..6181fae 100644
+--- a/include/errno.h
++++ b/include/errno.h
+@@ -13,6 +13,5 @@
+ #define EBUSY 16	/* Mount device busy */
+ #define EINVAL 22       /* Invalid argument */
+ #define ETIMEDOUT 60    /* Connection timed out */
+-#define EOPNOTSUPP 95	/* Operation not supported */
+ 
+ #endif /* _HL_ERRNO_H_ */

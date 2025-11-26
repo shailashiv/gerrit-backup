@@ -1,0 +1,63 @@
+From 67a075a8bf379ac8516570239480700a2230cf9d Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 10 Jan 2024 17:52:59 +0200
+Subject: [PATCH] [SW-170219] gaudi3: remove phy fw trailing zeroes
+
+PCI PHY FW has about 22kbytes of zeroes in the end of it.
+Instead of storing those zeroes on the flash, and copying them from
+flash cold boot, the image is trimmed and the remainig memory
+is zeroized using the memcpy engine.
+
+Change-Id: Iedc4b165da9a48262c366372f0b4394ba7bce238
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 90150c6..370560c 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -916,7 +916,7 @@
+ 
+ #define PHY_FW_FSM_ENA_MASK	(PCIE_WRAP_PHY_FW_FSM_EN_M | \
+ 				 PCIE_WRAP_PHY_FW_FSM_DIRECT_WRITE_EN_M)
+-#define FW_WORD_NUM		(PHY_FW_SIZE / 2)
++#define FW_WORD_NUM		(HL_PCIE_FW_SRAM_SIZE / 2)
+ 
+ static void pif_arc_init_pcie_phy_fw_update(void)
+ {
+@@ -1221,6 +1221,11 @@
+ 	err = gaudi3_hbw_memcpy(src, HL_PCIE_FW_SRAM_BASE_FULL, PHY_FW_SIZE);
+ 	if (err)
+ 		preboot_puts_hex("failed to copy phy fw to pcie sram, err 0x", err, false);
++
++	/* zeroize the remaining PCIE_FW_SRAM memory, offset & size must be 16bytes aligned */
++	if (PHY_FW_SIZE < HL_PCIE_FW_SRAM_SIZE)
++		arcboot_rom_mem_init(HL_PCIE_FW_SRAM_BASE_FULL + PHY_FW_SIZE,
++				     HL_PCIE_FW_SRAM_SIZE - PHY_FW_SIZE);
+ }
+ 
+ void ppboot_send_version(void)
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index be43a62..f91266e 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -23,6 +23,7 @@
+ #define HL_CFG_MEM_BASE_FULL		0x300007FFC000000ULL
+ #define HL_CFG_MEM_SIZE			SZ_64M
+ #define HL_PCIE_FW_SRAM_BASE_FULL	0x300007FD7F00000ULL
++#define HL_PCIE_FW_SRAM_SIZE		SZ_64K
+ 
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+diff --git a/arch/gaudi3/common/pcie_phy_fw.mk b/arch/gaudi3/common/pcie_phy_fw.mk
+index 1c284da..56eb447 100644
+--- a/arch/gaudi3/common/pcie_phy_fw.mk
++++ b/arch/gaudi3/common/pcie_phy_fw.mk
+@@ -1,3 +1,2 @@
+-# PHY_FW_SIZE := 0xA500
+-# TODO: optimize phy fw size, do not copy trailing zeroes
+-PHY_FW_SIZE := 0x10000
+\ No newline at end of file
++# size must be 16bytes aligned
++PHY_FW_SIZE := 0xA500
+\ No newline at end of file

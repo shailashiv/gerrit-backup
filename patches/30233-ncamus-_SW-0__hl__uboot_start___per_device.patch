@@ -1,0 +1,64 @@
+From 2f5a597da28f5f0aaeedf2f66757cb8fd56e3e9d Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Wed, 18 Mar 2020 11:54:49 +0200
+Subject: [PATCH] [SW-0] hl: uboot_start() per device
+
+In case run by ARC need to wake ARM from reset so it can execute uboot
+
+Change-Id: I83c3a7f8f445af3ffa842773420dd9801d14c034
+---
+
+diff --git a/app/preboot.c b/app/preboot.c
+index 70b0f02..b281413 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -135,10 +135,15 @@
+ __attribute__((weak)) void preboot_version(void) {}
+ #endif	/* TARGET_IS_TESTER */
+ 
++__attribute__((weak)) void uboot_start(void)
++{
++	void (*uboot_entry)(void) = (void *)UBOOT_TEXT_BASE;
++
++	uboot_entry();
++}
++
+ void preboot_main(void)
+ {
+-	void (*uboot_start)(void) = (void *)UBOOT_TEXT_BASE;
+-
+ 	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
+ 
+ 	/*
+diff --git a/goya2_arc/common.c b/goya2_arc/common.c
+index 21db14d..6ee4280 100644
+--- a/goya2_arc/common.c
++++ b/goya2_arc/common.c
+@@ -12,6 +12,7 @@
+ #include <pcie_wrap_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
++#include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
+ 
+ #include <hl_boot_if.h>
+@@ -222,3 +223,19 @@
+ {
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
++
++void uboot_start(void)
++{
++	unsigned int lsb = 0xf0000000 | UBOOT_TEXT_BASE, msb = 0x7f;
++	/* Set CPU0 Reset address to PREBOOT */
++	regmap_writel(lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_0);
++	regmap_writel(msb, mmCPU_CA53_CFG_RST_ADDR_MSB_0);
++
++	/* Wake up CPU0, after we put all CPUs in reset */
++	regmap_writel(0x0, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++
++	/* Main Loop */
++	while (1)
++		;
++}

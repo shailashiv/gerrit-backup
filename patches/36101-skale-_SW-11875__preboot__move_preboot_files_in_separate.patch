@@ -1,0 +1,3823 @@
+From 71bc43410663d3c25376d6c017cea48c7ba0d945 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 31 May 2020 10:53:00 +0300
+Subject: [PATCH] [SW-11875] preboot: move preboot files in separate directory
+
+This patch adds changes to move files used only by preboot to preboot
+directory.
+
+The idea here to compile preboot only with the files preboot binary
+uses. In order to achieve that, files in common folders are segregated
+where files used by preboot only are moved to preboot folder and files
+used by both preboot and ppboot are kept in common folder. This helps
+to add single entries in Makefile instead of individual files. Along
+with this, preboot files under app folder are also moved in preboot
+directory.
+
+Makefile changes are done to accommodate above changes. Also
+change is made to copy all binaries in bin directory.
+
+Change-Id: I30238c13ea9e5b525aa5faae0e4a890d24fa909c
+---
+
+diff --git a/Makefile b/Makefile
+index e8678fa..e83054e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,31 +28,35 @@
+ 
+ include $(HL_DEV)/Makefile
+ 
++PREBOOT_SRCS_C += $(shell ls preboot/*.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+-PREBOOT_APP_S := $(shell ls app/crt0_preboot.S)
+-PREBOOT_APP_C := $(shell ls app/preboot.c)
++PREBOOT_APP_S := $(shell ls preboot/crt0_preboot.S)
+ PPBOOT_APP_S := $(shell ls app/crt0_ppboot.S)
+ PPBOOT_APP_C := $(shell ls app/ppboot.c)
+ 
+ PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+ PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
+-PREBOOT_OBJECTS += $(PREBOOT_APP_C:.c=.o)
+ PPBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+ PPBOOT_OBJECTS += $(PPBOOT_APP_S:.S=.o)
+ PPBOOT_OBJECTS += $(PPBOOT_APP_C:.c=.o)
+ AUTO_GENERATED_FILE := auto_generated.h
+ 
+-all: ppboot.bin preboot.bin pcie_phy_fw.bin buildversion-habanalabs
++BINDIR = bin
++PPBOOT_TARGET = $(BINDIR)/ppboot.bin
++PREBOOT_TARGET = $(BINDIR)/preboot.bin
++PCI_PHY_FW_TARGET = $(BINDIR)/pcie_phy_fw.bin
+ 
+-%.bin: %
+-	$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
++all: bin $(PPBOOT_TARGET) $(PREBOOT_TARGET) $(PCI_PHY_FW_TARGET) buildversion-habanalabs
++
++$(BINDIR)/%.bin: %
++	$(OBJCOPY) -O binary -R .note.gnu.build-id $(BINDIR)/$< $@
+ 
+ preboot: $(PREBOOT_OBJECTS) $(PREBOOT_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PREBOOT_OBJECTS) $(PREBOOT_LDLIBS) -Wl,--end-group
++	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $(BINDIR)/$@ -Wl,--start-group $(PREBOOT_OBJECTS) $(PREBOOT_LDLIBS) -Wl,--end-group
+ 
+ ppboot: $(PPBOOT_OBJECTS) $(PPBOOT_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(PPBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PPBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
++	@$(CC) $(LDFLAGS) -T $(PPBOOT_LD_SCRIPT) -o $(BINDIR)/$@ -Wl,--start-group $(PPBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
+ 
+ $(AUTO_GENERATED_FILE): localversion-habanalabs $(PREBOOT_SRCS_C) $(PREBOOT_SRCS_S)
+ 	@( printf '#define PREBOOT_VER "%s"\n' '$(shell cut -d- -f2- localversion-habanalabs)' ) > $@
+@@ -62,12 +66,15 @@
+ buildversion-habanalabs: include/preboot.h $(AUTO_GENERATED_FILE)
+ 	echo "VERSION_STR" | gcc -include $< $(CFLAGS) -P -E -o - - | tail -1 | sed 's/\" \+\"//g;s/["\n]//g' | cut -d' ' -f2- | tr -d '\n' > $@
+ 
+-pcie_phy_fw.bin: $(HL_DEV)/pcie_phy_fw.i
++$(PCI_PHY_FW_TARGET): $(HL_DEV)/pcie_phy_fw.i
+ 	@cut -d' ' -f2- $< | xxd -r -p | dd status=none bs=16 count=$$(($(FW_SIZE) / 16)) conv=sync,swab of=$@
+ 
+ $(HL_DEV)/pcie_phy_fw.i: $(HL_DEV)/pcie_phy_fw.hex
+ 	@$(CC) -x c -E -P -nostdinc -o $@ $<
+ 
++bin:
++	@mkdir -p $@
++
+ %.lds: %.lds.S
+ 	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
+ 
+diff --git a/app/crt0_preboot.S b/app/crt0_preboot.S
+deleted file mode 100644
+index f2608b1..0000000
+--- a/app/crt0_preboot.S
++++ /dev/null
+@@ -1,46 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-/*
+- * This is preboot entry point
+- * Setting sp/fp/lr and jumping to C code
+- */
+-.globl	_start
+-_start:
+-
+-#ifdef __arc__
+-/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
+-.global	lf2flt
+-lf2flt:
+-
+-	mov	sp, __stack_top
+-	mov	fp, sp
+-
+-/* Clear BSS */
+-	mov	r5, __bss_start
+-	sub	r6, __bss_end, r5
+-	lsr.f	lp_count, r6, 2
+-	lpnz	1f
+-	st.ab   0, [r5, 4]
+-1:
+-#endif
+-
+-#ifdef __aarch64__
+-	ldr	x0, =__stack_top
+-	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
+-	mov	x29, sp		/* Set FP (x29) */
+-
+-/* Clear BSS */
+-	ldr	x0, =__bss_start
+-	ldr	x1, =__bss_end
+-clear_loop:
+-	str	xzr, [x0], #8
+-	cmp	x0, x1
+-	b.lo	clear_loop
+-#endif
+-
+-	bl	preboot_main	/* Set LR (x30) */
+diff --git a/app/preboot.c b/app/preboot.c
+deleted file mode 100644
+index ff9b443..0000000
+--- a/app/preboot.c
++++ /dev/null
+@@ -1,173 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * (C) Copyright 2017-2020 HabanaLabs, Ltd.
+- * All rights reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-
+-#include <psoc_global_conf_regs.h>
+-
+-#include <preboot.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_if.h>
+-
+-#include "common.h"
+-#include "uart.h"
+-#include "pll.h"
+-#include "boot_if.h"
+-#include "cmd_module.h"
+-
+-static struct cmd_module_ops cmd_ops[] = {
+-	{	/* PCI module */
+-		.setup = module_pci_setup,
+-		.check = module_pci_check,
+-		.disable = noop,
+-		.run = noop,
+-		.enable = noop,
+-		.run_fast = module_pci_run,
+-		.teardown = noop,
+-		.run_noreturn = noop,
+-	},
+-	{	/* FW UPD module */
+-		.setup = module_fwupd_setup,
+-		.check = module_fwupd_check,
+-		.disable = noop,
+-		.run = noop,
+-		.enable = noop,
+-		.run_fast = module_fwupd_run,
+-		.teardown = noop,
+-		.run_noreturn = noop,
+-	},
+-	{	/* LKD module */
+-		.setup = module_lkd_setup,
+-		.check = module_lkd_check,
+-		.disable = module_lkd_disable,
+-		.run = module_lkd_run,
+-		.enable = module_lkd_setup,
+-		.run_fast = noop,
+-		.teardown = module_lkd_disable,
+-		.run_noreturn = module_lkd_run_noret,
+-	},
+-	{	/* UART module */
+-		.setup = noop,
+-		.check = module_uart_check,
+-		.disable = noop,
+-		.run = noop,
+-		.enable = noop,
+-		.run_fast = module_uart_run,
+-		.teardown = noop,
+-		.run_noreturn = noop,
+-	},
+-	{	/* I2C SLAVE module */
+-		.setup = module_i2c_s_setup,
+-		.check = module_i2c_s_check,
+-		.disable = module_i2c_s_disable,
+-		.run = noop,
+-		.enable = module_i2c_s_setup,
+-		.run_fast = module_i2c_s_run_fast,
+-		.teardown = module_i2c_s_disable,
+-		.run_noreturn = noop,
+-	},
+-};
+-
+-static void preboot_handle_cmds(void)
+-{
+-	int i = 0, j = 0, size = ARRAY_SIZE(cmd_ops);
+-	enum cmd_check_res res = NOT_FOUND;
+-
+-	for (j = 0; j < size; j++)
+-		cmd_ops[j].setup();
+-
+-	preboot_puts("Waiting for commands...\n");
+-	i = 0;
+-	while (1) {
+-		res = cmd_ops[i].check();
+-		switch (res) {
+-		case NOT_FOUND:
+-			break;
+-		case FOUND_FAST_RETURN:
+-			cmd_ops[i].run_fast();
+-			break;
+-		case FOUND_SLOW_RETURN:
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].disable();
+-
+-			cmd_ops[i].run();
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].enable();
+-
+-			break;
+-		case FOUND_NO_RETURN:
+-			for (j = 0; j < size; j++)
+-				if (i != j)
+-					cmd_ops[j].teardown();
+-
+-			cmd_ops[i].run_noreturn();
+-			break;
+-		default:
+-			break;
+-		}
+-
+-		if (++i == size)
+-			i = 0;
+-	}
+-}
+-
+-static const char *preboot_ver_str = "Preboot " VERSION_STR;
+-static char preboot_btl_ver_str[VERSION_MAX_LEN] = "BTL version ";
+-
+-static void preboot_version(void)
+-{
+-	unsigned long offset = (unsigned long) preboot_btl_ver_str;
+-	u32 btlver = regmap_readl(mmPREBOOT_VER_OFFSET);
+-	int i, btl_ver_sz;
+-
+-	preboot_puts("\n");
+-	preboot_puts_raw(preboot_btl_ver_str);
+-	preboot_puth(btlver, true);
+-	preboot_puts_raw(preboot_ver_str);
+-	preboot_puts("\n");
+-
+-	/* get to the end of the predefined btl string */
+-	for (i = 0; i < VERSION_MAX_LEN; i++)
+-		if (preboot_btl_ver_str[i] == '\0')
+-			break;
+-
+-	/* convert and copy the btl version */
+-	i += preboot_uint2hexstring(&preboot_btl_ver_str[i], btlver, true);
+-
+-	/* separate the btl from preboot */
+-	preboot_btl_ver_str[i++] = '\n';
+-	btl_ver_sz = i;
+-
+-	/* copy the preboot version */
+-	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
+-		preboot_btl_ver_str[i++] = preboot_ver_str[j];
+-		if (preboot_ver_str[j] == '\0')
+-			break;
+-	}
+-
+-	regmap_writel((u32)(offset & ~SDRAM_BASE), mmPREBOOT_VER_OFFSET);
+-}
+-
+-void preboot_main(void)
+-{
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+-	/* Enable the errors communication */
+-	cpu_boot_err_clrset(CPU_BOOT_ERR0_ENABLED, true);
+-
+-	/*
+-	 * Note: we assume CPU frequency is not changed while CPU is running,
+-	 * so the udelay init is done once before we start.
+-	 */
+-	udelay_init();
+-
+-	hl_uart_init();
+-	hl_ts_init();
+-	preboot_version();
+-	preboot_handle_cmds();
+-}
+diff --git a/common/boot_if.c b/common/boot_if.c
+deleted file mode 100644
+index 6d848ace..0000000
+--- a/common/boot_if.c
++++ /dev/null
+@@ -1,52 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <stdbool.h>
+-
+-#include <psoc_global_conf_regs.h>
+-
+-#include <hl_boot_if.h>
+-#include <preboot.h>
+-
+-/*
+- * The cpu_boot_cmd_clr_before_wfe() function should NOT be used in general as
+- * the LKD message register should be written by LKD solely.
+- *
+- * There is only one special case when this function can be used is only when
+- * the LKD performs hard reset, which may mean the H/W is not reliable and
+- * writing to PCI might not complete and result in the register not cleared.
+- * So to be on the safe side, when receiving the WFE, clear the message register
+- */
+-void cpu_boot_cmd_clr_before_wfe(void)
+-{
+-	regmap_writel(KMD_MSG_NA, mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
+-}
+-
+-enum kmd_msg cpu_boot_cmd_get(void)
+-{
+-	return regmap_readl(mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
+-}
+-
+-void cpu_boot_sts_set(u32 val)
+-{
+-	regmap_writel(val, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
+-}
+-
+-/* We support only ERR0 for now */
+-void cpu_boot_err_clrset(u32 mask, bool set)
+-{
+-	u32 val = regmap_readl(mmCPU_BOOT_ERR0) & ~mask;
+-
+-	if (set)
+-		val |= mask;
+-
+-	regmap_writel(val, mmCPU_BOOT_ERR0);
+-}
+-
+-void cpu_boot_rsp_set(enum cpu_msg_status sts)
+-{
+-	regmap_writel(sts, mmCPU_CMD_STATUS_TO_HOST);
+-}
+diff --git a/common/boot_if.h b/common/boot_if.h
+deleted file mode 100644
+index e0f54c0..0000000
+--- a/common/boot_if.h
++++ /dev/null
+@@ -1,18 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0+ */
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#ifndef _HL_BOOT_IF_H_
+-#define _HL_BOOT_IF_H_
+-
+-#include <hl_boot_if.h>
+-
+-enum kmd_msg cpu_boot_cmd_get(void);
+-void cpu_boot_cmd_clr_before_wfe(void);
+-void cpu_boot_sts_set(u32 val);
+-void cpu_boot_err_clrset(u32 mask, bool set);
+-void cpu_boot_rsp_set(enum cpu_msg_status sts);
+-
+-#endif /* _HL_BOOT_IF_H_ */
+diff --git a/common/fit.c b/common/fit.c
+deleted file mode 100644
+index d3588c8..0000000
+--- a/common/fit.c
++++ /dev/null
+@@ -1,299 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include <libfdt.h>
+-#include "common.h"
+-#include "uart.h"
+-#include "fit.h"
+-#include "fit_rsa.h"
+-
+-
+-#define FIT_IMAGES_PATH		"/images"
+-#define FIT_CONFS_PATH		"/configurations"
+-
+-#define FIT_CONF_NAME		"preboot-conf"
+-#define FIT_DESC_PROP		"description"
+-#define FIT_LOADABLE_PROP	"loadables"
+-#define FIT_DATA_PROP		"data"
+-#define FIT_LOADADDR_PROP	"loadaddr"
+-
+-#define FIT_SIG_NODENAME	"signature"
+-#define FIT_VALUE_PROP		"value"
+-#define FIT_ALGO_PROP		"algo"
+-#define FIT_KEY_NAME_HINT	"key-name-hint"
+-#define FIT_HL_PUBKEY_LEN_PROP  "hl-pub-key-len"
+-
+-#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+-
+-__attribute__((weak)) int fit_need_image_verification(void)
+-{
+-	return 0;
+-}
+-
+-static const char *fit_loadables_name(const void *fit, int noffset, int id)
+-{
+-	return fdt_stringlist_get(fit, noffset, FIT_LOADABLE_PROP, id, NULL);
+-}
+-
+-static int fit_find_config_node(const void *fit)
+-{
+-	int conf, node;
+-	int dflt_conf_node = -1;
+-
+-	conf = fdt_path_offset(fit, FIT_CONFS_PATH);
+-	if (conf < 0) {
+-		preboot_puts("Cannot find configuration node\n");
+-		return -1;
+-	}
+-
+-	for (node = fdt_first_subnode(fit, conf); node >= 0; node = fdt_next_subnode(fit, node)) {
+-		const char *node_name = fdt_get_name(fit, node, NULL);
+-
+-		if (strcmp(FIT_CONF_NAME, node_name) == 0) {
+-			dflt_conf_node = node;
+-			break;
+-		}
+-	}
+-
+-	return dflt_conf_node;
+-}
+-
+-static int fit_loadables_node_get(const void *fit, int id)
+-{
+-	int images, conf = fit_find_config_node(fit);
+-	const char *uname = fit_loadables_name(fit, conf, id);
+-
+-	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
+-	return fdt_subnode_offset(fit, images, uname);
+-}
+-
+-int fit_check_format(const void *fit)
+-{
+-	if (fdt_check_header(fit)) {
+-		preboot_puts("FIT header check failed\n");
+-		return 0;
+-	}
+-
+-	/* mandatory / node 'description' property */
+-	if (fdt_getprop(fit, 0, FIT_DESC_PROP, NULL) == NULL) {
+-		preboot_puts("Wrong FIT format: no description\n");
+-		return 0;
+-	}
+-
+-	/* mandatory subimages parent '/images' node */
+-	if (fdt_path_offset(fit, FIT_IMAGES_PATH) < 0) {
+-		preboot_puts("Wrong FIT format: no images parent node\n");
+-		return 0;
+-	}
+-
+-	return 1;
+-}
+-
+-static int fit_get_int(const void *fit, int node, const char *prop_name,
+-		       int default_val)
+-{
+-	const int *cell;
+-	int len;
+-
+-	cell = fdt_getprop(fit, node, prop_name, &len);
+-	if (cell && len >= sizeof(int))
+-		return fdt32_to_cpu(cell[0]);
+-
+-	return default_val;
+-}
+-
+-static int get_algo_prop(const void *fit, int noffset, const u8 **algo_prop)
+-{
+-	int algo_prop_len;
+-
+-	*algo_prop = fdt_getprop(fit, noffset, FIT_ALGO_PROP, &algo_prop_len);
+-	if (!(*algo_prop)) {
+-		preboot_puts("Wrong FIT format: algo property\n");
+-		return 1;
+-	}
+-	if (algo_prop_len != sizeof(FIT_ALGO_PROP_EXPECTED_VALUE)) {
+-		preboot_puts("Wrong FIT format: algo len\n");
+-		return 1;
+-	}
+-	if (memcmp((char *)*algo_prop, FIT_ALGO_PROP_EXPECTED_VALUE,
+-			sizeof(FIT_ALGO_PROP_EXPECTED_VALUE))) {
+-		preboot_puts("Wrong FIT format: hash-algo not supported\n");
+-		preboot_puts((char *)algo_prop);
+-		preboot_puts("\n");
+-		return 1;
+-	}
+-	return 0;
+-}
+-
+-static int get_sig_hash(const void *fit, int noffset, const u8 **hash_value,
+-			int *hash_value_len)
+-{
+-	*hash_value = fdt_getprop(fit, noffset, FIT_VALUE_PROP, hash_value_len);
+-	if (!(*hash_value)) {
+-		preboot_puts("Wrong FIT format: missing sig hash value\n");
+-		return 1;
+-	}
+-	return 0;
+-}
+-
+-static int get_key_name(const void *fit, int noffset, const char **key_name)
+-{
+-	int key_name_len;
+-
+-	*key_name = fdt_getprop(fit, noffset, FIT_KEY_NAME_HINT, &key_name_len);
+-	if (!(*key_name)) {
+-		preboot_puts("Wrong FIT format: key name\n");
+-		return 1;
+-	}
+-	return 0;
+-}
+-
+-static int get_pub_key_node(const void *pub_key_fit, const char *key_name)
+-{
+-	int sig_node;
+-	char key_node_name[64] = "key-";
+-
+-	memcpy(key_node_name+strlen(key_node_name), key_name, strlen(key_name));
+-
+-	sig_node = fdt_subnode_offset(pub_key_fit, 0, FIT_SIG_NODENAME);
+-
+-	return fdt_subnode_offset(pub_key_fit, sig_node, key_node_name);
+-}
+-
+-static int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
+-			    struct rsa_key_prop *prop)
+-{
+-	int pub_key_node = 0;
+-	int length;
+-
+-	if (fdt_check_header(pub_key_fit)) {
+-		preboot_puts("FITkey header check failed\n");
+-		return 1;
+-	}
+-	pub_key_node = get_pub_key_node(pub_key_fit, key_name);
+-	if (pub_key_node < 0) {
+-		preboot_puts("Wrong FITkey format: no key node\n");
+-		return 1;
+-	}
+-	prop->num_bits =
+-		fit_get_int(pub_key_fit, pub_key_node, "rsa,num-bits", 0);
+-	prop->n0inv =
+-		fit_get_int(pub_key_fit, pub_key_node, "rsa,n0-inverse", 0);
+-	prop->public_exponent =
+-		fdt_getprop(pub_key_fit, pub_key_node, "rsa,exponent", &length);
+-	if (!prop->public_exponent || length < sizeof(uint64_t))
+-		prop->public_exponent = NULL;
+-	prop->modulus =
+-		fdt_getprop(pub_key_fit, pub_key_node, "rsa,modulus", NULL);
+-	prop->rr =
+-		fdt_getprop(pub_key_fit, pub_key_node, "rsa,r-squared", NULL);
+-
+-	if (!prop->num_bits || !prop->modulus) {
+-		preboot_puts("FIT: missing RSA Key\n");
+-		return 1;
+-	}
+-
+-	return 0;
+-}
+-
+-/* based on :
+- * int fit_config_check_sig(const void *fit, int noffset, int required_keynode,
+- * char **err_msgp)
+- * from u-boot: u-boot/common/image-sig.c
+- */
+-int fit_check_sig(const void *fit, int noffset, const u8 *data, int data_len,
+-		  int pub_key_len)
+-{
+-	const u8 *algo_prop = NULL;
+-	const u8 *hash_value = NULL;
+-	const char *key_name = NULL;
+-	const void *pub_key_fit = NULL;
+-	int hash_len = 0;
+-	struct rsa_key_prop prop;
+-
+-	if (get_algo_prop(fit, noffset, &algo_prop))
+-		return 1;
+-
+-	if (get_sig_hash(fit, noffset, &hash_value, &hash_len))
+-		return 1;
+-
+-	if (get_key_name(fit, noffset, &key_name))
+-		return 1;
+-
+-	pub_key_fit = data + data_len - pub_key_len;
+-	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
+-		return 1;
+-
+-	return rsa_verify(data, data_len, hash_value, hash_len, &prop);
+-}
+-
+-int fit_verify_image(const void *fit, int node, const u8 *buf, int *len)
+-{
+-	int sig_sub_node;
+-	int pub_key_len;
+-	int buf_len = *len;
+-	int ret = 1;
+-
+-	sig_sub_node = fdt_subnode_offset(fit, node, FIT_SIG_NODENAME);
+-	if (sig_sub_node < 0) {
+-		preboot_puts("Wrong FIT format: missing signature\n");
+-		return 1;
+-	}
+-
+-	pub_key_len = fit_get_int(fit, 0, FIT_HL_PUBKEY_LEN_PROP, 0);
+-	if (pub_key_len == 0) {
+-		preboot_puts("Wrong FIT format: public key length invalid\n");
+-		return 1;
+-	}
+-	if (!fit_check_sig(fit, sig_sub_node, buf, buf_len, pub_key_len)) {
+-		preboot_puts("fit_check_sig OK\n");
+-		ret = 0;
+-	} else {
+-		preboot_puts("fit_check_sig failed\n");
+-		ret = 1;
+-	}
+-	*len = *len - pub_key_len;
+-	return ret;
+-}
+-
+-int fit_load_image(const void *fit, u64 *dest)
+-{
+-	int node, len, copy_image = 1;
+-	const u8 *buf;
+-	const u32 *loadaddr;
+-	u64 dst = 0;
+-
+-	node = fit_loadables_node_get(fit, 0);
+-	if (node < 0) {
+-		preboot_puts("Wrong FIT format: no loadable image node\n");
+-		return 1;
+-	}
+-
+-	loadaddr = fdt_getprop(fit, node, FIT_LOADADDR_PROP, &len);
+-	if (!loadaddr || len != sizeof(u64)) {
+-		preboot_puts("Wrong FIT format: no image loadaddr\n");
+-		return 1;
+-	}
+-
+-	dst = ((u64)fdt32_to_cpu(loadaddr[0])) << 32;
+-	dst |= fdt32_to_cpu(loadaddr[1]);
+-
+-	buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
+-	if (!buf) {
+-		preboot_puts("Wrong FIT format: image data empty\n");
+-		return 1;
+-	}
+-
+-	if (fit_need_image_verification())
+-		copy_image = !fit_verify_image(fit, node, buf, &len);
+-
+-	if (copy_image) {
+-		fit_copy_image(dst, buf, len);
+-		*dest = dst;
+-	}
+-	return 0;
+-}
+diff --git a/common/fit.h b/common/fit.h
+deleted file mode 100644
+index ed9919a..0000000
+--- a/common/fit.h
++++ /dev/null
+@@ -1,15 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#ifndef _HL_FIT_H_
+-#define _HL_FIT_H_
+-
+-int fit_load_image(const void *fit, u64 *dest);
+-int fit_check_format(const void *fit);
+-void fit_copy_image(u64 dst, const void *buf, int len);
+-
+-#endif /* _HL_FIT_H_ */
+diff --git a/common/fit_rsa.c b/common/fit_rsa.c
+deleted file mode 100644
+index dcc199d..0000000
+--- a/common/fit_rsa.c
++++ /dev/null
+@@ -1,352 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- */
+-
+-#include <libfdt.h>
+-#include "common.h"
+-#include "sha256.h"
+-#include "uart.h"
+-#include "fit_rsa.h"
+-
+-struct rsa_public_key {
+-	u32 len;	/* len of modulus[] in number of u32 */
+-	u32 n0inv;	/* -1 / modulus[0] mod 2^32 */
+-	u32 *modulus;	/* modulus as little endian array */
+-	u32 *rr;	/* R^2 as little endian array */
+-	u64 exponent;	/* public exponent */
+-};
+-
+-#define CHECKSUM_LENGTH		(SHA256_SUM_LEN)
+-#define CHECKSUM_DER_LENGTH	(SHA256_DER_LEN)
+-#define CHECKSUM_DER_PREFIX	(sha256_der_prefix)
+-
+-
+-#define RSA4096_BITS		(4096)
+-#define RSA4096_BYTES		(RSA4096_BITS / 8)
+-#define RSA3072_BITS		(3072)
+-#define RSA3072_BYTES		(RSA3072_BITS / 8)
+-#define CRYPTO_RSA_LENGTH	(RSA3072_BYTES)
+-#define RSA_DEFAULT_PUBEXP	(65537)
+-
+-#if (CHECKSUM_LENGTH > CRYPTO_RSA_LENGTH)
+-#error "CHECKSUM_LENGTH > CRYPTO_RSA_LENGTH"
+-#endif
+-
+-#define get_unaligned_be32(a) fdt32_to_cpu(*(u32 *)a)
+-#define put_unaligned_be32(a, b) (*(u32 *)(b) = cpu_to_fdt32(a))
+-
+-
+-/**
+- * is_public_exponent_bit_set() - Check if a bit in the public exponent is set
+- *
+- * @key:	RSA key
+- * @pos:	The bit position to check
+- */
+-static int is_public_exponent_bit_set(const struct rsa_public_key *key,
+-				      int pos)
+-{
+-	return key->exponent & (1ULL << pos);
+-}
+-
+-/**
+- * subtract_modulus() - subtract modulus from the given value
+- *
+- * @key:	Key containing modulus to subtract
+- * @num:	Number to subtract modulus from, as little endian word array
+- */
+-static void subtract_modulus(const struct rsa_public_key *key, u32 num[])
+-{
+-	long long acc = 0;
+-	u32 i;
+-
+-	for (i = 0; i < key->len; i++) {
+-		acc += (u64)num[i] - key->modulus[i];
+-		num[i] = (u32)acc;
+-		acc >>= 32;
+-	}
+-}
+-
+-
+-/**
+- * greater_equal_modulus() - check if a value is >= modulus
+- *
+- * @key:	Key containing modulus to check
+- * @num:	Number to check against modulus, as little endian word array
+- * @return 0 if num < modulus, 1 if num >= modulus
+- */
+-static int greater_equal_modulus(const struct rsa_public_key *key,
+-				 u32 num[])
+-{
+-	int i;
+-
+-	for (i = (int)key->len - 1; i >= 0; i--) {
+-		if (num[i] < key->modulus[i])
+-			return 0;
+-		if (num[i] > key->modulus[i])
+-			return 1;
+-	}
+-
+-	return 1;	/* equal */
+-}
+-
+-/**
+- * num_pub_exponent_bits() - Number of bits in the public exponent
+- *
+- * @key:	RSA key
+- * @num_bits:	Storage for the number of public exponent bits
+- */
+-static int num_public_exponent_bits(const struct rsa_public_key *key,
+-				    int *num_bits)
+-{
+-	u64 exponent;
+-	int exponent_bits;
+-	const u32 max_bits = (sizeof(exponent) * 8);
+-
+-	exponent = key->exponent;
+-	exponent_bits = 0;
+-
+-	if (!exponent) {
+-		*num_bits = exponent_bits;
+-		return 0;
+-	}
+-
+-	for (exponent_bits = 1; exponent_bits < max_bits + 1; ++exponent_bits)
+-		if (!(exponent >>= 1)) {
+-			*num_bits = exponent_bits;
+-			return 0;
+-		}
+-
+-	return 1;
+-}
+-
+-/**
+- * montgomery_mul_add_step() - Perform montgomery multiply-add step
+- *
+- * Operation: montgomery result[] += a * b[] / n0inv % modulus
+- *
+- * @key:	RSA key
+- * @result:	Place to put result, as little endian word array
+- * @a:		Multiplier
+- * @b:		Multiplicand, as little endian word array
+- */
+-static void montgomery_mul_add_step(const struct rsa_public_key *key,
+-				    u32 result[], const u32 a, const u32 b[])
+-{
+-	u64 acc_a, acc_b;
+-	u32 d0;
+-	u32 i;
+-
+-	acc_a = (u64)a * b[0] + result[0];
+-	d0 = (u32)acc_a * key->n0inv;
+-	acc_b = (u64)d0 * key->modulus[0] + (u32)acc_a;
+-	for (i = 1; i < key->len; i++) {
+-		acc_a = (acc_a >> 32) + (u64)a * b[i] + result[i];
+-		acc_b = (acc_b >> 32) + (u64)d0 * key->modulus[i] +
+-				(u32)acc_a;
+-		result[i - 1] = (u32)acc_b;
+-	}
+-
+-	acc_a = (acc_a >> 32) + (acc_b >> 32);
+-
+-	result[i - 1] = (u32)acc_a;
+-
+-	if (acc_a >> 32)
+-		subtract_modulus(key, result);
+-}
+-
+-/**
+- * montgomery_mul() - Perform montgomery mutitply
+- *
+- * Operation: montgomery result[] = a[] * b[] / n0inv % modulus
+- *
+- * @key:	RSA key
+- * @result:	Place to put result, as little endian word array
+- * @a:		Multiplier, as little endian word array
+- * @b:		Multiplicand, as little endian word array
+- */
+-static void montgomery_mul(const struct rsa_public_key *key,
+-			   u32 result[], u32 a[], const u32 b[])
+-{
+-	u32 i;
+-
+-	for (i = 0; i < key->len; ++i)
+-		result[i] = 0;
+-	for (i = 0; i < key->len; ++i)
+-		montgomery_mul_add_step(key, result, a[i], b);
+-}
+-
+-static int pow_mod(const struct rsa_public_key *key, u32 *out, u32 *in)
+-{
+-	u32 *result, *ptr;
+-	u32 i;
+-	int j, k;
+-
+-	u32 val[key->len], acc[key->len], tmp[key->len];
+-	u32 a_scaled[key->len];
+-
+-	result = tmp;	/* Re-use location. */
+-
+-	/* Convert from big endian byte array to little endian word array. */
+-	for (i = 0, ptr = in + key->len - 1; i < key->len; i++, ptr--)
+-		val[i] = get_unaligned_be32(ptr);
+-
+-	if (num_public_exponent_bits(key, &k) != 0) {
+-		preboot_puts("num_public_exponent_bits failed!\n");
+-		return 1;
+-	}
+-
+-	if (k < 2) {
+-		preboot_puts("Public exponent is too short\n");
+-		return 1;
+-	}
+-
+-	if (!is_public_exponent_bit_set(key, 0)) {
+-		preboot_puts("LSB of RSA public exponent must be set.\n");
+-		return 1;
+-	}
+-
+-	/* the bit at e[k-1] is 1 by definition, so start with: C := M */
+-	montgomery_mul(key, acc, val, key->rr); /* acc = a * RR / R mod n */
+-	/* retain scaled version for intermediate use */
+-	memcpy(a_scaled, acc, key->len * sizeof(a_scaled[0]));
+-
+-	for (j = k - 2; j > 0; --j) {
+-		montgomery_mul(key, tmp, acc, acc); /* tmp = acc^2 / R mod n */
+-
+-		if (is_public_exponent_bit_set(key, j)) {
+-			/* acc = tmp * val / R mod n */
+-			montgomery_mul(key, acc, tmp, a_scaled);
+-		} else {
+-			/* e[j] == 0, copy tmp back to acc for next operation */
+-			memcpy(acc, tmp, key->len * sizeof(acc[0]));
+-		}
+-	}
+-
+-	/* the bit at e[0] is always 1 */
+-	montgomery_mul(key, tmp, acc, acc); /* tmp = acc^2 / R mod n */
+-	montgomery_mul(key, acc, tmp, val); /* acc = tmp * a / R mod M */
+-	memcpy(result, acc, key->len * sizeof(result[0]));
+-
+-	/* Make sure result < mod; result is at most 1x mod too large. */
+-	if (greater_equal_modulus(key, result))
+-		subtract_modulus(key, result);
+-
+-	/* Convert to bigendian byte array */
+-	for (i = key->len - 1, ptr = out; (int)i >= 0; i--, ptr++)
+-		put_unaligned_be32(result[i], ptr);
+-	return 0;
+-}
+-
+-static void rsa_convert_big_endian(u32 *dst, const u32 *src, int len)
+-{
+-	int i;
+-
+-	for (i = 0; i < len; i++)
+-		dst[i] = fdt32_to_cpu(src[len - 1 - i]);
+-}
+-
+-int rsa_mod_exp_sw(const u8 *sig, struct rsa_key_prop *prop, u32 *out)
+-{
+-	struct rsa_public_key key;
+-	int ret;
+-
+-	key.n0inv = prop->n0inv;
+-	key.len = prop->num_bits / (sizeof(u32) * 8);
+-	if (prop->public_exponent)
+-		key.exponent = fdt64_to_cpu(*(prop->public_exponent));
+-	else
+-		key.exponent = RSA_DEFAULT_PUBEXP;
+-
+-	u32 key1[key.len], key2[key.len];
+-
+-	key.modulus = key1;
+-	key.rr = key2;
+-
+-	rsa_convert_big_endian(key.modulus, (u32 *)prop->modulus, key.len);
+-	rsa_convert_big_endian(key.rr, (u32 *)prop->rr, key.len);
+-
+-	ret = pow_mod(&key, out, (u32 *)sig);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
+-}
+-
+-static int rsa_verify_padding(const u8 *msg, const int pad_len)
+-{
+-	int ff_len;
+-	int ret;
+-
+-	/* first byte must be 0x00 */
+-	ret = *msg++;
+-	/* second byte must be 0x01 */
+-	ret |= *msg++ ^ 0x01;
+-	/* next ff_len bytes must be 0xff */
+-	ff_len = pad_len - CHECKSUM_DER_LENGTH - 3;
+-	ret |= *msg ^ 0xff;
+-	ret |= memcmp(msg, msg+1, ff_len-1);
+-	msg += ff_len;
+-	/* next byte must be 0x00 */
+-	ret |= *msg++;
+-	/* next der_len bytes must match der_prefix */
+-	ret |= memcmp(msg, CHECKSUM_DER_PREFIX, CHECKSUM_DER_LENGTH);
+-
+-	return ret;
+-}
+-
+-int padding_pkcs_15_verify(u8 *msg, int msg_len, const u8 *hash)
+-{
+-	int pad_len = msg_len - CHECKSUM_LENGTH;
+-
+-	if (rsa_verify_padding(msg, pad_len)) {
+-		preboot_puts("RSAVerify(): rsa_verify_padding failed!\n");
+-		return 1;
+-	}
+-
+-	/* Check hash. */
+-	if (memcmp((u8 *)msg + pad_len, hash, msg_len - pad_len)) {
+-		preboot_puts("RSAVerify(): Hash check failed!\n");
+-		return 1;
+-	}
+-
+-	return 0;
+-}
+-
+-static int rsa_verify_key(struct rsa_key_prop *prop, const u8 *sig,
+-			  const u32 sig_len, const u8 *hash, const u32 key_len)
+-{
+-	u32 buf[sig_len>>2];
+-
+-	if (rsa_mod_exp_sw(sig, prop, buf)) {
+-		preboot_puts("rsa_mod_exp_sw failed\n");
+-		return 1;
+-	}
+-
+-	if (padding_pkcs_15_verify((u8 *)buf, key_len, hash))
+-		return 1;
+-
+-	return 0;
+-}
+-
+-/* based on int rsa_verify(struct image_sign_info *info,
+- *		const struct image_region region[], int region_count,
+- *		uint8_t *sig, uint sig_len)
+- * from: u-boot/lib/rsa/rsa-verify.c
+- */
+-int rsa_verify(const u8 *data, int data_len, const u8 *sig, u32 sig_len,
+-	       struct rsa_key_prop *prop)
+-{
+-	u8 hash[CRYPTO_RSA_LENGTH];
+-	int ret;
+-
+-	if (sig_len != (prop->num_bits >> 3)) {
+-		preboot_puts("sig_len != (prop->num_bits / 8)\n");
+-		return 1;
+-	}
+-
+-	sha256_csum(data, data_len, hash);
+-
+-	ret = rsa_verify_key(prop, sig, sig_len, hash, CRYPTO_RSA_LENGTH);
+-	return ret;
+-}
+diff --git a/common/fit_rsa.h b/common/fit_rsa.h
+deleted file mode 100644
+index 7dd6c23..0000000
+--- a/common/fit_rsa.h
++++ /dev/null
+@@ -1,21 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- */
+-
+-#ifndef COMMON_FIT_RSA_H_
+-#define COMMON_FIT_RSA_H_
+-
+-struct rsa_key_prop {
+-	const void *rr;			/* R^2 can be treated as byte array */
+-	const void *modulus;		/* modulus as byte array */
+-	const u64 *public_exponent;	/* public exponent as byte array */
+-	u32 n0inv;			/* -1 / modulus[0] mod 2^32 */
+-	int num_bits;			/* Key length in bits */
+-};
+-
+-
+-int rsa_verify(const u8 *data, int data_len,
+-	       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop);
+-
+-#endif /* COMMON_FIT_RSA_H_ */
+diff --git a/common/module_fwupd.c b/common/module_fwupd.c
+deleted file mode 100644
+index 9506d8f..0000000
+--- a/common/module_fwupd.c
++++ /dev/null
+@@ -1,43 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <psoc_global_conf_regs.h>
+-#include <hl_fw_if.h>
+-#include <preboot.h>
+-
+-#include "cmd_module.h"
+-#include "uart.h"
+-
+-void module_fwupd_setup(void)
+-{
+-	struct hl_upd_status status  = { .val = 0 };
+-
+-	status.status = HL_UPD_STS_RST_OK;
+-	regmap_writel(status.val, mmUPD_STS);
+-}
+-
+-enum cmd_check_res module_fwupd_check(void)
+-{
+-	if (regmap_readl(mmUPD_CMD) != HL_UPD_NOOP)
+-		return FOUND_FAST_RETURN;
+-
+-	return NOT_FOUND;
+-}
+-
+-void module_fwupd_run(void)
+-{
+-	struct hl_upd_command cmd;
+-
+-	cmd.val = regmap_readl(mmUPD_CMD);
+-	switch (cmd.cmd) {
+-	case HL_UPD_CLR_STS:
+-		regmap_writel(HL_UPD_STS_NOOP, mmUPD_STS);
+-		preboot_puts("FW UPD CLR STS received\n");
+-		break;
+-	default:
+-		break;
+-	}
+-}
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+deleted file mode 100644
+index 19ad37c..0000000
+--- a/common/module_i2c_slave.c
++++ /dev/null
+@@ -1,245 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-#include <psoc_global_conf_regs.h>
+-#include <psoc_i2c_s_regs.h>
+-#include <psoc_i2c_s_masks.h>
+-#include <hl_fw_if.h>
+-#include <pcie_dbi_regs.h>
+-#include <preboot.h>
+-#include <thermal.h>
+-
+-#include "cmd_module.h"
+-#include "uart.h"
+-#include "common.h"
+-
+-#define HL_DEVICE_STATUS_LINUX		0x0
+-#define HL_DEVICE_STATUS_PREBOOT	0x1
+-
+-#define HL_DEVICE_STATUS_CMD_CODE_LEN		0x1
+-#define HL_PCIE_VENDOR_ID_CMD_CODE_LEN		0x16
+-
+-static unsigned int cmd;
+-static unsigned int read_bytes_count;
+-
+-enum preboot_i2c_slave_event_id {
+-	HL_ASIC_TEMP_CMD_CODE = 0,
+-	HL_ASIC_TEMP_MAX_VAL = 3,
+-	HL_PCIE_VENDOR_ID_VAL_LOW = 9,
+-	HL_PCIE_VENDOR_ID_VAL_HIGH = 10,
+-	HL_DEVICE_STATUS_CMD_CODE = 165,
+-	HL_DEVICE_STATUS = 166,
+-};
+-
+-static void hl_i2c_slave_init(void)
+-{
+-	/* Check if already enabled */
+-	if (regmap_readl(mmPSOC_I2C_S_IC_ENABLE)) {
+-		preboot_puts("I2C SLAVE already initialized\n");
+-		return;
+-	}
+-
+-	/* Program IC_SAR with address to which slave responds */
+-	regmap_writel(I2C_SLAVE_ADDRESS, mmPSOC_I2C_S_IC_SAR);
+-
+-	/* Enable I2C Slave */
+-	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_I2C_SLV);
+-
+-	/* Enable I2C Slave interrupts */
+-	regmap_writel(0x0, mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK);
+-
+-	/* Program IC_CON */
+-	regmap_writel(0x22, mmPSOC_I2C_S_IC_CON);
+-
+-	/* Write to IC_INTR_MASK to enable all interrupts */
+-	regmap_writel(0x7FFF, mmPSOC_I2C_S_IC_INTR_MASK);
+-
+-	/* Write to IC_RX_TL to set Rx FIFO threshold level */
+-	regmap_writel(0x0, mmPSOC_I2C_S_IC_RX_TL);
+-
+-	/* Write to IC_TX_TL to set Tx FIFO threshold level */
+-	regmap_writel(0x7, mmPSOC_I2C_S_IC_TX_TL);
+-
+-	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
+-	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+-
+-	preboot_puts("I2C SLAVE initialized\n");
+-}
+-
+-static u32 i2c_dw_read_clear_intrbits_slave(void)
+-{
+-	u32 stat;
+-
+-	/*
+-	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
+-	 * Ths unmasked raw version of interrupt status bits are available
+-	 * in the IC_RAW_INTR_STAT register.
+-	 *
+-	 * That is,
+-	 *   stat = regmap_readl(IC_INTR_STAT);
+-	 * equals to,
+-	 *   stat = regmap_readl(IC_RAW_INTR_STAT) & regmap_readl(IC_INTR_MASK);
+-	 *
+-	 * The raw version might be useful for debugging purposes.
+-	 */
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/*
+-	 * Do not use the IC_CLR_INTR register to clear interrupts, or
+-	 * you'll miss some interrupts, triggered during the period from
+-	 * regmap_readl(IC_INTR_STAT) to regmap_readl(IC_CLR_INTR).
+-	 *
+-	 * Instead, use the separately-prepared IC_CLR_* registers.
+-	 */
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_ABRT_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_ABRT);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_UNDER_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_OVER_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_OVER);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_OVER_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_OVER);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_DONE_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_DONE);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_ACTIVITY_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_ACTIVITY);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_STOP_DET_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_STOP_DET);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_START_DET_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_START_DET);
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_GEN_CALL_MASK)
+-		regmap_readl(mmPSOC_I2C_S_IC_CLR_GEN_CALL);
+-
+-	return stat;
+-}
+-
+-void module_i2c_s_setup(void)
+-{
+-	hl_i2c_slave_init();
+-}
+-
+-enum cmd_check_res module_i2c_s_check(void)
+-{
+-	enum cmd_check_res res = NOT_FOUND;
+-	unsigned int stat;
+-
+-	i2c_dw_read_clear_intrbits_slave();
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
+-	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)) {
+-		preboot_puts("I2C SLAVE: read request received\n");
+-		res = FOUND_FAST_RETURN;
+-	}
+-
+-	return res;
+-}
+-
+-void module_i2c_s_disable(void)
+-{
+-	unsigned int stat;
+-
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/* Clear requests before disabling */
+-	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
+-
+-	regmap_writel(0x0, mmPSOC_I2C_S_IC_ENABLE);
+-
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	/* Make sure all requests are handled after disable */
+-	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
+-		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+-		module_i2c_s_run_fast();
+-
+-	preboot_puts("I2C SLAVE: disabled\n");
+-}
+-
+-static char i2cslave_pcie_vendor_id_cmd(int command_idx, int bytes_count)
+-{
+-	char ret;
+-	unsigned int data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+-
+-	switch (command_idx + bytes_count) {
+-	case HL_PCIE_VENDOR_ID_VAL_LOW:
+-		data &= 0xFFFF;
+-		ret = (data & 0xFF00) >> 8;
+-		break;
+-	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		data &= 0xFFFF;
+-		ret = data & 0xFF;
+-		break;
+-	default:
+-		ret = 0;
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+-static int i2cslave_handle_read_req(void)
+-{
+-	int max_tmp, ret;
+-
+-	switch (cmd) {
+-	case HL_ASIC_TEMP_CMD_CODE:
+-	case HL_ASIC_TEMP_MAX_VAL:
+-		max_tmp = hl_ts_get_max_temp();
+-		/* Convert from mC to C */
+-		ret = max_tmp / 1000;
+-		break;
+-	case HL_DEVICE_STATUS_CMD_CODE:
+-		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
+-		break;
+-	case HL_DEVICE_STATUS:
+-		ret = HL_DEVICE_STATUS_PREBOOT;
+-		break;
+-	case HL_PCIE_VENDOR_ID_VAL_LOW:
+-	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+-		ret = i2cslave_pcie_vendor_id_cmd(cmd, read_bytes_count);
+-		break;
+-	default:
+-		/* NA */
+-		ret = 0;
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+-void module_i2c_s_run_fast(void)
+-{
+-	unsigned int stat;
+-	int ret;
+-
+-	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
+-
+-	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) {
+-		if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK) {
+-			read_bytes_count = 0;
+-
+-			cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
+-
+-			/* clear read request */
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+-			stat = i2c_dw_read_clear_intrbits_slave();
+-		} else {
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
+-			regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
+-			stat = i2c_dw_read_clear_intrbits_slave();
+-		}
+-
+-		ret = i2cslave_handle_read_req();
+-		read_bytes_count++;
+-		regmap_writel(ret, mmPSOC_I2C_S_IC_DATA_CMD);
+-		preboot_puts("I2C SLAVE: read request processed");
+-	}
+-}
+diff --git a/common/module_lkd.c b/common/module_lkd.c
+deleted file mode 100644
+index f067ad0..0000000
+--- a/common/module_lkd.c
++++ /dev/null
+@@ -1,102 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <hl_boot_if.h>
+-#include <preboot.h>
+-
+-#include "cmd_module.h"
+-#include "uart.h"
+-#include "boot_if.h"
+-#include "fit.h"
+-
+-struct lkd_status {
+-	int fit_not_checked;	/* negative logic */
+-	u32 msg_reg_val;
+-	u64 loadaddr;
+-};
+-
+-static struct lkd_status sts = {
+-	.fit_not_checked = 1,
+-};
+-
+-void module_lkd_setup(void)
+-{
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
+-}
+-
+-enum cmd_check_res module_lkd_check(void)
+-{
+-	enum cmd_check_res res;
+-
+-	/* we already have the FIT and it is good */
+-	if (sts.fit_not_checked != 1)
+-		return FOUND_NO_RETURN;
+-
+-	sts.msg_reg_val = cpu_boot_cmd_get();
+-	switch (sts.msg_reg_val) {
+-	case KMD_MSG_GOTO_WFE:
+-		res = FOUND_NO_RETURN;
+-		/* WFE - we should clear the message/cmd register */
+-		cpu_boot_cmd_clr_before_wfe();
+-		cpu_boot_rsp_set(CPU_MSG_OK);
+-		preboot_puts("LKD WFE received\n");
+-		break;
+-	case KMD_MSG_FIT_RDY:
+-		res = FOUND_SLOW_RETURN;
+-		/* Tell LKD we got the message */
+-		cpu_boot_rsp_set(CPU_MSG_OK);
+-		preboot_puts("LKD FIT RDY received\n");
+-		break;
+-	case KMD_MSG_SKIP_BMC:
+-		cpu_boot_rsp_set(CPU_MSG_ERR);
+-		preboot_puts("LKD SKIP BMC received\n");
+-		/* no break */
+-	default:
+-		res = NOT_FOUND;
+-	}
+-
+-	return res;
+-}
+-
+-void module_lkd_disable(void)
+-{
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+-}
+-
+-void module_lkd_run(void)
+-{
+-	int err;
+-	void *fit = (void *)FIT_IMG_BASE;
+-
+-	err = !fit_check_format(fit);
+-	if (!err)
+-		err = fit_load_image(fit, &sts.loadaddr);
+-
+-	if (err) {/* Report the FIT is bad */
+-		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+-		preboot_puts("FIT loading failed, Retrying...\n");
+-		return;
+-	}
+-
+-	sts.fit_not_checked = 0;
+-	/* Report the FIT is good */
+-	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, false);
+-}
+-
+-void module_lkd_run_noret(void)
+-{
+-	switch (sts.msg_reg_val) {
+-	case KMD_MSG_GOTO_WFE:
+-		cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
+-		wfe();
+-		break;
+-	case KMD_MSG_FIT_RDY:
+-		image_start(sts.loadaddr);
+-		/* no break */
+-	default:
+-		break;
+-	}
+-}
+diff --git a/common/module_pci.c b/common/module_pci.c
+deleted file mode 100644
+index 688bbc2..0000000
+--- a/common/module_pci.c
++++ /dev/null
+@@ -1,62 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <pcie_aux_regs.h>
+-#include <pcie_core_regs.h>
+-
+-#include <preboot.h>
+-
+-#include "cmd_module.h"
+-#include "uart.h"
+-
+-struct pci_status {
+-	u32 flr_reg_val;
+-	u32 hot_rst_reg_val;
+-};
+-
+-static struct pci_status pci_sts = {
+-	.flr_reg_val = ~1,
+-	.hot_rst_reg_val = ~1,
+-};
+-
+-__attribute__((weak)) void pci_dev_specific_setup(void) {}
+-
+-void module_pci_setup(void)
+-{
+-	pci_dev_specific_setup();
+-}
+-
+-__attribute__((weak)) enum cmd_check_res dev_specific_module_pci_check(void)
+-{
+-	pci_sts.flr_reg_val = regmap_readl(mmPCIE_AUX_FLR_INT);
+-	pci_sts.hot_rst_reg_val = regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
+-
+-	if (pci_sts.flr_reg_val == 1 || pci_sts.hot_rst_reg_val == 1)
+-		return FOUND_FAST_RETURN;
+-
+-	return NOT_FOUND;
+-}
+-
+-enum cmd_check_res module_pci_check(void)
+-{
+-	return dev_specific_module_pci_check();
+-}
+-
+-void module_pci_run(void)
+-{
+-	if (pci_sts.flr_reg_val == 1) {
+-		regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
+-		regmap_writel(1, mmPCIE_AUX_FLR_INT);
+-		regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
+-		preboot_puts("FLR received\n");
+-	}
+-
+-	if (pci_sts.hot_rst_reg_val == 1) {
+-		regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+-		regmap_writel(1, mmPCIE_AUX_LTSSM_EN);
+-		preboot_puts("HOT RST received\n");
+-	}
+-}
+diff --git a/common/module_uart.c b/common/module_uart.c
+deleted file mode 100644
+index 16f3259..0000000
+--- a/common/module_uart.c
++++ /dev/null
+@@ -1,32 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright 2016-2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-#include <preboot.h>
+-
+-#include "cmd_module.h"
+-#include "uart.h"
+-
+-enum cmd_check_res module_uart_check(void)
+-{
+-	if (!preboot_uart_tstc())
+-		return NOT_FOUND;
+-
+-	preboot_puts("Keyboard press received\n");
+-
+-	return FOUND_FAST_RETURN;
+-}
+-
+-__attribute__((weak)) void hl_parse_uart(int val) {}
+-
+-void module_uart_run(void)
+-{
+-	int val = preboot_uart_getc();
+-
+-	if (val < 0)
+-		return;
+-
+-	hl_parse_uart(val);
+-}
+diff --git a/common/sha256.c b/common/sha256.c
+deleted file mode 100644
+index 1cfb109..0000000
+--- a/common/sha256.c
++++ /dev/null
+@@ -1,277 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * FIPS-180-2 compliant SHA-256 implementation
+- *
+- * Copyright (C) 2001-2003  Christophe Devine
+- */
+-
+-#include "common.h"
+-#include <string.h>
+-#include "sha256.h"
+-
+-struct sha256_context {
+-	u32 total[2];
+-	u32 state[8];
+-	u8 buffer[64];
+-};
+-
+-/*----------------------------------------------------------------*/
+-
+-const u8 sha256_der_prefix[SHA256_DER_LEN] = {
+-	0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+-	0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+-	0x00, 0x04, 0x20
+-};
+-
+-/*
+- * 32-bit integer manipulation macros (big endian)
+- */
+-#ifndef GET_UINT32_BE
+-#define GET_UINT32_BE(n, b, i) {			\
+-	(n) = ((unsigned long) (b)[(i)] << 24)		\
+-	    | ((unsigned long) (b)[(i) + 1] << 16)	\
+-	    | ((unsigned long) (b)[(i) + 2] <<  8)	\
+-	    | ((unsigned long) (b)[(i) + 3]);		\
+-}
+-#endif
+-#ifndef PUT_UINT32_BE
+-#define PUT_UINT32_BE(n, b, i) {			\
+-	(b)[(i)] = (unsigned char)((n) >> 24);		\
+-	(b)[(i) + 1] = (unsigned char) ((n) >> 16);	\
+-	(b)[(i) + 2] = (unsigned char) ((n) >>  8);	\
+-	(b)[(i) + 3] = (unsigned char) ((n));		\
+-}
+-#endif
+-
+-void sha256_starts(struct sha256_context *ctx)
+-{
+-	ctx->total[0] = 0;
+-	ctx->total[1] = 0;
+-
+-	ctx->state[0] = 0x6A09E667;
+-	ctx->state[1] = 0xBB67AE85;
+-	ctx->state[2] = 0x3C6EF372;
+-	ctx->state[3] = 0xA54FF53A;
+-	ctx->state[4] = 0x510E527F;
+-	ctx->state[5] = 0x9B05688C;
+-	ctx->state[6] = 0x1F83D9AB;
+-	ctx->state[7] = 0x5BE0CD19;
+-}
+-
+-static void sha256_process(struct sha256_context *ctx, const u8 data[64])
+-{
+-	u32 temp1, temp2;
+-	u32 W[64];
+-	u32 A, B, C, D, E, F, G, H;
+-
+-	GET_UINT32_BE(W[0], data, 0);
+-	GET_UINT32_BE(W[1], data, 4);
+-	GET_UINT32_BE(W[2], data, 8);
+-	GET_UINT32_BE(W[3], data, 12);
+-	GET_UINT32_BE(W[4], data, 16);
+-	GET_UINT32_BE(W[5], data, 20);
+-	GET_UINT32_BE(W[6], data, 24);
+-	GET_UINT32_BE(W[7], data, 28);
+-	GET_UINT32_BE(W[8], data, 32);
+-	GET_UINT32_BE(W[9], data, 36);
+-	GET_UINT32_BE(W[10], data, 40);
+-	GET_UINT32_BE(W[11], data, 44);
+-	GET_UINT32_BE(W[12], data, 48);
+-	GET_UINT32_BE(W[13], data, 52);
+-	GET_UINT32_BE(W[14], data, 56);
+-	GET_UINT32_BE(W[15], data, 60);
+-
+-#define SHR(x, n) ((x & 0xFFFFFFFF) >> n)
+-#define ROTR(x, n) (SHR(x, n) | (x << (32 - n)))
+-
+-#define S0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ SHR(x, 3))
+-#define S1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10))
+-
+-#define S2(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
+-#define S3(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
+-
+-#define F0(x, y, z) ((x & y) | (z & (x | y)))
+-#define F1(x, y, z) (z ^ (x & (y ^ z)))
+-
+-#define R(t)					\
+-(						\
+-	W[t] = S1(W[t - 2]) + W[t - 7] +	\
+-		S0(W[t - 15]) + W[t - 16]	\
+-)
+-
+-#define P(a, b, c, d, e, f, g, h, x, K) {		\
+-	temp1 = h + S3(e) + F1(e, f, g) + K + x;	\
+-	temp2 = S2(a) + F0(a, b, c);		\
+-	d += temp1; h = temp1 + temp2;		\
+-}
+-
+-	A = ctx->state[0];
+-	B = ctx->state[1];
+-	C = ctx->state[2];
+-	D = ctx->state[3];
+-	E = ctx->state[4];
+-	F = ctx->state[5];
+-	G = ctx->state[6];
+-	H = ctx->state[7];
+-
+-	P(A, B, C, D, E, F, G, H, W[0], 0x428A2F98);
+-	P(H, A, B, C, D, E, F, G, W[1], 0x71374491);
+-	P(G, H, A, B, C, D, E, F, W[2], 0xB5C0FBCF);
+-	P(F, G, H, A, B, C, D, E, W[3], 0xE9B5DBA5);
+-	P(E, F, G, H, A, B, C, D, W[4], 0x3956C25B);
+-	P(D, E, F, G, H, A, B, C, W[5], 0x59F111F1);
+-	P(C, D, E, F, G, H, A, B, W[6], 0x923F82A4);
+-	P(B, C, D, E, F, G, H, A, W[7], 0xAB1C5ED5);
+-	P(A, B, C, D, E, F, G, H, W[8], 0xD807AA98);
+-	P(H, A, B, C, D, E, F, G, W[9], 0x12835B01);
+-	P(G, H, A, B, C, D, E, F, W[10], 0x243185BE);
+-	P(F, G, H, A, B, C, D, E, W[11], 0x550C7DC3);
+-	P(E, F, G, H, A, B, C, D, W[12], 0x72BE5D74);
+-	P(D, E, F, G, H, A, B, C, W[13], 0x80DEB1FE);
+-	P(C, D, E, F, G, H, A, B, W[14], 0x9BDC06A7);
+-	P(B, C, D, E, F, G, H, A, W[15], 0xC19BF174);
+-	P(A, B, C, D, E, F, G, H, R(16), 0xE49B69C1);
+-	P(H, A, B, C, D, E, F, G, R(17), 0xEFBE4786);
+-	P(G, H, A, B, C, D, E, F, R(18), 0x0FC19DC6);
+-	P(F, G, H, A, B, C, D, E, R(19), 0x240CA1CC);
+-	P(E, F, G, H, A, B, C, D, R(20), 0x2DE92C6F);
+-	P(D, E, F, G, H, A, B, C, R(21), 0x4A7484AA);
+-	P(C, D, E, F, G, H, A, B, R(22), 0x5CB0A9DC);
+-	P(B, C, D, E, F, G, H, A, R(23), 0x76F988DA);
+-	P(A, B, C, D, E, F, G, H, R(24), 0x983E5152);
+-	P(H, A, B, C, D, E, F, G, R(25), 0xA831C66D);
+-	P(G, H, A, B, C, D, E, F, R(26), 0xB00327C8);
+-	P(F, G, H, A, B, C, D, E, R(27), 0xBF597FC7);
+-	P(E, F, G, H, A, B, C, D, R(28), 0xC6E00BF3);
+-	P(D, E, F, G, H, A, B, C, R(29), 0xD5A79147);
+-	P(C, D, E, F, G, H, A, B, R(30), 0x06CA6351);
+-	P(B, C, D, E, F, G, H, A, R(31), 0x14292967);
+-	P(A, B, C, D, E, F, G, H, R(32), 0x27B70A85);
+-	P(H, A, B, C, D, E, F, G, R(33), 0x2E1B2138);
+-	P(G, H, A, B, C, D, E, F, R(34), 0x4D2C6DFC);
+-	P(F, G, H, A, B, C, D, E, R(35), 0x53380D13);
+-	P(E, F, G, H, A, B, C, D, R(36), 0x650A7354);
+-	P(D, E, F, G, H, A, B, C, R(37), 0x766A0ABB);
+-	P(C, D, E, F, G, H, A, B, R(38), 0x81C2C92E);
+-	P(B, C, D, E, F, G, H, A, R(39), 0x92722C85);
+-	P(A, B, C, D, E, F, G, H, R(40), 0xA2BFE8A1);
+-	P(H, A, B, C, D, E, F, G, R(41), 0xA81A664B);
+-	P(G, H, A, B, C, D, E, F, R(42), 0xC24B8B70);
+-	P(F, G, H, A, B, C, D, E, R(43), 0xC76C51A3);
+-	P(E, F, G, H, A, B, C, D, R(44), 0xD192E819);
+-	P(D, E, F, G, H, A, B, C, R(45), 0xD6990624);
+-	P(C, D, E, F, G, H, A, B, R(46), 0xF40E3585);
+-	P(B, C, D, E, F, G, H, A, R(47), 0x106AA070);
+-	P(A, B, C, D, E, F, G, H, R(48), 0x19A4C116);
+-	P(H, A, B, C, D, E, F, G, R(49), 0x1E376C08);
+-	P(G, H, A, B, C, D, E, F, R(50), 0x2748774C);
+-	P(F, G, H, A, B, C, D, E, R(51), 0x34B0BCB5);
+-	P(E, F, G, H, A, B, C, D, R(52), 0x391C0CB3);
+-	P(D, E, F, G, H, A, B, C, R(53), 0x4ED8AA4A);
+-	P(C, D, E, F, G, H, A, B, R(54), 0x5B9CCA4F);
+-	P(B, C, D, E, F, G, H, A, R(55), 0x682E6FF3);
+-	P(A, B, C, D, E, F, G, H, R(56), 0x748F82EE);
+-	P(H, A, B, C, D, E, F, G, R(57), 0x78A5636F);
+-	P(G, H, A, B, C, D, E, F, R(58), 0x84C87814);
+-	P(F, G, H, A, B, C, D, E, R(59), 0x8CC70208);
+-	P(E, F, G, H, A, B, C, D, R(60), 0x90BEFFFA);
+-	P(D, E, F, G, H, A, B, C, R(61), 0xA4506CEB);
+-	P(C, D, E, F, G, H, A, B, R(62), 0xBEF9A3F7);
+-	P(B, C, D, E, F, G, H, A, R(63), 0xC67178F2);
+-
+-	ctx->state[0] += A;
+-	ctx->state[1] += B;
+-	ctx->state[2] += C;
+-	ctx->state[3] += D;
+-	ctx->state[4] += E;
+-	ctx->state[5] += F;
+-	ctx->state[6] += G;
+-	ctx->state[7] += H;
+-}
+-
+-void sha256_update(struct sha256_context *ctx, const u8 *input, u32 length)
+-{
+-	u32 left, fill;
+-
+-	if (!length)
+-		return;
+-
+-	left = ctx->total[0] & 0x3F;
+-	fill = 64 - left;
+-
+-	ctx->total[0] += length;
+-	ctx->total[0] &= 0xFFFFFFFF;
+-
+-	if (ctx->total[0] < length)
+-		ctx->total[1]++;
+-
+-	if (left && length >= fill) {
+-		memcpy((void *) (ctx->buffer + left), (void *) input, fill);
+-		sha256_process(ctx, ctx->buffer);
+-		length -= fill;
+-		input += fill;
+-		left = 0;
+-	}
+-
+-	while (length >= 64) {
+-		sha256_process(ctx, input);
+-		length -= 64;
+-		input += 64;
+-	}
+-
+-	if (length)
+-		memcpy((void *) (ctx->buffer + left), (void *) input, length);
+-}
+-
+-static u8 sha256_padding[64] = {
+-	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-	   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+-};
+-
+-void sha256_finish(struct sha256_context *ctx, u8 digest[32])
+-{
+-	u32 last, padn;
+-	u32 high, low;
+-	u8 msglen[8];
+-
+-	high = ((ctx->total[0] >> 29)
+-		| (ctx->total[1] << 3));
+-	low = (ctx->total[0] << 3);
+-
+-	PUT_UINT32_BE(high, msglen, 0);
+-	PUT_UINT32_BE(low, msglen, 4);
+-
+-	last = ctx->total[0] & 0x3F;
+-	padn = (last < 56) ? (56 - last) : (120 - last);
+-
+-	sha256_update(ctx, sha256_padding, padn);
+-	sha256_update(ctx, msglen, 8);
+-
+-	PUT_UINT32_BE(ctx->state[0], digest, 0);
+-	PUT_UINT32_BE(ctx->state[1], digest, 4);
+-	PUT_UINT32_BE(ctx->state[2], digest, 8);
+-	PUT_UINT32_BE(ctx->state[3], digest, 12);
+-	PUT_UINT32_BE(ctx->state[4], digest, 16);
+-	PUT_UINT32_BE(ctx->state[5], digest, 20);
+-	PUT_UINT32_BE(ctx->state[6], digest, 24);
+-	PUT_UINT32_BE(ctx->state[7], digest, 28);
+-}
+-
+-/*
+- * Output = SHA-256( input buffer ).
+- */
+-void sha256_csum(const unsigned char *input, unsigned int ilen,
+-		unsigned char *output)
+-{
+-	struct sha256_context ctx;
+-
+-	if (ilen < SHA256_SUM_LEN) {
+-		*output = 0;
+-		return;
+-	}
+-	sha256_starts(&ctx);
+-	sha256_update(&ctx, input, ilen);
+-	sha256_finish(&ctx, output);
+-}
+diff --git a/common/sha256.h b/common/sha256.h
+deleted file mode 100644
+index 2cc1fd9..0000000
+--- a/common/sha256.h
++++ /dev/null
+@@ -1,15 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- */
+-#ifndef _SHA256_H
+-#define _SHA256_H
+-
+-#define SHA256_SUM_LEN	32
+-#define SHA256_DER_LEN	19
+-
+-extern const u8 sha256_der_prefix[];
+-
+-void sha256_csum(const u8 *input, u32 ilen, u8 *output);
+-
+-#endif /* _SHA256_H */
+diff --git a/gaudi/preboot.lds.S b/gaudi/preboot.lds.S
+index 70f70db..0e4134f 100644
+--- a/gaudi/preboot.lds.S
++++ b/gaudi/preboot.lds.S
+@@ -16,7 +16,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_preboot.o (.text*)
++		preboot/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/goya/preboot.lds.S b/goya/preboot.lds.S
+index b244777..0c0b725 100644
+--- a/goya/preboot.lds.S
++++ b/goya/preboot.lds.S
+@@ -16,7 +16,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_preboot.o (.text*)
++		preboot/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/goya2/preboot.lds.S b/goya2/preboot.lds.S
+index b244777..0c0b725 100644
+--- a/goya2/preboot.lds.S
++++ b/goya2/preboot.lds.S
+@@ -16,7 +16,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_preboot.o (.text*)
++		preboot/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/goya2_arc_gnu/preboot.lds.S b/goya2_arc_gnu/preboot.lds.S
+index 2950588..53b1fb1 100644
+--- a/goya2_arc_gnu/preboot.lds.S
++++ b/goya2_arc_gnu/preboot.lds.S
+@@ -18,7 +18,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_preboot.o (.text*)
++		preboot/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/preboot/boot_if.c b/preboot/boot_if.c
+new file mode 100644
+index 0000000..6d848ace
+--- /dev/null
++++ b/preboot/boot_if.c
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <stdbool.h>
++
++#include <psoc_global_conf_regs.h>
++
++#include <hl_boot_if.h>
++#include <preboot.h>
++
++/*
++ * The cpu_boot_cmd_clr_before_wfe() function should NOT be used in general as
++ * the LKD message register should be written by LKD solely.
++ *
++ * There is only one special case when this function can be used is only when
++ * the LKD performs hard reset, which may mean the H/W is not reliable and
++ * writing to PCI might not complete and result in the register not cleared.
++ * So to be on the safe side, when receiving the WFE, clear the message register
++ */
++void cpu_boot_cmd_clr_before_wfe(void)
++{
++	regmap_writel(KMD_MSG_NA, mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
++}
++
++enum kmd_msg cpu_boot_cmd_get(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
++}
++
++void cpu_boot_sts_set(u32 val)
++{
++	regmap_writel(val, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
++}
++
++/* We support only ERR0 for now */
++void cpu_boot_err_clrset(u32 mask, bool set)
++{
++	u32 val = regmap_readl(mmCPU_BOOT_ERR0) & ~mask;
++
++	if (set)
++		val |= mask;
++
++	regmap_writel(val, mmCPU_BOOT_ERR0);
++}
++
++void cpu_boot_rsp_set(enum cpu_msg_status sts)
++{
++	regmap_writel(sts, mmCPU_CMD_STATUS_TO_HOST);
++}
+diff --git a/preboot/boot_if.h b/preboot/boot_if.h
+new file mode 100644
+index 0000000..e0f54c0
+--- /dev/null
++++ b/preboot/boot_if.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef _HL_BOOT_IF_H_
++#define _HL_BOOT_IF_H_
++
++#include <hl_boot_if.h>
++
++enum kmd_msg cpu_boot_cmd_get(void);
++void cpu_boot_cmd_clr_before_wfe(void);
++void cpu_boot_sts_set(u32 val);
++void cpu_boot_err_clrset(u32 mask, bool set);
++void cpu_boot_rsp_set(enum cpu_msg_status sts);
++
++#endif /* _HL_BOOT_IF_H_ */
+diff --git a/preboot/crt0_preboot.S b/preboot/crt0_preboot.S
+new file mode 100644
+index 0000000..f2608b1
+--- /dev/null
++++ b/preboot/crt0_preboot.S
+@@ -0,0 +1,46 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++/*
++ * This is preboot entry point
++ * Setting sp/fp/lr and jumping to C code
++ */
++.globl	_start
++_start:
++
++#ifdef __arc__
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++
++	mov	sp, __stack_top
++	mov	fp, sp
++
++/* Clear BSS */
++	mov	r5, __bss_start
++	sub	r6, __bss_end, r5
++	lsr.f	lp_count, r6, 2
++	lpnz	1f
++	st.ab   0, [r5, 4]
++1:
++#endif
++
++#ifdef __aarch64__
++	ldr	x0, =__stack_top
++	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
++	mov	x29, sp		/* Set FP (x29) */
++
++/* Clear BSS */
++	ldr	x0, =__bss_start
++	ldr	x1, =__bss_end
++clear_loop:
++	str	xzr, [x0], #8
++	cmp	x0, x1
++	b.lo	clear_loop
++#endif
++
++	bl	preboot_main	/* Set LR (x30) */
+diff --git a/preboot/fit.c b/preboot/fit.c
+new file mode 100644
+index 0000000..d3588c8
+--- /dev/null
++++ b/preboot/fit.c
+@@ -0,0 +1,299 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <libfdt.h>
++#include "common.h"
++#include "uart.h"
++#include "fit.h"
++#include "fit_rsa.h"
++
++
++#define FIT_IMAGES_PATH		"/images"
++#define FIT_CONFS_PATH		"/configurations"
++
++#define FIT_CONF_NAME		"preboot-conf"
++#define FIT_DESC_PROP		"description"
++#define FIT_LOADABLE_PROP	"loadables"
++#define FIT_DATA_PROP		"data"
++#define FIT_LOADADDR_PROP	"loadaddr"
++
++#define FIT_SIG_NODENAME	"signature"
++#define FIT_VALUE_PROP		"value"
++#define FIT_ALGO_PROP		"algo"
++#define FIT_KEY_NAME_HINT	"key-name-hint"
++#define FIT_HL_PUBKEY_LEN_PROP  "hl-pub-key-len"
++
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
++
++__attribute__((weak)) int fit_need_image_verification(void)
++{
++	return 0;
++}
++
++static const char *fit_loadables_name(const void *fit, int noffset, int id)
++{
++	return fdt_stringlist_get(fit, noffset, FIT_LOADABLE_PROP, id, NULL);
++}
++
++static int fit_find_config_node(const void *fit)
++{
++	int conf, node;
++	int dflt_conf_node = -1;
++
++	conf = fdt_path_offset(fit, FIT_CONFS_PATH);
++	if (conf < 0) {
++		preboot_puts("Cannot find configuration node\n");
++		return -1;
++	}
++
++	for (node = fdt_first_subnode(fit, conf); node >= 0; node = fdt_next_subnode(fit, node)) {
++		const char *node_name = fdt_get_name(fit, node, NULL);
++
++		if (strcmp(FIT_CONF_NAME, node_name) == 0) {
++			dflt_conf_node = node;
++			break;
++		}
++	}
++
++	return dflt_conf_node;
++}
++
++static int fit_loadables_node_get(const void *fit, int id)
++{
++	int images, conf = fit_find_config_node(fit);
++	const char *uname = fit_loadables_name(fit, conf, id);
++
++	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	return fdt_subnode_offset(fit, images, uname);
++}
++
++int fit_check_format(const void *fit)
++{
++	if (fdt_check_header(fit)) {
++		preboot_puts("FIT header check failed\n");
++		return 0;
++	}
++
++	/* mandatory / node 'description' property */
++	if (fdt_getprop(fit, 0, FIT_DESC_PROP, NULL) == NULL) {
++		preboot_puts("Wrong FIT format: no description\n");
++		return 0;
++	}
++
++	/* mandatory subimages parent '/images' node */
++	if (fdt_path_offset(fit, FIT_IMAGES_PATH) < 0) {
++		preboot_puts("Wrong FIT format: no images parent node\n");
++		return 0;
++	}
++
++	return 1;
++}
++
++static int fit_get_int(const void *fit, int node, const char *prop_name,
++		       int default_val)
++{
++	const int *cell;
++	int len;
++
++	cell = fdt_getprop(fit, node, prop_name, &len);
++	if (cell && len >= sizeof(int))
++		return fdt32_to_cpu(cell[0]);
++
++	return default_val;
++}
++
++static int get_algo_prop(const void *fit, int noffset, const u8 **algo_prop)
++{
++	int algo_prop_len;
++
++	*algo_prop = fdt_getprop(fit, noffset, FIT_ALGO_PROP, &algo_prop_len);
++	if (!(*algo_prop)) {
++		preboot_puts("Wrong FIT format: algo property\n");
++		return 1;
++	}
++	if (algo_prop_len != sizeof(FIT_ALGO_PROP_EXPECTED_VALUE)) {
++		preboot_puts("Wrong FIT format: algo len\n");
++		return 1;
++	}
++	if (memcmp((char *)*algo_prop, FIT_ALGO_PROP_EXPECTED_VALUE,
++			sizeof(FIT_ALGO_PROP_EXPECTED_VALUE))) {
++		preboot_puts("Wrong FIT format: hash-algo not supported\n");
++		preboot_puts((char *)algo_prop);
++		preboot_puts("\n");
++		return 1;
++	}
++	return 0;
++}
++
++static int get_sig_hash(const void *fit, int noffset, const u8 **hash_value,
++			int *hash_value_len)
++{
++	*hash_value = fdt_getprop(fit, noffset, FIT_VALUE_PROP, hash_value_len);
++	if (!(*hash_value)) {
++		preboot_puts("Wrong FIT format: missing sig hash value\n");
++		return 1;
++	}
++	return 0;
++}
++
++static int get_key_name(const void *fit, int noffset, const char **key_name)
++{
++	int key_name_len;
++
++	*key_name = fdt_getprop(fit, noffset, FIT_KEY_NAME_HINT, &key_name_len);
++	if (!(*key_name)) {
++		preboot_puts("Wrong FIT format: key name\n");
++		return 1;
++	}
++	return 0;
++}
++
++static int get_pub_key_node(const void *pub_key_fit, const char *key_name)
++{
++	int sig_node;
++	char key_node_name[64] = "key-";
++
++	memcpy(key_node_name+strlen(key_node_name), key_name, strlen(key_name));
++
++	sig_node = fdt_subnode_offset(pub_key_fit, 0, FIT_SIG_NODENAME);
++
++	return fdt_subnode_offset(pub_key_fit, sig_node, key_node_name);
++}
++
++static int fit_get_key_prop(const void *pub_key_fit, const char *key_name,
++			    struct rsa_key_prop *prop)
++{
++	int pub_key_node = 0;
++	int length;
++
++	if (fdt_check_header(pub_key_fit)) {
++		preboot_puts("FITkey header check failed\n");
++		return 1;
++	}
++	pub_key_node = get_pub_key_node(pub_key_fit, key_name);
++	if (pub_key_node < 0) {
++		preboot_puts("Wrong FITkey format: no key node\n");
++		return 1;
++	}
++	prop->num_bits =
++		fit_get_int(pub_key_fit, pub_key_node, "rsa,num-bits", 0);
++	prop->n0inv =
++		fit_get_int(pub_key_fit, pub_key_node, "rsa,n0-inverse", 0);
++	prop->public_exponent =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,exponent", &length);
++	if (!prop->public_exponent || length < sizeof(uint64_t))
++		prop->public_exponent = NULL;
++	prop->modulus =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,modulus", NULL);
++	prop->rr =
++		fdt_getprop(pub_key_fit, pub_key_node, "rsa,r-squared", NULL);
++
++	if (!prop->num_bits || !prop->modulus) {
++		preboot_puts("FIT: missing RSA Key\n");
++		return 1;
++	}
++
++	return 0;
++}
++
++/* based on :
++ * int fit_config_check_sig(const void *fit, int noffset, int required_keynode,
++ * char **err_msgp)
++ * from u-boot: u-boot/common/image-sig.c
++ */
++int fit_check_sig(const void *fit, int noffset, const u8 *data, int data_len,
++		  int pub_key_len)
++{
++	const u8 *algo_prop = NULL;
++	const u8 *hash_value = NULL;
++	const char *key_name = NULL;
++	const void *pub_key_fit = NULL;
++	int hash_len = 0;
++	struct rsa_key_prop prop;
++
++	if (get_algo_prop(fit, noffset, &algo_prop))
++		return 1;
++
++	if (get_sig_hash(fit, noffset, &hash_value, &hash_len))
++		return 1;
++
++	if (get_key_name(fit, noffset, &key_name))
++		return 1;
++
++	pub_key_fit = data + data_len - pub_key_len;
++	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
++		return 1;
++
++	return rsa_verify(data, data_len, hash_value, hash_len, &prop);
++}
++
++int fit_verify_image(const void *fit, int node, const u8 *buf, int *len)
++{
++	int sig_sub_node;
++	int pub_key_len;
++	int buf_len = *len;
++	int ret = 1;
++
++	sig_sub_node = fdt_subnode_offset(fit, node, FIT_SIG_NODENAME);
++	if (sig_sub_node < 0) {
++		preboot_puts("Wrong FIT format: missing signature\n");
++		return 1;
++	}
++
++	pub_key_len = fit_get_int(fit, 0, FIT_HL_PUBKEY_LEN_PROP, 0);
++	if (pub_key_len == 0) {
++		preboot_puts("Wrong FIT format: public key length invalid\n");
++		return 1;
++	}
++	if (!fit_check_sig(fit, sig_sub_node, buf, buf_len, pub_key_len)) {
++		preboot_puts("fit_check_sig OK\n");
++		ret = 0;
++	} else {
++		preboot_puts("fit_check_sig failed\n");
++		ret = 1;
++	}
++	*len = *len - pub_key_len;
++	return ret;
++}
++
++int fit_load_image(const void *fit, u64 *dest)
++{
++	int node, len, copy_image = 1;
++	const u8 *buf;
++	const u32 *loadaddr;
++	u64 dst = 0;
++
++	node = fit_loadables_node_get(fit, 0);
++	if (node < 0) {
++		preboot_puts("Wrong FIT format: no loadable image node\n");
++		return 1;
++	}
++
++	loadaddr = fdt_getprop(fit, node, FIT_LOADADDR_PROP, &len);
++	if (!loadaddr || len != sizeof(u64)) {
++		preboot_puts("Wrong FIT format: no image loadaddr\n");
++		return 1;
++	}
++
++	dst = ((u64)fdt32_to_cpu(loadaddr[0])) << 32;
++	dst |= fdt32_to_cpu(loadaddr[1]);
++
++	buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
++	if (!buf) {
++		preboot_puts("Wrong FIT format: image data empty\n");
++		return 1;
++	}
++
++	if (fit_need_image_verification())
++		copy_image = !fit_verify_image(fit, node, buf, &len);
++
++	if (copy_image) {
++		fit_copy_image(dst, buf, len);
++		*dest = dst;
++	}
++	return 0;
++}
+diff --git a/preboot/fit.h b/preboot/fit.h
+new file mode 100644
+index 0000000..ed9919a
+--- /dev/null
++++ b/preboot/fit.h
+@@ -0,0 +1,15 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _HL_FIT_H_
++#define _HL_FIT_H_
++
++int fit_load_image(const void *fit, u64 *dest);
++int fit_check_format(const void *fit);
++void fit_copy_image(u64 dst, const void *buf, int len);
++
++#endif /* _HL_FIT_H_ */
+diff --git a/preboot/fit_rsa.c b/preboot/fit_rsa.c
+new file mode 100644
+index 0000000..dcc199d
+--- /dev/null
++++ b/preboot/fit_rsa.c
+@@ -0,0 +1,352 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ */
++
++#include <libfdt.h>
++#include "common.h"
++#include "sha256.h"
++#include "uart.h"
++#include "fit_rsa.h"
++
++struct rsa_public_key {
++	u32 len;	/* len of modulus[] in number of u32 */
++	u32 n0inv;	/* -1 / modulus[0] mod 2^32 */
++	u32 *modulus;	/* modulus as little endian array */
++	u32 *rr;	/* R^2 as little endian array */
++	u64 exponent;	/* public exponent */
++};
++
++#define CHECKSUM_LENGTH		(SHA256_SUM_LEN)
++#define CHECKSUM_DER_LENGTH	(SHA256_DER_LEN)
++#define CHECKSUM_DER_PREFIX	(sha256_der_prefix)
++
++
++#define RSA4096_BITS		(4096)
++#define RSA4096_BYTES		(RSA4096_BITS / 8)
++#define RSA3072_BITS		(3072)
++#define RSA3072_BYTES		(RSA3072_BITS / 8)
++#define CRYPTO_RSA_LENGTH	(RSA3072_BYTES)
++#define RSA_DEFAULT_PUBEXP	(65537)
++
++#if (CHECKSUM_LENGTH > CRYPTO_RSA_LENGTH)
++#error "CHECKSUM_LENGTH > CRYPTO_RSA_LENGTH"
++#endif
++
++#define get_unaligned_be32(a) fdt32_to_cpu(*(u32 *)a)
++#define put_unaligned_be32(a, b) (*(u32 *)(b) = cpu_to_fdt32(a))
++
++
++/**
++ * is_public_exponent_bit_set() - Check if a bit in the public exponent is set
++ *
++ * @key:	RSA key
++ * @pos:	The bit position to check
++ */
++static int is_public_exponent_bit_set(const struct rsa_public_key *key,
++				      int pos)
++{
++	return key->exponent & (1ULL << pos);
++}
++
++/**
++ * subtract_modulus() - subtract modulus from the given value
++ *
++ * @key:	Key containing modulus to subtract
++ * @num:	Number to subtract modulus from, as little endian word array
++ */
++static void subtract_modulus(const struct rsa_public_key *key, u32 num[])
++{
++	long long acc = 0;
++	u32 i;
++
++	for (i = 0; i < key->len; i++) {
++		acc += (u64)num[i] - key->modulus[i];
++		num[i] = (u32)acc;
++		acc >>= 32;
++	}
++}
++
++
++/**
++ * greater_equal_modulus() - check if a value is >= modulus
++ *
++ * @key:	Key containing modulus to check
++ * @num:	Number to check against modulus, as little endian word array
++ * @return 0 if num < modulus, 1 if num >= modulus
++ */
++static int greater_equal_modulus(const struct rsa_public_key *key,
++				 u32 num[])
++{
++	int i;
++
++	for (i = (int)key->len - 1; i >= 0; i--) {
++		if (num[i] < key->modulus[i])
++			return 0;
++		if (num[i] > key->modulus[i])
++			return 1;
++	}
++
++	return 1;	/* equal */
++}
++
++/**
++ * num_pub_exponent_bits() - Number of bits in the public exponent
++ *
++ * @key:	RSA key
++ * @num_bits:	Storage for the number of public exponent bits
++ */
++static int num_public_exponent_bits(const struct rsa_public_key *key,
++				    int *num_bits)
++{
++	u64 exponent;
++	int exponent_bits;
++	const u32 max_bits = (sizeof(exponent) * 8);
++
++	exponent = key->exponent;
++	exponent_bits = 0;
++
++	if (!exponent) {
++		*num_bits = exponent_bits;
++		return 0;
++	}
++
++	for (exponent_bits = 1; exponent_bits < max_bits + 1; ++exponent_bits)
++		if (!(exponent >>= 1)) {
++			*num_bits = exponent_bits;
++			return 0;
++		}
++
++	return 1;
++}
++
++/**
++ * montgomery_mul_add_step() - Perform montgomery multiply-add step
++ *
++ * Operation: montgomery result[] += a * b[] / n0inv % modulus
++ *
++ * @key:	RSA key
++ * @result:	Place to put result, as little endian word array
++ * @a:		Multiplier
++ * @b:		Multiplicand, as little endian word array
++ */
++static void montgomery_mul_add_step(const struct rsa_public_key *key,
++				    u32 result[], const u32 a, const u32 b[])
++{
++	u64 acc_a, acc_b;
++	u32 d0;
++	u32 i;
++
++	acc_a = (u64)a * b[0] + result[0];
++	d0 = (u32)acc_a * key->n0inv;
++	acc_b = (u64)d0 * key->modulus[0] + (u32)acc_a;
++	for (i = 1; i < key->len; i++) {
++		acc_a = (acc_a >> 32) + (u64)a * b[i] + result[i];
++		acc_b = (acc_b >> 32) + (u64)d0 * key->modulus[i] +
++				(u32)acc_a;
++		result[i - 1] = (u32)acc_b;
++	}
++
++	acc_a = (acc_a >> 32) + (acc_b >> 32);
++
++	result[i - 1] = (u32)acc_a;
++
++	if (acc_a >> 32)
++		subtract_modulus(key, result);
++}
++
++/**
++ * montgomery_mul() - Perform montgomery mutitply
++ *
++ * Operation: montgomery result[] = a[] * b[] / n0inv % modulus
++ *
++ * @key:	RSA key
++ * @result:	Place to put result, as little endian word array
++ * @a:		Multiplier, as little endian word array
++ * @b:		Multiplicand, as little endian word array
++ */
++static void montgomery_mul(const struct rsa_public_key *key,
++			   u32 result[], u32 a[], const u32 b[])
++{
++	u32 i;
++
++	for (i = 0; i < key->len; ++i)
++		result[i] = 0;
++	for (i = 0; i < key->len; ++i)
++		montgomery_mul_add_step(key, result, a[i], b);
++}
++
++static int pow_mod(const struct rsa_public_key *key, u32 *out, u32 *in)
++{
++	u32 *result, *ptr;
++	u32 i;
++	int j, k;
++
++	u32 val[key->len], acc[key->len], tmp[key->len];
++	u32 a_scaled[key->len];
++
++	result = tmp;	/* Re-use location. */
++
++	/* Convert from big endian byte array to little endian word array. */
++	for (i = 0, ptr = in + key->len - 1; i < key->len; i++, ptr--)
++		val[i] = get_unaligned_be32(ptr);
++
++	if (num_public_exponent_bits(key, &k) != 0) {
++		preboot_puts("num_public_exponent_bits failed!\n");
++		return 1;
++	}
++
++	if (k < 2) {
++		preboot_puts("Public exponent is too short\n");
++		return 1;
++	}
++
++	if (!is_public_exponent_bit_set(key, 0)) {
++		preboot_puts("LSB of RSA public exponent must be set.\n");
++		return 1;
++	}
++
++	/* the bit at e[k-1] is 1 by definition, so start with: C := M */
++	montgomery_mul(key, acc, val, key->rr); /* acc = a * RR / R mod n */
++	/* retain scaled version for intermediate use */
++	memcpy(a_scaled, acc, key->len * sizeof(a_scaled[0]));
++
++	for (j = k - 2; j > 0; --j) {
++		montgomery_mul(key, tmp, acc, acc); /* tmp = acc^2 / R mod n */
++
++		if (is_public_exponent_bit_set(key, j)) {
++			/* acc = tmp * val / R mod n */
++			montgomery_mul(key, acc, tmp, a_scaled);
++		} else {
++			/* e[j] == 0, copy tmp back to acc for next operation */
++			memcpy(acc, tmp, key->len * sizeof(acc[0]));
++		}
++	}
++
++	/* the bit at e[0] is always 1 */
++	montgomery_mul(key, tmp, acc, acc); /* tmp = acc^2 / R mod n */
++	montgomery_mul(key, acc, tmp, val); /* acc = tmp * a / R mod M */
++	memcpy(result, acc, key->len * sizeof(result[0]));
++
++	/* Make sure result < mod; result is at most 1x mod too large. */
++	if (greater_equal_modulus(key, result))
++		subtract_modulus(key, result);
++
++	/* Convert to bigendian byte array */
++	for (i = key->len - 1, ptr = out; (int)i >= 0; i--, ptr++)
++		put_unaligned_be32(result[i], ptr);
++	return 0;
++}
++
++static void rsa_convert_big_endian(u32 *dst, const u32 *src, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++)
++		dst[i] = fdt32_to_cpu(src[len - 1 - i]);
++}
++
++int rsa_mod_exp_sw(const u8 *sig, struct rsa_key_prop *prop, u32 *out)
++{
++	struct rsa_public_key key;
++	int ret;
++
++	key.n0inv = prop->n0inv;
++	key.len = prop->num_bits / (sizeof(u32) * 8);
++	if (prop->public_exponent)
++		key.exponent = fdt64_to_cpu(*(prop->public_exponent));
++	else
++		key.exponent = RSA_DEFAULT_PUBEXP;
++
++	u32 key1[key.len], key2[key.len];
++
++	key.modulus = key1;
++	key.rr = key2;
++
++	rsa_convert_big_endian(key.modulus, (u32 *)prop->modulus, key.len);
++	rsa_convert_big_endian(key.rr, (u32 *)prop->rr, key.len);
++
++	ret = pow_mod(&key, out, (u32 *)sig);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int rsa_verify_padding(const u8 *msg, const int pad_len)
++{
++	int ff_len;
++	int ret;
++
++	/* first byte must be 0x00 */
++	ret = *msg++;
++	/* second byte must be 0x01 */
++	ret |= *msg++ ^ 0x01;
++	/* next ff_len bytes must be 0xff */
++	ff_len = pad_len - CHECKSUM_DER_LENGTH - 3;
++	ret |= *msg ^ 0xff;
++	ret |= memcmp(msg, msg+1, ff_len-1);
++	msg += ff_len;
++	/* next byte must be 0x00 */
++	ret |= *msg++;
++	/* next der_len bytes must match der_prefix */
++	ret |= memcmp(msg, CHECKSUM_DER_PREFIX, CHECKSUM_DER_LENGTH);
++
++	return ret;
++}
++
++int padding_pkcs_15_verify(u8 *msg, int msg_len, const u8 *hash)
++{
++	int pad_len = msg_len - CHECKSUM_LENGTH;
++
++	if (rsa_verify_padding(msg, pad_len)) {
++		preboot_puts("RSAVerify(): rsa_verify_padding failed!\n");
++		return 1;
++	}
++
++	/* Check hash. */
++	if (memcmp((u8 *)msg + pad_len, hash, msg_len - pad_len)) {
++		preboot_puts("RSAVerify(): Hash check failed!\n");
++		return 1;
++	}
++
++	return 0;
++}
++
++static int rsa_verify_key(struct rsa_key_prop *prop, const u8 *sig,
++			  const u32 sig_len, const u8 *hash, const u32 key_len)
++{
++	u32 buf[sig_len>>2];
++
++	if (rsa_mod_exp_sw(sig, prop, buf)) {
++		preboot_puts("rsa_mod_exp_sw failed\n");
++		return 1;
++	}
++
++	if (padding_pkcs_15_verify((u8 *)buf, key_len, hash))
++		return 1;
++
++	return 0;
++}
++
++/* based on int rsa_verify(struct image_sign_info *info,
++ *		const struct image_region region[], int region_count,
++ *		uint8_t *sig, uint sig_len)
++ * from: u-boot/lib/rsa/rsa-verify.c
++ */
++int rsa_verify(const u8 *data, int data_len, const u8 *sig, u32 sig_len,
++	       struct rsa_key_prop *prop)
++{
++	u8 hash[CRYPTO_RSA_LENGTH];
++	int ret;
++
++	if (sig_len != (prop->num_bits >> 3)) {
++		preboot_puts("sig_len != (prop->num_bits / 8)\n");
++		return 1;
++	}
++
++	sha256_csum(data, data_len, hash);
++
++	ret = rsa_verify_key(prop, sig, sig_len, hash, CRYPTO_RSA_LENGTH);
++	return ret;
++}
+diff --git a/preboot/fit_rsa.h b/preboot/fit_rsa.h
+new file mode 100644
+index 0000000..7dd6c23
+--- /dev/null
++++ b/preboot/fit_rsa.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ */
++
++#ifndef COMMON_FIT_RSA_H_
++#define COMMON_FIT_RSA_H_
++
++struct rsa_key_prop {
++	const void *rr;			/* R^2 can be treated as byte array */
++	const void *modulus;		/* modulus as byte array */
++	const u64 *public_exponent;	/* public exponent as byte array */
++	u32 n0inv;			/* -1 / modulus[0] mod 2^32 */
++	int num_bits;			/* Key length in bits */
++};
++
++
++int rsa_verify(const u8 *data, int data_len,
++	       const u8 *sig, u32 sig_len, struct rsa_key_prop *prop);
++
++#endif /* COMMON_FIT_RSA_H_ */
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+new file mode 100644
+index 0000000..9506d8f
+--- /dev/null
++++ b/preboot/module_fwupd.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <hl_fw_if.h>
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++
++void module_fwupd_setup(void)
++{
++	struct hl_upd_status status  = { .val = 0 };
++
++	status.status = HL_UPD_STS_RST_OK;
++	regmap_writel(status.val, mmUPD_STS);
++}
++
++enum cmd_check_res module_fwupd_check(void)
++{
++	if (regmap_readl(mmUPD_CMD) != HL_UPD_NOOP)
++		return FOUND_FAST_RETURN;
++
++	return NOT_FOUND;
++}
++
++void module_fwupd_run(void)
++{
++	struct hl_upd_command cmd;
++
++	cmd.val = regmap_readl(mmUPD_CMD);
++	switch (cmd.cmd) {
++	case HL_UPD_CLR_STS:
++		regmap_writel(HL_UPD_STS_NOOP, mmUPD_STS);
++		preboot_puts("FW UPD CLR STS received\n");
++		break;
++	default:
++		break;
++	}
++}
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+new file mode 100644
+index 0000000..19ad37c
+--- /dev/null
++++ b/preboot/module_i2c_slave.c
+@@ -0,0 +1,245 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stddef.h>
++#include <psoc_global_conf_regs.h>
++#include <psoc_i2c_s_regs.h>
++#include <psoc_i2c_s_masks.h>
++#include <hl_fw_if.h>
++#include <pcie_dbi_regs.h>
++#include <preboot.h>
++#include <thermal.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++#include "common.h"
++
++#define HL_DEVICE_STATUS_LINUX		0x0
++#define HL_DEVICE_STATUS_PREBOOT	0x1
++
++#define HL_DEVICE_STATUS_CMD_CODE_LEN		0x1
++#define HL_PCIE_VENDOR_ID_CMD_CODE_LEN		0x16
++
++static unsigned int cmd;
++static unsigned int read_bytes_count;
++
++enum preboot_i2c_slave_event_id {
++	HL_ASIC_TEMP_CMD_CODE = 0,
++	HL_ASIC_TEMP_MAX_VAL = 3,
++	HL_PCIE_VENDOR_ID_VAL_LOW = 9,
++	HL_PCIE_VENDOR_ID_VAL_HIGH = 10,
++	HL_DEVICE_STATUS_CMD_CODE = 165,
++	HL_DEVICE_STATUS = 166,
++};
++
++static void hl_i2c_slave_init(void)
++{
++	/* Check if already enabled */
++	if (regmap_readl(mmPSOC_I2C_S_IC_ENABLE)) {
++		preboot_puts("I2C SLAVE already initialized\n");
++		return;
++	}
++
++	/* Program IC_SAR with address to which slave responds */
++	regmap_writel(I2C_SLAVE_ADDRESS, mmPSOC_I2C_S_IC_SAR);
++
++	/* Enable I2C Slave */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_I2C_SLV);
++
++	/* Enable I2C Slave interrupts */
++	regmap_writel(0x0, mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK);
++
++	/* Program IC_CON */
++	regmap_writel(0x22, mmPSOC_I2C_S_IC_CON);
++
++	/* Write to IC_INTR_MASK to enable all interrupts */
++	regmap_writel(0x7FFF, mmPSOC_I2C_S_IC_INTR_MASK);
++
++	/* Write to IC_RX_TL to set Rx FIFO threshold level */
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_RX_TL);
++
++	/* Write to IC_TX_TL to set Tx FIFO threshold level */
++	regmap_writel(0x7, mmPSOC_I2C_S_IC_TX_TL);
++
++	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
++	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
++
++	preboot_puts("I2C SLAVE initialized\n");
++}
++
++static u32 i2c_dw_read_clear_intrbits_slave(void)
++{
++	u32 stat;
++
++	/*
++	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
++	 * Ths unmasked raw version of interrupt status bits are available
++	 * in the IC_RAW_INTR_STAT register.
++	 *
++	 * That is,
++	 *   stat = regmap_readl(IC_INTR_STAT);
++	 * equals to,
++	 *   stat = regmap_readl(IC_RAW_INTR_STAT) & regmap_readl(IC_INTR_MASK);
++	 *
++	 * The raw version might be useful for debugging purposes.
++	 */
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/*
++	 * Do not use the IC_CLR_INTR register to clear interrupts, or
++	 * you'll miss some interrupts, triggered during the period from
++	 * regmap_readl(IC_INTR_STAT) to regmap_readl(IC_CLR_INTR).
++	 *
++	 * Instead, use the separately-prepared IC_CLR_* registers.
++	 */
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_ABRT_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_ABRT);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_UNDER_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_OVER_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_OVER);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_TX_OVER_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_TX_OVER);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_DONE_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_DONE);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_ACTIVITY_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_ACTIVITY);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_STOP_DET_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_STOP_DET);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_START_DET_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_START_DET);
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_GEN_CALL_MASK)
++		regmap_readl(mmPSOC_I2C_S_IC_CLR_GEN_CALL);
++
++	return stat;
++}
++
++void module_i2c_s_setup(void)
++{
++	hl_i2c_slave_init();
++}
++
++enum cmd_check_res module_i2c_s_check(void)
++{
++	enum cmd_check_res res = NOT_FOUND;
++	unsigned int stat;
++
++	i2c_dw_read_clear_intrbits_slave();
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
++	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)) {
++		preboot_puts("I2C SLAVE: read request received\n");
++		res = FOUND_FAST_RETURN;
++	}
++
++	return res;
++}
++
++void module_i2c_s_disable(void)
++{
++	unsigned int stat;
++
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/* Clear requests before disabling */
++	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++		module_i2c_s_run_fast();
++
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_ENABLE);
++
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/* Make sure all requests are handled after disable */
++	if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++		    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++		module_i2c_s_run_fast();
++
++	preboot_puts("I2C SLAVE: disabled\n");
++}
++
++static char i2cslave_pcie_vendor_id_cmd(int command_idx, int bytes_count)
++{
++	char ret;
++	unsigned int data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++
++	switch (command_idx + bytes_count) {
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++		data &= 0xFFFF;
++		ret = (data & 0xFF00) >> 8;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++		data &= 0xFFFF;
++		ret = data & 0xFF;
++		break;
++	default:
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
++static int i2cslave_handle_read_req(void)
++{
++	int max_tmp, ret;
++
++	switch (cmd) {
++	case HL_ASIC_TEMP_CMD_CODE:
++	case HL_ASIC_TEMP_MAX_VAL:
++		max_tmp = hl_ts_get_max_temp();
++		/* Convert from mC to C */
++		ret = max_tmp / 1000;
++		break;
++	case HL_DEVICE_STATUS_CMD_CODE:
++		ret = HL_DEVICE_STATUS_CMD_CODE_LEN;
++		break;
++	case HL_DEVICE_STATUS:
++		ret = HL_DEVICE_STATUS_PREBOOT;
++		break;
++	case HL_PCIE_VENDOR_ID_VAL_LOW:
++	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++		ret = i2cslave_pcie_vendor_id_cmd(cmd, read_bytes_count);
++		break;
++	default:
++		/* NA */
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
++void module_i2c_s_run_fast(void)
++{
++	unsigned int stat;
++	int ret;
++
++	stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) {
++		if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK) {
++			read_bytes_count = 0;
++
++			cmd = regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
++
++			/* clear read request */
++			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
++			stat = i2c_dw_read_clear_intrbits_slave();
++		} else {
++			regmap_readl(mmPSOC_I2C_S_IC_CLR_RD_REQ);
++			regmap_readl(mmPSOC_I2C_S_IC_CLR_RX_UNDER);
++			stat = i2c_dw_read_clear_intrbits_slave();
++		}
++
++		ret = i2cslave_handle_read_req();
++		read_bytes_count++;
++		regmap_writel(ret, mmPSOC_I2C_S_IC_DATA_CMD);
++		preboot_puts("I2C SLAVE: read request processed");
++	}
++}
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+new file mode 100644
+index 0000000..f067ad0
+--- /dev/null
++++ b/preboot/module_lkd.c
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <hl_boot_if.h>
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++#include "boot_if.h"
++#include "fit.h"
++
++struct lkd_status {
++	int fit_not_checked;	/* negative logic */
++	u32 msg_reg_val;
++	u64 loadaddr;
++};
++
++static struct lkd_status sts = {
++	.fit_not_checked = 1,
++};
++
++void module_lkd_setup(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
++}
++
++enum cmd_check_res module_lkd_check(void)
++{
++	enum cmd_check_res res;
++
++	/* we already have the FIT and it is good */
++	if (sts.fit_not_checked != 1)
++		return FOUND_NO_RETURN;
++
++	sts.msg_reg_val = cpu_boot_cmd_get();
++	switch (sts.msg_reg_val) {
++	case KMD_MSG_GOTO_WFE:
++		res = FOUND_NO_RETURN;
++		/* WFE - we should clear the message/cmd register */
++		cpu_boot_cmd_clr_before_wfe();
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD WFE received\n");
++		break;
++	case KMD_MSG_FIT_RDY:
++		res = FOUND_SLOW_RETURN;
++		/* Tell LKD we got the message */
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD FIT RDY received\n");
++		break;
++	case KMD_MSG_SKIP_BMC:
++		cpu_boot_rsp_set(CPU_MSG_ERR);
++		preboot_puts("LKD SKIP BMC received\n");
++		/* no break */
++	default:
++		res = NOT_FOUND;
++	}
++
++	return res;
++}
++
++void module_lkd_disable(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
++}
++
++void module_lkd_run(void)
++{
++	int err;
++	void *fit = (void *)FIT_IMG_BASE;
++
++	err = !fit_check_format(fit);
++	if (!err)
++		err = fit_load_image(fit, &sts.loadaddr);
++
++	if (err) {/* Report the FIT is bad */
++		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
++		preboot_puts("FIT loading failed, Retrying...\n");
++		return;
++	}
++
++	sts.fit_not_checked = 0;
++	/* Report the FIT is good */
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, false);
++}
++
++void module_lkd_run_noret(void)
++{
++	switch (sts.msg_reg_val) {
++	case KMD_MSG_GOTO_WFE:
++		cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
++		wfe();
++		break;
++	case KMD_MSG_FIT_RDY:
++		image_start(sts.loadaddr);
++		/* no break */
++	default:
++		break;
++	}
++}
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+new file mode 100644
+index 0000000..688bbc2
+--- /dev/null
++++ b/preboot/module_pci.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <pcie_aux_regs.h>
++#include <pcie_core_regs.h>
++
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++
++struct pci_status {
++	u32 flr_reg_val;
++	u32 hot_rst_reg_val;
++};
++
++static struct pci_status pci_sts = {
++	.flr_reg_val = ~1,
++	.hot_rst_reg_val = ~1,
++};
++
++__attribute__((weak)) void pci_dev_specific_setup(void) {}
++
++void module_pci_setup(void)
++{
++	pci_dev_specific_setup();
++}
++
++__attribute__((weak)) enum cmd_check_res dev_specific_module_pci_check(void)
++{
++	pci_sts.flr_reg_val = regmap_readl(mmPCIE_AUX_FLR_INT);
++	pci_sts.hot_rst_reg_val = regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
++
++	if (pci_sts.flr_reg_val == 1 || pci_sts.hot_rst_reg_val == 1)
++		return FOUND_FAST_RETURN;
++
++	return NOT_FOUND;
++}
++
++enum cmd_check_res module_pci_check(void)
++{
++	return dev_specific_module_pci_check();
++}
++
++void module_pci_run(void)
++{
++	if (pci_sts.flr_reg_val == 1) {
++		regmap_writel(1, mmPCIE_AUX_PF_FLR_ACTIVE);
++		regmap_writel(1, mmPCIE_AUX_FLR_INT);
++		regmap_writel(1, mmPCIE_AUX_PF_FLR_DONE);
++		preboot_puts("FLR received\n");
++	}
++
++	if (pci_sts.hot_rst_reg_val == 1) {
++		regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
++		regmap_writel(1, mmPCIE_AUX_LTSSM_EN);
++		preboot_puts("HOT RST received\n");
++	}
++}
+diff --git a/preboot/module_uart.c b/preboot/module_uart.c
+new file mode 100644
+index 0000000..16f3259
+--- /dev/null
++++ b/preboot/module_uart.c
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++
++enum cmd_check_res module_uart_check(void)
++{
++	if (!preboot_uart_tstc())
++		return NOT_FOUND;
++
++	preboot_puts("Keyboard press received\n");
++
++	return FOUND_FAST_RETURN;
++}
++
++__attribute__((weak)) void hl_parse_uart(int val) {}
++
++void module_uart_run(void)
++{
++	int val = preboot_uart_getc();
++
++	if (val < 0)
++		return;
++
++	hl_parse_uart(val);
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+new file mode 100644
+index 0000000..ff9b443
+--- /dev/null
++++ b/preboot/preboot.c
+@@ -0,0 +1,173 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * (C) Copyright 2017-2020 HabanaLabs, Ltd.
++ * All rights reserved.
++ *
++ */
++
++#include <stddef.h>
++
++#include <psoc_global_conf_regs.h>
++
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_if.h>
++
++#include "common.h"
++#include "uart.h"
++#include "pll.h"
++#include "boot_if.h"
++#include "cmd_module.h"
++
++static struct cmd_module_ops cmd_ops[] = {
++	{	/* PCI module */
++		.setup = module_pci_setup,
++		.check = module_pci_check,
++		.disable = noop,
++		.run = noop,
++		.enable = noop,
++		.run_fast = module_pci_run,
++		.teardown = noop,
++		.run_noreturn = noop,
++	},
++	{	/* FW UPD module */
++		.setup = module_fwupd_setup,
++		.check = module_fwupd_check,
++		.disable = noop,
++		.run = noop,
++		.enable = noop,
++		.run_fast = module_fwupd_run,
++		.teardown = noop,
++		.run_noreturn = noop,
++	},
++	{	/* LKD module */
++		.setup = module_lkd_setup,
++		.check = module_lkd_check,
++		.disable = module_lkd_disable,
++		.run = module_lkd_run,
++		.enable = module_lkd_setup,
++		.run_fast = noop,
++		.teardown = module_lkd_disable,
++		.run_noreturn = module_lkd_run_noret,
++	},
++	{	/* UART module */
++		.setup = noop,
++		.check = module_uart_check,
++		.disable = noop,
++		.run = noop,
++		.enable = noop,
++		.run_fast = module_uart_run,
++		.teardown = noop,
++		.run_noreturn = noop,
++	},
++	{	/* I2C SLAVE module */
++		.setup = module_i2c_s_setup,
++		.check = module_i2c_s_check,
++		.disable = module_i2c_s_disable,
++		.run = noop,
++		.enable = module_i2c_s_setup,
++		.run_fast = module_i2c_s_run_fast,
++		.teardown = module_i2c_s_disable,
++		.run_noreturn = noop,
++	},
++};
++
++static void preboot_handle_cmds(void)
++{
++	int i = 0, j = 0, size = ARRAY_SIZE(cmd_ops);
++	enum cmd_check_res res = NOT_FOUND;
++
++	for (j = 0; j < size; j++)
++		cmd_ops[j].setup();
++
++	preboot_puts("Waiting for commands...\n");
++	i = 0;
++	while (1) {
++		res = cmd_ops[i].check();
++		switch (res) {
++		case NOT_FOUND:
++			break;
++		case FOUND_FAST_RETURN:
++			cmd_ops[i].run_fast();
++			break;
++		case FOUND_SLOW_RETURN:
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].disable();
++
++			cmd_ops[i].run();
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].enable();
++
++			break;
++		case FOUND_NO_RETURN:
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].teardown();
++
++			cmd_ops[i].run_noreturn();
++			break;
++		default:
++			break;
++		}
++
++		if (++i == size)
++			i = 0;
++	}
++}
++
++static const char *preboot_ver_str = "Preboot " VERSION_STR;
++static char preboot_btl_ver_str[VERSION_MAX_LEN] = "BTL version ";
++
++static void preboot_version(void)
++{
++	unsigned long offset = (unsigned long) preboot_btl_ver_str;
++	u32 btlver = regmap_readl(mmPREBOOT_VER_OFFSET);
++	int i, btl_ver_sz;
++
++	preboot_puts("\n");
++	preboot_puts_raw(preboot_btl_ver_str);
++	preboot_puth(btlver, true);
++	preboot_puts_raw(preboot_ver_str);
++	preboot_puts("\n");
++
++	/* get to the end of the predefined btl string */
++	for (i = 0; i < VERSION_MAX_LEN; i++)
++		if (preboot_btl_ver_str[i] == '\0')
++			break;
++
++	/* convert and copy the btl version */
++	i += preboot_uint2hexstring(&preboot_btl_ver_str[i], btlver, true);
++
++	/* separate the btl from preboot */
++	preboot_btl_ver_str[i++] = '\n';
++	btl_ver_sz = i;
++
++	/* copy the preboot version */
++	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
++		preboot_btl_ver_str[i++] = preboot_ver_str[j];
++		if (preboot_ver_str[j] == '\0')
++			break;
++	}
++
++	regmap_writel((u32)(offset & ~SDRAM_BASE), mmPREBOOT_VER_OFFSET);
++}
++
++void preboot_main(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
++	/* Enable the errors communication */
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_ENABLED, true);
++
++	/*
++	 * Note: we assume CPU frequency is not changed while CPU is running,
++	 * so the udelay init is done once before we start.
++	 */
++	udelay_init();
++
++	hl_uart_init();
++	hl_ts_init();
++	preboot_version();
++	preboot_handle_cmds();
++}
+diff --git a/preboot/sha256.c b/preboot/sha256.c
+new file mode 100644
+index 0000000..1cfb109
+--- /dev/null
++++ b/preboot/sha256.c
+@@ -0,0 +1,277 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * FIPS-180-2 compliant SHA-256 implementation
++ *
++ * Copyright (C) 2001-2003  Christophe Devine
++ */
++
++#include "common.h"
++#include <string.h>
++#include "sha256.h"
++
++struct sha256_context {
++	u32 total[2];
++	u32 state[8];
++	u8 buffer[64];
++};
++
++/*----------------------------------------------------------------*/
++
++const u8 sha256_der_prefix[SHA256_DER_LEN] = {
++	0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
++	0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
++	0x00, 0x04, 0x20
++};
++
++/*
++ * 32-bit integer manipulation macros (big endian)
++ */
++#ifndef GET_UINT32_BE
++#define GET_UINT32_BE(n, b, i) {			\
++	(n) = ((unsigned long) (b)[(i)] << 24)		\
++	    | ((unsigned long) (b)[(i) + 1] << 16)	\
++	    | ((unsigned long) (b)[(i) + 2] <<  8)	\
++	    | ((unsigned long) (b)[(i) + 3]);		\
++}
++#endif
++#ifndef PUT_UINT32_BE
++#define PUT_UINT32_BE(n, b, i) {			\
++	(b)[(i)] = (unsigned char)((n) >> 24);		\
++	(b)[(i) + 1] = (unsigned char) ((n) >> 16);	\
++	(b)[(i) + 2] = (unsigned char) ((n) >>  8);	\
++	(b)[(i) + 3] = (unsigned char) ((n));		\
++}
++#endif
++
++void sha256_starts(struct sha256_context *ctx)
++{
++	ctx->total[0] = 0;
++	ctx->total[1] = 0;
++
++	ctx->state[0] = 0x6A09E667;
++	ctx->state[1] = 0xBB67AE85;
++	ctx->state[2] = 0x3C6EF372;
++	ctx->state[3] = 0xA54FF53A;
++	ctx->state[4] = 0x510E527F;
++	ctx->state[5] = 0x9B05688C;
++	ctx->state[6] = 0x1F83D9AB;
++	ctx->state[7] = 0x5BE0CD19;
++}
++
++static void sha256_process(struct sha256_context *ctx, const u8 data[64])
++{
++	u32 temp1, temp2;
++	u32 W[64];
++	u32 A, B, C, D, E, F, G, H;
++
++	GET_UINT32_BE(W[0], data, 0);
++	GET_UINT32_BE(W[1], data, 4);
++	GET_UINT32_BE(W[2], data, 8);
++	GET_UINT32_BE(W[3], data, 12);
++	GET_UINT32_BE(W[4], data, 16);
++	GET_UINT32_BE(W[5], data, 20);
++	GET_UINT32_BE(W[6], data, 24);
++	GET_UINT32_BE(W[7], data, 28);
++	GET_UINT32_BE(W[8], data, 32);
++	GET_UINT32_BE(W[9], data, 36);
++	GET_UINT32_BE(W[10], data, 40);
++	GET_UINT32_BE(W[11], data, 44);
++	GET_UINT32_BE(W[12], data, 48);
++	GET_UINT32_BE(W[13], data, 52);
++	GET_UINT32_BE(W[14], data, 56);
++	GET_UINT32_BE(W[15], data, 60);
++
++#define SHR(x, n) ((x & 0xFFFFFFFF) >> n)
++#define ROTR(x, n) (SHR(x, n) | (x << (32 - n)))
++
++#define S0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ SHR(x, 3))
++#define S1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10))
++
++#define S2(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
++#define S3(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
++
++#define F0(x, y, z) ((x & y) | (z & (x | y)))
++#define F1(x, y, z) (z ^ (x & (y ^ z)))
++
++#define R(t)					\
++(						\
++	W[t] = S1(W[t - 2]) + W[t - 7] +	\
++		S0(W[t - 15]) + W[t - 16]	\
++)
++
++#define P(a, b, c, d, e, f, g, h, x, K) {		\
++	temp1 = h + S3(e) + F1(e, f, g) + K + x;	\
++	temp2 = S2(a) + F0(a, b, c);		\
++	d += temp1; h = temp1 + temp2;		\
++}
++
++	A = ctx->state[0];
++	B = ctx->state[1];
++	C = ctx->state[2];
++	D = ctx->state[3];
++	E = ctx->state[4];
++	F = ctx->state[5];
++	G = ctx->state[6];
++	H = ctx->state[7];
++
++	P(A, B, C, D, E, F, G, H, W[0], 0x428A2F98);
++	P(H, A, B, C, D, E, F, G, W[1], 0x71374491);
++	P(G, H, A, B, C, D, E, F, W[2], 0xB5C0FBCF);
++	P(F, G, H, A, B, C, D, E, W[3], 0xE9B5DBA5);
++	P(E, F, G, H, A, B, C, D, W[4], 0x3956C25B);
++	P(D, E, F, G, H, A, B, C, W[5], 0x59F111F1);
++	P(C, D, E, F, G, H, A, B, W[6], 0x923F82A4);
++	P(B, C, D, E, F, G, H, A, W[7], 0xAB1C5ED5);
++	P(A, B, C, D, E, F, G, H, W[8], 0xD807AA98);
++	P(H, A, B, C, D, E, F, G, W[9], 0x12835B01);
++	P(G, H, A, B, C, D, E, F, W[10], 0x243185BE);
++	P(F, G, H, A, B, C, D, E, W[11], 0x550C7DC3);
++	P(E, F, G, H, A, B, C, D, W[12], 0x72BE5D74);
++	P(D, E, F, G, H, A, B, C, W[13], 0x80DEB1FE);
++	P(C, D, E, F, G, H, A, B, W[14], 0x9BDC06A7);
++	P(B, C, D, E, F, G, H, A, W[15], 0xC19BF174);
++	P(A, B, C, D, E, F, G, H, R(16), 0xE49B69C1);
++	P(H, A, B, C, D, E, F, G, R(17), 0xEFBE4786);
++	P(G, H, A, B, C, D, E, F, R(18), 0x0FC19DC6);
++	P(F, G, H, A, B, C, D, E, R(19), 0x240CA1CC);
++	P(E, F, G, H, A, B, C, D, R(20), 0x2DE92C6F);
++	P(D, E, F, G, H, A, B, C, R(21), 0x4A7484AA);
++	P(C, D, E, F, G, H, A, B, R(22), 0x5CB0A9DC);
++	P(B, C, D, E, F, G, H, A, R(23), 0x76F988DA);
++	P(A, B, C, D, E, F, G, H, R(24), 0x983E5152);
++	P(H, A, B, C, D, E, F, G, R(25), 0xA831C66D);
++	P(G, H, A, B, C, D, E, F, R(26), 0xB00327C8);
++	P(F, G, H, A, B, C, D, E, R(27), 0xBF597FC7);
++	P(E, F, G, H, A, B, C, D, R(28), 0xC6E00BF3);
++	P(D, E, F, G, H, A, B, C, R(29), 0xD5A79147);
++	P(C, D, E, F, G, H, A, B, R(30), 0x06CA6351);
++	P(B, C, D, E, F, G, H, A, R(31), 0x14292967);
++	P(A, B, C, D, E, F, G, H, R(32), 0x27B70A85);
++	P(H, A, B, C, D, E, F, G, R(33), 0x2E1B2138);
++	P(G, H, A, B, C, D, E, F, R(34), 0x4D2C6DFC);
++	P(F, G, H, A, B, C, D, E, R(35), 0x53380D13);
++	P(E, F, G, H, A, B, C, D, R(36), 0x650A7354);
++	P(D, E, F, G, H, A, B, C, R(37), 0x766A0ABB);
++	P(C, D, E, F, G, H, A, B, R(38), 0x81C2C92E);
++	P(B, C, D, E, F, G, H, A, R(39), 0x92722C85);
++	P(A, B, C, D, E, F, G, H, R(40), 0xA2BFE8A1);
++	P(H, A, B, C, D, E, F, G, R(41), 0xA81A664B);
++	P(G, H, A, B, C, D, E, F, R(42), 0xC24B8B70);
++	P(F, G, H, A, B, C, D, E, R(43), 0xC76C51A3);
++	P(E, F, G, H, A, B, C, D, R(44), 0xD192E819);
++	P(D, E, F, G, H, A, B, C, R(45), 0xD6990624);
++	P(C, D, E, F, G, H, A, B, R(46), 0xF40E3585);
++	P(B, C, D, E, F, G, H, A, R(47), 0x106AA070);
++	P(A, B, C, D, E, F, G, H, R(48), 0x19A4C116);
++	P(H, A, B, C, D, E, F, G, R(49), 0x1E376C08);
++	P(G, H, A, B, C, D, E, F, R(50), 0x2748774C);
++	P(F, G, H, A, B, C, D, E, R(51), 0x34B0BCB5);
++	P(E, F, G, H, A, B, C, D, R(52), 0x391C0CB3);
++	P(D, E, F, G, H, A, B, C, R(53), 0x4ED8AA4A);
++	P(C, D, E, F, G, H, A, B, R(54), 0x5B9CCA4F);
++	P(B, C, D, E, F, G, H, A, R(55), 0x682E6FF3);
++	P(A, B, C, D, E, F, G, H, R(56), 0x748F82EE);
++	P(H, A, B, C, D, E, F, G, R(57), 0x78A5636F);
++	P(G, H, A, B, C, D, E, F, R(58), 0x84C87814);
++	P(F, G, H, A, B, C, D, E, R(59), 0x8CC70208);
++	P(E, F, G, H, A, B, C, D, R(60), 0x90BEFFFA);
++	P(D, E, F, G, H, A, B, C, R(61), 0xA4506CEB);
++	P(C, D, E, F, G, H, A, B, R(62), 0xBEF9A3F7);
++	P(B, C, D, E, F, G, H, A, R(63), 0xC67178F2);
++
++	ctx->state[0] += A;
++	ctx->state[1] += B;
++	ctx->state[2] += C;
++	ctx->state[3] += D;
++	ctx->state[4] += E;
++	ctx->state[5] += F;
++	ctx->state[6] += G;
++	ctx->state[7] += H;
++}
++
++void sha256_update(struct sha256_context *ctx, const u8 *input, u32 length)
++{
++	u32 left, fill;
++
++	if (!length)
++		return;
++
++	left = ctx->total[0] & 0x3F;
++	fill = 64 - left;
++
++	ctx->total[0] += length;
++	ctx->total[0] &= 0xFFFFFFFF;
++
++	if (ctx->total[0] < length)
++		ctx->total[1]++;
++
++	if (left && length >= fill) {
++		memcpy((void *) (ctx->buffer + left), (void *) input, fill);
++		sha256_process(ctx, ctx->buffer);
++		length -= fill;
++		input += fill;
++		left = 0;
++	}
++
++	while (length >= 64) {
++		sha256_process(ctx, input);
++		length -= 64;
++		input += 64;
++	}
++
++	if (length)
++		memcpy((void *) (ctx->buffer + left), (void *) input, length);
++}
++
++static u8 sha256_padding[64] = {
++	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++};
++
++void sha256_finish(struct sha256_context *ctx, u8 digest[32])
++{
++	u32 last, padn;
++	u32 high, low;
++	u8 msglen[8];
++
++	high = ((ctx->total[0] >> 29)
++		| (ctx->total[1] << 3));
++	low = (ctx->total[0] << 3);
++
++	PUT_UINT32_BE(high, msglen, 0);
++	PUT_UINT32_BE(low, msglen, 4);
++
++	last = ctx->total[0] & 0x3F;
++	padn = (last < 56) ? (56 - last) : (120 - last);
++
++	sha256_update(ctx, sha256_padding, padn);
++	sha256_update(ctx, msglen, 8);
++
++	PUT_UINT32_BE(ctx->state[0], digest, 0);
++	PUT_UINT32_BE(ctx->state[1], digest, 4);
++	PUT_UINT32_BE(ctx->state[2], digest, 8);
++	PUT_UINT32_BE(ctx->state[3], digest, 12);
++	PUT_UINT32_BE(ctx->state[4], digest, 16);
++	PUT_UINT32_BE(ctx->state[5], digest, 20);
++	PUT_UINT32_BE(ctx->state[6], digest, 24);
++	PUT_UINT32_BE(ctx->state[7], digest, 28);
++}
++
++/*
++ * Output = SHA-256( input buffer ).
++ */
++void sha256_csum(const unsigned char *input, unsigned int ilen,
++		unsigned char *output)
++{
++	struct sha256_context ctx;
++
++	if (ilen < SHA256_SUM_LEN) {
++		*output = 0;
++		return;
++	}
++	sha256_starts(&ctx);
++	sha256_update(&ctx, input, ilen);
++	sha256_finish(&ctx, output);
++}
+diff --git a/preboot/sha256.h b/preboot/sha256.h
+new file mode 100644
+index 0000000..2cc1fd9
+--- /dev/null
++++ b/preboot/sha256.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ */
++#ifndef _SHA256_H
++#define _SHA256_H
++
++#define SHA256_SUM_LEN	32
++#define SHA256_DER_LEN	19
++
++extern const u8 sha256_der_prefix[];
++
++void sha256_csum(const u8 *input, u32 ilen, u8 *output);
++
++#endif /* _SHA256_H */

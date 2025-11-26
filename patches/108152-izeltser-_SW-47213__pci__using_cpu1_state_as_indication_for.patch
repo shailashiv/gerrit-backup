@@ -1,0 +1,82 @@
+From 73e17d78d1b7ae5ab5c2dcf19cb3c8db09af7fa5 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 04 Jul 2021 14:46:50 +0300
+Subject: [PATCH] [SW-47213] pci: using cpu1 state as indication for pci init done
+
+Using scratch pad register for pci init indication opens a security
+threat, because sp register are writable by the host.
+Instead, CPU0 will monitor the running state of CPU1 and deduct the
+pci state from there.
+Meaning, if CPU1 has finished running (wfe state) or wasn't running
+at all (reset state), then pci is initialized. otherwise pci
+initialization is still in progress.
+
+Change-Id: I3d1540ee3500b6e346ef9ea06a306180a1c7faa6
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 06001f7..77269c0 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -54,6 +54,8 @@
+ 	((BIT(1) << CPU_CA53_CFG_ARM_RST_CONTROL_NCPUPORESET_SHIFT) |	\
+ 	 (BIT(1) << CPU_CA53_CFG_ARM_RST_CONTROL_NCORERESET_SHIFT))
+ 
++#define CPU1_WFE_STAT (BIT(1) << CPU_CA53_CFG_ARM_PWR_STAT_0_STANDBYWFE_SHIFT)
++
+ bool hl_is_debug_mode(enum hl_debug_hw_func func)
+ {
+ 	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
+@@ -246,8 +248,6 @@
+ }
+ static void preboot_pcie_monitoring(void)
+ {
+-	regmap_writel(PCIE_NOT_INITIALIZED, mmPCIE_STATE);
+-
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+ 		;
+@@ -285,7 +285,6 @@
+ 
+ 	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-	regmap_writel(PCIE_INITIALIZED, mmPCIE_STATE);
+ }
+ 
+ void preboot_secondary_cpu_stop(void)
+@@ -578,5 +577,17 @@
+ 
+ bool is_pcie_initialized(void)
+ {
+-	return !!regmap_readl(mmPCIE_STATE);
++	u32 rst_ctrl, wfe_stat;
++
++	rst_ctrl = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	rst_ctrl &= CPU1_RST_CTRL; /* reset signals are active low */
++
++	wfe_stat = regmap_readl(mmCPU_CA53_CFG_ARM_PWR_STAT_0);
++	wfe_stat &= CPU1_WFE_STAT;
++
++	/*
++	 * if CPU1 finished running (wfe) of didn't run at all (reset state)
++	 * pcie should be in operational state.
++	 */
++	return (!rst_ctrl || wfe_stat);
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index 73751b7..6a5e1de 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -80,11 +80,6 @@
+ 	FIT_SEC_SIGN_FAILED,
+ };
+ 
+-enum pcie_init_status {
+-	PCIE_NOT_INITIALIZED = 0,
+-	PCIE_INITIALIZED
+-};
+-
+ struct hl_nic_en {
+ 	bool is_valid;
+ 	uint32_t bitmask;

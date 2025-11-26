@@ -1,0 +1,110 @@
+From 3800025fe9621c162012952436a203e417da3c44 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 04 Jun 2019 13:25:23 +0300
+Subject: [PATCH] [SW-4185] gaudi: pll: add w/a for north hbm pll
+
+The North HBM PLL is different than the others in a way that nothing can
+program it while the HBW clock is gated.
+Therefore we cannot use the usual W/A here.
+In order to W/A the clock switch glitch in the North HBM PLL, we toggle
+the clock switch in a regular manner and deal with the "fallout" of the
+clock switch glitch.
+To deal with the "fallout", we need to reset the SoC subsystems
+excluding PLLs.
+We implement the following state machine for the North HBM PLL:
+                   -------
+      ----------->/ init  \
+      |           \ done ?/
+      |            -------
+      |        no /       \ yes
+      |          /         \
+      |     ------         -------
+      |    / do   \<---   / reset \
+      |    \ init /   |   \ done ?/
+      |     ------    |    -------
+      |       |        \ no /   \ yes
+      |       |         ----     \
+      |    --------            -------
+      |   / update \          / clear \
+      |   \ reset  /          \ reset /
+      |    --------            -------
+      |        |                  |
+      |     -------            -------
+      |____/ reset \          / cont. \
+           \  soc  /          \ boot  /
+            -------            -------
+
+This way we do both reconfigure the PLL, so we boot in a known state,
+and clear the possible fallout from the clock switch glitch.
+
+Change-Id: I6a9cb4e4d52880d8c3b37527eda289bc6d141f94
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index b04622b..7798a41 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -173,12 +173,26 @@
+ 	},
+ };
+ 
++static bool gaudi_hbw_init_done(u64 pll_base)
++{
++	return hl_pll_bypass_get(pll_base, HL_PLL_DIV0) == HL_PLL_PLL_CLK;
++}
++
++static bool gaudi_reset_soc_done(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2) == 1;
++}
++
+ bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
+ {
+ 	switch (cfg->base) {
+ 	case mmPSOC_PCI_PLL_BASE:
+ 	case mmPSOC_CPU_PLL_BASE:
+ 		return false;
++	case mmNIC2_HBM_PLL_BASE:
++		if (gaudi_hbw_init_done(cfg->base) && gaudi_reset_soc_done())
++			return false;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -229,6 +243,19 @@
+ 	return factor > 2 ? factor : 2;
+ }
+ 
++static void gaudi_reset_soc(void)
++{
++	regmap_writel(0xFFE00000, mmPSOC_GLOBAL_CONF_SW_ALL_RST_CFG_L);
++	regmap_writel(0x003FFFFF, mmPSOC_GLOBAL_CONF_SW_ALL_RST_CFG_H);
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_SW_ALL_RST);
++
++	/* Wait for reset */
++	__asm__ __volatile__ ("wfe\n\t" : : );
++
++	while (1)
++		preboot_puts("Surprise! Woke up from WFE...\n");
++}
++
+ #define HL_PLL_GATER_OFFSET	0x300
+ #define HL_PLL_DIVSEL_OFFSET	0x280
+ 
+@@ -250,7 +277,15 @@
+ 		switch (gaudi_pll_cfg[i].base) {
+ 		case mmPSOC_CPU_PLL_BASE:
+ 		case mmPSOC_PCI_PLL_BASE:
++			continue;
+ 		case mmNIC2_HBM_PLL_BASE:
++			if (gaudi_reset_soc_done()) {
++				regmap_writel(0, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++			} else {
++				regmap_writel(1, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++				preboot_puts("NIC2_HBM configuration done, resetting...\n");
++				gaudi_reset_soc();
++			}
+ 			continue;
+ 		default:
+ 			break;

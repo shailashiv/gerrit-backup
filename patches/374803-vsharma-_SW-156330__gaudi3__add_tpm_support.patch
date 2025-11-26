@@ -1,0 +1,80 @@
+From 210429cd3e3292071d6f250fa95f8cf8203e504a Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Thu, 30 Nov 2023 20:27:41 +0200
+Subject: [PATCH] [SW-156330] gaudi3: add tpm support
+
+This patch adds initial support to extend preboot
+hash into tpm via tpm_pcr_extend() function.
+
+Change-Id: I0b30d1b045e2bb90da28e3f877daffdd2af87316
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 5a8f209..bd4f9be 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -74,6 +74,8 @@
+ 	return is_valid;
+ }
+ 
++__weak void preboot_tpm_extend(struct boot_desc *desc) {}
++
+ __weak bool ppboot_load_preboot_img(u64 *loadaddr)
+ {
+ 	struct boot_desc desc;
+@@ -89,6 +91,7 @@
+ 	ret = ppboot_try_candidate_img(image_pending, &desc, true);
+ 	if (ret) {
+ 		*loadaddr = desc.loadaddr;
++		preboot_tpm_extend(&desc);
+ 		return true;
+ 	}
+ 
+@@ -98,6 +101,7 @@
+ 	ret = ppboot_try_candidate_img(image_pending, &desc, false);
+ 	if (ret) {
+ 		*loadaddr = desc.loadaddr;
++		preboot_tpm_extend(&desc);
+ 		return true;
+ 	}
+ 
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index de49fb4..515cd64 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -43,6 +43,8 @@
+ #include <arcboot_export.h>
+ #include <gaudi3/gaudi3_security.h>
+ #include <hl_sec_if.h>
++#include <tpm2.h>
++#include <tpm_auth.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+ #include <gaudi3/gaudi3_reg_map.h>
+@@ -1516,3 +1518,12 @@
+ 	memcpy(hash, desc.chksum, SHA384_SUM_LEN);
+ 	return is_valid;
+ }
++
++void preboot_tpm_extend(struct boot_desc *desc)
++{
++	if (!tpm_is_supported())
++		return;
++
++	if (tpm_pcr_extend(TPM2_PREBOOT_PCR_IDX, desc->chksum))
++		preboot_puts("PPBOOT: preboot pcr extend failed\n");
++}
+diff --git a/arch/gaudi3/common/common.c b/arch/gaudi3/common/common.c
+index f9ee96c..f171861 100644
+--- a/arch/gaudi3/common/common.c
++++ b/arch/gaudi3/common/common.c
+@@ -128,6 +128,8 @@
+ 	return false;
+ }
+ 
++bool tpm_is_supported(void) { return true; }
++
+ void spi_tpm_base_get(unsigned int *regs)
+ {
+ 	*regs = D0_PSOC_SPI_REG(mmSPI_CTRLR0);

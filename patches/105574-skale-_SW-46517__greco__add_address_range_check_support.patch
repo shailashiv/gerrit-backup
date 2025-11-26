@@ -1,0 +1,112 @@
+From 5ca32cbf10572c82205a46008ebc53474353d2ba Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 23 Jun 2021 20:53:11 +0300
+Subject: [PATCH] [SW-46517] greco: add address range check support
+
+This patch implements address range check support for the addresses
+received as part of FIT.
+
+Change-Id: I0de04f26d2dd961436473d016c5d2d44a7a48d78
+---
+
+diff --git a/arch/greco_arc_gnu/common.c b/arch/greco_arc_gnu/common.c
+index e598026..7c88fd2 100644
+--- a/arch/greco_arc_gnu/common.c
++++ b/arch/greco_arc_gnu/common.c
+@@ -36,12 +36,14 @@
+ #include <greco/greco_reg_map.h>
+ #include <common/pci_ids.h>
+ //#include <greco_blocks_linux_driver.h>
++#include <goya2/goya2.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ #include <string.h>
++#include <spi.h>
+ #include <preboot/fit.h>
+ #include <boot_if.h>
+ #include "common.h"
+@@ -293,6 +295,47 @@
+ 			mmCPU_IF_PCIE_SPI_INTR_CLR);
+ }
+ 
++#define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
++#define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
++
++bool preboot_sram_is_valid_address_range(u64 addr, int len)
++{
++	/* Prepare the ARC SRAM address */
++	u32 arc_addr = ((u32)addr & 0xFFFFFFF) | BIT(28);
++
++	if (arc_addr >= SDRAM_BASE && arc_addr + len <= SDRAM_BASE + SRAM_SIZE)
++		return !preboot_is_overlap_address_range(addr, len);
++
++	if (addr >= FIT_IMG_SPSRAM_BASE && addr + len <= FIT_IMG_SPSRAM_END)
++		return true;
++
++	return false;
++}
++
++bool preboot_is_valid_address_range(u64 addr, int len)
++{
++	if (addr >= HL_SP_SRAM_BASE &&
++	    addr + len < HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE) {
++		return true;
++	}
++
++	if (preboot_sram_is_valid_address_range(addr, len)) {
++		return true;
++	}
++
++	if (addr >= ARC0_ICCM_BASE_ADDR &&
++	    addr + len < ARC0_ICCM_BASE_ADDR + ARC0_MEM_SIZE) {
++		return true;
++	}
++
++	if (addr >= ARC1_ICCM_BASE_ADDR &&
++	    addr + len < ARC1_ICCM_BASE_ADDR + ARC1_MEM_SIZE) {
++		return true;
++	}
++
++	return false;
++}
++
+ static struct hl_ts_cfg greco_hl_ts_data[] = {
+ 	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
+ 		.use_calib = false, .calib_offset = 10, .hl_tmp_data = { 0 }},
+diff --git a/include/preboot.h b/include/preboot.h
+index d51b49f..fb9c048 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -171,6 +171,7 @@
+ 				    struct preboot_fuse_ver_data *fuse_data);
+ bool preboot_sram_is_valid_address_range(u64 addr, int len);
+ bool preboot_is_valid_address_range(u64 addr, int len);
++bool preboot_is_overlap_address_range(u64 addr, int len);
+ 
+ enum hl_fw_en_caps;
+ 
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index aa8210d..322c0d4 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -249,7 +249,7 @@
+ __weak void preboot_sp_sram_init(void) {}
+ __weak void hl_ram_init(void) {}
+ 
+-static bool preboot_is_overlap_address_range(u64 addr, int len)
++bool preboot_is_overlap_address_range(u64 addr, int len)
+ {
+ 	if (addr + len <= (uintptr_t)&_start || addr >= (uintptr_t)&__stack_top)
+ 		return false;
+@@ -257,7 +257,7 @@
+ 	return true;
+ }
+ 
+-bool preboot_sram_is_valid_address_range(u64 addr, int len)
++__weak bool preboot_sram_is_valid_address_range(u64 addr, int len)
+ {
+ 	if (addr >= SDRAM_BASE && addr + len <= SDRAM_BASE + SRAM_SIZE)
+ 		return !preboot_is_overlap_address_range(addr, len);

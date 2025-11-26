@@ -1,0 +1,122 @@
+From e65b10617c9c8b4873e20654fa942bfe66ffaa98 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Wed, 27 Oct 2021 18:12:54 +0300
+Subject: [PATCH] [SW-56233] security: gaudi2: protection bits init
+
+PSOC global conf address space will be opened using
+range registers in preboot. Prior to that unrelevant
+register spaces are blocked using protection bits
+configurations.
+Only following registers are opened,
+
+•	BTM_FSM
+•	SCRATCHPAD
+•	CPU_BOOT_STATUS
+•	KMD_MSG_TO_CPU
+•	TRACE_ADDR
+•	TRACE_AWUSER
+•	TRACE_ARUSER
+
+Change-Id: I9eb52801daccacb6e57d3968138a6c2546a31048
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index b286374..4fb6dff 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -10,9 +10,26 @@
+ #include <psoc_arc0_mstr_if_core_lbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_lbw_regs.h>
++#include <gaudi2/gaudi2.h>
++#include <gaudi2_blocks.h>
++#include <security.h>
++#include <uart.h>
++#include <hl_protbits_fw_if.h>
+ 
+ 
+ #define EN_ARC_SEC_PRIV				0x3
++
++/* protection bits configurations to open some selective registers */
++static u32 gaudi2_protbits_data0[] = { 0x400, 0xc103 };
++
++struct hl_prot_bits_cfg gaudi2_prot_bits_cfg[] = {
++	{{ HL_BLOCK_TYPE_PSOC, (mmPSOC_GLOBAL_CONF_BASE & ~CFG_BASE), 1, 0, 0, 0x0, 0x0, 0x0 },
++	  .prot_map = 0x00000004,
++	  .data_map = 0x41,
++	  .data = gaudi2_protbits_data0,
++	  .data_size = ARRAY_SIZE(gaudi2_protbits_data0)
++	},
++};
+ void preboot_secure_arc(void)
+ {
+ 	/* enable security and privilege mode for arc0 and arc1 */
+@@ -26,7 +43,67 @@
+ 		 mmPSOC_ARC1_MSTR_IF_CORE_LBW_AXPROT_OVRD);
+ }
+ 
++static int init_prot_bits_block(u8 major, u8 minor, u8 sub_minor)
++{
++	struct hl_prot_bits_cfg *cfg = &gaudi2_prot_bits_cfg[0];
++	u8 b_idx = 0, d_idx = 0;
++	u32 val;
++	u32 addr, reg_addr;
++
++	addr = cfg->addr.base_addr + HL_GLBL_PRIV_REG_OFFSET + major * cfg->addr.major_offset +
++			  minor * cfg->addr.minor_offset + sub_minor * cfg->addr.sub_minor_offset;
++
++	while (b_idx != HL_PROT_BITS_REGS) {
++		reg_addr = addr + (b_idx * 4);
++		if (cfg->data_map & BIT(b_idx)) {
++			if (!cfg->data) {
++				preboot_puts("No data for prot bit cfg\n");
++				return 1;
++			}
++			if (d_idx >= cfg->data_size) {
++				preboot_puts("bad data idx for prot bit cfg\n");
++				return 1;
++			}
++			val = cfg->data[d_idx];
++			d_idx++;
++		} else {
++			val = (cfg->prot_map & BIT(b_idx)) ?
++						HL_CNF_ALL_NON_PROT : HL_CNF_ALL_PROT;
++		}
++		regmap_writel(val, reg_addr);
++		b_idx++;
++	}
++
++	return 0;
++}
++
++static void hl_dev_prot_bits_init(void)
++{
++	u8 major_idx, minor_idx, sub_minor_idx;
++	struct hl_prot_bits_addr block_addr;
++
++	block_addr = gaudi2_prot_bits_cfg[0].addr;
++	for (major_idx = 0; major_idx < block_addr.major; major_idx++) {
++		minor_idx = 0;
++		do {
++			sub_minor_idx = 0;
++			do {
++				init_prot_bits_block(major_idx, minor_idx, sub_minor_idx);
++			} while (sub_minor_idx < block_addr.sub_minor);
++			minor_idx++;
++		} while (minor_idx < block_addr.minor);
++	}
++
++	preboot_puts("gaudi2 protection bits configured\n");
++}
++
+ void preboot_security_init(void)
+ {
+ 	preboot_secure_arc();
++
++	/* Do security related initializations only if security is enabled */
++	if (!preboot_security_is_enabled())
++		return;
++
++	hl_dev_prot_bits_init();
+ }

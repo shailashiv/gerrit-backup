@@ -1,0 +1,75 @@
+From be953107e46e9aeeb4c2343b32ae3414cf9f52de Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 02 Dec 2021 17:23:56 +0200
+Subject: [PATCH] [SW-65065] gaudi2: psoc cpu pll
+
+In case of agent running on arm, accesses to cpu_lbw
+are slow if psoc_cpu pll div1 is not configured.
+Currently in secureboot flow FSM only configures
+Div0 which causes communication between agent and
+host to be very slow and mismatched. This patch
+adds separate function to configure psoc cpu pll
+only in case of secureboot flow.
+
+Change-Id: I05c5a5439feeae54091faf57ceffcd0fd2b14b70
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index c73f233..bd29f30 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -12,12 +12,33 @@
+ #include <bitops.h>
+ #include <preboot.h>
+ #include <uart.h>
++#include <pll.h>
+ 
+ #include "common.h"
+ #include <hl.h>
+ 
+ #define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
+ 
++static struct hl_pll_cfg gaudi2_arch_pll_cfg[] = {
++	{
++		.name = "PSOC_CPU_PLL",
++		.base = mmPSOC_CPU_PLL_CTRL_BASE,
++		.nr = 1, .nf = 60, .od = 3, .nb = 2,	/* 500 */
++		.div_factor = { -1, -1, 4, -1 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_REF_CLK
++		},
++	}
++};
++
++void hl_arch_pll_init(void)
++{
++	/* In case of secureboot flow psoc pll needs to be configured */
++	hl_pll_init(gaudi2_arch_pll_cfg, ARRAY_SIZE(gaudi2_arch_pll_cfg));
++}
++
+ u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+ {
+ 	/* SPSRAM fit can only be in general region */
+diff --git a/arch/gaudi2/common/asic.c b/arch/gaudi2/common/asic.c
+index 2fb8162..a853f2f 100644
+--- a/arch/gaudi2/common/asic.c
++++ b/arch/gaudi2/common/asic.c
+@@ -195,12 +195,16 @@
+ 	}
+ };
+ 
++__weak void hl_arch_pll_init(void) {}
++
+ void hl_dev_pll_init(void)
+ {
+ 	/* If FW skip enabled return */
+ 	if (hl_skip_fw_cfg())
+ 		return;
+ 
++	hl_arch_pll_init();
++
+ 	hl_pll_init(gaudi2_pll_cfg, ARRAY_SIZE(gaudi2_pll_cfg));
+ }
+ 

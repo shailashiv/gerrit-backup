@@ -1,0 +1,119 @@
+From 69f7c5107b85386b91ee80bd2346dab738c8bb81 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 12 May 2022 14:17:27 +0300
+Subject: [PATCH] [SW-66329] pif_arc: add interrupt vector table to iccm
+
+ARC CPU is using predefined address offsets from the IVT base address
+(reset vector in our case) for fetching vectors of the exceptions
+handling routines.
+The code startup location upon CPU reset is also taken from
+"reset exception" vector.
+
+In order to support proper startup sequence from reset, and basic
+safe exception handling, the interrupt vector table is added to
+the beginning of the ICCM memory.
+Default exception handling routine is added, this routine is just
+reporting the exception to the error register, and halting the CPU.
+
+Change-Id: Id55e6b80f803058ebde6582d18f734af43aaad49
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/crt0_pcie_pif.S b/app/pcie_pif/crt0_pcie_pif.S
+index 7cc8d29..1c6e8a5 100644
+--- a/app/pcie_pif/crt0_pcie_pif.S
++++ b/app/pcie_pif/crt0_pcie_pif.S
+@@ -4,12 +4,44 @@
+  * All Rights Reserved.
+  */
+ 
+-.globl	_start
+-_start:
++.section .ivt, "a", @progbits
+ 
+-/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
+-.global	lf2flt
+-lf2flt:
++; Helper macro to define weak symbols to include into interrupt vector table.
++; User code may define those functions in them, so user function will be
++; referenced in the IVT. By default all handlers point to _exit_halt - so they
++; always cause application halt, because if application causes an exception or
++; interrupt, but doesn't set a handler for it - something is wrong in
++; application. Exception is "start" entry of IVT, which points to _start
++; function.
++#define IVT_ENTRY(name) \
++    .word name `\
++    .weak name `\
++    .set name, exit_halt
++
++; handler's name,		number,	name,			offset in IVT (hex/dec)
++.word _start			; 0	program entry point	0x0		0
++IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
++IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
++IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
++IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
++IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
++IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
++IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
++IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
++IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
++IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
++IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
++IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
++IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
++IVT_ENTRY(EV_VecUnit)		; 14	EV_VecUnit		0x38		56
++
++.section .text.__startup, "ax", @progbits
++
++.global _start
++.type _start, @function
++.align 4
++
++_start:
+ 	mov	sp, __stack_top
+ 	mov	fp, sp
+ 
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index 5ff9251..07bda56 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -262,3 +262,11 @@
+ 	/* Handle commands */
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
++
++/* default exception handler, report error and halt */
++void exit_halt(void)
++{
++	hl_flr_report_err(PIF_ERR_CPU_EXCEPTION_HALT);
++
++	__asm__ __volatile__("sleep\n\t" : : );
++}
+diff --git a/app/pcie_pif/pcie_pif.lds.S b/app/pcie_pif/pcie_pif.lds.S
+index 1bb74e3..acf978f 100644
+--- a/app/pcie_pif/pcie_pif.lds.S
++++ b/app/pcie_pif/pcie_pif.lds.S
+@@ -15,6 +15,7 @@
+ 	DCCM	: ORIGIN = PIF_ARC_DCCM_LOCAL_BASE, LENGTH = 4K
+ }
+ 
++REGION_ALIAS("REGION_IVT",	ICCM)
+ REGION_ALIAS("REGION_TEXT",	ICCM)
+ REGION_ALIAS("REGION_RODATA",	ICCM)
+ REGION_ALIAS("REGION_DATA",	DCCM)
+@@ -25,7 +26,14 @@
+ ENTRY(_start)
+ SECTIONS
+ {
+-	.text : {
++	.ivt : {
++		KEEP (*(.ivt));	/* preserve symbols even if not referenced */
++		crt0_pcie_pif.o (.ivt*)
++		*(.ivt .ivt.*)
++		_eivt = . ;
++	} > REGION_IVT
++
++	.text : AT ( LOADADDR(.ivt) + SIZEOF(.ivt) ) {
+ 		. = ALIGN(4);
+ 		crt0_pcie_pif.o (.text*)
+ 		*(.text .text.*)

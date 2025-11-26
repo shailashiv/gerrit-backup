@@ -1,0 +1,514 @@
+From 955beb0c5441d034ab74294543c94cac3c387f9f Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 29 Apr 2021 21:58:51 +0300
+Subject: [PATCH] [SW-40350] fwupd: rework to remove busy-wait loops
+
+The module_fwupd was implemented like U-Boot implementation which was
+done before I2C slave bus support and thus did not take into an account
+I2C slave bus handling while being single threaded w/o interrupts.
+Rework the FWUPD module to remove any busy-wait loops and make all the
+possible handling of the protocol fast.
+The only commands that are handled slow are those requiring significant
+time to process.
+
+Change-Id: I98a5056098f7319453c0b9b955a1fee28afcd8ce
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 6e65fbc..566ed13 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -81,6 +81,7 @@
+ /* FWUPD */
+ void module_fwupd_setup(void);
+ enum cmd_check_res module_fwupd_check(void);
++void module_fwupd_run_fast(void);
+ void module_fwupd_run(void);
+ void module_fwupd_run_noret(void);
+ 
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 6e31ba5..6dfcb0e 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -31,9 +31,12 @@
+ #define HL_FIT_PROTO_STATUS_PROP	"protocol-status"
+ 
+ struct fwupd_state {
+-	bool is_fit_checked;
+-	unsigned int map_size;
+ 	bool sending_error_flag;
++	unsigned int map_size;
++	void *map_offset;
++	struct hl_upd_command cmd;
++	struct hl_upd_command wfc_cmd;
++	enum cmd_check_res exec_res;
+ };
+ 
+ static struct fwupd_state state;
+@@ -54,9 +57,34 @@
+ 	module_fwupd_send_status(HL_UPD_STS_RST_OK, NULL);
+ }
+ 
++/* NOOP is a sync command, so here we decide what execution type is needed */
++static enum cmd_check_res module_fwupd_check_noop(void)
++{
++	enum cmd_check_res res = NOT_FOUND;
++
++	/* check the command we got before waiting for sync */
++	switch (state.wfc_cmd.cmd) {
++	case HL_UPD_NOOP:
++		break;
++	case HL_UPD_RUN_SRAM:
++	case HL_UPD_RUN_SPSRAM:
++	case HL_UPD_GET_PROTO_STATUS:
++		res = FOUND_SLOW_RETURN;
++		break;
++	case HL_UPD_RST_STATE:
++	case HL_UPD_MAP_SRAM:
++	case HL_UPD_MAP_SPSRAM:
++	default:
++		res = FOUND_FAST_RETURN;
++		break;
++	}
++
++	return res;
++}
++
+ enum cmd_check_res module_fwupd_check(void)
+ {
+-	struct hl_upd_command cmd;
++	enum cmd_check_res res = NOT_FOUND;
+ 
+ 	/*
+ 	 * the error status response, involved
+@@ -69,70 +97,71 @@
+ 	if (state.sending_error_flag)
+ 		return FOUND_SLOW_RETURN;
+ 
+-	if (state.is_fit_checked)
+-		return FOUND_NO_RETURN;
++	if (state.exec_res != NOT_FOUND)
++		return state.exec_res;
+ 
+-	cmd.val = regmap_readl(mmUPD_CMD);
+-	switch (cmd.cmd) {
++	state.cmd.val = regmap_readl(mmUPD_CMD);
++
++	if (state.cmd.cmd == state.wfc_cmd.cmd)
++		return NOT_FOUND;
++
++	switch (state.cmd.cmd) {
++	case HL_UPD_NOOP:	/* NOOP is a special command */
++		res = module_fwupd_check_noop();
++		break;
+ 	case HL_UPD_CLR_STS:
+-		return FOUND_FAST_RETURN;
+ 	case HL_UPD_RST_STATE:
+ 	case HL_UPD_MAP_SRAM:
+ 	case HL_UPD_MAP_SPSRAM:
+ 	case HL_UPD_RUN_SRAM:
+ 	case HL_UPD_RUN_SPSRAM:
+ 	case HL_UPD_GET_PROTO_STATUS:
+-		return FOUND_SLOW_RETURN;
++		res = FOUND_FAST_RETURN;
++		break;
+ 	default:
+-		return NOT_FOUND;
++		break;
+ 	}
++
++	return res;
+ }
+ 
+-static int module_fwupd_wfc(int timeout_ms)
++static void module_fwupd_state_shift(void)
+ {
+-	unsigned int reg;
++	/* do not shift if got CLR_STS several times */
++	if (state.cmd.cmd == HL_UPD_CLR_STS)
++		return;
+ 
+-	for (; timeout_ms > 0; timeout_ms--) {
+-		reg = regmap_readl(mmUPD_CMD);
+-		if (reg == HL_UPD_NOOP)
+-			return 0;
+-		udelay(TIMEOUT_US);
+-	}
+-
+-	return 1;
++	/* save current command waiting for clear, until handled */
++	state.wfc_cmd = state.cmd;
+ }
+ 
+ static void module_fwupd_reset_state(void)
+ {
+-	module_fwupd_send_status(HL_UPD_STS_RST_ACK, 0);
+-
+ 	preboot_security_dynamic_img_sram_close();
+ 	preboot_security_dynamic_img_spsram_close();
+ 
+-	/* reset state should never fail */
+-	module_fwupd_wfc(WFC_TIMEOUT_MS);
+-	module_fwupd_send_status(HL_UPD_STS_RST_OK, 0);
++	state.cmd.val = 0;	/* NOOP */
++	state.wfc_cmd.val = 0;	/* NOOP */
++	state.exec_res = NOT_FOUND;
++	state.map_size = 0;
++	state.map_offset = NULL;
++	state.sending_error_flag = false;
+ }
+ 
+-static void module_fwupd_map(unsigned int size, enum hl_upd_cmd cmd)
++static enum hl_upd_sts module_fwupd_map(unsigned int size, enum hl_upd_cmd cmd)
+ {
+ 	int err;
+-	enum hl_upd_sts sts;
+-	uintptr_t base_offset;
++	enum hl_upd_sts sts = HL_UPD_STS_MAP_OK;
++	uintptr_t base_offset = cmd == HL_UPD_MAP_SRAM ?
++					FIT_IMG_BASE : FIT_IMG_SPSRAM_BASE;
+ 
+-	base_offset = (cmd == HL_UPD_MAP_SRAM) ? FIT_IMG_BASE :
+-						FIT_IMG_SPSRAM_BASE;
+-
+-	preboot_shm_set_offset(base_offset);
+-	module_fwupd_send_status(HL_UPD_STS_MAP_ACK, 0);
+-	base_offset = preboot_shm_get_offset();
+ 	err = !preboot_is_valid_address_range(base_offset, size);
+ 	if (err) {
+-		sts = HL_UPD_STS_VALID_ERR;
+-		preboot_puts("Mapped address range is invalid\n");
+-		goto fwupd_map_err;
++		preboot_puts("Map address range is invalid\n");
++		return HL_UPD_STS_VALID_ERR;
+ 	}
+ 
++	state.map_offset = (void *)base_offset;
+ 	state.map_size = size;
+ 
+ 	if (cmd == HL_UPD_MAP_SRAM)
+@@ -140,24 +169,92 @@
+ 	else
+ 		preboot_security_dynamic_img_spsram_open();
+ 
+-	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
+-	if (err)
+-		goto fwupd_map_wfc_t;
++	return sts;
++}
+ 
+-	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)base_offset);
+-	return;
++static void module_fwupd_run_fast_noop(void)
++{
++	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
+ 
+-fwupd_map_wfc_t:
+-	sts = HL_UPD_STS_TIMEOUT_ERR;
+-	preboot_puts("Timeout error\n");
++	/* depending on the current state machine, perform action */
++	switch (state.wfc_cmd.cmd) {
++	case HL_UPD_NOOP:
++	case HL_UPD_CLR_STS:
++		break;
++	case HL_UPD_RST_STATE:
++		module_fwupd_reset_state();
++		module_fwupd_send_status(HL_UPD_STS_RST_OK, NULL);
++		break;
++	case HL_UPD_MAP_SRAM:
++	case HL_UPD_MAP_SPSRAM:
++		sts = module_fwupd_map(state.wfc_cmd.size, state.wfc_cmd.cmd);
++		module_fwupd_send_status(sts, state.map_offset);
++		break;
++	case HL_UPD_RUN_SRAM:
++	case HL_UPD_RUN_SPSRAM:
++	case HL_UPD_GET_PROTO_STATUS:
++	default:	/* should never get here */
++		preboot_puts_raw(__func__);
++		preboot_puts(": default case - err\n");
++	}
++}
+ 
+-	if (cmd == HL_UPD_MAP_SRAM)
+-		preboot_security_dynamic_img_sram_close();
+-	else
+-		preboot_security_dynamic_img_spsram_close();
++void module_fwupd_run_fast(void)
++{
++	const char *cmd_str = NULL;
++	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
+ 
+-fwupd_map_err:
+-	module_fwupd_send_status(sts, 0);
++	switch (state.cmd.cmd) {
++	case HL_UPD_NOOP:	/* NOOP is a special command */
++		cmd_str = "noop";
++		module_fwupd_run_fast_noop();
++		break;
++	case HL_UPD_CLR_STS:
++		cmd_str = "clr_sts";
++		/* Clear the status */
++		module_fwupd_send_status(HL_UPD_STS_NOOP, NULL);
++		break;
++	case HL_UPD_RST_STATE:
++		cmd_str = "rst_state";
++		module_fwupd_send_status(HL_UPD_STS_RST_ACK, NULL);
++		break;
++	case HL_UPD_MAP_SRAM:
++		cmd_str = "map_sram";
++		module_fwupd_send_status(HL_UPD_STS_MAP_ACK, NULL);
++		break;
++	case HL_UPD_MAP_SPSRAM:
++		cmd_str = "map_spsram";
++		module_fwupd_send_status(HL_UPD_STS_MAP_ACK, NULL);
++		break;
++	case HL_UPD_RUN_SRAM:
++		cmd_str = "run_sram";
++		/* no break */
++	case HL_UPD_RUN_SPSRAM:
++		cmd_str = cmd_str ?: "run_spsram";
++		/* Protect from RUN before MAP */
++		if (state.map_offset && state.map_size)
++			sts = HL_UPD_STS_ACK;
++		else
++			sts = HL_UPD_STS_VALID_ERR;
++
++		module_fwupd_send_status(sts, NULL);
++		break;
++	case HL_UPD_GET_PROTO_STATUS:
++		cmd_str = "proto_status";
++		module_fwupd_send_status(HL_UPD_STS_ACK, NULL);
++		/* We ACK the command, but handle only on CLR, so save cmd */
++		break;
++	default:
++		cmd_str = "unknown";
++		module_fwupd_send_status(HL_UPD_STS_VALID_ERR, NULL);
++		break;
++	}
++
++	module_fwupd_state_shift();
++
++	preboot_puts_raw_dbg("FW UPD ");
++	preboot_puts_raw_dbg(cmd_str);
++	preboot_puts_dbg(" received\n");
+ }
+ 
+ __weak void preboot_nic_en(u32 nic_en) {}
+@@ -181,25 +278,28 @@
+ 
+ static int module_fwupd_load_type_run(void)
+ {
+-	state.is_fit_checked = !fit_load_images();
+-	if (!state.is_fit_checked)
+-		return 1;
++	int err;
+ 
+-	return 0;
++	err = fit_load_images();
++
++	state.exec_res = err ? NOT_FOUND : FOUND_NO_RETURN;
++
++	return err;
+ }
+ 
+ static int module_fwupd_load_type(void)
+ {
+ 	u32 load_type;
+-	void *fit = (void *)preboot_shm_get_offset();
+-	int ret = fit_get_load_type(&load_type);
++	int ret;
+ 
++	preboot_shm_set_offset((uintptr_t)state.map_offset);
++	ret = fit_get_load_type(&load_type);
+ 	if (ret)
+ 		return 1;
+ 
+ 	switch (load_type) {
+ 	case FIT_LOAD_TYPE_NIC_EN_MASK:
+-		return module_fwupd_load_type_nic_en(fit);
++		return module_fwupd_load_type_nic_en(state.map_offset);
+ 	case FIT_LOAD_TYPE_RMA_ERASE:
+ 		return rma_erase();
+ 	case FIT_LOAD_TYPE_RUN:
+@@ -212,13 +312,11 @@
+ 	return 0;
+ }
+ 
+-static void module_fwupd_run_cmd(enum hl_upd_cmd cmd)
++static enum hl_upd_sts module_fwupd_run_cmd(enum hl_upd_cmd cmd,
++					    enum hl_upd_sts *status)
+ {
+ 	int err;
+-	enum hl_upd_sts sts;
+-	uintptr_t base_offset = preboot_shm_get_offset();
+-
+-	module_fwupd_send_status(HL_UPD_STS_RUN_ACK, 0);
++	enum hl_upd_sts sts = HL_UPD_STS_OK;
+ 
+ 	if (cmd == HL_UPD_RUN_SRAM)
+ 		preboot_security_dynamic_img_sram_close();
+@@ -228,32 +326,16 @@
+ 	err = module_fwupd_load_type();
+ 
+ 	if (cmd == HL_UPD_RUN_SPSRAM)
+-		memset((void *)base_offset, 0, ROUND_UP4(state.map_size));
++		memset(state.map_offset, 0, ROUND_UP4(state.map_size));
+ 
+ 	if (err) {
+ 		sts = HL_UPD_STS_ERR;
+ 		preboot_puts("Failed to load FIT image\n");
+-		goto fwupd_run_err;
+ 	}
+ 
+-	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
+-	if (err)
+-		goto fwupd_run_wfc_t;
++	*status = sts;
+ 
+-	module_fwupd_send_status(HL_UPD_STS_RUN_OK, 0);
+-	return;
+-
+-fwupd_run_wfc_t:
+-	sts = HL_UPD_STS_TIMEOUT_ERR;
+-	preboot_puts("Timeout error\n");
+-
+-fwupd_run_err:
+-	module_fwupd_send_status(sts, 0);
+-
+-	if (cmd == HL_UPD_RUN_SRAM)
+-		preboot_security_dynamic_img_sram_open();
+-	else
+-		preboot_security_dynamic_img_spsram_open();
++	return err;
+ }
+ 
+ static int fwupd_create_resp(void *res_fit, const int load_type,
+@@ -297,86 +379,57 @@
+ 	status->sub_err = serr;
+ }
+ 
+-static int fwupd_prepare_proto_status(void *res_fit, int rsp_err, int rsp_sub_err)
++static int module_fwupd_proto_status(void)
+ {
+ 	struct hl_upd_proto_status status;
+ 	int size = sizeof(status);
+-
+-	fwupd_get_proto_status(&status, rsp_err, rsp_sub_err);
+-
+-	return fwupd_create_resp(res_fit, FIT_LOAD_TYPE_PROTO_STATUS,
+-		HL_FIT_PROTO_STATUS_PROP, &status, &size);
+-}
+-
+-static void module_fwupd_proto_status(void)
+-{
+ 	int err;
+-	enum hl_upd_sts sts;
+-	void *offset;
+ 
+-	module_fwupd_send_status(HL_UPD_STS_ACK, 0);
+-	offset = (void *)preboot_shm_get_offset();
+-	err = fwupd_prepare_proto_status(offset, 0, 0);
++	state.map_offset = (void *)FIT_IMG_BASE;
++
++	fwupd_get_proto_status(&status, 0, 0);
++
++	err = fwupd_create_resp(state.map_offset, FIT_LOAD_TYPE_PROTO_STATUS,
++				HL_FIT_PROTO_STATUS_PROP, &status, &size);
++	state.map_size = size;
++
+ 	if (err)
+-		goto fwupd_proto_sts_err;
+-	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
+-	if (err)
+-		goto fwupd_proto_sts_wfc;
++		preboot_puts("Failed to create status FIT image\n");
+ 
+-	module_fwupd_send_status(HL_UPD_STS_OK, offset);
+-	return;
+-
+-fwupd_proto_sts_wfc:
+-	sts = HL_UPD_STS_TIMEOUT_ERR;
+-	preboot_puts("Timeout error\n");
+-
+-fwupd_proto_sts_err:
+-	module_fwupd_send_status(sts, 0);
++	return err;
+ }
+ 
+ void module_fwupd_run(void)
+ {
+-	struct hl_upd_command cmd;
+-
+-	cmd.val = regmap_readl(mmUPD_CMD);
++	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
++	int err = 0;
+ 
+ 	if (state.sending_error_flag) {
+ 		preboot_puts("FW UPD prepare ERROR_STATUS\n");
+ 		state.sending_error_flag = false;
+ 	}
+ 
+-	switch (cmd.cmd) {
+-	case HL_UPD_CLR_STS:
+-		module_fwupd_send_status(HL_UPD_STS_NOOP, NULL);
+-		preboot_puts_dbg("FW UPD CLR STS received\n");
+-		break;
+-	case HL_UPD_RST_STATE:
+-		module_fwupd_reset_state();
+-		preboot_puts("FW UPD RST STATE received\n");
+-		break;
+-	case HL_UPD_MAP_SRAM:
+-		preboot_puts("FW UPD MAP SRAM received\n");
+-		module_fwupd_map(cmd.size, cmd.cmd);
+-		break;
+-	case HL_UPD_MAP_SPSRAM:
+-		preboot_puts("FW UPD MAP SPSRAM received\n");
+-		module_fwupd_map(cmd.size, cmd.cmd);
+-		break;
++	switch (state.wfc_cmd.cmd) {
+ 	case HL_UPD_RUN_SRAM:
+-		preboot_puts("FW UPD RUN SRAM received\n");
+-		module_fwupd_run_cmd(cmd.cmd);
+-		break;
+ 	case HL_UPD_RUN_SPSRAM:
+-		preboot_puts("FW UPD RUN SPSRAM received\n");
+-		module_fwupd_run_cmd(cmd.cmd);
++		err = module_fwupd_run_cmd(state.wfc_cmd.cmd, &sts);
++		module_fwupd_send_status(sts, NULL);
+ 		break;
+ 	case HL_UPD_GET_PROTO_STATUS:
+-		preboot_puts("FW UPD PROTO STATUS received\n");
+-		module_fwupd_proto_status();
++		err = module_fwupd_proto_status();
++		if (err)
++			module_fwupd_send_status(HL_UPD_STS_ERR, NULL);
++		else
++			module_fwupd_send_status(HL_UPD_STS_OK,
++						 state.map_offset);
+ 		break;
+-	default:
+-		break;
++	default:	/* should never get here */
++		preboot_puts_raw(__func__);
++		preboot_puts(": default case - err\n");
+ 	}
++
++	if (err || state.exec_res == NOT_FOUND)
++		module_fwupd_reset_state();
+ }
+ 
+ void module_fwupd_run_noret(void)
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 679c2f0..4e1cb94 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -54,7 +54,7 @@
+ 		.disable = noop,
+ 		.run = module_fwupd_run,
+ 		.enable = noop,
+-		.run_fast = module_fwupd_run,
++		.run_fast = module_fwupd_run_fast,
+ 		.teardown = noop,
+ 		.run_noreturn = module_fwupd_run_noret,
+ 	},

@@ -1,0 +1,135 @@
+From 1b64fb06058c3d7fef7c49e72402a570233adb40 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 25 Jul 2022 11:42:00 +0300
+Subject: [PATCH] [SW-86607] gaudi3: spi: use spi dma for copying preboot
+
+So far the preboot image was copied from flash by a SW loop.
+Now the bootrom code had reached maturity, and it has
+implementation for SPI DMA functionality.
+This patch switches to using the SPI DMA function from the
+bootrom code for copying the preboot image from flash.
+
+Change-Id: I6e6f78f2f448bc7305e2d370f02a3ed9e1d1d5ee
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index a9ebdaa..e73cf9d 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -2,5 +2,9 @@
+ PPBOOT_MAX_SIZE := 16384
+ PREBOOT_BIN_MAX_SIZE := 130048
+ 
++# TODO: switch to exports elf provided in preboot sources after gaudi3 bootrom code freeze:
++#	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports.elf
++LDFLAGS += -Wl,--just-symbols $(PREBOOT_ROOT_DIR)/../arcboot-custom/exports.elf
++
+ image_validation: image_validation_common
+ image_validation: image_validation_preboot
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index b161b74..0cc693d 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -41,6 +41,7 @@
+ #include <spi_flash.h>
+ #include <memory.h>
+ #include <efuse.h>
++#include <arcboot_export_dev.h>
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -71,34 +72,31 @@
+ 	regmap_writel(1, mmVUART1_TX_STATUS);
+ }
+ 
+-/* TODO: replace ppboot_cp_preboot() implementation with dma_copy_image_v2() from arcboot */
++__weak u64 gaudi3_dma_addr_fixup(u64 loadaddr) { return loadaddr; }
+ 
+-#define CRC32_SIZE		4
+-#define MAX_SECTOR_SIZE		0xFFF0
+-#define MAX_SECTOR_SIZE_CRC	(MAX_SECTOR_SIZE + CRC32_SIZE)
+-#define OFFSET_64KB		0x10000
++static enum dma_dest_type preboot_get_dma_dest_type(uint64_t addr)
++{
++	if (addr >= HL_FW_SRAM_FULL_BASE &&
++	    addr < HL_FW_SRAM_FULL_BASE + HL_FW_SRAM_SIZE)
++		return DMA_DEST_SRAM;
++
++	return DMA_DEST_HBW;
++}
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	u32 laddr = (u32)loadaddr;
+-	u32 remain_size, cp_size;
+-	u32 cp_chunks;
+-	u8 i;
++	u64 dma_dest_addr;
++	enum dma_error dma_err;
++	enum dma_dest_type dma_type;
+ 
+ 	preboot_puts_hex("Preboot loadaddr: ", laddr, false);
+ 
+-	cp_chunks = size / MAX_SECTOR_SIZE_CRC;
+-	if (size % MAX_SECTOR_SIZE_CRC)
+-		cp_chunks++;
+-
+-	remain_size = size;
+-
+-	for (i = 0; i < cp_chunks; i++) {
+-		cp_size = remain_size > MAX_SECTOR_SIZE_CRC ? MAX_SECTOR_SIZE_CRC : remain_size;
+-		spi_flash_copy(((void *)laddr + (MAX_SECTOR_SIZE * i)), (offset + (OFFSET_64KB * i)),
+-				cp_size, name);
+-		remain_size -= cp_size;
+-	}
++	dma_dest_addr = gaudi3_dma_addr_fixup(loadaddr);
++	dma_type = preboot_get_dma_dest_type(dma_dest_addr);
++	dma_err = dma_copy_image_v2(size, offset, dma_dest_addr, dma_type, false);
++	if (dma_err != DMA_SUCCESS)
++		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
+ }
+ 
+ u32 hl_rst_src_get(void)
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index f71ce03..4b27668 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -20,5 +20,6 @@
+ 
+ u32 hl_get_die_id(void);
+ bool hl_is_dual_die_sku(void);
++u64 gaudi3_dma_addr_fixup(u64 loadaddr);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/onix.c b/arch/gaudi3/arc/onix.c
+index ff3c659..55592c0 100644
+--- a/arch/gaudi3/arc/onix.c
++++ b/arch/gaudi3/arc/onix.c
+@@ -6,6 +6,7 @@
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_parc_arc1_cfg_regs.h>
+ 
++#include <gaudi3/address_space.h>
+ #include <preboot.h>
+ #include <uart.h>
+ 
+@@ -50,3 +51,18 @@
+ 	regmap_writel(SRAM_EXTENSION_MSB, mmD0_PARC_ARC1_CFG_SRAM_MSB_ADDR);
+ 	regmap_writel(0x0, mmD0_PARC_ARC1_CFG_SRAM_LSB_ADDR);
+ }
++
++#define SRAM_OFFSET_MASK	0xFFFFFFF
++#define SRAM_EXTENSION_SHIFT	32
++
++u64 gaudi3_dma_addr_fixup(u64 loadaddr)
++{
++	u64 addr = loadaddr;
++
++	if ((loadaddr >= SRAM_BASE_ADDR) && (loadaddr <= SRAM_BASE_ADDR + SRAM_REGION_SIZE)) {
++		addr &= SRAM_OFFSET_MASK;
++		addr |= (u64)SRAM_EXTENSION_MSB << SRAM_EXTENSION_SHIFT;
++	}
++
++	return addr;
++}

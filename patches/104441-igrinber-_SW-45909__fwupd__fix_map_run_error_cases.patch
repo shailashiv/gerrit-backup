@@ -1,0 +1,57 @@
+From d584ab2f9fefe0513dfeadd488a1b5c1bb6887bb Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 20 Jun 2021 20:38:18 +0300
+Subject: [PATCH] [SW-45909] fwupd: fix map/run error cases
+
+In case of an illegal MAP or RUN command, FWUPD module returns error
+validation status, but continues and shifts the state. This in turn
+permits a host/BMC to ignore the error and get the MAP/RUN commands
+keep working.
+Fix this by disabling state shift in case of validation error.
+
+Change-Id: I9e0ec3da9920e2f86586fe0dfbbadfcd566e13f3
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 64149d3..f90521f 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -476,6 +476,7 @@
+ 	const char *cmd_str = NULL;
+ 	const char *err_str = NULL;
+ 	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
++	int err = 0;
+ 
+ 	switch (state->cmd.cmd) {
+ 	case HL_UPD_NOOP:	/* NOOP is a special command */
+@@ -500,6 +501,7 @@
+ 		if (state->map_offset || state->map_size) {
+ 			sts = HL_UPD_STS_VALID_ERR;
+ 			err_str = "MAP is already in progress...";
++			err = 1;
+ 		} else {
+ 			sts = HL_UPD_STS_MAP_ACK;
+ 		}
+@@ -517,6 +519,7 @@
+ 		} else {
+ 			sts = HL_UPD_STS_VALID_ERR;
+ 			err_str = "RUN is not allowed before MAP...";
++			err = 1;
+ 		}
+ 
+ 		module_fwupd_send_status(state, sts, NULL);
+@@ -529,10 +532,12 @@
+ 	default:
+ 		cmd_str = "unknown";
+ 		module_fwupd_send_status(state, HL_UPD_STS_VALID_ERR, NULL);
++		err = 1;
+ 		break;
+ 	}
+ 
+-	module_fwupd_state_shift(state);
++	if (!err)
++		module_fwupd_state_shift(state);
+ 
+ 	if (state->cmd.cmd != HL_UPD_CLR_STS) {
+ 		preboot_puts_raw("FW UPD ");

@@ -1,0 +1,169 @@
+From 38b41c741b692224da79ea7ce8d09a349ac674bc Mon Sep 17 00:00:00 2001
+From: Tamal Saha <tasaha@habana.ai>
+Date: Thu, 25 Jan 2024 13:06:50 +0200
+Subject: [PATCH] [SW-161726] gaudi3: init sram ecc
+
+SRAM self repair procedure is overwriting the ecc data of
+the SRAM, so after running the self repair the sram memory
+must be initialized. This patch initializes the ECC data by
+writing the whole SRAM address space using the mem_cpy engine.
+
+Change-Id: Ic4360aa22010dd76e77ee4b1b245b7e95bd9f06f
+Signed-off-by: Tamal Saha <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 020cf4c..7079d4d 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -23,6 +23,11 @@
+ #include "boot_desc.h"
+ #include <common.h>
+ 
++#include <cpu_if_special_regs.h>
++#include <cpu_if_special_masks.h>
++#include <cache_special_regs.h>
++#include <cache_special_masks.h>
++
+ /* TODO Remove GAUDI3_SRAM_MBIST_DISABLED */
+ #define GAUDI3_SRAM_MBIST_DISABLED	1
+ #define HL_SRAM_MBIST_FAIL_ARR_SIZE	16
+@@ -103,6 +108,98 @@
+ 	return false;
+ }
+ 
++static void gaudi3_mem_init(u64 base, u32 size)
++{
++	u64 mem_base = base;
++	u32 cpy_size, remain_size = size;
++
++	while (remain_size) {
++		if (remain_size > HL_MEMCPY_MAX_SIZE)
++			cpy_size = HL_MEMCPY_MAX_SIZE;
++		else
++			cpy_size = remain_size;
++
++		gaudi3_hbw_memcpy(0, mem_base, cpy_size, GAUDI3_HBW_MEM_INIT);
++
++		remain_size -= cpy_size;
++		mem_base += cpy_size;
++	}
++}
++
++/* GAUDI3_HDCORE_OFFSET = mmHD1_CS0_SPECIAL_BASE(0xE680E80) - mmHD0_CS0_SPECIAL_BASE(0xE280E80)
++ *  = 0x400000
++ *
++ * GAUDI3_SRAM_BANK_OFFSET = mmHD0_CS1_SPECIAL_BASE(0xE290E80) - mmHD0_CS0_SPECIAL_BASE(0xE280E80)
++ *  = 0x10000
++ */
++
++#define GAUDI3_HDCORE_OFFSET		(mmHD1_CS0_SPECIAL_BASE - mmHD0_CS0_SPECIAL_BASE)
++#define GAUDI3_SRAM_BANK_OFFSET		(mmHD0_CS1_SPECIAL_BASE - mmHD0_CS0_SPECIAL_BASE)
++#define NUM_OF_SRAM_BANK_PER_HDCORE	8
++
++static void gaudi3_mask_sram_ecc(bool enable)
++{
++	u32 val;
++	int hdcore, cache;
++	u32 offset;
++
++	if (enable) {
++		regmap_writel(CPU_IF_SPECIAL_MEM_ECC_GLBL_ERR_MASK_SERR_M |
++				CPU_IF_SPECIAL_MEM_ECC_GLBL_ERR_MASK_DERR_M,
++				D0_CPU_IF_REG(mmCPU_IF_SPECIAL_MEM_ECC_ERR_MASK));
++		regmap_writel(CPU_IF_SPECIAL_MEM_ECC_GLBL_ERR_MASK_SERR_M |
++				CPU_IF_SPECIAL_MEM_ECC_GLBL_ERR_MASK_DERR_M,
++				D0_CPU_IF_REG(mmCPU_IF_SPECIAL_MEM_ECC_GLBL_ERR_MASK));
++
++		val = CACHE_SPECIAL_MEM_ECC_GLBL_ERR_MASK_SERR_M |
++				CACHE_SPECIAL_MEM_ECC_GLBL_ERR_MASK_DERR_M;
++	} else {
++		regmap_writel(0, D0_CPU_IF_REG(mmCPU_IF_SPECIAL_MEM_ECC_ERR_MASK));
++		regmap_writel(0, D0_CPU_IF_REG(mmCPU_IF_SPECIAL_MEM_ECC_GLBL_ERR_MASK));
++		val = 0;
++	}
++
++	/* Die 0 only at ppboot */
++	for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE ; hdcore++) {
++		offset = mmHD0_CS0_SPECIAL_BASE + (hdcore * GAUDI3_HDCORE_OFFSET);
++		for (cache = 0; cache < NUM_OF_SRAM_BANK_PER_HDCORE; cache++) {
++			regmap_writel(val, mmCACHE_SPECIAL_MEM_ECC_GLBL_ERR_MASK + offset);
++			offset += GAUDI3_SRAM_BANK_OFFSET;
++		}
++	}
++}
++
++#define SRAM_BANK_ECC_CLR_MASK		(CACHE_SPECIAL_MEM_ECC_CTL_DERR_CLR_M | \
++					CACHE_SPECIAL_MEM_ECC_CTL_SERR_CLR_M)
++
++static void gaudi3_clear_sram_ecc(void)
++{
++	int hdcore, cache, wrap;
++	u32 offset;
++	u32 num_mem_wrapper = regmap_readl(HD0_CS0_SPECIAL_REG(mmCACHE_SPECIAL_MEM_NUMOF));
++
++	for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE ; hdcore++) {
++		offset = mmHD0_CS0_SPECIAL_BASE + (hdcore * GAUDI3_HDCORE_OFFSET);
++		for (cache = 0; cache < NUM_OF_SRAM_BANK_PER_HDCORE; cache++) {
++			for (wrap = 0; wrap < num_mem_wrapper; wrap++) {
++				regmap_writel(wrap, mmCACHE_SPECIAL_MEM_ECC_SEL + offset);
++				regmap_writel(SRAM_BANK_ECC_CLR_MASK,
++					mmCACHE_SPECIAL_MEM_ECC_CTL + offset);
++			}
++			offset += GAUDI3_SRAM_BANK_OFFSET;
++		}
++	}
++}
++
++static void gaudi3_sram_ecc_init(void)
++{
++	/* Die 0 only at ppboot */
++	gaudi3_mask_sram_ecc(true);
++	gaudi3_mem_init(HL_SRAM_BASE_FULL, HL_SRAM_SINGLE_DIE_SIZE);
++	gaudi3_clear_sram_ecc();
++	gaudi3_mask_sram_ecc(false);
++}
++
+ void hl_sram_self_repair(void)
+ {
+ 	struct gaudi3_cold_rst_data cold_rst_data;
+@@ -128,7 +225,8 @@
+ 	}
+ 
+ 	gaudi3_sram_self_repair(sram_loadaddr);
+-	preboot_puts("bist done for 96MB SRAM/CACHE\n");
++	gaudi3_sram_ecc_init();
++	preboot_puts("bist done for 48MB SRAM/CACHE\n");
+ }
+ #endif
+ 
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 86b93f0..cb144ba 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -18,12 +18,14 @@
+ #define HL_FW_SRAM_FULL_BASE		0x300007FD3140000ULL
+ #define HL_FW_SRAM_SIZE			SZ_128K
+ #define HL_SRAM_BASE_FULL		0x200fffffd000000ULL
++#define HL_SRAM_SINGLE_DIE_SIZE		(SZ_32M + SZ_16M)
+ #define HL_FW_MEM_BASE_FULL		0x300007FD0000000ULL
+ #define HL_FW_MEM_SIZE			SZ_256M
+ #define HL_CFG_MEM_BASE_FULL		0x300007FFC000000ULL
+ #define HL_CFG_MEM_SIZE			SZ_64M
+ #define HL_PCIE_FW_SRAM_BASE_FULL	0x300007FD7F00000ULL
+ #define HL_PCIE_FW_SRAM_SIZE		SZ_64K
++#define HL_MEMCPY_MAX_SIZE		SZ_512K
+ 
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+@@ -92,4 +94,10 @@
+ #define D1_PIF_ARC_DCCM_BASE		0xFCC1A000
+ #define PIF_ARC_CCM_SIZE		SZ_4K
+ 
++#define GAUDI3_NUM_DCORES		4
++#define GAUDI3_NUM_HDCORES		8
++#define GAUDI3_NUM_HDCORES_PER_DCORE	(GAUDI3_NUM_HDCORES / GAUDI3_NUM_DCORES)
++#define GAUDI3_NUM_HDCORES_PER_DIE	4
++#define GAUDI3_NUM_DCORES_PER_DIE	2
++
+ #endif /* COMMON_GAUDI3_ARC_GNU_H_ */

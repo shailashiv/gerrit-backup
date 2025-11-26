@@ -1,0 +1,459 @@
+From 38d09da63d92d8a2759323e424f37259b0a470ff Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 20 Jan 2022 18:32:26 +0200
+Subject: [PATCH] [SW-69581] common: remove global conf hdr from common code
+
+Including device specific headers from common code is not allowed
+anymore, and instead the device structures should be used.
+Common code is refactored to use device structure instead of
+psoc_global_conf header.
+
+Change-Id: I7edadb33445fe53ea097b18f796078b38bc9d0a3
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index d5c5905..8ec76f4 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -31,6 +31,7 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/pci.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/uart.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/lib_common.o \
+ 	$(PREBOOT_ROOT_DIR)/app/ppboot/ppboot.o \
+ 	$(HL_DEV_ARCH)/$(HL_TARGET).o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+index d2a2e50..49e5bda 100644
+--- a/app/ext_rom/erom_tpm.c
++++ b/app/ext_rom/erom_tpm.c
+@@ -6,7 +6,6 @@
+  */
+ 
+ #include <stdint.h>
+-#include <psoc_global_conf_regs.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_if.h>
+ 
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 0a3f89e..7e8be10 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -6,7 +6,6 @@
+  */
+ 
+ #include <string.h>
+-#include <psoc_global_conf_regs.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <hl_boot_if.h>
+ #include <bitops.h>
+@@ -77,7 +76,7 @@
+ {
+ 	struct boot_desc desc;
+ 	bool ret;
+-	enum fw_post_reset_cmd image_pending = regmap_readl(mmUPD_PENDING_STS);
++	enum fw_post_reset_cmd image_pending = regmap_readl(global_conf.upd_pending_sts_map);
+ 
+ 	/* Initialize load address with illegal value */
+ 	if (!boot_desc_init()) {
+@@ -167,7 +166,7 @@
+ 	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
+ 		return false;
+ 
+-	prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++	prstn = regmap_readl(global_conf.prstn_reg);
+ 	smlh = regmap_readl(pci.aux_rdlh_link_up_reg);
+ 	rdlh = regmap_readl(pci.aux_smlh_link_up_reg);
+ 
+@@ -266,6 +265,7 @@
+ 	device_init_efuse();
+ 	device_init_uart();
+ 	device_init_pci();
++	device_init_global_conf();
+ }
+ 
+ __weak void ppboot_security_init(void) {}
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index ac6c063..e98c512 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -10,8 +10,6 @@
+ #include <time.h>	/* required for nvme data */
+ #include <string.h>	/* for memset */
+ 
+-#include <psoc_global_conf_regs.h>
+-
+ #include <bitops.h>
+ #include <preboot.h>
+ #include <device.h>
+@@ -141,7 +139,7 @@
+ /* Return size of btl version copied */
+ static int copy_btl_version(void)
+ {
+-	u32 btlver = regmap_readl(mmPREBOOT_VER_OFFSET);
++	u32 btlver = regmap_readl(global_conf.preboot_ver_off_map);
+ 	int i = 0;
+ 
+ 	/* get to the end of the predefined btl string */
+@@ -161,7 +159,7 @@
+ static void preboot_version(void)
+ {
+ 	int err;
+-	u32 btlver = regmap_readl(mmPREBOOT_VER_OFFSET);
++	u32 btlver = regmap_readl(global_conf.preboot_ver_off_map);
+ 	unsigned long offset = (unsigned long) preboot_vers[PREBOOT_BTL_VER];
+ 	int i = 0, btl_ver_sz = 0;
+ 	bool is_legacy_boot = hl_is_legacy_boot();
+@@ -183,7 +181,7 @@
+ 			break;
+ 	}
+ 
+-	regmap_writel((u32)(offset & ~SDRAM_BASE), mmPREBOOT_VER_OFFSET);
++	regmap_writel((u32)(offset & ~SDRAM_BASE), global_conf.preboot_ver_off_map);
+ 
+ 	err = boot_info_set(HL_BOOT_INFO_PREBOOT_BTL_VERSION, preboot_vers[PREBOOT_BTL_VER],
+ 			VERSION_MAX_LEN);
+@@ -261,7 +259,7 @@
+ 	preboot_puts_raw(preboot_vers[PREBOOT_EFUSE_VER]);
+ 	preboot_puts("\n");
+ 
+-	regmap_writel((u32)(offset & ~SDRAM_BASE), mmFUSE_VER_OFFSET);
++	regmap_writel((u32)(offset & ~SDRAM_BASE), global_conf.mmfuse_ver_off_map);
+ 
+ 	err = boot_info_set(HL_BOOT_INFO_PREBOOT_EFUSE_VERSION, preboot_vers[PREBOOT_EFUSE_VER],
+ 			VERSION_MAX_LEN);
+@@ -415,6 +413,7 @@
+ 	device_init_uart();
+ 	device_init_pci();
+ 	device_init_i2c_s();
++	device_init_global_conf();
+ }
+ 
+ __weak void hl_set_reset_cause(uint32_t reset_cause) {}
+diff --git a/app/recovery/recovery.c b/app/recovery/recovery.c
+index f4292ef..82c2781 100644
+--- a/app/recovery/recovery.c
++++ b/app/recovery/recovery.c
+@@ -28,6 +28,7 @@
+ {
+ 	device_init_uart();
+ 	device_init_i2c_s();
++	device_init_global_conf();
+ }
+ 
+ void recovery_main(void)
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index 5df2a68..bbb04a9 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -703,3 +703,22 @@
+ 	i2c_s.clr_intr_reg = mmPSOC_I2C_S_IC_CLR_INTR;
+ 	i2c_s.rxflr_reg = mmPSOC_I2C_S_IC_RXFLR;
+ }
++
++void device_init_global_conf(void)
++{
++	global_conf.prstn_reg = mmPSOC_GLOBAL_CONF_PRSTN;
++	global_conf.kmd_msg_to_cpu_reg = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	global_conf.i2c_slv_reg = mmPSOC_GLOBAL_CONF_I2C_SLV;
++	global_conf.i2c_slv_intr_mask_reg = mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK;
++	global_conf.cpu_boot_status_reg = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	global_conf.cpu_cmd_status_to_host_map = mmCPU_CMD_STATUS_TO_HOST;
++	global_conf.cpu_boot_err0_map = mmCPU_BOOT_ERR0;
++	global_conf.cpu_boot_err1_map = mmCPU_BOOT_ERR1;
++	global_conf.cpu_boot_dev_sts0_map = mmCPU_BOOT_DEV_STS0;
++	global_conf.cpu_boot_dev_sts1_map = mmCPU_BOOT_DEV_STS1;
++	global_conf.upd_pending_sts_map = mmUPD_PENDING_STS;
++	global_conf.upd_cmd_map = mmUPD_CMD;
++	global_conf.upd_sts_map = mmUPD_STS;
++	global_conf.preboot_ver_off_map = mmPREBOOT_VER_OFFSET;
++	global_conf.mmfuse_ver_off_map = mmFUSE_VER_OFFSET;
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index b13ce53..ad6612a 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1272,3 +1272,22 @@
+ 	i2c_s.clr_intr_reg = mmPSOC_I2C_S_IC_CLR_INTR;
+ 	i2c_s.rxflr_reg = mmPSOC_I2C_S_IC_RXFLR;
+ }
++
++void device_init_global_conf(void)
++{
++	global_conf.prstn_reg = mmPSOC_GLOBAL_CONF_PRSTN;
++	global_conf.kmd_msg_to_cpu_reg = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	global_conf.i2c_slv_reg = mmPSOC_GLOBAL_CONF_I2C_SLV;
++	global_conf.i2c_slv_intr_mask_reg = mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK;
++	global_conf.cpu_boot_status_reg = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	global_conf.cpu_cmd_status_to_host_map = mmCPU_CMD_STATUS_TO_HOST;
++	global_conf.cpu_boot_err0_map = mmCPU_BOOT_ERR0;
++	global_conf.cpu_boot_err1_map = mmCPU_BOOT_ERR1;
++	global_conf.cpu_boot_dev_sts0_map = mmCPU_BOOT_DEV_STS0;
++	global_conf.cpu_boot_dev_sts1_map = mmCPU_BOOT_DEV_STS1;
++	global_conf.upd_pending_sts_map = mmUPD_PENDING_STS;
++	global_conf.upd_cmd_map = mmUPD_CMD;
++	global_conf.upd_sts_map = mmUPD_STS;
++	global_conf.preboot_ver_off_map = mmPREBOOT_VER_OFFSET;
++	global_conf.mmfuse_ver_off_map = mmFUSE_VER_OFFSET;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 33e726a..9fe5d2d 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -199,6 +199,25 @@
+ 	i2c_s.rxflr_reg = mmD0_PSOC_I2C_S_IC_RXFLR;
+ }
+ 
++void device_init_global_conf(void)
++{
++	global_conf.prstn_reg = mmD0_PSOC_GLOBAL_CONF_PRSTN;
++	global_conf.kmd_msg_to_cpu_reg = mmD0_PSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	global_conf.i2c_slv_reg = mmD0_PSOC_GLOBAL_CONF_I2C_SLV;
++	global_conf.i2c_slv_intr_mask_reg = mmD0_PSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK;
++	global_conf.cpu_boot_status_reg = mmD0_PSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	global_conf.cpu_cmd_status_to_host_map = mmCPU_CMD_STATUS_TO_HOST;
++	global_conf.cpu_boot_err0_map = mmCPU_BOOT_ERR0;
++	global_conf.cpu_boot_err1_map = mmCPU_BOOT_ERR1;
++	global_conf.cpu_boot_dev_sts0_map = mmCPU_BOOT_DEV_STS0;
++	global_conf.cpu_boot_dev_sts1_map = mmCPU_BOOT_DEV_STS1;
++	global_conf.upd_pending_sts_map = mmUPD_PENDING_STS;
++	global_conf.upd_cmd_map = mmUPD_CMD;
++	global_conf.upd_sts_map = mmUPD_STS;
++	global_conf.preboot_ver_off_map = mmPREBOOT_VER_OFFSET;
++	global_conf.mmfuse_ver_off_map = mmFUSE_VER_OFFSET;
++}
++
+ void lkd_dev_specific_setup(void)
+ {
+ 	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_HARD_RST_EN);
+diff --git a/arch/goya/arm/common.c b/arch/goya/arm/common.c
+index 08c44a8..e2ada22 100644
+--- a/arch/goya/arm/common.c
++++ b/arch/goya/arm/common.c
+@@ -362,3 +362,22 @@
+ 	i2c_s.clr_intr_reg = mmPSOC_I2C_S_IC_CLR_INTR;
+ 	i2c_s.rxflr_reg = mmPSOC_I2C_S_IC_RXFLR;
+ }
++
++void device_init_global_conf(void)
++{
++	global_conf.prstn_reg = mmPSOC_GLOBAL_CONF_PRSTN;
++	global_conf.kmd_msg_to_cpu_reg = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	global_conf.i2c_slv_reg = mmPSOC_GLOBAL_CONF_I2C_SLV;
++	global_conf.i2c_slv_intr_mask_reg = mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK;
++	global_conf.cpu_boot_status_reg = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	global_conf.cpu_cmd_status_to_host_map = mmCPU_CMD_STATUS_TO_HOST;
++	global_conf.cpu_boot_err0_map = mmCPU_BOOT_ERR0;
++	global_conf.cpu_boot_err1_map = mmCPU_BOOT_ERR1;
++	global_conf.cpu_boot_dev_sts0_map = mmCPU_BOOT_DEV_STS0;
++	global_conf.cpu_boot_dev_sts1_map = mmCPU_BOOT_DEV_STS1;
++	global_conf.upd_pending_sts_map = mmUPD_PENDING_STS;
++	global_conf.upd_cmd_map = mmUPD_CMD;
++	global_conf.upd_sts_map = mmUPD_STS;
++	global_conf.preboot_ver_off_map = mmPREBOOT_VER_OFFSET;
++	global_conf.mmfuse_ver_off_map = mmFUSE_VER_OFFSET;
++}
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 3b20a82..eb42f1b 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -641,3 +641,22 @@
+ 	i2c_s.clr_intr_reg = mmPSOC_I2C_S_IC_CLR_INTR;
+ 	i2c_s.rxflr_reg = mmPSOC_I2C_S_IC_RXFLR;
+ }
++
++void device_init_global_conf(void)
++{
++	global_conf.prstn_reg = mmPSOC_GLOBAL_CONF_PRSTN;
++	global_conf.kmd_msg_to_cpu_reg = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	global_conf.i2c_slv_reg = mmPSOC_GLOBAL_CONF_I2C_SLV;
++	global_conf.i2c_slv_intr_mask_reg = mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK;
++	global_conf.cpu_boot_status_reg = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	global_conf.cpu_cmd_status_to_host_map = mmCPU_CMD_STATUS_TO_HOST;
++	global_conf.cpu_boot_err0_map = mmCPU_BOOT_ERR0;
++	global_conf.cpu_boot_err1_map = mmCPU_BOOT_ERR1;
++	global_conf.cpu_boot_dev_sts0_map = mmCPU_BOOT_DEV_STS0;
++	global_conf.cpu_boot_dev_sts1_map = mmCPU_BOOT_DEV_STS1;
++	global_conf.upd_pending_sts_map = mmUPD_PENDING_STS;
++	global_conf.upd_cmd_map = mmUPD_CMD;
++	global_conf.upd_sts_map = mmUPD_STS;
++	global_conf.preboot_ver_off_map = mmPREBOOT_VER_OFFSET;
++	global_conf.mmfuse_ver_off_map = mmFUSE_VER_OFFSET;
++}
+diff --git a/include/device.h b/include/device.h
+index fac2299..0433699 100644
+--- a/include/device.h
++++ b/include/device.h
+@@ -60,12 +60,32 @@
+ 	u32 rxflr_reg;
+ };
+ 
++struct device_global_conf {
++	u32 prstn_reg;
++	u32 kmd_msg_to_cpu_reg;
++	u32 i2c_slv_reg;
++	u32 i2c_slv_intr_mask_reg;
++	u32 cpu_boot_status_reg;
++	u32 cpu_cmd_status_to_host_map;
++	u32 cpu_boot_err0_map;
++	u32 cpu_boot_err1_map;
++	u32 cpu_boot_dev_sts0_map;
++	u32 cpu_boot_dev_sts1_map;
++	u32 upd_pending_sts_map;
++	u32 upd_cmd_map;
++	u32 upd_sts_map;
++	u32 preboot_ver_off_map;
++	u32 mmfuse_ver_off_map;
++};
++
+ extern struct device_efuse efuse;
+ extern struct device_uart uart;
+ extern struct device_pci pci;
+ extern struct device_i2c_s i2c_s;
++extern struct device_global_conf global_conf;
+ 
+ void device_init_efuse(void);
+ void device_init_uart(void);
+ void device_init_pci(void);
+ void device_init_i2c_s(void);
++void device_init_global_conf(void);
+diff --git a/lib/common/boot_if.c b/lib/common/boot_if.c
+index 6106ae0..25ed55f 100644
+--- a/lib/common/boot_if.c
++++ b/lib/common/boot_if.c
+@@ -7,9 +7,8 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-#include <psoc_global_conf_regs.h>
+-
+ #include <preboot.h>
++#include <device.h>
+ #include <hl_boot_if.h>			/* requires stdint.h */
+ #include <bitops.h>
+ 
+@@ -26,12 +25,7 @@
+ 	u32 status_val;	/* boot progress status value */
+ };
+ 
+-static struct cpu_boot_if cpu_boot_if = {
+-	.status = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS,
+-	.response = mmCPU_CMD_STATUS_TO_HOST,
+-	.err = { mmCPU_BOOT_ERR0, mmCPU_BOOT_ERR1 },
+-	.dev_sts = { mmCPU_BOOT_DEV_STS0, mmCPU_BOOT_DEV_STS1 },
+-};
++static struct cpu_boot_if cpu_boot_if;
+ 
+ /*
+  * The cpu_boot_cmd_clr_before_wfe() function should NOT be used in general as
+@@ -45,12 +39,12 @@
+  */
+ void cpu_boot_cmd_clr_before_wfe(void)
+ {
+-	regmap_writel(KMD_MSG_NA, mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
++	regmap_writel(KMD_MSG_NA, global_conf.kmd_msg_to_cpu_reg);
+ }
+ 
+ u32 cpu_boot_cmd_get(void)
+ {
+-	return regmap_readl(mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
++	return regmap_readl(global_conf.kmd_msg_to_cpu_reg);
+ }
+ 
+ void cpu_boot_sts_set(u32 val)
+@@ -61,6 +55,13 @@
+ 
+ void cpu_boot_if_init(void)
+ {
++	cpu_boot_if.status = global_conf.cpu_boot_status_reg;
++	cpu_boot_if.response = global_conf.cpu_cmd_status_to_host_map;
++	cpu_boot_if.err[0] = global_conf.cpu_boot_err0_map;
++	cpu_boot_if.err[1] = global_conf.cpu_boot_err1_map;
++	cpu_boot_if.dev_sts[0] = global_conf.cpu_boot_dev_sts0_map;
++	cpu_boot_if.dev_sts[1] = global_conf.cpu_boot_dev_sts1_map;
++
+ 	cpu_boot_if.dev_sts_val[0] = regmap_readl(cpu_boot_if.dev_sts[0]);
+ 	cpu_boot_if.dev_sts_val[1] = regmap_readl(cpu_boot_if.dev_sts[1]);
+ 	cpu_boot_if.err_val[0] = regmap_readl(cpu_boot_if.err[0]);
+diff --git a/lib/common/lib_common.c b/lib/common/lib_common.c
+new file mode 100644
+index 0000000..c8746a9
+--- /dev/null
++++ b/lib/common/lib_common.c
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <types.h>
++#include <device.h>
++
++struct device_global_conf global_conf;
+diff --git a/lib/common/module_i2c_slave.c b/lib/common/module_i2c_slave.c
+index 543193c..9b3f80d 100644
+--- a/lib/common/module_i2c_slave.c
++++ b/lib/common/module_i2c_slave.c
+@@ -7,7 +7,6 @@
+ 
+ #include <stdint.h>
+ #include <stddef.h>
+-#include <psoc_global_conf_regs.h>
+ #include <preboot.h>
+ #include <device.h>
+ #include <hl_fw_if.h> /* requires preboot.h for __packed */
+@@ -69,10 +68,10 @@
+ 		regmap_writel(I2C_SLAVE_ADDRESS, i2c_s.sar_reg);
+ 
+ 		/* Enable I2C Slave */
+-		regmap_writel(0x1, mmPSOC_GLOBAL_CONF_I2C_SLV);
++		regmap_writel(0x1, global_conf.i2c_slv_reg);
+ 
+ 		/* Enable I2C Slave interrupts */
+-		regmap_writel(0x0, mmPSOC_GLOBAL_CONF_I2C_SLV_INTR_MASK);
++		regmap_writel(0x0, global_conf.i2c_slv_intr_mask_reg);
+ 	}
+ 
+ 	/* Program IC_CON */
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index f3c841e..653d43f 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -9,9 +9,9 @@
+ #include <inttypes.h>
+ #include <string.h>
+ 
+-#include <psoc_global_conf_regs.h>
+ #include <boot_if.h>
+ #include <preboot.h>
++#include <device.h>
+ #include <hl_fw_if.h>
+ #include <fit_load_type.h>
+ #include <security.h>
+@@ -66,12 +66,12 @@
+ 
+ u32 fwupd_cmd_readl(void)
+ {
+-	return regmap_readl(mmUPD_CMD);
++	return regmap_readl(global_conf.upd_cmd_map);
+ }
+ 
+ void fwupd_sts_writel(u32 val)
+ {
+-	regmap_writel(val, mmUPD_STS);
++	regmap_writel(val, global_conf.upd_sts_map);
+ }
+ 
+ u32 i2c_fwupd_cmd_readl(void)
+@@ -86,7 +86,7 @@
+ 
+ bool i2c_fwupd_owned(u32 offset)
+ {
+-	return offset == mmUPD_CMD || offset == mmUPD_STS;
++	return offset == global_conf.upd_cmd_map || offset == global_conf.upd_sts_map;
+ }
+ 
+ #define FWUPD_NORET_DELAY_US	200000

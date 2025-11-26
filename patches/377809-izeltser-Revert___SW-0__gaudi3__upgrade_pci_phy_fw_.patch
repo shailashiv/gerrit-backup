@@ -1,0 +1,133 @@
+From 7f9a492bc73d0b3f88c48a2fd1e195115ed24e6a Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 13 Dec 2023 14:25:58 +0200
+Subject: [PATCH] Revert "[SW-0] gaudi3: upgrade pci phy fw"
+
+This reverts commit cc9cdbcf9f374056b1a3dbdea776794c9960efee.
+
+this WA is not required anymore
+
+Change-Id: I7bdf91a394a541814c38521c0cb9dbab75170a94
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 8e66fef..63d254e 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1264,45 +1264,7 @@
+ 	regmap_writel(PCIE_AUX_BOOT_TERM_CLR_CLR_M, D0_PCIE_AUX_REG(mmPCIE_AUX_BOOT_TERM_CLR));
+ }
+ 
+-void init_pcie_phy_fw_update(void)
+-{
+-	/*
+-	 * Configure FW update size.
+-	 * PHY_FW_FSM_SIZE takes few clocks to propagate. It is being sampled by HW few
+-	 * clock cycles after the rising edge of PCIE_WRAP ➔ PHY_FW_FSM ➔ DIRECT_WRITE_EN bit.
+-	 */
+-	regmap_writel(0, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PHY_FW_FSM));
+-	regmap_writel(FW_WORD_NUM, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PHY_FW_FSM_SIZE));
+ 
+-	/* let PHY_FW_FSM_SIZE propagate */
+-	udelay(10);
+-
+-	/*
+-	 * PHY FW FSM EN and Direct FW write mechanism enable
+-	 * FW FSM assumes that the data is present in the SRAM
+-	 * The FSM will wait for SRAM init done before updating
+-	 * the SRAM contents
+-	 */
+-	regmap_writel(PHY_FW_FSM_ENA_MASK, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PHY_FW_FSM));
+-}
+-
+-#define PHY_FW_LOAD_TIMEOUT_US	100000
+-
+-void wait_for_sram_ext_ld_done(void)
+-{
+-	u64 start = timestamp_get_us();
+-
+-	while (!(regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0)) &&
+-	       regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1)) &&
+-	       regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2)) &&
+-	       regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3)))) {
+-
+-		if (timeout_expired(start, PHY_FW_LOAD_TIMEOUT_US)) {
+-			preboot_puts("timeout waiting for phy_fw_load\n");
+-			break;
+-		}
+-	}
+-}
+ 
+ #define mmLTSSM_EN			D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN)
+ #define LTSSM_EN_IND_MASK		PCIE_AUX_LTSSM_EN_IND_M
+@@ -1320,6 +1282,7 @@
+ 			PCIE_DBI_LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_S
+ void pcie_config(void)
+ {
++	uint32_t link_ctrl;
+ 	uint8_t ltssm_en;
+ 
+ 	pcie_loop_while_prstn(PCIE_PRSTN_ASSERT);
+@@ -1349,14 +1312,8 @@
+ #ifdef NOSSC
+ 		pcie_phy_ssc_en_set(); //?
+ #endif
+-
+-#ifndef PCIE_GEN1
+-		init_pcie_phy_fw_update();
+-#endif
+-
+ 		regmap_writel(1, mmPCIE_PHY_RST_N);
+ 
+-	#ifdef PCIE_GEN1
+ 		pcie_wait_for_sram_init_done();
+ 
+ 		pcie_wa_snps_dcc(); //?
+@@ -1364,13 +1321,11 @@
+ 		pcie_phy_set_sram_ext_ld_done();
+ 
+ 		pcie_set_pcie_device_vendor_id();
+-	#endif
++
+ 		preboot_update_bar_sizes();
+ 
+-	#ifdef PCIE_GEN1
+-		{
+-			uint32_t link_ctrl;
+-
++		if (true) { //(arcboot_rom_global.config_fuse & EFUSE_SYSCFG_PCIE_GEN_LIMIT) == 0) {
++	//		arcboot_rom_status_update(PROGRESS_ARCBOOT_ROM_PCIE_LINK_LIMIT_GEN1);
+ 			/* limit PCIe link gen to 1 */
+ 			link_ctrl = regmap_readl(mmLINK_CAPABILITIES_REG);
+ 			link_ctrl &=
+@@ -1385,18 +1340,11 @@
+ 				LINK_CONTROL2_LINK_STATUS2_REG_PCIE_CAP_TARGET_LINK_SPEED_SHIFT);
+ 			regmap_writel(link_ctrl, mmLINK_CONTROL2_LINK_STATUS2_REG);
+ 		}
+-	#endif
+ 
+ 		/* Configure IATU */
+ #ifdef NOIATU
+ 		pcie_config_iatu();
+ #endif
+-
+-#ifndef PCIE_GEN1
+-		preboot_puts("waiting for phy fw...\n");
+-		wait_for_sram_ext_ld_done();
+-#endif
+-
+ 		pcie_config_boot_termination();
+ 
+ 		/* enable flr handling by HW state machine */
+diff --git a/arch/gaudi3/common/pcie_phy_fw.mk b/arch/gaudi3/common/pcie_phy_fw.mk
+index 1c284da..2a0e729 100644
+--- a/arch/gaudi3/common/pcie_phy_fw.mk
++++ b/arch/gaudi3/common/pcie_phy_fw.mk
+@@ -1,3 +1 @@
+-# PHY_FW_SIZE := 0xA500
+-# TODO: optimize phy fw size, do not copy trailing zeroes
+-PHY_FW_SIZE := 0x10000
+\ No newline at end of file
++PHY_FW_SIZE := 0xA500
+\ No newline at end of file

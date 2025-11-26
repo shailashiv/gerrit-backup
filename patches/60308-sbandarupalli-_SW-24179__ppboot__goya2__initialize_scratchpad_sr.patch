@@ -1,0 +1,92 @@
+From f0a237d27f2485008c156db1781e2631c550809f Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 12 Nov 2020 19:16:09 +0200
+Subject: [PATCH] [SW-24179] ppboot: goya2: initialize scratchpad sram
+
+Currently ECC errors are observed for scratchpad memory while copying
+ARC ICCM and DCCM images in two step process (SRAM -> scratchpad SRAM
+-> ICCM/DCCM). These fake ECC errors are observed due to byte copy to
+scratchpad memory which turns to be read-modify-write transaction.
+In order to avoid these ECC errors, this patch adds complete
+initialization of scratchpad SRAM using memcopy block.
+
+Change-Id: I87b9bf9ceb83e2002eadeb9a45677bce1dbc2945
+---
+
+diff --git a/goya2/common.c b/goya2/common.c
+index 52c43d0..d89e957 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -353,6 +353,46 @@
+ 
+ }
+ 
++static void init_sp_sram(void)
++{
++	u32 mem_cfg, cpy_sts;
++	u8 retry = HL_INIT_SP_SRAM_RETRIES;
++
++	/* Use memblock to initialize scratchpad memory */
++	regmap_writel((u32)HL_SP_SRAM_BASE,
++			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((u32)(HL_SP_SRAM_BASE >> 32),
++			mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	/* set size of 64k in granuality of 16 bytes */
++	mem_cfg |= (0x1000 & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	mem_cfg |= (0x1 << PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT);
++
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	while (1) {
++		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts)
++			break;
++		/*
++		 * Do not wait indefinitely on copy status
++		 * Wait for 5 seconds (50 retries with 100 milli-
++		 * seconds sleep), else bailout.
++		 */
++		retry--;
++		if (!retry) {
++			preboot_puts("Timed-out waiting for SP SRAM copy\n");
++			break;
++		}
++		udelay(100000);
++	}
++
++}
++
+ void hl_plat_init(void)
+ {
+ 	init_arc();
+@@ -402,6 +442,13 @@
+ 	u32 mem_cfg;
+ 
+ 	/*
++	 * initialize scratch SRAM to avoid ECC exceptions
++	 * ECC errors are observed due to byte copy to SP
++	 * memory which turns to be read-modify-write transaction
++	 */
++	init_sp_sram();
++
++	/*
+ 	 * For ARC images:
+ 	 * 1. Copy FIT image to scratchpad SRAM base. This is required
+ 	 *    for using memcopy block as memcopy requires source and
+diff --git a/goya2/common.h b/goya2/common.h
+index d2a73b2..a70b17f 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -26,6 +26,7 @@
+ #define ARC_RST_VEC_ADDR		0x0
+ 
+ #define HL_PCIE_LINK_RETRIES		50
++#define HL_INIT_SP_SRAM_RETRIES		50
+ 
+ /*
+  * Set ARCs in halt state before reset

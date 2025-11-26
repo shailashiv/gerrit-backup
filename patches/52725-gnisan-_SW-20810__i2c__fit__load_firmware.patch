@@ -1,0 +1,226 @@
+From 6decbced08711c7b76dcbdd02536ceb05e7266c2 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 23 Sep 2020 19:43:27 +0300
+Subject: [PATCH] [SW-20810] i2c: fit: load firmware
+
+Use NVME indirect request port to load firmware in FIT format via I2C.
+
+The firmware is expected to be received in 65535 chunks (which is the
+maximum transmission unit for a single request). The chunks are
+accumulated together into the FIT base buffer and once verified,
+the FIT is loaded.
+
+Change-Id: Ibbe19428248e3a0cb159c62b54c88cd8ea9f05f8
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 789d845..91ceb1d 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -100,6 +100,7 @@
+ void module_i2c_s_disable(void);
+ void module_i2c_s_run(void);
+ void module_i2c_s_teardown(void);
++void module_i2c_s_run_noret(void);
+ 
+ void module_handle_cmds(struct cmd_module_ops cmd_ops[], int size);
+ #endif /* _HL_CMD_MODULE_H_ */
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index dffe337..ae81361 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -156,6 +156,9 @@
+ 	if (hl_is_debug_mode(HL_DEBUG_HW_I2C))
+ 		return NOT_FOUND;
+ 
++	if (i2cslave_fit_is_checked())
++		return FOUND_NO_RETURN;
++
+ 	stat = i2cslave_dw_read_clear_intrbits_slave();
+ 
+ 	if ((stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK) ||
+@@ -329,3 +332,9 @@
+ 
+ 	preboot_puts("I2C SLAVE: tear down done\n");
+ }
++
++void module_i2c_s_run_noret(void)
++{
++	module_i2c_s_teardown();
++	i2cslave_fit_run_image();
++}
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index 020f855..81a4c63 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -12,5 +12,8 @@
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq);
+ u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt);
+ void i2cslave_handle_sync_error(void);
++void i2cslave_fit_set_checked(void);
++bool i2cslave_fit_is_checked(void);
++void i2cslave_fit_run_image(void);
+ 
+ #endif /* _MODULE_I2C_SLAVE_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 2653a50..b7b3179 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -651,3 +651,15 @@
+ 
+ 	preboot_start_image(startaddr);
+ }
++
++int fit_validate_size(int len)
++{
++	const void *fit = (void *)FIT_IMG_BASE;
++
++	if (fdt_check_header(fit)) {
++		preboot_puts("Bad FIT header\n");
++		return 1;
++	}
++
++	return fdt_totalsize(fit) != len;
++}
+diff --git a/preboot/fit.h b/preboot/fit.h
+index f80e7dc..edee7b5 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -10,5 +10,6 @@
+ 
+ int fit_load_images(void);
+ void fit_run_image(void);
++int fit_validate_size(int len);
+ 
+ #endif /* _HL_FIT_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 8299e2a..109de0f 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -28,15 +28,59 @@
+ 
+ static struct i2cslave_indirect_req i2csi_req;
+ 
++static void i2csi_req_load_fw(void)
++{
++	/*
++	 * Received firmware length is the last requset RDQL + previous
++	 * requests length which is calculate by the header offset.
++	 * If IC bit is set, the 4 last bytes of each request is not part
++	 * of the firmware but rather integrity check data, so we do not
++	 * consider them.
++	 */
++	unsigned int fw_len = i2csi_req.hdr.rqdl +
++		(i2csi_req.hdr.offset * HL_I2CI_REQ_MAX_RQDL) -
++		((i2csi_req.hdr.offset + 1) *  i2csi_req.hdr.ic * 4);
++
++	if (fit_validate_size(fw_len))
++		return; /* More data is needed */
++
++	if (fit_load_images())
++		i2csi_req.sts.err = HL_I2CI_REQ_ERR_PROCESS;
++	else
++		i2cslave_fit_set_checked();
++
++}
++
+ static inline u8 *i2csi_req_opcode_alloc_buffer(void)
+ {
+-	/* Data will be consumed from HW but not stored anywhere */
+-	return NULL;
++	switch (i2csi_req.hdr.opcode) {
++	case HL_I2CI_REQ_OP_FW_LOADER:
++		/*
++		 * The firmware data is being placed directly to FIT base
++		 * buffer, it may be assembled by multiple requests so we used
++		 * the offset int the header an index.
++		 * If IC bit is set, the 4 last bytes are not part of the
++		 * firmware but rather integrity check data, so we ignore and
++		 * override them.
++		 */
++		return (u8 *)FIT_IMG_BASE + (i2csi_req.hdr.offset *
++			(HL_I2CI_REQ_MAX_RQDL - i2csi_req.hdr.ic * 4));
++	default:
++		/* Data will be consumed from HW but not stored anywhere */
++		return NULL;
++	}
+ }
+ 
+ static inline void i2csi_req_process_opcode(void)
+ {
+-	i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++	switch (i2csi_req.hdr.opcode) {
++	case HL_I2CI_REQ_OP_FW_LOADER:
++		i2csi_req_load_fw();
++		break;
++	default:
++		i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++		break;
++	}
+ }
+ 
+ static inline u32 i2csi_req_wdata_handle_chunk(u8 **data, u8 cnt)
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 3bb2e59..e864714 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -13,6 +13,9 @@
+ #include "thermal.h"
+ #include "module_i2c_slave.h"
+ #include "i2cslave_indirect.h"
++#include "fit.h"
++
++static bool is_fit_checked;
+ 
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+ {
+@@ -80,3 +83,18 @@
+ {
+ 	i2csi_req_handle_sync_error();
+ }
++
++void i2cslave_fit_set_checked(void)
++{
++	is_fit_checked = true;
++}
++
++bool i2cslave_fit_is_checked(void)
++{
++	return is_fit_checked;
++}
++
++void i2cslave_fit_run_image(void)
++{
++	fit_run_image();
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 597f1e1..a4e2892 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -70,7 +70,7 @@
+ 		.enable = module_i2c_s_setup,
+ 		.run_fast = noop,
+ 		.teardown = module_i2c_s_teardown,
+-		.run_noreturn = noop,
++		.run_noreturn = module_i2c_s_run_noret,
+ 	},
+ };
+ 
+diff --git a/recovery/module_i2c_slave.c b/recovery/module_i2c_slave.c
+index 9b96249..5337d50 100644
+--- a/recovery/module_i2c_slave.c
++++ b/recovery/module_i2c_slave.c
+@@ -36,3 +36,12 @@
+ }
+ 
+ void i2cslave_handle_sync_error(void) {}
++
++void i2cslave_fit_set_checked(void) {}
++
++bool i2cslave_fit_is_checked(void)
++{
++	return false;
++}
++
++void i2cslave_fit_run_image(void) {}

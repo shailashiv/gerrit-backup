@@ -1,0 +1,77 @@
+From 0ebd5a412766587ec643ff07751d98163bcc87f6 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 19 Jan 2021 16:19:23 +0200
+Subject: [PATCH] [SW-28880] gaudi: sec: i2c get pci vendor id bugfix
+
+in secured mode the pcie configuration space registers are
+inaccessible during iatu access, so when the bmc is asking
+for the vendor id the wrong value is retrieved.
+in order to fix that, the value is stored while conf space still
+accessible, and used when BMC is asking for it.
+
+Change-Id: I1469fd5acbc5543ec7e695ff1c91261c0da40add
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 422dc56..7e4715c 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -192,7 +192,7 @@
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd)
+ {
+ 	u8 ret;
+-	u32 data = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++	u32 data = device_id_vendor_id;
+ 
+ 	switch (cmd) {
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index 570078d..25adc9b 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -8,6 +8,8 @@
+ #ifndef _MODULE_I2C_SLAVE_H_
+ #define _MODULE_I2C_SLAVE_H_
+ 
++extern u32 device_id_vendor_id;
++
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd);
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq);
+ u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt);
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 3858e65..0b118ab 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -9,6 +9,7 @@
+ #include <stdint.h>
+ 
+ #include <psoc_global_conf_regs.h>
++#include <pcie_dbi_regs.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+@@ -245,6 +246,13 @@
+ 		      sizeof(preboot_en_caps));
+ }
+ 
++u32 device_id_vendor_id;
++
++static inline void preboot_retrieve_device_id_from_pcie(void)
++{
++	device_id_vendor_id = regmap_readl(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++}
++
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_conf_iatu_access(bool enable) {}
+@@ -271,6 +279,9 @@
+ 
+ 	preboot_sp_sram_init();
+ 
++	/* Get the VendorID before we lock the access to configuration space */
++	preboot_retrieve_device_id_from_pcie();
++
+ 	/* Enable access to iATU before locking PCIE_AUX */
+ 	preboot_conf_iatu_access(true);
+ 

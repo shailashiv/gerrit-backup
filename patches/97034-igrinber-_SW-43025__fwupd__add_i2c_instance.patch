@@ -1,0 +1,213 @@
+From 5844f802a8e70d583a26ac2c1ba97b0e0503a79a Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sat, 22 May 2021 22:35:32 +0300
+Subject: [PATCH] [SW-43025] fwupd: add i2c instance
+
+Since the requirement to close the PCI interface on demand, we need to
+separate the interface backend storage, so the I2C interface will
+continue to work regularly.
+We add another runtime instance of the FWUPD module, so it can live
+along with PCI instance as an independent one.
+This also requires the I2C indirect module to route the FW_UPD
+configuration accesses to the new API instead of just register write.
+
+Change-Id: Ib986f029255e81e2da0db946769ee88d1bfba057
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 566ed13..7a743b3 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -7,6 +7,7 @@
+ #ifndef _HL_CMD_MODULE_H_
+ #define _HL_CMD_MODULE_H_
+ 
++#include <stdbool.h>
+ #include <hl_boot_if.h>
+ /*
+  * enum cmd_check_res	- used to specify various results that check() routine
+@@ -85,6 +86,15 @@
+ void module_fwupd_run(void);
+ void module_fwupd_run_noret(void);
+ 
++/* I2C FWUPD */
++void module_i2c_fwupd_setup(void);
++enum cmd_check_res module_i2c_fwupd_check(void);
++void module_i2c_fwupd_run_fast(void);
++void module_i2c_fwupd_run(void);
++bool i2c_fwupd_owned(u32 offset);
++u32 i2c_fwupd_readl(u32 offset);
++void i2c_fwupd_writel(u32 offset, u32 val);
++
+ /* LKD */
+ void module_lkd_setup(void);
+ enum cmd_check_res module_lkd_check(void);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 36bff94..aa37f48 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -11,6 +11,7 @@
+ #include <preboot.h>
+ #include <uart.h>
+ #include <common/module_i2c_slave.h>
++#include <common/cmd_module.h>
+ #include <hl_i2c_indirect.h>
+ #include <hl_i2c_slave_events.h>
+ #include <crc32.h>
+@@ -157,10 +158,18 @@
+ {
+ 	switch (op_config.command) {
+ 	case HL_I2CI_CONFIG_CMD_READ:
+-		op_config.data = regmap_readl(op_config.address);
++		if (i2c_fwupd_owned(op_config.address))
++			op_config.data = i2c_fwupd_readl(op_config.address);
++		else
++			op_config.data = regmap_readl(op_config.address);
++
+ 		break;
+ 	case HL_I2CI_CONFIG_CMD_WRITE:
+-		regmap_writel(op_config.data, op_config.address);
++		if (i2c_fwupd_owned(op_config.address))
++			i2c_fwupd_writel(op_config.address, op_config.data);
++		else
++			regmap_writel(op_config.data, op_config.address);
++
+ 		break;
+ 	}
+ 
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index b483d6b..bde678b 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -37,11 +37,14 @@
+ 	struct hl_upd_command cmd;
+ 	struct hl_upd_command wfc_cmd;
+ 	enum cmd_check_res exec_res;
++	u32 cmd_reg;
++	u32 sts_reg;
+ 	void (*sts_writel)(u32 val);
+ 	u32 (*cmd_readl)(void);
+ };
+ 
+ static struct fwupd_state state;
++static struct fwupd_state i2c_state;
+ 
+ u32 fwupd_cmd_readl(void)
+ {
+@@ -51,6 +54,33 @@
+ void fwupd_sts_writel(u32 val)
+ {
+ 	regmap_writel(val, mmUPD_STS);
++}
++
++u32 i2c_fwupd_cmd_readl(void)
++{
++	return i2c_state.cmd_reg;
++}
++
++void i2c_fwupd_sts_writel(u32 val)
++{
++	i2c_state.sts_reg = val;
++}
++
++bool i2c_fwupd_owned(u32 offset)
++{
++	return offset == mmUPD_CMD || offset == mmUPD_STS;
++}
++
++/* This function is for reading status by other modules */
++u32 i2c_fwupd_readl(u32 offset)
++{
++	return i2c_state.sts_reg;
++}
++
++/* This function is for writing cmd by other modules */
++void i2c_fwupd_writel(u32 offset, u32 val)
++{
++	i2c_state.cmd_reg = val;
+ }
+ 
+ static void fwupd_get_proto_status(struct hl_upd_proto_status *status,
+@@ -120,6 +150,10 @@
+ 
+ 	state->map_offset = (void *)FIT_IMG_BASE;
+ 
++	/*
++	 * Here we assume that the error is reported only once and
++	 * regardless of the interface
++	 */
+ 	preboot_error_read_and_clr(&sts_err, &sts_serr);
+ 	fwupd_get_proto_status(&status, sts_err, sts_serr);
+ 
+@@ -213,6 +247,13 @@
+ 	module_fwupd_send_status(&state, HL_UPD_STS_RST_OK, NULL);
+ }
+ 
++void module_i2c_fwupd_setup(void)
++{
++	i2c_state.cmd_readl = i2c_fwupd_cmd_readl;
++	i2c_state.sts_writel = i2c_fwupd_sts_writel;
++	module_fwupd_send_status(&i2c_state, HL_UPD_STS_RST_OK, NULL);
++}
++
+ /* NOOP is a sync command, so here we decide what execution type is needed */
+ static enum cmd_check_res module_fwupd_check_noop(struct fwupd_state *state)
+ {
+@@ -284,6 +325,11 @@
+ enum cmd_check_res module_fwupd_check(void)
+ {
+ 	return __module_fwupd_check(&state);
++}
++
++enum cmd_check_res module_i2c_fwupd_check(void)
++{
++	return __module_fwupd_check(&i2c_state);
+ }
+ 
+ static void module_fwupd_state_shift(struct fwupd_state *state)
+@@ -427,6 +473,11 @@
+ 	__module_fwupd_run_fast(&state);
+ }
+ 
++void module_i2c_fwupd_run_fast(void)
++{
++	__module_fwupd_run_fast(&i2c_state);
++}
++
+ __weak void preboot_nic_en(u32 nic_en) {}
+ 
+ static int module_fwupd_load_type_nic_en(void *fit)
+@@ -566,6 +617,11 @@
+ 	__module_fwupd_run(&state);
+ }
+ 
++void module_i2c_fwupd_run(void)
++{
++	__module_fwupd_run(&i2c_state);
++}
++
+ void module_fwupd_run_noret(void)
+ {
+ 	hl_ts_shutdown();
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 1bce401..5d305d3 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -69,6 +69,16 @@
+ 		.teardown = noop,
+ 		.run_noreturn = module_fwupd_run_noret,
+ 	},
++	{	/* I2C FW UPD module */
++		.setup = module_i2c_fwupd_setup,
++		.check = module_i2c_fwupd_check,
++		.disable = noop,
++		.run = module_i2c_fwupd_run,
++		.enable = noop,
++		.run_fast = module_i2c_fwupd_run_fast,
++		.teardown = noop,
++		.run_noreturn = module_fwupd_run_noret, /* same as FW_UPD */
++	},
+ 	{	/* LKD module */
+ 		.setup = module_lkd_setup,
+ 		.check = module_lkd_check,

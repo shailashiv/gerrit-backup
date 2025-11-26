@@ -1,0 +1,112 @@
+From 04d341b3a952ac8f9dfb5cde5d53ca894182b43e Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 24 Apr 2024 16:03:27 +0300
+Subject: [PATCH] [FSW-4100] fs1: use mem copy bw specific params
+
+MEM_COPY engine has different size parameters when it's used for copying
+over HBW bus versus LBW bus.
+This patch fixes the mem copy function to use the correct parameters per
+bus.
+
+Change-Id: I854c9a01fa682ccc7bf38600df071aec165262b1
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 1980baf..1bac7d5 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -413,18 +413,32 @@
+ 	return hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, word, val);
+ }
+ 
+-#define MEM_CPY_SIZE_LIMIT		(SZ_4M - SZ_16)
+-#define MEM_CPY_SIZE_SHIFT		4
+-#define MEM_CPY_SIZE_SHIFT_MASK		(BIT(MEM_CPY_SIZE_SHIFT) - 1)
++#define MEM_CPY_LBW_SIZE_LIMIT		(SZ_1M - SZ_16)
++#define MEM_CPY_LBW_SIZE_SHIFT		2
++#define MEM_CPY_LBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_LBW_SIZE_SHIFT) - 1)
++#define MEM_CPY_HBW_SIZE_LIMIT		(SZ_4M - SZ_16)
++#define MEM_CPY_HBW_SIZE_SHIFT		4
++#define MEM_CPY_HBW_SIZE_SHIFT_MASK	(BIT(MEM_CPY_HBW_SIZE_SHIFT) - 1)
+ #define HL_MEM_CPY_TIMEOUT_US		10000
+ 
+-int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size)
++int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw)
+ {
+ 	u64 start = timestamp_get_us();
+ 	u32 cpy_sts, copy_sz;
+ 	u32 cp_err, wr_err, rd_err;
++	u32 sz_limit, sz_shift, sz_mask;
+ 
+-	if (size > MEM_CPY_SIZE_LIMIT) {
++	if (is_hbw) {
++		sz_limit = MEM_CPY_HBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_HBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_HBW_SIZE_SHIFT_MASK;
++	} else {
++		sz_limit = MEM_CPY_LBW_SIZE_LIMIT;
++		sz_shift = MEM_CPY_LBW_SIZE_SHIFT;
++		sz_mask = MEM_CPY_LBW_SIZE_SHIFT_MASK;
++	}
++
++	if (size > sz_limit) {
+ 		preboot_puts("size exceeds MEM_CPY engine limit\n");
+ 		return -1;
+ 	}
+@@ -439,9 +453,9 @@
+ 	regmap_writel((uint32_t)(dst >> 32), mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
+ 					     mmMEM_COPY_DEST_ADDR_MSB);
+ 
+-	/* set size of in granuality of 16 bytes */
+-	copy_sz = size >> MEM_CPY_SIZE_SHIFT;
+-	if (size & MEM_CPY_SIZE_SHIFT_MASK) {
++	/* set size of in granuality of 4 bytes */
++	copy_sz = size >> sz_shift;
++	if (size & sz_mask) {
+ 		preboot_puts("MEM_CPY size not aligned, rounding up\n");
+ 		copy_sz++;
+ 	}
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index 341fd3a..dd88634 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -73,6 +73,6 @@
+ #endif /* USE_BOOTROM_SPI_DMA */
+ 
+ void hl_dev_psoc_pll_init(void);
+-int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size);
++int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw);
+ 
+ #endif /* ARCH_FS1_ARC_HL_H_ */
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+index 9d42711..6dd34c9 100644
+--- a/arch/fs1/arc/pldm.c
++++ b/arch/fs1/arc/pldm.c
+@@ -227,7 +227,7 @@
+ 	 * exceeds MNG ICCM size (256kb), the rest is stored in MISC ICCM.
+ 	 * An efuse bit is controlling whether the application binary is larger than MNG ICCM size.
+ 	 */
+-	fs1_mem_copy(ARC_MNG_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, ARC_MNG_ICCM_SIZE);
++	fs1_mem_copy(ARC_MNG_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, ARC_MNG_ICCM_SIZE, false);
+ 
+ 	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
+ 	if (err)
+@@ -239,7 +239,7 @@
+ 		return;
+ 
+ 	fs1_mem_copy(ARC_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL + ARC_MNG_ICCM_SIZE,
+-		     ARC_MISC_ICCM_SIZE);
++		     ARC_MISC_ICCM_SIZE, false);
+ }
+ 
+ static void btldr_copy_bootinfo(void)
+@@ -263,7 +263,7 @@
+ 	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in MISC DCCM and copied
+ 	 * back to the SPSRAM as part of the preparation to run preboot rtos.
+ 	 */
+-	fs1_mem_copy(ARC_MISC_DCCM_FULL_BASE, HL_SP_SRAM_BASE, BOOT_INFO_SIZE);
++	fs1_mem_copy(ARC_MISC_DCCM_FULL_BASE, HL_SP_SRAM_BASE, BOOT_INFO_SIZE, false);
+ }
+ 
+ void btldr_copy_data(void)

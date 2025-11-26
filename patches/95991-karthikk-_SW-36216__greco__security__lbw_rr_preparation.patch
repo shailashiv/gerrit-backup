@@ -1,0 +1,243 @@
+From d1f2538b67f0c54fbed9038e19adc2cd56cac057 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 20 May 2021 05:18:36 +0300
+Subject: [PATCH] [SW-36216] greco: security: lbw rr preparation
+
+Add api for lbw range register configuration.
+
+There are 18(0..17 rr idx) RRs for LBW
+1) 14(0..13 rr idx) RRs with 4KB granularity
+API: preboot_secure_lbw_rr_short(rr idx, min addr, max addr)
+
+2) 4(14..17 rr idx) RRs with full 39 bit address range.
+API: preboot_secure_lbw_rr_full(rr idx, min addr, max addr)
+rr idx type : greco_sec_if_lbw_rrs
+
+Change-Id: Ie8fe1f118c0aa94ec41bbf47870cd3300bcb77e0
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/arch/greco/security.c b/arch/greco/security.c
+index 61daddc..59807ce 100644
+--- a/arch/greco/security.c
++++ b/arch/greco/security.c
+@@ -9,7 +9,56 @@
+ #include <psoc_arc0_mstr_if_core_lbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_lbw_regs.h>
++#include <dcore0_tpcif_rtr0_mstr_if_rr_prvt_lbw_regs.h>
++#include <dcore1_tpcif_rtr0_mstr_if_rr_prvt_lbw_regs.h>
++#include <dcore0_mmeif_rtr0_mstr_if_rr_prvt_lbw_regs.h>
++#include <dcore1_mmeif_rtr0_mstr_if_rr_prvt_lbw_regs.h>
++#include <pcie_elbi_rr_mstr_if_rr_shrd_lbw_regs.h>
++#include <dcon0_lbw_rtr_if_mstr_if_rr_prvt_lbw_regs.h>
++#include <dcon0_lbw_rtr_if_mstr_if_rr_shrd_lbw_regs.h>
++
+ #include "uart.h"
++
++struct preboot_sec_rrs_cfg {
++	u32 instances_num;
++	u32 instances_dist;
++	u32 min_short_breg;
++	u32 max_short_breg;
++	u32 min_full_breg;
++	u32 min_full_breg_hi;
++	u32 max_full_breg;
++	u32 max_full_breg_hi;
++	u32 hit_wr_breg;
++	u32 hit_rd_breg;
++};
++
++/*
++ * enum preboot_sec_common_engine_type classifies the interfaces with
++ * respect to the initiator engine. TPC, MME and ELBI have unique
++ * interfaces, while others (DEC/ENC/PSOC/CPU etc) share the common
++ * DCONx interfaces which here is prefixed as 'COMMON_IF_'.
++ *
++ * ----------------------------------
++ *        LBW       |      HBW
++ * ----------------------------------
++ * TPC_MME_IF       |TPC_MME_IF
++ * COMMON_IF_PRVT   |COMMON_IF_PRVT
++ * COMMON_IF_SHRD   |COMMON_IF_SHRD
++ * ELBI             |COMMON_IF2
++ *                  |COMMON_IF_SHRD2
++ * ----------------------------------
++ */
++enum preboot_sec_engine_type {
++	TPC_MME_IF,
++	COMMON_IF_PRVT,
++	COMMON_IF_SHRD,
++	ELBI_OR_COMMON_IF2,
++	COMMON_IF_SHRD2,
++};
++
++enum greco_sec_if_lbw_rrs {
++	LBW_MAX_RR_IDX = 18,
++};
+ 
+ #define EN_ARC_SEC_PRIV		0x3
+ 
+@@ -26,8 +75,162 @@
+ 		 mmPSOC_ARC1_MSTR_IF_CORE_LBW_AXPROT_OVRD);
+ }
+ 
++#define SHIFT_4K_POS		12
++#define TPC_MME_IF_NUM		16
++#define TPC_MME_IF_DIST		0x8000
++#define ELBI_IF_NUM		1
++#define ELBI_IF_DIST		0x0
++#define COMMON_PRVT_NUM		4
++#define COMMON_PRVT_DIST	0x10000
++#define COMMON_SHRD_NUM		2
++#define COMMON_SHRD_DIST	(COMMON_PRVT_DIST * 2)
++
++static struct preboot_sec_rrs_cfg preboot_sec_lbw_rrs_tbl[] = {
++	[TPC_MME_IF] = {
++		.instances_num = TPC_MME_IF_NUM,
++		.instances_dist = TPC_MME_IF_DIST,
++		.min_short_breg = mmDCORE0_TPCIF_RTR0_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmDCORE0_TPCIF_RTR0_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmDCORE0_TPCIF_RTR0_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmDCORE0_TPCIF_RTR0_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmDCORE0_TPCIF_RTR0_MSTR_IF_RR_PRVT_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmDCORE0_TPCIF_RTR0_MSTR_IF_RR_PRVT_LBW_PRIV_HIT_AR,
++	},
++	[COMMON_IF_PRVT] = {
++		.instances_num = COMMON_PRVT_NUM,
++		.instances_dist = COMMON_PRVT_DIST,
++		.min_short_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_PRVT_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_PRVT_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_PRVT_LBW_PRIV_HIT_AR,
++	},
++	[COMMON_IF_SHRD] = {
++		.instances_num = COMMON_SHRD_NUM,
++		.instances_dist = COMMON_SHRD_DIST,
++		.min_short_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
++		.hit_wr_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmDCON0_LBW_RTR_IF_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR,
++	},
++	[ELBI_OR_COMMON_IF2] = {
++		.instances_num = ELBI_IF_NUM,
++		.instances_dist = ELBI_IF_DIST,
++		.min_short_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_SHORT_0,
++		.max_short_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_SHORT_0,
++		.min_full_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
++		.max_full_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0,
++		.hit_wr_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW,
++		.hit_rd_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR,
++	},
++};
++
++static void preboot_secure_update_rr_reg(int rr_idx, u32 inst_offset, u32 min_reg, u32 max_reg,
++		u32 min, u32 max)
++{
++	u32 rr_base, rr_dest;
++
++	rr_base = rr_idx * sizeof(u32) + inst_offset;
++	rr_dest = rr_base + min_reg;
++	regmap_writel(min, rr_dest);
++	rr_dest = rr_base + max_reg;
++	regmap_writel(max, rr_dest);
++}
++
++static void preboot_secure_update_hit_reg(int rr_idx, struct preboot_sec_rrs_cfg *cfg, int inst_num,
++		bool write_only)
++{
++	u32 rr_base, rr_dest, hit;
++	/* Enable (hit) RR */
++	rr_base = cfg->instances_dist * inst_num;
++	rr_dest = rr_base + cfg->hit_wr_breg;
++	hit = regmap_readl(rr_dest);
++	regmap_writel(hit | BIT(rr_idx), rr_dest);
++
++	if (write_only)
++		return;
++
++	rr_dest = rr_base + cfg->hit_rd_breg;
++	hit = regmap_readl(rr_dest);
++	regmap_writel(hit | BIT(rr_idx), rr_dest);
++}
++
++#define MAX_LBW_SHORT_RR 14
++
++static void preboot_secure_lbw_rr_gen(int rr_idx, u32 min, u32 max,
++		enum preboot_sec_engine_type type, bool is_short)
++{
++	int i;
++	u32 min_breg, max_breg, rr_calc;
++	struct preboot_sec_rrs_cfg *cfg = &preboot_sec_lbw_rrs_tbl[type];
++
++	if (is_short) {
++		rr_calc = rr_idx;
++		min_breg = cfg->min_short_breg;
++		max_breg = cfg->max_short_breg;
++	} else {
++		rr_calc = rr_idx - MAX_LBW_SHORT_RR;
++		min_breg = cfg->min_full_breg;
++		max_breg = cfg->max_full_breg;
++	}
++
++	for (i = 0; i < cfg->instances_num; i++) {
++		preboot_secure_update_rr_reg(rr_calc, cfg->instances_dist * i,
++				min_breg, max_breg, min, max);
++
++		preboot_secure_update_hit_reg(rr_idx, cfg, i, false);
++	}
++}
++
++static void preboot_secure_lbw_rr_wrap(int rr_idx, u32 min, u32 max, bool is_short)
++{
++	int i;
++
++	for (i = TPC_MME_IF; i <= ELBI_OR_COMMON_IF2; i++)
++		preboot_secure_lbw_rr_gen(rr_idx, min, max, (enum preboot_sec_engine_type)i,
++				is_short);
++}
++
++__unused static void preboot_secure_lbw_rr_full(int rr_idx, u64 min64, u64 max64)
++{
++	u32 min = min64 & ~HL_CFG_BASE;
++	u32 max = max64 & ~HL_CFG_BASE;
++
++	preboot_secure_lbw_rr_wrap(rr_idx, min, max, false);
++}
++
++__unused static void preboot_secure_lbw_rr_short(int rr_idx, u64 min64, u64 max64)
++{
++	u32 min = (min64 & ~HL_CFG_BASE) >> SHIFT_4K_POS;
++	u32 max = (max64 & ~HL_CFG_BASE) >> SHIFT_4K_POS;
++
++	preboot_secure_lbw_rr_wrap(rr_idx, min, max, true);
++}
++
++static void preboot_secure_lbw(void)
++{
++	/*
++	 * There are 18(0..17 rr idx) RRs for LBW.
++	 * The classification and apis are as listed below:
++	 *
++	 * 1) 14(0..13 rr idx) Regions with 4KB granularity
++	 * API: preboot_secure_lbw_rr_short(rr idx, min addr, max addr)
++	 *
++	 * 2) 4(14..17 rr idx) Regions with full address range.
++	 * API: preboot_secure_lbw_rr_full(rr idx, min addr, max addr)
++	 *
++	 * rr idx type : greco_sec_if_lbw_rrs
++	 * NOTE: The apis listed above will block all read and write
++	 * transactions for the input address range.
++	 */
++}
++
+ void preboot_security_init(void)
+ {
+ 	/* TODO add check for security strap ON */
+ 	preboot_secure_arc();
++	preboot_secure_lbw();
+ }

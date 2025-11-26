@@ -1,0 +1,69 @@
+From 30ec0b26b08e8b5f0f180945e717fdf825b5c747 Mon Sep 17 00:00:00 2001
+From: sai surya teja <sssteja@habana.ai>
+Date: Wed, 19 Apr 2023 04:13:28 +0300
+Subject: [PATCH] [SW-140835] fwupd: sec: ro access to err sts msg
+
+This patch aligns erom and preboot based on the following patch:
+https://gerrit.habana-labs.com/#/c/266783/
+
+When error occurs during RUN state, The response message
+body is not accessible from the pci. The FWL reads zeros (RAZWI).
+
+When executing the RUN command; It closes the access to the downloaded
+FIT. When it exits with an error, a status message containing the error
+information is passed as FIT towards the host. Its memory area should be
+re-opened in RO mode. The access will be blocked again as a response to
+RESET_STATE cmd.
+
+It is the host responsibility to send a RESET_STATE command. Indicating
+the end of transaction.
+
+NOTE: In secure mode while in MAP_SRAM, the FIT area should be open in
+RW mode, allowing the host to upload a FIT.
+
+Change-Id: I1c66fd301ff9b27efc1f439c80d71d6810a4966c
+---
+
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index a1943b5..e996cb5 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -165,24 +165,32 @@
+ 	struct hl_upd_status status;
+ 	uintptr_t address = (uintptr_t)offset;
+ 
+-	if (state->use_security && offset)
+-		preboot_security_dynamic_img_sram_open(state->mregion, ACCESS_RO);
+-
+ 	status.val = 0;
+ 	status.status = sts;
+ 
+ 	/* only if we get a address we need to calc offset */
+-	if (state->wfc_cmd.cmd == HL_UPD_MAP_ELBI) {
+-		if (address)
++	if (state->wfc_cmd.cmd == HL_UPD_MAP_ELBI ||
++	    state->wfc_cmd.cmd == HL_UPD_RUN_ELBI) {
++		if (address) {
+ 			status.offset = preboot_get_elbi_reg_offset_from_base(address);
+-		else
++			if (state->use_security)
++				preboot_security_dynamic_img_elbi_reg_open();
++		} else {
+ 			status.offset = 0;
++		}
+ 	} else {
+ 		if (address >=  SDRAM_BASE)
+ 			status.offset = (u32)((address - SDRAM_BASE) &
+ 					~HL_UPD_STS_OFFSET_MASK);
+ 		else
+ 			status.offset = (u32)(address & ~HL_UPD_STS_OFFSET_MASK);
++
++		/* In case of MAP_SRAM, the access should be already open in RW mode
++		 * overrunning with RO, will not allow the host to transfer the FIT.
++		 */
++		if (state->use_security && status.offset &&
++		    state->wfc_cmd.cmd != HL_UPD_MAP_SRAM)
++			preboot_security_dynamic_img_sram_open(state->mregion, ACCESS_RO);
+ 	}
+ 
+ 	state->sts_writel(status.val);

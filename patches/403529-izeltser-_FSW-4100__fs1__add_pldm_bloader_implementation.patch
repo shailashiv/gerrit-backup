@@ -1,0 +1,360 @@
+From dc469a526b95020c5b493d73550cd93f300c59f1 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 14 Mar 2024 12:28:42 +0200
+Subject: [PATCH] [FSW-4100] fs1: add pldm bloader implementation
+
+PLDM Bloader is a small bootloader for PLDM that runs instead of
+arcboot in the partial boot flow, and performs following tasks:
+1. init PLLs for prints and performance
+2. init memory with fresh copy of preboot
+3. init memory with bootinfo snapshot
+
+This patch adds the implementation of PLDM Bloader for FS1.
+
+Change-Id: Iaf2d50555948f6c41390a8ef6113a9f6e1b20fb5
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 9c04ecf..8d1c017 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -26,6 +26,8 @@
+ #include <pcie_wrap_regs.h>
+ #include <parc_global_conf_regs.h>
+ #include <parc_global_conf_masks.h>
++#include <mem_copy_regs.h>
++#include <mem_copy_masks.h>
+ #include <fs1_blocks_linux_driver.h>
+ #include <fs1_security.h>
+ 
+@@ -35,6 +37,9 @@
+ #include <fs1_reg_map.h>
+ #include <fs1_fw_if.h>
+ #include <uart.h>
++#include <iopoll.h>
++#include <pll.h>
++#include <efuse.h>
+ #include "common.h"
+ #include "hl.h"
+ 
+@@ -396,3 +401,80 @@
+ {
+ 	return TPM2_PREBOOT_PCR_IDX;
+ }
++
++/* by default IO0 fuse is read */
++int preboot_fuse_read(u32 word, u32 *val)
++{
++	return hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, word, val);
++}
++
++#define MEM_CPY_SIZE_LIMIT		(SZ_4M - SZ_16)
++#define MEM_CPY_SIZE_SHIFT		4
++#define MEM_CPY_SIZE_SHIFT_MASK		(BIT(MEM_CPY_SIZE_SHIFT) - 1)
++#define HL_MEM_CPY_TIMEOUT_US		10000
++
++int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size)
++{
++	u64 start = timestamp_get_us();
++	u32 cpy_sts, copy_sz;
++	u32 cp_err, wr_err, rd_err;
++
++	if (size > MEM_CPY_SIZE_LIMIT) {
++		preboot_puts("size exceeds MEM_CPY engine limit\n");
++		return -1;
++	}
++
++	regmap_writel((uint32_t)src >> MEM_CPY_SIZE_SHIFT,
++		      mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE + mmMEM_COPY_SRC_ADDR_LSB);
++	regmap_writel((uint32_t)(src >> 32), mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					     mmMEM_COPY_SRC_ADDR_MSB);
++
++	regmap_writel((uint32_t)dst >> MEM_CPY_SIZE_SHIFT,
++		      mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE + mmMEM_COPY_DEST_ADDR_LSB);
++	regmap_writel((uint32_t)(dst >> 32), mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					     mmMEM_COPY_DEST_ADDR_MSB);
++
++	/* set size of in granuality of 16 bytes */
++	copy_sz = size >> MEM_CPY_SIZE_SHIFT;
++	if (size & MEM_CPY_SIZE_SHIFT_MASK) {
++		preboot_puts("MEM_CPY size not aligned, rounding up\n");
++		copy_sz++;
++	}
++
++	regmap_writel(copy_sz, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			       mmMEM_COPY_COPY_SIZE);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(MEM_COPY_COPY_EN_VAL_M, mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++					      mmMEM_COPY_COPY_EN);
++
++	/* let 'enable' command propagate before polling on status */
++	HL_MNG_W_BARRIER();
++
++	while (1) {
++		cpy_sts = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++				       mmMEM_COPY_COPY_EN);
++		/* COPY_EN is set by FW, and cleared by HW when copy ends */
++		if (!(cpy_sts & MEM_COPY_COPY_EN_VAL_M))
++			break;
++
++		if (timeout_expired(start, HL_MEM_CPY_TIMEOUT_US)) {
++			preboot_puts("error: MEM_CPY engine timeout\n");
++			return -1;
++		}
++	}
++
++	cp_err = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_COPY_ERR_STS);
++	wr_err = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_WR_ERR_STS);
++	rd_err = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_MEM_COPY_BASE +
++			      mmMEM_COPY_RD_ERR_STS);
++
++	if (cp_err | wr_err | rd_err) {
++		preboot_puts("MEM_CPY finished with errors\n");
++		return -1;
++	}
++
++	return 0;
++}
+diff --git a/arch/fs1/arc/common.h b/arch/fs1/arc/common.h
+index 766dfee..beec0a3 100644
+--- a/arch/fs1/arc/common.h
++++ b/arch/fs1/arc/common.h
+@@ -37,6 +37,10 @@
+ #define ARC_PID_ICCM_SIZE		SZ_128K
+ #define ARC_PID_DCCM_FULL_BASE		0x300007FE88E0000ull
+ #define ARC_PID_DCCM_SIZE		SZ_64K
++#define ARC_MISC_ICCM_FULL_BASE		0x300007FE8900000ull
++#define ARC_MISC_ICCM_SIZE		SZ_256K
++#define ARC_MISC_DCCM_FULL_BASE		0x300007FE8940000ull
++#define ARC_MISC_DCCM_SIZE		SZ_64K
+ 
+ /* CFG is at Arc region F, specs CFG base address is 0x70000000. 7+8 = 0xF */
+ #define HL_CFG_BASE			0x80000000
+@@ -49,12 +53,16 @@
+ #define ARC_PID_ICCM_BASE		(FW_MEM_REGION_BASE + 0xC0000)
+ #define HL_SPI_BASE			0x94000000
+ 
++#define BOOT_INFO_BASE			SP_SRAM_BASE
++#define BOOT_INFO_SIZE			SZ_32K
++
+ #define PPBOOT_TEXT_BASE		FW_SRAM_BASE
+-#define PREBOOT_TEXT_BASE		(SP_SRAM_BASE + SZ_32K) /* preboot sits after bootinfo */
++/* preboot sits after bootinfo */
++#define PREBOOT_TEXT_BASE		(SP_SRAM_BASE + BOOT_INFO_SIZE)
++#define PREBOOT_TEXT_BASE_FULL		(HL_SP_SRAM_BASE + BOOT_INFO_SIZE)
+ #define RECOVERY_TEXT_BASE		0x0
+ #define RECOVERY_SIZE			SZ_16K
+ 
+-#define BOOT_INFO_BASE			SP_SRAM_BASE
+ /* SDRAM is not available in FS1, SPSRAM used instead */
+ #define SDRAM_BASE			SP_SRAM_BASE
+ 
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index d88893e..341fd3a 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -73,5 +73,6 @@
+ #endif /* USE_BOOTROM_SPI_DMA */
+ 
+ void hl_dev_psoc_pll_init(void);
++int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size);
+ 
+ #endif /* ARCH_FS1_ARC_HL_H_ */
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+index ed42b49..d9ca7db 100644
+--- a/arch/fs1/arc/pldm.c
++++ b/arch/fs1/arc/pldm.c
+@@ -10,6 +10,7 @@
+ #include <pcie_aux_masks.h>
+ #include <psoc_boot_conf_regs.h>
+ #include <psoc_boot_conf_masks.h>
++#include <arc_regs.h>
+ #include <fs1_blocks_linux_driver.h>
+ 
+ #include <baremetal.h>
+@@ -19,6 +20,7 @@
+ #include <fs1_reg_map.h>
+ #include <fs1_efuse.h>
+ #include <efuse.h>
++#include <hl.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
+ 
+@@ -104,7 +106,7 @@
+ 	u8 num_vf = 0;
+ 	u32 val;
+ 
+-	hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, IO_EFUSE_PLDM_PCI_CFG_OFFSET,
++	hl_fuse_read(mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_EFUSE_BASE, IO_EFUSE_PLDM_CFG_0_OFFSET,
+ 		     &pci_efuse_cfg);
+ 	preboot_puts_hex("efuse pci cfg = ", pci_efuse_cfg, false);
+ 
+@@ -189,3 +191,86 @@
+ 	regmap_writel(LTTSM_ENA_MASK, mmIO_0_CFG_HALF_0_CXL_EP_PCIE_AUX_BASE +
+ 				      mmPCIE_AUX_LTSSM_EN);
+ }
++
++
++/*
++ * pcie pll is initialized by the boot fsm to nominal values (in secured boot mode). In order to
++ * support uart prints on pldm only div3 of the PSOC pll should be modified.
++ */
++void btldr_pll_fixup(uint32_t die_id)
++{
++	hl_dev_psoc_pll_init();
++}
++
++/*
++ * ARC must not be in reset state when accessing the CCM modules.
++ * bloader is using CCM memories of MNG and MISC ARCs. MNG is already running, only MISC's reset
++ * need to be deasserted.
++ */
++void btldr_parc_prepare(void)
++{
++	regmap_writel(0, mmIO_0_CFG_HALF_0_PSOC_ARC_MISC_ARC_BASE + mmARC_ARC_RST);
++}
++
++static void btldr_copy_preboot_app(void)
++{
++	int err;
++	u32 val;
++
++	/*
++	 * Clean copy of the application is stored in MNG ICCM. In case the application binary
++	 * exceeds MNG ICCM size (256kb), the rest is stored in MISC ICCM.
++	 * An efuse bit is controlling whether the application binary is larger than MNG ICCM size.
++	 */
++	fs1_mem_copy(ARC_MNG_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL, ARC_MNG_ICCM_SIZE);
++
++	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
++	if (err)
++		val = BLOADER_COPY_LARGE_APP;
++
++	val &= BLOADER_COPY_LARGE_APP;
++
++	if (!val)
++		return;
++
++	fs1_mem_copy(ARC_MISC_ICCM_FULL_BASE, PREBOOT_TEXT_BASE_FULL + ARC_MNG_ICCM_SIZE,
++		     ARC_MISC_ICCM_SIZE);
++}
++
++static void btldr_copy_bootinfo(void)
++{
++	int err;
++	u32 val;
++
++	err = preboot_fuse_read(IO_EFUSE_PLDM_CFG_0_OFFSET, &val);
++	if (err)
++		val = BLOADER_COPY_BOOTINFO;
++
++	val &= BLOADER_COPY_BOOTINFO;
++
++	if (!val)
++		return;
++
++	/*
++	 * Normally bootinfo is first written to spsram by the arcboot, so preboot rtos expects some
++	 * bootinfo data to be available when it runs. On PLDM, when running standalone preboot,
++	 * pre-recorded boot info data is loaded to the SPSRAM.
++	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in MISC DCCM and copied
++	 * back to the SPSRAM as part of the preparation to run preboot rtos.
++	 */
++	fs1_mem_copy(ARC_MISC_DCCM_FULL_BASE, HL_SP_SRAM_BASE, BOOT_INFO_SIZE);
++}
++
++void btldr_copy_data(void)
++{
++	btldr_copy_preboot_app();
++	btldr_copy_bootinfo();
++}
++
++#define APP_RST_VECTOR_ADDR	PREBOOT_TEXT_BASE_FULL
++
++void btldr_exec_app(void)
++{
++	preboot_puts("pldm-bloader resigned\n");
++	image_start(APP_RST_VECTOR_ADDR);
++}
+diff --git a/arch/fs1/arc/pldm_bloader.lds.S b/arch/fs1/arc/pldm_bloader.lds.S
+new file mode 100644
+index 0000000..367d883
+--- /dev/null
++++ b/arch/fs1/arc/pldm_bloader.lds.S
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2024 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
++	SBROM	: ORIGIN = 0x78980000, LENGTH = 128K
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 128K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		crt0_rom.o (.text*)
++		*(.text .text.* .rodata .rodata.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext;
++		_data = .;
++		_rom_non_persistent_dccm_start = .;
++		*(.data .data.*)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + 2k;
++		__stack_top = . ;
++	} > REGION_STACK
++}

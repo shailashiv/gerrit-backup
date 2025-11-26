@@ -1,0 +1,527 @@
+From c0e49b53b479c620f59edb37300feb3a34425272 Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Fri, 09 Feb 2024 15:26:44 +0200
+Subject: [PATCH] [SW-137122] gaudi3: erom rec: ported pcie code from rtos
+
+ported gaudi3 pci code from preboot rtos to erom recovery
+to support firmware update.
+
+Created a gaudi3 specific pci.c file and put the gaudi3
+related pci functions in this file.
+
+Change-Id: I57a2f57183ec01a556305bb556f90e8eb2841ee8
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 7d05684..9d039b4 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -55,7 +55,7 @@
+ 	$(HL_DEV_ARCH)/../common/security.o \
+ 	erom_secondary.o
+ 
+-EROM_RECOVERY_DEPS := \
++EROM_RECOVERY_DEPS += \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_desc.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/cmd_module.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/module_i2c_slave.o \
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 35aa7a1..011de14 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -22,4 +22,7 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/string.o
+ 
++EROM_RECOVERY_DEPS := \
++	$(HL_DEV_ARCH_COMMON)/pci.o
++
+ image_validation: image_validation_common
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index b8f5a8f..1ef51ae 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -548,6 +548,7 @@
+ 	pci.aux_rdlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP);
+ 	pci.aux_smlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP);
+ 	pci.core_hot_rst_reg = D0_PCIE_CORE_REG(mmPCIE_CORE_HOT_RST);
++	pci.bmu_base_addr = mmD0_PCIE_BMU_BASE;
+ }
+ 
+ void device_init_i2c_s(void)
+diff --git a/arch/gaudi3/common/common.c b/arch/gaudi3/common/common.c
+index a4c99ad..b896fbb 100644
+--- a/arch/gaudi3/common/common.c
++++ b/arch/gaudi3/common/common.c
+@@ -12,11 +12,12 @@
+ #include <pcie_aux_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_aux_masks.h>
++#include <pcie_wrap_masks.h>
+ #include <global_conf_regs.h>
+-#include <gaudi3_fw_if.h>
+ #include <uart.h>
+ #include <bitops.h>
+ #include <gpio_regs.h>
++#include <address_space.h>
+ 
+ #define GPIOS_PER_BANK			16
+ #define FORCE_RECOVERY_MASK	BIT(2)
+@@ -46,6 +47,45 @@
+ 	regmap_writel(0, D0_PCIE_WRAP_REG(mmPCIE_WRAP_MASK_REQ));
+ }
+ 
++#define PCIE_OUTBOUND_RETRY_COUNT	10
++#define PCIE_OUTBOUND_DELAY_US		10
++
++#define PCIE_WRAP_RESET_MASK_REQ_VAL			(PCIE_WRAP_MASK_REQ_FROM_HBW_M | \
++							PCIE_WRAP_MASK_REQ_DBG_M | \
++							PCIE_WRAP_MASK_REQ_TRACE_M | \
++							PCIE_WRAP_MASK_REQ_ECT_M)
++
++#define PCIE_AUX_RESET_HOST_TERM_VAL		(PCIE_AUX_HOST_TERM_CTRL_MSTR_WR_TERM_M | \
++						PCIE_AUX_HOST_TERM_CTRL_MSTR_RD_TERM_M | \
++						PCIE_AUX_HOST_TERM_CTRL_ELBI_WR_TERM_M | \
++						PCIE_AUX_HOST_TERM_CTRL_ELBI_RD_TERM_M)
++
++void hl_pcie_disable_access(void)
++{
++	uint8_t retry = PCIE_OUTBOUND_RETRY_COUNT;
++
++	/* Terminate all downstream access */
++	regmap_writel(PCIE_AUX_RESET_HOST_TERM_VAL,
++					D0_PCIE_AUX_REG(mmPCIE_AUX_HOST_TERM_CTRL));
++
++	/* Isolate all PCIe outbound memory access */
++	regmap_writel(PCIE_WRAP_RESET_MASK_REQ_VAL,
++					D0_PCIE_WRAP_REG(mmPCIE_WRAP_MASK_REQ));
++
++	while (regmap_readl(D0_PCIE_WRAP_REG(mmPCIE_WRAP_OUTBOUND_OUTSTANDING))) {
++		udelay(PCIE_OUTBOUND_DELAY_US);
++		retry--;
++
++		if (!retry) {
++			preboot_puts("Outstanding transactions are non-zero, ");
++			preboot_puts("proceeding with reset\n");
++			return;
++		}
++	}
++
++	preboot_puts("Outstanding transaction are zero, proceeding with reset\n");
++}
++
+ /*
+  * Request CPLD to stop the watchdog, by deasserting
+  * GPIO_66.
+diff --git a/arch/gaudi3/common/pci.c b/arch/gaudi3/common/pci.c
+new file mode 100644
+index 0000000..9b025c3
+--- /dev/null
++++ b/arch/gaudi3/common/pci.c
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <baremetal.h>
++#include <gaudi3_blocks_linux_driver.h>
++#include <gaudi3_reg_map.h>
++#include <gaudi3_fw_if.h>
++#include <pif_arc_special_regs.h>
++#include <hl_pif_arc_if.h>
++#include <hl_pci_if.h>
++#include <hl_boot_if.h>
++#include <address_space.h>
++#include <boot_if.h>
++#include <bitops.h>
++#include <device.h>
++#include <uart.h>
++#include <pci.h>
++#include <hl.h>
++
++static u32 pif_prev_err;
++
++/* TODO: Move this functions to emb common modules */
++bool is_pcie_initialized(void)
++{
++	u32 regval;
++
++	regval = regmap_readl(mmD0_PIF_ARC_STATUS);
++	if (regval & PIF_STAT_PCIE_INIT_DONE)
++		return true;
++
++	return false;
++}
++
++u32 dev_pci_dbi_cfg_offset_get(void)
++{
++	return mmD0_PCIE_DBI_SIG_BASE;
++}
++
++/* TODO: Move this functions to emb common modules */
++static void pif_arc_ctrl_reset(bool enable)
++{
++	u32 val = regmap_readl(mmD0_PIF_ARC_CONTROL);
++
++	if (enable)
++		val |= PIF_CTRL_FLR_RST_EN;
++	else
++		val &= ~PIF_CTRL_FLR_RST_EN;
++
++	regmap_writel(val, mmD0_PIF_ARC_CONTROL);
++}
++
++/* TODO: Move this functions to emb common modules */
++void pci_dev_specific_setup(void)
++{
++	/* In Preboot no need to perform FLR - disable FLR reset */
++	pif_arc_ctrl_reset(false);
++
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
++}
++
++/* TODO: Move this functions to emb common modules */
++bool pci_dev_specific_pif_err_pending(void)
++{
++	u32 regval = regmap_readl(mmD0_PIF_ARC_ERROR);
++
++	return !(regval == pif_prev_err);
++}
++
++/* TODO: Move this functions to emb common modules */
++void hl_pif_report_err(u32 err_bit)
++{
++	char *msg;
++	enum pif_runtime_error err = err_bit;
++
++	switch (err) {
++	case ERR_PCI_OUTBOUND_TIMEOUT:
++		msg = "outbound transactions timeout";
++		break;
++	case ERR_FLR_HW_RESET_TIMEOUT:
++		msg = "FLR HW reset timeout";
++		break;
++	case ERR_SEC_DIE_READY_TIMEOUT:
++		msg = "slave die ready timeout";
++		break;
++	case ERR_TS_COUNTER_OVERFLOW:
++		msg = "ts counter overflow";
++		break;
++	case ERR_CPU_EXCEPTION_HALT:
++		msg = "ARC halt on exeption";
++		break;
++	case ERR_PHY_FW_LOAD_TIMEOUT:
++		msg = "PHY FW update timeout";
++		break;
++	case ERR_PCI_LINK_UP_TIMEOUT:
++		preboot_puts_raw("waiting for pci link for more than 500ms");
++		return;
++	default:
++		preboot_puts_hex_raw("Unknown PIF err reported ", err, false);
++		return;
++	}
++
++	preboot_puts_raw("PIF err reported: ");
++	preboot_puts(msg);
++	preboot_puts("\n");
++}
++
++void pci_dev_specific_pif_err_process(void)
++{
++	unsigned int err_idx = 0;
++	u32 regval, pending;
++
++	regval = regmap_readl(mmD0_PIF_ARC_ERROR);
++	pending = regval ^ pif_prev_err;
++	pending &= regval;
++
++	while (pending) {
++		if (pending & BIT(0))
++			hl_pif_report_err(err_idx);
++
++		pending >>= 1;
++		err_idx++;
++	}
++
++	pif_prev_err = regval;
++}
++
++struct hl_pci_inbound_region gaudi3_pci_inbound_regions[] = PCI_IATU_INBOUND_REGIONS_DATA;
++
++/* TODO: Move this functions to emb common modules */
++void hl_pci_iatu_init(void)
++{
++	int i;
++	struct hl_pci_outbound_region outbound_region;
++
++	for (i = 0; i < ARRAY_SIZE(gaudi3_pci_inbound_regions); ++i)
++		hl_pci_set_inbound_region(i, &gaudi3_pci_inbound_regions[i]);
++
++	/* Outbound Region 0 - Point to Host */
++	outbound_region.addr = HOST_PHYS_BASE_0;
++	outbound_region.size = HOST_PHYS_SIZE_0;
++	hl_pci_set_outbound_region(&outbound_region);
++}
++
++struct hl_bmu_region gaudi3_pci_bmu_regions[] = PCI_BMU_REGIONS_DATA;
++
++/* TODO: Move this functions to emb common modules */
++void hl_pci_bmu_init(void)
++{
++	int err, i;
++
++	hl_pci_bmu_set_cfg_base(CFG_PHYS_BASE);
++
++	for (i = 0; i < ARRAY_SIZE(gaudi3_pci_bmu_regions); ++i) {
++		err = hl_pci_set_bmu_region(&gaudi3_pci_bmu_regions[i]);
++		if (err)
++			preboot_puts_hex_raw("error initializing bmu region ", i, false);
++	}
++
++	hl_pci_bmu_enable(true);
++}
++
++#define BMU_CFG_SRC_START_OFF		0x8
++#define BMU_CFG_SRC_END_OFF		0x48
++#define BMU_CFG_DST_OFFS_R0_OFF		0x88
++#define BMU_CFG_DST_OFFS_R1_OFF		0xC8
++#define BMU_CFG_AWUSER_R0_OFF		0x108
++#define BMU_CFG_AWUSER_R1_OFF		0x148
++#define BMU_CFG_ARUSER_R0_OFF		0x1C8
++#define BMU_CFG_ARUSER_R1_OFF		0x208
++#define BMU_CFG_AXI_AW_PROT_OFF		0x288
++#define BMU_CFG_AXI_AW_CACHE_OFF	0x2A8
++#define BMU_CFG_AXI_AR_PROT_OFF		0x2C8
++#define BMU_CFG_AXI_AR_CACHE_OFF	0x2E8
++#define BMU_CFG_ADDR_SHIFT		2
++#define BMU_CFG_OFF_MASK		0xFFFFFFFFFCull /* GENMASK(39, 2) */
++
++static void hl_pci_set_bmu_cfg_region(struct hl_bmu_region *region)
++{
++	u32 base_addr = pci.bmu_base_addr + (region->id * SZ_4);
++	u32 start_addr = (u32)(region->src_start >> BMU_CFG_ADDR_SHIFT);
++	u32 end_addr = (u32)(region->src_end >> BMU_CFG_ADDR_SHIFT);
++	u64 dst_addr = region->dst_base - region->src_start;
++	u64 dst_off = (dst_addr & BMU_CFG_OFF_MASK) >> BMU_CFG_ADDR_SHIFT;
++
++	regmap_writel(start_addr, base_addr + BMU_CFG_SRC_START_OFF);
++	regmap_writel(end_addr, base_addr + BMU_CFG_SRC_END_OFF);
++	regmap_writel((u32)(dst_off), base_addr + BMU_CFG_DST_OFFS_R0_OFF);
++	regmap_writel((u32)(dst_off >> 32), base_addr + BMU_CFG_DST_OFFS_R1_OFF);
++
++	regmap_writel((u32)(region->perms.w_user), base_addr + BMU_CFG_AWUSER_R0_OFF);
++	regmap_writel((u32)(region->perms.w_user >> 32), base_addr + BMU_CFG_AWUSER_R1_OFF);
++	regmap_writel((u32)(region->perms.r_user), base_addr + BMU_CFG_ARUSER_R0_OFF);
++	regmap_writel((u32)(region->perms.r_user >> 32), base_addr + BMU_CFG_ARUSER_R1_OFF);
++	regmap_writel(region->perms.w_prot, base_addr + BMU_CFG_AXI_AW_PROT_OFF);
++	regmap_writel(region->perms.r_prot, base_addr + BMU_CFG_AXI_AR_PROT_OFF);
++	regmap_writel(region->perms.w_cache, base_addr + BMU_CFG_AXI_AW_CACHE_OFF);
++	regmap_writel(region->perms.r_cache, base_addr + BMU_CFG_AXI_AR_CACHE_OFF);
++}
++
++#define BMU_MEM_SRC_START_OFF		0x500
++#define BMU_MEM_SRC_END_OFF		0x520
++#define BMU_MEM_DST_OFFS_OFF		0x540
++#define BMU_MEM_AWUSER_R0_OFF		0x560
++#define BMU_MEM_AWUSER_R1_OFF		0x580
++#define BMU_MEM_ARUSER_R0_OFF		0x5C0
++#define BMU_MEM_ARUSER_R1_OFF		0x5E0
++#define BMU_MEM_AXI_AW_PROT_OFF		0x620
++#define BMU_MEM_AXI_AW_CACHE_OFF	0x630
++#define BMU_MEM_AXI_AR_PROT_OFF		0x640
++#define BMU_MEM_AXI_AR_CACHE_OFF	0x650
++#define BMU_MEM_DST_BASE_OFF		0x660
++#define BMU_MEM_ADDR_SHIFT		20
++#define BMU_MEM_DEST_BASE_SHIFT		48
++#define BMU_MEM_SRC_MASK		0x3FFFF00000ull	  /* GENMASK(37, 20) */
++#define BMU_MEM_DEST_MASK		0xFFFFFFF00000ull /* GENMASK(47, 20) */
++
++static void hl_pci_set_bmu_mem_region(struct hl_bmu_region *region)
++{
++	u32 base_addr = pci.bmu_base_addr + (region->id * SZ_4);
++	u32 start_addr = (u32)((region->src_start & BMU_MEM_SRC_MASK) >> BMU_MEM_ADDR_SHIFT);
++	u32 end_addr = (u32)((region->src_end & BMU_MEM_SRC_MASK) >> BMU_MEM_ADDR_SHIFT);
++	u32 mem_base = (u32)(region->dst_base >> BMU_MEM_DEST_BASE_SHIFT);
++	u64 dst_addr = region->dst_base - region->src_start;
++	u32 dst_off = (u32)((dst_addr & BMU_MEM_DEST_MASK) >> BMU_MEM_ADDR_SHIFT);
++
++	regmap_writel(start_addr, base_addr + BMU_MEM_SRC_START_OFF);
++	regmap_writel(end_addr, base_addr + BMU_MEM_SRC_END_OFF);
++	regmap_writel(mem_base, base_addr + BMU_MEM_DST_BASE_OFF);
++	regmap_writel(dst_off, base_addr + BMU_MEM_DST_OFFS_OFF);
++
++	regmap_writel((u32)(region->perms.w_user), base_addr + BMU_MEM_AWUSER_R0_OFF);
++	regmap_writel((u32)(region->perms.w_user >> 32), base_addr + BMU_MEM_AWUSER_R1_OFF);
++	regmap_writel((u32)(region->perms.r_user), base_addr + BMU_MEM_ARUSER_R0_OFF);
++	regmap_writel((u32)(region->perms.r_user >> 32), base_addr + BMU_MEM_ARUSER_R1_OFF);
++	regmap_writel(region->perms.w_prot, base_addr + BMU_MEM_AXI_AW_PROT_OFF);
++	regmap_writel(region->perms.r_prot, base_addr + BMU_MEM_AXI_AR_PROT_OFF);
++	regmap_writel(region->perms.w_cache, base_addr + BMU_MEM_AXI_AW_CACHE_OFF);
++	regmap_writel(region->perms.r_cache, base_addr + BMU_MEM_AXI_AR_CACHE_OFF);
++}
++
++#define BMU_REGION_EN_OFF	0x4
++#define BMU_NUM_CFG_REGIONS	8
++
++static void hl_pci_bmu_enable_region(enum hl_bmu_region_id id, enum hl_bmu_region_type type)
++{
++	u32 reg = regmap_readl(pci.bmu_base_addr + BMU_REGION_EN_OFF);
++	u32 reg_mask = BIT(id);
++
++	reg_mask = (type == BMU_REGION_TYPE_MEM) ? (reg_mask << BMU_NUM_CFG_REGIONS) : reg_mask;
++	reg |= reg_mask;
++	regmap_writel(reg, pci.bmu_base_addr + BMU_REGION_EN_OFF);
++}
++
++int hl_pci_set_bmu_region(struct hl_bmu_region *region)
++{
++	if (region->type == BMU_REGION_TYPE_MEM) {
++		if (region->id > BMU_MEM_REGION_MAX)
++			return -1;
++
++		hl_pci_set_bmu_mem_region(region);
++	} else {
++		if (region->id > BMU_CFG_REGION_MAX)
++			return -1;
++
++		hl_pci_set_bmu_cfg_region(region);
++	}
++
++	hl_pci_bmu_enable_region(region->id, region->type);
++
++	return 0;
++}
++
++#define BMU_CFG_BASE_SHIFT	40
++#define BMU_CFG_DST_BASE_OFFSET	0x308
++
++void hl_pci_bmu_set_cfg_base(u64 cfg_base_addr)
++{
++	u32 cfg_dst = (u32)(cfg_base_addr >> BMU_CFG_BASE_SHIFT);
++
++	regmap_writel(cfg_dst, pci.bmu_base_addr + BMU_CFG_DST_BASE_OFFSET);
++}
++
++void hl_pci_bmu_enable(bool enable)
++{
++	u32 val = enable ? 1 : 0;
++
++	regmap_writel(val, pci.bmu_base_addr);
++}
+diff --git a/include/baremetal.h b/include/baremetal.h
+index 3b57c83..f37e06e 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -221,6 +221,7 @@
+ const char *preboot_get_version(enum preboot_vers ver);
+ void hl_ram_init(void);
+ void hl_pci_iatu_init(void);
++void hl_pci_bmu_init(void);
+ bool hl_pci_link_is_up(void);
+ void hl_pcie_enable_access(void);
+ void hl_pcie_disable_access(void);
+diff --git a/include/device.h b/include/device.h
+index d239ca8..fcd32f9 100644
+--- a/include/device.h
++++ b/include/device.h
+@@ -37,6 +37,7 @@
+ 	u32 aux_rdlh_link_up_reg;
+ 	u32 aux_smlh_link_up_reg;
+ 	u32 core_hot_rst_reg;
++	u32 bmu_base_addr;
+ };
+ 
+ struct device_i2c_s {
+diff --git a/lib/common/cmd_module.h b/lib/common/cmd_module.h
+index f7ca55c..320cdc8 100644
+--- a/lib/common/cmd_module.h
++++ b/lib/common/cmd_module.h
+@@ -81,6 +81,8 @@
+ void pci_dev_specific_teardown(void);
+ void pci_dev_specific_hot_rst(void);
+ void pci_dev_specific_run(void);
++bool pci_dev_specific_pif_err_pending(void);
++void pci_dev_specific_pif_err_process(void);
+ 
+ /* FWUPD */
+ void module_fwupd_setup(void);
+diff --git a/lib/common/module_pci.c b/lib/common/module_pci.c
+index dc96982..51e1d50 100644
+--- a/lib/common/module_pci.c
++++ b/lib/common/module_pci.c
+@@ -38,7 +38,6 @@
+ 	.setup_done = false,
+ };
+ 
+-__weak void pci_dev_specific_setup(void) {}
+ __weak void pci_dev_specific_teardown(void) {}
+ __weak void pci_dev_specific_disable(void) {}
+ __weak void pci_dev_specific_enable(void) {}
+@@ -67,8 +66,6 @@
+ 	regmap_writel(1, pci.aux_pf_flr_done_reg);
+ }
+ 
+-__weak void hl_pci_iatu_init(void) {}
+-__weak bool is_pcie_initialized(void) { return true; }
+ __weak void hl_dev_pci_pll_wa(void) {}
+ 
+ __weak void module_pci_do_setup(void)
+@@ -120,6 +117,9 @@
+ 	return NOT_FOUND;
+ }
+ 
++__weak bool pci_dev_specific_pif_err_pending(void) { return false; }
++__weak void pci_dev_specific_pif_err_process(void) {}
++
+ enum cmd_check_res module_pci_check(void)
+ {
+ 	if (hl_is_debug_mode(HL_DEBUG_HW_PCIE))
+@@ -131,6 +131,11 @@
+ 	 */
+ 	if (!is_pcie_initialized()) {
+ 		pci_init_wait_dbg();
++
++		/* process PIF ARC errors before link up, this is safe when prst_n is asserted */
++		if (pci_dev_specific_pif_err_pending())
++			pci_dev_specific_pif_err_process();
++
+ 		return NOT_FOUND;
+ 	}
+ 
+@@ -171,6 +176,7 @@
+ }
+ 
+ __weak void pci_dev_specific_post_link_up(void) {}
++__weak void hl_pci_bmu_init(void) {}
+ 
+ void module_pci_run_fast(void)
+ {
+@@ -203,8 +209,10 @@
+ 		pci_sts.mem_enabled_prev = pci_sts.mem_enabled;
+ 		rst_src = hl_rst_src_get();
+ 		if (pci_sts.mem_enabled && ((rst_src == HL_COLD_RST) ||
+-					    (rst_src == HL_PRSTN_RST)))
++					    (rst_src == HL_PRSTN_RST))) {
++			hl_pci_bmu_init();
+ 			hl_pci_iatu_init();
++		}
+ 
+ 		preboot_puts_raw("PCIe mem_en changed to: ");
+ 		preboot_puts_raw(pci_sts.mem_enabled ? "true" : "false");
+diff --git a/lib/common/pci.h b/lib/common/pci.h
+index 0b4cf15..91698e1 100644
+--- a/lib/common/pci.h
++++ b/lib/common/pci.h
+@@ -24,5 +24,8 @@
+ void hl_pcie_mask_ca_aer(void);
+ void hl_pcie_init(void);
+ void pci_init_wait_dbg(void);
++int hl_pci_set_bmu_region(struct hl_bmu_region *region);
++void hl_pci_bmu_set_cfg_base(u64 cfg_base_addr);
++void hl_pci_bmu_enable(bool enable);
+ 
+ #endif /* _PCI_H_ */

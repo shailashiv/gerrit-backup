@@ -1,0 +1,258 @@
+From 9b8049755b5ff42ded4d82eb3fbda9b832150b11 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 27 Apr 2021 12:02:05 +0300
+Subject: [PATCH] [SW-40470] gaudi: sec: adding fit descriptor verification
+
+Proprietry descriptor is added to all fit images in order
+to increase security, by avoiding using public u-boot code for
+signature verification.
+
+The descriptor is attached to the fit image as a footer.
+If security is enabled, for every received fit image preboot
+verifies the Image signature prior to parsing it or using any of
+the data.
+The signature is calculated on the entire fit image as a whole +
+the security descriptor with zeroized signature field.
+
+Change-Id: Ie7e171a667044f22eed845a32dbbc28a839f715a
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 5120693..6b621e4 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -61,6 +61,7 @@
+ #include <spi.h>
+ #include <sha256.h>
+ #include <hl_fw_if.h>
++#include <preboot/fit.h>
+ 
+ #include "common.h"
+ 
+@@ -1792,3 +1793,83 @@
+ {
+ 	boot_info_set(HL_BOOT_INFO_PUB_KEY_HASH, key, len);
+ }
++
++int preboot_verify_img_sig(const void *img, size_t img_size,
++			   enum fit_sec_failure *res)
++{
++	struct hl_fit_sec_desc fit_sec;
++	const void *fit_sec_off;
++	const void *pub_key_fit;
++	u8 signature[FIT_SIGNATURE_SIZE];
++
++	/* hl fit files are padded so the size is 4 bytes aligned */
++	img_size = ROUND_UP4(img_size);
++
++	/* security descriptor is at the footer of the image */
++	fit_sec_off = (const void *)((u8 *)img + img_size);
++
++	memcpy(&fit_sec, fit_sec_off, FIT_SEC_DESC_SIZE);
++
++	if (fit_sec.magic_number != FIT_SEC_MAGIC) {
++		preboot_puts("Bad magic, security descriptor not found\n");
++		return 1;
++	}
++
++	if ((fit_sec.desc_version_maj != FIT_SEC_DESC_VER_MAJOR) ||
++	    (fit_sec.desc_version_min != FIT_SEC_DESC_VER_MINOR)) {
++		preboot_puts("security descriptor version mismatch\n");
++		return 1;
++	}
++
++	if (fit_sec.desc_size < FIT_SEC_DESC_SIZE) {
++		preboot_puts("security descriptor size too small\n");
++		return 1;
++	}
++
++	if (fit_sec.img_size != img_size) {
++		preboot_puts("image size mismatch with security descriptor\n");
++		return 1;
++	}
++
++	if (!preboot_security_svn_is_valid(fit_sec.sec_version)) {
++		preboot_puts("security descriptor svn not valid\n");
++		*res = FIT_SEC_SVN_INVALID;
++		return 1;
++	}
++
++	if (preboot_security_key_is_revoked(fit_sec.key_num)) {
++		preboot_puts_hex("Key revoked: ", fit_sec.key_num, false);
++		*res = FIT_SEC_KEY_REVOKED;
++		return 1;
++	}
++
++	pub_key_fit = &fit_sec.pub_key;
++
++	if (!preboot_security_key_is_valid(fit_sec.key_num, pub_key_fit,
++					   FIT_PUB_KEY_SIZE, NULL, 0)) {
++		preboot_puts("Key validation failed\n");
++		*res = FIT_SEC_SIGN_FAILED;
++		return 1;
++	}
++
++	/*
++	 * signature is calculated on both the fit image and the security
++	 * descriptor with the signature field of the descriptor zeroized.
++	 */
++	memcpy(signature, fit_sec.signature, FIT_SIGNATURE_SIZE);
++	memset(fit_sec.signature, 0, FIT_SIGNATURE_SIZE);
++
++	if (fit_verify_img_sig(img, img_size, &fit_sec, FIT_SEC_DESC_SIZE,
++			       pub_key_fit, signature, FIT_SIGNATURE_SIZE)) {
++		preboot_puts("image signature verification failed\n");
++		*res = FIT_SEC_SIGN_FAILED;
++		return 1;
++	}
++
++	return 0;
++}
++
++size_t preboot_get_img_sec_desc_size(void)
++{
++	return FIT_SEC_DESC_SIZE;
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 5669a89..69618b9 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -73,6 +73,13 @@
+ 	PREBOOT_EFUSE_VER,
+ };
+ 
++enum fit_sec_failure {
++	FIT_SEC_NONE = 0,
++	FIT_SEC_SVN_INVALID,
++	FIT_SEC_KEY_REVOKED,
++	FIT_SEC_SIGN_FAILED,
++};
++
+ struct hl_nic_en {
+ 	bool is_valid;
+ 	uint32_t bitmask;
+@@ -174,6 +181,11 @@
+ 
+ uintptr_t preboot_shm_get_offset(void);
+ void preboot_shm_set_offset(uintptr_t offset);
++
++int preboot_verify_img_sig(const void *fit, size_t img_size,
++			   enum fit_sec_failure *res);
++size_t preboot_get_img_sec_desc_size(void);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index cf7b8f4..fa9eec4 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -83,13 +83,6 @@
+ 	FIT_LOAD_SEC_FAILED,
+ };
+ 
+-enum fit_sec_failure {
+-	FIT_SEC_NONE = 0,
+-	FIT_SEC_SVN_INVALID,
+-	FIT_SEC_KEY_REVOKED,
+-	FIT_SEC_SIGN_FAILED,
+-};
+-
+ struct fit_image images[FIT_MAX_IMAGES];
+ struct fdt_region fdt_regions[MAX_FDT_REGIONS];
+ struct image_region region[MAX_FDT_REGIONS];
+@@ -601,11 +594,22 @@
+ 	return 0;
+ }
+ 
++__weak int preboot_verify_img_sig(const void *fit, size_t img_size,
++				  enum fit_sec_failure *res)
++{
++	return 0;
++}
++
+ static int fit_verify_security(const void *fit, int noffset,
+ 			       enum fit_sec_failure *res)
+ {
++	size_t fit_size = fdt_totalsize(fit);
++
+ 	if (!preboot_security_is_enabled())
+ 		return 0;
++
++	if (preboot_verify_img_sig(fit, fit_size, res))
++		return 1;
+ 
+ 	if (!fit_svn_is_valid(fit)) {
+ 		*res = FIT_SEC_SVN_INVALID;
+@@ -948,16 +952,25 @@
+ 	preboot_start_image(startaddr);
+ }
+ 
++__weak size_t preboot_get_img_sec_desc_size(void)
++{
++	return 0;
++}
++
+ int fit_validate_size(int len)
+ {
+ 	const void *fit = (const void *)preboot_shm_get_offset();
++	size_t img_size = ROUND_UP4(fdt_totalsize(fit));
+ 
+ 	if (fdt_check_header(fit)) {
+ 		preboot_puts("Bad FIT header\n");
+ 		return 1;
+ 	}
+ 
+-	return fdt_totalsize(fit) != len;
++	/* taking the security footer into account */
++	img_size += preboot_get_img_sec_desc_size();
++
++	return img_size != len;
+ }
+ 
+ int fit_get_load_type(u32 *load_type)
+@@ -1065,3 +1078,30 @@
+ 
+ 	return 0;
+ }
++
++#define HL_SEC_REGIONS_CNT	2
++#define HL_SEC_KEY_NAME		"hl_rsa3072"
++
++int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
++		       size_t sec_desc_size, const void *pub_key_fit,
++		       const u8 *sig, size_t sig_len)
++{
++	const char *key_name = HL_SEC_KEY_NAME;
++	struct rsa_key_prop prop;
++	struct image_region region[HL_SEC_REGIONS_CNT];
++
++	if (fit_get_key_prop(pub_key_fit, key_name, &prop))
++		return 1;
++
++	/*
++	 * region 0 holds the fit image as a whole,
++	 * region 1 holds the hl security descriptor
++	 */
++	region[0].data = img;
++	region[0].size = img_size;
++	region[1].data = sec_desc;
++	region[1].size = sec_desc_size;
++
++	return rsa_verify_regions(region, HL_SEC_REGIONS_CNT, sig, sig_len,
++				  &prop);
++}
+diff --git a/preboot/fit.h b/preboot/fit.h
+index 528bedd..a3b03e0 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -16,4 +16,8 @@
+ 				size_t size);
+ int fit_init_resp(void *fit, size_t sz);
+ int fit_fin_resp(void *fit, unsigned int *res_size);
++int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
++		       size_t sec_desc_size, const void *pub_key_fit,
++		       const u8 *sig, size_t sig_len);
++
+ #endif /* _HL_FIT_H_ */

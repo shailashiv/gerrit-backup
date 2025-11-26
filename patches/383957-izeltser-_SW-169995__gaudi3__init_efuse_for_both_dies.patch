@@ -1,0 +1,131 @@
+From 5dfa173e490fb6f5df940a2d96b69e1b4b1f5898 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 04 Jan 2024 13:51:42 +0200
+Subject: [PATCH] [SW-169995] gaudi3: init efuse for both dies
+
+die0 & die1 efuse should be initialized so later FW components can read
+the shadow registers and get valid efuse data.
+bootrom is initializing the efuse whenever the efuse flag is not set in
+the cold flop register. bootrom is running locally on each die, so the
+best and fastest way to init the efuse of each die is simply clean the
+efuse flag in the cold flop after every boot and let bootrom handle
+the efuse init during the next boot.
+
+In d2d device, if spi gw is enabled, ppboot clears efuse flag in die1
+via the spi gw.
+
+Change-Id: Ic15eb8f0deffc57fbbd2c1bb107e862fdbc9f895
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index c3c53f2..020cf4c 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -218,3 +218,8 @@
+ 	hl_dev_security_init();
+ }
+ 
++/* TODO : remove after PO, when efuse is programmed on all devices  */
++bool is_spi_gw_enabled(void)
++{
++	return true;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c8b23ee..7f4573e 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -37,6 +37,7 @@
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <gaudi3_reg_map.h>
+ #include <pcie_dbi_masks.h>
++#include <efuse_masks.h>
+ #include <arcboot_export.h>
+ #include <hl_sec_if.h>
+ 
+@@ -1343,7 +1344,46 @@
+ 	return hl_fuse_read(mmD0_PSOC_EFUSE_BASE, word, val);
+ }
+ 
++__weak bool is_spi_gw_enabled(void)
++{
++	uint32_t fuse_data = 0;
++
++	if (preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &fuse_data)) {
++		preboot_puts("spi_gw: failed to read efuse");
++		return false;
++	}
++
++	if (fuse_data & EFUSE_SPI_GW_EN_MASK)
++		return true;
++
++	return false;
++}
++
++/*
++ * bootrom is initializing the efuse whenever the efuse flag is not set in the cold flop register.
++ * bootrom is running locally on each die, so the best and fastest way to init the efuse of each
++ * die is simply clean the efuse flag in the cold flop after every boot and let bootrom handle
++ * the efuse init during the next boot.
++ */
++
++#define D0_COLDFLOP_EFUSE_INIT_BIT	2
++#define D1_COLDFLOP_EFUSE_INIT_BIT	6
++
+ int preboot_fuse_init(void)
+ {
+-	return hl_fuse_init(mmD0_PSOC_EFUSE_BASE);
++	u32 regval;
++
++	regval = regmap_readl(mmCOLD_RST_DATA);
++	regval &= ~(BIT(D0_COLDFLOP_EFUSE_INIT_BIT));
++	regmap_writel(regval, mmCOLD_RST_DATA);
++
++	if (hl_is_dual_die_sku() && is_spi_gw_enabled()) {
++		regval = regmap_readl(SPI_GW_REGMAP_BASE +
++				      D1_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_COLD_RST_FLOPS_2));
++		regval &= ~(BIT(D1_COLDFLOP_EFUSE_INIT_BIT));
++		regmap_writel(regval, SPI_GW_REGMAP_BASE +
++				      D1_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_COLD_RST_FLOPS_2));
++	}
++
++	return 0;
+ }
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index be43a62..08c4420 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -40,6 +40,9 @@
+ 
+ #define SRAM_MEM_REGION_BASE		0x10000000
+ #define FW_MEM_REGION_BASE		0x20000000
++#define HL_SPI_GW_CFG_BASE		0xE0000000
++/* spi gw base to use with regmap_read/write functions */
++#define SPI_GW_REGMAP_BASE		(HL_SPI_GW_CFG_BASE + 0x10000000)
+ #define HL_CFG_BASE			0xF0000000
+ #define SDRAM_SIZE			(SZ_32M + SZ_16M) /* single die mode */
+ #define SDRAM_BASE			(FW_MEM_REGION_BASE - SDRAM_SIZE)
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 8c490ea..f276177 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -56,5 +56,6 @@
+ int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
+ 	u32 *fail_buffer, u32 fail_limit, u32 *fail_index);
+ bool ppboot_is_valid_img_desc_ex(void *desc);
++bool is_spi_gw_enabled(void);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/onix.c b/arch/gaudi3/arc/onix.c
+index 02da182..ab603cf 100644
+--- a/arch/gaudi3/arc/onix.c
++++ b/arch/gaudi3/arc/onix.c
+@@ -77,3 +77,8 @@
+ 
+ /* plls are not implemented on onix platform */
+ void gaudi3_print_cpu_pll(void) {}
++
++bool is_spi_gw_enabled(void)
++{
++	return false;
++}

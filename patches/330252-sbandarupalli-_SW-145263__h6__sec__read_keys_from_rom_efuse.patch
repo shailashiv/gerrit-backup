@@ -1,0 +1,61 @@
+From 49d5de978d6a290e5144c2bdc68da2884b9699f9 Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Wed, 31 May 2023 06:37:03 +0300
+Subject: [PATCH] [SW-145263] h6: sec: read keys from rom/efuse
+
+currently when fake security is enabled, keys are read from
+"FAKE Security keys" offset from flash. But in Gaudi2 as per
+efuse bit nap, keys can be read only from ROM or efuse
+
+Code change are done to read keys from ROM or EFUSE even if
+fake security is enabled
+
+Change-Id: Ifc13002ca62623986b152b744d7ddb8af8e1e389
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 61fb48a..087b6c3 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -353,8 +353,13 @@
+ 	struct hl_sec_efuse *fuse;
+ 	u32 *val;
+ 	int i;
+-
+-	if (preboot_hl_sec_fuse_cache.is_invalid) {
++	/*
++	 * fake security enable bit is stored in cold reset flops
++	 * which is erased after cold reset
++	 * To avoid potential mismatch (cold reset done with fake sec enabled)
++	 * fake fuse contents are not read from SPI if fake sec is not enabled
++	 */
++	if (preboot_fake_security_is_enabled() && preboot_hl_sec_fuse_cache.is_invalid) {
+ 		fuse = &preboot_hl_sec_fuse_cache.fuse;
+ 		/* Copy efuse security data */
+ 		spi_flash_copy(&fuse->data, FAKE_SECURITY_FUSE_OFFSET + (EFUSE_SEC_OFFSET *
+@@ -406,11 +411,6 @@
+ static void preboot_security_boot_info_write_efuse(void)
+ {
+ 	/* Do nothing for real eFuse */
+-}
+-
+-static void preboot_security_copy_fake_otp(struct hl_sec_otp *otp)
+-{
+-	spi_flash_copy(otp, FAKE_SECURITY_OTP_OFFSET, sizeof(struct hl_sec_otp), "FAKE OTP");
+ }
+ 
+ /* Number of DWORDS available in PSOC registers to store security key hash */
+@@ -478,11 +478,7 @@
+ 	struct hl_sec_otp *otp = &preboot_sec_otp_cache.otp;
+ 
+ 	if (preboot_sec_otp_cache.is_invalid) {
+-		if (preboot_fake_security_is_enabled())
+-			preboot_security_copy_fake_otp(otp);
+-		else
+-			preboot_security_copy_otp(otp);
+-
++		preboot_security_copy_otp(otp);
+ 		if (otp->magic_number != OTP_SEC_MAGIC)
+ 			return NULL;
+ 

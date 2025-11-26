@@ -1,0 +1,79 @@
+From 3224d4eee9e82415b285801ba2af8eef31c6cb68 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 20 May 2021 19:18:24 +0300
+Subject: [PATCH] [SW-42558] gaudi: security: lock dbi statically
+
+Since FW initializes the iATU, host no longer need to access it, so we
+can close the access to iATU/DBI space along with others during the
+static init.
+Remove the preboot_security_dbi_lock() function and update the static
+security configuration to cover the DBI/iATU sapce as well.
+
+Change-Id: I1b9afbfa1a57767c96d33be31082e8e51caa604c
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 1a16aeb..f6624d3 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -497,7 +497,6 @@
+ 	if (iatu_disabled || !preboot_security_is_enabled())
+ 		return;
+ 
+-	preboot_security_dbi_lock();
+ 	preboot_ack_razwi_irq();
+ 	iatu_disabled = true;
+ }
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 668eb12..ab2d53d 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1309,13 +1309,8 @@
+ 	max = mmPCIE_WRAP_BASE;
+ 	preboot_secure_lbw_rr(LBW_RR_HBM_GIC, min, max);
+ 
+-	/*
+-	 * Note: we skip here the PCIE_DBI, since iATU might not be configured
+-	 * yet and thus host needs access to DBI/iATU space.
+-	 * The DBI is closed at a later stage in DBI lock function.
+-	 */
+-	/* PCIE_CORE up to PCIE_CORE_L: RR(LBW_RR_PCIE_DBI_COREBGN) */
+-	min = mmPCIE_CORE_BASE - 1;
++	/* PCIE_DBI up to PCIE_CORE_L: RR(LBW_RR_PCIE_DBI_COREBGN) */
++	min = mmPCIE_DBI_BASE - 1;
+ 	max = HL_CFG_BASE + mmPCIE_CORE_MSI_REQ;
+ 	preboot_secure_lbw_rr(LBW_RR_PCIE_DBI_COREBGN, min, max);
+ 
+@@ -1773,19 +1768,6 @@
+ void preboot_security_sp_sram_write_key_idx(u32 *key_idx)
+ {
+ 	boot_info_set(HL_BOOT_INFO_KEY_IDX, key_idx, sizeof(u32));
+-}
+-
+-void preboot_security_dbi_lock(void)
+-{
+-	u64 min, max;
+-
+-	if (!preboot_security_is_enabled())
+-		return;
+-
+-	/* PCIE_DBI up to PCIE_CORE_L: RR(LBW_RR_PCIE_DBI_COREBGN) */
+-	min = mmPCIE_DBI_BASE - 1;
+-	max = HL_CFG_BASE + mmPCIE_CORE_MSI_REQ;
+-	preboot_secure_lbw_rr(LBW_RR_PCIE_DBI_COREBGN, min, max);
+ }
+ 
+ void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len)
+diff --git a/include/security.h b/include/security.h
+index ff1689e..60133c2 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -18,7 +18,6 @@
+ void preboot_security_dynamic_img_spsram_close(void);
+ void preboot_security_dynamic_img_spsram_open(void);
+ void preboot_security_cleanup_before_run(void);
+-void preboot_security_dbi_lock(void);
+ void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len);
+ 
+ #endif /* _HL_SECURITY_H_ */

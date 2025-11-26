@@ -1,0 +1,293 @@
+From b10940be5573665cd3c094389f1c32068da751cd Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Thu, 20 Dec 2018 07:21:05 +0200
+Subject: [PATCH] [SW-0] GOYA: make boot time shorter
+
+In order to minimize boot time we enable all PLLs relevant for
+copying SPL to SRAM which is the most consuming time effort.
+
+This save about 1.25Sec runtime.
+
+Change-Id: Id608cdff03751e277f133a65593de891048fca68
+---
+
+diff --git a/pll.c b/pll.c
+new file mode 100644
+index 0000000..6387f7d
+--- /dev/null
++++ b/pll.c
+@@ -0,0 +1,209 @@
++#include <common.h>
++#include <command.h>
++#include <linux/delay.h>
++#include <asm/io.h>
++#include <linux/types.h>
++#include "pll.h"
++
++#ifdef DEV_IS_GOYA
++#define HL_PLL_NR		0x100
++#define HL_PLL_NF		0x104
++#define HL_PLL_OD		0x108
++#define HL_PLL_NB		0x10c
++#define HL_PLL_CFG		0x110
++#define HL_PLL_CFG_LOCK		(1 << 4)
++#define HL_PLL_LOCK_INTR	0x128
++#define HL_PLL_DATA_CHNG	0x130
++#define HL_PLL_RST		0x134
++#define HL_PLL_DIV_FACTOR	0x200
++#define HL_PLL_DIV_FACTOR_CMD	0x220
++#define HL_PLL_DIV_SEL		0x280
++#define HL_PLL_DIV_EN		0x2a0
++
++#define HL_PLL_DIV_SIZE		4
++
++#define HL_PLL_MAX_WAIT_TIME	20	/* 20 us */
++#define HL_PLL_LOCK_TOUT	5000	/* 5 ms */
++
++#define USEC_PER_SEC		1000000
++#define CPU_CYCELS_PER_USEC	(1200000000 / USEC_PER_SEC)
++#define BYPASS_CYCLES_PER_USEC	(50000000 / USEC_PER_SEC)
++#define MIN_CYCLES_PER_ITER	5
++static int cpu_pll_bypassed = 1;
++
++#define mmCPU_PLL_BASE		0x7FFC4A2000ull
++#define mmIC_PLL_BASE		0x7FFC4A3000ull
++#define mmPSOC_MME_PLL_BASE	0x7FFCC71000ull
++
++struct hl_pll_cfg {
++	char	*name;
++	void	*base;
++	u32	nr;
++	u32	nf;
++	u32	od;
++	u32	nb;
++	u32	div_factor[HL_PLL_DIV_SIZE];
++};
++
++static struct hl_pll_cfg goya_pll_cfg[] = {
++	{.name="CPU", .base=(void*)mmCPU_PLL_BASE,
++	 .nr=0, .nf=47, .od=1, .nb=23, .div_factor={0,23,1,-1}},
++	{.name="IC", .base=(void*)mmIC_PLL_BASE,
++	 .nr=0, .nf=63, .od=15, .nb=31, .div_factor={0,1,1,2}},
++	{.name="MME", .base=(void*)mmPSOC_MME_PLL_BASE,
++	 .nr=0, .nf=63, .od=15, .nb=31, .div_factor={0,1,2,8}},
++};
++
++extern void preboot_puts_raw(const char *str);
++
++static int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
++{
++	int pll_num = sizeof(goya_pll_cfg) / sizeof(goya_pll_cfg[0]);
++
++	*hl_pll_cfg = goya_pll_cfg;
++
++	return pll_num;
++}
++
++static void hl_pll_udelay(unsigned int usec)
++{
++	long cnt;
++
++	if (cpu_pll_bypassed)
++		cnt = (BYPASS_CYCLES_PER_USEC * usec) / MIN_CYCLES_PER_ITER;
++	else
++		cnt = (CPU_CYCELS_PER_USEC * usec) / MIN_CYCLES_PER_ITER;
++
++	while (cnt--);
++}
++
++static void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++{
++	writel(reset, cfg->base + HL_PLL_RST);
++}
++
++static inline int hl_pll_is_locked(struct hl_pll_cfg *cfg)
++{
++	return readl(cfg->base + HL_PLL_CFG) & HL_PLL_CFG_LOCK;
++}
++
++static inline void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg)
++{
++	u32 reg = readl(cfg->base + HL_PLL_CFG);
++
++	writel(reg & ~HL_PLL_CFG_LOCK, cfg->base + HL_PLL_CFG);
++}
++
++static int hl_pll_cfg(struct hl_pll_cfg *cfg)
++{
++	int tout = HL_PLL_LOCK_TOUT;
++
++	hl_pll_reset(cfg, true);
++
++	writel(cfg->nr, cfg->base + HL_PLL_NR);
++	writel(cfg->nf, cfg->base + HL_PLL_NF);
++	writel(cfg->od, cfg->base + HL_PLL_OD);
++	writel(cfg->nb, cfg->base + HL_PLL_NB);
++	writel(0x11, cfg->base + HL_PLL_DATA_CHNG);
++
++	/* after updating the coefficients we need to wait >=5us */
++	hl_pll_udelay(HL_PLL_MAX_WAIT_TIME);
++
++	hl_pll_reset(cfg, false);
++
++	/* Wait >500 (10us) reference cycles until PLL re-locks. */
++	hl_pll_udelay(HL_PLL_MAX_WAIT_TIME);
++
++	/* to be on a safe side, poll on the PLL lock status bit */
++	while (!hl_pll_is_locked(cfg) && tout--)
++		hl_pll_udelay(1);
++
++	if (!tout) {
++		preboot_puts_raw("PLL: Timeout waiting for ");
++		preboot_puts_raw(cfg->name);
++		preboot_puts_raw(" PLL lock...\n\r");
++		return 1;
++	}
++
++	/* w/a the h/w erratum: lock status bit isn't getting cleared */
++	hl_pll_clear_lock_status(cfg);
++
++	return 0;
++}
++
++static void hl_pll_bypass(struct hl_pll_cfg *cfg, bool bypass)
++{
++	int sel, offset;
++
++	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
++		offset = sel * sizeof(u32);
++
++		if (cfg->div_factor[sel] == -1)
++			break;
++
++		if (bypass)
++			writel(0, cfg->base + offset + HL_PLL_DIV_SEL);
++		else
++			writel((sel || (cfg->div_factor[sel]))?3:1, cfg->base + offset + HL_PLL_DIV_SEL);
++	}
++
++	/* just to be on a safe side, wait for bypass to propagate */
++	hl_pll_udelay(1);
++}
++
++static void hl_pll_div_init(struct hl_pll_cfg *cfg)
++{
++	int sel, offset;
++
++	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
++		offset = sel * sizeof(u32);
++
++		if (cfg->div_factor[sel] == -1)
++			break;
++
++		writel(cfg->div_factor[sel], cfg->base +
++						offset + HL_PLL_DIV_FACTOR);
++		writel(1, cfg->base + offset + HL_PLL_DIV_FACTOR_CMD);
++		writel(1, cfg->base + offset + HL_PLL_DIV_EN);
++	}
++
++	/* just to be on a safe side, wait for DIV init to propagate */
++	hl_pll_udelay(1);
++}
++
++static void hl_pll_ack_int(struct hl_pll_cfg *cfg)
++{
++	writel(1, cfg->base + HL_PLL_LOCK_INTR);
++}
++
++static int hl_pll_set(struct hl_pll_cfg *cfg)
++{
++	int ret;
++
++	hl_pll_bypass(cfg, true);
++
++	ret = hl_pll_cfg(cfg);
++
++	hl_pll_div_init(cfg);
++
++	hl_pll_bypass(cfg, false);
++
++	hl_pll_ack_int(cfg);
++
++	return ret;
++}
++
++/**
++ * hl_pll_init - Initialize PLL registers
++ */
++void hl_pll_init(void)
++{
++	int i, pll_num;
++	struct hl_pll_cfg *hl_pll_cfg;
++
++	pll_num = hl_pll_get_cfg(&hl_pll_cfg);
++	cpu_pll_bypassed = hl_pll_set(hl_pll_cfg);
++	for (i=1; i<pll_num; i++)
++		hl_pll_set(hl_pll_cfg + i);
++}
++#endif
+diff --git a/pll.h b/pll.h
+new file mode 100644
+index 0000000..b3cc113
+--- /dev/null
++++ b/pll.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _HL_PLL_H_
++#define _HL_PLL_H_
++
++
++#ifdef DEV_IS_GOYA
++void hl_pll_init(void);
++#else
++static inline void hl_pll_init(void) {}
++#endif
++
++#endif /* _HL_PLL_H_ */
+diff --git a/preboot.c b/preboot.c
+index b2d2d21..ec294c0 100644
+--- a/preboot.c
++++ b/preboot.c
+@@ -13,6 +13,7 @@
+ #include "auto_generated.h"
+ #include <stddef.h>
+ #include <stdbool.h>
++#include "pll.h"
+ 
+ #define SYS_REF_CLOCK			50000000
+ #define BTL_COUNTER_MAX			BIT(22)
+@@ -67,7 +68,7 @@
+ static inline void preboot_putc_virt_uart(const char c) {}
+ #endif
+ 
+-static void preboot_puts_raw(const char* str)
++void preboot_puts_raw(const char* str)
+ {
+ 	int i;
+ 
+@@ -599,6 +600,7 @@
+ 	preboot_version();
+ 	preboot_pcie_init();
+ 	preboot_delay();
++	hl_pll_init();
+ 	preboot_copy_spl();
+ 
+ 	spl_start();
+diff --git a/preboot.lds b/preboot.lds
+index a19762d..f8e8474 100644
+--- a/preboot.lds
++++ b/preboot.lds
+@@ -17,6 +17,7 @@
+ 		. = ALIGN(8);
+ 		start.o (.text*)
+ 		preboot.o (.text*)
++		pll.o (.text*)
+ 	} >.sram
+ 
+ 	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram

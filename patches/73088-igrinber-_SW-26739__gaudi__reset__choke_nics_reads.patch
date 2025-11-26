@@ -1,0 +1,73 @@
+From 17fb27cbcdf4e9a4528a9d735340d87e5a98f2a4 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 28 Jan 2021 17:48:44 +0200
+Subject: [PATCH] [SW-26739] gaudi: reset: choke nics reads
+
+Choke the NIC TXE read transactions on reset, so no new
+read transactions will be issued to host direction.
+Issueing read transaction to host during reset (or driver rmmod) might
+return with error and raise interrupt which in turn will result in more
+transactions towards host. This is not a recommended behaviour during
+the reset time and thus should be avoided.
+We do this by removing forcibly all the credits from the TXE engines.
+
+Change-Id: Ifd95f68c971aa7115be547e8fb124b75cf952e74
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 5fede8f..a0720c3 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -34,7 +34,8 @@
+ 
+ #define GAUDI_NICS_NUM			5
+ #define GAUDI_NICS_DIST			0x40000
+-#define GAUDI_NIC_ENGS_NUM		(GAUDI_NICS_NUM * 2)
++#define GAUDI_NIC_ENGS_IN_NIC		2
++#define GAUDI_NIC_ENGS_NUM		(GAUDI_NICS_NUM * GAUDI_NIC_ENGS_IN_NIC)
+ #define GAUDI_NIC_ENGS_DIST		0x1000
+ #define GAUDI_QPCS_NUM			2
+ #define GAUDI_TPCS_NUM			8
+diff --git a/gaudi/reset.c b/gaudi/reset.c
+index efbc0c6..9f1356a 100644
+--- a/gaudi/reset.c
++++ b/gaudi/reset.c
+@@ -14,6 +14,7 @@
+ #include <nic0_qpc0_regs.h>
+ #include <nic0_qm0_regs.h>
+ #include <nic0_qm1_regs.h>
++#include <nic0_txe0_regs.h>
+ #include <dma0_core_regs.h>
+ #include <dma1_core_regs.h>
+ #include <dma2_core_regs.h>
+@@ -120,6 +121,21 @@
+ 	}
+ }
+ 
++static void gaudi_nics_txe_read_choke(void)
++{
++	int i, j;
++	u32 reg, base, eng_base;
++
++	for (i = 0; i < GAUDI_NICS_NUM; i++) {
++		base = GAUDI_NICS_DIST * i;
++		for (j = 0; j < GAUDI_NIC_ENGS_IN_NIC; j++) {
++			eng_base = base + GAUDI_NIC_ENGS_DIST * j;
++			reg = eng_base + mmNIC0_TXE0_READ_CREDIT_FORCE_FULL;
++			regmap_writel(0x1, reg);
++		}
++	}
++}
++
+ static void gaudi_nic_qpc_disable(unsigned int reg, int nic, int qpc)
+ {
+ 	unsigned int off, mask = BIT(6);
+@@ -147,6 +163,7 @@
+ static void gaudi_nics_handle(void)
+ {
+ 	gaudi_nics_rxb_drop_reset();
++	gaudi_nics_txe_read_choke();
+ 	gaudi_nics_qpcs_disable();
+ }
+ 

@@ -1,0 +1,246 @@
+From d2b712f155330d0983b9e9f16c52190b5901e741 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Mon, 06 Feb 2023 15:16:56 +0200
+Subject: [PATCH] [SW-116970] greco: remove recovery app
+
+The recovery flow is not supported in greco
+and recovery app is not used by other platforms
+Therefore removing recovery app.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: If632586c61ec8b66784950570cfc6762bf0e1d32
+---
+
+diff --git a/app/recovery/Makefile b/app/recovery/Makefile
+deleted file mode 100644
+index a4aa7ab..0000000
+--- a/app/recovery/Makefile
++++ /dev/null
+@@ -1,63 +0,0 @@
+-CC = $(CROSS_COMPILE)gcc
+-OBJCOPY = $(CROSS_COMPILE)objcopy
+-BASE_DEV_NAME := $(shell echo $(HL_DEV) | cut -d'_' -f1)
+-HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
+-HL_DEV_ARCH := arch/$(BASE_DEV_NAME)/$(HL_DEV_SUBTYPE)
+-HL_DEV_ARCH_COMMON := arch/$(BASE_DEV_NAME)/common
+-PREBOOT_ROOT_DIR := ../..
+-ifeq ($(BASE_DEV_NAME),greco)
+-	BASE_DEV_NAME := goya2
+-endif
+-
+-CFLAGS += -I$(SPECS_DIR)
+-CFLAGS += -I$(SPECS_EMBEDDED_DIR)
+-CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
+-CFLAGS += -Wall -Werror
+-CFLAGS += -g -c
+-CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/
+-
+-CFLAGS += -Os -fdata-sections -ffunction-sections
+-# dummy parameter, real one required only for ppboot build
+-CFLAGS += -DPHY_FW_SIZE=0
+-
+-SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+-
+-RECOVERY_LD_SCRIPT := $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/recovery.lds
+-LDFLAGS := -g -nostdlib -static
+-LDFLAGS += -Wl,--gc-sections
+-LDLIBS := -lgcc
+-
+-RECOVERY_SRCS_C := $(shell ls *.c)
+-RECOVERY_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
+-RECOVERY_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH_COMMON)/common.c)
+-RECOVERY_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/common.c)
+-RECOVERY_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/$(HL_TARGET).c)
+-RECOVERY_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH_COMMON)/$(HL_TARGET).c)
+-RECOVERY_APP_S := $(shell ls crt0_recovery.S)
+-
+-RECOVERY_OBJECTS := $(RECOVERY_SRCS_C:.c=.o)
+-RECOVERY_OBJECTS += $(RECOVERY_APP_S:.S=.o)
+-
+-# TODO: add version info
+-
+-all: recovery.bin
+-
+-%.bin: %
+-	$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
+-
+-recovery: $(RECOVERY_OBJECTS) $(RECOVERY_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -T $(RECOVERY_LD_SCRIPT) -o $@ -Wl,--start-group $(RECOVERY_OBJECTS) $(LDLIBS) -Wl,--end-group
+-
+-%.lds: %.lds.S
+-	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
+-
+-%.o: %.c
+-	@$(CC) $(CFLAGS) -o $@ $<
+-
+-%.o: %.S
+-	@$(CC) $(SFLAGS) -o $@ $<
+-
+-clean:
+-	rm -f $(RECOVERY_OBJECTS)
+-
+-.PHONY: clean
+diff --git a/app/recovery/crt0_recovery.S b/app/recovery/crt0_recovery.S
+deleted file mode 100644
+index acffc4a..0000000
+--- a/app/recovery/crt0_recovery.S
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0+ */
+-/*
+- * Copyright 2020 HabanaLabs, Ltd.
+- * All Rights Reserved.
+- */
+-
+-/*
+- * This is recovery entry point
+- * Setting sp/fp/lr and jumping to C code
+- */
+-.globl	_start
+-_start:
+-
+-
+-/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
+-.global	lf2flt
+-lf2flt:
+-
+-	mov	sp, __stack_top
+-	mov	fp, sp
+-
+-	/* Clear BSS */
+-	mov	r5, __bss_start
+-	sub	r6, __bss_end, r5
+-	lsr.f	lp_count, r6, 2
+-	lpnz	1f
+-	st.ab   0, [r5, 4]
+-1:
+-	bl	recovery_main	/* Set LR (x30) */
+diff --git a/app/recovery/module_i2c_slave.c b/app/recovery/module_i2c_slave.c
+deleted file mode 100644
+index 03f540a..0000000
+--- a/app/recovery/module_i2c_slave.c
++++ /dev/null
+@@ -1,74 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * (C) Copyright 2020 HabanaLabs, Ltd.
+- * All rights reserved.
+- *
+- */
+-
+-#include <preboot.h>
+-#include <hl_i2c_slave_events.h>
+-
+-#include "module_i2c_slave.h"
+-
+-u8 i2cslave_pec;
+-u8 i2cslave_valid_pec;
+-
+-u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+-{
+-	u8 ret;
+-
+-	switch (cmd) {
+-	case HL_FW_UPDATE_CMD_CODE:
+-		ret = HL_FW_UPDATE_CMD_LEN;
+-		break;
+-	case HL_FW_UPDATE_CONTROL:
+-		ret = 0;
+-		break;
+-	default:
+-		/* NA */
+-		ret = 0;
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+-u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt)
+-{
+-	return 0;
+-}
+-
+-void i2cslave_handle_sync_error(void) {}
+-
+-void i2cslave_fit_set_checked(void) {}
+-
+-bool i2cslave_fit_is_checked(void)
+-{
+-	return false;
+-}
+-
+-void i2cslave_fit_run_image(void) {}
+-
+-
+-bool i2cslave_indirect_is_process_op(void)
+-{
+-	return false;
+-}
+-
+-void i2cslave_indirect_process_op(void) {}
+-
+-bool i2cslave_indirect_op_is_fast(void)
+-{
+-	return false;
+-}
+-
+-bool i2cslave_is_reset_dev(void)
+-{
+-	return false;
+-}
+-
+-void i2cslave_reset_dev(void) {}
+-
+-void i2cslave_pec_init(void) {}
+-
+-void i2cslave_pec_digest(u8 val) {}
+diff --git a/app/recovery/recovery.c b/app/recovery/recovery.c
+deleted file mode 100644
+index f63aad5..0000000
+--- a/app/recovery/recovery.c
++++ /dev/null
+@@ -1,43 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <stddef.h>
+-#include <preboot.h>
+-#include <device.h>
+-#include "cmd_module.h"
+-#include "pll.h"
+-
+-static struct cmd_module_ops cmd_ops[] = {
+-	{	/* I2C SLAVE module */
+-		.setup = module_i2c_s_setup,
+-		.check = module_i2c_s_check,
+-		.disable = module_i2c_s_disable,
+-		.run = module_i2c_s_run,
+-		.enable = module_i2c_s_setup,
+-		.run_fast = noop,
+-		.teardown = module_i2c_s_teardown,
+-		.run_noreturn = noop,
+-	},
+-};
+-
+-static void device_init(void)
+-{
+-	device_init_uart();
+-	device_init_i2c_s();
+-	device_init_global_conf();
+-	device_init_pll(); /* used for uart and delay */
+-}
+-
+-void recovery_main(void)
+-{
+-	device_init();
+-	udelay_init();
+-	hl_uart_init();
+-
+-	/* Handle commands */
+-	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+-}

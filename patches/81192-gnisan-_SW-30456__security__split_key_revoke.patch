@@ -1,0 +1,204 @@
+From 73bef9a2e24c7636790057cea7abadec84f2229c Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 09 Mar 2021 10:49:30 +0200
+Subject: [PATCH] [SW-30456] security: split key revoke
+
+This commit splits outs key revoke check out of key validation check.
+This is done as preparation to the need to report specific securityrity
+error to BMC.
+
+Change-Id: I443b08238de68f89dc61bd3af00ae6ca674cca20
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index b627c19..23bedcd 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -217,25 +217,36 @@
+ 	preboot_security_sp_sram_write_efuse();
+ }
+ 
++bool preboot_security_key_is_revoked(int key_idx)
++{
++	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
++
++	if (!fuse)
++		return true;
++
++	if (key_idx < SEC_KEY_REVOKE_BIT_START ||
++	    key_idx > SEC_KEY_REVOKE_BIT_END)
++		return true;
++
++	if (fuse->key_revoke & SEC_KEY_REVOKE_BIT(key_idx))
++		return true;
++
++	return false;
++}
++
+ bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+ 				   int pub_key_len, const void *pub_key_ext,
+ 				   int pub_key_ext_len)
+ {
+ 	const struct hl_sec_otp *otp = preboot_security_get_otp();
+-	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
+ 	u8 value[SHA256_SUM_LEN];
+ 
+-	if (!otp || !fuse)
++	if (!otp)
+ 		return false;
+ 
+ 	if (key_idx < SEC_KEY_REVOKE_BIT_START ||
+ 	    key_idx > SEC_KEY_REVOKE_BIT_END)
+ 		return false;
+-
+-	if (fuse->key_revoke & SEC_KEY_REVOKE_BIT(key_idx)) {
+-		preboot_puts_hex("Key revoked: ", key_idx, 0);
+-		return false;
+-	}
+ 
+ 	sha256_csum(pub_key, pub_key_len, value);
+ 	return !memcmp(&otp->keys[key_idx * SHA256_SUM_LEN], value,
+diff --git a/gaudi2_arc_gnu/security.c b/gaudi2_arc_gnu/security.c
+index 9c860b7..36cd8e6 100644
+--- a/gaudi2_arc_gnu/security.c
++++ b/gaudi2_arc_gnu/security.c
+@@ -28,11 +28,22 @@
+ 	return (config_efuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+ 
++bool preboot_security_key_is_revoked(int key_idx)
++{
++	u32 key_revoke;
++
++	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
++		return true;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	return !!(key_revoke & BIT(key_idx));
++}
++
+ bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+ 			 int pub_key_len, const void *pub_key_ext,
+ 			 int pub_key_ext_len)
+ {
+-	u32 key_revoke, key_base, hash_calculated, hash_stored;
++	u32 key_base, hash_calculated, hash_stored;
+ 	u8 bytes_per_dword = sizeof(u32);
+ 	u8 value[SHA256_SUM_LEN];
+ 	u8 key[KEY_SIZE];
+@@ -40,12 +51,6 @@
+ 
+ 	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
+ 		return false;
+-
+-	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+-	if (key_revoke & BIT(key_idx)) {
+-		preboot_puts_hex("Key revoked: ", key_idx, 0);
+-		return false;
+-	}
+ 
+ 	if (pub_key_len != (KEY_SIZE - KEY_EXT_SIZE)) {
+ 		preboot_puts_hex("Invalid pub key length: ", pub_key_len, 0);
+diff --git a/goya2_arc_gnu/security.c b/goya2_arc_gnu/security.c
+index f57388e..ccb0f84 100644
+--- a/goya2_arc_gnu/security.c
++++ b/goya2_arc_gnu/security.c
+@@ -28,6 +28,15 @@
+ 	return (config_efuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+ 
++bool preboot_security_key_is_revoked(int key_idx)
++{
++	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
++		return true;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	return !!(key_revoke & BIT(key_idx));
++}
++
+ bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+ 			 int pub_key_len, const void *pub_key_ext,
+ 			 int pub_key_ext_len)
+@@ -40,12 +49,6 @@
+ 
+ 	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
+ 		return false;
+-
+-	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+-	if (key_revoke & BIT(key_idx)) {
+-		preboot_puts_hex("Key revoked: ", key_idx, 0);
+-		return false;
+-	}
+ 
+ 	if (pub_key_len != (KEY_SIZE - KEY_EXT_SIZE)) {
+ 		preboot_puts_hex("Invalid pub key length: ", pub_key_len, 0);
+diff --git a/greco_arc_gnu/security.c b/greco_arc_gnu/security.c
+index a9ecd64..ba92d98 100644
+--- a/greco_arc_gnu/security.c
++++ b/greco_arc_gnu/security.c
+@@ -28,11 +28,22 @@
+ 	return (config_efuse & EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+ }
+ 
++bool preboot_security_key_is_revoked(int key_idx)
++{
++	u32 key_revoke;
++
++	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
++		return true;
++
++	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
++	return !!(key_revoke & BIT(key_idx));
++}
++
+ bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+ 			 int pub_key_len, const void *pub_key_ext,
+ 			 int pub_key_ext_len)
+ {
+-	u32 key_revoke, key_base, hash_calculated, hash_stored;
++	u32 key_base, hash_calculated, hash_stored;
+ 	u8 bytes_per_dword = sizeof(u32);
+ 	u8 value[SHA256_SUM_LEN];
+ 	u8 key[KEY_SIZE];
+@@ -40,12 +51,6 @@
+ 
+ 	if (key_idx < 0 || key_idx >= SECURITY_KEY_HASH_COUNT)
+ 		return false;
+-
+-	key_revoke = sp_sram_readl(SECURITY_EFUSE_KEYS_REVOKE_OFFSET);
+-	if (key_revoke & BIT(key_idx)) {
+-		preboot_puts_hex("Key revoked: ", key_idx, 0);
+-		return false;
+-	}
+ 
+ 	if (pub_key_len != (KEY_SIZE - KEY_EXT_SIZE)) {
+ 		preboot_puts_hex("Invalid pub key length: ", pub_key_len, 0);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index f37dfe6..69246a4 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -120,6 +120,11 @@
+ 	return false;
+ }
+ 
++__weak bool preboot_security_key_is_revoked(int key_idx)
++{
++	return false;
++}
++
+ __weak bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
+ 					  int pub_key_len,
+ 					  const void *pub_key_ext,
+@@ -486,6 +491,11 @@
+ 	}
+ 
+ key_validation:
++	if (preboot_security_key_is_revoked(preboot_key_idx)) {
++		preboot_puts_hex("Key revoked: ", preboot_key_idx, false);
++		return 1;
++	}
++
+ 	if (!preboot_security_key_is_valid(preboot_key_idx, key_data, key_len,
+ 				key_ext_data, key_ext_len)) {
+ 		preboot_puts("Key validation failed\n");

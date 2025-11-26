@@ -1,0 +1,154 @@
+From 092ec3929b5bd3548fb06c743813855defbb8ec8 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 24 May 2021 17:46:36 +0300
+Subject: [PATCH] [SW-42526] ras: add asic serial number in preboot
+
+Asic serial number support is added in preboot for both
+direct (offset 11-30) and indirect (opcode 0) commands.
+
+In direct command for compatibility reasons 11-12 is for
+pcie device id and 13-30 is for asic serial number.
+
+Change-Id: I8ee0609118331bd2d18f7c4e0285e7075799e3bd
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 2e80a6e..6058f7f 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -235,6 +235,14 @@
+ 		data &= 0xFFFF;
+ 		ret = data & 0xFF;
+ 		break;
++	case HL_PCIE_DEVICE_ID_VAL_LOW:
++		data >>= 16;
++		ret = (data & 0xFF00) >> 8;
++		break;
++	case HL_PCIE_DEVICE_ID_VAL_HIGH:
++		data >>= 16;
++		ret = data & 0xFF;
++		break;
+ 	default:
+ 		ret = 0;
+ 		break;
+@@ -243,6 +251,23 @@
+ 	return ret;
+ }
+ 
++u8 i2cslave_asic_sn_cmd(u8 cmd)
++{
++	u8 ret;
++
++	switch (cmd) {
++	case HL_ASIC_SERIAL_NUMBER_0 ... HL_ASIC_SERIAL_NUMBER_7:
++		ret = hl_asic_sn[cmd - HL_ASIC_SERIAL_NUMBER_0];
++		break;
++	default:
++		/* HL_ASIC_SERIAL_NUMBER_8 .. HL_ASIC_SERIAL_NUMBER_17 are reserved */
++		ret = 0;
++		break;
++	}
++
++	return ret;
++}
++
+ #define ERR_STS_REG_MASK_LOW	0xFF
+ #define ERR_STS_REG_MASK_HI	0xFF00
+ u8 i2cslave_error_status_cmd(u8 cmd)
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index 298e165..79153f7 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -17,6 +17,7 @@
+ extern u32 err_sts_reg_val;
+ 
+ u8 i2cslave_pcie_vendor_id_cmd(u8 cmd);
++u8 i2cslave_asic_sn_cmd(u8 cmd);
+ u8 i2cslave_error_status_cmd(u8 cmd);
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq);
+ u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt);
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 340aad1..fb2fe26 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -140,6 +140,8 @@
+ 	if (!fuse.dev_id[GAUDI_FUSE_DEVID_SIZE - 1])
+ 		fuse.dev_id[GAUDI_FUSE_DEVID_SIZE - 1] = '0';
+ 
++	memcpy(hl_asic_sn, fuse.dev_id, sizeof(hl_asic_sn));
++
+ 	preboot_fuse_version_serialize(version, size, &ver_data);
+ 
+ 	return 0;
+diff --git a/include/preboot.h b/include/preboot.h
+index ab0a648..8a3e6c3 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -89,6 +89,13 @@
+ extern uintptr_t __stack_top;	/* End of ppboot/preboot region */
+ 
+ extern struct hl_fw_info_compat fw_info;
++/*
++ * TODO: Move to platform specific file once
++ * device id size is defined for other platforms
++ */
++#define FUSE_DEVID_SIZE	8
++
++extern u8 hl_asic_sn[FUSE_DEVID_SIZE];
+ 
+ static inline u8 regmap_readb(u32 offset)
+ {
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 3b9da37..2217fef 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -104,6 +104,7 @@
+ 
+ static struct hl_i2ci_device_info op_info = {
+ 	.device_id = 0,
++	.asic_sn = 0,
+ };
+ 
+ static struct hl_i2ci_config_access op_config;
+@@ -513,6 +514,9 @@
+ 		if (!op_info.device_id)
+ 			op_info.device_id = (u16)(device_id_vendor_id >> 16);
+ 
++		if (!op_info.asic_sn)
++			memcpy((u8 *)&op_info.asic_sn, hl_asic_sn, sizeof(op_info.asic_sn));
++
+ 		req_rd.data = (u8 *)&op_info;
+ 		req_rd.length = sizeof(op_info);
+ 		break;
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index fc62476..edd0b7a 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -58,8 +58,13 @@
+ 		break;
+ 	case HL_PCIE_VENDOR_ID_VAL_LOW:
+ 	case HL_PCIE_VENDOR_ID_VAL_HIGH:
++	case HL_PCIE_DEVICE_ID_VAL_LOW:
++	case HL_PCIE_DEVICE_ID_VAL_HIGH:
+ 		ret = i2cslave_pcie_vendor_id_cmd(cmd);
+ 		break;
++	case HL_ASIC_SERIAL_NUMBER_0 ... HL_ASIC_SERIAL_NUMBER_17:
++		ret = i2cslave_asic_sn_cmd(cmd);
++		break;
+ 	case HL_ERROR_STATUS_CODE:
+ 		ret = HL_ERROR_STATUS_CMD_LEN;
+ 		break;
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 6aa9355..096d28a 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -43,6 +43,8 @@
+ 	};
+ };
+ 
++u8 hl_asic_sn[FUSE_DEVID_SIZE];
++
+ struct hl_fw_info_compat fw_info;
+ 
+ static struct hl_rsp_err pending_error;

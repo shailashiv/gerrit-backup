@@ -1,0 +1,88 @@
+From bfa82c176fd49fa814cb7eff16d10068ed6e3cf4 Mon Sep 17 00:00:00 2001
+From: sai surya teja <sssteja@habana.ai>
+Date: Wed, 19 Apr 2023 04:22:22 +0300
+Subject: [PATCH] [SW-140835] fwupd: add run mode indicator
+
+This patch aligns erom and preboot on the patch below:
+https://gerrit.habana-labs.com/#/c/257047/
+
+The current running mode, needs to be available, to the module_fwupd's
+state machine. Allowing decision making according to running mode,
+such as FAST, SLOW and NO_RET.
+
+There are operations that shouldn't be executed in FAST mode, but only
+in SLOW mode.
+
+The original scenario was observed on a secured machine and a corrupted
+FIT image. The FW rejected the update request as it was aware of the FIT
+error.
+
+The acknowledge appears immediately on the FW console. But the FWL
+didn't receive any indication.
+
+It appears that the fit error happens always when the preboot is in
+"fast" mode. Moving to "slow" mode didn't triggered the delayed work of
+sending the SRAM_RUN error status FIT.
+
+The cause as mentioned above was not using the right indication while in
+"slow" mode to build the error message.
+
+Change-Id: I28eebfe773922ad797779009cdbddc8f4969d105
+---
+
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index 9601327..541b692 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -35,6 +35,7 @@
+ 	struct hl_upd_command wfc_cmd;
+ 	enum cmd_check_res exec_res;
+ 	enum cmd_check_res sync_exec_res;
++	enum cmd_check_res run_mode;
+ 	u32 cmd_reg;
+ 	u32 sts_reg;
+ 	u64 noret_delay;
+@@ -259,7 +260,7 @@
+ 		 * status as protocol error and set it's minor value.
+ 		 */
+ 		preboot_error_inform(HL_FW_ERR_PROTO, sts);
+-		if (state->exec_res != FOUND_SLOW_RETURN) {
++		if (state->run_mode != FOUND_SLOW_RETURN) {
+ 			/*
+ 			 * error status response requires FIT creation, that
+ 			 * implies - SLOW MODE
+@@ -521,6 +522,8 @@
+ 	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
+ 	int err = 0;
+ 
++	state->run_mode = FOUND_FAST_RETURN;
++
+ 	switch (state->cmd.cmd) {
+ 	case HL_UPD_NOOP:	/* NOOP is a special command */
+ 		cmd_str = "noop";
+@@ -595,6 +598,8 @@
+ 		preboot_puts_raw(err_str);
+ 		preboot_puts("\n");
+ 	}
++
++	state->run_mode = NOT_FOUND;
+ }
+ 
+ void module_fwupd_run_fast(void)
+@@ -723,6 +728,8 @@
+ 	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
+ 	int err = 0;
+ 
++	state->run_mode = FOUND_SLOW_RETURN;
++
+ 	if (state->sending_error_flag && preboot_error_is_pending()) {
+ 		preboot_puts("FW UPD prepare ERROR_STATUS\n");
+ 		module_fwupd_push_error_status(state);
+@@ -760,6 +767,7 @@
+ 		state->wfc_cmd.val = 0;	/* NOOP - clear cmds state machine */
+ 		state->cmd.val = 0;	/* NOOP */
+ 	}
++	state->run_mode = NOT_FOUND;
+ }
+ 
+ void module_fwupd_run(void)

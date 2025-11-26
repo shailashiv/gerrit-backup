@@ -1,0 +1,57 @@
+From 9c753c8fa6f8552d0fe8c168d69a282c8be1355b Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 15 Nov 2020 20:02:28 +0200
+Subject: [PATCH] [SW-14676] fwupd: minimize wfc wait time
+
+Rework the function to minimize the time spent in wfc by moving all the
+work before wfc.
+
+Change-Id: Ic3f9a5ceb4df43eb7aec5d8b08e47edd44df0cf5
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index ac447f5..1b3e632 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -86,21 +86,31 @@
+ 
+ static void module_fwupd_sram_map(unsigned int size, enum hl_upd_cmd cmd)
+ {
++	int err;
++	enum hl_upd_sts sts;
++
+ 	module_fwupd_send_status(HL_UPD_STS_MAP_ACK, 0);
+ 
+-	if (module_fwupd_wfc(WFC_TIMEOUT_MS)) {
+-		module_fwupd_send_status(HL_UPD_STS_TIMEOUT_ERR, 0);
+-		preboot_puts("Timeout error\n");
+-		return;
++	err = !preboot_is_valid_address_range(FIT_IMG_BASE, size);
++	if (err) {
++		sts = HL_UPD_STS_VALID_ERR;
++		preboot_puts("Mapped address range is invalid\n");
++		goto fwupd_map_err;
+ 	}
+ 
+-	if (!preboot_is_valid_address_range(FIT_IMG_BASE, size)) {
+-		module_fwupd_send_status(HL_UPD_STS_VALID_ERR, 0);
+-		preboot_puts("Mapped address range is invalid\n");
+-		return;
+-	}
++	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
++	if (err)
++		goto fwupd_map_wfc_t;
+ 
+ 	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)FIT_IMG_BASE);
++	return;
++
++fwupd_map_wfc_t:
++	sts = HL_UPD_STS_TIMEOUT_ERR;
++	preboot_puts("Timeout error\n");
++
++fwupd_map_err:
++	module_fwupd_send_status(sts, 0);
+ }
+ 
+ static void module_fwupd_sram_run(void)

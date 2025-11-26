@@ -1,0 +1,115 @@
+From 0a6804294e7dda14593b1fea98f5d4bd65c8d342 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 25 Feb 2021 04:14:54 +0200
+Subject: [PATCH] [SW-34091] gaudi: pcie: add timeout for pcie link
+
+Currently we are waiting indefinitely for PCIe link up status and
+the control doesn't reach to preboot in case PCIe link up is not up
+for any reasons. In such scenario, there is requirement to reach
+control to preboot to handle i2c commands even if PCIe link is not
+established. This patch add changes to add timeout of 5 seconds for
+PRSTn assert and 5 seconds for PCIe link up and proceed with preboot
+in case link is not up within defined timeout.
+
+Change-Id: I311234da25efd59cf7e722b3e9dc8d9e1c4b06ba
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index b201341..a3ad28b 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -63,6 +63,26 @@
+ 	return udelay_timestamp_get() / cycles_per_usec;
+ }
+ 
++bool timeout_expired(u64 start_tv, u32 delay)
++{
++	u64 current, timeout_tv = start_tv + delay;
++	bool overlap;
++
++	if (timeout_tv < start_tv)
++		overlap = true;
++
++	current = timestamp_get_us();
++	if (!overlap) {
++		if (current > timeout_tv || current <= start_tv)
++			return true;
++	} else {
++		if (current > timeout_tv && current < start_tv)
++			return true;
++	}
++
++	return false;
++}
++
+ void udelay(unsigned int usec)
+ {
+ 	u64 start, current, end = cycles_per_usec * usec;
+diff --git a/common/pll.h b/common/pll.h
+index ca7961f..b58987d 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -58,6 +58,7 @@
+ u32 hl_pll_get_freq(u32 pll_base, enum hl_pll_div_out div);
+ void udelay(unsigned int usec);
+ u64 timestamp_get_us(void);
++bool timeout_expired(u64 start_tv, u32 delay);
+ 
+ static inline void mdelay(unsigned int msec) { udelay(1000 * msec); }
+ 
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 35ebcbc..b3d9e20 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -179,12 +179,24 @@
+ 
+ void preboot_pcie_wait_for_link(void)
+ {
++	u64 start = timestamp_get_us();
++
+ 	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN))
+-		;
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
++		/* If PRSTn does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PRSTn!\n");
++			return;
++		}
++	}
+ 
+ 	/* Only after PRSTn is de-asserted */
+ 	preboot_pcie_enable();
++
++	/* Reset start timer */
++	start = timestamp_get_us();
+ 
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+@@ -199,6 +211,11 @@
+ 			break;
+ 		}
+ 
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PCIe link UP!\n");
++			break;
++		}
++
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+ 		 * This cause BAR size to be reset
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 6bede08..360cf3d 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -43,6 +43,8 @@
+ #define GAUDI_DMA_CHANNELS_NUM		8
+ #define GAUDI_QM_CGM_NUM		2
+ 
++#define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++
+ #ifndef __ASSEMBLY__
+ #include <spi.h>
+ #include <types.h>

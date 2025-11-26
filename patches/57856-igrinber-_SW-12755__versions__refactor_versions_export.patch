@@ -1,0 +1,110 @@
+From 202afa94b59e6c9dcd8d9e4f8990dcbeb759a436 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 29 Oct 2020 19:24:19 +0200
+Subject: [PATCH] [SW-12755] versions: refactor versions export
+
+As a preparation for SRAM dynamic security enablement, move all the
+versions (Preboot with BTL and eFuse) into an array, so it will be
+contiguous and we can use one Range Register for all.
+
+Change-Id: I1ad71c7de080110dba669ac7367f2dd37fbc2140
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index e7b5b9a..900511b 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -73,35 +73,48 @@
+ };
+ 
+ static const char *preboot_ver_str = "Preboot " VERSION_STR;
+-static char preboot_btl_ver_str[VERSION_MAX_LEN] = "BTL version ";
++
++enum preboot_vers {
++	PREBOOT_BTL_VER,
++	PREBOOT_EFUSE_VER,
++};
++
++#define BTL_VER_PREFIX	"BTL version "
++#define FUSE_VER_PREFIX	"Fuse version "
++
++static char preboot_vers[][VERSION_MAX_LEN] = {
++	[PREBOOT_BTL_VER] = { BTL_VER_PREFIX },
++	[PREBOOT_EFUSE_VER] = { FUSE_VER_PREFIX },
++};
+ 
+ static void preboot_version(void)
+ {
+-	unsigned long offset = (unsigned long) preboot_btl_ver_str;
++	unsigned long offset = (unsigned long) preboot_vers[PREBOOT_BTL_VER];
+ 	u32 btlver = regmap_readl(mmPREBOOT_VER_OFFSET);
+ 	int i, btl_ver_sz;
+ 
+ 	preboot_puts("\n");
+-	preboot_puts_raw(preboot_btl_ver_str);
++	preboot_puts_raw(preboot_vers[PREBOOT_BTL_VER]);
+ 	preboot_puth(btlver, true);
+ 	preboot_puts_raw(preboot_ver_str);
+ 	preboot_puts("\n");
+ 
+ 	/* get to the end of the predefined btl string */
+ 	for (i = 0; i < VERSION_MAX_LEN; i++)
+-		if (preboot_btl_ver_str[i] == '\0')
++		if (preboot_vers[PREBOOT_BTL_VER][i] == '\0')
+ 			break;
+ 
+ 	/* convert and copy the btl version */
+-	i += preboot_uint2hexstring(&preboot_btl_ver_str[i], btlver, true);
++	i += preboot_uint2hexstring(&preboot_vers[PREBOOT_BTL_VER][i],
++				    btlver, true);
+ 
+ 	/* separate the btl from preboot */
+-	preboot_btl_ver_str[i++] = '\n';
++	preboot_vers[PREBOOT_BTL_VER][i++] = '\n';
+ 	btl_ver_sz = i;
+ 
+ 	/* copy the preboot version */
+ 	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
+-		preboot_btl_ver_str[i++] = preboot_ver_str[j];
++		preboot_vers[PREBOOT_BTL_VER][i++] = preboot_ver_str[j];
+ 		if (preboot_ver_str[j] == '\0')
+ 			break;
+ 	}
+@@ -109,12 +122,7 @@
+ 	regmap_writel((u32)(offset & ~SDRAM_BASE), mmPREBOOT_VER_OFFSET);
+ }
+ 
+-#define FUSE_VER_PREFIX		"Fuse version "
+-#define FUSE_VER_UNKNOWN	"unknown"
+ #define FUSE_VER_NOT_IMPLEMENT	"not implemented"
+-
+-static char preboot_fuse_ver_str[VERSION_MAX_LEN] = FUSE_VER_PREFIX;
+-
+ __weak int hl_fuse_get_version(char *version, size_t size)
+ {
+ 	int i, max_sz = sizeof(FUSE_VER_NOT_IMPLEMENT);
+@@ -165,11 +173,12 @@
+ 	ver[-1] = '\0';
+ }
+ 
++#define FUSE_VER_UNKNOWN	"unknown"
+ static void fuse_version(void)
+ {
+-	unsigned long offset = (unsigned long)preboot_fuse_ver_str;
++	unsigned long offset = (unsigned long)preboot_vers[PREBOOT_EFUSE_VER];
+ 	size_t ver_prefix_len = sizeof(FUSE_VER_PREFIX) - 1;
+-	char *version = preboot_fuse_ver_str + ver_prefix_len;
++	char *version = preboot_vers[PREBOOT_EFUSE_VER] + ver_prefix_len;
+ 	const char *unknown = FUSE_VER_UNKNOWN;
+ 	int err, i;
+ 
+@@ -178,7 +187,7 @@
+ 		for (i = 0; i < sizeof(FUSE_VER_UNKNOWN); i++)
+ 			version[i] = unknown[i];
+ 
+-	preboot_puts_raw(preboot_fuse_ver_str);
++	preboot_puts_raw(preboot_vers[PREBOOT_EFUSE_VER]);
+ 	preboot_puts("\n");
+ 
+ 	regmap_writel((u32)(offset & ~SDRAM_BASE), mmFUSE_VER_OFFSET);

@@ -1,0 +1,132 @@
+From 20868351f5e8d1701ee27fa32e623fbfdf4ca983 Mon Sep 17 00:00:00 2001
+From: Tamal <tasaha@habana.ai>
+Date: Sun, 17 Mar 2024 14:43:53 +0200
+Subject: [PATCH] [SW-161727] gaudi3: count fail controller in mbist
+
+This patch counts total failing controllers number
+identified during mbist execution in ppboot stage
+and stores result in boot_info and passes it to
+different fw components.
+
+This patch updates local varialble names to fix
+checkpatch errors.
+
+Change-Id: Ia5a8d58c727bc61b8457b74e28ba0f19f3898be4
+Signed-off-by: Tamal <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 2009686..009be21 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -42,7 +42,7 @@
+ 				ARC_ADDR_MASK) | FW_MEM_REGION_BASE));
+ 
+ 	status = hl_ppboot_sram_self_repair_mismatch_logic(mmD0_PSOC_DFT_APB_BASE,
+-		hl_gaudi3_sram_mbist_data_start_address, &bist_data.mbist_fail_engine_arr[0],
++		hl_gaudi3_sram_mbist_data_start_address, &bist_data,
+ 		SRAM_MBIST_FAIL_CNTRL_MAX_COUNT);
+ 
+ 	bist_data.magic_number = SRAM_BIST_MAGIC;
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 6b97bf3..adac7de 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1445,3 +1445,19 @@
+ {
+ 	device_init_efuse();
+ }
++
++/*
++ * calculate the number of set bits
++ * Kernighan's algorithm: execution complexity is as a number of set bits.
++ */
++
++u32 gaudi3_count_set_bit(u32 n)
++{
++	u32 count;
++
++	/* Brian Kernighan's solution */
++	for (count = 0; n; count++)
++		n &= n - 1;
++
++	return count;
++}
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index d6983ab..98599bb 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -65,8 +65,9 @@
+ void hl_pcie_clear_boot_termination(void);
+ void gaudi3_print_cpu_pll(void);
+ int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
+-	struct mbist_fail_engine_info *fail_buffer, u32 fail_limit);
++	struct hl_ras_sram_bist_data *bist_data, u32 fail_limit);
+ bool ppboot_is_valid_img_desc_ex(void *desc);
+ bool is_spi_gw_enabled(void);
++u32 gaudi3_count_set_bit(u32 n);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/mbist.c b/arch/gaudi3/arc/mbist.c
+index 1f94167..602d16f 100644
+--- a/arch/gaudi3/arc/mbist.c
++++ b/arch/gaudi3/arc/mbist.c
+@@ -22,12 +22,14 @@
+ }
+ 
+ int hl_ppboot_sram_self_repair_mismatch_logic(u32 ist_addr, u32 *data,
+-		struct mbist_fail_engine_info *fail_buffer, u32 fail_limit)
++		struct hl_ras_sram_bist_data *bd, u32 fail_limit)
+ {
+ 	int status = 0;
+ 	u32 rdval, expval, failmask;
+ 	u32 i = 1, read_id;
+-	u32 fail_index = 0;
++	u32 fail_id = 0;
++
++	bd->no_failing_cntrl = 0;
+ 
+ 	if (data[0] != 1) {
+ 		preboot_puts("mbist self repair version mismatch\n");
+@@ -65,11 +67,15 @@
+ 
+ 				if (rdval != expval) {
+ 					status = 1;
+-					if (fail_index < (fail_limit)) {
+-						failmask = rdval ^ expval;
+-						fail_buffer[fail_index].mbist_read_id = read_id;
+-						fail_buffer[fail_index].mbist_failmask = failmask;
+-						fail_index++;
++					failmask = rdval ^ expval;
++					bd->no_failing_cntrl += gaudi3_count_set_bit(failmask);
++
++					if (fail_id < fail_limit) {
++						bd->mbist_fail_engine_arr[fail_id].mbist_read_id =
++								read_id;
++						bd->mbist_fail_engine_arr[fail_id].mbist_failmask =
++								failmask;
++						fail_id++;
+ 					}
+ 				}
+ 
+@@ -81,11 +87,15 @@
+ 
+ 				if (rdval != expval) {
+ 					status = 1;
+-					if (fail_index < (fail_limit)) {
+-						failmask = rdval ^ expval;
+-						fail_buffer[fail_index].mbist_read_id = read_id;
+-						fail_buffer[fail_index].mbist_failmask = failmask;
+-						fail_index++;
++					failmask = rdval ^ expval;
++					bd->no_failing_cntrl += gaudi3_count_set_bit(failmask);
++
++					if (fail_id < fail_limit) {
++						bd->mbist_fail_engine_arr[fail_id].mbist_read_id =
++								read_id;
++						bd->mbist_fail_engine_arr[fail_id].mbist_failmask =
++								failmask;
++						fail_id++;
+ 					}
+ 				}
+ 

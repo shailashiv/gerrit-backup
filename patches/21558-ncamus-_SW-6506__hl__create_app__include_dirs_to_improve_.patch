@@ -1,0 +1,763 @@
+From b1e632dd1583f738b0439fb332f94d9dc76ec8f2 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sat, 16 Nov 2019 09:17:10 +0200
+Subject: [PATCH] [SW-6506] hl: create app, include dirs to improve src structure
+
+This project can easily now modified to create more than one binary.
+This will serve to split preboot into PCIe part and all the rest.
+This will further decrease binary size copied by BTL and hence will
+improve PCIe link timing to match 20mS of warm reset limit
+
+Change-Id: Id04918d354272cf1a3e41ccf9b045354586f8d66
+---
+
+diff --git a/Makefile b/Makefile
+index 4212f3e..d3a1847 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@
+ CFLAGS += -I$(dir $(BR2_EXTERNAL))/embedded/specs
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c
+-CFLAGS += -I ./ -I ./common/
++CFLAGS += -I ./include/ -I ./ -I ./common/
+ 
+ ifeq ($(HL_TARGET),pldm)
+ 	CFLAGS += -DTARGET_IS_PLDM
+@@ -17,8 +17,8 @@
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ SFLAGS := $(CFLAGS)
+ 
+-LD_SCRIPT := $(HL_DEV)/preboot.lds
+-LDFLAGS := -g -T $(LD_SCRIPT) -nostdlib -static
++PREBOOT_LD_SCRIPT := $(HL_DEV)/preboot.lds
++LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+ LDLIBS := -lgcc
+ 
+@@ -27,19 +27,21 @@
+ PREBOOT_SRCS_C := $(shell ls common/*.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+-PREBOOT_SRCS_S := $(shell ls common/*.S)
++PREBOOT_APP_S := $(shell ls app/crt0_preboot.S)
++PREBOOT_APP_C := $(shell ls app/preboot.c)
+ 
+ PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+-PREBOOT_OBJECTS += $(PREBOOT_SRCS_S:.S=.o)
++PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
++PREBOOT_OBJECTS += $(PREBOOT_APP_C:.c=.o)
+ AUTO_GENERATED_FILE := auto_generated.h
+ 
+ all: preboot.bin common/pcie_phy_fw.bin
+ 
+-preboot.bin: preboot
++%.bin: %
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
+ 
+-preboot: $(PREBOOT_OBJECTS) $(LD_SCRIPT)
+-	@$(CC) $(LDFLAGS) -o $@ -Wl,--start-group $(PREBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
++preboot: $(PREBOOT_OBJECTS) $(PREBOOT_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PREBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
+ 
+ $(AUTO_GENERATED_FILE): localversion-habanalabs $(PREBOOT_SRCS_C) $(PREBOOT_SRCS_S)
+ 	@( printf '#define PREBOOT_VER "%s"\n' '$(shell cut -d- -f2- localversion-habanalabs)' ) > $@
+@@ -52,7 +54,7 @@
+ common/pcie_phy_fw.i: common/pcie_phy_fw.hex
+ 	@$(CC) -x c -E -P -nostdinc -o $@ $<
+ 
+-$(LD_SCRIPT): $(LD_SCRIPT).S
++%.lds: %.lds.S
+ 	@$(CC) -E -P -nostdinc -o $@ $<
+ 
+ %.o: %.c $(AUTO_GENERATED_FILE)
+diff --git a/app/crt0_preboot.S b/app/crt0_preboot.S
+new file mode 100644
+index 0000000..5bb2238
+--- /dev/null
++++ b/app/crt0_preboot.S
+@@ -0,0 +1,30 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++/*
++ * This is preboot entry point
++ * Setting sp/fp/lr and jumping to C code
++ */
++.globl	_start
++_start:
++
++#ifdef __arc__
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++
++	mov	sp, __stack_top
++	mov	fp, sp
++#endif
++
++#ifdef __aarch64__
++	ldr	x0, =__stack_top
++	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
++	mov	x29, sp		/* Set FP (x29) */
++#endif
++
++	bl	preboot_main	/* Set LR (x30) */
+diff --git a/app/preboot.c b/app/preboot.c
+new file mode 100644
+index 0000000..330ac37
+--- /dev/null
++++ b/app/preboot.c
+@@ -0,0 +1,185 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include "auto_generated.h"
++#include <stddef.h>
++
++#include <psoc_global_conf_regs.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <hl_fw_if.h>
++#include <hl_boot_if.h>
++
++
++#include "preboot.h"
++#include "uart.h"
++#include "spi.h"
++#include "pll.h"
++
++#define VERSION_MAX_LEN		128
++
++#define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
++	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
++
++/* Stable ID can be 0 or 1, if not defined return primary offset (0) */
++static u32 stable_image_offset(void)
++{
++	u32 stable_image_id;
++
++	spi_copy(&stable_image_id, HL_SPI_NEXT_IMAGE_OFF,
++		 sizeof(stable_image_id), "NEXT");
++	stable_image_id = (stable_image_id & 0xFF) - '1';
++
++	if (stable_image_id == 1)
++		return HL_SPI_SECONDARY_BASE;
++
++	return HL_SPI_PRIMARY_BASE;
++}
++
++static u32 modifiable_image_offset(bool *pending)
++{
++	u32 ret = HL_SPI_PRIMARY_BASE;
++	u32 modifiable_id;
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++
++	spi_copy(&modifiable_id, HL_SPI_MODIFI_IMAGE_OFF,
++		 sizeof(modifiable_id), "MODIFIABLE");
++	modifiable_id = (modifiable_id & 0xFF) - '1';
++
++	if (modifiable_id < 2) {
++		*pending = true;
++		if (!modifiable_id) {
++			regmap_writel(FLOPS_UPD_NXT_IMG1, upd_pending_reg);
++		} else {
++			regmap_writel(FLOPS_UPD_NXT_IMG2, upd_pending_reg);
++			ret = HL_SPI_SECONDARY_BASE;
++		}
++	} else { /* No valid modifiable image ID */
++		regmap_writel(FLOPS_UPD_NOOP, upd_pending_reg);
++	}
++
++	return ret;
++}
++
++static u32 next_image_offset(bool *pending)
++{
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++	u32 image_pending = regmap_readl(upd_pending_reg);
++
++	/* Check for normal boot */
++	if (image_pending != FLOPS_UPD_PENDING)
++		return stable_image_offset();
++
++	/* There is an update pending */
++	return modifiable_image_offset(pending);
++}
++
++static void preboot_copy_spl(void)
++{
++	char *name = "SPL";
++	bool upgrade_pending = false;
++	u32 img_offset = next_image_offset(&upgrade_pending);
++	u32 spl_offset = img_offset + HL_SPI_SPL_OFF;
++	u32 uboot_offset = img_offset + HL_SPI_UBOOT_OFF;
++	char *spl_image = upgrade_pending ? "candidate" : "stable";
++
++	preboot_puts_raw("Preparing to run SPL ");
++	preboot_puts_raw(spl_image);
++	preboot_puts_hex_raw(" (offset: ", img_offset, false);
++	preboot_puts(")\n");
++
++	spi_copy((void *)SPL_TEXT_BASE, spl_offset, SPL_SIZE, name);
++
++	regmap_writel(uboot_offset, mmPSOC_GLOBAL_CONF_SCRATCHPAD_30);
++}
++
++static void preboot_pcie_init(void)
++{
++	if (hl_skip_pcie_init()) {
++		preboot_puts("PCIe initialization is skipped!\n");
++		return;
++	}
++
++	//preboot_puts("Waiting for PCIe link...\n");
++	preboot_pcie_wait_for_link();
++	preboot_puts("PCIe link is UP!\n");
++}
++
++#ifndef TARGET_IS_TESTER
++static void preboot_version(void)
++{
++	const char *btl_ver_tag = "BTL version ";
++	const char *preboot_ver_str = PREBOOT_VER_STR;
++	char *dst_version_str = (char *)PREBOOT_VER_BASE;
++	unsigned long offset = (unsigned long)dst_version_str;
++	u32 btlver = regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
++	int i, btl_ver_sz;
++
++	preboot_puts("\n");
++	preboot_puts_raw(btl_ver_tag);
++	preboot_puth(btlver, true);
++	preboot_puts_raw(preboot_ver_str);
++	preboot_puts("\n");
++
++	/* Copy the BTL version tag to destination (SRAM) address */
++	for (i = 0; i < VERSION_MAX_LEN; i++) {
++		if (btl_ver_tag[i] == '\0')
++			break;
++
++		dst_version_str[i] = btl_ver_tag[i];
++	}
++
++	/* convert and copy the btl version */
++	i += preboot_uint2hexstring(&dst_version_str[i], btlver, true);
++
++	/* separate the btl from preboot */
++	dst_version_str[i++] = '\n';
++	btl_ver_sz = i;
++
++	/* copy the preboot version */
++	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
++		dst_version_str[i++] = preboot_ver_str[j];
++		if (preboot_ver_str[j] == '\0')
++			break;
++	}
++
++	regmap_writel((u32)(offset & ~SDRAM_BASE),
++			mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
++}
++#else	/* TARGET_IS_TESTER */
++static inline void preboot_version(void) {}
++#endif	/* TARGET_IS_TESTER */
++
++static void hl_jtag_init(void)
++{
++	u32 reg, nPRESETDBG = BIT(12);
++
++	/* Enable JTAG attach */
++	reg = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	reg |= nPRESETDBG;
++	regmap_writel(reg, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
++void preboot_main(void)
++{
++	void (*spl_start)(void) = (void *)SPL_TEXT_BASE;
++
++	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
++
++	hl_jtag_init();
++	preboot_sync_btl();
++	hl_uart_init();
++	preboot_pcie_init();
++	preboot_version();
++	preboot_delay();
++	hl_pll_init();
++	hl_pll_wa();
++	/* reinit uart after PLLs configured */
++	hl_uart_init();
++	preboot_copy_spl();
++
++	spl_start();
++}
+diff --git a/common/preboot.c b/common/preboot.c
+deleted file mode 100644
+index 330ac37..0000000
+--- a/common/preboot.c
++++ /dev/null
+@@ -1,185 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include "auto_generated.h"
+-#include <stddef.h>
+-
+-#include <psoc_global_conf_regs.h>
+-#include <cpu_ca53_cfg_regs.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_if.h>
+-
+-
+-#include "preboot.h"
+-#include "uart.h"
+-#include "spi.h"
+-#include "pll.h"
+-
+-#define VERSION_MAX_LEN		128
+-
+-#define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+-	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
+-
+-/* Stable ID can be 0 or 1, if not defined return primary offset (0) */
+-static u32 stable_image_offset(void)
+-{
+-	u32 stable_image_id;
+-
+-	spi_copy(&stable_image_id, HL_SPI_NEXT_IMAGE_OFF,
+-		 sizeof(stable_image_id), "NEXT");
+-	stable_image_id = (stable_image_id & 0xFF) - '1';
+-
+-	if (stable_image_id == 1)
+-		return HL_SPI_SECONDARY_BASE;
+-
+-	return HL_SPI_PRIMARY_BASE;
+-}
+-
+-static u32 modifiable_image_offset(bool *pending)
+-{
+-	u32 ret = HL_SPI_PRIMARY_BASE;
+-	u32 modifiable_id;
+-	u32 upd_pending_reg = get_upd_pending_sts_reg();
+-
+-	spi_copy(&modifiable_id, HL_SPI_MODIFI_IMAGE_OFF,
+-		 sizeof(modifiable_id), "MODIFIABLE");
+-	modifiable_id = (modifiable_id & 0xFF) - '1';
+-
+-	if (modifiable_id < 2) {
+-		*pending = true;
+-		if (!modifiable_id) {
+-			regmap_writel(FLOPS_UPD_NXT_IMG1, upd_pending_reg);
+-		} else {
+-			regmap_writel(FLOPS_UPD_NXT_IMG2, upd_pending_reg);
+-			ret = HL_SPI_SECONDARY_BASE;
+-		}
+-	} else { /* No valid modifiable image ID */
+-		regmap_writel(FLOPS_UPD_NOOP, upd_pending_reg);
+-	}
+-
+-	return ret;
+-}
+-
+-static u32 next_image_offset(bool *pending)
+-{
+-	u32 upd_pending_reg = get_upd_pending_sts_reg();
+-	u32 image_pending = regmap_readl(upd_pending_reg);
+-
+-	/* Check for normal boot */
+-	if (image_pending != FLOPS_UPD_PENDING)
+-		return stable_image_offset();
+-
+-	/* There is an update pending */
+-	return modifiable_image_offset(pending);
+-}
+-
+-static void preboot_copy_spl(void)
+-{
+-	char *name = "SPL";
+-	bool upgrade_pending = false;
+-	u32 img_offset = next_image_offset(&upgrade_pending);
+-	u32 spl_offset = img_offset + HL_SPI_SPL_OFF;
+-	u32 uboot_offset = img_offset + HL_SPI_UBOOT_OFF;
+-	char *spl_image = upgrade_pending ? "candidate" : "stable";
+-
+-	preboot_puts_raw("Preparing to run SPL ");
+-	preboot_puts_raw(spl_image);
+-	preboot_puts_hex_raw(" (offset: ", img_offset, false);
+-	preboot_puts(")\n");
+-
+-	spi_copy((void *)SPL_TEXT_BASE, spl_offset, SPL_SIZE, name);
+-
+-	regmap_writel(uboot_offset, mmPSOC_GLOBAL_CONF_SCRATCHPAD_30);
+-}
+-
+-static void preboot_pcie_init(void)
+-{
+-	if (hl_skip_pcie_init()) {
+-		preboot_puts("PCIe initialization is skipped!\n");
+-		return;
+-	}
+-
+-	//preboot_puts("Waiting for PCIe link...\n");
+-	preboot_pcie_wait_for_link();
+-	preboot_puts("PCIe link is UP!\n");
+-}
+-
+-#ifndef TARGET_IS_TESTER
+-static void preboot_version(void)
+-{
+-	const char *btl_ver_tag = "BTL version ";
+-	const char *preboot_ver_str = PREBOOT_VER_STR;
+-	char *dst_version_str = (char *)PREBOOT_VER_BASE;
+-	unsigned long offset = (unsigned long)dst_version_str;
+-	u32 btlver = regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
+-	int i, btl_ver_sz;
+-
+-	preboot_puts("\n");
+-	preboot_puts_raw(btl_ver_tag);
+-	preboot_puth(btlver, true);
+-	preboot_puts_raw(preboot_ver_str);
+-	preboot_puts("\n");
+-
+-	/* Copy the BTL version tag to destination (SRAM) address */
+-	for (i = 0; i < VERSION_MAX_LEN; i++) {
+-		if (btl_ver_tag[i] == '\0')
+-			break;
+-
+-		dst_version_str[i] = btl_ver_tag[i];
+-	}
+-
+-	/* convert and copy the btl version */
+-	i += preboot_uint2hexstring(&dst_version_str[i], btlver, true);
+-
+-	/* separate the btl from preboot */
+-	dst_version_str[i++] = '\n';
+-	btl_ver_sz = i;
+-
+-	/* copy the preboot version */
+-	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
+-		dst_version_str[i++] = preboot_ver_str[j];
+-		if (preboot_ver_str[j] == '\0')
+-			break;
+-	}
+-
+-	regmap_writel((u32)(offset & ~SDRAM_BASE),
+-			mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
+-}
+-#else	/* TARGET_IS_TESTER */
+-static inline void preboot_version(void) {}
+-#endif	/* TARGET_IS_TESTER */
+-
+-static void hl_jtag_init(void)
+-{
+-	u32 reg, nPRESETDBG = BIT(12);
+-
+-	/* Enable JTAG attach */
+-	reg = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
+-	reg |= nPRESETDBG;
+-	regmap_writel(reg, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+-}
+-
+-void preboot_main(void)
+-{
+-	void (*spl_start)(void) = (void *)SPL_TEXT_BASE;
+-
+-	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
+-
+-	hl_jtag_init();
+-	preboot_sync_btl();
+-	hl_uart_init();
+-	preboot_pcie_init();
+-	preboot_version();
+-	preboot_delay();
+-	hl_pll_init();
+-	hl_pll_wa();
+-	/* reinit uart after PLLs configured */
+-	hl_uart_init();
+-	preboot_copy_spl();
+-
+-	spl_start();
+-}
+diff --git a/common/preboot.h b/common/preboot.h
+deleted file mode 100644
+index cfef8ed..0000000
+--- a/common/preboot.h
++++ /dev/null
+@@ -1,79 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#ifndef COMMON_PREBOOT_H_
+-#define COMMON_PREBOOT_H_
+-
+-#define BIT(nr)					(1 << (nr))
+-#define ARRAY_SIZE(x)				(sizeof(x) / sizeof((x)[0]))
+-
+-#ifdef __arc__
+-#define HL_SPI_BASE				0x1A000000
+-#define HL_CFG_BASE				0x1C000000
+-#define SDRAM_BASE				0x10000000
+-#define SPL_TEXT_BASE				0x10080000
+-#endif
+-
+-#ifdef __aarch64__
+-#define HL_SPI_BASE				0x7FF8000000ull
+-#define HL_CFG_BASE				0x7FFC000000ull
+-#define SDRAM_BASE				0x7FF0000000ull
+-#define SPL_TEXT_BASE				0x7FF0080000ull
+-#endif
+-
+-#define PREBOOT_VER_BASE			(SPL_TEXT_BASE - 0x1000)
+-
+-#define SPL_SIZE		0x10000		/* 64KB */
+-#define HL_UART_BAUDRATE	115200
+-#define HL_SPI_FLASH_MAX_FREQ	25000000
+-#define HL_SPI_NEXT_IMAGE_OFF	0x60000
+-#define HL_SPI_MODIFI_IMAGE_OFF	0x60004
+-#define HL_SPI_SPL_OFF		0xA0000
+-#define HL_SPI_UBOOT_OFF	0xB0000
+-#define HL_SPI_PRIMARY_BASE	0
+-#define HL_SPI_SECONDARY_BASE	0x800000
+-
+-typedef unsigned char u8;
+-typedef unsigned int u32;
+-typedef unsigned long long u64;
+-
+-static inline u8 regmap_readb(u32 offset)
+-{
+-	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
+-
+-	return (u8)(reg & 0xFF);
+-}
+-
+-static inline void regmap_writeb(u8 val, u32 offset)
+-{
+-	*((volatile u32 *)(HL_CFG_BASE + offset)) = (u32)val;
+-}
+-
+-static inline u32 regmap_readl(u32 offset)
+-{
+-	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
+-
+-	return reg;
+-}
+-
+-static inline void regmap_writel(u32 val, u32 offset)
+-{
+-	*((volatile u32 *)(HL_CFG_BASE + offset)) = val;
+-}
+-
+-u32 get_cpu_boot_status_reg(void);
+-u32 get_upd_pending_sts_reg(void);
+-u32 hl_skip_pcie_init(void);
+-void hl_uart_init(void);
+-u32 hl_spi_baudr_get(void);
+-
+-void preboot_pcie_wait_for_link(void);
+-void preboot_delay(void);
+-void preboot_putc_virt_uart(const char c);
+-void preboot_sync_btl(void);
+-
+-#endif /* COMMON_PREBOOT_H_ */
+diff --git a/common/start.S b/common/start.S
+deleted file mode 100644
+index 423ce29..0000000
+--- a/common/start.S
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-/*
+- * This is preboot entry point
+- * Setting sp/fp/lr and jumping to C code
+- */
+-.globl	_start
+-_start:
+-
+-#ifdef __arc__
+-/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
+-.global	lf2flt
+-lf2flt:
+-
+-	mov	sp, _start + 0x10000
+-	mov	fp, sp
+-#endif
+-
+-#ifdef __aarch64__
+-	ldr	x0, =(_start + 0x10000)
+-	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
+-	mov	x29, sp		/* Set FP (x29) */
+-#endif
+-
+-	bl	preboot_main	/* Set LR (x30) */
+diff --git a/gaudi/preboot.lds.S b/gaudi/preboot.lds.S
+index ea6a573..474bd2d 100644
+--- a/gaudi/preboot.lds.S
++++ b/gaudi/preboot.lds.S
+@@ -14,9 +14,16 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		common/start.o (.text*)
++		app/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
+ 	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+ }
+diff --git a/goya/preboot.lds.S b/goya/preboot.lds.S
+index 98653bc..8e43cc0 100644
+--- a/goya/preboot.lds.S
++++ b/goya/preboot.lds.S
+@@ -14,9 +14,16 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		common/start.o (.text*)
++		app/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
+ 	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+ }
+diff --git a/goya2_arc/preboot.lds.S b/goya2_arc/preboot.lds.S
+index 14713f0..34a85b2 100644
+--- a/goya2_arc/preboot.lds.S
++++ b/goya2_arc/preboot.lds.S
+@@ -16,9 +16,16 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		common/start.o (.text*)
++		app/crt0_preboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
+ 	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+new file mode 100644
+index 0000000..cfef8ed
+--- /dev/null
++++ b/include/preboot.h
+@@ -0,0 +1,79 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef COMMON_PREBOOT_H_
++#define COMMON_PREBOOT_H_
++
++#define BIT(nr)					(1 << (nr))
++#define ARRAY_SIZE(x)				(sizeof(x) / sizeof((x)[0]))
++
++#ifdef __arc__
++#define HL_SPI_BASE				0x1A000000
++#define HL_CFG_BASE				0x1C000000
++#define SDRAM_BASE				0x10000000
++#define SPL_TEXT_BASE				0x10080000
++#endif
++
++#ifdef __aarch64__
++#define HL_SPI_BASE				0x7FF8000000ull
++#define HL_CFG_BASE				0x7FFC000000ull
++#define SDRAM_BASE				0x7FF0000000ull
++#define SPL_TEXT_BASE				0x7FF0080000ull
++#endif
++
++#define PREBOOT_VER_BASE			(SPL_TEXT_BASE - 0x1000)
++
++#define SPL_SIZE		0x10000		/* 64KB */
++#define HL_UART_BAUDRATE	115200
++#define HL_SPI_FLASH_MAX_FREQ	25000000
++#define HL_SPI_NEXT_IMAGE_OFF	0x60000
++#define HL_SPI_MODIFI_IMAGE_OFF	0x60004
++#define HL_SPI_SPL_OFF		0xA0000
++#define HL_SPI_UBOOT_OFF	0xB0000
++#define HL_SPI_PRIMARY_BASE	0
++#define HL_SPI_SECONDARY_BASE	0x800000
++
++typedef unsigned char u8;
++typedef unsigned int u32;
++typedef unsigned long long u64;
++
++static inline u8 regmap_readb(u32 offset)
++{
++	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
++
++	return (u8)(reg & 0xFF);
++}
++
++static inline void regmap_writeb(u8 val, u32 offset)
++{
++	*((volatile u32 *)(HL_CFG_BASE + offset)) = (u32)val;
++}
++
++static inline u32 regmap_readl(u32 offset)
++{
++	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));
++
++	return reg;
++}
++
++static inline void regmap_writel(u32 val, u32 offset)
++{
++	*((volatile u32 *)(HL_CFG_BASE + offset)) = val;
++}
++
++u32 get_cpu_boot_status_reg(void);
++u32 get_upd_pending_sts_reg(void);
++u32 hl_skip_pcie_init(void);
++void hl_uart_init(void);
++u32 hl_spi_baudr_get(void);
++
++void preboot_pcie_wait_for_link(void);
++void preboot_delay(void);
++void preboot_putc_virt_uart(const char c);
++void preboot_sync_btl(void);
++
++#endif /* COMMON_PREBOOT_H_ */

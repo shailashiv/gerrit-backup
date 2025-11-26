@@ -1,0 +1,86 @@
+From ac45e1013f2e64c477e19128c4a97b266d0045e2 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Thu, 25 Jun 2020 15:00:49 +0300
+Subject: [PATCH] [SW-0] preboot: add i2cslave tear down function
+
+In case of booting u-boot from preboot, i2cslave
+needs to be completely tear down with interrupts
+disabled to avoid i2c bus busy issues. This tear
+down function will be called in case of booting
+fit or WFE no return state.
+
+Change-Id: Iacb515935a44a6c7c61f69a1fbfd9c5db75341c6
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 5d787d6..adb14e6 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -89,5 +89,6 @@
+ enum cmd_check_res module_i2c_s_check(void);
+ void module_i2c_s_disable(void);
+ void module_i2c_s_run_fast(void);
++void module_i2c_s_teardown(void);
+ 
+ #endif /* _HL_CMD_MODULE_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 369cad9..b8dea9c 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -15,6 +15,7 @@
+ #include <thermal.h>
+ 
+ #include "cmd_module.h"
++#include "pll.h"
+ #include "uart.h"
+ #include "common.h"
+ 
+@@ -255,3 +256,35 @@
+ 		preboot_puts("I2C SLAVE: read request processed\n");
+ 	}
+ }
++
++void module_i2c_s_teardown(void)
++{
++	unsigned int val;
++
++	/* Write 0 to IC_ENABLE to disable DW_apb_i2c */
++	regmap_writel(0, mmPSOC_I2C_S_IC_ENABLE);
++
++	/* wait for disable to impact */
++	udelay(100);
++
++	/* Disable all interrupts */
++	regmap_writel(0x0, mmPSOC_I2C_S_IC_INTR_MASK);
++	regmap_readl(mmPSOC_I2C_S_IC_CLR_INTR);
++
++	/* Write IC_SLAVE_DISABLE to IC_CON */
++	val = regmap_readl(mmPSOC_I2C_S_IC_CON);
++	val |= PSOC_I2C_S_IC_CON_IC_SLAVE_DISABLE_MASK;
++	regmap_writel(val, mmPSOC_I2C_S_IC_CON);
++
++	/* Make sure all transactions arrived */
++	udelay(1000);
++
++	val = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++	/* Make sure all requests are handled after disable */
++	if (val & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++		   PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++		module_i2c_s_run_fast();
++
++	preboot_puts("I2C SLAVE: tear down done\n");
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index ff9b443..480b670 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -67,7 +67,7 @@
+ 		.run = noop,
+ 		.enable = module_i2c_s_setup,
+ 		.run_fast = module_i2c_s_run_fast,
+-		.teardown = module_i2c_s_disable,
++		.teardown = module_i2c_s_teardown,
+ 		.run_noreturn = noop,
+ 	},
+ };

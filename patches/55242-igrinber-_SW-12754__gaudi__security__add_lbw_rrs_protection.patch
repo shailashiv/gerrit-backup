@@ -1,0 +1,164 @@
+From 45b6c7faa2bd007310c68a16c92238128c5c48e9 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 07 Oct 2020 23:05:47 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: add lbw rrs protection
+
+Add LBW protection with Range Registers.
+The LBW RRs protection in Gaudi is implemented by using "min and max"
+concept. Therefore we specify the minimum and maximum addresses to
+protect.
+The "hit" is implemented by H/W as not inclusive - meaning that the
+addresses we supply are not protected by the specific register.
+Formula for the "hit": min < hit < max.
+So we supply min and max outside of the protected area.
+
+Change-Id: Id272d008fac70f270dfd6c6f177f93316f600a84
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index e3417b5..a293572 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -30,6 +30,7 @@
+ #include <psoc_global_conf_regs.h>
+ #include <dma_if_w_s_down_ch0_regs.h>
+ #include <dma_if_w_s_regs.h>
++#include <gic_regs.h>
+ 
+ #include <cpu_if_masks.h>
+ #include <psoc_global_conf_masks.h>
+@@ -980,6 +981,125 @@
+ 	 */
+ }
+ 
++static void preboot_secure_pcie_lbw_rr(int rr, u64 min64, u64 max64)
++{
++	u32 min = min64 & ~HL_CFG_BASE;
++	u32 max = max64 & ~HL_CFG_BASE;
++	/* We allocate 0 - 15 PCIe RRs for LBW */
++	u32 rr_base = rr * sizeof(u32), rr_dest;
++
++	/* Set WP RR */
++	rr_dest = rr_base + mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0;
++	regmap_writel(min, rr_dest);
++	rr_dest = rr_base + mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MAX_0;
++	regmap_writel(max, rr_dest);
++	/* Set RP RR */
++	rr_dest = rr_base + mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MIN_0;
++	regmap_writel(min, rr_dest);
++	rr_dest = rr_base + mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MAX_0;
++	regmap_writel(max, rr_dest);
++}
++
++static void preboot_secure_lbw_rr(int rr, u64 min64, u64 max64)
++{
++	int i;
++	u32 min = min64 & ~HL_CFG_BASE;
++	u32 max = max64 & ~HL_CFG_BASE;
++	u32 rr_base, rr_dest, hit;
++
++	for (i = 0; i < IF_RTRS_NUM; i++) {
++		rr_base = rr * sizeof(u32) + IF_RTRS_DIST * i;
++		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MIN_AW_0;
++		regmap_writel(min, rr_dest);
++		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MAX_AW_0;
++		regmap_writel(max, rr_dest);
++		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MIN_AR_0;
++		regmap_writel(min, rr_dest);
++		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_MAX_AR_0;
++		regmap_writel(max, rr_dest);
++
++		/* Enable (hit) RR */
++		rr_base = IF_RTRS_DIST * i;
++		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_HIT_AW;
++		hit = regmap_readl(rr_dest);
++		regmap_writel(hit | BIT(rr), rr_dest);
++
++		rr_dest = rr_base + mmSIF_RTR_0_LBW_RANGE_PRIV_HIT_AR;
++		hit = regmap_readl(rr_dest);
++		regmap_writel(hit | BIT(rr), rr_dest);
++	}
++}
++
++static void preboot_secure_lbw(void)
++{
++	u64 min, max;
++
++	/*
++	 * NOTE: The LBW and PCIe RRs HIT is: min < hit < max
++	 * meaning - not inclusive, so we need to provide it the min address
++	 * below the forbidden one and max address above the forbidden one.
++	 */
++	/* SRAM_CFG up to SIF: RR_0 */
++	min = mmSRAM_Y0_X0_BANK_BASE - 1;
++	max = mmSIF_RTR_0_BASE;
++	preboot_secure_lbw_rr(0, min, max);
++	preboot_secure_pcie_lbw_rr(0, min, max);
++
++	/* CPU_TIMESTAMP: RR_1 */
++	min = mmCPU_TIMESTAMP_BASE - 1;
++	max = mmDMA_IF_W_S_BASE;
++	preboot_secure_lbw_rr(1, min, max);
++	preboot_secure_pcie_lbw_rr(1, min, max);
++
++	/* HBM_CFG up to GIC_L: RR_2 */
++	min = mmHBM0_BASE - 1;
++	max = mmGIC_DISTRIBUTOR__5_GICD_SETSPI_NSR;
++	preboot_secure_lbw_rr(2, min, max);
++	preboot_secure_pcie_lbw_rr(2, min, max);
++
++	/* GIC_H up to PCIE_WRAP: RR_3 */
++	min = mmGIC_DISTRIBUTOR__5_GICD_SETSPI_NSR + sizeof(u32) - 1;
++	max = mmPCIE_WRAP_BASE;
++	preboot_secure_lbw_rr(3, min, max);
++	preboot_secure_pcie_lbw_rr(3, min, max);
++
++	/* PCIE_DBI up to MMU_UP: RR_4 */
++	min = mmPCIE_DBI_BASE - 1;
++	max = mmMMU_UP_BASE;
++	preboot_secure_lbw_rr(4, min, max);
++	preboot_secure_pcie_lbw_rr(4, min, max);
++
++	/* PSOC_I2C_M0 up to PSOC_TIMESTAMP: RR_5 */
++	min = mmPSOC_I2C_M0_BASE - 1;
++	max = mmPSOC_TIMESTAMP_BASE;
++	preboot_secure_lbw_rr(5, min, max);
++	preboot_secure_pcie_lbw_rr(5, min, max);
++
++	/* PSOC_GPIO0 up to NIC0_MAC_CH0: RR_6 */
++	min = mmPSOC_GPIO0_BASE - 1;
++	max = mmNIC0_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(6, min, max);
++	preboot_secure_pcie_lbw_rr(6, min, max);
++
++	/* NIC0_TS up to NIC1_MAC_CH0: RR_7 */
++	min = mmNIC0_TS_BASE - 1;
++	max = mmNIC1_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(7, min, max);
++	preboot_secure_pcie_lbw_rr(7, min, max);
++
++	/* NIC1_TS up to NIC2_MAC_CH0: RR_8 */
++	min = mmNIC1_TS_BASE - 1;
++	max = mmNIC2_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(8, min, max);
++	preboot_secure_pcie_lbw_rr(8, min, max);
++
++	/* NIC3_TS up to NIC4_MAC_CH0: RR_9 */
++	min = mmNIC3_TS_BASE - 1;
++	max = mmNIC4_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(9, min, max);
++	preboot_secure_pcie_lbw_rr(9, min, max);
++}
++
+ static void preboot_secure_hbw_rr(int rr, u64 base, u64 mask)
+ {
+ 	int i;
+@@ -1129,6 +1249,7 @@
+ 	preboot_secure_sram_cfg();
+ 	preboot_secure_dma();
+ 
++	preboot_secure_lbw();
+ 	preboot_secure_hbw();
+ 
+ 	/* TODO: implement the rest of security enablement */

@@ -1,0 +1,106 @@
+From 6f4b4ed69ee2986e78ed1883447fd6ef83c63307 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 25 Aug 2020 22:36:12 +0300
+Subject: [PATCH] [SW-17562] gaudi: add security validation
+
+Add Gaudi device security support, validate the SVN, public key and
+security bit enabled.
+
+Change-Id: Ic9bcc24b193a4c2d9f47ed37c0d029635a88a79b
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 87edd06..bbdc256 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -24,6 +24,7 @@
+ #include <efuse.h>
+ #include <gaudi/gaudi_security.h>
+ #include <spi.h>
++#include <preboot/sha256.h>
+ 
+ #define PROT_REGS_COUNT		32
+ #define PROT_REGS_MAX		(PROT_REGS_COUNT - 1) /* Secure config -> LKD */
+@@ -109,6 +110,81 @@
+ 	return &preboot_security_fuse_cache.fuse;
+ }
+ 
++bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
++				   int pub_key_len)
++{
++	const struct hl_sec_otp *otp = preboot_security_get_otp();
++	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
++	u8 value[SHA256_SUM_LEN];
++
++	if (!otp || !fuse)
++		return false;
++
++	if (key_idx < SEC_KEY_REVOKE_BIT_START ||
++	    key_idx > SEC_KEY_REVOKE_BIT_END)
++		return false;
++
++	if (fuse->key_revoke & SEC_KEY_REVOKE_BIT(key_idx)) {
++		preboot_puts_hex("Key revoked: ", key_idx, 0);
++		return false;
++	}
++
++	sha256_csum(pub_key, pub_key_len, value);
++	return !memcmp(&otp->keys[key_idx * SHA256_SUM_LEN], value,
++		       SHA256_SUM_LEN);
++}
++
++static int preboot_security_get_minimal_svn(void)
++{
++	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
++	const u32 *svn_bits;
++	int i, svn = 0;
++
++	if (!fuse)
++		return -1;
++
++	/* Use 32bit because the data may not be 64bit aligned */
++	svn_bits = (const u32 *)fuse->sec_ver_num;
++
++	/* Count how many consecutive LSB bits out of 128 are set in 4 32bit
++	 * iterations.
++	 */
++	for (i = 0; i < 4; i++) {
++		/* No bits are set, stop counting */
++		if (!svn_bits[i])
++			break;
++		/* All bits are set, move to next iteration, bits are counted
++		 * by the iterator at the end. Move to the next iteration.
++		 */
++		if (!~svn_bits[i])
++			continue;
++
++		/* Some bits are set, count them by __builtin_ctz() the bitwise
++		 * NOT value of the SVN since __builtin_ctz() count unset bits.
++		 */
++		svn += __builtin_ctz(~svn_bits[i]);
++		break;
++	}
++	/* Add bits counted by iterator in case that all the bits are set */
++	svn += i * 32;
++
++	preboot_puts_hex("SVN on eFuse: ", svn, 0);
++	return svn;
++}
++
++bool preboot_security_svn_is_valid(int sec_ver)
++{
++	int svn = preboot_security_get_minimal_svn();
++
++	if (svn < 0)
++		return false;
++
++	if (sec_ver < svn)
++		preboot_puts_hex("Security version too low: ", sec_ver, 0);
++
++	return sec_ver >= svn;
++}
++
+ /* Enable bit is SOC_STRAP10 in schematics */
+ #define SECURITY_ENABLE_SW BIT(10)
+ 

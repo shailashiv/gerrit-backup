@@ -1,0 +1,804 @@
+From 79c5a959e3b1f2b491f6821fd22c3a090e5989ea Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 03 May 2021 22:30:20 +0300
+Subject: [PATCH] [SW-30993] gaudi: hbm: add soft lane repair
+
+Add soft lane repair to HBM. The repair is done in 2 stages, DC test and
+AC test (MCBIST) without the iterative part of the test and without the
+combination of row repair.
+
+More information from the design document:
+
+Purpose of HBM Lane Repair is to identify malfunctioning IO on the HBM
+bus and attempt recovery by using IO redundancy feature of the HBM.
+The IO is tested using two methods:
+1. DC test -  this is used to identify disconnections or shorts.
+   It uses special test mode of the HBM, in which constant known values
+   are driven on all the IOs both in the TX direction and in the RX
+   direction. The driven values are compared with the values captured
+   by the receiver (HBM or SoC).
+2. AC test - this is used to identify transient faults. It uses
+   functional operation of the HBM. The SoC is performing Writes with
+   pseudo-random data pattern followed by Reads of the same addresses.
+   Data is compared. This flow uses the MCBIST mechanism of the MC,
+   running in all PCs in parallel.
+After each test stage, the results are parsed to check which (if any)
+of the IOs malfunctions.
+
+Change-Id: I083897e58625933efcb1466079b308c4bc98b51a
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index 07900b8..65e9f03 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -15,6 +15,7 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <string.h>
+ 
+ #include "common.h"
+ 
+@@ -47,7 +48,10 @@
+ 
+ #define BYTES_PER_DWORD			4
+ #define DWORDS_PER_PC			2
++#define BYTES_PER_PC			(BYTES_PER_DWORD * DWORDS_PER_PC)
+ #define PC_PER_CH			2
++#define BITS_PER_BYTE			8
++#define BITS_PER_NIBBLE			4
+ 
+ #define HLR_DWORD_CODE_SHIFT		16
+ #define MAX_REPAIRED_LANES_PER_CH	10 //8DW + 2AW
+@@ -66,6 +70,13 @@
+ 		}						\
+ 		ret;						\
+ 	})
++
++#define REDUNDENT_CBUS_LANES		1
++#define REDUNDENT_RBUS_LANES		1
++#define REDUNDENT_BYTE_PAIR_LANES	1
++
++#define CBUS_LANES_NUM			8
++#define RBUS_LANES_NUM			6
+ 
+ struct hbm {
+ 	u32 acc_initial;
+@@ -102,7 +113,43 @@
+ 	u32 dw23_code;
+ 	u16 aw_code;
+ 	bool status;
++	bool is_repair_code_valid;
+ 	struct hlr_count count;
++	/* DC test only */
++	u32 extest_rx_fails[EXTEST_WDR_REG_NUM];
++	u32 extest_tx_fails[EXTEST_WDR_REG_NUM];
++	u8 failed_r;			/* For row bus */
++	u8 failed_c;			/* For column bus */
++	/* DC + AC tests */
++	u64 failed_dq[PC_PER_CH];	/* For data bits */
++	u8 failed_dm[PC_PER_CH];	/* For ECC bits */
++	u8 failed_dbi[PC_PER_CH];	/* Bit inversion */
++	int fails_in_byte[PC_PER_CH][BYTES_PER_PC];
++};
++
++enum lane_repair_code {
++	REPAIR_CODE_DM = 0x0,
++	REPAIR_CODE_DQ0 = 0x1,
++	REPAIR_CODE_DQ1 = 0x2,
++	REPAIR_CODE_DQ2 = 0x3,
++	REPAIR_CODE_DQ3 = 0x4,
++	REPAIR_CODE_DQ4 = 0x5,
++	REPAIR_CODE_DQ5 = 0x6,
++	REPAIR_CODE_DQ6 = 0x7,
++	REPAIR_CODE_DQ7 = 0x8,
++	REPAIR_CODE_DBI = 0x9,
++	REPAIR_CODE_ADJ = 0xe,		/* Adjacent lane repaired */
++	REPAIR_CODE_NONE = 0xf		/* Default, no repair */
++};
++
++struct dev_fail_info {
++	/* TEMP[2:0] output pins from hbm to ASIC */
++	u8 temp0:1;
++	u8 temp1:1;
++	u8 temp2:1;
++	u8 cattrip:1;
++	u32 unrep_dw; /* Data Word */
++	u32 unrep_aw; /* Address Word */
+ };
+ 
+ struct extest_skip_info {
+@@ -238,6 +285,7 @@
+ static u32 dword_wr[GAUDI_HBM_CHANNELS][4][4];
+ static u32 dword_rd[GAUDI_HBM_CHANNELS][4][4];
+ static struct ch_lane_repair_info hlr_info[GAUDI_HBM_DEVICES][GAUDI_HBM_CHANNELS];
++static struct dev_fail_info dev_fail_info[GAUDI_HBM_DEVICES];
+ 
+ static const u32 extest_wdr_pattern[EXTEST_WDR_PTRNS_NUM * EXTEST_WDR_REG_NUM] = {
+ 	/* pattern 0 */
+@@ -522,6 +570,9 @@
+ 					preboot_puts_hex_raw(", received ", received, true);
+ 					preboot_puts_hex(", mask ", mask, true);
+ 				}
++
++				hlr_info[device][ch].extest_rx_fails[i] |=
++					(received & mask) ^ (expected & mask);
+ 			}
+ 		}
+ 	}
+@@ -593,6 +644,9 @@
+ 
+ 				if ((received & mask) != (expected & mask))
+ 					err++;
++
++				hlr_info[device][ch].extest_tx_fails[i] |=
++					(received & mask) ^ (expected & mask);
+ 			}
+ 
+ 			/* Special case - pins TEMP[2:0] + CATTRIP */
+@@ -601,16 +655,19 @@
+ 				if (((received >> 2) & 1) !=
+ 						((expected  >>  20) & 1)) {
+ 					err++;
++					dev_fail_info[device].temp2 |= 1;
+ 				}
+ 
+ 				if (((received >> 1) & 1) !=
+ 						((expected >> 21) & 1)) {
+ 					err++;
++					dev_fail_info[device].temp1 |= 1;
+ 				}
+ 
+ 				if (((received >> 0) & 1) !=
+ 						((expected  >>  22) & 1)) {
+ 					err++;
++					dev_fail_info[device].temp0 |= 1;
+ 				}
+ 			}
+ 
+@@ -619,6 +676,7 @@
+ 				if (((received >> 3) & 1) !=
+ 						((expected >> 20) & 1)) {
+ 					err++;
++					dev_fail_info[device].cattrip |= 1;
+ 				}
+ 			}
+ 		}
+@@ -669,6 +727,9 @@
+ 
+ 				if ((received & mask) != (expected & mask))
+ 					err++;
++
++				hlr_info[device][ch].extest_tx_fails[i] |=
++					(received & mask) ^ (expected & mask);
+ 			}
+ 
+ 			/* Special case - pins TEMP[2:0] + CATTRIP */
+@@ -677,16 +738,19 @@
+ 				if (((received >> 2) & 1) !=
+ 						((expected  >>  20) & 1)) {
+ 					err++;
++					dev_fail_info[device].temp2 |= 1;
+ 				}
+ 
+ 				if (((received >> 1) & 1) !=
+ 						((expected >> 21) & 1)) {
+ 					err++;
++					dev_fail_info[device].temp1 |= 1;
+ 				}
+ 
+ 				if (((received >> 0) & 1) !=
+ 						((expected  >>  22) & 1)) {
+ 					err++;
++					dev_fail_info[device].temp0 |= 1;
+ 				}
+ 			}
+ 
+@@ -695,6 +759,7 @@
+ 				if (((received >> 3) & 1) !=
+ 						((expected >> 20) & 1)) {
+ 					err++;
++					dev_fail_info[device].cattrip |= 1;
+ 				}
+ 			}
+ 		}
+@@ -927,7 +992,317 @@
+ 	}
+ }
+ 
+-static int mcbist_poll_completion(int sid, int dev)
++static void lane_update_phy(int device, int mc_ch)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	struct ch_lane_repair_info *hlr = &hlr_info[device][mc_ch];
++
++	/* Configure MLB according to remapped lanes */
++	if (hlr->dw01_code != 0xFFFFFFFF) {
++		hlr->dw01_code = hlr->dw01_code;
++		hlr->count.pc0 = 1;
++		if (((hlr->dw01_code & 0xFFFF) != 0xFFFF) &&
++		    (((hlr->dw01_code >> 16) & 0xFFFF) != 0xFFFF))
++			hlr->count.pc0 = 2;
++
++		hlr->status = true;
++
++		WREG32(base + (mc_ch * 0x1000) + 0x2F0, hlr->dw01_code);
++	}
++
++	if (hlr->dw23_code != 0xFFFFFFFF) {
++		hlr->dw23_code = hlr->dw23_code;
++		hlr->count.pc1 = 1;
++		if (((hlr->dw23_code & 0xFFFF) != 0xFFFF) &&
++		    (((hlr->dw23_code >> 16) & 0xFFFF) != 0xFFFF))
++			hlr->count.pc1 = 2;
++
++		hlr->status = true;
++
++		WREG32(base + (mc_ch * 0x1000) + 0x2F4, hlr->dw23_code);
++	}
++
++	if (hlr->aw_code != 0xFF) {
++		hlr->aw_code = hlr->aw_code;
++		hlr->count.aw = 1;
++		hlr->status = true;
++
++		WREG32(base + (mc_ch * 0x1000) + 0x2F8, hlr->aw_code);
++	}
++}
++
++static void lane_update_hbm(int device, int mc_ch)
++{
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	struct ch_lane_repair_info *hlr = &hlr_info[device][mc_ch];
++
++	/* Check if we need to update HBM */
++	if (!hlr->is_repair_code_valid ||
++	    (hlr->dw01_code == 0xFFFFFFFF && hlr->dw23_code == 0xFFFFFFFF &&
++	     hlr->aw_code == 0xFF))
++		return;
++
++	/* HBM device configuration */
++	WREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) + 0x100,
++	       hlr->dw01_code);
++	WREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) + 0x104,
++	       (hlr->dw23_code << 8) | (hlr->aw_code & 0xff));
++	WREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) + 0x108,
++	       hlr->dw23_code >> 24);
++
++	ieee1500_inst(device, hbm_ch_mapping[mc_ch], ieee1500_soft_lane_repair,
++		      EXTEST_WRITE_INST);
++}
++
++static void hlr_reset_failures(struct ch_lane_repair_info *hlr,
++			       bool is_reset_count)
++{
++	memset(hlr->extest_rx_fails, 0, sizeof(hlr->extest_rx_fails));
++	memset(hlr->extest_tx_fails, 0, sizeof(hlr->extest_tx_fails));
++	memset(hlr->failed_dq, 0, sizeof(hlr->failed_dq));
++	memset(hlr->failed_dm, 0, sizeof(hlr->failed_dm));
++	memset(hlr->failed_dbi, 0, sizeof(hlr->failed_dbi));
++	hlr->failed_r = 0;
++	hlr->failed_c = 0;
++
++	if (is_reset_count)
++		memset(hlr->fails_in_byte, 0, sizeof(hlr->fails_in_byte));
++}
++
++static void hbm_reset_failures(void)
++{
++	int device, ch;
++
++	for (device = 0; device < GAUDI_HBM_DEVICES; device++)
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++			hlr_reset_failures(&hlr_info[device][ch], true);
++}
++
++/*
++ * Return 0 if HBM was repaired or does not need repair.
++ */
++static int hbm_channel_lane_repair(int device, int ch)
++{
++	struct hbm *hbm = &hbm_data;
++	struct ch_lane_repair_info *hlr = &hlr_info[device][ch];
++	struct dev_fail_info *dev_fail = &dev_fail_info[device];
++	int fails_in_cbus = 0, fails_in_rbus = 0;
++	u8 repair_code[PC_PER_CH][8], repair_code_c, repair_code_r;
++	u32 *dw_code;
++	int pc, byte, bit;
++
++	if (dev_fail->unrep_dw)  /* Failures in unrepairable pins */
++		return 1;
++
++	/* Create repair vector */
++	for (pc = 0; pc < PC_PER_CH; pc++) {
++		dw_code = pc ? &hlr->dw23_code : &hlr->dw01_code;
++
++		/* Convert dw codes nibbles to repair_code array */
++		for (byte = 0; byte < BYTES_PER_PC; byte++)
++			repair_code[pc][byte] = (*dw_code >> (4 * byte)) & 0xf;
++
++		for (byte = 0; byte < BYTES_PER_PC; byte++) {
++			/* repair_code should contains the repair codes that we
++			 * introduce during ATE (hard repair)
++			 */
++			if (repair_code[pc][byte] < REPAIR_CODE_ADJ)
++				hlr->fails_in_byte[pc][byte] = 1;
++			else
++				hlr->fails_in_byte[pc][byte] = 0;
++
++			/* Check result of current byte */
++			for (bit = 0; bit < BITS_PER_BYTE; bit++) {
++				if (!!(hlr->failed_dq[pc] &
++				       BIT(byte * 8 + bit))) {
++					hlr->fails_in_byte[pc][byte]++;
++					repair_code[pc][byte] = bit + REPAIR_CODE_DQ0;
++				}
++			}
++
++			/* In case that DBI (data bit inversion) is enabled and
++			 * we got more than 8 flipped bits, than probably dbi
++			 * lane is failing
++			 */
++			if (hbm->dbi_enable &&
++			    hlr->fails_in_byte[pc][byte] >= 8 &&
++			    !(hlr->failed_dm[pc] & BIT(byte))) {
++				/* DBI fault - detect for AC test */
++				hlr->failed_dbi[pc] |= BIT(byte);
++				hlr->fails_in_byte[pc][byte] -= 8;
++			}
++
++			/* ECC */
++			if (!!(hlr->failed_dm[pc] & BIT(byte))) {
++				hlr->fails_in_byte[pc][byte]++;
++				repair_code[pc][byte] = REPAIR_CODE_DM;
++			}
++
++			/* Data bit inversion */
++			if (!!(hlr->failed_dbi[pc] & BIT(byte))) {
++				hlr->fails_in_byte[pc][byte]++;
++				repair_code[pc][byte] = REPAIR_CODE_DBI;
++			}
++
++			/* more than one lane per byte, cannot repair */
++			if (hlr->fails_in_byte[pc][byte] > REDUNDENT_BYTE_PAIR_LANES)
++				return 1;
++		}
++
++		/* Check result of byte pair */
++		for (byte = 0; byte < BYTES_PER_PC; byte += 2) {
++			/* more than one lane per byte pair */
++			if (hlr->fails_in_byte[pc][byte] +
++			    hlr->fails_in_byte[pc][byte + 1] > REDUNDENT_BYTE_PAIR_LANES)
++				return 1;
++
++			/* mark repair in adjacent byte */
++			if (hlr->fails_in_byte[pc][byte])
++				repair_code[pc][byte + 1] = REPAIR_CODE_ADJ;
++
++			if (hlr->fails_in_byte[pc][byte + 1])
++				repair_code[pc][byte] = REPAIR_CODE_ADJ;
++		}
++	}
++
++	/* AWORD: Check whether repairable and create repair vector */
++	if (dev_fail->unrep_aw)  /* Failures in unrepairable pins */
++		return 1;
++
++	repair_code_c = hlr->aw_code & 0xf;
++	repair_code_r = (hlr->aw_code >> 4) & 0xf;
++
++	/* Check if we already fixed this bus */
++	if (repair_code_c < REPAIR_CODE_NONE)
++		fails_in_cbus = 1;
++
++	/* Check result of current C bus */
++	for (bit = 0; bit < CBUS_LANES_NUM; bit++) {
++		if (!(hlr->failed_c & BIT(bit)))
++			continue;
++
++		fails_in_cbus++;
++		repair_code_c = bit;
++	}
++
++	if (fails_in_cbus > REDUNDENT_CBUS_LANES)
++		return 1;
++
++	/* Check if we already fixed this bus */
++	if (repair_code_r < REPAIR_CODE_NONE)
++		fails_in_rbus = 1;
++
++	/* Check result of current R bus */
++	for (bit = 0; bit < RBUS_LANES_NUM; bit++) {
++		if (!(hlr->failed_r & BIT(bit)))
++			continue;
++
++		fails_in_rbus++;
++		repair_code_r = bit;
++	}
++
++	if (fails_in_rbus > REDUNDENT_RBUS_LANES)
++		return 1;
++
++	/* Convert back the repair code arrays */
++	for (pc = 0; pc < PC_PER_CH; pc++) {
++		dw_code = pc ? &hlr->dw23_code : &hlr->dw01_code;
++
++		*dw_code = 0;
++		for (byte = 0; byte < BYTES_PER_PC; byte++)
++			*dw_code |= repair_code[pc][byte] << (byte * 4);
++	}
++
++	hlr->aw_code = repair_code_c | (repair_code_r << 4);
++
++	lane_update_hbm(device, ch);
++	lane_update_phy(device, ch);
++
++	/* Since soft repair is an iterative process, reset handled failures to
++	 * prevent redudant repair attempts.
++	 */
++	hlr_reset_failures(hlr, false);
++
++	return 0;
++}
++
++#define DM_MISMATCH_REG		0x12c
++#define DM_EXPECTED_REG		0x128
++#define DM_BIT_GROUP_SIZE	4
++#define DM_BIT_GROUP_COUNT	2
++
++const static int dm_bit[DM_BIT_GROUP_COUNT][DM_BIT_GROUP_SIZE] = {
++	{ 0, 4, 16, 20 },
++	{ 8, 12, 24, 28 }
++};
++
++static u8 calc_dm_bit(u32 flipped, int dm_idx)
++{
++	int bit, nibble;
++	u8 res = 0;
++
++	for (bit = 0; bit < DM_BIT_GROUP_SIZE; bit++)
++		for (nibble = 0; nibble < DM_BIT_GROUP_COUNT; nibble++)
++			if (!!(flipped & BIT(dm_bit[nibble][bit] + dm_idx)))
++				res |= BIT(dm_idx + nibble * BITS_PER_NIBBLE);
++
++	return res;
++}
++
++struct failed_dq_reg {
++	u32 mismatch_reg;
++	u32 expected_reg;
++	int shift_res;
++};
++
++const static struct failed_dq_reg failed_dq_reg[] = {
++	{ 0x16c, 0x14c, 0 },  /*   0 ..  31 */
++	{ 0x168, 0x148, 0 },  /*  32 ..  63 */
++	{ 0x15c, 0x13c, 0 },  /* 128 .. 159 */
++	{ 0x158, 0x138, 0 },  /* 160 .. 191 */
++	{ 0x164, 0x144, 32 }, /*  64 ..  95 */
++	{ 0x160, 0x140, 32 }, /*  96 .. 128 */
++	{ 0x154, 0x134, 32 }, /* 192 .. 223 */
++	{ 0x150, 0x130, 32 }, /* 224 .. 255 */
++};
++
++static int hbm_channel_ac_test_repair(int device, int ch)
++{
++	struct ch_lane_repair_info *hlr = &hlr_info[device][ch];
++	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
++	u32 status = RREG32(base + ch * 0x1000 + 0x11C);
++	u32 mismatch, expected, flipped;
++	int pc, i;
++
++	for (pc = 0; pc < PC_PER_CH; pc++) {
++		if (!!(status & BIT(24 + pc))) /* No failures */
++			continue;
++
++		/* Select pseudo channel */
++		RMWREG32(base + ch * 0x1000 + 0x100, pc, BIT(5));
++
++		/* Gather mismatched bits */
++		for (i = 0; i < ARRAY_SIZE(failed_dq_reg); i++) {
++			mismatch = RREG32(base + ch * 0x1000 +
++					  failed_dq_reg[i].mismatch_reg);
++			expected = RREG32(base + ch * 0x1000 +
++					  failed_dq_reg[i].expected_reg);
++			flipped = mismatch ^ expected;
++			hlr->failed_dq[pc] |= ((u64)flipped) <<
++				failed_dq_reg[i].shift_res;
++		}
++
++		mismatch = RREG32(base + ch * 0x1000 + DM_MISMATCH_REG);
++		expected = RREG32(base + ch * 0x1000 + DM_EXPECTED_REG);
++		flipped = mismatch ^ expected;
++		for (i = 0; i < BITS_PER_NIBBLE; i++)
++			hlr->failed_dm[pc] |= calc_dm_bit(flipped, i);
++	}
++
++	return hbm_channel_lane_repair(device, ch);
++}
++
++static int mcbist_poll_completion(int sid, int dev, bool is_repair)
+ {
+ 	int err, ch, rc = 0;
+ 	u32 base, status;
+@@ -940,13 +1315,20 @@
+ 		if (!err)
+ 			continue;
+ 
+-		rc = -1;
++		if (!is_repair) {
++			rc = -1;
++			continue;
++		}
++
++		err = hbm_channel_ac_test_repair(dev, ch);
++		if (err)
++			rc = -1;
+ 	}
+ 
+ 	return rc;
+ }
+ 
+-static int mcbist_write_read_full(struct hbm *hbm, int unused)
++static int mcbist_write_read_full(struct hbm *hbm, int unused, bool is_repair)
+ {
+ 	int device, ch, sid, acc_err = 0;
+ 	u32 base, pseudo_rand = 0x1, interleave = 0x0;
+@@ -994,7 +1376,8 @@
+ 
+ 		/* Poll for MCBIST completion */
+ 		for (device = 0; device < GAUDI_HBM_DEVICES; device++)
+-			acc_err |= mcbist_poll_completion(sid, device);
++			acc_err |= mcbist_poll_completion(sid, device,
++							  is_repair);
+ 
+ 		if (acc_err)
+ 			break;
+@@ -1320,6 +1703,10 @@
+ 		/* tINIT5 */
+ 		udelay(1);
+ 	}
++
++	/* Lane repair info was lost during reset - restore it */
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++		lane_update_hbm(device, ch);
+ }
+ 
+ static void init_mc(struct hbm *hbm, int device)
+@@ -1640,6 +2027,123 @@
+ 	return 0;
+ }
+ 
++#define EXTEST_PC_SIZE		116
++#define EXTEST_BYTE_SIZE	12
++#define EXTEST_COL1_OFFSET	96
++#define EXTEST_COL2_OFFSET	97
++#define EXTEST_ROW1_OFFSET	106
++#define EXTEST_ROW2_OFFSET	108
++#define EXTEST_AW_IDX		3
++
++static int hbm_channel_dc_test_repair(int device, int ch)
++{
++	struct ch_lane_repair_info *hlr = &hlr_info[device][ch];
++	struct dev_fail_info *dev_fail = &dev_fail_info[device];
++	u32 extest_fails[EXTEST_WDR_REG_NUM];
++	int i, r, bit, byte, pc, extest_idx, dq, col, row;
++
++	/* Gather extest fails */
++	for (r = 0; r < EXTEST_WDR_REG_NUM; r++)
++		extest_fails[r] = hlr->extest_rx_fails[r] |
++			hlr->extest_tx_fails[r];
++
++	for (pc = 0; pc < PC_PER_CH; pc++) {
++		for (byte = 0; byte < BYTES_PER_PC; byte++) {
++			/* DM (ECC) */
++			extest_idx = pc * EXTEST_PC_SIZE + byte * EXTEST_BYTE_SIZE + 0;
++			r = extest_idx / 32;
++			i = extest_idx % 32;
++			if (!!(extest_fails[r] & BIT(i)))
++				hlr->failed_dm[pc] |= BIT(byte);
++
++			/* DBI (bit inversion) */
++			extest_idx = pc * EXTEST_PC_SIZE + byte * EXTEST_BYTE_SIZE + 11;
++			r = extest_idx / 32;
++			i = extest_idx % 32;
++			if (!!(extest_fails[r] & BIT(i)))
++				hlr->failed_dbi[pc] |= BIT(byte);
++
++			/* DQ (data) */
++			for (bit = 0; bit < 4; bit++) {
++				dq = byte * 8 + bit;
++				extest_idx = pc * EXTEST_PC_SIZE + byte *
++					EXTEST_BYTE_SIZE + (bit + 1);
++				r = extest_idx / 32;
++				i = extest_idx % 32;
++				if (!!(extest_fails[r] & BIT(i)))
++					hlr->failed_dq[pc] |= BIT(dq);
++			}
++
++			for (bit = 4; bit < 8; bit++) {
++				dq = byte * 8 + bit;
++				extest_idx = pc * EXTEST_PC_SIZE + byte * EXTEST_BYTE_SIZE +
++					(bit + 3);
++				r = extest_idx / 32;
++				i = extest_idx % 32;
++				if (!!(extest_fails[r] & BIT(i)))
++					hlr->failed_dq[pc] |= BIT(dq);
++			}
++
++			/* Rest of DWORD pins: PAR, RD, WDQS, RDQS, DERR */
++			for (bit = 0; bit < 2; bit++) {
++				extest_idx = pc * EXTEST_PC_SIZE + byte * EXTEST_BYTE_SIZE +
++					(bit + 5);
++				r = extest_idx / 32;
++				i = extest_idx % 32;
++				if (!!(extest_fails[r] & BIT(i)))
++					dev_fail->unrep_dw |= BIT(i);
++			}
++		}
++	}
++
++	/* Column */
++	for (col = 0; col < 4; col++) {
++		extest_idx = EXTEST_COL1_OFFSET + col;
++		r = extest_idx / 32;
++		i = extest_idx % 32;
++		if (!!(extest_fails[r] & BIT(i)))
++			hlr->failed_c |= BIT(col);
++	}
++
++	for (col = 4; col < CBUS_LANES_NUM; col++) {
++		extest_idx = EXTEST_COL2_OFFSET + col;
++		r = extest_idx / 32;
++		i = extest_idx % 32;
++		if (!!(extest_fails[r] & BIT(i)))
++			hlr->failed_c |= BIT(col);
++	}
++
++	/* Row */
++	for (row = 0; row < 4; row++) {
++		extest_idx = EXTEST_ROW1_OFFSET + row;
++		r = extest_idx / 32;
++		i = extest_idx % 32;
++		if (!!(extest_fails[r] & BIT(i)))
++			hlr->failed_r |= BIT(row);
++	}
++
++	for (row = 4; row < RBUS_LANES_NUM; row++) {
++		extest_idx = EXTEST_ROW2_OFFSET + row;
++		r = extest_idx / 32;
++		i = extest_idx % 32;
++		if (!!(extest_fails[r] & BIT(i)))
++			hlr->failed_r |= BIT(row);
++	}
++
++	/* Rest of AWORD pins */
++	dev_fail->unrep_aw =
++		(extest_fails[EXTEST_AW_IDX] & BIT(4)) ||   /* CKE  */
++		(extest_fails[EXTEST_AW_IDX] & BIT(9))  ||  /* RC   */
++		(extest_fails[EXTEST_AW_IDX] & BIT(14)) ||  /* CK_t */
++		(extest_fails[EXTEST_AW_IDX] & BIT(15)) ||  /* CK_c */
++		(extest_fails[EXTEST_AW_IDX] & BIT(18)) ||  /* RR   */
++		(extest_fails[EXTEST_AW_IDX] & BIT(19)) ||  /* AERR */
++		dev_fail->temp2 || dev_fail->temp1 ||
++		dev_fail->temp0 || dev_fail->cattrip;
++
++	return hbm_channel_lane_repair(device, ch);
++}
++
+ static int lane_detection(int device)
+ {
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+@@ -1649,27 +2153,18 @@
+ 	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
+ 		WREG32(base + ch * 0x1000 + 0x900, 1);
+ 
+-	rc = extest_rx(device);
+-	if (rc) {
+-		/* Exit IODC mode */
+-		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
+-			WREG32(base + ch * 0x1000 + 0x900, 0);
+-
+-		return rc;
+-	}
+-
+-	rc = extest_tx(device);
+-	if (rc) {
+-		/* Exit IODC mode */
+-		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
+-			WREG32(base + ch * 0x1000 + 0x900, 0);
+-
+-		return rc;
+-	}
++	extest_rx(device);
++	extest_tx(device);
+ 
+ 	/* Exit IODC mode */
+ 	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
+ 		WREG32(base + ch * 0x1000 + 0x900, 0);
++
++	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		rc = hbm_channel_dc_test_repair(device, ch);
++		if (rc)
++			break;
++	}
+ 
+ 	return 0;
+ }
+@@ -1679,7 +2174,6 @@
+ 	struct ch_lane_repair_info *hlr;
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 reg_800, reg_804, reg_808;
+-	u32 dw01_repair_code, dw23_repair_code, aw_repair_code;
+ 	int mc_ch;
+ 
+ 	/* Clearing HLR information for all channels */
+@@ -1703,46 +2197,14 @@
+ 		reg_808 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
+ 				 0x808 + (hbm_ch_mapping[mc_ch] * 0x100));
+ 
+-		dw01_repair_code = reg_800;
+-		aw_repair_code = reg_804 & 0xFF;
+-		dw23_repair_code = ((reg_804 & 0xFFFFFF00) >> 8) |
+-						((reg_808 & 0xFF) << 24);
++		hlr->dw01_code = reg_800;
++		hlr->aw_code = reg_804 & 0xFF;
++		hlr->dw23_code = ((reg_804 & 0xFFFFFF00) >> 8) |
++			((reg_808 & 0xFF) << 24);
+ 
+-		/* Configure MLB according to remapped lanes */
+-		if (dw01_repair_code != 0xFFFFFFFF) {
+-			hlr->dw01_code = dw01_repair_code;
+-			hlr->count.pc0 = 1;
+-			if (((dw01_repair_code & 0xFFFF) != 0xFFFF) &&
+-			    (((dw01_repair_code >> 16) & 0xFFFF) != 0xFFFF))
+-				hlr->count.pc0 = 2;
++		lane_update_phy(device, mc_ch);
+ 
+-			hlr->status = true;
+-
+-			WREG32(base + (mc_ch * 0x1000) + 0x2F0,
+-			       dw01_repair_code);
+-		}
+-
+-		if (dw23_repair_code != 0xFFFFFFFF) {
+-			hlr->dw23_code = dw23_repair_code;
+-			hlr->count.pc1 = 1;
+-			if (((dw23_repair_code & 0xFFFF) != 0xFFFF) &&
+-			    (((dw23_repair_code >> 16) & 0xFFFF) != 0xFFFF))
+-				hlr->count.pc1 = 2;
+-
+-			hlr->status = true;
+-
+-			WREG32(base + (mc_ch * 0x1000) + 0x2F4,
+-			       dw23_repair_code);
+-		}
+-
+-		if (aw_repair_code != 0xFF) {
+-			hlr->aw_code = aw_repair_code;
+-			hlr->count.aw = 1;
+-			hlr->status = true;
+-
+-			WREG32(base + (mc_ch * 0x1000) + 0x2F8,
+-			       aw_repair_code);
+-		}
++		hlr->is_repair_code_valid = true;
+ 	}
+ }
+ 
+@@ -1830,8 +2292,11 @@
+ 		init_mc(hbm, dev);
+ 	}
+ 
+-	/* MC BIST (validate Training result) */
+-	err = mcbist_write_read_full(hbm, 0);
++	/* Reset repaired failures before AC test */
++	hbm_reset_failures();
++
++	/* MC BIST (validate Training result and attempt repair) */
++	err = mcbist_write_read_full(hbm, 0, true);
+ 	if (err)
+ 		return 1;
+ 

@@ -1,0 +1,484 @@
+From a5e7e006cb4d689a59836c50859bbf60aceb1d28 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Thu, 25 Mar 2021 22:11:38 +0200
+Subject: [PATCH] [SW-36011] gaudi: add spsram cmd for passing fit
+
+Add SPSRAM command so that a fit can be passed
+from fw-loader using Scratch pad SRAM.
+This is required as part of passing nic enable info
+in a fit using a secured transport layer (ELBI) from
+host to FW preboot.
+
+Change-Id: I23997d9334a1a0586af7ef38d33cceae514f25e8
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 6f345bb..872b256 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -59,6 +59,7 @@
+ #include <gaudi/gaudi_security.h>
+ #include <spi.h>
+ #include <sha256.h>
++#include <hl_fw_if.h>
+ 
+ #include "common.h"
+ 
+@@ -1492,11 +1493,13 @@
+ 	/*
+ 	 * PCIe IF HBW RRs are for direct access from PCIe IF to PSOC domain:
+ 	 * STM, SPI Flash, Scratchpad SRAM, PCIe FW SRAM.
+-	 * Assign the PCIe IF RR_16 (0-15 and 28-31 are allocated for LBW) for
+-	 * this job.
++	 * SPSRAM space for fit is used in dynamic RR.
++	 * Assign the PCIe IF RR_16 , RR_17 (0-15 and 28-31 are allocated for
++	 * LBW) for this job.
+ 	 * NOTE: The PCIe RRs use min/max concept and HIT is: min < hit < max
+ 	 */
+-	preboot_secure_pcie_rr(16, mmSTM_BASE - 1, mmRAZWI_BASE);
++	preboot_secure_pcie_rr(16, mmSTM_BASE - 1, FIT_IMG_SPSRAM_BASE);
++	preboot_secure_pcie_rr(17, FIT_IMG_SPSRAM_END - 1, mmRAZWI_BASE);
+ }
+ 
+ static void preboot_security_pci_rtr_disable(int rr)
+@@ -1595,6 +1598,7 @@
+ 	VERS_END_TO_IMG,
+ 	IMAGE,
+ 	IMG_END_TO_SRAM_END,
++	SPSRAM_IMAGE,
+ };
+ 
+ struct preboot_sec_dyn_pcie_rr_cfg {
+@@ -1628,10 +1632,15 @@
+ 		.rr = PCIE_DYN_RR_SRAM_END,
+ 		.min = BOOT_FIT_END - 1,
+ 		.max = SRAM_END,
+-	}
++	},
++	[SPSRAM_IMAGE] = {
++		.rr = PCIE_DYN_RR_SPSRAM_IMG,
++		.min = FIT_IMG_SPSRAM_BASE - 1,
++		.max = FIT_IMG_SPSRAM_END,
++	},
+ };
+ 
+-void preboot_security_dynamic_img_close(void)
++void preboot_security_dynamic_img_sram_close(void)
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg = &preboot_sec_dyn_cfg[IMAGE];
+ 
+@@ -1641,11 +1650,27 @@
+ 	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
+ }
+ 
+-void preboot_security_dynamic_img_open(void)
++void preboot_security_dynamic_img_sram_open(void)
+ {
+ 	preboot_secure_pcie_rr(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
+ }
+ 
++void preboot_security_dynamic_img_spsram_close(void)
++{
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg =
++					&preboot_sec_dyn_cfg[SPSRAM_IMAGE];
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
++}
++
++void preboot_security_dynamic_img_spsram_open(enum hl_upd_cmd cmd)
++{
++	preboot_secure_pcie_rr(preboot_sec_dyn_cfg[SPSRAM_IMAGE].rr, 0, 0);
++}
++
+ void preboot_security_dynamic_vers_init(u64 vers_off, u32 size)
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
+diff --git a/greco_arc_gnu/common.h b/greco_arc_gnu/common.h
+index f069c99..1111fd6 100644
+--- a/greco_arc_gnu/common.h
++++ b/greco_arc_gnu/common.h
+@@ -24,6 +24,9 @@
+ #define PPBOOT_TEXT_BASE	(FW_SRAM_BASE + 0xC)
+ #define PREBOOT_TEXT_BASE	(SP_SRAM_BASE + SP_SRAM_PREBOOT_OFFSET + 0x8)
+ 
++#define HL_SP_SRAM_BASE		0x7FFBFE0000
++#define HL_SP_SRAM_SIZE		0x10000
++
+ /*
+  * TODO: this address is wrong, a good address must be set in order to use
+  * boot info API.
+diff --git a/include/preboot.h b/include/preboot.h
+index 473e4d6..11924e1 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -24,6 +24,12 @@
+ #define HL_UART_BAUDRATE	115200
+ #define HL_SPI_FLASH_MAX_FREQ	25000000
+ 
++#define FIT_IMG_SPSRAM_MAX_SIZE		0x2000
++#define FIT_IMG_SPSRAM_END		(HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE)
++#define FIT_IMG_SPSRAM_BASE		(FIT_IMG_SPSRAM_END - \
++					 FIT_IMG_SPSRAM_MAX_SIZE)
++
++
+ #ifndef __ASSEMBLY__
+ 
+ #include <stddef.h>
+diff --git a/include/security.h b/include/security.h
+index a9a8c87..ff1689e 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -13,8 +13,10 @@
+ void preboot_security_init(void);
+ void preboot_security_dynamic_init(void);
+ void preboot_security_dynamic_vers_init(u64 ver_off, u32 size);
+-void preboot_security_dynamic_img_close(void);
+-void preboot_security_dynamic_img_open(void);
++void preboot_security_dynamic_img_sram_close(void);
++void preboot_security_dynamic_img_sram_open(void);
++void preboot_security_dynamic_img_spsram_close(void);
++void preboot_security_dynamic_img_spsram_open(void);
+ void preboot_security_cleanup_before_run(void);
+ void preboot_security_dbi_lock(void);
+ void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index e3dff17..ac65a8b 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -817,7 +817,7 @@
+ int fit_load_images(void)
+ {
+ 	enum fit_sec_failure sec_res = FIT_SEC_NONE;
+-	void *fit = (void *)FIT_IMG_BASE;
++	void *fit = (void *)fit_base_offset;
+ 	int err;
+ 
+ 	memset(&images, 0x0, sizeof(images));
+@@ -870,7 +870,7 @@
+ 
+ int fit_validate_size(int len)
+ {
+-	const void *fit = (void *)FIT_IMG_BASE;
++	const void *fit = (void *)fit_base_offset;
+ 
+ 	if (fdt_check_header(fit)) {
+ 		preboot_puts("Bad FIT header\n");
+@@ -879,3 +879,39 @@
+ 
+ 	return fdt_totalsize(fit) != len;
+ }
++
++int fit_get_load_type(u32 *load_type)
++{
++	const void *fit = (const void *)fit_base_offset;
++	const u32 *cell;
++	u32 type = FIT_LOAD_TYPE_RUN;
++	int ret, len, conf;
++
++	ret = fit_check_format(fit);
++	if (!ret)
++		return 1;
++
++	conf = fit_find_config_node(fit);
++	if (conf >= 0) {
++		cell = fdt_getprop(fit, conf, FIT_LOAD_TYPE_PROP, &len);
++		if (!cell) {
++			preboot_puts("load type does not exist!");
++			*load_type = type;
++			return 0;
++		}
++		if (len != sizeof(*cell)) {
++			preboot_puts("Currupted load type\n");
++			return 1;
++		}
++
++		type = fdt32_to_cpu(*cell);
++		if (type >= FIT_LOAD_TYPE_COUNT) {
++			preboot_puts_hex("Unsupported load type ", type, false);
++			return 1;
++		}
++	}
++
++	*load_type = type;
++
++	return 0;
++}
+diff --git a/preboot/fit.h b/preboot/fit.h
+index edee7b5..ef6f2b9 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -8,8 +8,11 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
++extern uintptr_t fit_base_offset;
++
+ int fit_load_images(void);
+ void fit_run_image(void);
+ int fit_validate_size(int len);
++int fit_get_load_type(u32 *load_type);
+ 
+ #endif /* _HL_FIT_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index aab3c93..c1e627c 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -365,7 +365,7 @@
+ 		 * the offset int the header an index.
+ 		 * Integrity check is not supported for opcode 12 (fw load)
+ 		 */
+-		data = (u8 *)FIT_IMG_BASE +
++		data = (u8 *)fit_base_offset +
+ 			(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
+ 		i2csi_req_wdata_wait_for(data, size);
+ 		break;
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index e7c5615..e41451b 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -24,6 +24,8 @@
+ 
+ static bool is_fit_checked;
+ 
++uintptr_t fit_base_offset;
++
+ void module_fwupd_setup(void)
+ {
+ 	struct hl_upd_status status  = { .val = 0 };
+@@ -45,7 +47,9 @@
+ 		return FOUND_FAST_RETURN;
+ 	case HL_UPD_RST_STATE:
+ 	case HL_UPD_MAP_SRAM:
++	case HL_UPD_MAP_SPSRAM:
+ 	case HL_UPD_RUN_SRAM:
++	case HL_UPD_RUN_SPSRAM:
+ 		return FOUND_SLOW_RETURN;
+ 	default:
+ 		return NOT_FOUND;
+@@ -81,57 +85,105 @@
+ {
+ 	module_fwupd_send_status(HL_UPD_STS_RST_ACK, 0);
+ 
+-	preboot_security_dynamic_img_close();
++	preboot_security_dynamic_img_sram_close();
++	preboot_security_dynamic_img_spsram_close();
+ 
+ 	/* reset state should never fail */
+ 	module_fwupd_wfc(WFC_TIMEOUT_MS);
+ 	module_fwupd_send_status(HL_UPD_STS_RST_OK, 0);
+ }
+ 
+-static void module_fwupd_sram_map(unsigned int size, enum hl_upd_cmd cmd)
++static void module_fwupd_map(unsigned int size, enum hl_upd_cmd cmd)
+ {
+ 	int err;
+ 	enum hl_upd_sts sts;
+ 
++	fit_base_offset = (cmd == HL_UPD_MAP_SRAM) ? FIT_IMG_BASE :
++						FIT_IMG_SPSRAM_BASE;
+ 	module_fwupd_send_status(HL_UPD_STS_MAP_ACK, 0);
+ 
+-	err = !preboot_is_valid_address_range(FIT_IMG_BASE, size);
++	err = !preboot_is_valid_address_range(fit_base_offset, size);
+ 	if (err) {
+ 		sts = HL_UPD_STS_VALID_ERR;
+ 		preboot_puts("Mapped address range is invalid\n");
+ 		goto fwupd_map_err;
+ 	}
+ 
+-	preboot_security_dynamic_img_open();
++	if (cmd == HL_UPD_MAP_SRAM)
++		preboot_security_dynamic_img_sram_open();
++	else
++		preboot_security_dynamic_img_spsram_open();
+ 
+ 	err = module_fwupd_wfc(WFC_TIMEOUT_MS);
+ 	if (err)
+ 		goto fwupd_map_wfc_t;
+ 
+-	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)FIT_IMG_BASE);
++	module_fwupd_send_status(HL_UPD_STS_MAP_OK, (void *)fit_base_offset);
+ 	return;
+ 
+ fwupd_map_wfc_t:
+ 	sts = HL_UPD_STS_TIMEOUT_ERR;
+ 	preboot_puts("Timeout error\n");
+ 
+-	preboot_security_dynamic_img_close();
++	if (cmd == HL_UPD_MAP_SRAM)
++		preboot_security_dynamic_img_sram_close();
++	else
++		preboot_security_dynamic_img_spsram_close();
+ 
+ fwupd_map_err:
+ 	module_fwupd_send_status(sts, 0);
+ }
+ 
+-static void module_fwupd_sram_run(void)
++static int module_fwupd_load_type_nic_en(void *fit)
++{
++	/* TODO handle nic en here */
++	return 0;
++}
++
++static int module_fwupd_load_type_run(void)
++{
++	is_fit_checked = !fit_load_images();
++	if (!is_fit_checked)
++		return 1;
++
++	return 0;
++}
++
++static int module_fwupd_load_type(void)
++{
++	u32 load_type;
++	void *fit = (void *)fit_base_offset;
++	int ret = fit_get_load_type(&load_type);
++
++	if (ret)
++		return 1;
++
++	switch (load_type) {
++	case FIT_LOAD_TYPE_NIC_EN_MASK:
++		return module_fwupd_load_type_nic_en(fit);
++	case FIT_LOAD_TYPE_RUN:
++		return module_fwupd_load_type_run();
++	default:
++		return 1;
++	}
++
++	return 0;
++}
++
++static void module_fwupd_run_cmd(enum hl_upd_cmd cmd)
+ {
+ 	int err;
+ 	enum hl_upd_sts sts;
+ 
+ 	module_fwupd_send_status(HL_UPD_STS_RUN_ACK, 0);
+ 
+-	preboot_security_dynamic_img_close();
++	if (cmd == HL_UPD_RUN_SRAM)
++		preboot_security_dynamic_img_sram_close();
++	else
++		preboot_security_dynamic_img_spsram_close();
+ 
+-	is_fit_checked = !fit_load_images();
+-	if (!is_fit_checked) {
++	err = module_fwupd_load_type();
++	if (err) {
+ 		sts = HL_UPD_STS_VALID_ERR;
+ 		preboot_puts("Failed to load FIT image\n");
+ 		goto fwupd_run_err;
+@@ -151,7 +203,10 @@
+ fwupd_run_err:
+ 	module_fwupd_send_status(sts, 0);
+ 
+-	preboot_security_dynamic_img_open();
++	if (cmd == HL_UPD_RUN_SRAM)
++		preboot_security_dynamic_img_sram_open();
++	else
++		preboot_security_dynamic_img_spsram_open();
+ }
+ 
+ void module_fwupd_run(void)
+@@ -170,11 +225,19 @@
+ 		break;
+ 	case HL_UPD_MAP_SRAM:
+ 		preboot_puts("FW UPD MAP SRAM received\n");
+-		module_fwupd_sram_map(cmd.size, cmd.cmd);
++		module_fwupd_map(cmd.size, cmd.cmd);
++		break;
++	case HL_UPD_MAP_SPSRAM:
++		preboot_puts("FW UPD MAP SPSRAM received\n");
++		module_fwupd_map(cmd.size, cmd.cmd);
+ 		break;
+ 	case HL_UPD_RUN_SRAM:
+ 		preboot_puts("FW UPD RUN SRAM received\n");
+-		module_fwupd_sram_run();
++		module_fwupd_run_cmd(cmd.cmd);
++		break;
++	case HL_UPD_RUN_SPSRAM:
++		preboot_puts("FW UPD RUN SPSRAM received\n");
++		module_fwupd_run_cmd(cmd.cmd);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index b9ca6b1..9ffeeb0 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -14,6 +14,8 @@
+ #include "uart.h"
+ #include "fit.h"
+ 
++extern uintptr_t fit_base_offset;
++
+ struct lkd_status {
+ 	bool is_fit_checked;
+ 	bool is_fit_ready_ignored;
+@@ -32,7 +34,7 @@
+ void module_lkd_setup(void)
+ {
+ 	lkd_dev_specific_setup();
+-	preboot_security_dynamic_img_open();
++	preboot_security_dynamic_img_sram_open();
+ 	module_lkd_enable();
+ }
+ 
+@@ -65,6 +67,8 @@
+ 	case KMD_MSG_FIT_RDY:
+ 		if (sts.is_fit_ready_ignored)
+ 			return NOT_FOUND;
++
++		fit_base_offset = FIT_IMG_BASE;
+ 
+ 		res = FOUND_SLOW_RETURN;
+ 		/* Tell LKD we got the message */
+@@ -133,12 +137,12 @@
+ {
+ 	int err;
+ 
+-	preboot_security_dynamic_img_close();
++	preboot_security_dynamic_img_sram_close();
+ 
+ 	err = fit_load_images();
+ 	if (err) {
+ 		sts.is_fit_ready_ignored = true;
+-		preboot_security_dynamic_img_open();
++		preboot_security_dynamic_img_sram_open();
+ 		return;
+ 	}
+ 
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 6ef4b83..08ee3b4 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -213,8 +213,10 @@
+ __weak void preboot_security_init(void) {}
+ __weak void preboot_security_dynamic_init(void) {}
+ __weak void preboot_security_dynamic_vers_init(u64 ver_off, u32 size) {}
+-__weak void preboot_security_dynamic_img_open(void) {}
+-__weak void preboot_security_dynamic_img_close(void) {}
++__weak void preboot_security_dynamic_img_sram_open(void) {}
++__weak void preboot_security_dynamic_img_sram_close(void) {}
++__weak void preboot_security_dynamic_img_spsram_open(void) {}
++__weak void preboot_security_dynamic_img_spsram_close(void) {}
+ __weak void preboot_security_cleanup_before_run(void) {}
+ __weak void preboot_led_on(void) {}
+ __weak void preboot_sp_sram_init(void) {}
+@@ -233,6 +235,9 @@
+ 	if (addr >= SDRAM_BASE && addr + len <= SDRAM_BASE + SRAM_SIZE)
+ 		return !preboot_is_overlap_address_range(addr, len);
+ 
++	if (addr >= FIT_IMG_SPSRAM_BASE && addr + len <= FIT_IMG_SPSRAM_END)
++		return true;
++
+ 	return false;
+ }
+ 

@@ -1,0 +1,165 @@
+From afb92a662638d104666e862d59b06038d3bc29a0 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Sat, 02 Jul 2022 00:53:07 +0300
+Subject: [PATCH] [SW-93545] gaudi2: erom: reduce tpm prints
+
+reduce un-necessary prints from erom tpm to save on any
+delays before ppboot loads to establish pci link
+
+Change-Id: I8b2edeb2465556e7df6df9ae3882f41821362cbd
+---
+
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+index 3a20a66..7c3a90a 100644
+--- a/app/ext_rom/erom_tpm.c
++++ b/app/ext_rom/erom_tpm.c
+@@ -18,6 +18,7 @@
+ #include <boot_if.h>
+ #include <pll.h>
+ #include <device.h>
++#include <uart.h>
+ #include <gaudi2/gaudi2_security.h>
+ #include <gaudi2/gaudi2_bootrom.h>
+ 
+@@ -49,7 +50,7 @@
+ 	uint32_t flash_image_switch;
+ 
+ 	/* read if we need to switch order of primary/secondary image */
+-	spi_flash_copy(&flash_image_switch, FLASH_IMAGE_SWITCH_OFFSET, 1, "EROM_TPM");
++	spi_flash_copy(&flash_image_switch, FLASH_IMAGE_SWITCH_OFFSET, 1, NULL);
+ 	if (flash_image_switch != 0) {
+ 		if (image_ptr != ARCBOOT_SECONDARY)
+ 			image_ptr = ARCBOOT_SECONDARY;
+@@ -58,9 +59,9 @@
+ 	}
+ 
+ 	if (image_ptr == ARCBOOT_SECONDARY)
+-		spi_flash_copy(&flash_image_offset, FLASH_SECONDARY_OFFSET, 1, "EROM_TPM");
++		spi_flash_copy(&flash_image_offset, FLASH_SECONDARY_OFFSET, 1, NULL);
+ 	else
+-		spi_flash_copy(&flash_image_offset, FLASH_PRIMARY_OFFSET, 1, "EROM_TPM");
++		spi_flash_copy(&flash_image_offset, FLASH_PRIMARY_OFFSET, 1, NULL);
+ 
+ 	return flash_image_offset;
+ }
+@@ -92,7 +93,7 @@
+ 
+ 	flash_ppboot_pcie_offset = (uint32_t)(FLASH_64KB_PADD +
+ 					      flash_image_offset);
+-	spi_flash_copy(&ppboot_pcie_size, flash_ppboot_pcie_offset, 4, "EROM_TPM");
++	spi_flash_copy(&ppboot_pcie_size, flash_ppboot_pcie_offset, 4, NULL);
+ 	if (ppboot_pcie_size > SECUREBOOT_MAX_PPBOOT_IMG_SIZE ||
+ 	    ppboot_pcie_size <= SECUREBOOT_IMG_HEAD_FOOTER) {
+ 		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+@@ -138,8 +139,9 @@
+ 	udelay_init();
+ 	hl_uart_init();
+ 	cpu_boot_if_init();
++	preboot_puts("eTPM\n");
+ 
+-	if (tpm_init())
++	if (tpm_init(false))
+ 		return;
+ 
+ 	if (tpm_startup())
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c04bec4..f552a60 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -349,7 +349,7 @@
+ 	return -1;
+ }
+ 
+-__weak int tpm_init(void)
++__weak int tpm_init(bool print)
+ {
+ 	return -1;
+ }
+@@ -558,7 +558,7 @@
+ 	 * Hash is read and not calculated because of ppboot image size
+ 	 * limitations
+ 	 */
+-	ret = tpm_init();
++	ret = tpm_init(true);
+ 	if (!ret) {
+ 		memcpy(hash, (void *)(SDRAM_BASE + IMG_LEN_SIZE + image_size),
+ 		       SHA256_SUM_LEN);
+diff --git a/arch/gaudi2/common/tpm2.c b/arch/gaudi2/common/tpm2.c
+index 3a1a379..a691aa5 100644
+--- a/arch/gaudi2/common/tpm2.c
++++ b/arch/gaudi2/common/tpm2.c
+@@ -1015,7 +1015,7 @@
+ 	return -EIO;
+ }
+ 
+-int tpm2_init(void)
++int tpm2_init(bool print)
+ {
+ 	int ret;
+ 	u32 vend_dev;
+@@ -1052,7 +1052,8 @@
+ 		return ret;
+ 	}
+ 
+-	preboot_puts("SPI TPMv2.0 found\n");
++	if (print)
++		preboot_puts("SPI TPMv2.0 found\n");
+ 
+ 	return 0;
+ }
+diff --git a/arch/gaudi2/common/tpm_auth.c b/arch/gaudi2/common/tpm_auth.c
+index b258ef4..a7e49fa 100644
+--- a/arch/gaudi2/common/tpm_auth.c
++++ b/arch/gaudi2/common/tpm_auth.c
+@@ -53,14 +53,14 @@
+ 	return 0;
+ }
+ 
+-int tpm_init(void)
++int tpm_init(bool print)
+ {
+ 	int ret;
+ 
+ 	if (tpm_is_enabled() != 0)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = tpm2_init();
++	ret = tpm2_init(print);
+ 	if (ret) {
+ 		preboot_puts("TPM: tpm2_init failed\n");
+ 		cpu_boot_err_set(CPU_BOOT_ERR_TPM_FAIL);
+@@ -127,7 +127,7 @@
+ 	if (cpu_boot_err_get(CPU_BOOT_ERR_TPM_FAIL))
+ 		return;
+ 
+-	tpm_init();
++	tpm_init(true);
+ 
+ 	ret = tpm2_nv_read(TPM_NV_DEV_SN_ADDRESS, &tpm_dev_id, sizeof(tpm_dev_id));
+ 	if (ret) {
+diff --git a/arch/gaudi2/common/tpm_auth.h b/arch/gaudi2/common/tpm_auth.h
+index 3ccd57e..75d58c6 100644
+--- a/arch/gaudi2/common/tpm_auth.h
++++ b/arch/gaudi2/common/tpm_auth.h
+@@ -8,7 +8,7 @@
+ #ifndef _HL_TPM_AUTH_H_
+ #define _HL_TPM_AUTH_H_
+ 
+-int tpm_init(void);
++int tpm_init(bool print);
+ int tpm_startup(void);
+ int tpm_hash_and_pcr_extend(uint32_t image_index, uintptr_t image_ptr, uint32_t image_size);
+ int tpm_pcr_extend(uint32_t image_index, uint8_t *hash);
+diff --git a/include/tpm2.h b/include/tpm2.h
+index 34c773e..5f0b5c8 100644
+--- a/include/tpm2.h
++++ b/include/tpm2.h
+@@ -64,7 +64,7 @@
+ 	TPM2_ALG_SM3_256        = 0x12,
+ };
+ 
+-int tpm2_init(void);
++int tpm2_init(bool print);
+ int tpm2_startup(enum tpm2_startup_types mode);
+ int tpm2_nv_read(u32 index, void *data, u32 count);
+ int tpm2_pcr_extend(u32 index, u32 algorithm, const u8 *digest, u32 digest_len);

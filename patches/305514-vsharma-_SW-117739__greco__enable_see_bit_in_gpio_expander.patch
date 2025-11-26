@@ -1,0 +1,101 @@
+From 47e115d105df009cd181a5950da9bc768ee2c204 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Mon, 27 Feb 2023 08:26:07 +0200
+Subject: [PATCH] [SW-117739] greco: enable see bit in gpio expander's
+
+As per system team, the GPIO expanders in Greco (ds4520e+)
+boot occasionally with wrong values after power cycle.
+It occurs in two expanders randomly (0x50 or 0x51).
+Some potential vulnerability of the GPIO expanders might
+be causing this. if for some reason there is an unwanted
+access/noise to GPIO expander the write will be done to the EEPROM
+section and will be kept forever and can effect boot flow.
+
+So FW should set SEE bit of GPIO expander to 0x1 during boot, in this case
+any wrong access will only be written to shadow section and not be kept.
+Initially this change was added in hlnpu driver init, but as per system
+team request to do it asap, added this in preboot.
+
+Change-Id: I68cf285d2bb6fa261517e21c2032a61edc24fa1d
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 0535c68..cb5e48b 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -453,6 +453,7 @@
+ __weak void preboot_reset_init(void) {}
+ __weak void preboot_cond_arc0_reset(void) {}
+ __weak void preboot_tpm_auth(void) {}
++__weak void preboot_close_strap_eeprom_write(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -479,6 +480,8 @@
+ 
+ 	hl_uart_init();
+ 
++	preboot_close_strap_eeprom_write();
++
+ 	preboot_cond_arc0_reset();
+ 
+ 	spi_flash_init();
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index 07b4fa0..bb29767 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -23,7 +23,7 @@
+ #include <psoc_arc0_cfg_masks.h>
+ #include <psoc_arc1_cfg_regs.h>
+ #include <psoc_arc1_cfg_masks.h>
+-
++#include <psoc_i2c_m1_regs.h>
+ #include <hl_boot_if.h>				/* requires stdint.h */
+ #include <hl_spsram_if.h>
+ #include <greco/greco_reg_map.h>
+@@ -221,3 +221,44 @@
+ {
+ 	return ((u32)addr & 0xFFFFFFF) | BIT(28);
+ }
++
++#define SEE_REG			0xF4
++#define SEE_DATA_CMD_VAL	0x201
++#define GPIO_EX1_DEV_ADDR	0x50
++#define GPIO_EX2_DEV_ADDR	0x51
++static void preboot_set_gpio_ex_see_bit(u32 dev_addr)
++{
++	/* Disable the controller */
++	regmap_writel(0x0, mmPSOC_I2C_M1_IC_ENABLE);
++	/* Disable intr mask */
++	regmap_writel(0x0, mmPSOC_I2C_M1_IC_INTR_MASK);
++	/* Set target address register */
++	regmap_writel(dev_addr, mmPSOC_I2C_M1_IC_TAR);
++	/* Enable the controller */
++	regmap_writel(0x1, mmPSOC_I2C_M1_IC_ENABLE);
++
++	regmap_writel(SEE_REG, mmPSOC_I2C_M1_IC_DATA_CMD);
++
++	udelay(50);
++
++	/* Write 1 to SEE BIT */
++	regmap_writel(SEE_DATA_CMD_VAL, mmPSOC_I2C_M1_IC_DATA_CMD);
++
++	/* Disable the controller */
++	regmap_writel(0x0, mmPSOC_I2C_M1_IC_ENABLE);
++}
++
++void preboot_close_strap_eeprom_write(void)
++{
++	/* Set padsel for I2C M1 */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_PAD_SEL_32);
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_PAD_SEL_33);
++
++	/* Set i2c configuration */
++	regmap_writel(0x4b, mmPSOC_I2C_M1_IC_FS_SCL_HCNT);
++	regmap_writel(0x57, mmPSOC_I2C_M1_IC_FS_SCL_LCNT);
++	regmap_writel(0x28, mmPSOC_I2C_M1_IC_SDA_HOLD);
++
++	preboot_set_gpio_ex_see_bit(GPIO_EX1_DEV_ADDR);
++	preboot_set_gpio_ex_see_bit(GPIO_EX2_DEV_ADDR);
++}

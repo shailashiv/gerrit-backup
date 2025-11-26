@@ -1,0 +1,107 @@
+From f6969aa1b771135eada823efc4054794d38ca0f1 Mon Sep 17 00:00:00 2001
+From: Sagi Maimon <smaimon@habana.ai>
+Date: Thu, 18 Feb 2021 16:24:06 +0200
+Subject: [PATCH] [SW-32460] gaudi: security: pass pub key to u-boot
+
+Passing the u-boot public hash key value to u-boot.
+In fake security mode, u-boot using command will program
+this key to the fake OTP.
+Since this is the u-boot public key, this will reduce the need to create
+special OTP for fake security mode.
+
+Change-Id: I5eca26b33c9dcf5eb555fa788d21a45398338ce8
+Signed-off-by: Sagi Maimon <smaimon@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 6bc88d5..b627c19 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1701,3 +1701,8 @@
+ 	max = HL_CFG_BASE + mmPCIE_CORE_MSI_REQ;
+ 	preboot_secure_lbw_rr(LBW_RR_PCIE_DBI_COREBGN, min, max);
+ }
++
++void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len)
++{
++	boot_info_set(HL_BOOT_INFO_PUB_KEY_HASH, key, len);
++}
+diff --git a/include/security.h b/include/security.h
+index 12a826f..a9a8c87 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -17,5 +17,6 @@
+ void preboot_security_dynamic_img_open(void);
+ void preboot_security_cleanup_before_run(void);
+ void preboot_security_dbi_lock(void);
++void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len);
+ 
+ #endif /* _HL_SECURITY_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index effa203..f37dfe6 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -43,6 +43,7 @@
+ #define FIT_PUB_KEY_PROP	"pub-key"
+ #define FIT_PUB_KEY_EXT_PROP	"pub-key-ext"
+ #define FIT_LOAD_TYPE_PROP	"load-type"
++#define FIT_PUB_KEY_HASH_PROP	"hash"
+ 
+ #define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+ 
+@@ -371,6 +372,43 @@
+ 	return fdt_subnode_offset(fit, images, FIT_PUB_KEY_PROP);
+ }
+ 
++#ifdef FAKE_SECURITY
++__weak void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len) {}
++
++int fit_pub_key_value_node_get(const void *fit)
++{
++	int conf = 0;
++	int hash_len = 0;
++	const u8 *hash_value = NULL;
++
++	conf = fit_pub_key_node_get(fit, conf);
++	if (conf < 0) {
++		preboot_puts("Wrong FIT format missing pubkey\n");
++		return 1;
++	}
++
++	conf =  fdt_subnode_offset(fit, conf, FIT_PUB_KEY_HASH_PROP);
++	if (conf < 0) {
++		preboot_puts("Wrong FIT format missing pubkey hash\n");
++		return 1;
++	}
++
++	hash_value = fdt_getprop(fit, conf, FIT_VALUE_PROP, &hash_len);
++	if (conf < 0) {
++		preboot_puts("Cannot find hash node\n");
++		return 1;
++	}
++
++	/*
++	 * Pass public key value to u-boot.
++	 * u-boot uses this information to create fake OTP
++	 * used in fake security mode.
++	 */
++	preboot_security_sp_sram_write_key_hash((u8 *)hash_value, hash_len);
++	return 0;
++}
++#endif
++
+ static int fit_pub_key_ext_node_get(const void *fit, int conf)
+ {
+ 	int images;
+@@ -622,7 +660,10 @@
+ 
+ 	if (fit_verify_security(fit, conf))
+ 		return FIT_LOAD_SEC_FAILED;
+-
++#ifdef FAKE_SECURITY
++	if (fit_pub_key_value_node_get(fit))
++		return FIT_LOAD_SEC_FAILED;
++#endif
+ 	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
+ 	if (num_images > FIT_MAX_IMAGES) {
+ 		preboot_puts_hex("Images in fit exceeds max limit: ",

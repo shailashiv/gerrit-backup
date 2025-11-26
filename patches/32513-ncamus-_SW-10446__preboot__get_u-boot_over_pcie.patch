@@ -1,0 +1,498 @@
+From 6e181fd0bdade9fff977262962e00d948d222eec Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 21 Apr 2020 01:25:55 +0300
+Subject: [PATCH] [SW-10446] preboot: get u-boot over pcie
+
+This is an alternative to previous method which retrieves uboot from
+SPI. Now we have slim SPI image without U-Boot on it.
+Host pushes U-Boot image to sram in FIT format.
+Implement the receiving side.
+The implementation is done in generic way.
+Each module serving requests from host or any other external entity, is
+registered in the common handler and is required to implement the set of
+methods defined in struct cmd_module_ops.
+Then the main loop walks through the modules and gives them an
+opportunity to handle requests they claim to be responsible of.
+As a part of the transition, the LKD and FW UPD handling modules are
+implemented and also serve as an example for adding more modules as
+needed.
+
+Change-Id: I6623612000afd55de7535b169fefd75dda9a45e0
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/preboot.c b/app/preboot.c
+index 4a5f2f9..8d2b331 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -9,117 +9,87 @@
+ #include <stddef.h>
+ 
+ #include <psoc_global_conf_regs.h>
+-#include <cpu_ca53_cfg_regs.h>
++
+ #include <preboot.h>
+ #include <hl_fw_if.h>
+ #include <hl_boot_if.h>
+-#include <boot_desc.h>
+ 
+ #include "common.h"
+ #include "uart.h"
+-#include "spi.h"
+ #include "pll.h"
+ #include "boot_if.h"
++#include "cmd_module.h"
+ 
+ #define VERSION_MAX_LEN		128
+ 
+ #define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+ 	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
+ 
+-/* Stable ID can be 0 or 1, if not defined return primary offset (0) */
+-static u32 stable_image_base_offset(void)
++static struct cmd_module_ops cmd_ops[] = {
++	{	/* FW UPD module */
++		.setup = module_fwupd_setup,
++		.check = module_fwupd_check,
++		.disable = noop,
++		.run = noop,
++		.enable = noop,
++		.run_fast = module_fwupd_run,
++		.teardown = noop,
++		.run_noreturn = noop,
++	},
++	{	/* LKD module */
++		.setup = module_lkd_setup,
++		.check = module_lkd_check,
++		.disable = module_lkd_disable,
++		.run = module_lkd_run,
++		.enable = module_lkd_setup,
++		.run_fast = noop,
++		.teardown = module_lkd_disable,
++		.run_noreturn = module_lkd_run_noret,
++	},
++};
++
++static void preboot_handle_cmds(void)
+ {
+-	u32 stable_image_id;
++	int i = 0, j = 0, size = ARRAY_SIZE(cmd_ops);
++	enum cmd_check_res res = NOT_FOUND;
+ 
+-	spi_copy(&stable_image_id, HL_SPI_NEXT_IMAGE_OFF,
+-		 sizeof(stable_image_id), "NEXT");
+-	stable_image_id = (stable_image_id & 0xFF) - '1';
++	for (j = 0; j < size; j++)
++		cmd_ops[j].setup();
+ 
+-	if (stable_image_id == 1)
+-		return HL_SPI_SECONDARY_BASE;
++	i = 0;
++	while (1) {
++		res = cmd_ops[i].check();
++		switch (res) {
++		case NOT_FOUND:
++			break;
++		case FOUND_FAST_RETURN:
++			cmd_ops[i].run_fast();
++			break;
++		case FOUND_SLOW_RETURN:
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].disable();
+ 
+-	return HL_SPI_PRIMARY_BASE;
+-}
++			cmd_ops[i].run();
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].enable();
+ 
+-static void preboot_set_upd_pending_reg(u32 modifiable_id)
+-{
+-	u32 magic;
++			break;
++		case FOUND_NO_RETURN:
++			for (j = 0; j < size; j++)
++				if (i != j)
++					cmd_ops[j].teardown();
+ 
+-	switch (modifiable_id) {
+-	case 0:
+-		magic = FLOPS_UPD_NXT_IMG1;
+-		break;
+-	case 1:
+-		magic = FLOPS_UPD_NXT_IMG2;
+-		break;
+-	default:
+-		magic = FLOPS_UPD_NOOP;
+-	}
+-
+-	regmap_writel(magic, mmUPD_PENDING_STS);
+-}
+-
+-static u32 modifiable_image_base_offset(bool *pending)
+-{
+-	u32 modifiable_id;
+-
+-	spi_copy(&modifiable_id, HL_SPI_MODIFI_IMAGE_OFF,
+-		 sizeof(modifiable_id), "MODIFIABLE");
+-	modifiable_id = (modifiable_id & 0xFF) - '1';
+-
+-	preboot_set_upd_pending_reg(modifiable_id);
+-	*pending = modifiable_id < 2;
+-
+-	return modifiable_id == 1 ? HL_SPI_SECONDARY_BASE : HL_SPI_PRIMARY_BASE;
+-}
+-
+-static u32 next_image_offset_legacy(u32 image_pending, bool *pending)
+-{
+-	u32 base_off;
+-
+-	/* Check for normal boot */
+-	if (image_pending != FLOPS_UPD_PENDING)
+-		base_off = stable_image_base_offset();
+-	else /* There is an update pending */
+-		base_off = modifiable_image_base_offset(pending);
+-
+-	return base_off + HL_SPI_LEGACY_UBOOT_OFF;
+-}
+-
+-static u32 next_image_offset(bool *pending)
+-{
+-	u32 image_pending = regmap_readl(mmUPD_PENDING_STS);
+-	u32 offset, idx;
+-
+-	if (boot_desc_init()) {
+-		offset = boot_desc_get_offset(image_pending,
+-					      HL_FW_IMG_UBOOT, &idx);
+-		if (offset != HL_FW_IMG_NOT_FOUND) {
+-			*pending = image_pending;
+-			if (image_pending)
+-				preboot_set_upd_pending_reg(idx);
+-
+-			return offset;
++			cmd_ops[i].run_noreturn();
++			break;
++		default:
++			break;
+ 		}
++
++		if (++i == size)
++			i = 0;
+ 	}
+-
+-	preboot_puts("No boot descriptors detected, falling back to legacy\n");
+-	return next_image_offset_legacy(image_pending, pending);
+-}
+-
+-static void preboot_copy_uboot(void)
+-{
+-	char *name = "U-Boot";
+-	bool upgrade_pending = false;
+-	u32 uboot_offset = next_image_offset(&upgrade_pending);
+-	char *uboot_image = upgrade_pending ? "candidate" : "stable";
+-
+-	preboot_puts_raw("Preparing to run U-Boot ");
+-	preboot_puts_raw(uboot_image);
+-	preboot_puts_hex_raw(" (offset: ", uboot_offset, false);
+-	preboot_puts(")\n");
+-
+-	spi_copy((void *)UBOOT_TEXT_BASE, uboot_offset, UBOOT_SIZE, name);
+ }
+ 
+ #ifndef TARGET_IS_TESTER
+@@ -163,13 +133,6 @@
+ __attribute__((weak)) void preboot_version(void) {}
+ #endif	/* TARGET_IS_TESTER */
+ 
+-__attribute__((weak)) void uboot_start(void)
+-{
+-	void (*uboot_entry)(void) = (void *)UBOOT_TEXT_BASE;
+-
+-	uboot_entry();
+-}
+-
+ void preboot_main(void)
+ {
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+@@ -184,7 +147,5 @@
+ 
+ 	hl_uart_init();
+ 	preboot_version();
+-	preboot_copy_uboot();
+-
+-	uboot_start();
++	preboot_handle_cmds();
+ }
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+new file mode 100644
+index 0000000..8250e63
+--- /dev/null
++++ b/common/cmd_module.h
+@@ -0,0 +1,77 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef _HL_CMD_MODULE_H_
++#define _HL_CMD_MODULE_H_
++
++/*
++ * enum cmd_check_res	- used to specify various results that check() routine
++ *			  can return following its check.
++ *
++ * NOT_FOUND		- check() routine has not discovered any request which
++ *			  is related to its module.
++ * FOUND_FAST_RETURN	- check() routine has discovered a request that is very
++ *			  fast to handle.
++ * FOUND_SLOW_RETURN	- check() routine has discovered a request that will
++ *			  take relatively large amount time to handle and after
++ *			  it has been handled, the execution will return back
++ * FOUND_NO_RETURN	- check() routine has discovered a request and its
++ *			  handling will never return back.
++ */
++enum cmd_check_res {
++	NOT_FOUND,
++	FOUND_FAST_RETURN,
++	FOUND_SLOW_RETURN,
++	FOUND_NO_RETURN,
++};
++
++/*
++ * struct cmd_module_ops	- operations defined for all registered modules
++ *
++ * setup()		- setup the module and prepare checking for
++ *			  commands/requests and handling them
++ * check()		- check if there is a command/request pending and return
++ *			  the appropriate result
++ * disable()		- temporarily disable the module to enable another
++ *			  module execution of run() routine
++ * run()		- run the handling of the command/request discovered by
++ *			  the check() routine - can be slow since other modules
++ *			  have been disabled by disable() routine
++ * run_fast()		- run the handling of the command/request discovered by
++ *			  the check() routine - must take low amount of time
++ *			  since other modules have not been disabled
++ * teardown()		- the opposite from setup(), the module will no longer
++ *			  be checked or handled - stop the module
++ * run_noreturn()	- all modules have been teared down, so run the handling
++ *			  w/o returning
++ */
++struct cmd_module_ops {
++	void (*setup)(void);
++	enum cmd_check_res (*check)(void);
++	void (*disable)(void);
++	void (*run)(void);
++	void (*enable)(void);
++	void (*run_fast)(void);
++	void (*teardown)(void);
++	void (*run_noreturn)(void);
++};
++
++/* a dummy to fill in irrelevant entries */
++static inline void noop(void) {}
++
++/* FWUPD */
++void module_fwupd_setup(void);
++enum cmd_check_res module_fwupd_check(void);
++void module_fwupd_run(void);
++
++/* LKD */
++void module_lkd_setup(void);
++enum cmd_check_res module_lkd_check(void);
++void module_lkd_disable(void);
++void module_lkd_run(void);
++void module_lkd_run_noret(void);
++
++#endif /* _HL_CMD_MODULE_H_ */
+diff --git a/common/module_fwupd.c b/common/module_fwupd.c
+new file mode 100644
+index 0000000..9506d8f
+--- /dev/null
++++ b/common/module_fwupd.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <hl_fw_if.h>
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++
++void module_fwupd_setup(void)
++{
++	struct hl_upd_status status  = { .val = 0 };
++
++	status.status = HL_UPD_STS_RST_OK;
++	regmap_writel(status.val, mmUPD_STS);
++}
++
++enum cmd_check_res module_fwupd_check(void)
++{
++	if (regmap_readl(mmUPD_CMD) != HL_UPD_NOOP)
++		return FOUND_FAST_RETURN;
++
++	return NOT_FOUND;
++}
++
++void module_fwupd_run(void)
++{
++	struct hl_upd_command cmd;
++
++	cmd.val = regmap_readl(mmUPD_CMD);
++	switch (cmd.cmd) {
++	case HL_UPD_CLR_STS:
++		regmap_writel(HL_UPD_STS_NOOP, mmUPD_STS);
++		preboot_puts("FW UPD CLR STS received\n");
++		break;
++	default:
++		break;
++	}
++}
+diff --git a/common/module_lkd.c b/common/module_lkd.c
+new file mode 100644
+index 0000000..898bfb3
+--- /dev/null
++++ b/common/module_lkd.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <hl_boot_if.h>
++#include <preboot.h>
++
++#include "cmd_module.h"
++#include "uart.h"
++#include "boot_if.h"
++#include "fit.h"
++
++struct lkd_status {
++	int fit_not_checked;	/* negative logic */
++	u32 msg_reg_val;
++};
++
++static struct lkd_status sts = {
++	.fit_not_checked = 1,
++};
++
++void module_lkd_setup(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
++}
++
++enum cmd_check_res module_lkd_check(void)
++{
++	enum cmd_check_res res;
++
++	/* we already have the FIT and it is good */
++	if (sts.fit_not_checked != 1)
++		return FOUND_NO_RETURN;
++
++	sts.msg_reg_val = cpu_boot_cmd_get();
++	switch (sts.msg_reg_val) {
++	case KMD_MSG_GOTO_WFE:
++		res = FOUND_NO_RETURN;
++		/* WFE - we should clear the message/cmd register */
++		cpu_boot_cmd_clr_before_wfe();
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD WFE received\n");
++		break;
++	case KMD_MSG_FIT_RDY:
++		res = FOUND_SLOW_RETURN;
++		/* Tell LKD we got the message */
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD FIT RDY received\n");
++		break;
++	case KMD_MSG_SKIP_BMC:
++		cpu_boot_rsp_set(CPU_MSG_ERR);
++		preboot_puts("LKD SKIP BMC received\n");
++		/* no break */
++	default:
++		res = NOT_FOUND;
++	}
++
++	return res;
++}
++
++void module_lkd_disable(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
++}
++
++void module_lkd_run(void)
++{
++	int err;
++	void *fit = (void *)UBOOT_FIT_BASE;
++	void *dst = (void *)UBOOT_TEXT_BASE;
++
++	err = !fit_check_format(fit);
++	if (!err)
++		err = fit_load_uboot(fit, dst);
++
++	if (err) {/* Report the FIT is bad */
++		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
++		preboot_puts("FIT loading failed, Retrying...\n");
++		return;
++	}
++
++	sts.fit_not_checked = 0;
++	/* Report the FIT is good */
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, false);
++}
++
++__attribute__((weak)) void uboot_start(void)
++{
++	void (*uboot_entry)(void) = (void *)UBOOT_TEXT_BASE;
++
++	uboot_entry();
++}
++
++void module_lkd_run_noret(void)
++{
++	switch (sts.msg_reg_val) {
++	case KMD_MSG_GOTO_WFE:
++		cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
++		wfe();
++		break;
++	case KMD_MSG_FIT_RDY:
++		uboot_start();
++		/* no break */
++	default:
++		break;
++	}
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 97a4ad9..3025fd7 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -16,6 +16,9 @@
+ #define HL_CFG_BASE				0xFC000000
+ #define SDRAM_BASE				0x10000000
+ #define UBOOT_TEXT_BASE				0x10100000
++#define UBOOT_FIT_BASE				0x10200000
++
++#define wfe()	__asm__ __volatile__("sleep 0x11\n\t" : : )
+ #endif
+ 
+ #ifdef __aarch64__
+@@ -23,6 +26,9 @@
+ #define HL_CFG_BASE				0x7FFC000000ull
+ #define SDRAM_BASE				0x7FF0000000ull
+ #define UBOOT_TEXT_BASE				0x7FF0100000ull
++#define UBOOT_FIT_BASE				0x7FF0200000ull
++
++#define wfe()	__asm__ __volatile__ ("wfe\n\t" : : )
+ #endif
+ 
+ #define PPBOOT_SIZE		0x4000		/* 16KB */

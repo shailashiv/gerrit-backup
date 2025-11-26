@@ -1,0 +1,79 @@
+From a53de14cdcb48cc49dc08e92cd53ab20cb26392e Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 15 Jan 2023 18:49:37 +0200
+Subject: [PATCH] [SW-118475] pll: add pll_reconfig_div()
+
+Add a function for safely reconfiguring a single divider in a PLL
+
+Change-Id: Id2ee0b13d2bd5ee7fca7a4886692a6d281202095
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/lib/common/pll.c b/lib/common/pll.c
+index a14f60c..f436375 100644
+--- a/lib/common/pll.c
++++ b/lib/common/pll.c
+@@ -260,22 +260,25 @@
+ 	udelay(1);
+ }
+ 
++static void hl_pll_div_set(struct hl_pll_cfg *cfg, int div_sel)
++{
++	u32 div_base = cfg->base + (div_sel * sizeof(u32));
++
++	if (cfg->div_sel[div_sel] == HL_PLL_REF_CLK ||
++	    cfg->div_factor[div_sel] < 0)
++		return;
++
++	regmap_writel(cfg->div_factor[div_sel], div_base + HL_PLL_DIV_FACTOR);
++	regmap_writel(1, div_base + HL_PLL_DIV_FACTOR_CMD);
++	regmap_writel(1, div_base + HL_PLL_DIV_EN);
++}
++
+ static void hl_pll_div_init(struct hl_pll_cfg *cfg)
+ {
+ 	int sel;
+-	u32 div_base;
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+-		if (cfg->div_sel[sel] == HL_PLL_REF_CLK ||
+-		    cfg->div_factor[sel] < 0)
+-			continue;
+-
+-		div_base = cfg->base + (sel * sizeof(u32));
+-
+-		regmap_writel(cfg->div_factor[sel],
+-				div_base + HL_PLL_DIV_FACTOR);
+-		regmap_writel(1, div_base + HL_PLL_DIV_FACTOR_CMD);
+-		regmap_writel(1, div_base + HL_PLL_DIV_EN);
++		hl_pll_div_set(cfg, sel);
+ 	}
+ 
+ 	/* just to be on a safe side, wait for DIV init to propagate */
+@@ -352,3 +355,14 @@
+ 	for (i = 0; i < size; i++)
+ 		hl_pll_set(hl_pll_cfg + i);
+ }
++
++void hl_pll_reconfig_div(struct hl_pll_cfg *cfg, int div_num)
++{
++	hl_pll_clk_switch_to_ref(cfg->base, div_num);
++	hl_pll_div_set(cfg, div_num);
++
++	/* just to be on a safe side, wait for DIV setting to propagate */
++	udelay(1);
++
++	hl_pll_clk_switch_to_pll(cfg->base, div_num, cfg->div_sel[div_num]);
++}
+diff --git a/lib/common/pll.h b/lib/common/pll.h
+index 101c384..95d6407 100644
+--- a/lib/common/pll.h
++++ b/lib/common/pll.h
+@@ -58,6 +58,7 @@
+ void hl_pll_clk_switch_to_pll(u32 pll_base, int div_num, int div_sel);
+ void hl_pll_clk_switch_to_ref(u32 pll_base, int div_num);
+ void hl_pll_switch_to_ref(struct hl_pll_cfg *cfg);
++void hl_pll_reconfig_div(struct hl_pll_cfg *cfg, int div_num);
+ void udelay_init(void);
+ u64 hl_pll_timestamp_freq_get(void);
+ u32 hl_pll_timestamp_base_get(void);

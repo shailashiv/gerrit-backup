@@ -1,0 +1,1116 @@
+From d9585f6e63b9ab29cd79fa5713c5543a4734c7f0 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Thu, 02 Mar 2023 09:02:24 +0200
+Subject: [PATCH] [SW-116644] gaudi3: use new specs_h9 for register access
+
+In order to reduce the specs header file sizes CAD team
+came with new repo specs_h9. This patch adds support to
+use register addresses from specs_h9 repo which uses block
+base instead of config bar base. This aligns firmware
+implementation with LKD.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I2eadeb12932d352282173665366cec9497239f45
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 8903e08..4b9f239 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -3,12 +3,14 @@
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
+ 
+-#include <d0_psoc_global_conf_regs.h>
+-#include <d0_g4_pci_pll_ctrl_regs.h>
+-#include <d0_pcie_aux_regs.h>
+-#include <d0_pcie_aux_masks.h>
+-#include <d0_pcie_dbi_sig_regs.h>
+-#include <d0_pcie_phy_regs.h>
++#include <gaudi3_blocks_linux_driver.h>
++#include <global_conf_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_aux_masks.h>
++#include <pcie_dbi_regs.h>
++#include <pcie_phy_regs.h>
++#include <pll_ctrl_regs.h>
++#include <gaudi3_reg_map.h>
+ #include <common/pci_ids.h>
+ 
+ #include <bitops.h>
+@@ -27,16 +29,17 @@
+ u64 hl_pll_timestamp_freq_get(void)
+ {
+ 	/* As per Gaudi3 Frequencies.xlsx, PCI PLL Div[3] drives CPU ts */
+-	return hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_CFG, HL_PLL_DIV3);
++	return hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_BASE + mmPLL_CTRL_CFG, HL_PLL_DIV3);
+ }
+ 
+ void hl_uart_init(void)
+ {
+ 	/* As per Gaudi3 Frequencies.xlsx, PCI PLL Div[3] drives uart */
+-	u32 uart_clk_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_CFG, HL_PLL_DIV3);
++	u32 uart_clk_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_BASE
++						+ mmPLL_CTRL_CFG, HL_PLL_DIV3);
+ 
+-	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_48);	/* UART0 RXD */
+-	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_49);	/* UART0 TXD */
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_48));	/* UART0 RXD */
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_49));	/* UART0 TXD */
+ 	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
+ }
+ 
+@@ -44,7 +47,7 @@
+ {
+ 	u32 factor, pcie_div3_freq;
+ 
+-	pcie_div3_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_CFG, HL_PLL_DIV3);
++	pcie_div3_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_BASE, HL_PLL_DIV3);
+ 	factor = pcie_div3_freq / HL_SPI_FLASH_MAX_FREQ;
+ 
+ 	/* baud rate doesn't support odd number and must not be 0 */
+@@ -58,10 +61,10 @@
+ void preboot_update_bar_sizes(void)
+ {
+ 	/* Set HBM BAR size to 128GB */
+-	regmap_writel(HBM_BAR_PF_NUM << D0_PCIE_AUX_DBI_PF_NUM_S, mmD0_PCIE_AUX_DBI);
+-	regmap_writel(0xFFFFFFFF, mmD0_PCIE_DBI_SIG_BAR4_REG);
+-	regmap_writel(0x0000001F, mmD0_PCIE_DBI_SIG_BAR5_REG);
+-	regmap_writel(0x00000000, mmD0_PCIE_AUX_DBI);
++	regmap_writel(HBM_BAR_PF_NUM << PCIE_AUX_DBI_PF_NUM_S, D0_PCIE_AUX_REG(mmPCIE_AUX_DBI));
++	regmap_writel(0xFFFFFFFF, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR4_REG));
++	regmap_writel(0x0000001F, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR5_REG));
++	regmap_writel(0x00000000, D0_PCIE_AUX_REG(mmPCIE_AUX_DBI));
+ }
+ 
+ u32 preboot_device_id_get(void)
+@@ -85,10 +88,10 @@
+ 
+ 	hl_pif_report_sts(PIF_STAT_POLL_PCIE_PHY_LOAD);
+ 
+-	while (!(regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0) &&
+-	       regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1) &&
+-	       regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2) &&
+-	       regmap_readl(mmD0_PCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3))) {
++	while (!(regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_0)) &&
++	       regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_1)) &&
++	       regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_2)) &&
++	       regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_EXT_LD_DONE_3)))) {
+ 
+ 		if (pif_ts_timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
+ 			hl_pif_report_err(PIF_ERR_PHY_FW_LOAD_TIMEOUT);
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index a9d62b6..40a79c5 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -3,49 +3,39 @@
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
+ 
+-#include <d0_psoc_global_conf_regs.h>
+-#include <d0_psoc_boot_conf_regs.h>
+-#include <d0_psoc_boot_conf_masks.h>
+-#include <d0_cpu_timestamp_regs.h>
+-#include <d0_cpu_ca53_cfg_regs.h>
+-#include <d0_psoc_gpio0_regs.h>
+-#include <d0_psoc_qspi_regs.h>
+-#include <d0_pcie_aux_regs.h>
+-#include <d0_pcie_aux_masks.h>
+-#include <d0_pcie_core_regs.h>
+-#include <d0_pcie_dbi_sig_regs.h>
+-#include <d0_psoc_reset_conf_regs.h>
+-#include <d0_psoc_efuse_regs.h>
+-#include <d0_psoc_uart_0_regs.h>
+-#include <d0_psoc_timestamp_regs.h>
+-#include <d0_parc_arc0_cfg_regs.h>
+-#include <d0_parc_arc1_cfg_regs.h>
+-#include <d0_parc_arc2_cfg_regs.h>
+-#include <d0_psoc_i2c_s_regs.h>
+-#include <d0_parc_int_aggr_i2c_slv_comb_regs.h>
+-#include <d0_parc_local_cfg_regs.h>
+-#include <d0_pif_arc_regs.h>
+-#include <d0_parc_global_conf_regs.h>
+-#include <d0_parc_global_conf_masks.h>
+-#include <d0_parc_global_conf_spy_dma_hbw_attr_ctrl_regs.h>
+-#include <d0_parc_global_conf_spy_dma_hbw_attr_ctrl_masks.h>
+-#include <d0_pif_arc_special_regs.h>
+-#include <d0_g4_pci_pll_ctrl_regs.h>
+-#include <d0_pif_arc_masks.h>
+-#include <d0_parc_global_conf_regs.h>
+-#include <d0_parc_global_conf_masks.h>
+-#include <d0_psoc_global_conf_masks.h>
+-#include <d0_pcie_phy_regs.h>
+-#include <d0_pcie_wrap_regs.h>
+-#include <d0_pcie_wrap_masks.h>
+-#include <d1_pcie_aux_regs.h>
+-#include <d1_pcie_core_regs.h>
+-#include <d1_pcie_dbi_sig_regs.h>
+-#include <d1_pif_arc_regs.h>
+-#include <d1_pif_arc_special_regs.h>
+-#include <d1_psoc_boot_conf_regs.h>
+-#include <d1_psoc_timestamp_regs.h>
+ #include <gaudi3_blocks_linux_driver.h>
++#include <global_conf_regs.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
++#include <gpio_regs.h>
++#include <qspi_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_aux_masks.h>
++#include <pcie_core_regs.h>
++#include <pcie_dbi_regs.h>
++#include <psoc_reset_conf_regs.h>
++#include <efuse_regs.h>
++#include <uart_regs.h>
++#include <timestamp_regs.h>
++#include <i2c_regs.h>
++#include <int_agg_psoc_i2c_slv_comb_regs.h>
++#include <parc_local_cfg_regs.h>
++#include <pif_arc_regs.h>
++#include <parc_global_conf_regs.h>
++#include <parc_global_conf_masks.h>
++#include <parc_global_conf_spy_dma_hbw_attr_ctrl_regs.h>
++#include <parc_global_conf_spy_dma_hbw_attr_ctrl_masks.h>
++#include <pif_arc_special_regs.h>
++#include <ca53_cfg_regs.h>
++#include <pif_arc_masks.h>
++#include <global_conf_masks.h>
++#include <pcie_phy_regs.h>
++#include <pcie_wrap_regs.h>
++#include <pcie_wrap_masks.h>
++#include <arc_regs.h>
++#include <pll_ctrl_regs.h>
++#include <gaudi3_blocks_linux_driver.h>
++#include <gaudi3_reg_map.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+ #include <gaudi3/gaudi3_reg_map.h>
+@@ -144,9 +134,9 @@
+ u32 gaudi3_die_timestamp_base_get(u32 die_id)
+ {
+ 	if (die_id == GAUDI3_SLAVE_DIE_ID)
+-		return mmD1_PSOC_TIMESTAMP_CNTCR;
++		return mmD1_PSOC_TIMESTAMP_BASE;
+ 
+-	return mmD0_PSOC_TIMESTAMP_CNTCR;
++	return mmD0_PSOC_TIMESTAMP_BASE;
+ }
+ 
+ u32 hl_pll_timestamp_base_get(void)
+@@ -158,20 +148,20 @@
+ 
+ unsigned int get_cs_pad_sel_flash(void)
+ {
+-	return mmD0_PSOC_GLOBAL_CONF_PAD_SEL_8;
++	return D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_8);
+ }
+ 
+ void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
+ 		     unsigned int *out_en_offset)
+ {
+ 	*mask = BIT(8);
+-	*data_offset = mmD0_PSOC_GPIO0_DATAOUT;
+-	*out_en_offset = mmD0_PSOC_GPIO0_OUTENSET;
++	*data_offset = D0_PSOC_GPIO0_REG(mmGPIO_DATAOUT);
++	*out_en_offset = D0_PSOC_GPIO0_REG(mmGPIO_OUTENSET);
+ }
+ 
+ void spi_flash_base_get(unsigned int *regs)
+ {
+-	*regs = mmD0_PSOC_QSPI_CTRLR0;
++	*regs = mmD0_PSOC_QSPI_BASE;
+ }
+ 
+ void preboot_putc_virt_uart(const char c)
+@@ -187,10 +177,11 @@
+ 	u32 val = 0x0;
+ 
+ 	if (set)
+-		val = (D0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS_WR_M |
+-			D0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS_RD_M);
++		val = (PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS_WR_M |
++			PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS_RD_M);
+ 
+-	regmap_writel(val, mmD0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS);
++	regmap_writel(val, mmD0_PARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_BASE +
++					mmPARC_GLOBAL_CONF_SPY_DMA_HBW_ATTR_CTRL_HB_MMU_BYPASS);
+ }
+ 
+ static bool preboot_is_dma_dest_psoc_mem(uint64_t addr)
+@@ -242,23 +233,23 @@
+ 	if (rst_src.initialized)
+ 		return rst_src.src;
+ 
+-	fifo_sts = regmap_readl(mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_STS);
+-	if (fifo_sts & D0_PSOC_BOOT_CONF_BTM_RST_FIFO_STS_EMPTY_M) {
++	fifo_sts = regmap_readl(D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_BTM_RST_FIFO_STS));
++	if (fifo_sts & PSOC_BOOT_CONF_BTM_RST_FIFO_STS_EMPTY_M) {
+ 		rst_src.src = HL_UNKNOWN_RST;
+ 		goto out;
+ 	}
+ 
+-	fill_level = fifo_sts >> D0_PSOC_BOOT_CONF_BTM_RST_FIFO_STS_FILL_LEVEL_S;
++	fill_level = fifo_sts >> PSOC_BOOT_CONF_BTM_RST_FIFO_STS_FILL_LEVEL_S;
+ 	for (; fill_level > 1; fill_level--)
+-		regmap_writel(D0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL_POP_M,
+-				mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL);
++		regmap_writel(PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL_POP_M,
++					D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_BTM_RST_FIFO_CTRL));
+ 
+-	rst_src.src = regmap_readl(mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_HEAD) &
++	rst_src.src = regmap_readl(D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_BTM_RST_FIFO_HEAD)) &
+ 					BTM_FSM_FIFO_HEAD_RST_SRC_MASK;
+ 
+ 	/* pop the last entry from FIFO */
+-	regmap_writel(D0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL_POP_M,
+-			mmD0_PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL);
++	regmap_writel(PSOC_BOOT_CONF_BTM_RST_FIFO_CTRL_POP_M,
++		D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_BTM_RST_FIFO_CTRL));
+ 
+ 	rst_src.initialized = true;
+ out:
+@@ -268,32 +259,33 @@
+ void init_prstn(void)
+ {
+ 	/* Configure PRSTN to reset entire SoC */
+-	regmap_writel(0x1, mmD0_PSOC_RESET_CONF_PSOC_PRSTN_RST_CFG);
+-	regmap_writel(0x7, mmD0_PSOC_RESET_CONF_ARC_PRSTN_RST_CFG);
++	regmap_writel(0x1, D0_PSOC_RESET_CONF_REG(mmPSOC_RESET_CONF_PSOC_PRSTN_RST_CFG));
++	regmap_writel(0x7, D0_PSOC_RESET_CONF_REG(mmPSOC_RESET_CONF_ARC_PRSTN_RST_CFG));
+ 
+ 	/* Clear masking of PRSTN from SW reset */
+-	regmap_writel(0x0, mmD0_PSOC_GLOBAL_CONF_PRSTN_MASK);
++	regmap_writel(0x0, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN_MASK));
+ 
+ 	/*
+ 	 * Hold PCIe controller at reset during PRSTn
+ 	 * Configure Boot Sequencer to wait for PRSTn
+ 	 * instead of PCLK stable
+ 	 */
+-	regmap_writel(0x1, mmD0_PSOC_GLOBAL_CONF_PHY_STABLE);
++	regmap_writel(0x1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PHY_STABLE));
+ }
+ 
+ #define EARLY_WRITE_RESP_MASK	\
+-	(1 << D0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_AWCACHE_OVRD_EN_S | \
+-	 1 << D0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_ARCACHE_OVRD_EN_S | \
+-	 D0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_FORCE_WR_BUF_M)
++	(1 << PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_AWCACHE_OVRD_EN_S | \
++	 1 << PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_ARCACHE_OVRD_EN_S | \
++	 PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_FORCE_WR_BUF_M)
+ 
+ static void hl_lbw_early_write_resp_enable(void)
+ {
+ 	u32 axi_split_val, val;
+ 
+-	axi_split_val = regmap_readl(mmD0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1);
++	axi_split_val = regmap_readl(
++			D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1));
+ 	val = axi_split_val | EARLY_WRITE_RESP_MASK;
+-	regmap_writel(val, mmD0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1);
++	regmap_writel(val, D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_1));
+ }
+ 
+ __weak void hl_dev_cpu_pll_init(void) {}
+@@ -310,9 +302,9 @@
+ 
+ static void hl_init_cpu_ids(void)
+ {
+-	regmap_writel(PSOC_ARC0_PRELOADED_ID, mmD0_PARC_ARC0_CFG_ARC_NUM);
+-	regmap_writel(PSOC_ARC1_PRELOADED_ID, mmD0_PARC_ARC1_CFG_ARC_NUM);
+-	regmap_writel(PSOC_ARC2_PRELOADED_ID, mmD0_PARC_ARC2_CFG_ARC_NUM);
++	regmap_writel(PSOC_ARC0_PRELOADED_ID, mmD0_PARC_ARC0_CFG_BASE + mmARC_ARC_NUM);
++	regmap_writel(PSOC_ARC1_PRELOADED_ID, mmD0_PARC_ARC1_CFG_BASE + mmARC_ARC_NUM);
++	regmap_writel(PSOC_ARC2_PRELOADED_ID, mmD0_PARC_ARC2_CFG_BASE + mmARC_ARC_NUM);
+ }
+ 
+ #define HBW_DRAIN_TIMEOUT	0x1000
+@@ -326,19 +318,19 @@
+ 	if (hl_skip_fw_cfg())
+ 		return;
+ 
+-	regmap_writel(HBW_DRAIN_TIMEOUT, mmD0_PCIE_WRAP_HBW_DRAIN_TIMEOUT);
+-	regmap_writel(D0_PCIE_WRAP_HBW_RSP_ERR_DRAIN_STAMP_EN_M,
+-		      mmD0_PCIE_WRAP_HBW_RSP_ERR_DRAIN_STAMP);
+-	val = regmap_readl(mmD0_PCIE_WRAP_HBW_DRAIN_CFG);
+-	val |= D0_PCIE_WRAP_HBW_DRAIN_CFG_EN_M;
+-	regmap_writel(val, mmD0_PCIE_WRAP_HBW_DRAIN_CFG);
++	regmap_writel(HBW_DRAIN_TIMEOUT, D0_PCIE_WRAP_REG(mmPCIE_WRAP_HBW_DRAIN_TIMEOUT));
++	regmap_writel(PCIE_WRAP_HBW_RSP_ERR_DRAIN_STAMP_EN_M,
++		      D0_PCIE_WRAP_REG(mmPCIE_WRAP_HBW_RSP_ERR_DRAIN_STAMP));
++	val = regmap_readl(D0_PCIE_WRAP_REG(mmPCIE_WRAP_HBW_DRAIN_CFG));
++	val |= PCIE_WRAP_HBW_DRAIN_CFG_EN_M;
++	regmap_writel(val, D0_PCIE_WRAP_REG(mmPCIE_WRAP_HBW_DRAIN_CFG));
+ 
+-	regmap_writel(LBW_DRAIN_TIMEOUT, mmD0_PCIE_WRAP_LBW_DRAIN_TIMEOUT);
+-	regmap_writel(D0_PCIE_WRAP_LBW_RSP_ERR_DRAIN_STAMP_EN_M,
+-		      mmD0_PCIE_WRAP_LBW_RSP_ERR_DRAIN_STAMP);
+-	val = regmap_readl(mmD0_PCIE_WRAP_LBW_DRAIN_CFG);
+-	val |= D0_PCIE_WRAP_LBW_DRAIN_CFG_EN_M;
+-	regmap_writel(val, mmD0_PCIE_WRAP_LBW_DRAIN_CFG);
++	regmap_writel(LBW_DRAIN_TIMEOUT, D0_PCIE_WRAP_REG(mmPCIE_WRAP_LBW_DRAIN_TIMEOUT));
++	regmap_writel(PCIE_WRAP_LBW_RSP_ERR_DRAIN_STAMP_EN_M,
++		      D0_PCIE_WRAP_REG(mmPCIE_WRAP_LBW_RSP_ERR_DRAIN_STAMP));
++	val = regmap_readl(D0_PCIE_WRAP_REG(mmPCIE_WRAP_LBW_DRAIN_CFG));
++	val |= PCIE_WRAP_LBW_DRAIN_CFG_EN_M;
++	regmap_writel(val, D0_PCIE_WRAP_REG(mmPCIE_WRAP_LBW_DRAIN_CFG));
+ }
+ 
+ static void hl_psoc_drain_init(void)
+@@ -347,8 +339,10 @@
+ 	if (hl_skip_fw_cfg())
+ 		return;
+ 
+-	regmap_writel(HBW_DRAIN_TIMEOUT, mmD0_PARC_GLOBAL_CONF_MST_HBW_DRAIN_TIMEOUT);
+-	regmap_writel(LBW_DRAIN_TIMEOUT, mmD0_PARC_GLOBAL_CONF_MST_LBW_DRAIN_TIMEOUT);
++	regmap_writel(HBW_DRAIN_TIMEOUT,
++				D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_MST_HBW_DRAIN_TIMEOUT));
++	regmap_writel(LBW_DRAIN_TIMEOUT,
++				D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_MST_LBW_DRAIN_TIMEOUT));
+ 	/* psoc drain is enabled in HW by default */
+ }
+ 
+@@ -401,7 +395,7 @@
+ 
+ __weak bool hl_dev_spec_debug_mode(enum hl_debug_hw_func func)
+ {
+-	u32 boot_strap = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_L);
++	u32 boot_strap = regmap_readl(D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_L));
+ 	u32 strap_mask;
+ 
+ 	switch (func) {
+@@ -473,7 +467,7 @@
+ 	 * same address space read by both dies will return a different value
+ 	 * depending on the die location
+ 	 */
+-	return regmap_readl(mmD0_PARC_LOCAL_CFG_DIE_ID);
++	return regmap_readl(mmD0_PARC_LOCAL_CFG_BASE + mmPARC_LOCAL_CFG_DIE_ID);
+ }
+ 
+ #define EFUSE_SKU_OFFSET	58
+@@ -497,89 +491,93 @@
+ 
+ void device_init_efuse(void)
+ {
+-	efuse.read_address_reg = mmD0_PSOC_EFUSE_READ_ADDRESS;
+-	efuse.data_0_reg = mmD0_PSOC_EFUSE_DATA_0;
+-	efuse.read_reg = mmD0_PSOC_EFUSE_RD;
++	efuse.read_address_reg = D0_PSOC_EFUSE_REG(mmEFUSE_READ_ADDRESS);
++	efuse.data_0_reg = D0_PSOC_EFUSE_REG(mmEFUSE_DATA_0);
++	efuse.read_reg = D0_PSOC_EFUSE_REG(mmEFUSE_RD);
+ 	efuse.addr_range = GAUDI3_EFUSE_READ_RANGE_ALL;
+ 	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
+ }
+ 
+ void device_init_uart(void)
+ {
+-	uart.uart_data_reg = mmD0_PSOC_UART_0_DATA;
+-	uart.uart_state_reg = mmD0_PSOC_UART_0_STATE;
+-	uart.uart_ctrl_reg = mmD0_PSOC_UART_0_CTRL;
+-	uart.uart_bauddiv_reg = mmD0_PSOC_UART_0_BAUDDIV;
++	uart.uart_data_reg = D0_PSOC_UART_0_REG(mmUART_DATA);
++	uart.uart_state_reg = D0_PSOC_UART_0_REG(mmUART_STATE);
++	uart.uart_ctrl_reg = D0_PSOC_UART_0_REG(mmUART_CTRL);
++	uart.uart_bauddiv_reg = D0_PSOC_UART_0_REG(mmUART_BAUDDIV);
+ }
+ 
+ void device_init_pci(void)
+ {
+-	if (!hl_get_die_id()) {	/* DIE0 */
+-		pci.dbi_bar0_reg = mmD0_PCIE_DBI_SIG_BAR0_REG;
+-		pci.dbi_bar2_reg = mmD0_PCIE_DBI_SIG_BAR2_REG;
+-		pci.dbi_bar4_reg = mmD0_PCIE_DBI_SIG_BAR4_REG;
+-		pci.dbi_status_command_reg = mmD0_PCIE_DBI_SIG_STATUS_COMMAND_REG;
+-		pci.dbi_uncorr_aer_mask = mmD0_PCIE_DBI_SIG_UNCORR_ERR_MASK_OFF;
+-		pci.aux_dbi_reg = mmD0_PCIE_AUX_DBI;
+-		pci.aux_mem_space_en_reg = mmD0_PCIE_AUX_MEM_SPACE_EN;
+-		pci.aux_flr_ctrl_reg = mmD0_PCIE_AUX_FLR_CTRL;
+-		pci.aux_ltssm_en_reg = mmD0_PCIE_AUX_LTSSM_EN;
+-		pci.aux_pf_flr_active_reg = mmD0_PCIE_AUX_PF_FLR_ACTIVE;
+-		pci.aux_flr_int_reg = mmD0_PCIE_AUX_FLR_INT;
+-		pci.aux_pf_flr_done_reg = mmD0_PCIE_AUX_PF_FLR_DONE;
+-		pci.aux_rdlh_link_up_reg = mmD0_PCIE_AUX_RDLH_LINK_UP;
+-		pci.aux_smlh_link_up_reg = mmD0_PCIE_AUX_SMLH_LINK_UP;
+-		pci.core_hot_rst_reg = mmD0_PCIE_CORE_HOT_RST;
+-	} else {	/* DIE1 */
+-		pci.dbi_bar0_reg = mmD1_PCIE_DBI_SIG_BAR0_REG;
+-		pci.dbi_bar2_reg = mmD1_PCIE_DBI_SIG_BAR2_REG;
+-		pci.dbi_bar4_reg = mmD1_PCIE_DBI_SIG_BAR4_REG;
+-		pci.dbi_status_command_reg = mmD1_PCIE_DBI_SIG_STATUS_COMMAND_REG;
+-		pci.dbi_uncorr_aer_mask = mmD1_PCIE_DBI_SIG_UNCORR_ERR_MASK_OFF;
+-		pci.aux_dbi_reg = mmD1_PCIE_AUX_DBI;
+-		pci.aux_mem_space_en_reg = mmD1_PCIE_AUX_MEM_SPACE_EN;
+-		pci.aux_flr_ctrl_reg = mmD1_PCIE_AUX_FLR_CTRL;
+-		pci.aux_ltssm_en_reg = mmD1_PCIE_AUX_LTSSM_EN;
+-		pci.aux_pf_flr_active_reg = mmD1_PCIE_AUX_PF_FLR_ACTIVE;
+-		pci.aux_flr_int_reg = mmD1_PCIE_AUX_FLR_INT;
+-		pci.aux_pf_flr_done_reg = mmD1_PCIE_AUX_PF_FLR_DONE;
+-		pci.aux_rdlh_link_up_reg = mmD1_PCIE_AUX_RDLH_LINK_UP;
+-		pci.aux_smlh_link_up_reg = mmD1_PCIE_AUX_SMLH_LINK_UP;
+-		pci.core_hot_rst_reg = mmD1_PCIE_CORE_HOT_RST;
++
++	if (!hl_get_die_id()) {
++		/* DIE 0 */
++		pci.dbi_bar0_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR0_REG);
++		pci.dbi_bar2_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
++		pci.dbi_bar4_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
++		pci.dbi_status_command_reg = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_STATUS_COMMAND_REG);
++		pci.dbi_uncorr_aer_mask = D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_UNCORR_ERR_MASK_OFF);
++		pci.aux_dbi_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_DBI);
++		pci.aux_mem_space_en_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_MEM_SPACE_EN);
++		pci.aux_flr_ctrl_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_CTRL);
++		pci.aux_ltssm_en_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN);
++		pci.aux_pf_flr_active_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_ACTIVE);
++		pci.aux_flr_int_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_FLR_INT);
++		pci.aux_pf_flr_done_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_DONE);
++		pci.aux_rdlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP);
++		pci.aux_smlh_link_up_reg = D0_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP);
++		pci.core_hot_rst_reg = D0_PCIE_CORE_REG(mmPCIE_CORE_HOT_RST);
++	} else {
++		/* DIE 1 */
++		pci.dbi_bar0_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR0_REG);
++		pci.dbi_bar2_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
++		pci.dbi_bar4_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_BAR2_REG);
++		pci.dbi_status_command_reg = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_STATUS_COMMAND_REG);
++		pci.dbi_uncorr_aer_mask = D1_PCIE_DBI_SIG_REG(mmPCIE_DBI_UNCORR_ERR_MASK_OFF);
++		pci.aux_dbi_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_DBI);
++		pci.aux_mem_space_en_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_MEM_SPACE_EN);
++		pci.aux_flr_ctrl_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_FLR_CTRL);
++		pci.aux_ltssm_en_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN);
++		pci.aux_pf_flr_active_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_ACTIVE);
++		pci.aux_flr_int_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_FLR_INT);
++		pci.aux_pf_flr_done_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_PF_FLR_DONE);
++		pci.aux_rdlh_link_up_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP);
++		pci.aux_smlh_link_up_reg = D1_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP);
++		pci.core_hot_rst_reg = D1_PCIE_CORE_REG(mmPCIE_CORE_HOT_RST);
+ 	}
+ }
+ 
+ void device_init_i2c_s(void)
+ {
+-	i2c_s.enable_reg = mmD0_PSOC_I2C_S_IC_ENABLE;
+-	i2c_s.sar_reg = mmD0_PSOC_I2C_S_IC_SAR;
+-	i2c_s.con_reg = mmD0_PSOC_I2C_S_IC_CON;
+-	i2c_s.intr_mask_reg = mmD0_PSOC_I2C_S_IC_INTR_MASK;
+-	i2c_s.intr_stat_reg = mmD0_PSOC_I2C_S_IC_INTR_STAT;
+-	i2c_s.rx_tl_reg = mmD0_PSOC_I2C_S_IC_RX_TL;
+-	i2c_s.tx_tl_reg = mmD0_PSOC_I2C_S_IC_TX_TL;
+-	i2c_s.data_cmd_reg = mmD0_PSOC_I2C_S_IC_DATA_CMD;
+-	i2c_s.clr_tx_abrt_reg = mmD0_PSOC_I2C_S_IC_CLR_TX_ABRT;
+-	i2c_s.clr_rx_under_reg = mmD0_PSOC_I2C_S_IC_CLR_RX_UNDER;
+-	i2c_s.clr_rx_over_reg = mmD0_PSOC_I2C_S_IC_CLR_RX_OVER;
+-	i2c_s.clr_tx_over_reg = mmD0_PSOC_I2C_S_IC_CLR_TX_OVER;
+-	i2c_s.clr_rx_done_reg = mmD0_PSOC_I2C_S_IC_CLR_RX_DONE;
+-	i2c_s.clr_activity_reg = mmD0_PSOC_I2C_S_IC_CLR_ACTIVITY;
+-	i2c_s.clr_stop_det_reg = mmD0_PSOC_I2C_S_IC_CLR_STOP_DET;
+-	i2c_s.clr_start_det_reg = mmD0_PSOC_I2C_S_IC_CLR_START_DET;
+-	i2c_s.clr_gen_call_reg = mmD0_PSOC_I2C_S_IC_CLR_GEN_CALL;
+-	i2c_s.clr_rd_req_reg = mmD0_PSOC_I2C_S_IC_CLR_RD_REQ;
+-	i2c_s.clr_intr_reg = mmD0_PSOC_I2C_S_IC_CLR_INTR;
+-	i2c_s.rxflr_reg = mmD0_PSOC_I2C_S_IC_RXFLR;
++	i2c_s.enable_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_ENABLE);
++	i2c_s.sar_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_SAR);
++	i2c_s.con_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CON);
++	i2c_s.intr_mask_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_INTR_MASK);
++	i2c_s.intr_stat_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_INTR_STAT);
++	i2c_s.rx_tl_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_RX_TL);
++	i2c_s.tx_tl_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_TX_TL);
++	i2c_s.data_cmd_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_DATA_CMD);
++	i2c_s.clr_tx_abrt_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_TX_ABRT);
++	i2c_s.clr_rx_under_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_RX_UNDER);
++	i2c_s.clr_rx_over_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_RX_OVER);
++	i2c_s.clr_tx_over_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_TX_OVER);
++	i2c_s.clr_rx_done_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_RX_DONE);
++	i2c_s.clr_activity_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_ACTIVITY);
++	i2c_s.clr_stop_det_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_STOP_DET);
++	i2c_s.clr_start_det_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_START_DET);
++	i2c_s.clr_gen_call_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_GEN_CALL);
++	i2c_s.clr_rd_req_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_RD_REQ);
++	i2c_s.clr_intr_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_CLR_INTR);
++	i2c_s.rxflr_reg = D0_PSOC_I2C_S_REG(mmI2C_IC_RXFLR);
+ }
+ 
+ void device_init_global_conf(void)
+ {
+-	global_conf.prstn_reg = mmD0_PSOC_GLOBAL_CONF_PRSTN;
+-	global_conf.kmd_msg_to_cpu_reg = mmD0_PSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
+-	global_conf.i2c_slv_reg = mmD0_PSOC_GLOBAL_CONF_I2C_SLV;
+-	global_conf.i2c_slv_intr_mask_reg = mmD0_PARC_INT_AGGR_I2C_SLV_COMB_MASK;
+-	global_conf.cpu_boot_status_reg = mmD0_PSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	global_conf.prstn_reg = D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN);
++	global_conf.kmd_msg_to_cpu_reg = D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_KMD_MSG_TO_CPU);
++	global_conf.i2c_slv_reg = D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_I2C_SLV);
++	global_conf.i2c_slv_intr_mask_reg = mmD0_PARC_INT_AGGR_I2C_SLV_COMB_BASE +
++							mmINT_AGG_PSOC_I2C_SLV_COMB_MASK;
++	global_conf.cpu_boot_status_reg = D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_CPU_BOOT_STATUS);
+ 	global_conf.cpu_cmd_status_to_host_map = mmCPU_CMD_STATUS_TO_HOST;
+ 	global_conf.cpu_boot_err0_map = mmCPU_BOOT_ERR0;
+ 	global_conf.cpu_boot_err1_map = mmCPU_BOOT_ERR1;
+@@ -594,40 +592,40 @@
+ 
+ void device_init_ca53_cfg(void)
+ {
+-	ca53_cfg.arm_rst_control_reg = mmD0_CPU_CA53_CFG_ARM_RST_CONTROL;
++	ca53_cfg.arm_rst_control_reg = mmD0_CPU_CA53_CFG_BASE + mmCA53_CFG_ARM_RST_CONTROL;
+ }
+ 
+ void device_init_pif_arc(void)
+ {
+ 	if (!hl_get_die_id()) {	/* DIE0 */
+-		pif_arc.pf_flr_active = mmD0_PIF_ARC_PF_FLR_ACTIVE;
+-		pif_arc.pf_flr_done = mmD0_PIF_ARC_PF_FLR_DONE;
+-		pif_arc.inbound_term = mmD0_PIF_ARC_INBOUND_TERM;
+-		pif_arc.crs = mmD0_PIF_ARC_CRS;
+-		pif_arc.outbound_iso = mmD0_PIF_ARC_OUTBOUND_ISO;
+-		pif_arc.outstand_trans = mmD0_PIF_ARC_OUTSTAND_TRANS;
+-		pif_arc.pif2psoc_flr_active = mmD0_PIF_ARC_PIF2PSOC_FLR_ACTIVE;
+-		pif_arc.psoc2pif_flr_req = mmD0_PIF_ARC_PSOC2PIF_FLR_REQ;
+-		pif_arc.psoc2pif_flr_done = mmD0_PIF_ARC_PSOC2PIF_FLR_DONE;
+-		pif_arc.psoc2pif_die_ready = mmD0_PIF_ARC_PSOC2PIF_DIE_READY;
+-		pif_arc.timestamp_ctrl = mmD0_PIF_ARC_FLR_TIMESTAMP_CTRL;
+-		pif_arc.timestamp_cnt = mmD0_PIF_ARC_FLR_TIMESTAMP_CNT;
++		pif_arc.pf_flr_active = D0_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
++		pif_arc.pf_flr_done = D0_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
++		pif_arc.inbound_term = D0_PIF_ARC_REG(mmPIF_ARC_INBOUND_TERM);
++		pif_arc.crs = D0_PIF_ARC_REG(mmPIF_ARC_CRS);
++		pif_arc.outbound_iso = D0_PIF_ARC_REG(mmPIF_ARC_OUTBOUND_ISO);
++		pif_arc.outstand_trans = D0_PIF_ARC_REG(mmPIF_ARC_OUTSTAND_TRANS);
++		pif_arc.pif2psoc_flr_active = D0_PIF_ARC_REG(mmPIF_ARC_PIF2PSOC_FLR_ACTIVE);
++		pif_arc.psoc2pif_flr_req = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_REQ);
++		pif_arc.psoc2pif_flr_done = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_DONE);
++		pif_arc.psoc2pif_die_ready = D0_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_DIE_READY);
++		pif_arc.timestamp_ctrl = D0_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CTRL);
++		pif_arc.timestamp_cnt = D0_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CNT);
+ 		pif_arc.error_reg = mmD0_PIF_ARC_ERROR;
+ 		pif_arc.status_reg = mmD0_PIF_ARC_STATUS;
+ 		pif_arc.control_reg = mmD0_PIF_ARC_CONTROL;
+ 	} else {	/* DIE1 */
+-		pif_arc.pf_flr_active = mmD1_PIF_ARC_PF_FLR_ACTIVE;
+-		pif_arc.pf_flr_done = mmD1_PIF_ARC_PF_FLR_DONE;
+-		pif_arc.inbound_term = mmD1_PIF_ARC_INBOUND_TERM;
+-		pif_arc.crs = mmD1_PIF_ARC_CRS;
+-		pif_arc.outbound_iso = mmD1_PIF_ARC_OUTBOUND_ISO;
+-		pif_arc.outstand_trans = mmD1_PIF_ARC_OUTSTAND_TRANS;
+-		pif_arc.pif2psoc_flr_active = mmD1_PIF_ARC_PIF2PSOC_FLR_ACTIVE;
+-		pif_arc.psoc2pif_flr_req = mmD1_PIF_ARC_PSOC2PIF_FLR_REQ;
+-		pif_arc.psoc2pif_flr_done = mmD1_PIF_ARC_PSOC2PIF_FLR_DONE;
+-		pif_arc.psoc2pif_die_ready = mmD1_PIF_ARC_PSOC2PIF_DIE_READY;
+-		pif_arc.timestamp_ctrl = mmD1_PIF_ARC_FLR_TIMESTAMP_CTRL;
+-		pif_arc.timestamp_cnt = mmD1_PIF_ARC_FLR_TIMESTAMP_CNT;
++		pif_arc.pf_flr_active = D1_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
++		pif_arc.pf_flr_done = D1_PIF_ARC_REG(mmPIF_ARC_PF_FLR_DONE);
++		pif_arc.inbound_term = D1_PIF_ARC_REG(mmPIF_ARC_INBOUND_TERM);
++		pif_arc.crs = D1_PIF_ARC_REG(mmPIF_ARC_CRS);
++		pif_arc.outbound_iso = D1_PIF_ARC_REG(mmPIF_ARC_OUTBOUND_ISO);
++		pif_arc.outstand_trans = D1_PIF_ARC_REG(mmPIF_ARC_OUTSTAND_TRANS);
++		pif_arc.pif2psoc_flr_active = D1_PIF_ARC_REG(mmPIF_ARC_PIF2PSOC_FLR_ACTIVE);
++		pif_arc.psoc2pif_flr_req = D1_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_REQ);
++		pif_arc.psoc2pif_flr_done = D1_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_FLR_DONE);
++		pif_arc.psoc2pif_die_ready = D1_PIF_ARC_REG(mmPIF_ARC_PSOC2PIF_DIE_READY);
++		pif_arc.timestamp_ctrl = D1_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CTRL);
++		pif_arc.timestamp_cnt = D1_PIF_ARC_REG(mmPIF_ARC_FLR_TIMESTAMP_CNT);
+ 		pif_arc.error_reg = mmD1_PIF_ARC_ERROR;
+ 		pif_arc.status_reg = mmD1_PIF_ARC_STATUS;
+ 	}
+@@ -635,9 +633,9 @@
+ 
+ void device_init_pll(void)
+ {
+-	pll.div_sel_offset = mmD0_G4_PCI_PLL_CTRL_DIV_SEL_0 - mmD0_G4_PCI_PLL_CTRL_BASE;
+-	pll.cfg_div_offset = mmD0_G4_PCI_PLL_CTRL_CFG_DIV - mmD0_G4_PCI_PLL_CTRL_BASE;
+-	pll.div_factor_offset = mmD0_G4_PCI_PLL_CTRL_DIV_FACTOR_0 - mmD0_G4_PCI_PLL_CTRL_BASE;
++	pll.div_sel_offset = mmPLL_CTRL_DIV_SEL_0;
++	pll.cfg_div_offset = mmPLL_CTRL_CFG_DIV;
++	pll.div_factor_offset = mmPLL_CTRL_DIV_FACTOR_0;
+ }
+ 
+ void lkd_dev_specific_setup(void)
+@@ -736,8 +734,8 @@
+ 	return boot_info_get_no_merge(type, data, max_size, copy_size);
+ }
+ 
+-#define CCM_TERMINATE_MASK	(D0_PIF_ARC_CCM_TERMINATE_D_EN_M | D0_PIF_ARC_CCM_TERMINATE_I_EN_M)
+-#define PIF_CCM_TERM_OFF	(mmD0_PIF_ARC_CCM_TERMINATE - mmD0_PIF_ARC_BASE)
++#define CCM_TERMINATE_MASK	(PIF_ARC_CCM_TERMINATE_D_EN_M | PIF_ARC_CCM_TERMINATE_I_EN_M)
++#define PIF_CCM_TERM_OFF	mmPIF_ARC_CCM_TERMINATE
+ 
+ static void pif_arc_mem_init(struct cpu_load_data *data, struct boot_desc *desc)
+ {
+@@ -816,8 +814,8 @@
+ 	return 0;
+ }
+ 
+-#define PIF_RUN_HALT_REQ_OFF	(mmD0_PIF_ARC_RUN_HALT_REQ - mmD0_PIF_ARC_BASE)
+-#define PIF_RUN_HALT_ACK_OFF	(mmD0_PIF_ARC_RUN_HALT_ACK - mmD0_PIF_ARC_BASE)
++#define PIF_RUN_HALT_REQ_OFF	mmPIF_ARC_RUN_HALT_REQ
++#define PIF_RUN_HALT_ACK_OFF	mmPIF_ARC_RUN_HALT_ACK
+ #define ARC_RUN_ACK_TIMEOUT_US	100
+ 
+ static void ppboot_run_pif_arc(struct cpu_load_data *data)
+@@ -827,10 +825,10 @@
+ 	u64 start;
+ 
+ 	/* Set ARC in running state */
+-	regmap_writel(D0_PIF_ARC_RUN_HALT_REQ_RUN_REQ_M, run_req_reg);
++	regmap_writel(PIF_ARC_RUN_HALT_REQ_RUN_REQ_M, run_req_reg);
+ 
+ 	start = timestamp_get_us();
+-	while (!(regmap_readl(run_ack_reg) & D0_PIF_ARC_RUN_HALT_ACK_RUN_ACK_M)) {
++	while (!(regmap_readl(run_ack_reg) & PIF_ARC_RUN_HALT_ACK_RUN_ACK_M)) {
+ 		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
+ 			preboot_puts_hex("No running state ack from PIF ARC ",
+ 					 data->die_id, false);
+@@ -841,7 +839,7 @@
+ 	regmap_writel(0x0, run_req_reg);
+ }
+ 
+-#define PIF_ARC_RST_OFF		(mmD0_PIF_ARC_ARC_RST - mmD0_PIF_ARC_BASE)
++#define PIF_ARC_RST_OFF		mmPIF_ARC_ARC_RST
+ #define ARC_HALT_ACK_TIMEOUT_US	100
+ 
+ static void ppboot_halt_n_reset_pif_arc(u32 cpu_cfg_base)
+@@ -854,17 +852,17 @@
+ 
+ 	/* Check if already in reset state */
+ 	val = regmap_readl(rst_reg);
+-	if (val & D0_PIF_ARC_ARC_RST_CORE_M)
++	if (val & PIF_ARC_ARC_RST_CORE_M)
+ 		return;
+ 
+ 	val = regmap_readl(halt_ack_reg);
+-	if (!(val & D0_PIF_ARC_RUN_HALT_ACK_SYS_HALT_R_M)) {
++	if (!(val & PIF_ARC_RUN_HALT_ACK_SYS_HALT_R_M)) {
+ 		/* Halt ARC incase it is not halted already */
+-		regmap_writel(D0_PIF_ARC_RUN_HALT_REQ_HALT_REQ_M, halt_req_reg);
++		regmap_writel(PIF_ARC_RUN_HALT_REQ_HALT_REQ_M, halt_req_reg);
+ 		start = timestamp_get_us();
+ 		while (true) {
+ 			val = regmap_readl(halt_ack_reg);
+-			if (val & D0_PIF_ARC_RUN_HALT_ACK_HALT_ACK_M)
++			if (val & PIF_ARC_RUN_HALT_ACK_HALT_ACK_M)
+ 				break;
+ 
+ 			if (timeout_expired(start, ARC_HALT_ACK_TIMEOUT_US)) {
+@@ -876,10 +874,10 @@
+ 	}
+ 
+ 	/* Reset ARC */
+-	regmap_writel(D0_PIF_ARC_ARC_RST_CORE_M, rst_reg);
++	regmap_writel(PIF_ARC_ARC_RST_CORE_M, rst_reg);
+ }
+ 
+-#define PIF_RST_VEC_ADDR_OFF	(mmD0_PIF_ARC_RST_VEC_ADDR - mmD0_PIF_ARC_BASE)
++#define PIF_RST_VEC_ADDR_OFF	mmPIF_ARC_RST_VEC_ADDR
+ #define PIF_ARC_ICCM_IDX	0
+ #define PIF_ARC_DCCM_IDX	1
+ 
+@@ -897,7 +895,7 @@
+ 	 * in halt state.
+ 	 */
+ 	regmap_writel(ARC_RST_VEC_ADDR, rst_vec_reg);
+-	regmap_writel(D0_PIF_ARC_ARC_RST_PRESETDBGN_M, rst_reg);
++	regmap_writel(PIF_ARC_ARC_RST_PRESETDBGN_M, rst_reg);
+ 
+ 	if (hl_rst_src_get() == HL_COLD_RST) {
+ 		if (!boot_desc_init()) {
+@@ -921,8 +919,8 @@
+ 	ppboot_run_pif_arc(data);
+ }
+ 
+-#define PHY_FW_FSM_ENA_MASK	(D0_PCIE_WRAP_PHY_FW_FSM_EN_M | \
+-				 D0_PCIE_WRAP_PHY_FW_FSM_DIRECT_WRITE_EN_M)
++#define PHY_FW_FSM_ENA_MASK	(PCIE_WRAP_PHY_FW_FSM_EN_M | \
++				 PCIE_WRAP_PHY_FW_FSM_DIRECT_WRITE_EN_M)
+ #define FW_WORD_NUM		(PHY_FW_SIZE / 2)
+ 
+ static void pif_arc_init_pcie_phy_fw_update(void)
+@@ -932,8 +930,8 @@
+ 	 * PHY_FW_FSM_SIZE takes few clocks to propagate. It is being sampled by HW few
+ 	 * clock cycles after the rising edge of PCIE_WRAP ➔ PHY_FW_FSM ➔ DIRECT_WRITE_EN bit.
+ 	 */
+-	regmap_writel(0, mmD0_PCIE_WRAP_PHY_FW_FSM);
+-	regmap_writel(FW_WORD_NUM, mmD0_PCIE_WRAP_PHY_FW_FSM_SIZE);
++	regmap_writel(0, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PHY_FW_FSM));
++	regmap_writel(FW_WORD_NUM, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PHY_FW_FSM_SIZE));
+ 
+ 	/* let PHY_FW_FSM_SIZE propagate */
+ 	pif_ts_delay_us(1);
+@@ -944,53 +942,53 @@
+ 	 * The FSM will wait for SRAM init done before updating
+ 	 * the SRAM contents
+ 	 */
+-	regmap_writel(PHY_FW_FSM_ENA_MASK, mmD0_PCIE_WRAP_PHY_FW_FSM);
++	regmap_writel(PHY_FW_FSM_ENA_MASK, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PHY_FW_FSM));
+ 
+ 	/* Take the PHY out of reset */
+-	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PCIE_PHY_RST_N));
+ }
+ 
+ static void pcie_ref_clk_mode_init(void)
+ {
+-	u32 strap_h = regmap_readl(mmD0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H);
++	u32 strap_h = regmap_readl(D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_BOOT_STRAP_PINS_H));
+ 	bool srns, sris;
+ 
+-	srns = strap_h & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRNS_M;
+-	sris = strap_h & D0_PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRIS_M;
++	srns = strap_h & PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRNS_M;
++	sris = strap_h & PSOC_BOOT_CONF_BOOT_STRAP_PINS_H_SRIS_M;
+ 
+ 	/* if common clk mode, no configs are required */
+ 	if (!srns && !sris)
+ 		return;
+ 
+ 	/* common configs for both srns and sris clk */
+-	regmap_writel(0, mmD0_PCIE_PHY_PIPE_LANE_CMN_REFCLK_MODE);
+-	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_0);
+-	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_1);
+-	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_2);
+-	regmap_writel(0, mmD0_PCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_3);
++	regmap_writel(0, D0_PCIE_PHY_REG(mmPCIE_PHY_PIPE_LANE_CMN_REFCLK_MODE));
++	regmap_writel(0, D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_0));
++	regmap_writel(0, D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_1));
++	regmap_writel(0, D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_2));
++	regmap_writel(0, D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_MPLL_SHORT_LOCK_EN_3));
+ 
+ 	if (sris) {
+-		regmap_writel(1, mmD0_PCIE_AUX_APP_SRIS_MODE);
+-		regmap_writel(1, mmD0_PCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++		regmap_writel(1, D0_PCIE_AUX_REG(mmPCIE_AUX_APP_SRIS_MODE));
++		regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN));
+ 	}
+ }
+ 
+ static void pif_arc_init_pcie_phy(void)
+ {
+ 	/* Reset PCIe PHY */
+-	regmap_writel(0, mmD0_PSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++	regmap_writel(0, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PCIE_PHY_RST_N));
+ 
+ 	/*
+ 	 * Set PCIe PHY CR Para I/F to CFG.
+ 	 * Select CR PARA I/F instead of JTAG
+ 	 */
+-	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_0);
+-	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_1);
+-	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_2);
+-	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_SEL_3);
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_0));
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_1));
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_2));
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_SEL_3));
+ 
+ 	/* Select indirect access to CR PARA I/F instead of PRBI */
+-	regmap_writel(1, mmD0_PCIE_PHY_CR_PARA_CFG);
++	regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_CFG));
+ 
+ 	pcie_ref_clk_mode_init();
+ 
+@@ -1002,22 +1000,23 @@
+ 	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+ 
+ 	/* Update Vendor ID */
+-	regmap_writel(device_id_vendor_id, mmD0_PCIE_DBI_SIG_DEVICE_ID_VENDOR_ID_REG);
++	regmap_writel(device_id_vendor_id, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG));
+ 
+ 	/* Update subsystem Vendor ID */
+-	regmap_writel(device_id_vendor_id, mmD0_PCIE_DBI_SIG_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
++	regmap_writel(device_id_vendor_id,
++			D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG));
+ }
+ 
+ static void pif_arc_config_dbi_params(void)
+ {
+-	regmap_writel(0x02402801, mmD0_PCIE_DBI_SIG_GEN3_RELATED_OFF);
+-	regmap_writel(0x04020031, mmD0_PCIE_DBI_SIG_GEN3_EQ_CONTROL_OFF);
++	regmap_writel(0x02402801, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_GEN3_RELATED_OFF));
++	regmap_writel(0x04020031, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_GEN3_EQ_CONTROL_OFF));
+ }
+ 
+ __weak void preboot_update_bar_sizes(void) {}
+ __weak void pcie_wait_for_sram_ext_ld_done(void) {}
+ 
+-#define LTTSM_ENA_MASK	(D0_PCIE_AUX_LTSSM_EN_IND_M | D0_PCIE_AUX_LTSSM_EN_MASK_M)
++#define LTTSM_ENA_MASK	(PCIE_AUX_LTSSM_EN_IND_M | PCIE_AUX_LTSSM_EN_MASK_M)
+ 
+ static void pif_arc_init_pcie(void)
+ {
+@@ -1040,14 +1039,14 @@
+ 	pcie_wait_for_sram_ext_ld_done();
+ 
+ 	/* Enable and Mask LTSSM */
+-	regmap_writel(LTTSM_ENA_MASK, mmD0_PCIE_AUX_LTSSM_EN);
++	regmap_writel(LTTSM_ENA_MASK, D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN));
+ }
+ 
+ 
+ void pif_arc_pcie_monitoring(void)
+ {
+ 	/* Wait for PRSTn */
+-	while (!regmap_readl(mmD0_PSOC_GLOBAL_CONF_PRSTN))
++	while (!regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN)))
+ 		;
+ 
+ 	/* Only after PRSTn is de-asserted */
+@@ -1057,10 +1056,10 @@
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+ 
+-		prstn = regmap_readl(mmD0_PSOC_GLOBAL_CONF_PRSTN);
+-		ltssm = regmap_readl(mmD0_PCIE_AUX_LTSSM_EN);
+-		smlh = regmap_readl(mmD0_PCIE_AUX_SMLH_LINK_UP);
+-		rdlh = regmap_readl(mmD0_PCIE_AUX_RDLH_LINK_UP);
++		prstn = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN));
++		ltssm = regmap_readl(D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN));
++		smlh = regmap_readl(D0_PCIE_AUX_REG(mmPCIE_AUX_SMLH_LINK_UP));
++		rdlh = regmap_readl(D0_PCIE_AUX_REG(mmPCIE_AUX_RDLH_LINK_UP));
+ 
+ 		if (prstn && smlh && rdlh)
+ 			break;
+@@ -1072,12 +1071,12 @@
+ 		 * till BAR is reconfigured
+ 		 */
+ 		if (!prstn && ltssm) {
+-			regmap_writel(0, mmD0_PCIE_AUX_LTSSM_EN);
++			regmap_writel(0, D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN));
+ 			continue;
+ 		}
+ 
+ 		if (prstn && !ltssm) {
+-			regmap_writel(LTTSM_ENA_MASK, mmD0_PCIE_AUX_LTSSM_EN);
++			regmap_writel(LTTSM_ENA_MASK, D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN));
+ 			continue;
+ 		}
+ 	}
+@@ -1118,14 +1117,17 @@
+ 		return -1;
+ 	}
+ 
+-	regmap_writel((uint32_t)src, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_L);
+-	regmap_writel((uint32_t)(src >> 32), mmD0_PSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_H);
+-	regmap_writel((uint32_t)dst, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
+-	regmap_writel((uint32_t)(dst >> 32), mmD0_PSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++	regmap_writel((uint32_t)src,
++				D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_START_ADDR_L));
++	regmap_writel((uint32_t)(src >> 32),
++				D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_START_ADDR_H));
++	regmap_writel((uint32_t)dst, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_DEST_ADDR_L));
++	regmap_writel((uint32_t)(dst >> 32),
++				D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_DEST_ADDR_H));
+ 
+-	mem_cfg = regmap_readl(mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
+-	mem_cfg &= ~D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M;
+-	mem_cfg &= ~D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_M;
++	mem_cfg = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_CTRL2));
++	mem_cfg &= ~GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M;
++	mem_cfg &= ~GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_M;
+ 
+ 	/* set size of in granuality of 16 bytes */
+ 	copy_sz = size >> MEM_CPY_SIZE_SHIFT;
+@@ -1133,28 +1135,29 @@
+ 		preboot_puts("MEM_CPY size not aligned, rounding up\n");
+ 		copy_sz++;
+ 	}
+-	mem_cfg |= (copy_sz & D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M);
++	mem_cfg |= (copy_sz & GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M);
+ 
+ 	/*
+ 	 * WA for HW errata GAUDI3_0315
+ 	 */
+-	mem_cfg |= (MEM_CPY_ERRATA_WR_OS_VAL << D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_S);
++	mem_cfg |= (MEM_CPY_ERRATA_WR_OS_VAL << GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_S);
+ 
+ 	/*
+ 	 * WA for HW errata GAUDI3_0306
+ 	 */
+-	mem_cfg |= (MEM_CPY_ERRATA_RD_OS_VAL << D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_RD_OS_S);
++	mem_cfg |= (MEM_CPY_ERRATA_RD_OS_VAL << GLOBAL_CONF_MEM_CPY_CTRL2_RD_OS_S);
+ 
+-	regmap_writel(mem_cfg, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	regmap_writel(mem_cfg, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_CTRL2));
+ 
+ 	/* Enable copy and wait for completion */
+-	regmap_writel(D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL_EN_M, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	regmap_writel(GLOBAL_CONF_MEM_CPY_CTRL_EN_M,
++			D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_CTRL));
+ 	/* let 'enable' command propagate before polling on status */
+ 	HL_ARC_W_BARRIER();
+ 
+ 	while (1) {
+-		cpy_sts = regmap_readl(mmD0_PSOC_GLOBAL_CONF_MEM_CPY_STATUS);
+-		if (cpy_sts & D0_PSOC_GLOBAL_CONF_MEM_CPY_STATUS_DONE_M)
++		cpy_sts = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_STATUS));
++		if (cpy_sts & GLOBAL_CONF_MEM_CPY_STATUS_DONE_M)
+ 			break;
+ 
+ 		if (timeout_expired(start, HL_MEM_CPY_TIMEOUT_US)) {
+diff --git a/arch/gaudi3/arc/erom_pcie.c b/arch/gaudi3/arc/erom_pcie.c
+index e4df6d6..3fcb4ab 100644
+--- a/arch/gaudi3/arc/erom_pcie.c
++++ b/arch/gaudi3/arc/erom_pcie.c
+@@ -6,10 +6,11 @@
+  */
+ 
+ #include <preboot.h>
+-#include <d0_psoc_security_regs.h>
++#include <psoc_security_regs.h>
++#include <gaudi3_reg_map.h>
+ 
+ void erom_main_function(void)
+ {
+ 	/* Dummy magic write to SW STATUS */
+-	regmap_writel(0xAABBCCDD, mmD0_PSOC_SECURITY_SW_STATUS_5);
++	regmap_writel(0xAABBCCDD, D0_PSOC_SECURITY_REG(mmPSOC_SECURITY_SW_STATUS_5));
+ }
+diff --git a/arch/gaudi3/arc/erom_recovery.c b/arch/gaudi3/arc/erom_recovery.c
+index 3478d9d..c3b4330 100644
+--- a/arch/gaudi3/arc/erom_recovery.c
++++ b/arch/gaudi3/arc/erom_recovery.c
+@@ -6,11 +6,12 @@
+  */
+ 
+ #include <preboot.h>
+-#include <d0_psoc_security_regs.h>
++#include <psoc_security_regs.h>
++#include <gaudi3_reg_map.h>
+ 
+ void erom_main_function(void)
+ {
+ 	/* Dummy magic write to SW STATUS */
+-	regmap_writel(0xAABBCCDD, mmD0_PSOC_SECURITY_SW_STATUS_6);
++	regmap_writel(0xAABBCCDD, D0_PSOC_SECURITY_REG(mmPSOC_SECURITY_SW_STATUS_6));
+ }
+ 
+diff --git a/arch/gaudi3/arc/erom_tpm.c b/arch/gaudi3/arc/erom_tpm.c
+index 3e69e71..07dda1b 100644
+--- a/arch/gaudi3/arc/erom_tpm.c
++++ b/arch/gaudi3/arc/erom_tpm.c
+@@ -6,10 +6,11 @@
+  */
+ 
+ #include <preboot.h>
+-#include <d0_psoc_security_regs.h>
++#include <psoc_security_regs.h>
++#include <gaudi3_reg_map.h>
+ 
+ void erom_main_function(void)
+ {
+ 	/* Dummy magic write to SW STATUS */
+-	regmap_writel(0xAABBCCDD, mmD0_PSOC_SECURITY_SW_STATUS_7);
++	regmap_writel(0xAABBCCDD, D0_PSOC_SECURITY_REG(mmPSOC_SECURITY_SW_STATUS_7));
+ }
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index d340919..70e92ae 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -8,8 +8,8 @@
+ 
+ #include <iopoll.h>
+ #include <preboot.h>
+-#include <d0_parc_global_conf_regs.h>
+-#include <d0_parc_global_conf_masks.h>
++#include <parc_global_conf_regs.h>
++#include <parc_global_conf_masks.h>
+ #include <gaudi3_fw_if.h>
+ 
+ #define BOOT_DESC_MAX_IMGS	7
+@@ -22,10 +22,11 @@
+ 	s8 __cpu_id = HL_ARC_V2_CORE_ID();							\
+ 	int err;										\
+ 												\
+-	__addr = mmD0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_0 + __cpu_id * sizeof(u32);	\
++	__addr = D0_PARC_GLOBAL_CONF_REG(mmPARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_0) +	\
++								__cpu_id * sizeof(u32);	\
+ 	err = readl_poll_timeout(__addr,							\
+ 			__val,									\
+-			__val & D0_PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_NO_WR_INFLIGHT_M,	\
++			__val & PARC_GLOBAL_CONF_ARC_LBU_AXI_SPLIT_CTRL2_NO_WR_INFLIGHT_M,	\
+ 			HL_W_BARRIER_TIMEOUT_US);						\
+ 	if (err)										\
+ 		preboot_puts("HL_ARC_W_BARRIER timeout");					\
+diff --git a/arch/gaudi3/arc/onix.c b/arch/gaudi3/arc/onix.c
+index 9c8776e..9dcc0bb 100644
+--- a/arch/gaudi3/arc/onix.c
++++ b/arch/gaudi3/arc/onix.c
+@@ -3,8 +3,9 @@
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
+ 
+-#include <d0_psoc_global_conf_regs.h>
+-#include <d0_parc_arc1_cfg_regs.h>
++#include <global_conf_regs.h>
++#include <arc_regs.h>
++#include <gaudi3_reg_map.h>
+ #include <common/pci_ids.h>
+ 
+ #include <gaudi3/address_space.h>
+@@ -25,8 +26,8 @@
+ 
+ void hl_uart_init(void)
+ {
+-	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_48);	/* UART0 RXD */
+-	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_49);	/* UART0 TXD */
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_48));	/* UART0 RXD */
++	regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PAD_SEL_49));	/* UART0 TXD */
+ 	preboot_uart_init(SYS_CLOCK_FREQUENCY / (HL_UART_BAUDRATE / 2));
+ }
+ 
+@@ -49,8 +50,8 @@
+ 
+ void sram_set_extension(void)
+ {
+-	regmap_writel(SRAM_EXTENSION_MSB, mmD0_PARC_ARC1_CFG_SRAM_MSB_ADDR);
+-	regmap_writel(0x0, mmD0_PARC_ARC1_CFG_SRAM_LSB_ADDR);
++	regmap_writel(SRAM_EXTENSION_MSB, mmD0_PARC_ARC1_CFG_BASE + mmARC_SRAM_MSB_ADDR);
++	regmap_writel(0x0, mmD0_PARC_ARC1_CFG_BASE + mmARC_SRAM_LSB_ADDR);
+ }
+ 
+ #define SRAM_OFFSET_MASK	0xFFFFFFF
+diff --git a/arch/gaudi3/common/common.c b/arch/gaudi3/common/common.c
+index 94a9a66..d381fc8 100644
+--- a/arch/gaudi3/common/common.c
++++ b/arch/gaudi3/common/common.c
+@@ -5,15 +5,16 @@
+ 
+ #include <preboot.h>
+ #include <hl.h>
+-#include <d0_pcie_wrap_regs.h>
+-#include <d0_pcie_core_regs.h>
+-#include <d0_pcie_aux_regs.h>
+-#include <d0_pcie_aux_masks.h>
+-#include <d0_pcie_elbi_rr_mstr_if_rr_lbw_regs.h>
++#include <gaudi3_reg_map.h>
++#include <mstr_if_rr_lbw_regs.h>
++#include <pcie_core_regs.h>
++#include <pcie_aux_regs.h>
++#include <pcie_wrap_regs.h>
++#include <pcie_aux_masks.h>
+ 
+ void hl_pcie_clear_boot_termination(void)
+ {
+-	regmap_writel(D0_PCIE_AUX_BOOT_TERM_CLR_CLR_M, mmD0_PCIE_AUX_BOOT_TERM_CLR);
++	regmap_writel(PCIE_AUX_BOOT_TERM_CLR_CLR_M, D0_PCIE_AUX_REG(mmPCIE_AUX_BOOT_TERM_CLR));
+ }
+ 
+ void hl_pcie_enable_access(void)
+@@ -23,14 +24,15 @@
+ 	hl_pcie_clear_boot_termination();
+ 
+ 	/* FSM blocks all range hence openning here */
+-	regmap_writel(0, mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_13);
++	regmap_writel(0, mmD0_PCIE_ELBI_RR_MSTR_IF_RR_LBW_BASE +
++					mmMSTR_IF_RR_LBW_PRIV_RANGE_EN_SHORT_13);
+ 	rst_src = hl_rst_src_get();
+ 
+ 	if ((rst_src == HL_FLR_RST) || (rst_src == HL_PRSTN_RST))
+-		regmap_writel(0, mmD0_PCIE_CORE_REQ_RETRY_EN);
++		regmap_writel(0, D0_PCIE_CORE_REG(mmPCIE_CORE_REQ_RETRY_EN));
+ 
+ 	/* Enable downstream access */
+-	regmap_writel(0, mmD0_PCIE_AUX_HOST_TERM_CTRL);
++	regmap_writel(0, D0_PCIE_AUX_REG(mmPCIE_AUX_HOST_TERM_CTRL));
+ 	/* Enable PCIe outbound memory access  */
+-	regmap_writel(0, mmD0_PCIE_WRAP_MASK_REQ);
++	regmap_writel(0, D0_PCIE_WRAP_REG(mmPCIE_WRAP_MASK_REQ));
+ }

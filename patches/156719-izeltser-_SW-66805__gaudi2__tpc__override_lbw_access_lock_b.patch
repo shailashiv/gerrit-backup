@@ -1,0 +1,49 @@
+From bc984d3662ec0c7c7e3782b95c79265b45d8ead1 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 14 Dec 2021 15:32:53 +0200
+Subject: [PATCH] [SW-66805] gaudi2: tpc: override lbw access lock bit
+
+After FW is accessing the TPC configuration space invalid_lock_access
+irq is observed. The cause for this violation is that ARM uses the
+same AxUSER default value both for LBW and HBW. HBW access AxUSER[10]
+is MMU BP while for LBW this is Lock indication.
+
+Workaround:
+Use CPU master IF to override LBW access-
+1. Configure Value of 0x0 to CPU_MSTR_IF.LB_LOCK
+2. Configure value of 0xFFFF_FBFF to CPU_MSTR_IF.LB_OVRD
+
+Change-Id: I8796b6a686da1eb4064c7808ae8a72354cc95593
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/asic.c b/arch/gaudi2/common/asic.c
+index 228f401..095b2aa 100644
+--- a/arch/gaudi2/common/asic.c
++++ b/arch/gaudi2/common/asic.c
+@@ -12,6 +12,7 @@
+ #include <pcie_aux_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_aux_masks.h>
++#include <cpu_mstr_if_axuser_regs.h>
+ 
+ #include <string.h>
+ #include <preboot.h>
+@@ -323,3 +324,17 @@
+ {
+ 	hl_fuse_print_hbm();
+ }
++
++#define LOCK_BIT_OVRD_MASK	0xFFFFFBFF
++
++void preboot_engines_init(void)
++{
++	/*
++	 * GAUDI2_1400 Erratum workaround.
++	 * any access from ARM to TPC registers causes a lock_access irq, due
++	 * to wrong AxUSER default value in HW for LBW access.
++	 * workaround: override LBW access user bits from cpu master if.
++	 */
++	regmap_writel(0, mmCPU_MSTR_IF_AXUSER_LB_LOCK);
++	regmap_writel(LOCK_BIT_OVRD_MASK, mmCPU_MSTR_IF_AXUSER_LB_OVRD);
++}

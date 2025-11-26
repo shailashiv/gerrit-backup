@@ -1,0 +1,87 @@
+From 1958fe05375e0f64c363cb55f7bc7f923e7970bd Mon Sep 17 00:00:00 2001
+From: Sai Surya Teja <sssteja@habana.ai>
+Date: Mon, 21 Feb 2022 08:36:50 +0200
+Subject: [PATCH] [SW-75471] gaudi2: security: update noc and psoc hbw rr
+
+Updating noc and psoc hbw rrs in preboot as per recent hbw spec update.
+Blocking SPI_FLASH_START (0x1000007FF6000000) to DBG_SPACE_BASE
+(0x1000007FF8000000) for psoc and noc rrs.
+
+Change-Id: Idc0b3707c99ec99610859fd02f3ba319b7eb02c5
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 5949a84..5a4f184 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -929,18 +929,10 @@
+ #define SRAM_RSVD_BASE		0x1000008000000000ull
+ #define DRAM_RSVD_END		0xFF00000000000000ull
+ 
+-static void hl_secure_hbw(struct hl_rr_eng_select rr_sel)
++/* common function for ppboot and preboot HBW RR programming */
++static void hl_secure_hbw_common(struct hl_rr_eng_select rr_sel)
+ {
+ 	u64 min, max;
+-
+-	/*
+-	 * SPI FLASH END to SP SRAM END
+-	 * Includes the reserved space at end of SPSRAM.
+-	 * 0x1000007FF7000000 - 0x1000007FF7FFF000
+-	 */
+-	min = SPI_FLASH_END;
+-	max = SCRATCHPAD_SRAM_ADDR + SCRATCHPAD_SRAM_SIZE;
+-	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, min, max, rr_sel);
+ 
+ 	/*
+ 	 * Block Reserved space to HBM
+@@ -962,18 +954,29 @@
+ static void ppboot_secure_hbw(void)
+ {
+ 	struct hl_rr_eng_select rr_sel;
++	u64 min, max;
+ 
+ 	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
+ 
+ 	/* Only block pcie RR in ppboot */
+ 	rr_sel.pcie = 1;
+ 
+-	hl_secure_hbw(rr_sel);
++	/*
++	 * SPI FLASH END to SP SRAM END
++	 * Includes the reserved space at end of SPSRAM.
++	 * 0x1000007FF7000000 - 0x1000007FF7FFF000
++	 */
++	min = SPI_FLASH_END;
++	max = SCRATCHPAD_SRAM_ADDR + SCRATCHPAD_SRAM_SIZE;
++	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, min, max, rr_sel);
++
++	hl_secure_hbw_common(rr_sel);
+ }
+ 
+ static void preboot_secure_hbw(void)
+ {
+ 	struct hl_rr_eng_select rr_sel;
++	u64 min, max;
+ 
+ 	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
+ 
+@@ -981,7 +984,17 @@
+ 	rr_sel.noc = 1;
+ 	rr_sel.psoc = 1;
+ 
+-	hl_secure_hbw(rr_sel);
++	/*
++	 * For noc and psoc rrs, need to protect from SPI_FLASH_END to DBG_SPACE_BASE
++	 * SPI FLASH END to DBG_SPACE_BASE
++	 * Reusing the HL_SEC_HBW_ICCM0_TO_SP_SRAM rr idx to increase the protection range.
++	 * 0x1000007FF7000000 - 0x1000007FF8000000ull
++	 */
++	min = SPI_FLASH_END;
++	max = DBG_SPACE_BASE;
++	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, min, max, rr_sel);
++
++	hl_secure_hbw_common(rr_sel);
+ }
+ 
+ static void hl_secure_dyn_rr_cfg(int rr_idx, u64 min64, u64 max64)

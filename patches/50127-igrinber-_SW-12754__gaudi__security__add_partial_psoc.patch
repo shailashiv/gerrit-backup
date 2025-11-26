@@ -1,0 +1,131 @@
+From d678440e61725b638c00a3c951c78c214fc16083 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 04 Sep 2020 12:31:40 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: add partial psoc
+
+Implement PSOC protection with "protection bits".
+The RRs protection will be added in a separate commits - thus this is a
+partial protection of the PSOC domain.
+
+Change-Id: I74f6be700b9e2b59f307d712ddfe3603f21fc46f
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index f4d18a7..25b0efd 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -10,11 +10,13 @@
+ #include <gaudi_blocks.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <cpu_if_regs.h>
++#include <psoc_global_conf_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <sif_rtr_ctrl_7_regs.h>
+ #include <psoc_global_conf_regs.h>
+ 
+ #include <cpu_if_masks.h>
++#include <psoc_global_conf_masks.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
+@@ -299,6 +301,91 @@
+ 	/* TODO: use RRs for CPU_TIMESTAMP protection */
+ }
+ 
++static void preboot_secure_psoc_global_conf(void)
++{
++	int i;
++	u32 mask, prot_base, base = mmPSOC_GLOBAL_CONF_BASE & ~HL_CFG_BASE;
++
++	prot_base = base;	/* offsets: 0 - 0x80 */
++	mask = ~(PROT_BIT(mmPSOC_GLOBAL_CONF_NON_RST_FLOPS_0) &
++		PROT_BIT(mmPSOC_GLOBAL_CONF_BTM_FSM));
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x80 - 0x100 */
++	set_prot_bits_range_all(prot_base, SNGL_REG_PROT_SIZE);
++
++	/* Unprotect SCRATCHPADs: offsets: 0x100 - 0x200 */
++	for (i = 0; i < 2; i++) {
++		prot_base += SNGL_REG_PROT_SIZE;
++		regmap_writel(~0, PRIV_PROT_REG(prot_base));
++	}
++
++	/* offsets: 0x200 - 0x300 */
++	prot_base += SNGL_REG_PROT_SIZE;
++	set_prot_bits_range_all(prot_base, SNGL_REG_PROT_SIZE * 2);
++
++	/* offsets: 0x300 - 0x380 */
++	prot_base += SNGL_REG_PROT_SIZE * 2;
++	mask = ~(PROT_BIT(mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS) &
++		PROT_BIT(mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU) &
++		PROT_BIT(mmPSOC_GLOBAL_CONF_TRACE_ADDR) &
++		PROT_BIT(mmPSOC_GLOBAL_CONF_TRACE_AWUSER) &
++		PROT_BIT(mmPSOC_GLOBAL_CONF_TRACE_ARUSER));
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x380 - 0x480 */
++	set_prot_bits_range_all(prot_base, SNGL_REG_PROT_SIZE * 2);
++
++	prot_base += SNGL_REG_PROT_SIZE * 2;	/* offsets: 0x480 - 0x500 */
++	mask = ~PROT_BIT(mmPSOC_GLOBAL_CONF_SW_ALL_RST);
++	regmap_writel(mask, PRIV_PROT_REG(prot_base));
++
++	prot_base += SNGL_REG_PROT_SIZE;	/* offsets: 0x500 - 0xF80 */
++	set_prot_bits_range_all(prot_base, PROT_SIZE_MAX - (prot_base - base));
++}
++
++static void preboot_secure_psoc(void)
++{
++	u32 mask/*, base*/;	/* uncomment along with eFuse protection code */
++
++	/* Set PSOC level to privilege */
++	mask = BIT(PSOC_GLOBAL_CONF_PROT_AR_SHIFT) |
++		BIT(PSOC_GLOBAL_CONF_PROT_AW_SHIFT);
++	regmap_writel(mask, mmPSOC_GLOBAL_CONF_PROT);
++
++	/*
++	 * TODO: use RRs to protect:
++	 *	 I2C M0/1, I2C_S, SPI, UART0-1, TIMER, WDOG
++	 */
++
++	/* Note: PSOC_TIMESTAMP should not be protected */
++
++	/* Protect EFUSE */
++	/* TODO: This eFuse protection is temporarily disabled until preboot
++	 * provides the eFuse data string offset through a scratchpad register
++	 * and LKD implements its parsing instead of direct access to eFuse h/w
++	 * interface. Then we can uncomment the eFuse protection.
++	 */
++/*
++	base = mmPSOC_EFUSE_BASE & ~HL_CFG_BASE;
++	set_prot_bits_range_all(base, PROT_SIZE_MAX);
++ */
++
++	/* Protect GLOBAL_CONF - 4K */
++	preboot_secure_psoc_global_conf();
++
++	/*
++	 * TODO: use RRs to protect:
++	 *	 GPIO0-6, BTL, CS_TRACE, DFT_EFUSE, RPMs,
++	 *	 PSOC PLLSs(CPU, MME, PCI, TPC, HBM), PM, TS, PWM0-3
++	 *	 RAZWI
++	 * and
++	 *	 PCIE_PMA_0-3
++	 */
++
++	/* TODO: handle PSOC_DBG/PSOC_ETR/AXICTL */
++}
++
+ static void preboot_security_pci_disable(void)
+ {
+ 	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
+@@ -345,6 +432,7 @@
+ 	preboot_security_pci_disable();
+ 
+ 	preboot_secure_cpu();
++	preboot_secure_psoc();
+ 
+ 	/* TODO: implement the rest of security enablement */
+ 

@@ -1,0 +1,179 @@
+From cc920ebac83b260bf983aec8368ffb56435b15d0 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 18 Sep 2022 10:04:10 +0300
+Subject: [PATCH] [SW-104157] gaudi2: init sram ecc
+
+SRAM self repair procedure is overwriting the ecc data of the SRAM,
+so after running the self repair the ECC must be initialized.
+So far it was performed by resetting the whole SRAM subsystem, but
+it's also resetting some parts of the NOC which can cause troubles
+if other activities are running in the background (like pci init).
+So we switch to plan B, and initialize the ECC data by writing the
+whole SRAM address space using the mem_cpy engine.
+
+Change-Id: I365f852879fa4888df9cb6e9c4f9aa88b97d4e41
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 6d0ee4b..56d3cf2 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -324,16 +324,6 @@
+ 	}
+ }
+ 
+-static void gaudi2_reset_srams(void)
+-{
+-	regmap_writel(PSOC_RESET_CONF_SRAM_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_SRAM_UNIT_RST);
+-	regmap_writel(PSOC_RESET_CONF_UNIT_RST_N_IND_MASK, mmPSOC_RESET_CONF_UNIT_RST_N);
+-	udelay(DELAY_1K_USEC); /* TODO: confirm the delay */
+-	regmap_writel(0, mmPSOC_RESET_CONF_UNIT_RST_N);
+-	regmap_writel(0, mmPSOC_RESET_CONF_SRAM_UNIT_RST);
+-	udelay(DELAY_1K_USEC); /* TODO: confirm the delay */
+-}
+-
+ static void init_sram_bist_data(void)
+ {
+ 	struct mem_desc desc;
+@@ -352,6 +342,132 @@
+ 	bist_data->magic_number = SRAM_BIST_MAGIC;
+ }
+ 
++#define HL_MEMCPY_TIMEOUT_US	100000
++#define HL_MEMCPY_OUTSTANDING	62
++#define HL_MEMCPY_SIZE_SHIFT	4
++
++static int gaudi2_memcpy_init_mem(u64 addr, u32 size)
++{
++	u64 start;
++	u32 mem_cfg, cpy_sts;
++
++	regmap_writel((u32)addr, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((u32)(addr >> 32), mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_MASK);
++
++	/* set size of in granularity of 16 bytes */
++	size >>= HL_MEMCPY_SIZE_SHIFT;
++	mem_cfg |= size & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK;
++	mem_cfg |= PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_MASK;
++
++	/* set number of outstanding write transactions */
++	mem_cfg |= HL_MEMCPY_OUTSTANDING << PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_SHIFT;
++
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	regmap_writel(0x0, mmPSOC_GLOBAL_CONF_MEM_CPY_CONST);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(PSOC_GLOBAL_CONF_MEM_CPY_CTRL_EN_MASK, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	start = timestamp_get_us();
++	while (1) {
++		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts & PSOC_GLOBAL_CONF_MEM_CPY_STATUS_DONE_MASK)
++			break;
++
++		if (timeout_expired(start, HL_MEMCPY_TIMEOUT_US)) {
++			preboot_puts_hex64_raw("memcpy timed out, addr ", addr, false);
++			preboot_puts_hex(" size", size, false);
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++#define HL_MEMCPY_MAX_SIZE	SZ_512K
++
++static void gaudi2_mem_init(u64 base, u32 size)
++{
++	u64 mem_base = base;
++	u32 cpy_size, remain_size = size;
++
++	while (remain_size) {
++		if (remain_size > HL_MEMCPY_MAX_SIZE)
++			cpy_size = HL_MEMCPY_MAX_SIZE;
++		else
++			cpy_size = remain_size;
++
++		gaudi2_memcpy_init_mem(mem_base, cpy_size);
++
++		remain_size -= cpy_size;
++		mem_base += cpy_size;
++	}
++}
++
++#define GAUDI2_DCORE_OFFSET	0x200000
++#define GAUDI2_SRAM_BANK_OFFSET	0x8000
++
++static void gaudi2_mask_sram_ecc(bool enable)
++{
++	u32 val;
++	int dcore, sram;
++	u32 offset;
++
++	if (enable) {
++		regmap_writel(CPU_IF_SRAM_DERR_INTR_MASK_VAL_MASK, mmCPU_IF_SRAM_DERR_INTR_MASK);
++		regmap_writel(CPU_IF_SRAM_SERR_INTR_MASK_VAL_MASK, mmCPU_IF_SRAM_SERR_INTR_MASK);
++		val = DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_GLBL_ERR_MASK_DERR_MASK |
++				DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_GLBL_ERR_MASK_SERR_MASK;
++	} else {
++		regmap_writel(0, mmCPU_IF_SRAM_SERR_INTR_MASK);
++		regmap_writel(0, mmCPU_IF_SRAM_DERR_INTR_MASK);
++		val = 0;
++	}
++
++	for (dcore = 0; dcore < NUM_OF_DCORES ; dcore++) {
++		offset = dcore * GAUDI2_DCORE_OFFSET;
++		for (sram = 0; sram < NUM_OF_SRAM_BANK_PER_DCORE; sram++) {
++			regmap_writel(val,
++				      mmDCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_GLBL_ERR_MASK + offset);
++			offset += GAUDI2_SRAM_BANK_OFFSET;
++		}
++	}
++}
++
++#define SRAM_BANK_ECC_CLR_MASK	(DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_CTL_DERR_CLR_MASK | \
++				 DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_CTL_SERR_CLR_MASK)
++
++static void gaudi2_mask_clear_sram_ecc(void)
++{
++	int dcore, sram, wrap;
++	u32 offset;
++	u32 num_mem_wrapper = regmap_readl(mmDCORE0_SRAM0_BANK_SPECIAL_MEM_NUMOF);
++
++	for (dcore = 0; dcore < NUM_OF_DCORES ; dcore++) {
++		offset = dcore * GAUDI2_DCORE_OFFSET;
++		for (sram = 0; sram < NUM_OF_SRAM_BANK_PER_DCORE; sram++) {
++			for (wrap = 0; wrap < num_mem_wrapper; wrap++) {
++				regmap_writel(wrap,
++					      mmDCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_SEL + offset);
++				regmap_writel(SRAM_BANK_ECC_CLR_MASK,
++					      mmDCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_CTL + offset);
++			}
++			offset += GAUDI2_SRAM_BANK_OFFSET;
++		}
++	}
++}
++
++static void gaudi2_sram_ecc_init(void)
++{
++	gaudi2_mask_sram_ecc(true);
++	gaudi2_mem_init(SDRAM_FULL_BASE, ARM_SDRAM_SIZE);
++	gaudi2_mask_clear_sram_ecc();
++	gaudi2_mask_sram_ecc(false);
++}
++
+ #define DFT_APB_CONTROL_DEFAULT_VAL		0xFE
+ void hl_sram_self_repair(void)
+ {
+@@ -365,6 +481,6 @@
+ 	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BIST);
+ 	/* Get back to normal from DFT mode */
+ 	regmap_writel(DFT_APB_CONTROL_DEFAULT_VAL, mmPSOC_GLOBAL_CONF_DFT_APB_CONTROL);
+-	gaudi2_reset_srams();
++	gaudi2_sram_ecc_init();
+ 	preboot_puts("bist done for 48MB SRAM\n");
+ }

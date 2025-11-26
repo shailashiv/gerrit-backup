@@ -1,0 +1,100 @@
+From 84415e134a9ca358b8d19032d3168ea3651404b0 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 26 May 2022 00:13:28 +0300
+Subject: [PATCH] [SW-71880] versions: make setup device specific
+
+Gaudi2 is no longer uses the legacy version registers, but forced to
+keep them defined for the common code to compile.
+Rework the versions setup code to be device specific and enable the
+legacy versions registers to be removed on Gaudi2.
+
+Change-Id: I3052e2a769291a589b50a4359e101fd958d63c0a
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 282d325..c238483 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -156,6 +156,24 @@
+ 	return i;
+ }
+ 
++__weak void preboot_dev_spec_legacy_vers_setup(enum preboot_vers vers_type, u32 offset)
++{
++	u32 reg;
++
++	switch (vers_type) {
++	case PREBOOT_BTL_VER:
++		reg = global_conf.preboot_ver_off_map;
++		break;
++	case PREBOOT_EFUSE_VER:
++		reg = global_conf.mmfuse_ver_off_map;
++		break;
++	default:
++		return;
++	}
++
++	regmap_writel(offset, reg);
++}
++
+ void preboot_version(void)
+ {
+ 	int err;
+@@ -181,7 +199,7 @@
+ 			break;
+ 	}
+ 
+-	regmap_writel((u32)(offset & ~SDRAM_BASE), global_conf.preboot_ver_off_map);
++	preboot_dev_spec_legacy_vers_setup(PREBOOT_BTL_VER, (u32)(offset & ~SDRAM_BASE));
+ 
+ 	err = boot_info_set(HL_BOOT_INFO_PREBOOT_BTL_VERSION, preboot_vers[PREBOOT_BTL_VER],
+ 			VERSION_MAX_LEN);
+@@ -259,7 +277,7 @@
+ 	preboot_puts_raw(preboot_vers[PREBOOT_EFUSE_VER]);
+ 	preboot_puts("\n");
+ 
+-	regmap_writel((u32)(offset & ~SDRAM_BASE), global_conf.mmfuse_ver_off_map);
++	preboot_dev_spec_legacy_vers_setup(PREBOOT_EFUSE_VER, (u32)(offset & ~SDRAM_BASE));
+ 
+ 	err = boot_info_set(HL_BOOT_INFO_PREBOOT_EFUSE_VERSION, preboot_vers[PREBOOT_EFUSE_VER],
+ 			VERSION_MAX_LEN);
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 9885e08..57fecd3 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1315,14 +1315,8 @@
+ 	global_conf.upd_pending_sts_map = mmUPD_PENDING_STS;
+ 	global_conf.upd_cmd_map = mmUPD_CMD;
+ 	global_conf.upd_sts_map = mmUPD_STS;
+-	/*
+-	 * Fuse version is transferred over the COMMS protocol, and the legacy
+-	 * register definition was removed. For backwards compatibility
+-	 * fuse_ver_offset and preboot_ver_off are still initialized here to
+-	 * the legacy scratchpad register.
+-	 */
+-	global_conf.preboot_ver_off_map = mmPSOC_GLOBAL_CONF_SCRATCHPAD_28;
+-	global_conf.mmfuse_ver_off_map = mmPSOC_GLOBAL_CONF_SCRATCHPAD_22;
++	global_conf.preboot_ver_off_map = 0; /* unused */
++	global_conf.mmfuse_ver_off_map = 0; /* unused */
+ }
+ 
+ void device_init_ca53_cfg(void)
+@@ -1352,3 +1346,5 @@
+ 	gaudi2_ack_pci_axi_irq();
+ 	gaudi2_ack_gic_irq();
+ }
++
++void preboot_dev_spec_legacy_vers_setup(enum preboot_vers vers_type, u32 offset) {}
+diff --git a/include/preboot.h b/include/preboot.h
+index 417afa6..094669d 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -251,6 +251,7 @@
+ 
+ void preboot_main(void);
+ void preboot_version(void);
++void preboot_dev_spec_legacy_vers_setup(enum preboot_vers vers_type, u32 offset);
+ void ppboot_secure_arc(void);
+ 
+ void hl_flr_report_err(u32 err_bit);

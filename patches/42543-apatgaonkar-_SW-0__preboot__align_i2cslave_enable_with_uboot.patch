@@ -1,0 +1,78 @@
+From 60d0c3d96ef9015b631d4ccffdf6b9f564db7182 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Tue, 07 Jul 2020 13:08:57 +0300
+Subject: [PATCH] [SW-0] preboot: align i2cslave enable with uboot
+
+As BMC panics are happening with i2c slave module
+in preboot, so aligning software flow exactly with
+uboot where this panic is not reproducible.
+This patch will check for any read requests
+as soon as i2c slave is enabled.
+
+Change-Id: I630ba04b303e6e9b622cbe29950908055f82cd31
+---
+
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 67a5dcb..919185b 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -38,17 +38,14 @@
+ 	HL_DEVICE_STATUS = 166,
+ };
+ 
+-static void hl_i2c_slave_init(void)
++static void hl_i2c_slave_init(bool debug_mode)
+ {
+-	bool debug_mode;
+-
+ 	/* Check if already enabled */
+ 	if (regmap_readl(mmPSOC_I2C_S_IC_ENABLE)) {
+ 		preboot_puts("I2C SLAVE already initialized\n");
+ 		return;
+ 	}
+ 
+-	debug_mode = hl_is_debug_mode(HL_DEBUG_HW_I2C);
+ 	if (debug_mode) {
+ 		regmap_writel(I2C_SLAVE_ADDRESS_DBG, mmPSOC_I2C_S_IC_SAR);
+ 	} else {
+@@ -77,8 +74,6 @@
+ 
+ 	/* Write 1 to IC_ENABLE to enable DW_apb_i2c */
+ 	regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
+-
+-	preboot_puts("I2C SLAVE initialized\n");
+ }
+ 
+ static u32 i2c_dw_read_clear_intrbits_slave(void)
+@@ -130,7 +125,30 @@
+ 
+ void module_i2c_s_setup(void)
+ {
+-	hl_i2c_slave_init();
++	unsigned int stat;
++	bool debug_mode;
++
++	debug_mode = hl_is_debug_mode(HL_DEBUG_HW_I2C);
++
++	hl_i2c_slave_init(debug_mode);
++
++	if (!debug_mode) {
++		stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++			module_i2c_s_run_fast();
++
++		regmap_writel(0x1, mmPSOC_I2C_S_IC_ENABLE);
++
++		stat = regmap_readl(mmPSOC_I2C_S_IC_INTR_STAT);
++
++		if (stat & (PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK |
++			    PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
++			module_i2c_s_run_fast();
++	}
++
++	preboot_puts("I2C SLAVE initialized\n");
+ }
+ 
+ enum cmd_check_res module_i2c_s_check(void)

@@ -1,0 +1,293 @@
+From d9b7e36b52d396696ab95056666114e91f27b227 Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Sun, 26 Apr 2020 13:39:29 +0300
+Subject: [PATCH] [SW-11867] preboot: add asic thermal sensors reading capability
+
+this patch adds the infrastructure changes required to get on-chip
+thermal sensors readings from pre-boot using i2c interfaces
+
+As part of the SLIM flash layout changes it is decided to service
+I2C slave requests from pre-boot and hence ASIC temperature sensors
+readings should be supported from preboot.
+
+Change-Id: I6a7b545bd48eb5e9c1086723d3db8d7e17480478
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/app/preboot.c b/app/preboot.c
+index 68efc44..ff9b443 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -167,6 +167,7 @@
+ 	udelay_init();
+ 
+ 	hl_uart_init();
++	hl_ts_init();
+ 	preboot_version();
+ 	preboot_handle_cmds();
+ }
+diff --git a/common/thermal.c b/common/thermal.c
+new file mode 100644
+index 0000000..a805597
+--- /dev/null
++++ b/common/thermal.c
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <stdbool.h>
++#include "thermal.h"
++#include <pll.h>
++#include <thermal.h>
++#include <efuse.h>
++#include <thermal.h>
++#include <string.h>
++
++#define HL_TS_SDIF_DATA_OFFSET	0x44
++#define HL_TS_CLK_SYNTH		0x010
++#define HL_TS_SDIF		0x020
++#define HL_TS0_ALARMA_CFG	0x144
++#define HL_TS0_ALARMB_CFG	0x164
++#define C_TO_MC			1000
++
++struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
++
++__attribute__((weak)) void hl_ts_clk_set(u32 addr, unsigned int clk)
++{
++	/* TODO goya/gaudi specific clock settings */
++
++}
++__attribute__((weak)) void hl_ts_sdif_set(u32 addr, bool use_calib)
++{
++	/* TODO goya/gaudi specific sdif settings */
++}
++
++/* convert 12-bit HL_TMP register value to milliCelsius */
++__attribute__((weak)) long hl_tmp_temp_reg_to_mC(int val, int ts)
++{
++	/* TODO goya/gaudi specific temp conversions */
++	return 0;
++}
++
++/* convert milliCelsius to 12-bit HL_TMP register value */
++__attribute__((weak)) u32 hl_tmp_mC_to_temp_reg(long val, int ts)
++{
++	/* TODO goya/gaudi specific temp conversions */
++	return 0;
++}
++/* twos complement to u32 without changing result sign
++ * since the temperature formula uses the positive value of
++ * the conversion.
++ */
++static inline s32 twos_complement_to_s32(u32 val)
++{
++	return  val & 0x8000 ? ((~val & 0xFFFF) + 1) * (-1) : val;
++}
++
++/* Extract A and B coefficients from efuse
++ *
++ * A:
++ * N_bin_twos_comp = efuse_read & 0x0000FFFF
++ * N_bin = twos_comp(N_bin_twos_comp, 16) #twos complement to int
++ * A_North = (N_bin * (-1)) / 1000.0
++ * A = A + A_North
++ *
++ * B:
++ * N_bin_twos_comp = (efuse_read >> (2) * 8) & 0x0000FFFF
++ * N_bin = twos_comp(N_bin_twos_comp, 16) #twos complement to int
++ * B_North = (N_bin * (-1)) / 1000.0
++ * B = B + B_North
++ */
++static inline void hl_tmp_extract_A_B(u32 calib_data, int ts)
++{
++	s32 efuse_a_coeff = calib_data & 0xFFFF;
++	s32 efuse_b_coeff = (calib_data >> 16) & 0xFFFF;
++
++	/* convert from two's complement to int */
++	efuse_a_coeff = twos_complement_to_s32(efuse_a_coeff);
++	efuse_b_coeff = twos_complement_to_s32(efuse_b_coeff);
++
++	/* A and B extracted has to be divided by 1000,
++	 * but since defined coefficients are multiplied by 100
++	 * for accuracy purposes, the coeff extracted are divided
++	 * only by 10 to match defined coefficients resolution.
++	 */
++	hl_ts_data[ts].hl_tmp_data.coef_a_g += efuse_a_coeff / 10;
++	hl_ts_data[ts].hl_tmp_data.coef_b_h += efuse_b_coeff / 10;
++}
++
++__attribute__((weak)) int get_alarma_offset(void)
++{
++	return HL_TS0_ALARMA_CFG;
++}
++
++__attribute__((weak)) int get_alarmb_offset(void)
++{
++	return HL_TS0_ALARMB_CFG;
++}
++
++static inline void hl_ts_alarm_set(u32 ts_num)
++{
++	long reg;
++	int alarm_mc;
++
++	alarm_mc = hl_ts_data[ts_num].alarm_a * C_TO_MC;
++	reg = hl_tmp_mC_to_temp_reg(alarm_mc, ts_num);
++	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarma_offset());
++
++	alarm_mc = hl_ts_data[ts_num].alarm_b * C_TO_MC;
++	reg = hl_tmp_mC_to_temp_reg(alarm_mc, ts_num);
++	regmap_writel(reg, hl_ts_data[ts_num].base + get_alarmb_offset());
++}
++
++
++__attribute__((weak)) void hl_set_calib_coeff(int ts, bool calib_enabled,
++		struct hl_tmp_opmode_info *calib_data)
++{
++	/* TODO goya/gaudi specific calib offsets */
++}
++
++__attribute__((weak)) int hl_ts_get_count(void)
++{
++	return HL_ASIC_TS_MAX_COUNT;
++}
++
++__attribute__((weak)) int get_sdif_offset(void)
++{
++	return HL_TS_SDIF;
++}
++
++__attribute__((weak)) int hl_ts_pvt_init(int ts)
++{
++	return 0;
++}
++
++__attribute__((weak)) void hl_ts_data_init(void)
++{
++	memset(hl_ts_data, 0, sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
++
++void hl_ts_init(void)
++{
++	u32 efuse_word, ts;
++
++	hl_ts_data_init();
++
++	for (ts = 0; ts < hl_ts_get_count(); ts++) {
++
++		if (hl_ts_pvt_init(ts))
++			continue;
++
++		if (!hl_ts_data[ts].use_calib)
++			hl_set_calib_coeff(ts, false,
++						&hl_ts_data[ts].hl_tmp_data);
++
++		else {
++			preboot_fuse_read(hl_ts_data[ts].calib_offset,
++						&efuse_word);
++
++			/* Calculate new A and B coeff using efuse offsets */
++			hl_tmp_extract_A_B(efuse_word, ts);
++			hl_set_calib_coeff(ts, true,
++						&hl_ts_data[ts].hl_tmp_data);
++		}
++
++		hl_ts_alarm_set(ts);
++		hl_ts_clk_set(hl_ts_data[ts].base, hl_ts_data[ts].freq);
++		hl_ts_sdif_set(hl_ts_data[ts].base, hl_ts_data[ts].use_calib);
++
++	}
++}
++
++__attribute__((weak)) int get_sdif_data_offset(void)
++{
++	return HL_TS_SDIF_DATA_OFFSET;
++}
++
++int hl_ts_get_max_temp(void)
++{
++	int tmp, max_tmp = 0;
++	int ts_num, ts;
++
++	ts_num = hl_ts_get_count();
++	for (ts = 0; ts < ts_num; ts++) {
++		tmp = regmap_readl(hl_ts_data[ts].base +
++					get_sdif_data_offset());
++		tmp = hl_tmp_temp_reg_to_mC(tmp, ts);
++		if (max_tmp < tmp)
++			max_tmp = tmp;
++	}
++
++	return max_tmp;
++}
+diff --git a/common/thermal.h b/common/thermal.h
+new file mode 100644
+index 0000000..c5a281c
+--- /dev/null
++++ b/common/thermal.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _HL_THERMAL_H_
++#define _HL_THERMAL_H_
++
++#include <preboot.h>
++#include <stdbool.h>
++
++#define HL_ASIC_TS_MAX_COUNT    4
++
++struct hl_tmp_opmode_info {
++	/* temp Formula coefficients */
++	u32 coef_a_g;   /* G for uncalibrated, A for calibrated */
++	u32 coef_b_h;   /* H for uncalibrated, B for calibrated */
++	u32 coef_j;
++	u32 coef_div;
++	u32 fclk;
++
++	/* sensor operation mode config */
++	unsigned int opmode;
++};
++
++struct hl_ts_cfg {
++	u32 base;
++	u64 freq;
++	u32 alarm_a;
++	u32 alarm_b;
++	u32 calib_offset;
++	bool use_calib;
++	struct hl_tmp_opmode_info hl_tmp_data;
++};
++
++extern struct hl_ts_cfg hl_ts_data[HL_ASIC_TS_MAX_COUNT];
++
++int hl_ts_get_max_temp(void);
++
++#endif /* _HL_THERMAL_H_ */
+diff --git a/include/preboot.h b/include/preboot.h
+index ee354fb..bf0cc4f 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -48,6 +48,7 @@
+ 
+ typedef unsigned char u8;
+ typedef unsigned int u32;
++typedef signed int s32;
+ typedef unsigned long long u64;
+ 
+ enum hl_rst_src {
+@@ -87,6 +88,7 @@
+ u32 hl_spi_baudr_get(void);
+ int hl_pcie_init_only(void);
+ void hl_plat_init(void);
++void hl_ts_init(void);
+ 
+ void preboot_pcie_wait_for_link(void);
+ void preboot_delay(void);

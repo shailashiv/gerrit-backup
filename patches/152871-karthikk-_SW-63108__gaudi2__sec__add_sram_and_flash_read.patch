@@ -1,0 +1,114 @@
+From 9372bc987b03cebe5a9de04c107fc6b5b171afe1 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 02 Dec 2021 18:21:09 +0200
+Subject: [PATCH] [SW-63108] gaudi2: sec: add sram and flash read
+
+SRAM and SPI Flash memory is to be opened up for read-only access
+when hypervisor sends a fit with FIT_LOAD_TYPE_SRAM_SF_ACCESS load
+type. The hbw range registers index 8 and 9 support read-only
+functionality.
+
+This patch supports enabling/disabling sram and spi flash read
+support.
+
+Change-Id: I2f5bd8e15346ad29d1c9005354f6f6883e51afdc
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 9d5ff55..e463f38 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1080,3 +1080,16 @@
+ {
+ 	return (u32)mmPCIE_DBI_BASE & 0xFFFFFFF;
+ }
++
++int preboot_set_sram_sf_access(bool is_enable)
++{
++	/*
++	 * TODO: Add hbm initialized pre-condition once
++	 * hbm init is ported for preboot.
++	 */
++	spi_flash_lock_access(is_enable);
++	preboot_security_sram_pci_set_ro(is_enable);
++	preboot_security_sf_pci_set_ro(is_enable);
++
++	return 0;
++}
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 23f216f..53085d2 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -167,6 +167,8 @@
+ 	 */
+ 	HL_SEC_HBW_SRAM_END = HL_SEC_HBW_SRAM,
+ 	HL_SEC_HBW_HBM = 7,
++	HL_SEC_HBW_SRAM_RO = 8,
++	HL_SEC_HBW_SF_RO = 9,
+ 	HL_SEC_HBW_MAX_RR_IDX = 10,
+ };
+ 
+@@ -896,3 +898,63 @@
+ 	preboot_secure_lbw();
+ 	preboot_secure_hbw();
+ }
++
++void preboot_security_sram_pci_set_ro(bool en)
++{
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++	rr_sel.pcie = true;
++
++	if (en) {
++		/*
++		 * Make SRAM Read-only
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_RO, SRAM_BASE_ADDR, SRAM_END, rr_sel);
++		/*
++		 * Dynamic RR is inclusive of the static SRAM RR, hence the dynamic RRs
++		 * need to be opened in order for SRAM protection to be disabled.
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_BGN, 0, 0, rr_sel);
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_IMG, 0, 0, rr_sel);
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_END, 0, 0, rr_sel);
++	} else {
++		/*
++		 * Re-activate SRAM protection using the dynamic init
++		 */
++		preboot_security_dynamic_init();
++		/*
++		 * Disable SRAM Read-only configuration
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_RO, 0, 0, rr_sel);
++	}
++}
++
++void preboot_security_sf_pci_set_ro(bool en)
++{
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++	rr_sel.pcie = true;
++
++	if (en) {
++		/*
++		 * Make SPI Flash Read-only.
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SF_RO, SPI_FLASH_BASE, SPI_FLASH_END, rr_sel);
++		/*
++		 * Disable SPI Flash static protection.
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, 0, 0, rr_sel);
++	} else {
++		/*
++		 * Activate SPI Flash static protection.
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, SPI_FLASH_BASE, SPI_FLASH_BASE, rr_sel);
++		/*
++		 * Disable SPI Flash Read-only configuration.
++		 */
++		hl_secure_hbw_rr(HL_SEC_HBW_SF_RO, 0, 0, rr_sel);
++	}
++
++}

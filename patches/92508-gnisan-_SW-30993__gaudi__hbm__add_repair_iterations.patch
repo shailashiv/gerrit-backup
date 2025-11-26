@@ -1,0 +1,274 @@
+From fe9627588a9565f3174670fa6317c8c96324b2d2 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 04 May 2021 13:53:12 +0300
+Subject: [PATCH] [SW-30993] gaudi: hbm: add repair iterations
+
+Add iterative repair procedure to the AC test:
+- Run MCBIST, pass if successful.
+- If not, restart the problematic device/channel/pseudo channel from
+  the next row (MCBIST stops at the first bad row).
+- If successful, attempt row replacement (placeholder for now), if not,
+  attempt lane (IO) repair.
+- Reapeat (up to 5 iterations)
+
+Change-Id: Iaab51e34cc78924d35065df0f34936ee49cf5f20
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index 65e9f03..c5d303f 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -78,6 +78,8 @@
+ #define CBUS_LANES_NUM			8
+ #define RBUS_LANES_NUM			6
+ 
++#define MAX_LANE_REPAIR_ITERATIONS	5
++
+ struct hbm {
+ 	u32 acc_initial;
+ 	u32 internal_lb_length_usec;
+@@ -86,6 +88,7 @@
+ 	u8 inc;
+ 	u8 training_delay;
+ 	u8 hardware_training_repeat;
++	u8 lane_repair_iter[GAUDI_HBM_DEVICES];
+ };
+ 
+ static struct hbm hbm_data = {
+@@ -100,6 +103,7 @@
+ 	 */
+ 	.training_delay = 7,
+ 	.hardware_training_repeat = 1, /* range 1-4 */
++	.lane_repair_iter = {},
+ };
+ 
+ struct hlr_count {
+@@ -155,6 +159,28 @@
+ struct extest_skip_info {
+ 	u32 wdr_entry;
+ 	u32 bit;
++};
++
++struct mcbist_err_start_addr {
++	union {
++		struct {
++			u32 col :6;
++			u32 res6 :2;
++			u32 row :14;  /* Documented 15 is a mistake */
++			u32 not_row :1;
++			u32 res23 :1;
++			u32 bank :2;
++			u32 bg :2;
++			u32 res28 :1;
++			u32 res29 :3;
++		};
++		u32 val;
++	};
++};
++
++struct mcbist_err_row_addr {
++	bool is_error;
++	struct mcbist_err_start_addr addr;
+ };
+ 
+ enum phy_state {
+@@ -1268,11 +1294,17 @@
+ 
+ static int hbm_channel_ac_test_repair(int device, int ch)
+ {
++	struct hbm *hbm = &hbm_data;
+ 	struct ch_lane_repair_info *hlr = &hlr_info[device][ch];
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 status = RREG32(base + ch * 0x1000 + 0x11C);
+ 	u32 mismatch, expected, flipped;
+ 	int pc, i;
++
++	if (hbm->lane_repair_iter[device] == MAX_LANE_REPAIR_ITERATIONS)
++		return 1;
++
++	hbm->lane_repair_iter[device]++;
+ 
+ 	for (pc = 0; pc < PC_PER_CH; pc++) {
+ 		if (!!(status & BIT(24 + pc))) /* No failures */
+@@ -1302,27 +1334,135 @@
+ 	return hbm_channel_lane_repair(device, ch);
+ }
+ 
+-static int mcbist_poll_completion(int sid, int dev, bool is_repair)
++static int mcbist_err_restart_next_row(int sid, int dev, int ch, u32 status,
++				       struct mcbist_err_row_addr *row_err)
+ {
+-	int err, ch, rc = 0;
++	u32 base = GAUDI_HBM_CFG_BASE + dev * GAUDI_HBM_CFG_OFFSET;
++	struct mcbist_err_start_addr naddr;
++	int started = 0;
++	int pc;
++
++	for (pc = 0; pc < PC_PER_CH; pc++) {
++		if (!!(status & BIT(0 + pc)))
++			continue;
++
++		if (!!(status & BIT(24 + pc)))
++			continue; /* Test pass on PC */
++
++		/* Select pseudo channel */
++		RMWREG32(base + ch * 0x1000 + 0x100, pc, BIT(5));
++
++		/* Read failed addess */
++		row_err[pc].addr.val = RREG32(base + ch * 0x1000 + 0x124);
++		row_err[pc].is_error = true;
++
++		/* Restart from the beginning of the next row */
++		naddr = row_err[pc].addr;
++		naddr.col = 0;
++		if (!++naddr.row)			/* Final row */
++			if (!++naddr.bank)		/* Final bank */
++				if (!++naddr.bg)	/* Final bank group */
++					continue;	/* Last row */
++
++		/* Set start address to next row */
++		WREG32(base + ch * 0x1000 + 0x104,
++		       naddr.val | sid << 28 | sid << 29);
++
++		/* Start BIST on specific PC */
++		WREG32(base + ch * 0x1000 + 0x11C, BIT(pc));
++		started++;
++	}
++
++	return !started;
++}
++
++static int hbm_pc_row_repair(int sid, int device, int ch, int pc,
++			     struct mcbist_err_start_addr addr)
++{
++	/* TODO: implement row repair here */
++
++	return -1;
++}
++
++static int hbm_channel_row_repair(int sid, int device, int ch,
++				  struct mcbist_err_row_addr row_err[])
++{
++	int err;
++	int pc;
++
++	for (pc = 0; pc < PC_PER_CH; pc++) {
++		if (!row_err[pc].is_error)
++			continue;
++
++		err = hbm_pc_row_repair(sid, device, ch, pc, row_err[pc].addr);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++#define MCBIST_CH_MAX_RETRIES	2
++
++/*
++ * Return 0 if successful, -1 for failure, and 1 for re-run AC test.
++ */
++static int mcbist_poll(int sid, int dev, bool is_repair)
++{
++	struct mcbist_err_row_addr row_err[PC_PER_CH];
++	int err, ch, rc = 0, retry;
++
+ 	u32 base, status;
+ 
+ 	base = GAUDI_HBM_CFG_BASE + dev * GAUDI_HBM_CFG_OFFSET;
+ 
+ 	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
+-		err = hbm_poll_timeout(base + ch * 0x1000 + 0x11C, 0x03000000,
+-				       GAUDI_HBM_ECC_CFG_TIMEOUT_US, &status);
+-		if (!err)
+-			continue;
++		memset(row_err, 0, sizeof(row_err));
+ 
+-		if (!is_repair) {
+-			rc = -1;
+-			continue;
++		for (retry = 0; retry < MCBIST_CH_MAX_RETRIES; retry++) {
++			if (retry > 0) {
++				err = mcbist_err_restart_next_row(sid, dev, ch,
++								  status,
++								  row_err);
++				/* Failed to restart MCBIST, this may happen in
++				 * the rare case where the failed row is also
++				 * the last row. We should attempt row
++				 * replacement.
++				 */
++				if (err) {
++					err = 0;
++					break;
++				}
++			}
++
++			err = hbm_poll_timeout(base + ch * 0x1000 + 0x11C, 0x03000000,
++				       GAUDI_HBM_ECC_CFG_TIMEOUT_US, &status);
++			if (!err)
++				break;
++
++			if (!is_repair) {
++				rc = -1;
++				break;
++			}
+ 		}
+ 
+-		err = hbm_channel_ac_test_repair(dev, ch);
++		if ((!retry && !err) || !is_repair)
++			continue;
++
++		rc = 1; /* Run AC test again */
++
++		/* In case that MCBIST failed after retry suggest a lane issue,
++		 * while single failure may suggest row issue.
++		 */
+ 		if (err)
++			err = hbm_channel_ac_test_repair(dev, ch);
++		else
++			err = hbm_channel_row_repair(sid, dev, ch, row_err);
++
++		if (err) {
++			is_repair = false; /* Don't attempt to repair others */
+ 			rc = -1;
++		}
+ 	}
+ 
+ 	return rc;
+@@ -1330,7 +1470,7 @@
+ 
+ static int mcbist_write_read_full(struct hbm *hbm, int unused, bool is_repair)
+ {
+-	int device, ch, sid, acc_err = 0;
++	int device, ch, sid, err, acc_err = 0;
+ 	u32 base, pseudo_rand = 0x1, interleave = 0x0;
+ 	enum mc_bist_mode bist_mode = mc_bist_mode_once;
+ 
+@@ -1375,9 +1515,11 @@
+ 		}
+ 
+ 		/* Poll for MCBIST completion */
+-		for (device = 0; device < GAUDI_HBM_DEVICES; device++)
+-			acc_err |= mcbist_poll_completion(sid, device,
+-							  is_repair);
++		for (device = 0; device < GAUDI_HBM_DEVICES; device++) {
++			err = mcbist_poll(sid, device, is_repair);
++			if (err && acc_err >= 0)
++				acc_err = err;
++		}
+ 
+ 		if (acc_err)
+ 			break;
+@@ -2296,7 +2438,9 @@
+ 	hbm_reset_failures();
+ 
+ 	/* MC BIST (validate Training result and attempt repair) */
+-	err = mcbist_write_read_full(hbm, 0, true);
++	do {
++		err = mcbist_write_read_full(hbm, 0, true);
++	} while (err > 0);
+ 	if (err)
+ 		return 1;
+ 

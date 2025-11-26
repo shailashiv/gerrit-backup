@@ -1,0 +1,112 @@
+From 4a15d3320c8d267ea745b89b1f3470c579c51b06 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 26 Jan 2021 15:33:23 +0200
+Subject: [PATCH] [SW-30453] preboot: add crc32 function
+
+Add a way to compute CRC32 using 256 deep lookup table.
+Taken from Linux implementation of Sarwate algorithm with additional bit
+flip for pre and post CRC.
+
+Change-Id: Ide6cde6244f96ace651bb7f3024b2e807d6330fb
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/include/crc32.h b/include/crc32.h
+new file mode 100644
+index 0000000..5e577a6
+--- /dev/null
++++ b/include/crc32.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _CRC_H_
++#define _CRC_H_
++
++#define CRC32_LEN	4
++
++void crc32_init_lookup(void);
++u32 crc32(u32 crc, unsigned char const *p, size_t len);
++
++#endif
+diff --git a/preboot/crc32.c b/preboot/crc32.c
+new file mode 100644
+index 0000000..3f85224
+--- /dev/null
++++ b/preboot/crc32.c
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <preboot.h>
++#include <uart.h>
++
++/*
++ * Compute CRC32 using 256 deep lookup table.
++ * Taken from Linux implementation of Sarwate algorithm with additional bit
++ * flip for pre and post CRC.
++ * This implementation is only good for little endian processor.
++ */
++
++#define CRC32_POLY	0xedb88320
++#define CRC_BITS	8
++#define TABLE_SIZE	256
++
++static u32 crc32table[256];
++
++void crc32_init_lookup(void)
++{
++	unsigned int i, j;
++	u32 crc = 1;
++
++	crc32table[0] = 0;
++
++	for (i = TABLE_SIZE >> 1; i; i >>= 1) {
++		crc = (crc >> 1) ^ ((crc & 1) ? CRC32_POLY : 0);
++		for (j = 0; j < TABLE_SIZE; j += 2 * i)
++			crc32table[i + j] = crc ^ crc32table[j];
++	}
++	for (i = 0; i < TABLE_SIZE; i++) {
++		crc = crc32table[i];
++		crc = crc32table[crc & 0xff] ^ (crc >> 8);
++	}
++}
++
++u32 crc32(u32 crc, unsigned char const *p, size_t len)
++{
++	crc = ~crc;
++
++	while (len--) {
++		crc ^= *p++;
++		crc = (crc >> 8) ^ crc32table[crc & 255];
++	}
++
++	return ~crc;
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index d351223..2a478b7 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -19,6 +19,7 @@
+ #include <security.h>
+ #include <boot_info.h>
+ #include <hl_boot_desc.h>
++#include <crc32.h>
+ 
+ #include "common.h"
+ #include "uart.h"
+@@ -303,5 +304,6 @@
+ 
+ 	hl_ram_init();
+ 	preboot_dev_enable_caps();
++	crc32_init_lookup();
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }

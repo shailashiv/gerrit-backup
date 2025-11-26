@@ -1,0 +1,227 @@
+From 12abc2a9f073b3bdf3854866db58f2ab46053be0 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 05 Oct 2021 19:58:10 +0300
+Subject: [PATCH] [SW-55223] rst_src: abstract to a function call
+
+For Gaudi2 reset source, we cannot just simply read the reset source
+register, as we have an erratum that this register cannot be cleared and
+therefore it accumulated the reset bits.
+So the reset source cannot be simply tracked by reading the register.
+Instead, we need to implement an algorithm of some kind to track the
+reset sources.
+Introduce an API for reading the reset source which will allow us to
+implement a more complicated algorithm for Gaudi2.
+It will be sensible to make a weak function for anyone aligned to the
+register, but we simply do not have yet a common place for all devices
+and all components (e.g. ppboot, preboot), and this weak functionality
+is too small to deserve a file of its own.
+Thus implement for all devices.
+
+Change-Id: Iba0eea826ba2dcb490b06ececa2f31097993f3c5
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index ebdb853..5edb410 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -110,7 +110,7 @@
+ {
+ 	u32 rst_src;
+ 
+-	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	rst_src = hl_rst_src_get();
+ 	switch (rst_src) {
+ 	case HL_COLD_RST:
+ 	case HL_PRSTN_RST:
+@@ -130,7 +130,7 @@
+ 
+ __weak void rst_src_dump(void)
+ {
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	unsigned int rst_src = hl_rst_src_get();
+ 	char *cause;
+ 
+ 	switch (rst_src) {
+@@ -163,7 +163,7 @@
+ 	unsigned int prstn, smlh, rdlh, rst_src;
+ 
+ 	/* check source of reset */
+-	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	rst_src = hl_rst_src_get();
+ 	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
+ 		return false;
+ 
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index a70feb9..de7671f 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -342,7 +342,7 @@
+ 	 * Preserve pci disable if exist, except for PRSTN, in which it is
+ 	 * required to clear previous indication.
+ 	 */
+-	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	rst_src = hl_rst_src_get();
+ 	if (rst_src != HL_PRSTN_RST)
+ 		boot_info_get(HL_BOOT_INFO_FW_UPD_CLOSURE, &fw_upd_is_dis,
+ 			      sizeof(fw_upd_is_dis), &data_size);
+diff --git a/arch/gaudi/arm/asic.c b/arch/gaudi/arm/asic.c
+index 3248bf7..13ee112 100644
+--- a/arch/gaudi/arm/asic.c
++++ b/arch/gaudi/arm/asic.c
+@@ -272,7 +272,7 @@
+ {
+ 	u32 rst_src;
+ 
+-	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	rst_src = hl_rst_src_get();
+ 	return rst_src == HL_WD_RST;
+ }
+ 
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index cc767e2..a51cadf 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -103,6 +103,11 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
++u32 hl_rst_src_get(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++}
++
+ void preboot_init_pcie_phy_fw_update(void)
+ {
+ 	/* Configure FW update size */
+diff --git a/arch/gaudi/arm/pll.c b/arch/gaudi/arm/pll.c
+index 14f84fc..6962334 100644
+--- a/arch/gaudi/arm/pll.c
++++ b/arch/gaudi/arm/pll.c
+@@ -137,7 +137,7 @@
+ 	};
+ 
+ 	/* execute pci pll WA only when required */
+-	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	rst_src = hl_rst_src_get();
+ 	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST)) {
+ 		for (i = 0; i < ARRAY_SIZE(gaudi_pll_cfg); i++) {
+ 			if (strcmp(gaudi_pll_cfg[i].name, "PCI") != 0)
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index b472456..d559b1f 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -55,7 +55,7 @@
+ 	u32 size = image_size - ppboot_size - FW_SRAM_META_SIZE;
+ 	u32 *src = (u32 *)((char *)(fw_sram_base + 3) + ppboot_size);
+ 	u32 *dst = (u32 *)PCIE_FW_SRAM_BASE;
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	u32 rst_src = hl_rst_src_get();
+ 
+ 	/* If not cold reset, dont download PHY FW */
+ 	if (!(rst_src & BIT(HL_COLD_RST)))
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 294658a..87e3908 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -175,6 +175,12 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
++u32 hl_rst_src_get(void)
++{
++	/* TODO: implement the W/A for the reset source bug erratum */
++	return regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++}
++
+ void preboot_init_pcie_phy_fw_update(void)
+ {
+ 	/* Configure FW update size */
+@@ -499,7 +505,7 @@
+ 
+ void rst_src_dump(void)
+ {
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	unsigned int rst_src = hl_rst_src_get();
+ 	const char *cause;
+ 
+ 	switch (rst_src) {
+diff --git a/arch/goya/arm/common.c b/arch/goya/arm/common.c
+index 234e456..af6b7f0 100644
+--- a/arch/goya/arm/common.c
++++ b/arch/goya/arm/common.c
+@@ -61,6 +61,11 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
++u32 hl_rst_src_get(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++}
++
+ static int preboot_wait_for_bit(unsigned int reg, unsigned long timeout_ns)
+ {
+ 	unsigned int val;
+diff --git a/arch/greco/arc_elf32/asic.c b/arch/greco/arc_elf32/asic.c
+index 133e0f3..3a6a39a 100644
+--- a/arch/greco/arc_elf32/asic.c
++++ b/arch/greco/arc_elf32/asic.c
+@@ -34,7 +34,7 @@
+ 	u32 size = image_size - ppboot_size - FW_SRAM_META_SIZE;
+ 	u32 *src = (u32 *)((char *)(fw_sram_base + 3) + ppboot_size);
+ 	u32 *dst = (u32 *)PCIE_FW_SRAM_BASE;
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	u32 rst_src = hl_rst_src_get();
+ 
+ 	if (rst_src != HL_COLD_RST)
+ 		return;
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 127ff93..0fd48ee 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -95,6 +95,11 @@
+ 	return boot_strap & strap_mask;
+ }
+ 
++u32 hl_rst_src_get(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++}
++
+ void preboot_init_pcie_phy_fw_update(void)
+ {
+ 	/* Configure FW update size */
+diff --git a/include/preboot.h b/include/preboot.h
+index 8b4ec8d..663a844 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -142,6 +142,7 @@
+ void hl_enter_recovery(void);
+ void hl_dev_reset(void);
+ void hl_esc_key_handle(void);
++u32 hl_rst_src_get(void);
+ 
+ void preboot_pcie_wait_for_link(void);
+ void preboot_delay(void);
+diff --git a/lib/preboot/module_pci.c b/lib/preboot/module_pci.c
+index cafbefb..6cf219c 100644
+--- a/lib/preboot/module_pci.c
++++ b/lib/preboot/module_pci.c
+@@ -128,7 +128,7 @@
+ 
+ void module_pci_run(void)
+ {
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	unsigned int rst_src = hl_rst_src_get();
+ 
+ 	if (!pci_sts.pci_pll_initialized) {
+ 		if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST))
+@@ -166,7 +166,7 @@
+ 
+ 	if (pci_sts.mem_enabled_prev != pci_sts.mem_enabled) {
+ 		pci_sts.mem_enabled_prev = pci_sts.mem_enabled;
+-		rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++		rst_src = hl_rst_src_get();
+ 		if (pci_sts.mem_enabled && ((rst_src == HL_COLD_RST) ||
+ 					    (rst_src == HL_PRSTN_RST)))
+ 			hl_pci_iatu_init();

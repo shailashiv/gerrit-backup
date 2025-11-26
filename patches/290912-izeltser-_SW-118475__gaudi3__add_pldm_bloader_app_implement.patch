@@ -1,0 +1,529 @@
+From 1a26327278172b371157a6772c1f59ec352444fa Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 15 Jan 2023 15:51:33 +0200
+Subject: [PATCH] [SW-118475] gaudi3: add pldm_bloader app implementation
+
+On the pldm emulator a fast lean bootloader is required in order
+to run the preboot rtos application (and maybe others in the future).
+The pldm-bloader application is making the most necessary preparations
+for running the preboot rtos app, and copying a fresh copy of the
+preboot rtos binary to the iccm memory.
+current flow is:
+1. fixup the pci pll to enable prints on the pldm.
+2. copy the preboot rtos binary from ARC0/2 ICCMs to ARC1 ICCM.
+3. copy the spsram content (bootinfo) from ARC0 DCCM the SPSRAM.
+4. run preboot rtos app.
+
+The pldm_bloader is sideloaded to the bootrom memory and executed
+automatically after Arc1 reset.
+
+Div3 of PCI PLL drives the SPI GW and the UART.
+if the clocks on both dies are not synced the SPI GW can't pass data.
+Since the Pci PLL fixup must be performed on both dies and can't be
+performed over the SPI GW, an instance of the pldm_bloader is running
+on die1 as well.
+
+Change-Id: I46deb5ab934b2c8a5def52b21d760197576c369c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pldm_bloader/Makefile b/app/pldm_bloader/Makefile
+new file mode 100644
+index 0000000..743c70e
+--- /dev/null
++++ b/app/pldm_bloader/Makefile
+@@ -0,0 +1,62 @@
++CC = $(CROSS_COMPILE)gcc
++OBJCOPY = $(CROSS_COMPILE)objcopy
++BASE_DEV_NAME := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
++HL_DEV_ARCH := arch/$(BASE_DEV_NAME)/$(HL_DEV_SUBTYPE)
++HL_DEV_ARCH_COMMON := arch/$(BASE_DEV_NAME)/common
++PREBOOT_ROOT_DIR := ../..
++
++CFLAGS += -I$(SPECS_DIR)
++CFLAGS += -I$(SPECS_EMBEDDED_DIR)
++CFLAGS += -I$(SPECS_EMBEDDED_DIR)/$(BASE_DEV_NAME)
++CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
++CFLAGS += -Wall -Werror
++CFLAGS += -g -c
++CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/
++
++CFLAGS += -Os -fdata-sections -ffunction-sections
++
++include $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH_COMMON)/pcie_phy_fw.mk
++CFLAGS += -DPHY_FW_SIZE=$(PHY_FW_SIZE)
++
++SFLAGS := $(CFLAGS) -D__ASSEMBLY__
++
++PLDM_BLOADER_LD_SCRIPT := $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/pldm_bloader.lds.S)
++LDFLAGS := -g -nostdlib -static
++LDFLAGS += -Wl,--gc-sections
++LDLIBS := -lgcc
++
++PLDM_BLOADER_SRCS_C := $(shell ls *.c)
++PLDM_BLOADER_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
++PLDM_BLOADER_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH_COMMON)/common.c)
++PLDM_BLOADER_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/common.c)
++PLDM_BLOADER_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/$(HL_TARGET).c)
++PLDM_BLOADER_APP_S := $(shell ls crt0_rom.S)
++
++PLDM_BLOADER_OBJECTS := $(PLDM_BLOADER_SRCS_C:.c=.o)
++PLDM_BLOADER_OBJECTS += $(PLDM_BLOADER_APP_S:.S=.o)
++
++# TODO: add version info
++
++all: clean
++	$(MAKE) pldm_bloader.bin
++
++pldm_bloader.bin: pldm_bloader.elf
++	$(OBJCOPY) -O binary $< $@
++
++pldm_bloader.elf: $(PLDM_BLOADER_OBJECTS) $(PLDM_BLOADER_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(PLDM_BLOADER_LD_SCRIPT) -o $@ -Wl,--start-group $(PLDM_BLOADER_OBJECTS) $(LDLIBS) -Wl,--end-group
++
++%.lds: %.lds.S
++	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
++
++%.o: %.c
++	@$(CC) $(CFLAGS) -o $@ $<
++
++%.o: %.S
++	@$(CC) $(SFLAGS) -o $@ $<
++
++clean:
++	rm -f $(PLDM_BLOADER_OBJECTS)
++
++.PHONY: clean
+diff --git a/app/pldm_bloader/crt0_rom.S b/app/pldm_bloader/crt0_rom.S
+new file mode 100644
+index 0000000..b41d0e5
+--- /dev/null
++++ b/app/pldm_bloader/crt0_rom.S
+@@ -0,0 +1,139 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2022 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++;; ************************************************************************************************
++;; -----------------
++;; ARC start up file
++;; -----------------
++;; The startup code for the ARC family of processors does the following
++;; before transferring control to user defined main label :
++;;	1. Set sp to __stack_top (link time variable)
++;;	2. Set fp to zero
++;;	3. Zero out the bss section (for uninitialized globals)
++;; After returning from main, the processor is halted and the pipeline is flushed out
++;;
++;; ************************************************************************************************
++.file "crt0_rom.S"
++
++.macro CPU_EARLY_SETUP
++	; enable I-cache/D-cache
++	lr	r5, [ic_ctrl]
++	bclr	r5, r5, 0	; 0 - Enable, 1 is Disable
++	sr	r5, [ic_ctrl]
++
++	lr	r5, [dc_ctrl]
++	bclr	r5, r5, 6	; Invalidate (discard w/o wback)
++	bclr	r5, r5, 0	; Enable (+Inv)
++	sr	r5, [dc_ctrl]
++
++	; Disable alignment checking
++	lr	r5, [status32]
++	bset	r5, r5, 19
++	kflag	r5
++.endm
++
++.extern main
++
++.section .ivt, "a", @progbits
++
++; Helper macro to define weak symbols to include into interrupt vector table.
++; User code may define those functions in them, so user function will be
++; referenced in the IVT. By default all handlers point to _exit_halt - so they
++; always cause application halt, because if application causes an exception or
++; interrupt, but doesn't set a handler for it - something is wrong in
++; application. Exception is "start" entry of IVT, which points to __start
++; function.
++#define IVT_ENTRY(name) \
++    .word name `\
++    .weak name `\
++    .set name, _exit_halt
++
++; handler's name,		number,	name,			offset in IVT (hex/dec)
++.word __start			; 0	program entry point	0x0		0
++IVT_ENTRY(memory_error)		; 1	memory_error		0x4		4
++IVT_ENTRY(instruction_error)	; 2	instruction_error	0x8		8
++IVT_ENTRY(EV_MachineCheck)	; 3	EV_MachineCheck		0xC		12
++IVT_ENTRY(EV_TLBMissI)		; 4	EV_TLBMissI		0x10		16
++IVT_ENTRY(EV_TLBMissD)		; 5	EV_TLBMissD		0x14		20
++IVT_ENTRY(EV_ProtV)		; 6	EV_ProtV		0x18		24
++IVT_ENTRY(EV_PrivilegeV)	; 7	EV_PrivilegeV		0x1C		28
++IVT_ENTRY(EV_SWI)		; 8	EV_SWI			0x20		32
++IVT_ENTRY(EV_Trap)		; 9	EV_Trap			0x24		36
++IVT_ENTRY(EV_Extension)		; 10	EV_Extension		0x28		40
++IVT_ENTRY(EV_DivZero)		; 11	EV_DivZero		0x2C		44
++IVT_ENTRY(EV_DCError)		; 12	EV_DCError		0x30		48
++IVT_ENTRY(EV_Maligned)		; 13	EV_Maligned		0x34		52
++IVT_ENTRY(EV_Ex14)		; 14	unused			0x38		56
++IVT_ENTRY(EV_Ex15)		; 15	unused			0x3C		60
++IVT_ENTRY(IRQ_Timer0)		; 16	Timer 0			0x40		64
++IVT_ENTRY(IRQ_Timer1)		; 17	Timer 1			0x44		68
++IVT_ENTRY(IRQ_18)		; 18				0x48		72
++IVT_ENTRY(IRQ_19)		; 19				0x4C		76
++IVT_ENTRY(IRQ_20)		; 20				0x50		80
++
++.section .text.__startup, "ax", @progbits
++
++.global __start
++.type __start, @function
++.align 4
++
++; Startup code for the ARC600, ARC700 and ARCv2 processors
++; NOTE:  The following restrictions apply on zero overhead loops (other
++; restrictions are not pertinent to this code)
++; - loop end should be 4 instruction words away from the lp_count setting
++;   instruction
++; - loop body should have at least two instruction words
++__start:
++	CPU_EARLY_SETUP
++	mov gp, @__SDATA_BEGIN__
++
++	mov sp, @__stack_top	; initialize stack pointer
++
++	mov r2, @_rom_non_persistent_dccm_start; r2 = start of the non persistent dccm section
++	sub r3, @_dccm_end, r2	; r3 = size of the dccm section in bytes
++	; set up the loop counter register to the size (in words) of the dccm section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	mov r4, 0x0
++	; loop to zero out the dccm.  Enter loop only if lp_count != 0
++	lpnz @.Lend_dccm
++	st.ab r4, [r2, 4]	; zero out the word
++	nop
++.Lend_dccm:
++
++	mov_s r1, @_data_after_persist_sec	; r1 = non persistent section begin in ROM(LMA).
++	mov_s r2, @_rom_non_persistent_dccm_start; r2 = non persistent section begin in DCCM(VMA).
++
++	sub r3, @_edata, r2	; r3 = size of the non persistent data section in bytes
++
++	; set up the loop counter register to the size (in words) of the data section
++	asr_s r13, r3
++	asr.f lp_count, r13
++
++	; loop to copy data from ROM to DCCM.  Enter loop only if lp_count != 0
++	lpnz @.Lend_cdata
++	ld.ab	r5,[r1,4]
++	st.ab	r5,[r2,4]
++.Lend_cdata:
++
++	;; branch to main
++	bl.d @pldm_bloader_main
++	mov fp, 0		; initialize frame pointer
++				; r0 contains exit code
++	j @_exit_halt
++
++.global _exit_halt
++.type _exit_halt, @function
++.align 4
++_exit_halt:
++				; r0 contains exit code
++	flag 0x01
++	nop
++	nop
++	nop
++	j @_exit_halt
++	nop
+diff --git a/app/pldm_bloader/pldm_bloader.c b/app/pldm_bloader/pldm_bloader.c
+new file mode 100644
+index 0000000..e4273cc
+--- /dev/null
++++ b/app/pldm_bloader/pldm_bloader.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stddef.h>
++#include <preboot.h>
++#include <hl.h>
++#include <device.h>
++#include <uart.h>
++#include <pll.h>
++
++#include "pldm_bloader.h"
++
++int preboot_fuse_init(void) { return 0; }
++
++static void device_init(void)
++{
++	device_init_global_conf();
++	device_init_efuse();
++	device_init_uart();
++}
++
++void pldm_bloader_main(void)
++{
++	uint32_t die_id = hl_get_die_id();
++
++	device_init_pll(); /* used for uart and delay */
++	udelay_init();
++
++	btldr_pll_fixup(die_id);
++	if (die_id)
++		wfe();
++
++	device_init();
++	hl_uart_init();
++
++	preboot_puts("starting pldm-bloader\n");
++	btldr_parc_prepare();
++	btldr_copy_data();
++	btldr_exec_app();
++}
+diff --git a/app/pldm_bloader/pldm_bloader.h b/app/pldm_bloader/pldm_bloader.h
+new file mode 100644
+index 0000000..eda7a7b
+--- /dev/null
++++ b/app/pldm_bloader/pldm_bloader.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++#ifndef _PLDM_BLOADER_H_
++#define _PLDM_BLOADER_H_
++
++void btldr_pll_fixup(uint32_t die_id);
++void btldr_parc_prepare(void);
++void btldr_copy_data(void);
++void btldr_exec_app(void);
++
++#endif /* _PLDM_BLOADER_H_ */
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 3bdd974..57d10f0 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1148,7 +1148,7 @@
+ #define MEM_CPY_SIZE_SHIFT_MASK		(BIT(MEM_CPY_SIZE_SHIFT) - 1)
+ #define HL_MEM_CPY_TIMEOUT_US		1000
+ 
+-static int gaudi3_hbw_memcpy(uint64_t src, uint64_t dst, uint32_t size)
++int gaudi3_hbw_memcpy(uint64_t src, uint64_t dst, uint32_t size)
+ {
+ 	u64 start = timestamp_get_us();
+ 	u32 mem_cfg, cpy_sts, copy_sz;
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 0e0cc7d..be43a62 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -35,6 +35,8 @@
+ #define ARC1_ICCM_SIZE			SZ_256K
+ #define ARC1_DCCM_FULL_BASE		0x300007FD3080000ull
+ #define ARC1_DCCM_SIZE			SZ_64K
++#define ARC2_ICCM_FULL_BASE		0x300007FD30c0000ull
++#define ARC2_ICCM_SIZE			SZ_128K
+ 
+ #define SRAM_MEM_REGION_BASE		0x10000000
+ #define FW_MEM_REGION_BASE		0x20000000
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index ae367a2..d340919 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -48,5 +48,6 @@
+ u64 gaudi3_dma_addr_fixup(u64 loadaddr);
+ void pif_arc_pcie_monitoring(void);
+ u32 gaudi3_die_timestamp_base_get(u32 die_id);
++int gaudi3_hbw_memcpy(u64 src, u64 dst, u32 size);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index 7fb5f83..84aee1c 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -5,6 +5,9 @@
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <d0_psoc_global_conf_regs.h>
+ #include <d0_psoc_global_conf_masks.h>
++#include <d0_parc_arc0_cfg_regs.h>
++#include <d0_parc_arc2_cfg_regs.h>
++#include <d0_parc_local_cfg_regs.h>
+ #include <common/pci_ids.h>
+ #include <stddef.h>
+ #include <bitops.h>
+@@ -13,6 +16,7 @@
+ #include <pll.h>
+ #include <arcboot_export_dev.h>
+ #include <boot_desc.h>
++#include <efuse.h>
+ #include "hl.h"
+ 
+ #define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 SIMULATION CLK */
+@@ -162,3 +166,79 @@
+ 
+ 	return dev_id;
+ }
++
++#define UART_DIV_ID	3
++
++/*
++ * pcie pll is initialized by the boot fsm to nominal values (in secured boot mode). In order to
++ * support uart prints on pldm only div3 of the pci pll should be modified. Since div3 also impacts
++ * the baudrate of the d2d spi dma, pci pll of both dies should be carefully reconfigured first,
++ * before using the spi gw for data transfer.
++ */
++void btldr_pll_fixup(uint32_t die_id)
++{
++	gaudi3_cpu_pll_cfg[0].base = die_id ? mmD1_G4_PCI_PLL_CTRL_BASE : mmD0_G4_PCI_PLL_CTRL_BASE;
++
++	hl_pll_reconfig_div(gaudi3_cpu_pll_cfg, UART_DIV_ID);
++}
++
++void btldr_parc_prepare(void)
++{
++	/* ARC must not be in reset state when accessing the CCM modules */
++	regmap_writel(0, mmD0_PARC_ARC0_CFG_ARC_RST);
++	regmap_writel(0, mmD0_PARC_ARC2_CFG_ARC_RST);
++}
++
++#define EFUSE_APP_SIZE_OFFSET	55
++#define EFUSE_APP_SIZE_MASK	0x1
++
++static void btldr_copy_preboot_app(void)
++{
++	int err;
++	u32 val;
++
++	/*
++	 * Clean copy of the application is stored in ICCM0. In case the application binary
++	 * exceeds ICCM0 size, the rest is stored in ICCM2.
++	 * An efuse bit is controlling whether the application binary is larger than ICCM0 size.
++	 */
++	gaudi3_hbw_memcpy(ARC0_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE, ARC0_ICCM_SIZE);
++
++	err = preboot_fuse_read(EFUSE_APP_SIZE_OFFSET, &val);
++	if (err)
++		val = EFUSE_APP_SIZE_MASK;
++
++	val &= EFUSE_APP_SIZE_MASK;
++
++	if (!val)
++		return;
++
++	gaudi3_hbw_memcpy(ARC2_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE + ARC0_ICCM_SIZE,
++			  ARC1_ICCM_SIZE - ARC0_ICCM_SIZE);
++}
++
++static void btldr_copy_bootinfo(void)
++{
++	/*
++	 * Normally bootinfo is first written to spsram by the arcboot, so preboot rtos expects some
++	 * bootinfo data to be available when it runs. On PLDM, when running standalone preboot,
++	 * pre-recorded boot info data is loaded to the SPSRAM.
++	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in DCCM0 and copied
++	 * back to the SPSRAM as part of the preparation to run preboot rtos.
++	 */
++	gaudi3_hbw_memcpy(ARC0_DCCM_FULL_BASE, HL_SP_SRAM_BASE, ARC0_DCCM_SIZE);
++}
++
++void btldr_copy_data(void)
++{
++	btldr_copy_preboot_app();
++	btldr_copy_bootinfo();
++}
++
++#define APP_RST_VECTOR_ADDR	0 /* first address of the local ICCM */
++
++void btldr_exec_app(void)
++{
++	preboot_puts("pldm-bloader resigned\n");
++	preboot_start_image(APP_RST_VECTOR_ADDR, true);
++}
+diff --git a/arch/gaudi3/arc/pldm_bloader.lds.S b/arch/gaudi3/arc/pldm_bloader.lds.S
+new file mode 100644
+index 0000000..4bfef04
+--- /dev/null
++++ b/arch/gaudi3/arc/pldm_bloader.lds.S
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2023 HabanaLabs Ltd.
++ */
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM	: ORIGIN = 0x00000000, LENGTH = 256K
++	SBROM	: ORIGIN = 0x23100000, LENGTH = 128K
++	DCCM	: ORIGIN = 0x80000000, LENGTH = 64K
++}
++
++REGION_ALIAS("REGION_IVT",	SBROM)
++REGION_ALIAS("REGION_TEXT",	SBROM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(__start)
++
++SECTIONS
++{
++	_dccm_begin = ORIGIN(DCCM);
++	_dccm_end = ORIGIN(DCCM) + LENGTH(DCCM);
++
++	.ivt : {
++		KEEP (*(.ivt));
++	} > REGION_IVT
++
++	.text : {
++		crt0_rom.o (.text*)
++		*(.text .text.* .rodata .rodata.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.data : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_data_after_persist_sec = _etext;
++		_data = .;
++		_rom_non_persistent_dccm_start = .;
++		*(.data .data.*)
++	} > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		__SDATA_BEGIN__ = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_edata = .;
++		PROVIDE (edata = .);
++	} > REGION_SDATA
++
++	.bss : {
++		*(.dynbss)
++		*(.bss .bss.* .gnu.linkonce.b.*)
++		*(COMMON)
++		/* Align here to ensure that the .bss section occupies space up to
++		_end. Align after .bss to ensure correct alignment even if the
++		.bss section disappears because there are no input sections. */
++		. = ALIGN(32 / 8);
++		_end = .;
++		PROVIDE (end = .);
++	} > REGION_BSS
++
++	.stack : {
++		. = ALIGN(32 / 8);
++		__stack = . ;
++		. = . + 2k;
++		__stack_top = . ;
++	} > REGION_STACK
++}

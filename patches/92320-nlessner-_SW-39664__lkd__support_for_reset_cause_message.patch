@@ -1,0 +1,136 @@
+From 8917a7da1f44b226ab8972204b717ca7e1c69dd7 Mon Sep 17 00:00:00 2001
+From: Noam Lessner <nlessner@habana.ai>
+Date: Tue, 04 May 2021 16:20:46 +0300
+Subject: [PATCH] [SW-39664] lkd: support for reset cause message
+
+Add support for new message types like reset cause. To keep current flow
+and backward compatibility we validate first that data received isn't a FIT
+image. If not FIT we check for comms message via magic in header.
+If msg magic found in header we evaluate the type otherwise fail as
+before.
+
+Signed-off-by: Noam Lessner <nlessner@habana.ai>
+Change-Id: I63c80a99f68d7ff9c935a793014843f8d81a8124
+---
+
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 718cb83..4521074 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -6,6 +6,7 @@
+ 
+ #include <string.h>
+ #include <hl_boot_if.h>
++#include <hl_fw_if.h>
+ #include <preboot.h>
+ #include <boot_if.h>
+ #include <boot_info.h>
+@@ -13,6 +14,7 @@
+ #include <crc32.h>
+ 
+ #include "cmd_module.h"
++#include "i2cslave_indirect.h"
+ #include "uart.h"
+ #include "fit.h"
+ 
+@@ -123,13 +125,50 @@
+ 	return res;
+ }
+ 
++static int module_lkd_msg_reset_cause(struct lkd_msg_comms *mcomms)
++{
++	int err = 1;
++
++	switch (mcomms->reset_cause) {
++	case HL_RESET_CAUSE_HEARTBEAT:
++		err = i2csi_set_wd_err(HL_FW_RESET_CAUSE_HEARTBEAT);
++		break;
++	case HL_RESET_CAUSE_TDR:
++		err = i2csi_set_wd_err(HL_FW_RESET_CAUSE_TDR);
++		/* no break */
++	default:
++		break;
++	}
++
++	return err;
++}
++
++static int module_lkd_msg_process(struct lkd_msg_comms *mcomms)
++{
++	int err = 1;
++
++	switch (mcomms->header.type) {
++	case HL_COMMS_RESET_CAUSE_TYPE:
++		err = module_lkd_msg_reset_cause(mcomms);
++		/* no break */
++	default:
++		break;
++	}
++
++	return err;
++}
++
+ static int module_lkd_run_fast_exec(void)
+ {
+-	/* Placeholder - empty for now */
++	struct lkd_msg_comms *mcomms = (struct lkd_msg_comms *) FIT_IMG_BASE;
++	int err;
+ 
+-	/* on error do preboot_security_dynamic_img_open(); */
++	err = module_lkd_msg_process(mcomms);
+ 
+-	return 1;
++	if (err)
++		preboot_security_dynamic_img_sram_open();
++
++	return err;
+ }
+ 
+ static void module_lkd_reset_state(void)
+@@ -355,18 +394,43 @@
+ 	return FIT_IMG_BASE;
+ }
+ 
++static int module_lkd_msg_validate(uintptr_t offset)
++{
++	struct lkd_msg_comms *mcomms = (struct lkd_msg_comms *) offset;
++	int err = 1;
++
++
++
++	if (mcomms->header.magic == HL_COMMS_MSG_MAGIC) {
++		sts.exec_res = FOUND_FAST_RETURN;
++		err = 0;
++	}
++
++	return err;
++}
++
+ static int module_lkd_validate(void)
+ {
+ 	int err;
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
++	/* validate if shared memory has fit image */
+ 	preboot_shm_set_offset(FIT_IMG_BASE);
+ 	err = fit_load_images();
+-	if (err)
+-		preboot_security_dynamic_img_sram_open();
+ 
+-	sts.exec_res = err ? NOT_FOUND : FOUND_NO_RETURN;
++	if (!err) {
++		sts.exec_res = FOUND_NO_RETURN;
++		return 0;
++	}
++
++	/* shared mem doesn't contain fit image. */
++	err = module_lkd_msg_validate(FIT_IMG_BASE);
++
++	if (err) {
++		preboot_security_dynamic_img_sram_open();
++		sts.exec_res = NOT_FOUND;
++	}
+ 
+ 	return err;
+ }

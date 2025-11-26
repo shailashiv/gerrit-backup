@@ -1,0 +1,93 @@
+From 9dc6b39205eebc829848ca5868d2d57f06eefc8d Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Thu, 22 Apr 2021 08:09:28 +0300
+Subject: [PATCH] [SW-39414] fit: validate image hash
+
+Add validation of image hash to detect corrupted loadable images, but
+more importantly, since signature validation is only done for hash
+field and not its data, skipping this step caused a security hole where
+an attacker may replace the data binary which does not go through the
+signature validation process.
+
+Change-Id: I840ea2521469e629ae2f6c363ca2246e0da680d8
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 4bd9868..526854f 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -16,6 +16,7 @@
+ #include <boot_info.h>
+ #include <lzo/lzo.h>
+ #include <hl_fw_if.h>
++#include <sha256.h>
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
+@@ -32,6 +33,7 @@
+ #define FIT_LOADABLE_PROP	"loadables"
+ #define FIT_HASHED_NODES_PROP	"hashed-nodes"
+ #define FIT_DATA_PROP		"data"
++#define FIT_HASH_PROP		"hash"
+ #define FIT_LOADADDR_PROP	"loadaddr"
+ #define FIT_STARTADDR_PROP	"startaddr"
+ #define FIT_ARCH_PROP		"arch"
+@@ -48,6 +50,7 @@
+ #define FIT_LOAD_TYPE_PROP	"load-type"
+ #define FIT_PUB_KEY_HASH_PROP	"hash"
+ 
++#define FIT_SHA256			"sha256"
+ #define FIT_ALGO_PROP_EXPECTED_VALUE	"sha256,rsa3072"
+ 
+ #define FIT_MAX_PATH		200
+@@ -677,6 +680,37 @@
+ 	return type == FIT_LOAD_TYPE_RUN;
+ }
+ 
++static const u8 *fit_node_get_hash(const void *fit, int node)
++{
++	int hash;
++	const char *prop;
++
++	hash = fdt_subnode_offset(fit, node, FIT_HASH_PROP);
++	prop = (const char *)fdt_getprop(fit, hash, FIT_ALGO_PROP, NULL);
++	if (strcmp(prop, FIT_SHA256))
++		return NULL;
++
++	return (const u8 *)fdt_getprop(fit, hash, FIT_VALUE_PROP, NULL);
++}
++
++static int fit_node_check_hash(const void *fit, int node, const u8 *buf,
++			       int len)
++{
++	const u8 *node_hash = fit_node_get_hash(fit, node);
++	u8 calc_hash[SHA256_SUM_LEN];
++
++	if (!node_hash) {
++		preboot_puts("Missing hash for loadable\n");
++		return 1;
++	}
++
++	sha256_csum(buf, len, calc_hash);
++	if (memcmp(node_hash, calc_hash, SHA256_SUM_LEN))
++		return 1;
++
++	return 0;
++}
++
+ static enum fit_load_result fit_copy_images(const void *fit,
+ 					    enum fit_sec_failure *res)
+ {
+@@ -735,6 +769,11 @@
+ 			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
++		if (fit_node_check_hash(fit, node, buf, len)) {
++			preboot_puts_hex("FIT loadable currupted: bad hash for image: ", i, false);
++			return FIT_LOAD_CORRUPTED;
++		}
++
+ 		cmpr = (const char *)fdt_getprop(fit, node,
+ 						 FIT_COMPRESSION_PROP,
+ 						 NULL);

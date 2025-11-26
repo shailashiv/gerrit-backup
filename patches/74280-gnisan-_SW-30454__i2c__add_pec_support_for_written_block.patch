@@ -1,0 +1,231 @@
+From fe6955b7b291b7eff614878f4dd4337b43c6b1d0 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 01 Feb 2021 21:51:14 +0200
+Subject: [PATCH] [SW-30454] i2c: add pec support for written block
+
+I2C (SMBus) defines a way to validate the data written by the master.
+The PEC algorithm is CRC-8-CCITT which is defined by polynomial (0x07)
+x^8 + x^2 + x + 1.
+
+The PEC is calculated over all the data and addresses from start to stop
+including read and write bit.
+e.g. for slave address 0x4f -> (0x4f << 1) | is_read -> 0x9e / 0x9f
+
+When master sends a block:
+
+          w        w       w      w         w          w
+Master -[0x9e]->-[LEN]->-[CMD]->-[D]-...->-[D]-...->-[PEC]
+        ADDR-W                   data      data
+
+When master sends the PEC, the slave will compare it to the PEC
+calculated by the slave. Since there is no way in current I2C controller
+to send NACK in PEC comparation fails, the calculated PEC is saved to be
+read by master to check if write was successful.
+
+The way the master may read the calculted PEC is by reading the PEC byte
+directly. This is not part of SMBus standard.
+
+If master reads different PEC than it calculated, it may assume that
+block write failed and abort its operation.
+
+Change-Id: Iafaee91e36f7d0579998d3028d7271586f21a6f0
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index a3e7102..a8af510 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -33,6 +33,7 @@
+ 	u8 seq_cmd;
+ 	u8 cnt;
+ 	bool is_sync_error;
++	bool is_direct_pec;
+ };
+ 
+ struct i2cslave_data {
+@@ -229,7 +230,9 @@
+ static inline u8 *i2cslave_consume_hw(u8 *data, u8 cnt)
+ {
+ 	register u8 val = (u8)regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
++	register u8 cmd;
+ 	bool is_virt;
++	bool is_pec;
+ 
+ 	if (data) {
+ 		*data = (u8)val;
+@@ -240,13 +243,16 @@
+ 	if (!cnt)
+ 		i2cs_data.buf.seq_cmd = i2cs_data.buf.cmd;
+ 
+-	is_virt = I2CSLAVE_IS_VIRTUAL_CMD(i2cs_data.buf.cmd);
++	cmd = i2cs_data.buf.seq_cmd;
++	is_virt = I2CSLAVE_IS_VIRTUAL_CMD(cmd);
+ 	if (!is_virt) {
+-		i2cslave_pec_digest(val);
++		is_pec = HL_I2C_EVENT_IS_PEC(cmd);
++		if (!is_pec)
++			i2cslave_pec_digest(val);
+ 
+ 		/* Increase command sequence for data bytes */
+ 		if (cnt)
+-			i2cs_data.buf.seq_cmd++;
++			i2cs_data.buf.seq_cmd = cmd + 1;
+ 	}
+ 
+ 	return data;
+@@ -254,13 +260,15 @@
+ 
+ static inline u32 i2cslave_produce_handler(struct i2cslave_buf *buf)
+ {
+-	register u32 seq_wr;
++	register u32 seq_wr = 0;
++	register u8 cmd = buf->cmd;
+ 
+-	if (!buf->cnt)
+-		buf->seq_cmd = buf->cmd;
++	/* Just started to process and PEC cmd called directly */
++	buf->is_direct_pec = !buf->cnt && HL_I2C_EVENT_IS_PEC(cmd);
+ 
+ 	/* Notify upper layer */
+-	seq_wr = i2cslave_handle_write_req(buf->cmd, &buf->data, buf->cnt);
++	if (!buf->is_direct_pec)
++		seq_wr = i2cslave_handle_write_req(cmd, &buf->data, buf->cnt);
+ 
+ 	if (seq_wr)
+ 		buf->cnt++;
+@@ -309,6 +317,9 @@
+ 	u8 seq_cmd = buf->seq_cmd;
+ 	u8 ret;
+ 
++	if (i2cs_data.buf.is_direct_pec)
++		return i2cslave_valid_pec;
++
+ 	/* Check if we are in the middle of write request processing */
+ 	if (i2cs_data.seq.wr) {
+ 		preboot_puts("I2C SLAVE: sync error\n");
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index a5ebb84..41637c7 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -28,7 +28,8 @@
+ bool i2cslave_is_reset_dev(void);
+ void i2cslave_reset_dev(void);
+ 
+-extern u8 i2cslave_pec;
++extern u8 i2cslave_pec;		/* Ongoing digest of CRC-8 */
++extern u8 i2cslave_valid_pec;	/* To validate PEC by Master */
+ 
+ void i2cslave_pec_init(void);
+ void i2cslave_pec_digest(u8 val);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 7049903..8655c22 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -57,8 +57,16 @@
+ 	u8 length;
+ 	union {
+ 		struct hl_i2ci_wdata_hdr wdata;
+-		struct hl_i2ci_req_cfg req_cfg;
+-		struct hl_i2ci_ctrl_cmd ctrl_cmd;
++
++		struct {
++			struct hl_i2ci_req_cfg req_cfg;
++			u8 req_cfg_pec;
++		} __packed;
++
++		struct {
++			struct hl_i2ci_ctrl_cmd ctrl_cmd;
++			u8 ctrl_cmd_pec;
++		} __packed;
+ 	};
+ } __packed;
+ 
+@@ -95,10 +103,19 @@
+ static u32 i2csi_block_wait_for(u8 block_cmd, u8 cmd, u8 len, u8 **data)
+ {
+ 	u8 offset = cmd - block_cmd;
++	bool is_virt = I2CSLAVE_IS_VIRTUAL_CMD(cmd);
++	u8 overhead;
+ 
+-	block_write.is_full_block = !offset;
+ 	*data = ((u8 *)&block_write.data) + offset;
+-	return len + 1 - offset; /* Adding 1 for the len byte itself */
++	if (is_virt || offset) {
++		block_write.is_full_block = false;
++		overhead = 1; /* Adding 1 for len byte itself */
++	} else {
++		block_write.is_full_block = true;
++		overhead = 2; /* Adding 2 for len and pec */
++	}
++
++	return len + overhead - offset;
+ }
+ 
+ static void i2csi_req_config_access(void)
+@@ -647,6 +664,12 @@
+ 					    HL_I2CI_REQ_CFG_LEN, data);
+ 	}
+ 
++	if (block_write.is_full_block) {
++		i2cslave_valid_pec = i2cslave_pec;
++		if (i2cslave_pec != block_write.data.req_cfg_pec)
++			return 0;
++	}
++
+ 	req_cfg = block_write.data.req_cfg;
+ 
+ 	/* Request config received */
+@@ -700,6 +723,12 @@
+ 					    HL_I2CI_CTRL_CMD_LEN, data);
+ 	}
+ 
++	if (block_write.is_full_block) {
++		i2cslave_valid_pec = i2cslave_pec;
++		if (i2cslave_pec != block_write.data.ctrl_cmd_pec)
++			return 0;
++	}
++
+ 	ctrl_cmd = block_write.data.ctrl_cmd;
+ 
+ 	ctrl_sts.tag = ctrl_cmd.tag;
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index a29a772..8ea870c 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -18,6 +18,8 @@
+ #include "fit.h"
+ 
+ u8 i2cslave_pec;
++u8 i2cslave_valid_pec;
++
+ static u8 pec_table[CRC8_TABLE_SIZE];
+ 
+ static bool is_fit_checked;
+@@ -103,12 +105,14 @@
+ 		return i2csi_req_handle_wdata(cmd, data, cnt);
+ 	case HL_INDIRECT_REQ_CFG_CODE:
+ 	case HL_INDIRECT_REQ_CFG_DATA:
++	case HL_INDIRECT_REQ_CFG_PEC:
+ 		return i2csi_req_handle_cfg(cmd, data, cnt);
+ 	case HL_INDIRECT_CTRL_CMD_CODE:
+ 	case HL_INDIRECT_CTRL_CMD_DATA:
+ 	case HL_INDIRECT_CTRL_CMD_DATA_1:
+ 	case HL_INDIRECT_CTRL_CMD_DATA_2:
+ 	case HL_INDIRECT_CTRL_CMD_DATA_3:
++	case HL_INDIRECT_CTRL_CMD_PEC:
+ 		return i2csi_ctrl_handle_command(cmd, data, cnt);
+ 	case HL_INDIRECT_REQ_RDATA_CODE:
+ 	case HL_INDIRECT_REQ_RDATA_DATA:
+diff --git a/recovery/module_i2c_slave.c b/recovery/module_i2c_slave.c
+index 9856a2f..03f540a 100644
+--- a/recovery/module_i2c_slave.c
++++ b/recovery/module_i2c_slave.c
+@@ -11,6 +11,7 @@
+ #include "module_i2c_slave.h"
+ 
+ u8 i2cslave_pec;
++u8 i2cslave_valid_pec;
+ 
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+ {

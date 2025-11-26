@@ -1,0 +1,186 @@
+From 20d1107b13ff17d18c4e12b8dedbfb3c0cd72f14 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Mon, 20 Nov 2023 10:07:45 +0200
+Subject: [PATCH] [SW-156330] gaudi2: remove erom tpm compilation
+
+In gaudi2 tpm is moved to ppboot and in erom tpm is
+not getting used as it increase pcie link up timing
+in recovery. This patch remove's redundant code which
+was getting compiled.
+
+Change-Id: I41f67b2e455c826623a01b75db584890d162c364
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+Signed-off-by: Priyajit Ghosh <prghosh@habana.ai>
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 56ea42a..34f7522 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -26,13 +26,10 @@
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+ 
+-EROM_TPM_LD_SCRIPT := tpm_erom.lds
+ EROM_PCIE_LD_SCRIPT := pcie_erom.lds
+ EROM_RECOVERY_LD_SCRIPT := recovery_erom.lds
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+-LDFLAGS_TPM := -g -static
+-LDFLAGS_TPM += -Wl,--gc-sections
+ LDLIBS := -lgcc
+ 
+ EROM_APP_S := $(shell ls crt0_common_erom.S)
+@@ -44,11 +41,9 @@
+ # TODO: Revert as a part of gaudi3 erom implementation
+ ifeq ($(BASE_DEV_NAME),gaudi3)
+ 	EROM_PCIE_SRC := $(HL_DEV_ARCH)/erom_pcie.o
+-	EROM_TPM_SRC := $(HL_DEV_ARCH)/erom_tpm.o
+ 	EROM_RECOVERY_SRC := $(HL_DEV_ARCH)/erom_recovery.o
+ else
+ 	EROM_PCIE_SRC := erom_pcie.o
+-	EROM_TPM_SRC := erom_tpm.o
+ 	EROM_RECOVERY_SRC := erom_recovery.o
+ 	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports.elf
+ endif
+@@ -109,28 +104,10 @@
+ 
+ EROM_RECOVERY_EXTRA_LIBS := "-lfdt"
+ 
+-EROM_TPM_DEPS := \
+-	$(PREBOOT_ROOT_DIR)/lib/common/uart.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/spi.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/spi_flash.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/boot_if.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/pll.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/sha256.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/lib_common.o \
+-	$(HL_DEV_ARCH_COMMON)/tpm2.o \
+-	$(HL_DEV_ARCH_COMMON)/tpm_auth.o \
+-	$(HL_DEV_ARCH_COMMON)/security.o \
+-	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+-	$(HL_DEV_ARCH)/../common/common.o \
+-	$(HL_DEV_ARCH)/../common/pll.o \
+-	$(HL_DEV_ARCH)/common.o
+-
+ .PHONY: all
+ all: clean
+ 	$(MAKE) erom_recovery
+ 	$(MAKE) erom_pcie
+-	$(MAKE) erom_tpm
+ 
+ erom_recovery: $(EROM_RECOVERY_SRC) $(EROM_RECOVERY_DEPS) $(EROM_RECOVERY_APP_OBJECTS) $(EROM_RECOVERY_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(EROM_RECOVERY_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_RECOVERY_DEPS) $(LDLIBS) $(EROM_RECOVERY_EXTRA_LIBS) -Wl,--end-group
+@@ -138,10 +115,6 @@
+ 
+ erom_pcie: $(EROM_PCIE_SRC) $(EROM_APP_OBJECTS) $(EROM_PCIE_DEPS) $(EROM_PCIE_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(EROM_PCIE_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_PCIE_DEPS) $(LDLIBS) -Wl,--end-group
+-	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+-
+-erom_tpm: $(EROM_TPM_SRC) $(EROM_APP_OBJECTS) $(EROM_TPM_DEPS) $(EROM_TPM_LD_SCRIPT)
+-	@$(CC) $(LDFLAGS_TPM) -T $(EROM_TPM_LD_SCRIPT) -o $@  -Wl,--start-group $< $(EROM_TPM_DEPS) $(LDLIBS) -Wl,--end-group
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $@ $@.bin
+ 
+ %.lds: %.lds.S
+@@ -154,6 +127,6 @@
+ 	@$(CC) $(SFLAGS) -o $@ $<
+ 
+ clean:
+-	rm -f $(EROM_APP_OBJECTS) $(EROM_RECOVERY_APP_OBJECTS) $(EROM_TPM_DEPS) $(EROM_RECOVERY_DEPS) $(EROM_PCIE_DEPS)
++	rm -f $(EROM_APP_OBJECTS) $(EROM_RECOVERY_APP_OBJECTS) $(EROM_RECOVERY_DEPS) $(EROM_PCIE_DEPS)
+ 
+ .PHONY: clean
+diff --git a/app/ext_rom/erom_tpm.c b/app/ext_rom/erom_tpm.c
+deleted file mode 100644
+index 3b6b129..0000000
+--- a/app/ext_rom/erom_tpm.c
++++ /dev/null
+@@ -1,86 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright (C) 2021 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <stdint.h>
+-#include <baremetal.h>
+-#include <psoc_global_conf_regs.h>
+-#include <psoc_security_regs.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_if.h>
+-#include <arcboot_export.h>
+-#include <spi_flash.h>
+-#include <tpm2.h>
+-#include <tpm_auth.h>
+-#include <boot_if.h>
+-#include <pll.h>
+-#include <device.h>
+-#include <uart.h>
+-#include <gaudi2/gaudi2_security.h>
+-#include <gaudi2/gaudi2_bootrom.h>
+-#include <gaudi2/arc/dev_security.h>
+-#include <sha512.h>
+-#include <string.h>
+-#include <hl_sec_if.h>
+-
+-static void erom_get_ppboot_data(uint8_t **offset)
+-{
+-	uint32_t ppboot_pcie_size;
+-
+-	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
+-
+-	ppboot_pcie_size -= SIG_SIZE;
+-	ppboot_pcie_size -= CRC32_SIZE;
+-	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
+-	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
+-	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
+-
+-	*offset = (uint8_t *)(HL_FWSRAM_BASE + ppboot_pcie_size);
+-}
+-
+-static void device_init(void)
+-{
+-	device_init_global_conf();
+-	device_init_uart();
+-	device_init_efuse();
+-	device_init_pll(); /* used for uart and delay */
+-}
+-
+-__weak void ppboot_secure_arc(void) {}
+-
+-void erom_main_function(void)
+-{
+-	uint8_t *data;
+-	uint32_t magic;
+-	uint8_t hash[SHA384_SUM_LEN] = { 0 };
+-
+-	device_init();
+-
+-	/* Set ARCs to privileged mode */
+-	ppboot_secure_arc();
+-
+-	udelay_init();
+-	hl_uart_init();
+-	cpu_boot_if_init();
+-	preboot_puts("eTPM\n");
+-
+-	if (tpm_init(false))
+-		return;
+-
+-	if (tpm_startup())
+-		return;
+-
+-	erom_get_ppboot_data(&data);
+-
+-	memcpy(&magic, data, PPBOOT_HASH_MAGIC_SIZE);
+-
+-	if (magic != PPBOOT_SHA_MAGIC)
+-		preboot_puts("no ppboot sha magic found\n");
+-	else
+-		memcpy(hash, data + PPBOOT_HASH_MAGIC_SIZE, SHA384_SUM_LEN);
+-
+-	tpm_pcr_extend(TPM2_PPBOOT_PCR_IDX, hash);
+-}

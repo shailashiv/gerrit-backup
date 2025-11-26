@@ -1,0 +1,94 @@
+From 4b7c8af281a9bc5753a595f3e388abc25ae65593 Mon Sep 17 00:00:00 2001
+From: Meron Cohen <mecohen@habana.ai>
+Date: Thu, 08 May 2025 19:45:58 +0300
+Subject: [PATCH] [SW-227605] g2e: support bis-e-compliant ppboot
+
+In case reading real fuse or fake fuse from flash fails, then assume
+the worst case revision which is revision E.
+
+Change-Id: Idd3d29ad8f57be1a9e36ea85da63da5fbaac8dfa
+Signed-off-by: Meron Cohen <mecohen@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 13e40f8..c36659d 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -530,18 +530,23 @@
+ 	if (preboot_security_is_real_efuse_sec_en()) {
+ 		fuse = preboot_get_hl_sec_real_efuse();
+ 		if (!fuse)
+-			return GAUDI2_BIS_REV_MAX - 1; /* assume the worst case */
++			return GAUDI2_BIS_REV_MAX - 1; /* Assume the worst case */
+ 	} else {
+ 		fuse = preboot_get_hl_sec_fake_efuse();
+ 
+-		/* HL-288 is Chiana only card so BIS D is set by default,
+-		 * unless fake security is enabled
++		/* HL-288 is China only card so BIS E is set by default,
++		 * unless fake security is enabled.
++		 * This is because SuperMicro servers reboot do not produce PRSTn,
++		 * and PCI id and rev is not being refreshed.
++		 * In case that this SuperMicro issue is resolved, we can remove this default.
+ 		 */
+ 		if (!preboot_fake_security_is_enabled() && is_card_type_pcie())
+-			return GAUDI2_BIS_REV_D;
++			return GAUDI2_BIS_REV_E;
+ 	}
+ 
+-	if (fuse->bis_d_compliant)
++	if (fuse->bis_e_compliant)
++		return GAUDI2_BIS_REV_E;
++	else if (fuse->bis_d_compliant)
+ 		return GAUDI2_BIS_REV_D;
+ 	else if (fuse->bis_compliant)
+ 		return GAUDI2_BIS_REV_C;
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 4a10ea3..b8ad2e3 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -373,12 +373,13 @@
+ 				val = &fuse->data[i];
+ 				*val = ~(*val);
+ 			}
+-			/* HL-288 is China only card so BIS D is set by default,
++		} else if (is_card_type_pcie()) {
++			/* HL-288 is China only card so BIS E is set by default,
+ 			 * unless fake security is enabled
+ 			 */
+ 		} else if (is_card_type_pcie()) {
+ 			fuse->bis_compliant = 1;
+-			fuse->bis_d_compliant = 1;
++			fuse->bis_e_compliant = 1;
+ 		}
+ 
+ 		preboot_hl_sec_fuse_cache.is_invalid = false;
+@@ -1510,18 +1511,23 @@
+ 	reset_arc_farm_arc0();
+ }
+ 
++static bool is_bis_compliant_mode(const struct hl_sec_efuse *fuse)
++{
++	if (!fuse)
++		return true;
++
++	return fuse->bis_compliant || fuse->bis_d_compliant || fuse->bis_e_compliant;
++}
++
+ __weak bool preboot_is_bis_compliant_mode(void)
+ {
+ 	const struct hl_sec_efuse *fuse;
+ 
+ 	if (preboot_security_is_real_efuse_sec_en()) {
+ 		fuse = preboot_get_hl_sec_real_efuse();
+-		if (!fuse)
+-			return true;
+-
+-		return fuse->bis_compliant || fuse->bis_d_compliant;
++		return is_bis_compliant_mode(fuse);
+ 	}
+ 
+ 	fuse = preboot_get_hl_sec_fake_efuse();
+-	return fuse->bis_compliant || fuse->bis_d_compliant;
++	return is_bis_compliant_mode(fuse);
+ }

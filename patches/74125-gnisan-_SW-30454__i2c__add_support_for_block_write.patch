@@ -1,0 +1,269 @@
+From 8fd2288cd085af649822858af0dd9fa9a1142bbe Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 01 Feb 2021 10:33:01 +0200
+Subject: [PATCH] [SW-30454] i2c: add support for block write
+
+I2C (SMBus) defines a way to send block of data from master to slave.
+
+The block format is:
+[ADDR][CMD][LENGTH][DATA][PEC]
+
+PEC is not part of this patch.
+
+This patch introduces the capability to send complete block, minus PEC.
+The length is ignored as it is known.
+
+In order to support the data not wrapped in a block, command sequence
+increases for every written byte for non-virtual commands.
+
+Change-Id: If23a796aa5ed47f31f31cf91f323f7b145da6d45
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index 1d7fea4..ea1253f 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -226,7 +226,7 @@
+ 	return ret;
+ }
+ 
+-static inline u8 *i2cslave_consume_hw(u8 *data)
++static inline u8 *i2cslave_consume_hw(u8 *data, u8 cnt)
+ {
+ 	register u8 val = (u8)regmap_readl(mmPSOC_I2C_S_IC_DATA_CMD);
+ 	bool is_virt;
+@@ -236,9 +236,18 @@
+ 		data++;
+ 	}
+ 
++	/* New command code, save it for sequential increase */
++	if (!cnt)
++		i2cs_data.buf.seq_cmd = i2cs_data.buf.cmd;
++
+ 	is_virt = I2CSLAVE_IS_VIRTUAL_CMD(i2cs_data.buf.cmd);
+-	if (!is_virt)
++	if (!is_virt) {
+ 		i2cslave_pec_digest(val);
++
++		/* Increase command sequence for data bytes */
++		if (cnt)
++			i2cs_data.buf.seq_cmd++;
++	}
+ 
+ 	return data;
+ }
+@@ -263,6 +272,7 @@
+ {
+ 	register struct i2cslave_seq seq = i2cs_data.seq;
+ 	register u8 *data = i2cs_data.buf.data;
++	register u8 cnt = i2cs_data.buf.cnt;
+ 
+ 	/* Next read will start from offset 0 */
+ 	seq.rd = 0;
+@@ -273,16 +283,18 @@
+ 			i2cslave_reset_buffer(&i2cs_data.buf);
+ 			seq.wr = 1;
+ 			data = i2cs_data.buf.data;
++			cnt = i2cs_data.buf.cnt;
+ 		}
+ 		/* Consume data as long as we expect it */
+ 		if (seq.wr) {
+ 			seq.wr--;
+-			data = i2cslave_consume_hw(data);
++			data = i2cslave_consume_hw(data, cnt);
+ 		}
+ 		/* Additional data is not expected, produce data */
+ 		if (!seq.wr) {
+ 			seq.wr = i2cslave_produce_handler(&i2cs_data.buf);
+ 			data = i2cs_data.buf.data;
++			cnt = i2cs_data.buf.cnt;
+ 		}
+ 	} while (regmap_readl(mmPSOC_I2C_S_IC_RXFLR));
+ 
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index fb3d3c3..7049903 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -53,6 +53,22 @@
+ 	struct hl_i2ci_wdata_hdr hdr;
+ };
+ 
++struct i2csi_block_write {
++	u8 length;
++	union {
++		struct hl_i2ci_wdata_hdr wdata;
++		struct hl_i2ci_req_cfg req_cfg;
++		struct hl_i2ci_ctrl_cmd ctrl_cmd;
++	};
++} __packed;
++
++struct i2csi_block_write_context {
++	bool is_full_block;
++	struct i2csi_block_write data;
++};
++
++struct i2csi_block_write_context block_write;
++
+ static struct hl_i2ci_req_cfg req_cfg;
+ static struct hl_i2ci_req_sts req_sts;
+ static struct i2csi_wdata_chunk_context req_chunk;
+@@ -75,6 +91,15 @@
+ 
+ static struct hl_i2ci_ctrl_cmd ctrl_cmd;
+ static struct hl_i2ci_ctrl_sts ctrl_sts;
++
++static u32 i2csi_block_wait_for(u8 block_cmd, u8 cmd, u8 len, u8 **data)
++{
++	u8 offset = cmd - block_cmd;
++
++	block_write.is_full_block = !offset;
++	*data = ((u8 *)&block_write.data) + offset;
++	return len + 1 - offset; /* Adding 1 for the len byte itself */
++}
+ 
+ static void i2csi_req_config_access(void)
+ {
+@@ -420,8 +445,6 @@
+ 	if (req_wd.hdr.ic) {
+ 		switch (cnt) {
+ 		case 1: /* Header received, wait for CRC */
+-			req_wd.crc = crc32(req_wd.crc, req_wd.data,
+-					   req_wd.length);
+ 			i2csi_req_wdata_wait_for(req_wd.req_crc_data, 4);
+ 			return;
+ 
+@@ -488,23 +511,17 @@
+   */
+ static void i2csi_req_wdata_process_data(u8 cnt)
+ {
+-	switch (cnt) {
+-	case 0: /* Header is expected */
+-		req_sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
+-		i2csi_req_reset();
+-		i2csi_req_wdata_wait_for(req_wd.hdr.data,
+-					 HL_I2CI_REQ_WDATA_LEN);
+-		return;
+-
+-	case 1: /* Chunk header or payload are expected */
++	if (cnt == 1) { /* Chunk header or payload are expected */
++		req_wd.hdr = block_write.data.wdata;
+ 		if (HL_I2CI_REQ_RQCL_IS_EXISTS(req_wd.hdr)) {
+ 			i2csi_req_wdata_wait_for(req_chunk.hdr.data,
+ 						 HL_I2CI_REQ_CHUNK_LEN);
+ 			return;
+ 		}
+-		/* Fall through */
+-	default:
+-		break;
++
++		if (req_wd.hdr.ic)
++			req_wd.crc = crc32(0, req_wd.hdr.data,
++					   sizeof(req_wd.hdr));
+ 	}
+ 
+ 	if (req_wd.hdr.write)
+@@ -513,8 +530,16 @@
+ 		i2csi_req_wdata_handle_read(cnt);
+ }
+ 
+-u32 i2csi_req_handle_wdata(u8 **data, u8 cnt)
++u32 i2csi_req_handle_wdata(u8 cmd, u8 **data, u8 cnt)
+ {
++	if (!cnt) { /* Header is expected */
++		req_sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
++		i2csi_req_reset();
++		block_write.data.wdata = req_wd.hdr;
++		return i2csi_block_wait_for(HL_INDIRECT_REQ_WDATA_CODE, cmd,
++					    HL_I2CI_REQ_WDATA_LEN, data);
++	}
++
+ 	i2csi_req_wdata_process_data(cnt);
+ 	*data = req_wd.data;
+ 
+@@ -614,12 +639,15 @@
+  *   before calling this function again. Returning 0 means the command handling
+  *   was finished.
+  */
+-u32 i2csi_req_handle_cfg(u8 **data, u8 cnt)
++u32 i2csi_req_handle_cfg(u8 cmd, u8 **data, u8 cnt)
+ {
+-	if (!cnt) { /* Header is expected */
+-		*data = req_cfg.data;
+-		return HL_I2CI_REQ_CFG_LEN;
++	if (!cnt) {/* Header is expected */
++		block_write.data.req_cfg = req_cfg;
++		return i2csi_block_wait_for(HL_INDIRECT_REQ_CFG_CODE, cmd,
++					    HL_I2CI_REQ_CFG_LEN, data);
+ 	}
++
++	req_cfg = block_write.data.req_cfg;
+ 
+ 	/* Request config received */
+ 	req_sts.init = req_cfg.init;
+@@ -661,16 +689,19 @@
+ 	}
+ }
+ 
+-u32 i2csi_ctrl_handle_command(u8 **data, u8 cnt)
++u32 i2csi_ctrl_handle_command(u8 cmd, u8 **data, u8 cnt)
+ {
+ 	struct hl_i2ci_ctrl_cpsr *cpsr;
+ 
+ 	/* Command is expected */
+ 	if (!cnt) {
+-		*data = ctrl_cmd.data;
+-		return HL_I2CI_CTRL_CMD_LEN;
++		block_write.data.ctrl_cmd = ctrl_cmd;
++		return i2csi_block_wait_for(HL_INDIRECT_CTRL_CMD_CODE, cmd,
++					    HL_I2CI_CTRL_CMD_LEN, data);
+ 	}
+ 
++	ctrl_cmd = block_write.data.ctrl_cmd;
++
+ 	ctrl_sts.tag = ctrl_cmd.tag;
+ 	ctrl_sts.status = HL_I2CI_CTRL_STS_BUSY;
+ 	ctrl_sts.error = HL_I2CI_CTRL_ERR_NONE;
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+index 4c35e9e..6e32cb3 100644
+--- a/preboot/i2cslave_indirect.h
++++ b/preboot/i2cslave_indirect.h
+@@ -10,9 +10,9 @@
+ 
+ u8 i2csi_req_handle_sts(u8 cmd);
+ u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
+-u32 i2csi_req_handle_wdata(u8 **data, u8 cnt);
+-u32 i2csi_req_handle_cfg(u8 **data, u8 cnt);
+-u32 i2csi_ctrl_handle_command(u8 **data, u8 cnt);
++u32 i2csi_req_handle_wdata(u8 cmd, u8 **data, u8 cnt);
++u32 i2csi_req_handle_cfg(u8 cmd, u8 **data, u8 cnt);
++u32 i2csi_ctrl_handle_command(u8 cmd, u8 **data, u8 cnt);
+ u8 i2csi_ctrl_handle_status(u8 cmd);
+ void i2csi_req_set_idle(void);
+ void i2csi_req_handle_sync_error(void);
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 8eb3595..a29a772 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -98,12 +98,18 @@
+ u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt)
+ {
+ 	switch (cmd) {
++	case HL_INDIRECT_REQ_WDATA_CODE:
+ 	case HL_INDIRECT_REQ_WDATA_DATA:
+-		return i2csi_req_handle_wdata(data, cnt);
++		return i2csi_req_handle_wdata(cmd, data, cnt);
++	case HL_INDIRECT_REQ_CFG_CODE:
+ 	case HL_INDIRECT_REQ_CFG_DATA:
+-		return i2csi_req_handle_cfg(data, cnt);
++		return i2csi_req_handle_cfg(cmd, data, cnt);
++	case HL_INDIRECT_CTRL_CMD_CODE:
+ 	case HL_INDIRECT_CTRL_CMD_DATA:
+-		return i2csi_ctrl_handle_command(data, cnt);
++	case HL_INDIRECT_CTRL_CMD_DATA_1:
++	case HL_INDIRECT_CTRL_CMD_DATA_2:
++	case HL_INDIRECT_CTRL_CMD_DATA_3:
++		return i2csi_ctrl_handle_command(cmd, data, cnt);
+ 	case HL_INDIRECT_REQ_RDATA_CODE:
+ 	case HL_INDIRECT_REQ_RDATA_DATA:
+ 		i2csi_req_set_idle();

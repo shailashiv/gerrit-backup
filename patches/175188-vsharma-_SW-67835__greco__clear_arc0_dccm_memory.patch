@@ -1,0 +1,91 @@
+From 0a893668e6d92544c3cf2d1f6a9f976b7de06a6a Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Thu, 03 Feb 2022 10:48:10 +0200
+Subject: [PATCH] [SW-67835] greco: clear arc0 dccm memory
+
+This patch clear arc0 dccm memory as a precaution,
+as it was seen uninitialized reads sometimes cause ecc
+exception.
+
+Change-Id: I749d74ec3ec2316837db2e9aea49f4092dc0cf57
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index 6640138..e1e6e62 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -132,6 +132,9 @@
+ 	 */
+ 	regmap_writel(ARC_RST_VEC_ADDR, mmPSOC_ARC0_CFG_RST_VEC_ADDR);
+ 	regmap_writel(ARC_RST_VALUE, mmPSOC_ARC0_CFG_ARC_RST);
++
++	/* Clear DCCM memory */
++	init_arc_mem(0, ARC0_DCCM_FULL_BASE, ARC0_DCCM_SIZE);
+ }
+ 
+ void hl_plat_early_init(void)
+diff --git a/arch/greco/arc_elf32/common.h b/arch/greco/arc_elf32/common.h
+index 55e5562..672f43c 100644
+--- a/arch/greco/arc_elf32/common.h
++++ b/arch/greco/arc_elf32/common.h
+@@ -37,6 +37,7 @@
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+ #define ARC0_ICCM_BASE		0x1B000000
++#define ARC0_DCCM_FULL_BASE	0x7FFB010000ULL
+ 
+ #define FUSE_WORDS_PER_BANK	0x40
+ #define I2C_SLAVE_ADDRESS	0x6A
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index a0e2a08..706bca9 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -671,3 +671,36 @@
+ {
+ 	ca53_cfg.arm_rst_control_reg = mmCPU_CA53_CFG_ARM_RST_CONTROL;
+ }
++
++#define ARC_MEM_INIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++#define MEM_CPY_16B_DIVIDER		4
++void init_arc_mem(u8 id, u64 addr, u32 size)
++{
++	u32 mem_cfg;
++	u64 start;
++
++	/* Use memblock to initialize dccm memory */
++	regmap_writel((u32)addr, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((u32)(addr >> 32), mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++
++	/* set size in granuality of 16 bytes */
++	size = size >> MEM_CPY_16B_DIVIDER;
++	mem_cfg |= (size & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	mem_cfg |= (0x1 << PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT);
++
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++
++	start = timestamp_get_us();
++	while (!(regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS))) {
++		if (timeout_expired(start, ARC_MEM_INIT_TIMEOUT_US)) {
++			preboot_puts_hex("Init memory timed-out for arc", id, false);
++			return;
++		}
++	}
++}
+diff --git a/arch/greco/common/hl.h b/arch/greco/common/hl.h
+index e441440..84d1b90 100644
+--- a/arch/greco/common/hl.h
++++ b/arch/greco/common/hl.h
+@@ -51,5 +51,6 @@
+ void run_arc(u8 id);
+ void halt_n_reset_arc(u8 id);
+ void axi_enable_drain(void);
++void init_arc_mem(u8 id, u64 addr, u32 size);
+ 
+ #endif /* ARCH_GRECO_COMMON_HL_H_ */

@@ -1,0 +1,114 @@
+From d45f5e0cffcac4f88fe128161090c14243b568eb Mon Sep 17 00:00:00 2001
+From: Peleg Vigodny <pvigodny@habana.ai>
+Date: Wed, 21 Sep 2022 13:17:16 +0300
+Subject: [PATCH] [SW-103986] fit: img load: halt arc0 only on need
+
+When loading an image, halt ARC0 only if the image loaded is intended
+to run on ARC.
+
+If we are loading an image on ARM, we can let ARC0 continue trying to
+establish PCI connection.
+
+Issue the following warning message:
+    "Warning: ARC0 busy with PCI init, halting anyway"
+In case ARC0 needs to be halted but it is still busy with PCI
+initialization.
+
+Change-Id: Iae44d8e4d338733e0ff4841fe83b03d9827981e2
+Signed-off-by: Peleg Vigodny <pvigodny@habana.ai>
+---
+
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 7a41dc9..fd882d1 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -61,6 +61,8 @@
+ #define FIT_MAX_KEY_NAME	64
+ #define PREFIX_KEY			"key-"
+ 
++#define FIT_ARC_PID_LOADABLE_PREFIX	"zephyr-pid"
++
+ /*
+  * For checking decompressed image bounderies, assume the compression factor to
+  * be 5 times bigger than the compressed data.
+@@ -730,6 +732,31 @@
+ 	return preboot_verify_img_sig(fit, fit_size, res, &preboot_key_idx);
+ }
+ 
++/*
++ * For secureboot flow, ARC0 is used to run
++ * PCIe initialization code and put in sleep
++ * once initialization is done. ARC0 will be
++ * halt and reseted as part of secondary_cpu_stop
++ * function before copying images in ICCM and DCCM
++ * as part of fit_copy_image function.
++ */
++__weak void preboot_secondary_cpu_stop(void) {}
++
++static bool fit_image_is_for_arc0(const void *fit, int id)
++{
++	const char *loadable_name;
++
++	loadable_name = fit_loadables_name(fit, fit_find_config_node(fit), id);
++	if (!loadable_name) {
++		preboot_puts_hex("Wrong FIT format: loadable name not found: ", id, false);
++		return false;
++	}
++
++	/* Note: We assume that the image that is intended to run on ARC0 is ARC PID */
++	return !(memcmp(loadable_name, FIT_ARC_PID_LOADABLE_PREFIX,
++			sizeof(FIT_ARC_PID_LOADABLE_PREFIX) - 1));
++}
++
+ static enum fit_load_result fit_copy_images(const void *fit,
+ 					    enum fit_sec_failure *res)
+ {
+@@ -739,6 +766,7 @@
+ 	u64 load, start;
+ 	const char *cmpr;
+ 	size_t fit_size = fdt_totalsize(fit);
++	bool halted_secondary_cpu = false;
+ 
+ 	/* Check if image supports a minimum FDT version or newer */
+ 	if (fdt_version(fit) < FDT_MIN_SUPPORTED_VERSION)
+@@ -824,6 +852,14 @@
+ 			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
++		if (!halted_secondary_cpu && fit_image_is_for_arc0(fit, i)) {
++			if (!is_pcie_initialized())
++				preboot_puts("Warning: ARC0 busy with PCI init, halting anyway\n");
++
++			preboot_secondary_cpu_stop();
++			halted_secondary_cpu = true;
++		}
++
+ 		images[i].loadaddr = load;
+ 		images[i].startaddr = start;
+ 
+@@ -896,16 +932,6 @@
+ 	return serr;
+ }
+ 
+-/*
+- * For secureboot flow, ARC0 is used to run
+- * PCIe initialization code and put in sleep
+- * once initialization is done. ARC0 will be
+- * halt and reseted as part of secondary_cpu_stop
+- * function before copying images in ICCM and DCCM
+- * as part of fit_copy_image function.
+- */
+-__weak void preboot_secondary_cpu_stop(void) {}
+-
+ void fit_load_print_error(enum fit_load_result errtype)
+ {
+ 	switch (errtype) {
+@@ -954,8 +980,6 @@
+ 	enum fit_sec_failure sec_res = FIT_SEC_NONE;
+ 	enum fit_load_result fit_load_error;
+ 	enum fit_format_result fit_format_error;
+-
+-	preboot_secondary_cpu_stop();
+ 
+ 	memset(&images, 0x0, sizeof(images));
+ 

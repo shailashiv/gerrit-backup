@@ -1,0 +1,127 @@
+From 0a140974ac1ee8d91679b066a683bbcd86990a28 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Sun, 05 Feb 2023 09:20:41 +0200
+Subject: [PATCH] [SW-121890] gaudi2: split fake bis from security
+
+In hl_sec_efuse there is bis_compliant field, for indication
+if device is bis compliant.
+But in order to allow using fake bis independently from
+faked security, we use scratchpad register mmCOLD_RST_DATA
+bit fake_bis_compliant as indication if faked bis is
+enabled.
+
+This patch modifies preboot_is_bis_compliant_mode logic
+as following:
+1. If it is a real security (as indicated by efuse), then
+efuse content (specifically bis_compliant field) defines
+if bis compliant indication is enabled.
+2. Otherwise, scratchpad register mmCOLD_RST_DATA, fake_bis_compliant
+bit indication defines if bis compliant indication is enabled.
+
+Change-Id: Iaf89f0efe5cf4c2a4476b4c4f88af2cff43177c4
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 6c715ae..ab027cd 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -906,12 +906,20 @@
+ 	return false;
+ }
+ 
++bool preboot_security_is_real_efuse_sec_en(void)
++{
++	if (preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK))
++		return true;
++
++	return false;
++}
++
+ bool preboot_security_is_enabled(void)
+ {
+ 	if (preboot_security_fuse_override())
+ 		return false;
+ 
+-	if (preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK))
++	if (preboot_security_is_real_efuse_sec_en())
+ 		return true;
+ 
+ 	return preboot_fake_security_is_enabled();
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 1a97856..db2589b 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -424,12 +424,22 @@
+ 
+ 	return !!(efuse_word & mask);
+ }
++bool preboot_security_is_real_efuse_sec_en(void)
++{
++	if (preboot_sec_efuse_is_set(EFUSE_SECURITY_ENABLE_BIT))
++		return true;
++
++	return false;
++}
+ 
+ bool preboot_security_is_enabled(void)
+ {
+ 	if (preboot_sec_efuse_is_set(EFUSE_SECURITY_ENABLE_BIT))
+ 		return true;
+ 
++	if (preboot_security_is_real_efuse_sec_en())
++		return true;
++
+ 	return preboot_fake_security_is_enabled();
+ }
+ 
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 3453bf6..46ce12e 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -56,6 +56,7 @@
+ #include <dcore0_hmmu0_mmu_regs.h>
+ #include <dcore0_hmmu0_mmu_masks.h>
+ #include <pll.h>
++#include <gaudi2_fw_if.h>
+ #include "common.h"
+ 
+ static struct hl_sec_rrs_cfg hl_sec_lbw_rrs_tbl[] = {
+@@ -1507,15 +1508,16 @@
+ 
+ __weak bool preboot_is_bis_compliant_mode(void)
+ {
+-	u32 config_fuse;
+-	int ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
++	const struct hl_sec_efuse *fuse;
++	struct gaudi2_cold_rst_data cold_rst_data;
+ 
+-	/*
+-	 * failed to read efuse, forcing bis compliant mode
+-	 * No print is added here as this code is run before link up
+-	 */
+-	if (ret)
+-		return true;
++	if (preboot_security_is_real_efuse_sec_en()) {
++		fuse = preboot_get_hl_sec_real_efuse();
+ 
+-	return !!(config_fuse & EFUSE_ENABLE_BIS_COMPLIANT);
++		return fuse->bis_compliant;
++	}
++
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
++
++	return !!cold_rst_data.fake_bis_compliant;
+ }
+diff --git a/include/security.h b/include/security.h
+index d6d14d4..676d881 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -16,6 +16,7 @@
+ 	ACCESS_RW,
+ };
+ 
++bool preboot_security_is_real_efuse_sec_en(void);
+ bool preboot_security_is_enabled(void);
+ bool preboot_img_validation_is_enabled(void);
+ void preboot_security_init(void);

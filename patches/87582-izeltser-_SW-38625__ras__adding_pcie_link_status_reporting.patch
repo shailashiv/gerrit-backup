@@ -1,0 +1,67 @@
+From c8e721cb2c6508396a1fa3d1d7bb97aa87250c9b Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 08 Apr 2021 18:15:19 +0300
+Subject: [PATCH] [SW-38625] ras: adding pcie link status reporting
+
+Since we have a pcie link monitor now, we should report the link
+status to the bmc as well.
+Pcie link down is part of the pci fatal error alert reported over
+SMBUS ALERT opcode.
+
+Change-Id: I7e42be1a602576d4f42d432cf5acb360df83274c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/include/preboot.h b/include/preboot.h
+index 9b68207..5424e9f 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -158,6 +158,7 @@
+ const char *preboot_get_version(enum preboot_vers ver);
+ void hl_ram_init(void);
+ void hl_pci_iatu_init(void);
++bool hl_pci_link_is_up(void);
+ 
+ void preboot_finalize_fw_info(void);
+ void preboot_boot_info_set_fw_info(void);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index c1e627c..5c09bb1 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -467,6 +467,14 @@
+ 	err_chksum_avail = true;
+ }
+ 
++static void i2csi_alert_set_pcie(void)
++{
++	if (!hl_pci_link_is_up())
++		smbus_alert.pcie_error = HL_I2CI_SMBUS_PCIE_UNCORR_ERROR;
++	else
++		smbus_alert.pcie_error = 0;
++}
++
+ static inline void i2csi_req_process_read_opcode(void)
+ {
+ 	switch (req_wd.hdr.opcode) {
+@@ -486,6 +494,8 @@
+ 		req_rd.length = sizeof(op_config);
+ 		break;
+ 	case HL_I2CI_REQ_OP_SMBUS_ALERT:
++		i2csi_alert_set_pcie();
++
+ 		req_rd.data = (u8 *)&smbus_alert;
+ 		req_rd.length = sizeof(smbus_alert);
+ 		break;
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 254e0b5..1bba904 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -138,3 +138,8 @@
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
+ 		pci_dev_specific_teardown();
+ }
++
++bool hl_pci_link_is_up(void)
++{
++	return pci_sts.link_is_up;
++}

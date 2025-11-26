@@ -1,0 +1,161 @@
+From 9ca5e109735f0f91d293ac1ee8a702a167c65d25 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sat, 22 May 2021 21:48:45 +0300
+Subject: [PATCH] [SW-43039] gaudi: security: open dram range
+
+In order to provide the host a way to validate dram scrubbing, dram
+range is kept open if HBM init was successful.
+
+Change-Id: I231d4f8cc35baa1e11a2105dd093988282a71054
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 710344e..d290b28 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -29,6 +29,7 @@
+ #include <hl_fw_if.h>
+ #include <crc32.h>
+ #include <pci.h>
++#include <security.h>
+ 
+ #include "common.h"
+ 
+@@ -231,6 +232,7 @@
+ 	} else {
+ 		preboot_set_enabled_cap(HL_FW_EN_CAPS_MEM_CLR);
+ 		preboot_puts("finished\n");
++		preboot_security_hbm_pci_set_access(true);
+ 	}
+ }
+ 
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 97fc210..77edc6f 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1384,42 +1384,54 @@
+ 	}
+ }
+ 
+-static void preboot_secure_hbw_rr(int rr, u64 base, u64 mask)
++static void preboot_hbw_rr_set_rtr(int rr, int rtr, u64 base, u64 mask,
++				   bool is_lock)
+ {
+-	int i;
+ 	u32 base_l = (u32)base, base_h = (u32)(base >> BITS_IN_REG);
+ 	u32 mask_l = (u32)mask, mask_h = (u32)(mask >> BITS_IN_REG);
+ 	u32 rr_base, rr_dest, hit;
+ 
+-	for (i = 0; i < IF_RTRS_NUM; i++) {
+-		rr_base = rr * sizeof(u32) + IF_RTRS_DIST * i;
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_LOW_AW_0;
+-		regmap_writel(base_l, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_HIGH_AW_0;
+-		regmap_writel(base_h, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_LOW_AW_0;
+-		regmap_writel(mask_l, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_HIGH_AW_0;
+-		regmap_writel(mask_h, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_LOW_AR_0;
+-		regmap_writel(base_l, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_HIGH_AR_0;
+-		regmap_writel(base_h, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_LOW_AR_0;
+-		regmap_writel(mask_l, rr_dest);
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_HIGH_AR_0;
+-		regmap_writel(mask_h, rr_dest);
++	rr_base = rr * sizeof(u32) + IF_RTRS_DIST * rtr;
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_LOW_AW_0;
++	regmap_writel(base_l, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_HIGH_AW_0;
++	regmap_writel(base_h, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_LOW_AW_0;
++	regmap_writel(mask_l, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_HIGH_AW_0;
++	regmap_writel(mask_h, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_LOW_AR_0;
++	regmap_writel(base_l, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_HIGH_AR_0;
++	regmap_writel(base_h, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_LOW_AR_0;
++	regmap_writel(mask_l, rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_HIGH_AR_0;
++	regmap_writel(mask_h, rr_dest);
+ 
+-		/* Enable (hit) RR */
+-		rr_base = IF_RTRS_DIST * i;
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AW;
+-		hit = regmap_readl(rr_dest);
++	/* Enable (hit) RR */
++	rr_base = IF_RTRS_DIST * rtr;
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AW;
++	hit = regmap_readl(rr_dest);
++	if (is_lock)
+ 		regmap_writel(hit | BIT(rr), rr_dest);
++	else
++		regmap_writel(hit & ~BIT(rr), rr_dest);
+ 
+-		rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AR;
+-		hit = regmap_readl(rr_dest);
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AR;
++	hit = regmap_readl(rr_dest);
++	if (is_lock)
+ 		regmap_writel(hit | BIT(rr), rr_dest);
+-	}
++	else
++		regmap_writel(hit & ~BIT(rr), rr_dest);
++}
++
++static void preboot_secure_hbw_rr(int rr, u64 base, u64 mask)
++{
++	int i;
++
++	for (i = 0; i < IF_RTRS_NUM; i++)
++		preboot_hbw_rr_set_rtr(rr, i, base, mask, true);
+ }
+ 
+ static void preboot_secure_hbw_tpc3_seclvl_rr(u64 base, u64 mask, bool close)
+@@ -1484,10 +1496,13 @@
+ #define mmSTM_BASE	0x7FF4000000ULL
+ #define mmRAZWI_BASE	0x7FFBFFF000ULL
+ 
++#define HBM_RR_BASE	0
++#define HBM_RR_MASK	0x3FFF800000000
++
+ static void preboot_secure_hbw(void)
+ {
+ 	/* HBM RR 0 - 32GB */
+-	preboot_secure_hbw_rr(HBW_RR_HBM, 0, 0x3FFF800000000);
++	preboot_secure_hbw_rr(HBW_RR_HBM, HBM_RR_BASE, HBM_RR_MASK);
+ 
+ 	/* SRAM RR 0x7F_F000_0000 - 0x7F_F140_0000 (20MB) */
+ 	preboot_secure_hbw_sram();
+@@ -1860,3 +1875,16 @@
+ {
+ 	return true;
+ }
++
++#define PCI_RTR_NO	7
++
++void preboot_security_hbm_pci_set_access(bool enable)
++{
++	bool is_lock = !enable;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	preboot_hbw_rr_set_rtr(HBW_RR_HBM, PCI_RTR_NO, HBM_RR_BASE,
++			       is_lock ? HBM_RR_MASK : 0, is_lock);
++}
+diff --git a/include/security.h b/include/security.h
+index 60133c2..bb50024 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -19,5 +19,6 @@
+ void preboot_security_dynamic_img_spsram_open(void);
+ void preboot_security_cleanup_before_run(void);
+ void preboot_security_sp_sram_write_key_hash(u8 *key, size_t len);
++void preboot_security_hbm_pci_set_access(bool enable);
+ 
+ #endif /* _HL_SECURITY_H_ */

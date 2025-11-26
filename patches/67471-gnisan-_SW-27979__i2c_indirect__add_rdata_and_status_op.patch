@@ -1,0 +1,262 @@
+From 419df2e4ef1404bb1d1c201832bb7163fa075c8e Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 27 Dec 2020 09:56:45 +0200
+Subject: [PATCH] [SW-27979] i2c indirect: add rdata and status op
+
+This review adds a basic RDATA support along with an opcode which uses
+it.
+
+RDATA frame is being read by the master after a WDATA with read commnad
+was issued. The master is expected to wait for TRANSMIT state in the
+request status before issuing the RDATA command.
+
+The added status command is important as it the only way for the master
+to know which opcodes are supported. Hence status op must always be
+supported.
+
+Change-Id: Idd379c802802069f8f69e49d007ba36b43ed2c34
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 109de0f..ae2702d 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -14,9 +14,18 @@
+ #include <hl_i2c_slave_events.h>
+ #include "fit.h"
+ 
++#define SUPPORTED_OPCODES_MASK	(BIT(HL_I2CI_REQ_OP_DEVICE_STATUS) | \
++				BIT(HL_I2CI_REQ_OP_FW_LOADER))
++
+ struct i2csi_wdata_chunk_context {
+ 	u16 offset; /* Chunk offset within the request */
+ 	struct hl_i2ci_wdata_chunk_hdr hdr;
++};
++
++struct i2csi_wdata_read_context {
++	u8 *data; /* Pointer to data to be read */
++	u16 length;
++	struct hl_i2ci_rdata_hdr hdr;
+ };
+ 
+ struct i2cslave_indirect_req {
+@@ -24,9 +33,15 @@
+ 	struct hl_i2ci_req_cfg cfg;
+ 	struct hl_i2ci_req_sts sts;
+ 	struct i2csi_wdata_chunk_context chunk;
++	struct i2csi_wdata_read_context rd;
+ };
+ 
+ static struct i2cslave_indirect_req i2csi_req;
++
++static struct hl_i2ci_device_status op_status = {
++	.device_status = HL_I2CI_REQ_DEV_STS_PREBOOT,
++	.valid_opcode_map = SUPPORTED_OPCODES_MASK,
++};
+ 
+ static void i2csi_req_load_fw(void)
+ {
+@@ -71,14 +86,33 @@
+ 	}
+ }
+ 
+-static inline void i2csi_req_process_opcode(void)
++static inline void i2csi_req_process_read_opcode(void)
++{
++	switch (i2csi_req.hdr.opcode) {
++	case HL_I2CI_REQ_OP_DEVICE_STATUS:
++		i2csi_req.rd.data = (u8 *)&op_status;
++		i2csi_req.rd.length = sizeof(op_status);
++		break;
++	default:
++		if ((BIT(i2csi_req.hdr.opcode) & SUPPORTED_OPCODES_MASK))
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++		else
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++		break;
++	}
++}
++
++static inline void i2csi_req_process_write_opcode(void)
+ {
+ 	switch (i2csi_req.hdr.opcode) {
+ 	case HL_I2CI_REQ_OP_FW_LOADER:
+ 		i2csi_req_load_fw();
+ 		break;
+ 	default:
+-		i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++		if ((BIT(i2csi_req.hdr.opcode) & SUPPORTED_OPCODES_MASK))
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++		else
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
+ 		break;
+ 	}
+ }
+@@ -104,7 +138,7 @@
+ 	if (i2csi_req.chunk.offset == i2csi_req.hdr.rqdl) {
+ 		i2csi_req.chunk.offset = 0;
+ 		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+-		i2csi_req_process_opcode();
++		i2csi_req_process_write_opcode();
+ 		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
+ 	}
+ 
+@@ -120,7 +154,7 @@
+ 
+ 	/* Payload received */
+ 	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+-	i2csi_req_process_opcode();
++	i2csi_req_process_write_opcode();
+ 	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
+ 	return 0;
+ }
+@@ -156,14 +190,11 @@
+ 		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
+ 		i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
+ 		i2csi_req.chunk.hdr.rqcl = 0;
++		i2csi_req.rd.data = NULL;
++		i2csi_req.rd.length = 0;
+ 		*data = i2csi_req.hdr.data;
+ 		return HL_I2CI_REQ_WDATA_LEN;
+ 	case 1: /* Chunk header or payload are expected */
+-		if (!i2csi_req.hdr.write) {
+-			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
+-			return 0;
+-		}
+-
+ 		if (HL_I2CI_REQ_RQCL_IS_EXISTS(i2csi_req.hdr)) {
+ 			*data = i2csi_req.chunk.hdr.data;
+ 			return HL_I2CI_REQ_CHUNK_LEN;
+@@ -173,10 +204,43 @@
+ 		break;
+ 	}
+ 
+-	if (i2csi_req.chunk.hdr.rqcl)
+-		return i2csi_req_wdata_handle_chunk(data, cnt);
+-	else
+-		return i2csi_req_wdata_handle_payload(data, cnt);
++	if (i2csi_req.hdr.write) {
++		if (i2csi_req.chunk.hdr.rqcl)
++			return i2csi_req_wdata_handle_chunk(data, cnt);
++		else
++			return i2csi_req_wdata_handle_payload(data, cnt);
++	} else {
++		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++
++		/* Data read with chunks is not supported */
++		if (i2csi_req.chunk.hdr.rqcl)
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_DATA_SIZE;
++		else
++			i2csi_req_process_read_opcode();
++
++		if (i2csi_req.rd.data) {
++			if (i2csi_req.hdr.offset < i2csi_req.rd.length) {
++				/* Adjust the read offset */
++				i2csi_req.rd.data += i2csi_req.hdr.offset;
++				i2csi_req.rd.length -= i2csi_req.hdr.offset;
++			} else {
++				/* Offset overshoots the read data */
++				i2csi_req.rd.data = NULL;
++				i2csi_req.rd.length = 0;
++			}
++
++			/* In case master requested partial data */
++			if (i2csi_req.hdr.rqdl < i2csi_req.rd.length)
++				i2csi_req.rd.length = i2csi_req.hdr.rqdl;
++
++			i2csi_req.rd.hdr.rsdl = i2csi_req.hdr.rqdl;
++			i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_TRANSMIT;
++		} else {
++			i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++		}
++
++		return 0;
++	}
+ }
+ 
+ /*
+@@ -195,6 +259,26 @@
+ 	i2csi_req.sts.ic = i2csi_req.hdr.ic;
+ 
+ 	return i2csi_req.sts.data[idx];
++}
++
++/*
++ * Handle request port read request. Return the RDATA header, followed by the
++ * payload.
++ */
++u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq)
++{
++	register int idx = cmd + read_seq - HL_INDIRECT_REQ_RDATA_DATA;
++
++	/* Header */
++	if (idx < HL_I2CI_REQ_RDATA_LEN)
++		return i2csi_req.rd.hdr.data[idx];
++
++	/* Payload */
++	idx -= HL_I2CI_REQ_RDATA_LEN;
++	if (idx < i2csi_req.rd.length)
++		return i2csi_req.rd.data[idx];
++
++	return 0;
+ }
+ 
+ /*
+@@ -244,3 +328,9 @@
+ 
+ 	return 0;
+ }
++
++void i2csi_req_set_idle(void)
++{
++	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
++}
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+index d2096ce..47397d0 100644
+--- a/preboot/i2cslave_indirect.h
++++ b/preboot/i2cslave_indirect.h
+@@ -9,8 +9,10 @@
+ #define _I2CSLAVE_INDIRECT_H_
+ 
+ u8 i2csi_req_handle_sts(u8 cmd, u32 read_seq);
++u8 i2csi_req_handle_rdata(u8 cmd, u32 read_seq);
+ u32 i2csi_req_handle_wdata(u8 **data, u8 cnt);
+ u32 i2csi_req_handle_cfg(u8 **data, u8 cnt);
++void i2csi_req_set_idle(void);
+ void i2csi_req_handle_sync_error(void);
+ 
+ #endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index e864714..abb2eb6 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -58,6 +58,17 @@
+ 	case HL_INDIRECT_REQ_CFG_CODE:
+ 		ret = HL_I2CI_REQ_CFG_LEN;
+ 		break;
++	case HL_INDIRECT_REQ_RDATA_CODE:
++		if (!read_seq) {
++			ret = HL_I2CI_REQ_RDATA_LEN;
++			break;
++		}
++	case HL_INDIRECT_REQ_RDATA_DATA:
++	case HL_INDIRECT_REQ_RDATA_DATA_1:
++	case HL_INDIRECT_REQ_RDATA_DATA_2:
++	case HL_INDIRECT_REQ_RDATA_DATA_3:
++		ret = i2csi_req_handle_rdata(cmd, read_seq);
++		break;
+ 	default:
+ 		/* NA */
+ 		ret = 0;
+@@ -74,6 +85,9 @@
+ 		return i2csi_req_handle_wdata(data, cnt);
+ 	case HL_INDIRECT_REQ_CFG_DATA:
+ 		return i2csi_req_handle_cfg(data, cnt);
++	case HL_INDIRECT_REQ_RDATA_DATA:
++		i2csi_req_set_idle();
++		/* Fall Though */
+ 	default:
+ 		return 0;
+ 	}

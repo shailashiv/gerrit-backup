@@ -1,0 +1,136 @@
+From bd78b01cb3635acbe5997dd42d9a195b3e11fd7d Mon Sep 17 00:00:00 2001
+From: Avinash Kumar <avikumar@habana.ai>
+Date: Mon, 19 Apr 2021 23:01:38 +0300
+Subject: [PATCH] [SW-39260] greco: disable pcie ltr capability
+
+The Latency Tolerance Reporting capability is included
+and supported in the PCIe controller and was integrated
+into all projects. However, it seems that the controller
+will not send an LTR message when needed if the latency
+values are not configured in the PCIE_WRAP.
+
+This causes us to fail PCI-SIGs CV tests that are related
+to LTR: the controller reports LTR supported, but the
+rules for this feature are not applied.
+
+We agreed that the best solution would be to disable support
+for LTR as this capability is not used or needed.
+
+Change-Id: I6fbeaa0354b79949cd38c45e792975ddf64d0758
+Signed-off-by: Avinash Kumar <avikumar@habana.ai>
+---
+
+diff --git a/greco/common.c b/greco/common.c
+index 7011301..604572a 100644
+--- a/greco/common.c
++++ b/greco/common.c
+@@ -18,6 +18,7 @@
+ #include <pcie_phy_regs.h>
+ #include <pcie_phy_masks.h>
+ #include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
+ 
+ #include <cpu_timestamp_regs.h>
+ #include <psoc_arc0_cfg_regs.h>
+@@ -45,6 +46,8 @@
+ 
+ #define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
+ #define FUSE_READ_RANGE_ALL	0x3F80
++#define PCIE_LTR_DISABLE		0
++#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+ 
+ u32 get_efuse_read_reg(void)
+ {
+@@ -236,6 +239,25 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
++static void preboot_disable_pcie_ltr(void)
++{
++	u32 cap_hdr_cfg, dev_cap2_reg;
++
++	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
++	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
++	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
++		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
++	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++
++	/* Disable LTR support, set bit-11 to '0' */
++	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
++	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
++		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
++	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++}
++
+ void preboot_init_pcie(void)
+ {
+ 	u64 start;
+@@ -272,6 +294,9 @@
+ 	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+ 	udelay(20);
+ 
++	/* PCIe disable LTR */
++	preboot_disable_pcie_ltr();
++
+ 	/* Enable and Mask LTSSM (erratum 102) */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+diff --git a/greco_arc/common.c b/greco_arc/common.c
+index 3889373..1ea8640 100644
+--- a/greco_arc/common.c
++++ b/greco_arc/common.c
+@@ -16,6 +16,7 @@
+ #include <pcie_wrap_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_dbi_regs.h>
++#include <pcie_dbi_masks.h>
+ #include <cpu_ca53_cfg_regs.h>
+ #include <cpu_timestamp_regs.h>
+ 
+@@ -38,6 +39,9 @@
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+ #define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
++
++#define PCIE_LTR_DISABLE		0
++#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+ 
+ u32 get_efuse_read_reg(void)
+ {
+@@ -133,6 +137,24 @@
+ 
+ }
+ 
++static void preboot_disable_pcie_ltr(void)
++{
++	u32 cap_hdr_cfg, dev_cap2_reg;
++	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
++	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
++	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
++		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
++	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++
++	/* Disable LTR support, set bit-11 to '0' */
++	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
++	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
++		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
++	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++}
++
+ void preboot_init_pcie(void)
+ {
+ 
+@@ -152,6 +174,9 @@
+ 	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+ 	udelay(20);
+ 
++	/* PCIe disable LTR */
++	preboot_disable_pcie_ltr();
++
+ 	/* Enable and Mask LTSSM (erratum 102) */
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }

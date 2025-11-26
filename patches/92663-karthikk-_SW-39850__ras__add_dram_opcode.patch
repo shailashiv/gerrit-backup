@@ -1,0 +1,154 @@
+From 9a5a7efa122d547bb8ca18f0762ea8fab73d8808 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 03 May 2021 15:56:32 +0300
+Subject: [PATCH] [SW-39850] ras: add dram opcode
+
+as per nvme-mi spec 1.3 support for
+dram opcode is added in preboot for hbm
+row replacement rma entry.
+
+in case hbm row replacement rma is active
+the opcode is updated with the relavent values
+as per nvme-mi spec 1.3.
+
+Change-Id: I6ade87ef41cd0946ae7fa10761138af5c5107bdd
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/gaudi/rma_info.c b/gaudi/rma_info.c
+index d9d98a5..25f31a6 100644
+--- a/gaudi/rma_info.c
++++ b/gaudi/rma_info.c
+@@ -24,6 +24,7 @@
+ #define RMA_HBM_PARITY_ENTRY_SIZE	sizeof(struct rma_hbm_parity_entry)
+ #define MAX_SIZE_ONE_RMA_TABLE		RMA_SRAM_ECC_ENTRY_SIZE
+ #define RMA_TABLE_HEADER_SIZE		sizeof(struct table_header)
++#define RMA_HBM_ROW_REP_ENTRY_SIZE	sizeof(struct rma_hbm_row_replacement_entry)
+ 
+ #define MAX_INFO_DESC_DATA	\
+ 	((MAX_SRAM_ECC_ENTRIES * MAX_SIZE_ONE_RMA_TABLE) + RMA_TABLE_HEADER_SIZE)
+@@ -318,3 +319,37 @@
+ 	op->mcbist_error = rma_hbm_init_err.mc_bist;
+ 	op->training_error = rma_hbm_init_err.training_error;
+ }
++
++void rma_info_hbm_row_replacement(struct hl_i2ci_dram *op)
++{
++	u32 size = MAX_INFO_DESC_DATA;
++	int ret, table_info_size;
++	struct rma_hbm_row_replacement_entry *hbm_row_replacement;
++	u16 offset;
++
++	ret = rma_info_get(RMA_HBM_ROW_REPLACEMENT_TABLE, err_sts_rma_buf, &size);
++	if (ret)
++		return;
++
++	table_info_size = size - RMA_TABLE_HEADER_SIZE;
++	op->number_of_replaced_rows =  table_info_size / RMA_HBM_ROW_REP_ENTRY_SIZE;
++
++	/*
++	 * Opcode's query of row index must
++	 * be an index within the replaced rows
++	 */
++	if (op->index_replaced_row_selection < op->number_of_replaced_rows) {
++		offset = RMA_TABLE_HEADER_SIZE +
++				(op->index_replaced_row_selection * RMA_HBM_ROW_REP_ENTRY_SIZE);
++		hbm_row_replacement =
++				(struct rma_hbm_row_replacement_entry *)&err_sts_rma_buf[offset];
++		op->replaced_row_hbm_index = hbm_row_replacement->device;
++		op->replaced_row_pc_index = hbm_row_replacement->pc;
++		op->replaced_row_bank_index = hbm_row_replacement->bank;
++		op->replaced_row_cause.data = hbm_row_replacement->header.data_cause;
++		op->replaced_row_address = hbm_row_replacement->row;
++
++	}
++	/* Clear out the data for buffer re-use */
++	memset(err_sts_rma_buf, 0, size);
++}
+diff --git a/include/rma_info.h b/include/rma_info.h
+index 7d2f345..ba4643c 100644
+--- a/include/rma_info.h
++++ b/include/rma_info.h
+@@ -14,5 +14,6 @@
+ void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op);
+ void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op);
+ void rma_info_hbm_init_err_sts(struct hl_i2ci_error_status_hbm_init *op);
++void rma_info_hbm_row_replacement(struct hl_i2ci_dram *op);
+ 
+ #endif /* _RMA_INFO_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 6e672eb..e8a19ff 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -112,6 +112,7 @@
+ 
+ static struct hl_i2ci_smbus_alert smbus_alert;
+ struct hl_i2ci_error_status op_err_status;
++struct hl_i2ci_dram op_dram;
+ 
+ static struct hl_i2ci_ctrl_cmd ctrl_cmd;
+ static struct hl_i2ci_ctrl_sts ctrl_sts;
+@@ -327,6 +328,7 @@
+ __weak void rma_info_hbm_ecc_err_sts(struct hl_i2ci_error_status_hbm_ecc *op) {}
+ __weak void rma_info_sram_ecc_err_sts(struct hl_i2ci_error_status_sram_ecc *op) {}
+ __weak void rma_info_hbm_init_err_sts(struct hl_i2ci_error_status_hbm_init *op) {}
++__weak void rma_info_hbm_row_replacement(struct hl_i2ci_dram *op) {}
+ 
+ static void i2csi_update_rma_entry(void)
+ {
+@@ -345,9 +347,17 @@
+ 	}
+ }
+ 
++static void i2csi_update_dram_rma_entry(void)
++{
++	if (i2c_rma_failure.data) {
++		if (i2c_rma_failure.row_replacement)
++			rma_info_hbm_row_replacement(&op_dram);
++	}
++}
++
+ static void i2csi_req_opcode_get_buffer(u16 size)
+ {
+-	int upper_bound;
++	int upper_bound, lower_bound;
+ 	u8 *data;
+ 
+ 	switch (req_wd.hdr.opcode) {
+@@ -388,6 +398,13 @@
+ 		break;
+ 	case HL_I2CI_REQ_OP_ERROR_STATUS:
+ 		i2csi_req_err_sts_check(size);
++		break;
++	case HL_I2CI_REQ_OP_DRAM:
++		lower_bound = offsetof(struct hl_i2ci_dram, index_replaced_row_selection);
++		upper_bound = offsetof(struct hl_i2ci_dram, replaced_row_hbm_index);
++
++		i2csi_req_buffer_get_writable(size, (u8 *)&op_dram, lower_bound,
++						  upper_bound);
+ 		break;
+ 	default:
+ 		/* Data will be consumed from HW but not stored anywhere */
+@@ -520,6 +537,12 @@
+ 		req_rd.data = (u8 *)&op_err_status;
+ 		req_rd.length = sizeof(op_err_status);
+ 		break;
++	case HL_I2CI_REQ_OP_DRAM:
++		i2csi_update_dram_rma_entry();
++
++		req_rd.data = (u8 *)&op_dram;
++		req_rd.length = sizeof(op_dram);
++		break;
+ 	default:
+ 		if ((BIT(req_wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+ 			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
+@@ -547,6 +570,9 @@
+ 	case HL_I2CI_REQ_OP_ERROR_STATUS:
+ 		/* Do nothing */
+ 		break;
++	case HL_I2CI_REQ_OP_DRAM:
++		/* Do nothing */
++		break;
+ 	default:
+ 		if ((BIT(req_wd.hdr.opcode) & SUPPORTED_OPCODES_MASK))
+ 			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;

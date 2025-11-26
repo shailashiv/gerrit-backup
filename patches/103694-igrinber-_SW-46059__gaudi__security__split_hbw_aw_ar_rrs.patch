@@ -1,0 +1,82 @@
+From d53ac24f231631df0566f805fb0d47209007fa0c Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 16 Jun 2021 23:03:03 +0300
+Subject: [PATCH] [SW-46059] gaudi: security: split hbw aw/ar rrs
+
+As a preparation for adding an HBM R/O functionality, split the HBW RRs
+setting function to A/R and A/W.
+This way the HBW access can be fine grained.
+
+Change-Id: I92e30a255a0e525cd05b59d4a228ca1da8902c54
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi/security.c b/arch/gaudi/security.c
+index 9b33d9d..ba7ee54 100644
+--- a/arch/gaudi/security.c
++++ b/arch/gaudi/security.c
+@@ -1387,8 +1387,8 @@
+ 	}
+ }
+ 
+-static void preboot_hbw_rr_set_rtr(int rr, int rtr, u64 base, u64 mask,
+-				   bool is_lock)
++static void preboot_hbw_rr_set_rtr_wr(int rr, int rtr, u64 base, u64 mask,
++				      bool is_lock)
+ {
+ 	u32 base_l = (u32)base, base_h = (u32)(base >> BITS_IN_REG);
+ 	u32 mask_l = (u32)mask, mask_h = (u32)(mask >> BITS_IN_REG);
+@@ -1403,6 +1403,25 @@
+ 	regmap_writel(mask_l, rr_dest);
+ 	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_MASK_HIGH_AW_0;
+ 	regmap_writel(mask_h, rr_dest);
++
++	/* Enable (hit) RR */
++	rr_base = IF_RTRS_DIST * rtr;
++	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AW;
++	hit = regmap_readl(rr_dest);
++	if (is_lock)
++		regmap_writel(hit | BIT(rr), rr_dest);
++	else
++		regmap_writel(hit & ~BIT(rr), rr_dest);
++}
++
++static void preboot_hbw_rr_set_rtr_ar(int rr, int rtr, u64 base, u64 mask,
++				      bool is_lock)
++{
++	u32 base_l = (u32)base, base_h = (u32)(base >> BITS_IN_REG);
++	u32 mask_l = (u32)mask, mask_h = (u32)(mask >> BITS_IN_REG);
++	u32 rr_base, rr_dest, hit;
++
++	rr_base = rr * sizeof(u32) + IF_RTRS_DIST * rtr;
+ 	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_LOW_AR_0;
+ 	regmap_writel(base_l, rr_dest);
+ 	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_BASE_HIGH_AR_0;
+@@ -1414,13 +1433,6 @@
+ 
+ 	/* Enable (hit) RR */
+ 	rr_base = IF_RTRS_DIST * rtr;
+-	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AW;
+-	hit = regmap_readl(rr_dest);
+-	if (is_lock)
+-		regmap_writel(hit | BIT(rr), rr_dest);
+-	else
+-		regmap_writel(hit & ~BIT(rr), rr_dest);
+-
+ 	rr_dest = rr_base + mmSIF_RTR_CTRL_0_RANGE_PRIV_HIT_AR;
+ 	hit = regmap_readl(rr_dest);
+ 	if (is_lock)
+@@ -1429,6 +1441,13 @@
+ 		regmap_writel(hit & ~BIT(rr), rr_dest);
+ }
+ 
++static void preboot_hbw_rr_set_rtr(int rr, int rtr, u64 base, u64 mask,
++				   bool is_lock)
++{
++	preboot_hbw_rr_set_rtr_wr(rr, rtr, base, mask, is_lock);
++	preboot_hbw_rr_set_rtr_ar(rr, rtr, base, mask, is_lock);
++}
++
+ static void preboot_secure_hbw_rr(int rr, u64 base, u64 mask)
+ {
+ 	int i;

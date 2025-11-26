@@ -1,0 +1,328 @@
+From 54d39484562e39fa74bb14fce36e4294a8eddbd8 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 31 Mar 2021 18:18:04 +0300
+Subject: [PATCH] [SW-28013] pci: adding api for iatu initialization
+
+So far the address translation unit (iATU) of the pci controller
+was initialized by the LKD driver.
+
+This patch inroduces apis for configuring inbound and outbound
+regions of the iATU , so from now on the FW will have the ability
+to configure the iATU independently. those apis will be used in
+ppboot and preboot in future commits.
+
+Change-Id: I532a0e3b37c069edbd47c4d2d57b127480685f5b
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/pci.c b/common/pci.c
+new file mode 100644
+index 0000000..37af2c8
+--- /dev/null
++++ b/common/pci.c
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <pcie_dbi_regs.h>
++#include <pcie_aux_regs.h>
++#include <bitops.h>
++#include "pci.h"
++
++#define IATU_BAR_NUM_OFFSET		8
++#define IATU_BAR_NUM_MASK		0x700
++#define IATU_NUM_MATCH_EN_MASK		BIT(19)
++#define IATU_MATCH_MODE_MASK		BIT(30)
++#define IATU_REGION_EN_MASK		BIT(31)
++
++#define IATU_REGION_SIZE		0x200
++#define IATU_REGION_INBOUND_OFF		0x100
++#define IATU_REGION_CTRL_1_OFF		0x0
++#define IATU_REGION_CTRL_2_OFF		0x4
++#define IATU_LWR_BASE_ADDR_OFF		0x8
++#define IATU_UPPER_BASE_ADDR_OFF	0xC
++#define IATU_LIMIT_ADDR_OFF		0x10
++#define IATU_LWR_TARGET_ADDR_OFF	0x14
++#define IATU_UPPER_TARGET_ADDR_OFF	0x18
++#define IATU_REGION_CTRL_3_OFF		0x1C
++#define IATU_UPPR_LIMIT_ADDR_OFF	0x20
++
++#define IATU_ACCESS_ENABLE_VAL		0x00300000
++#define IATU_ACCESS_DISABLE_VAL		0
++#define IATU_OUTBOUND_REGION_SIZE	0x00002000
++#define IATU_OUTBOUND_UPPER_ADDR_VAL	0x08000000
++
++__weak u32 dev_pci_dbi_cfg_offset_get(void)
++{
++	return 0;
++}
++
++/*
++ * hl_pci_set_inbound_region() - Configure inbound region
++ * @region: Inbound region number.
++ * @pci_region: Inbound region parameters.
++ *
++ * Configure the iATU inbound region.
++ */
++void hl_pci_set_inbound_region(u8 region,
++			       struct hl_pci_inbound_region *pci_region)
++{
++	u64 bar_phys_base, region_base, region_end_address;
++	u32 offset = dev_pci_dbi_cfg_offset_get();
++	u32 ctrl_reg_val;
++	u32 aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
++
++	regmap_writel(IATU_ACCESS_ENABLE_VAL, mmPCIE_AUX_DBI);
++
++	/* region offset */
++	offset += (IATU_REGION_SIZE * region) + IATU_REGION_INBOUND_OFF;
++
++	if (pci_region->mode == PCI_ADDRESS_MATCH_MODE) {
++		bar_phys_base = pci_region->pcie_bar_phys;
++		region_base = bar_phys_base + pci_region->offset_in_bar;
++		region_end_address = region_base + pci_region->size - 1;
++
++		regmap_writel((u32)region_base,
++			      offset + IATU_LWR_BASE_ADDR_OFF);
++		regmap_writel((u32)(region_base >> 32),
++			      offset + IATU_UPPER_BASE_ADDR_OFF);
++		regmap_writel((u32)region_end_address,
++			      offset + IATU_LIMIT_ADDR_OFF);
++	}
++
++	/* Point to the specified address */
++	regmap_writel((u32)pci_region->addr,
++		      offset + IATU_LWR_TARGET_ADDR_OFF);
++	regmap_writel((u32)(pci_region->addr >> 32),
++		      offset + IATU_UPPER_TARGET_ADDR_OFF);
++
++	/* Set bar type as memory */
++	regmap_writel(0, offset + IATU_REGION_CTRL_1_OFF);
++
++	/* Enable + bar/address match + match enable + bar number */
++	ctrl_reg_val = IATU_REGION_EN_MASK | IATU_NUM_MATCH_EN_MASK;
++
++	if (pci_region->mode == PCI_BAR_MATCH_MODE) {
++		ctrl_reg_val |= IATU_MATCH_MODE_MASK;
++		ctrl_reg_val |= (pci_region->bar << IATU_BAR_NUM_OFFSET) &
++				IATU_BAR_NUM_MASK;
++	}
++
++	regmap_writel(ctrl_reg_val, offset + IATU_REGION_CTRL_2_OFF);
++
++	/* restore iATU access state */
++	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
++}
++
++/*
++ * hl_pci_set_outbound_region() - Configure outbound region 0
++ * @pci_region: Outbound region parameters.
++ *
++ * Configure the iATU outbound region 0.
++ */
++void hl_pci_set_outbound_region(struct hl_pci_outbound_region *pci_region)
++{
++	u64 outbound_region_end_address;
++	u32 offset = dev_pci_dbi_cfg_offset_get();
++	u32 aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
++
++	regmap_writel(IATU_ACCESS_ENABLE_VAL, mmPCIE_AUX_DBI);
++
++	/* Outbound Region 0 */
++	outbound_region_end_address =
++			pci_region->addr + pci_region->size - 1;
++	regmap_writel((u32)pci_region->addr, offset + IATU_LWR_BASE_ADDR_OFF);
++	regmap_writel((u32)(pci_region->addr >> 32),
++		      offset + IATU_UPPER_BASE_ADDR_OFF);
++	regmap_writel((u32)outbound_region_end_address,
++		      offset + IATU_LIMIT_ADDR_OFF);
++	regmap_writel(0, offset + IATU_LWR_TARGET_ADDR_OFF);
++	regmap_writel(0, offset + IATU_UPPER_TARGET_ADDR_OFF);
++
++	regmap_writel((u32)(outbound_region_end_address >> 32),
++		      offset + IATU_UPPR_LIMIT_ADDR_OFF);
++	/* Increase region size */
++	regmap_writel(IATU_OUTBOUND_REGION_SIZE,
++		      offset + IATU_REGION_CTRL_1_OFF);
++	/* Enable */
++	regmap_writel(IATU_REGION_EN_MASK, offset + IATU_REGION_CTRL_2_OFF);
++
++	/* restore iATU access state */
++	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
++}
++
++/*
++ * hl_pci_get_bar_phys_addr() - get physical address of a bar
++ * @bar_id: bar number
++ * @bar_phys_addr: returned bar physical address
++ *
++ * the physical address is the address allocated by the host to each bar.
++ */
++int hl_pci_get_bar_phys_addr(enum hl_pci_bar_id bar_id, u64 *bar_phys_addr)
++{
++	u32 bar_reg, bar_addr_low, bar_addr_high;
++	u32 aux_dbi_reg;
++
++	switch (bar_id) {
++	case PCI_BAR_ID_0:
++		bar_reg = mmPCIE_DBI_BAR0_REG;
++		break;
++	case PCI_BAR_ID_2:
++		bar_reg = mmPCIE_DBI_BAR2_REG;
++		break;
++	case PCI_BAR_ID_4:
++		bar_reg = mmPCIE_DBI_BAR4_REG;
++		break;
++	default:
++		return -1;
++	}
++
++	aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
++	regmap_writel(IATU_ACCESS_DISABLE_VAL, mmPCIE_AUX_DBI);
++
++	bar_addr_low = regmap_readl(bar_reg) & ~0xF;
++	bar_addr_high = regmap_readl(bar_reg + sizeof(u32));
++
++	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
++
++	*bar_phys_addr = (u64)bar_addr_high << 32 | bar_addr_low;
++
++	return 0;
++}
++
++#define DBI_MEM_SPACE_EN_MASK	0x2
++
++/*
++ * hl_pci_is_mem_enabled() - is memory access enabled in the configuration
++ */
++bool hl_pci_is_mem_enabled(void)
++{
++	u32 sts_cmd_reg;
++	u32 aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
++
++	regmap_writel(IATU_ACCESS_DISABLE_VAL, mmPCIE_AUX_DBI);
++
++	sts_cmd_reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++
++	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
++
++	return !!(sts_cmd_reg & DBI_MEM_SPACE_EN_MASK);
++}
+diff --git a/common/pci.h b/common/pci.h
+new file mode 100644
+index 0000000..9498ac0
+--- /dev/null
++++ b/common/pci.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _PCI_H_
++#define _PCI_H_
++
++#include <preboot.h>
++
++/*
++ * enum hl_pci_bar_id - pci bar number enum
++ * since we are working in 64bit mode, only bars 0, 2, 4 are available.
++ */
++enum hl_pci_bar_id {
++	PCI_BAR_ID_0 = 0,
++	PCI_BAR_ID_2 = 2,
++	PCI_BAR_ID_4 = 4
++};
++
++/*
++ * enum hl_pci_match_mode - pci match mode per region
++ * @PCI_ADDRESS_MATCH_MODE: address match mode
++ * @PCI_BAR_MATCH_MODE: bar match mode
++ */
++enum hl_pci_match_mode {
++	PCI_ADDRESS_MATCH_MODE,
++	PCI_BAR_MATCH_MODE
++};
++
++/*
++ * struct hl_inbound_pci_region - inbound region descriptor
++ * @mode: pci match mode for this region
++ * @addr: region target address
++ * @size: region size in bytes
++ * @offset_in_bar: offset within bar (address match mode)
++ * @bar: bar id
++ * @pcie_bar_phys: PCIe bar physical address.
++ *		   (required only for PCI address match mode)
++ */
++struct hl_pci_inbound_region {
++	enum hl_pci_match_mode mode;
++	u64 addr;
++	u64 size;
++	u64 offset_in_bar;
++	u8 bar;
++	u64 pcie_bar_phys;
++};
++
++/*
++ * struct hl_outbound_pci_region - outbound region descriptor
++ * @addr: region target address
++ * @size: region size in bytes
++ */
++struct hl_pci_outbound_region {
++	u64 addr;
++	u64 size;
++};
++
++void hl_pci_set_inbound_region(u8 region,
++			       struct hl_pci_inbound_region *pci_region);
++void hl_pci_set_outbound_region(struct hl_pci_outbound_region *pci_region);
++int hl_pci_get_bar_phys_addr(enum hl_pci_bar_id bar_id, u64 *bar_phys_addr);
++bool hl_pci_is_mem_enabled(void);
++u32 dev_pci_dbi_cfg_offset_get(void);
++
++#endif /* _PCI_H_ */
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 2174d62..56063af 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -454,3 +454,8 @@
+ 	preboot_ack_razwi_irq();
+ 	iatu_disabled = true;
+ }
++
++u32 dev_pci_dbi_cfg_offset_get(void)
++{
++	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
++}
+diff --git a/gaudi2_arm/common.c b/gaudi2_arm/common.c
+index c586458..efb2dab 100644
+--- a/gaudi2_arm/common.c
++++ b/gaudi2_arm/common.c
+@@ -509,3 +509,8 @@
+ {
+ 	return mmPSOC_EFUSE_READ_CTRL;
+ }
++
++u32 dev_pci_dbi_cfg_offset_get(void)
++{
++	return (u32)mmPCIE_DBI_BASE & 0xFFFFFFF;
++}
+diff --git a/greco/common.c b/greco/common.c
+index 80689e5..3774df8 100644
+--- a/greco/common.c
++++ b/greco/common.c
+@@ -656,3 +656,8 @@
+ 	memcpy(hl_ts_data, greco_hl_ts_data,
+ 			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+ }
++
++u32 dev_pci_dbi_cfg_offset_get(void)
++{
++	return (u32)mmPCIE_DBI_BASE & 0xFFFFFF;
++}

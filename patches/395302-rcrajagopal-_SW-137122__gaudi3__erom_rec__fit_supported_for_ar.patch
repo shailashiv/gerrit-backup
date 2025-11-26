@@ -1,0 +1,180 @@
+From 0e4c1dcf1c87cd1888d0dba5e135328bfc93fb40 Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Mon, 12 Feb 2024 16:54:55 +0200
+Subject: [PATCH] [SW-137122] gaudi3: erom rec: fit supported for arc1 only
+
+FWUPD in erom recovery, support only ARC1 fit images.
+So we have added proper check to verify the fit is for ARC1 or
+not.
+
+Created a new fit.c file under gaudi3/common and put the
+above functions here.
+
+Change-Id: I9dbb0b547c4d3e6f8594d148f7ca50af7b488c28
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 011de14..3fedea7 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -13,6 +13,7 @@
+ 	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports.elf
+ endif
+ 
++CFLAGS += -I $(PREBOOT_ROOT_DIR)/lib/preboot
+ CFLAGS += -DPHY_FW_SIZE=$(PHY_FW_SIZE)
+ 
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/mbist.c)
+@@ -23,6 +24,7 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/string.o
+ 
+ EROM_RECOVERY_DEPS := \
+-	$(HL_DEV_ARCH_COMMON)/pci.o
++	$(HL_DEV_ARCH_COMMON)/pci.o \
++	$(HL_DEV_ARCH_COMMON)/fit.o
+ 
+ image_validation: image_validation_common
+diff --git a/arch/gaudi3/common/fit.c b/arch/gaudi3/common/fit.c
+new file mode 100644
+index 0000000..4b72adc
+--- /dev/null
++++ b/arch/gaudi3/common/fit.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <types.h>
++#include <fit.h>
++#include <uart.h>
++
++bool fit_is_core_id_supported(void)
++{
++	return true;
++}
++
++int fit_process_core_id(enum fit_core_id core_id)
++{
++	/* recovery currently only support fit load for master psoc arc1 */
++	if (core_id == FIT_CORE_ID_D0_PSOC_ARC1)
++		return 0;
++
++	preboot_puts_hex_raw("Unsupported core id: ", core_id, false);
++	return 1;
++}
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 4c0dd3b..fee6730 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -73,11 +73,17 @@
+ 	u64 loadaddr;
+ 	u64 startaddr;
+ 	const char *arch;
++	int core_id;
+ };
+ 
+ struct fit_image images[FIT_MAX_IMAGES];
+ struct fdt_region fdt_regions[MAX_FDT_REGIONS];
+ struct image_region region[MAX_FDT_REGIONS];
++
++__weak bool fit_is_core_id_supported(void)
++{
++	return false;
++}
+ 
+ __weak void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+@@ -639,6 +645,11 @@
+ 	return err;
+ }
+ 
++__weak int fit_process_core_id(enum fit_core_id core_id)
++{
++	return 1;
++}
++
+ static int fit_copy_image(u64 dst, const void *buf, int len, const char *arch,
+ 			  const char *cmpr)
+ {
+@@ -767,13 +778,14 @@
+ static enum fit_load_result fit_copy_images(const void *fit,
+ 					    enum fit_sec_failure *res)
+ {
+-	int node, len, image_len;
++	int node, len, image_len, core_id_len;
+ 	int conf, num_images, i;
+ 	const u8 *buf;
+ 	u64 load, start;
+ 	const char *cmpr;
+ 	size_t fit_size = fdt_totalsize(fit);
+ 	bool halted_secondary_cpu = false;
++	const uint32_t *core_id;
+ 
+ 	/* Check if image supports a minimum FDT version or newer */
+ 	if (fdt_version(fit) < FDT_MIN_SUPPORTED_VERSION)
+@@ -869,6 +881,19 @@
+ 
+ 		images[i].loadaddr = load;
+ 		images[i].startaddr = start;
++
++		if (fit_is_core_id_supported()) {
++			core_id = fdt_getprop(fit, node, HL_FIT_CORE_ID_PROP, &core_id_len);
++			if (!core_id)
++				return FIT_LOAD_CORRUPTED;
++
++			if (core_id_len != sizeof(*core_id))
++				return FIT_LOAD_CORRUPTED;
++
++			images[i].core_id = fdt32_to_cpu(*core_id);
++			if (fit_process_core_id((enum fit_core_id)images[i].core_id))
++				return FIT_LOAD_CORRUPTED;
++		}
+ 
+ 		if (fit_copy_image(load, buf, len, images[i].arch, cmpr))
+ 			return FIT_LOAD_CORRUPTED;
+@@ -1043,9 +1068,18 @@
+ 		if (!(strcmp(images[i].arch, "arm64")))
+ 			startaddr = images[i].startaddr;
+ 
+-		if (!(strcmp(images[i].arch, "arc")))
++		if (!(strcmp(images[i].arch, "arc"))) {
+ 			valid_arc_img = true;
+ 
++			if (fit_is_core_id_supported()) {
++				/* start ARC1 image in end, so skip running arc1 image here */
++				if (!(fit_process_core_id(images[i].core_id))) {
++					startaddr = images[i].startaddr;
++					continue;
++				}
++			}
++		}
++
+ 		if ((valid_arc_img) && (startaddr))
+ 			break;
+ 	}
+diff --git a/lib/preboot/fit.h b/lib/preboot/fit.h
+index 516a6fb..d35cc11 100644
+--- a/lib/preboot/fit.h
++++ b/lib/preboot/fit.h
+@@ -8,6 +8,8 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
++#include <hl_fit_if.h>
++
+ #define HL_SEC_KEY_NAME		"hl_rsa3072"
+ 
+ enum fit_load_result {
+@@ -40,5 +42,7 @@
+ int fit_verify_img_sig(const void *img, size_t img_size, const void *sec_desc,
+ 		       size_t sec_desc_size, const void *pub_key_fit,
+ 		       const u8 *sig, size_t sig_len);
++int fit_process_core_id(enum fit_core_id core_id);
++bool fit_is_core_id_supported(void);
+ 
+ #endif /* _HL_FIT_H_ */

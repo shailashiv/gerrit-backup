@@ -1,0 +1,96 @@
+From 7f26eb0cae8110a8f6a112d2c952e34c6e1f5776 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 13 Mar 2023 13:48:27 +0200
+Subject: [PATCH] [SW-127463] pif_arc: report link timeout err
+
+According to PciE spec, link must be established within a given time
+frame after prst_n release:
+1. 100mS after cold boot
+2. 20mS after warm reboot
+
+PIF ARC monitors this condition and flag an error if timeout
+has occurred.
+
+Arming of the pif TS counter is moved to the main pcie monitoring
+function pif_arc_pcie_monitoring() so it will be clear that this
+counter is being armed right after prst_n is deasserted.
+
+Change-Id: I626a4d482c0585ddf9463f945b89043c0eceb8d1
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 40a79c5..20fc801 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1020,9 +1020,6 @@
+ 
+ static void pif_arc_init_pcie(void)
+ {
+-	/* arm timer for delays and timeouts in the pcie init sequence */
+-	pif_ts_counter_arm();
+-
+ 	pif_arc_init_pcie_phy();
+ 
+ 	pif_arc_pcie_device_id_vendor_id_set();
+@@ -1042,17 +1039,50 @@
+ 	regmap_writel(LTTSM_ENA_MASK, D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN));
+ }
+ 
++enum pif_reset_source {
++	PIF_COLD_BOOT,
++	PIF_WARM_REBOOT,
++};
++
++/*
++ * PIF is being reset only by PRST_n signal (warm reboot) or power cycle (cold boot).
++ * Due to a known bug in the psoc rst_src register, this register should never be cleared, only
++ * power cycle is clearing it. Hence, we are looking for 2 scenarios:
++ * 1. PRST_n indication is on == last reset source was warm reboot
++ * 2. PRST_n indication is off == last reset source necessarily was cold boot.
++ */
++static enum pif_reset_source pif_get_reset_source(void)
++{
++	u32 regval = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_RST_SRC));
++
++	if (regval & GLOBAL_CONF_RST_SRC_PRSTN_RST_IND_M)
++		return PIF_WARM_REBOOT;
++
++	return PIF_COLD_BOOT;
++}
++
++#define COLD_LINK_TIMEOUT_US	100000
++#define WARM_LINK_TIMEOUT_US	20000
+ 
+ void pif_arc_pcie_monitoring(void)
+ {
++	u32 link_timeout;
++	enum pif_reset_source rst_src;
++
+ 	/* Wait for PRSTn */
+ 	while (!regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN)))
+ 		;
++
++	/* arm timer for delays and timeouts in the pcie init sequence */
++	pif_ts_counter_arm();
+ 
+ 	/* Only after PRSTn is de-asserted */
+ 	pif_arc_init_pcie();
+ 
+ 	hl_pif_report_sts(PIF_STAT_WAITING_FOR_LINK);
++	rst_src = pif_get_reset_source();
++	link_timeout = (rst_src == PIF_WARM_REBOOT) ? WARM_LINK_TIMEOUT_US : COLD_LINK_TIMEOUT_US;
++
+ 	while (1) {
+ 		unsigned int prstn, ltssm, smlh, rdlh;
+ 
+@@ -1064,6 +1094,9 @@
+ 		if (prstn && smlh && rdlh)
+ 			break;
+ 
++		if (pif_ts_timeout_expired(0, link_timeout))
++			hl_pif_report_err(PIF_ERR_PCI_LINK_UP_TIMEOUT);
++
+ 		/*
+ 		 * Some host assert prstn during link up while moving to GEN3
+ 		 * This cause BAR size to be reset

@@ -1,0 +1,239 @@
+From e207581784075619aa720888a786abc720cddbfc Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Fri, 23 Feb 2024 18:16:55 +0200
+Subject: [PATCH] [SW-137121] gaudi3: erom pcie: ported pcie config
+
+ported pcie config function from arcboot to support
+pcie link bringup manually here.
+
+Change-Id: I24875d83d6d2c990edfce8327b8993228f53dd61
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/app/ext_rom/erom_pcie.c b/app/ext_rom/erom_pcie.c
+index 3f3108f..8dc23c2 100644
+--- a/app/ext_rom/erom_pcie.c
++++ b/app/ext_rom/erom_pcie.c
+@@ -77,7 +77,7 @@
+ 
+ 	/* let the log be device specific according to its restrictions */
+ 	ppboot_log_waiting_for_pcie();
+-	preboot_pcie_wait_for_link();
++	hl_erom_bringup_pcie_link();
+ }
+ 
+ static uint32_t arcboot_flash_image_offset(uint8_t image_ptr)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 204579d..5e3849a 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -385,3 +385,8 @@
+ 	if (dma_err != DMA_SUCCESS)
+ 		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
+ }
++
++void hl_erom_bringup_pcie_link(void)
++{
++	preboot_pcie_wait_for_link();
++}
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index af6f87d..628bcb3 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -1068,3 +1068,8 @@
+ 
+ 	return (config_efuse & EFUSE_SYSCFG_DISABLE_SECONDARY_IMG);
+ }
++
++void hl_erom_bringup_pcie_link(void)
++{
++	preboot_pcie_wait_for_link();
++}
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 14d316f..1927800 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -450,3 +450,8 @@
+ 
+ 	return preboot_fake_security_is_sig_validation_enabled();
+ }
++
++void hl_erom_bringup_pcie_link(void)
++{
++	preboot_pcie_wait_for_link();
++}
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 3fedea7..fb66863 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -21,7 +21,8 @@
+ EROM_PCIE_DEPS := \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/boot_desc.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/efuse.o \
+-	$(PREBOOT_ROOT_DIR)/lib/common/string.o
++	$(PREBOOT_ROOT_DIR)/lib/common/string.o \
++	$(HL_DEV_ARCH_COMMON)/pci.o
+ 
+ EROM_RECOVERY_DEPS := \
+ 	$(HL_DEV_ARCH_COMMON)/pci.o \
+diff --git a/arch/gaudi3/common/pci.c b/arch/gaudi3/common/pci.c
+index 735e5ea..39d4df4 100644
+--- a/arch/gaudi3/common/pci.c
++++ b/arch/gaudi3/common/pci.c
+@@ -9,8 +9,14 @@
+ #include <gaudi3_blocks_linux_driver.h>
+ #include <gaudi3_reg_map.h>
+ #include <gaudi3_fw_if.h>
++#include <global_conf_regs.h>
++#include <psoc_boot_conf_regs.h>
++#include <psoc_boot_conf_masks.h>
+ #include <pcie_aux_masks.h>
+ #include <pcie_aux_regs.h>
++#include <pcie_phy_masks.h>
++#include <pcie_phy_regs.h>
++#include <pcie_wrap_regs.h>
+ #include <hl_pci_if.h>
+ #include <hl_boot_if.h>
+ #include <address_space.h>
+@@ -20,6 +26,8 @@
+ #include <uart.h>
+ #include <pci.h>
+ #include <hl.h>
++#include <pll.h>
++#include <arcboot_export_dev.h>
+ 
+ static bool pcie_initialized;
+ 
+@@ -237,3 +245,120 @@
+ 
+ 	regmap_writel(val, pci.bmu_base_addr);
+ }
++
++#define PHY_CR_PARA_CMD_DATA		0x2
++#define PHY_CR_PARA_CMD_ADDR		0x5149
++#define PHY_CR_PARA_STS_UDELAY		10000 /* 10ms */
++static void pcie_phy_wa_snps_dcc(void)
++{
++	uint64_t start;
++	uint32_t val;
++
++	regmap_writel(PCIE_PHY_CR_PARA_SEL_VAL_M,
++				D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_CFG));
++
++	regmap_writel(PCIE_PHY_CR_PARA_CTRL_WR_EN_M,
++				D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_CTRL));
++
++	val = ((PHY_CR_PARA_CMD_DATA << PCIE_PHY_CR_PARA_CMD_DATA_S) |
++			PHY_CR_PARA_CMD_ADDR);
++
++	start = timestamp_get_us();
++	/* Wait until status is cleared */
++	while (1) {
++		val = regmap_readl(D0_PCIE_PHY_REG(mmPCIE_PHY_CR_PARA_STS));
++		if (!val)
++			break;
++
++		if (timeout_expired(start, PHY_CR_PARA_STS_UDELAY))
++			break;
++	}
++}
++
++#define PHY_SRAM_INIT_UDELAY			100000 /* 100ms */
++static void pcie_phy_wait_for_sram_init_done(void)
++{
++	uint32_t sram_init_done0, sram_init_done1, sram_init_done2, sram_init_done3;
++	uint64_t start = timestamp_get_us();
++
++	/*
++	 * As per HW team, internal sram initialization can take several ms.
++	 * timeout should be added in 10-100ms.
++	 */
++	while (1) {
++		sram_init_done0 = regmap_readl(
++			D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0));
++		sram_init_done1 = regmap_readl(
++			D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1));
++		sram_init_done2 = regmap_readl(
++			D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_2));
++		sram_init_done3 = regmap_readl(
++			D0_PCIE_PHY_REG(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_3));
++
++		if ((sram_init_done0 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M) &&
++			(sram_init_done1 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M) &&
++			(sram_init_done2 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M) &&
++			(sram_init_done3 == PCIE_PHY_PHYX_SRAM_INIT_DONE_STATUS_M))
++			break;
++
++		if (timeout_expired(start, PHY_SRAM_INIT_UDELAY))
++			break;
++	}
++}
++
++void hl_erom_bringup_pcie_link(void)
++{
++	u8 ltssm_en;
++
++	/* Disable PIF isolation */
++	regmap_writel(0x00, D0_PSOC_BOOT_CONF_REG(mmPSOC_BOOT_CONF_D0_PIF_ISO));
++
++	/* Disable PCIe error responses (both HBW and LBW) */
++	regmap_writel(0x1, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PCIE_RSP_OK_0));
++	regmap_writel(0x1, D0_PCIE_WRAP_REG(mmPCIE_WRAP_PCIE_RSP_OK_1));
++
++	/* Wait for PRSTn */
++	while (!regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PRSTN)))
++		;
++
++	ltssm_en = regmap_readl(D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN)) &
++					PCIE_AUX_LTSSM_EN_IND_M;
++
++	if (!ltssm_en) {
++		/* Reset PCIe PHY */
++		regmap_writel(0, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PCIE_PHY_RST_N));
++
++		pcie_phy_para_sel_set();
++
++		if (get_sris_mode_from_strap()) {
++			regmap_writel(1, D0_PCIE_PHY_REG(mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN));
++			pcie_phy_set_lane_refclk_mode();
++			pcie_phy_set_pll_short_lock();
++			regmap_writel(1, D0_PCIE_AUX_REG(mmPCIE_AUX_APP_SRIS_MODE));
++		}
++
++		if (get_srns_mode_from_strap()) {
++			pcie_phy_set_lane_refclk_mode();
++			pcie_phy_set_pll_short_lock();
++		}
++
++		pcie_phy_ssc_en_set();
++
++		/* Take the PHY out of reset */
++		regmap_writel(1, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_PCIE_PHY_RST_N));
++
++		pcie_phy_wait_for_sram_init_done();
++
++		pcie_phy_wa_snps_dcc();
++
++		pcie_phy_set_sram_ext_ld_done();
++
++		pcie_set_pcie_device_vendor_id();
++
++		hl_pcie_clear_boot_termination();
++
++		regmap_writel(0x3, D0_PCIE_AUX_REG(mmPCIE_AUX_LTSSM_EN));
++	} else {
++		hl_pcie_clear_boot_termination();
++	}
++}
+diff --git a/include/baremetal.h b/include/baremetal.h
+index f37e06e..8de65fc 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -286,6 +286,7 @@
+ 
+ bool hl_is_efuse_syscfg_dis_secondary_img_set(void);
+ void erom_efuse_init(void);
++void hl_erom_bringup_pcie_link(void);
+ 
+ #endif /* __ASSEMBLY__ */
+ 

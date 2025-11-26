@@ -1,0 +1,66 @@
+From bc2ed9063cd957c780ad4477e43e737f01c01221 Mon Sep 17 00:00:00 2001
+From: Sagi Maimon <smaimon@habana.ai>
+Date: Tue, 02 Feb 2021 11:49:47 +0200
+Subject: [PATCH] [SW-29734] preboot: security: stack overflow fix
+
+corrupted fit information can cause stack based buffer overflow.
+make sure that public key string length does not exceed buffer size.
+
+Change-Id: Iab8fe886c265a0ae05971bb00c733b66c518e1ac
+Signed-off-by: Sagi Maimon <smaimon@habana.ai>
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 38602eb..effa203 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <libfdt.h>
++#include <string.h>
+ #include <security.h>
+ #include <hl_boot_if.h>
+ #include <preboot.h>
+@@ -52,6 +53,8 @@
+ #define FIT_MAX_IMAGES		8
+ 
+ #define FDT_MIN_SUPPORTED_VERSION 0x11
++#define FIT_MAX_KEY_NAME	64
++#define PREFIX_KEY			"key-"
+ 
+ /*
+  * For checking decompressed image bounderies, assume the compression factor to
+@@ -255,9 +258,19 @@
+ static int get_pub_key_node(const void *pub_key_fit, const char *key_name)
+ {
+ 	int sig_node;
+-	char key_node_name[64] = "key-";
++	char key_node_name[FIT_MAX_KEY_NAME] = PREFIX_KEY;
++	size_t key_node_name_len = sizeof(PREFIX_KEY) - 1;
+ 
+-	memcpy(key_node_name+strlen(key_node_name), key_name, strlen(key_name));
++	key_node_name[FIT_MAX_KEY_NAME - 1] = '\0';
++
++	strncpy(key_node_name + key_node_name_len,
++			key_name, FIT_MAX_KEY_NAME - key_node_name_len);
++	/*
++	 * To avoid stack based buffer overflow
++	 * make sure your key string length does not exceed buffer size.
++	 */
++	if (key_node_name[FIT_MAX_KEY_NAME - 1] != '\0')
++		return -1;
+ 
+ 	sig_node = fdt_subnode_offset(pub_key_fit, 0, FIT_SIG_NODENAME);
+ 
+@@ -615,6 +628,10 @@
+ 		preboot_puts_hex("Images in fit exceeds max limit: ",
+ 					FIT_MAX_IMAGES, false);
+ 		return FIT_LOAD_CORRUPTED;
++	} else if (num_images < 0) {
++		preboot_puts_hex("Cant read images from fit: ",
++					-num_images, false);
++		return FIT_LOAD_CORRUPTED;
+ 	}
+ 
+ 	for (i = 0; i < num_images; i++) {

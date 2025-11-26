@@ -1,0 +1,152 @@
+From de00966e81df059b38587a23e6664ce78a0bdbe6 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sun, 02 May 2021 13:16:21 +0300
+Subject: [PATCH] [SW-41202] greco: add retries for setting arc in run state
+
+Currently, after setting ARC in run state, we wait for indefinitely
+while loop for ACK response from ARC. This patch adds timeout for
+mechanism for checking ACK from ARC and print in case of no response
+for ARC.
+
+Change-Id: Id374f086373774107b5cef5a3bdcc42c510cb14c
+---
+
+diff --git a/greco/common.c b/greco/common.c
+index 9c514a7..c175dee 100644
+--- a/greco/common.c
++++ b/greco/common.c
+@@ -549,6 +549,46 @@
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+ 
++/*
++ * Set ARC in running state
++ * 1. Set run bit in RUN_HALT_REQ register
++ * 2. Wait for ACK from core in RUN_HALT_ACK register
++ * 3. Clear run bit in RUN_HALT_REQ register
++ */
++static void run_arc(u8 id)
++{
++	u32 run_ack_offset, run_req_offset;
++	u32 run_ack_mask;
++	u64 start;
++
++	if (id) {
++		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	} else {
++		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	}
++
++	/* Set ARC in running state */
++	regmap_writel(BIT(0), run_req_offset);
++
++	start = timestamp_get_us();
++	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
++
++		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
++			preboot_puts_hex("No running state ack from ARC ",
++					id, false);
++			break;
++		}
++	}
++
++	regmap_writel(0x0, run_req_offset);
++}
++
+ void image_start(u64 loadaddr)
+ {
+ 	void (*image_entry)(void) = (void *)loadaddr;
+@@ -559,8 +599,8 @@
+ void preboot_start_image(u64 startaddr)
+ {
+ 	/* Set ARC0 and ARC1 in running state */
+-	RUN_ARC(0);
+-	RUN_ARC(1);
++	run_arc(0);
++	run_arc(1);
+ 
+ 	/*
+ 	 * After image_entry, control is not expected to return
+diff --git a/greco/common.h b/greco/common.h
+index 467cabc..7ee7ca9 100644
+--- a/greco/common.h
++++ b/greco/common.h
+@@ -46,6 +46,7 @@
+ #define ARC_RST_VALUE			0x110
+ #define ARC_RST_VEC_ADDR		0x0
+ #define ARC_HALT_ACK_RETRIES		10
++#define ARC_RUN_ACK_TIMEOUT_US		100
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+ 
+@@ -53,21 +54,6 @@
+ #define BTL_SYNC_TIMEOUT_US		(USEC_PER_SEC / 2)
+ #define PCIE_EXT_LD_TIMEOUT_US		576
+ #define HL_INIT_SP_SRAM_RETRIES		50
+-
+-/*
+- * Set ARC in running state
+- * 1. Set run bit in RUN_HALT_REQ register
+- * 2. Wait for ACK from core in RUN_HALT_ACK register
+- * 3. Clear run bit in RUN_HALT_REQ register
+- */
+-#define RUN_ARC(id)							       \
+-	do {								       \
+-		regmap_writel(BIT(0), mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);      \
+-		while (!(regmap_readl(mmPSOC_ARC##id##_CFG_RUN_HALT_ACK) &     \
+-				PSOC_ARC##id##_CFG_RUN_HALT_ACK_RUN_ACK_MASK)) \
+-			;						       \
+-		regmap_writel(0x0, mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);	       \
+-	} while (0)
+ 
+ #define EFUSE_SYSCFG_WA_SNPS_CASE_01038891		BIT(23)
+ 
+diff --git a/greco_arc_gnu/common.c b/greco_arc_gnu/common.c
+index 0008810..9baf372 100644
+--- a/greco_arc_gnu/common.c
++++ b/greco_arc_gnu/common.c
+@@ -170,6 +170,7 @@
+ {
+ 	void (*image_entry)(void);
+ 	u32 lsb, msb;
++	u64 start;
+ 
+ 	if (startaddr) {
+ 		lsb = (u32)startaddr;
+@@ -190,9 +191,17 @@
+ 	 * 3. Clear run bit in RUN_HALT_REQ register
+ 	 */
+ 	regmap_writel(BIT(0), mmPSOC_ARC0_CFG_RUN_HALT_REQ);
++
++	start = timestamp_get_us();
+ 	while (!(regmap_readl(mmPSOC_ARC0_CFG_RUN_HALT_ACK) &
+-				PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK))
+-		;
++			PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK)) {
++
++		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
++			preboot_puts("No running state ack from ARC0");
++			break;
++		}
++	}
++
+ 	regmap_writel(0x0, mmPSOC_ARC0_CFG_RUN_HALT_REQ);
+ 
+ 	/*
+diff --git a/greco_arc_gnu/common.h b/greco_arc_gnu/common.h
+index 1111fd6..af26eb2 100644
+--- a/greco_arc_gnu/common.h
++++ b/greco_arc_gnu/common.h
+@@ -46,4 +46,6 @@
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+ 
++#define ARC_RUN_ACK_TIMEOUT_US		100
++
+ #endif /* COMMON_GRECO_ARC_GNU_H_ */

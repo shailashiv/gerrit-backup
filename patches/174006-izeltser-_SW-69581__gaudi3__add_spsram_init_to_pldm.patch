@@ -1,0 +1,70 @@
+From f65995e181cfbd9f849aa7085d5f650c02f2d799 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 31 Jan 2022 17:24:11 +0200
+Subject: [PATCH] [SW-69581] gaudi3: add spsram init to pldm
+
+Normally bootrom takes care of that, but in pldm when running without
+bootrom, let preboot initialize the spsram memory.
+The initialization is performed using the builtin HW mechanism.
+
+Change-Id: I52d58826b087481c796942d67284e16531cf7aae
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index 4174de2..3f73cfe 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -4,9 +4,12 @@
+  */
+ 
+ #include <d0_psoc_global_conf_regs.h>
++#include <d0_psoc_global_conf_masks.h>
+ 
+ #include <preboot.h>
+ #include <uart.h>
++#include <pll.h>
++#include "hl.h"
+ 
+ #define SYS_CLOCK_FREQUENCY	155000ULL
+ 
+@@ -39,3 +42,39 @@
+ 
+ 	return (factor + 1) & 0xFFFE;
+ }
++
++#define SP_SRAM_INIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++
++/*
++ * Initialize scratch SRAM to avoid ECC exceptions.
++ * Normally bootrom takes care of that, but in pldm when running without
++ * bootrom, let preboot initialize the spsram memory
++ */
++void preboot_sp_sram_init(void)
++{
++	unsigned int rst_src = hl_rst_src_get();
++	u32 init_sts;
++	u64 start;
++
++	if (rst_src != HL_COLD_RST)
++		return;
++
++	regmap_writel(D0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_START_M,
++		      mmD0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL);
++	start = timestamp_get_us();
++
++	while (1) {
++		init_sts = regmap_readl(mmD0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL);
++		if (init_sts & D0_PSOC_GLOBAL_CONF_SCRATCHPAD_INIT_CTRL_DONE_M)
++			break;
++
++		/*
++		 * If init does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, SP_SRAM_INIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for sp sram init\n");
++			break;
++		}
++	}
++}

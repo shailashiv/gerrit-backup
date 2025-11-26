@@ -1,0 +1,87 @@
+From dd0c8fa908d2169ae92e5d380a33c75c6771e707 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 29 Nov 2023 15:55:04 +0200
+Subject: [PATCH] [FSW-334] fs1: pldm: init psoc pll
+
+For PLDM Psoc PLL is reconfigured to feed the UART with 250MHz
+clock instead the nominal 50MHz. this is required to be able to
+print on PLDM, because of the very slow clocks of PLDM.
+
+Change-Id: I9cc16c86cbe273f17ee3dd4ed6e66647c13a366c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 79090c2..7a6a154 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -28,6 +28,7 @@
+ #include <fs1_reg_map.h>
+ #include <fs1_fw_if.h>
+ #include "common.h"
++#include "hl.h"
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -219,10 +220,13 @@
+ 					   mmPCIE_ARC_PCIE_ARC_ARC_NUM);
+ }
+ 
++__weak void hl_dev_psoc_pll_init(void) {}
++
+ void hl_plat_early_init(void)
+ {
+ 	hl_init_cpu_ids();
+ 	hl_lbw_early_write_resp_enable();
++	hl_dev_psoc_pll_init();
+ }
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index 1781af6..e0af6b1 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -38,4 +38,6 @@
+ 	err;											\
+ })
+ 
++void hl_dev_psoc_pll_init(void);
++
+ #endif /* ARCH_FS1_ARC_HL_H_ */
+diff --git a/arch/fs1/arc/pldm.c b/arch/fs1/arc/pldm.c
+index af4a9ec..ac14e76 100644
+--- a/arch/fs1/arc/pldm.c
++++ b/arch/fs1/arc/pldm.c
+@@ -15,6 +15,23 @@
+ #define UART_CLOCK_FREQUENCY	SYS_CLOCK_FREQUENCY
+ #define PLDM_UART_BAUDRATE	300
+ 
++/*
++ * This cfg specific to PLDM bumps up uart freq
++ * to 250 MHz while keeping other divs on nominal frequency
++ */
++static struct hl_pll_cfg fs1_psoc_pll_cfg[] = {
++	{
++		.name = "PSOC", .base = mmIO_0_CFG_HALF_0_SOC_PLL_PSOC_CTRL_BASE,
++		.nr = 1, .nf = 240, .od = 3, .nb = 2,
++		.div_factor = { 0, 1, 4, 3 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	},
++};
++
+ u64 hl_pll_timestamp_freq_get(void)
+ {
+ 	return SYS_CLOCK_FREQUENCY;
+@@ -43,3 +60,8 @@
+ 			 mmPSOC_CFG_PAD_CONF_PAD_SEL_50);			/* UART0 TXD */
+ 	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
+ }
++
++void hl_dev_psoc_pll_init(void)
++{
++	hl_pll_init(fs1_psoc_pll_cfg, 1);
++}

@@ -1,0 +1,101 @@
+From fd6ec04386a8e13142f7b9a300aa0a8db325bcb4 Mon Sep 17 00:00:00 2001
+From: sai surya teja <sssteja@habana.ai>
+Date: Mon, 10 Apr 2023 14:16:27 +0300
+Subject: [PATCH] [SW-140835] gaudi2: security: align erom and preboot hbw security config
+
+This patch aligns the recent hbw related security configuration changes
+in preboot_rtos to erom.
+
+TODO: Other preboot_rtos and erom related alignments are handled part of
+https://jira.habana-labs.com/browse/SW-140835
+
+Change-Id: Id75600dd44bfbd01beefd5f3925080a44db98914
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 9067eed..319b284 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -155,13 +155,14 @@
+ 	.rr_en = mmDCORE0_HMMU0_MMU_DDR_RANGE_REG_ENABLE,
+ };
+ 
++#define SRAM_RSVD_BASE		0x1000008000000000ull
+ #define SRAM_END		(SRAM_BASE_ADDR + SRAM_SIZE)
+ #define SRAM_END_EXC_TOP4K	(SRAM_END - 4096) /* Short HBW RR can't protect last 4K of SRAM */
+ 
+ static struct hl_sec_dyn_pcie_rr_cfg preboot_sec_dyn_cfg[] = {
+ 	[SRAM_BGN_TO_IMG] = {
+ 		.rr = HL_SEC_HBW_SRAM_BGN,
+-		.min = SRAM_BASE_ADDR,
++		.min = SRAM_RSVD_BASE,
+ 		.max = 0,	/* sram start to image start */
+ 	},
+ 	[IMAGE] = {
+@@ -172,7 +173,7 @@
+ 	[IMG_END_TO_SRAM_END] = {
+ 		.rr = HL_SEC_HBW_SRAM_END,
+ 		.min = 0,
+-		.max = SRAM_END,	/* image end to sram end */
++		.max = SRAM_END_EXC_TOP4K,	/* image end to sram end - 4K*/
+ 	},
+ };
+ 
+@@ -975,8 +976,11 @@
+ #define SPI_FLASH_BASE		(STM_FLASH_BASE_ADDR + STM_FLASH_SIZE)
+ #define SPI_FLASH_END		(SPI_FLASH_BASE + SPI_FLASH_SIZE)
+ #define PCIE_FW_SRAM_RSVD_END	0x1000007FF7FFF000ull
+-#define SRAM_RSVD_BASE		0x1000008000000000ull
+ #define DRAM_RSVD_END		0xFF00000000000000ull
++#define RSVD_ABOVE_PCIE_64PB	0x0100000000000000ull
++#define BAR0_1_GEN_192MB_BASE	0x1000007FF4000000ull
++#define RSVD_ABOVE_HBM_BASE	0x1002000000000000ull
++#define PCIE_1ZB_BASE		0xFF00000000000000ull
+ 
+ /* common function for ppboot and preboot HBW RR programming */
+ static void hl_secure_hbw_common(struct hl_rr_eng_select rr_sel)
+@@ -1096,7 +1100,29 @@
+ 	max = PCIE_FW_SRAM_RSVD_END;
+ 	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_RAZWI, min, max, rr_sel);
+ 
++	rr_sel.noc = 1;
++	rr_sel.psoc = 1;
+ 	hl_secure_hbw_common(rr_sel);
++
++	rr_sel.pcie = 1;
++	rr_sel.noc = 1;
++	rr_sel.psoc = 1;
++
++	/*
++	 * Block Reserved region above PCIE_64PB base
++	 * 0x0100000000000000 - 0x1000007FF4000000
++	 */
++	min = RSVD_ABOVE_PCIE_64PB;
++	max = BAR0_1_GEN_192MB_BASE;
++	hl_secure_hbw_rr(HL_SEC_HBW_RSVD_0, min, max, rr_sel);
++
++	/*
++	 * Block Reserved region above HBM region.
++	 * 0x1002000000000000 - 0xFF00000000000000
++	 */
++	min = RSVD_ABOVE_HBM_BASE;
++	max = PCIE_1ZB_BASE;
++	hl_secure_hbw_rr(HL_SEC_HBW_RSVD_1, min, max, rr_sel);
+ }
+ 
+ static void hl_secure_dyn_rr_cfg(int rr_idx, u64 min64, u64 max64)
+@@ -1320,12 +1346,12 @@
+ 		/*
+ 		 * Make SRAM Read-only
+ 		 */
+-		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_RO, SRAM_BASE_ADDR, SRAM_END, rr_sel);
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_RO, SRAM_BASE_ADDR, SRAM_END_EXC_TOP4K, rr_sel);
+ 		/*
+ 		 * Dynamic RR is inclusive of the static SRAM RR, hence the dynamic RRs
+ 		 * need to be opened in order for SRAM protection to be disabled.
+ 		 */
+-		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_BGN, 0, 0, rr_sel);
++		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_BGN, SRAM_RSVD_BASE, SRAM_BASE_ADDR, rr_sel);
+ 		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_IMG, 0, 0, rr_sel);
+ 		hl_secure_hbw_rr(HL_SEC_HBW_SRAM_END, 0, 0, rr_sel);
+ 	} else {

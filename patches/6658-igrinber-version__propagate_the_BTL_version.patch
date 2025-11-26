@@ -1,0 +1,82 @@
+From ef9e20812518cd8a4418f6cc2d44137f0dcf7842 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 05 Dec 2018 00:54:59 +0200
+Subject: [PATCH] version: propagate the BTL version
+
+Propagate the BTL version embedded inside the preboot version to upper
+SW layers.
+The BTL version is retrieved from the scratchpad 28 register and
+prepended to the preboot version.
+This forms a single string containing both versions, thus no further
+upper layer SW adjustments are needed.
+
+Sample output:
+=========================
+BTL version 9da9a8bd
+Preboot version hl-goya-0.1.6-rc-fw-2.1.4-13-gcb08c2b-dirty (Dec 05 2018 - 23:09:05)
+PCIe link is UP!
+Preparing to run SPL primary
+SPL copying from flash is completed
+Flash may be protected, depend on WP# signal
+
+U-Boot SPL 2017.11-hl-goya-0.1.6-rc-fw-2.1.4-13-gcb5fbf7 (Dec 05 2018 - 23:07:24)
+Trying to boot from SPI
+=========================
+
+Change-Id: I78f9feb9dba1dc71e4347c71683ebc45fcde8242
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/preboot.c b/preboot.c
+index 57d9d5d..387c667 100644
+--- a/preboot.c
++++ b/preboot.c
+@@ -53,6 +53,7 @@
+ #define SKIP_PCIE_INIT BIT(16)
+ #endif
+ 
++#define VERSION_MAX_LEN	128
+ #define STR_UINT_SZ	8
+ 
+ #define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+@@ -523,15 +524,39 @@
+ 
+ #ifndef TARGET_IS_TESTER
+ static const char *preboot_ver_str = PREBOOT_VER_STR;
++static char preboot_btl_ver_str[VERSION_MAX_LEN] = "BTL version ";
+ 
+ static void preboot_version(void)
+ {
+-	u64 offset = (u64) preboot_ver_str;
++	u64 offset = (u64) preboot_btl_ver_str;
++	u32 btlver = readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
++	int i, btl_ver_sz;
+ 
+ 	preboot_puts("\n");
++	preboot_puts_raw(preboot_btl_ver_str);
++	preboot_puth(btlver, true);
+ 	preboot_puts_raw(preboot_ver_str);
+ 	preboot_puts("\n");
+ 
++	/* get to the end of the predefined btl string */
++	for (i = 0; i < VERSION_MAX_LEN; i++)
++		if (preboot_btl_ver_str[i] == '\0')
++			break;
++
++	/* convert and copy the btl version */
++	i += preboot_uint2hexstring(&preboot_btl_ver_str[i], btlver, true);
++
++	/* separate the btl from preboot */
++	preboot_btl_ver_str[i++] = '\n';
++	btl_ver_sz = i;
++
++	/* copy the preboot version */
++	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
++		preboot_btl_ver_str[i++] = preboot_ver_str[j];
++		if (preboot_ver_str[j] == '\0')
++			break;
++	}
++
+ 	writel((u32)(offset & ~CONFIG_SYS_SDRAM_BASE),
+ 			mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
+ }

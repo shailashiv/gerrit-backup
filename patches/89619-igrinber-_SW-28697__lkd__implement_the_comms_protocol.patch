@@ -1,0 +1,645 @@
+From a1f1bc3612a621ea9d690495b66ce90291d69d28 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 18 Apr 2021 22:52:23 +0300
+Subject: [PATCH] [SW-28697] lkd: implement the comms protocol
+
+The new comms protocol is based on the hl-fw-loader update base protocol
+with slightly updated building blocks as a base for communication.
+It implements LKD communication specific high level commands and
+supplies generic statuses.
+Preboot implementation of the protocol is required to separate the
+execution process to "fast" and "slow" in a way that busy-wait loops
+must be avoided. This limitation forces the implementation to keep the
+communication states in between the execution stages.
+The protocol is implemented in a way that all the communication is done
+using the "fast" response and thus does not interfere with the I2C slave
+sensitive response time.
+To achieve that kind of separation (fast vs. slow), the processing of
+the data is done after the communication phase is finished, so the
+processing can take the relevant path (e.g. slow).
+
+Change-Id: Ia202e07b82e7f3885b33e47794bf56c5d58b8ec4
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/boot_if.c b/common/boot_if.c
+index 3dcaa7f..84a6962 100644
+--- a/common/boot_if.c
++++ b/common/boot_if.c
+@@ -63,3 +63,8 @@
+ {
+ 	regmap_writel(sts, mmCPU_CMD_STATUS_TO_HOST);
+ }
++
++void cpu_comms_sts_set(struct comms_status *sts)
++{
++	regmap_writel(sts->val, mmCPU_CMD_STATUS_TO_HOST);
++}
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 5f43866..6e65fbc 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -7,6 +7,7 @@
+ #ifndef _HL_CMD_MODULE_H_
+ #define _HL_CMD_MODULE_H_
+ 
++#include <hl_boot_if.h>
+ /*
+  * enum cmd_check_res	- used to specify various results that check() routine
+  *			  can return following its check.
+@@ -89,8 +90,11 @@
+ void module_lkd_enable(void);
+ void module_lkd_disable(void);
+ void module_lkd_run(void);
++void module_lkd_run_fast(void);
+ void module_lkd_run_noret(void);
+ void lkd_dev_specific_setup(void);
++uintptr_t lkd_dev_spec_desc_offset(int size);
++void lkd_dev_spec_regs(struct cpu_dyn_regs *regs);
+ 
+ /* UART */
+ void module_uart_setup(void);
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index cb60251..e3444fa 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -14,6 +14,7 @@
+ #include <mme1_qm_regs.h>
+ #include <tpc0_qm_regs.h>
+ #include <tpc1_qm_regs.h>
++#include <cpu_if_regs.h>
+ 
+ #include <string.h>
+ #include <bitops.h>
+@@ -23,6 +24,7 @@
+ #include <efuse.h>
+ #include <sha256.h>
+ #include <boot_desc.h>
++#include <hl_boot_if.h>
+ #include <boot_if.h>
+ #include <hl_fw_if.h>
+ #include <crc32.h>
+@@ -369,3 +371,33 @@
+ 
+ 	hl_pcie_enable_access();
+ }
++
++void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
++{
++	regs->cpu_pq_base_addr_low = mmCPU_IF_PQ_BASE_ADDR_LOW;
++	regs->cpu_pq_base_addr_high = mmCPU_IF_PQ_BASE_ADDR_HIGH;
++	regs->cpu_pq_length = mmCPU_IF_PQ_LENGTH;
++	regs->cpu_pq_init_status = mmCPU_IF_QUEUE_INIT;
++	regs->cpu_eq_base_addr_low = mmCPU_IF_EQ_BASE_ADDR_LOW;
++	regs->cpu_eq_base_addr_high = mmCPU_IF_EQ_BASE_ADDR_HIGH;
++	regs->cpu_eq_length = mmCPU_IF_EQ_LENGTH;
++	regs->cpu_eq_ci = mmCPU_IF_EQ_RD_OFFS;
++	regs->cpu_cq_base_addr_low = mmCPU_IF_CQ_BASE_ADDR_LOW;
++	regs->cpu_cq_base_addr_high = mmCPU_IF_CQ_BASE_ADDR_HIGH;
++	regs->cpu_cq_length = mmCPU_IF_CQ_LENGTH;
++	regs->cpu_pf_pq_pi = mmCPU_IF_PF_PQ_PI;
++	regs->cpu_boot_dev_sts0 = mmCPU_BOOT_DEV_STS0;
++	regs->cpu_boot_dev_sts1 = mmCPU_BOOT_DEV_STS1;
++	regs->cpu_boot_err0 = mmCPU_BOOT_ERR0;
++	regs->cpu_boot_err1 = mmCPU_BOOT_ERR1;
++	regs->cpu_boot_status = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	regs->fw_upd_sts = mmUPD_STS;
++	regs->fw_upd_cmd = mmUPD_CMD;
++	regs->fw_upd_pending_sts = mmUPD_PENDING_STS;
++	regs->fuse_ver_offset = mmFUSE_VER_OFFSET;
++	regs->preboot_ver_offset = mmPREBOOT_VER_OFFSET;
++	regs->uboot_ver_offset = mmUBOOT_VER_OFFSET;
++	regs->hw_state = mmHW_STATE;
++	regs->kmd_msg_to_cpu = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	regs->cpu_cmd_status_to_host = mmCPU_CMD_STATUS_TO_HOST;
++}
+diff --git a/goya/asic.c b/goya/asic.c
+index 9bd1e54..60b1253 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -7,11 +7,13 @@
+ 
+ #include <goya_blocks.h>
+ #include <psoc_global_conf_regs.h>
++#include <cpu_if_regs.h>
+ 
+ #include <bitops.h>
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <hl_boot_if.h>
+ 
+ #include "common.h"
+ 
+@@ -46,3 +48,32 @@
+ 	return factor > 2 ? factor : 2;
+ }
+ 
++void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
++{
++	regs->cpu_pq_base_addr_low = mmCPU_PQ_BASE_ADDR_LOW;
++	regs->cpu_pq_base_addr_high = mmCPU_PQ_BASE_ADDR_HIGH;
++	regs->cpu_pq_length = mmCPU_PQ_LENGTH;
++	regs->cpu_pq_init_status = mmCPU_PQ_INIT_STATUS;
++	regs->cpu_eq_base_addr_low = mmCPU_EQ_BASE_ADDR_LOW;
++	regs->cpu_eq_base_addr_high = mmCPU_EQ_BASE_ADDR_HIGH;
++	regs->cpu_eq_length = mmCPU_EQ_LENGTH;
++	regs->cpu_eq_ci = mmCPU_EQ_CI;
++	regs->cpu_cq_base_addr_low = mmCPU_CQ_BASE_ADDR_LOW;
++	regs->cpu_cq_base_addr_high = mmCPU_CQ_BASE_ADDR_HIGH;
++	regs->cpu_cq_length = mmCPU_CQ_LENGTH;
++	regs->cpu_pf_pq_pi = mmCPU_IF_PF_PQ_PI;
++	regs->cpu_boot_dev_sts0 = mmCPU_BOOT_DEV_STS0;
++	regs->cpu_boot_dev_sts1 = mmCPU_BOOT_DEV_STS1;
++	regs->cpu_boot_err0 = mmCPU_BOOT_ERR0;
++	regs->cpu_boot_err1 = mmCPU_BOOT_ERR1;
++	regs->cpu_boot_status = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	regs->fw_upd_sts = mmUPD_STS;
++	regs->fw_upd_cmd = mmUPD_CMD;
++	regs->fw_upd_pending_sts = mmUPD_PENDING_STS;
++	regs->fuse_ver_offset = mmFUSE_VER_OFFSET;
++	regs->preboot_ver_offset = mmPREBOOT_VER_OFFSET;
++	regs->uboot_ver_offset = mmUBOOT_VER_OFFSET;
++	regs->hw_state = mmHW_STATE;
++	regs->kmd_msg_to_cpu = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	regs->cpu_cmd_status_to_host = mmCPU_CMD_STATUS_TO_HOST;
++}
+diff --git a/greco/asic.c b/greco/asic.c
+index 3b8045b..3bc0151 100644
+--- a/greco/asic.c
++++ b/greco/asic.c
+@@ -7,6 +7,7 @@
+ 
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_gpio0_regs.h>
++#include <cpu_if_regs.h>
+ 
+ #include <string.h>
+ #include <bitops.h>
+@@ -15,6 +16,7 @@
+ #include <uart.h>
+ #include <sha256.h>
+ #include <boot_desc.h>
++#include <hl_boot_if.h>
+ #include <pci.h>
+ 
+ #include "common.h"
+@@ -105,3 +107,33 @@
+ 	/* TODO: implement hl_pcie_enable_access() for greco */
+ 	hl_pcie_enable_access();
+ }
++
++void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
++{
++	regs->cpu_pq_base_addr_low = mmCPU_IF_PQ_BASE_ADDR_LOW;
++	regs->cpu_pq_base_addr_high = mmCPU_IF_PQ_BASE_ADDR_HIGH;
++	regs->cpu_pq_length = mmCPU_IF_PQ_LENGTH;
++	regs->cpu_pq_init_status = mmCPU_IF_QUEUE_INIT;
++	regs->cpu_eq_base_addr_low = mmCPU_IF_EQ_BASE_ADDR_LOW;
++	regs->cpu_eq_base_addr_high = mmCPU_IF_EQ_BASE_ADDR_HIGH;
++	regs->cpu_eq_length = mmCPU_IF_EQ_LENGTH;
++	regs->cpu_eq_ci = mmCPU_IF_EQ_RD_OFFS;
++	regs->cpu_cq_base_addr_low = mmCPU_IF_CQ_BASE_ADDR_LOW;
++	regs->cpu_cq_base_addr_high = mmCPU_IF_CQ_BASE_ADDR_HIGH;
++	regs->cpu_cq_length = mmCPU_IF_CQ_LENGTH;
++	regs->cpu_pf_pq_pi = mmCPU_IF_PF_PQ_PI;
++	regs->cpu_boot_dev_sts0 = mmCPU_BOOT_DEV_STS0;
++	regs->cpu_boot_dev_sts1 = mmCPU_BOOT_DEV_STS1;
++	regs->cpu_boot_err0 = mmCPU_BOOT_ERR0;
++	regs->cpu_boot_err1 = mmCPU_BOOT_ERR1;
++	regs->cpu_boot_status = mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
++	regs->fw_upd_sts = mmUPD_STS;
++	regs->fw_upd_cmd = mmUPD_CMD;
++	regs->fw_upd_pending_sts = mmUPD_PENDING_STS;
++	regs->fuse_ver_offset = mmFUSE_VER_OFFSET;
++	regs->preboot_ver_offset = mmPREBOOT_VER_OFFSET;
++	regs->uboot_ver_offset = mmUBOOT_VER_OFFSET;
++	regs->hw_state = mmHW_STATE;
++	regs->kmd_msg_to_cpu = mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU;
++	regs->cpu_cmd_status_to_host = mmCPU_CMD_STATUS_TO_HOST;
++}
+diff --git a/include/boot_if.h b/include/boot_if.h
+index 59a26ed..5c8b77d 100644
+--- a/include/boot_if.h
++++ b/include/boot_if.h
+@@ -17,4 +17,7 @@
+ void cpu_boot_dev_sts_clrset(u32 mask, bool set);
+ void cpu_boot_rsp_set(enum cpu_msg_status sts);
+ 
++/* COMMS APIs */
++void cpu_comms_sts_set(struct comms_status *sts);
++
+ #endif /* _HL_BOOT_IF_H_ */
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index f6ee932..614a084 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -10,7 +10,7 @@
+ #include <boot_if.h>
+ #include <boot_info.h>
+ #include <security.h>
+-#include <boot_info.h>
++#include <crc32.h>
+ 
+ #include "cmd_module.h"
+ #include "uart.h"
+@@ -22,12 +22,16 @@
+ 	bool is_fit_checked;
+ 	bool is_fit_ready_ignored;
+ 	struct comms_command cmd;
++	struct comms_command wfc_cmd;
++	struct comms_command do_cmd;
++	enum cmd_check_res exec_res;
+ };
+ 
+ static struct lkd_status sts;
+ 
+ void module_lkd_enable(void)
+ {
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_LD_COM_EN, true);
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
+ }
+ 
+@@ -36,11 +40,25 @@
+ void module_lkd_setup(void)
+ {
+ 	lkd_dev_specific_setup();
++	/* TODO: remove the below img open once we remove the old protocol */
+ 	preboot_security_dynamic_img_sram_open();
+ 	module_lkd_enable();
+ }
+ 
+ __weak void preboot_disable_iatu_access(void) {}
++
++static void module_lkd_send_status(enum comms_sts sts, unsigned int ram_type,
++				   unsigned int offset)
++{
++	struct comms_status status;
++	u32 off = offset >> COMMS_STATUS_OFFSET_ALIGN_SHIFT;
++
++	status.val = 0;
++	status.status = sts;
++	status.ram_type = ram_type;
++	status.offset = off & COMMS_STATUS_OFFSET_MASK;
++	cpu_comms_sts_set(&status);
++}
+ 
+ static bool is_legacy_comms(u32 msg)
+ {
+@@ -106,6 +124,82 @@
+ 	return res;
+ }
+ 
++static int module_lkd_run_fast_exec(void)
++{
++	/* Placeholder - empty for now */
++
++	/* on error do preboot_security_dynamic_img_open(); */
++
++	return 1;
++}
++
++static void module_lkd_run_fast_noop(void)
++{
++	int err;
++
++	/* depending on the current state machine, perform action */
++	switch (sts.do_cmd.cmd) {
++	case COMMS_NOOP:
++	case COMMS_CLR_STS:
++	case COMMS_GOTO_WFE:
++	case COMMS_SKIP_BMC:
++	case COMMS_LOW_PLL_OPP:
++		module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
++		break;
++	case COMMS_RST_STATE:
++		sts.exec_res = NOT_FOUND;
++		module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
++		break;
++	case COMMS_EXEC:
++		err = module_lkd_run_fast_exec();
++		if (err)
++			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
++		else
++			module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
++
++		break;
++	default:	/* should never get here */
++		preboot_puts_raw(__func__);
++		preboot_puts(": default case - err\n");
++	}
++}
++
++/* CLR_STS is a sync command, so here we decide what execution type is needed */
++static enum cmd_check_res module_lkd_check_noop(void)
++{
++	enum cmd_check_res res = NOT_FOUND;
++
++	/* check the command we got before waiting for sync */
++	switch (sts.do_cmd.cmd) {
++	case COMMS_PREP_DESC:
++	case COMMS_DATA_RDY:
++		res = FOUND_SLOW_RETURN;
++		break;
++	case COMMS_EXEC:
++		res = sts.exec_res;
++		break;
++	case COMMS_RST_DEV:
++		res = FOUND_NO_RETURN;
++		break;
++	case COMMS_GOTO_WFE:
++		if (!preboot_security_is_enabled()) {
++			res = FOUND_NO_RETURN;
++			break;
++		}
++		/* no break */
++	case COMMS_NOOP:
++	case COMMS_CLR_STS:
++	case COMMS_RST_STATE:
++	case COMMS_SKIP_BMC:
++	case COMMS_LOW_PLL_OPP:
++	default:
++		res = FOUND_FAST_RETURN;
++		break;
++	}
++
++	return res;
++}
++
+ enum cmd_check_res module_lkd_check(void)
+ {
+ 	enum cmd_check_res res = NOT_FOUND;
+@@ -127,6 +221,29 @@
+ 	 */
+ 	sts.is_fit_ready_ignored = false;
+ 
++	if (sts.cmd.cmd == sts.wfc_cmd.cmd)
++		return NOT_FOUND;
++
++	switch (sts.cmd.cmd) {
++	case COMMS_NOOP:	/* NOOP is a special command */
++		res = module_lkd_check_noop();
++		break;
++	case COMMS_CLR_STS:
++	case COMMS_RST_STATE:
++	case COMMS_PREP_DESC:
++	case COMMS_DATA_RDY:
++	case COMMS_EXEC:
++	case COMMS_RST_DEV:
++	case COMMS_GOTO_WFE:
++	case COMMS_SKIP_BMC:
++	case COMMS_LOW_PLL_OPP:
++		preboot_disable_iatu_access();
++		res = FOUND_FAST_RETURN;
++		break;
++	default:
++		break;
++	}
++
+ 	return res;
+ }
+ 
+@@ -135,12 +252,84 @@
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+ }
+ 
+-void module_lkd_run(void)
++static void module_lkd_state_shift(void)
++{
++	/* do not shift if got CLR_STS several times */
++	if (sts.cmd.cmd == COMMS_CLR_STS && sts.wfc_cmd.cmd == COMMS_CLR_STS)
++		return;
++
++	/* CLR_STS should not propagate to do_cmd */
++	sts.do_cmd.cmd = sts.wfc_cmd.cmd == COMMS_CLR_STS ? COMMS_NOOP : sts.wfc_cmd.cmd;
++	/* save current command waiting for clear, until handled */
++	sts.wfc_cmd = sts.cmd;
++}
++
++void module_lkd_run_fast(void)
++{
++	const char *cmd_str = NULL;
++
++	preboot_disable_iatu_access();
++
++	switch (sts.cmd.cmd) {
++	case COMMS_NOOP:
++		cmd_str = "noop";
++		module_lkd_run_fast_noop();
++		break;
++	case COMMS_CLR_STS:
++		cmd_str = cmd_str ?: "clr_sts";
++		/* Clear the status */
++		module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
++		break;
++	case COMMS_RST_STATE:
++		cmd_str = "rst_state";
++		/* no break */
++	case COMMS_PREP_DESC:
++		cmd_str = cmd_str ?: "prep_desc";
++		/* no break */
++	case COMMS_DATA_RDY:
++		cmd_str = cmd_str ?: "data_rdy";
++		/* no break */
++	case COMMS_EXEC:
++		cmd_str = cmd_str ?: "exec";
++		/* no break */
++	case COMMS_RST_DEV:
++		cmd_str = cmd_str ?: "rst_dev";
++		module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
++		/* We ACK the command, but handle only on CLR, so save cmd */
++		break;
++	case COMMS_GOTO_WFE:
++		cmd_str = "wfe";
++		if (preboot_security_is_enabled())
++			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
++		else
++			module_lkd_send_status(COMMS_STS_ACK, COMMS_SRAM, 0);
++
++		break;
++	case COMMS_SKIP_BMC:
++		cmd_str = "skip_bmc";
++		/* no break */
++	case COMMS_LOW_PLL_OPP:
++		cmd_str = cmd_str ?: "low_pll_opp";
++		/* no break */
++	default:
++		cmd_str = cmd_str ?: "unknown";
++		module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
++	}
++
++	module_lkd_state_shift();
++
++	preboot_puts_raw("Got host ");
++	preboot_puts_raw(cmd_str);
++	preboot_puts(" command\n");
++}
++
++static void module_lkd_run_legacy(void)
+ {
+ 	int err;
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
++	fit_base_offset = FIT_IMG_BASE;
+ 	err = fit_load_images();
+ 	if (err) {
+ 		sts.is_fit_ready_ignored = true;
+@@ -149,6 +338,120 @@
+ 	}
+ 
+ 	sts.is_fit_checked = true;
++}
++
++__weak uintptr_t lkd_dev_spec_desc_offset(int size)
++{
++	return FIT_IMG_BASE;
++}
++
++static int module_lkd_validate(void)
++{
++	int err;
++
++	preboot_security_dynamic_img_sram_close();
++
++	fit_base_offset = FIT_IMG_BASE;
++	err = fit_load_images();
++	if (err)
++		preboot_security_dynamic_img_sram_open();
++
++	sts.exec_res = err ? NOT_FOUND : FOUND_NO_RETURN;
++
++	return err;
++}
++
++static int module_lkd_run_exec(void)
++{
++	/* Placeholder - empty for now */
++
++	/* on error do preboot_security_dynamic_img_open(); */
++
++	return 1;
++}
++
++__weak void lkd_dev_spec_regs(struct cpu_dyn_regs *regs);
++
++static int module_lkd_prep_desc(int size, u32 *offset)
++{
++	/* the same SRAM addr is used for both the descriptor and the image */
++	uintptr_t comms_desc_base = lkd_dev_spec_desc_offset(size);
++	struct lkd_fw_comms_desc *cdesc;
++	int err;
++	const char *preboot_ver, *fuse_data;
++	u8 *cdesc_data_off;
++
++	err = !preboot_is_valid_address_range(comms_desc_base, size);
++	if (err) {
++		preboot_puts("Device returned invalid desc address!\n");
++		return err;
++	}
++
++	cdesc = (struct lkd_fw_comms_desc *)comms_desc_base;
++	memset(cdesc, 0, sizeof(*cdesc));
++
++	lkd_dev_spec_regs(&cdesc->cpu_dyn_regs);
++	fuse_data = preboot_get_version(PREBOOT_EFUSE_VER);
++	memcpy(cdesc->fuse_ver, fuse_data, VERSION_MAX_LEN);
++	preboot_ver = preboot_get_version(PREBOOT_BTL_VER);
++	memcpy(cdesc->cur_fw_ver, preboot_ver, VERSION_MAX_LEN);
++	cdesc->img_addr = comms_desc_base;
++
++	/* Header */
++	cdesc->header.magic = HL_COMMS_DESC_MAGIC;
++	cdesc->header.size = sizeof(*cdesc) - sizeof(cdesc->header);
++	cdesc->header.version = HL_COMMS_DESC_VER;
++	cdesc_data_off = (u8 *)cdesc + sizeof(cdesc->header);
++	cdesc->header.crc32 = crc32(0, cdesc_data_off, cdesc->header.size);
++
++	*offset = (u32)comms_desc_base;
++
++	preboot_security_dynamic_img_sram_open();
++
++	return err;
++}
++
++void module_lkd_run(void)
++{
++	int err = 0;
++	u32 offset;
++
++	if (is_legacy_comms(sts.cmd.val))
++		return module_lkd_run_legacy();
++
++	/* depending on the current state machine, perform action */
++	switch (sts.do_cmd.cmd) {
++	case COMMS_PREP_DESC:
++		err = module_lkd_prep_desc(sts.wfc_cmd.size, &offset);
++		if (err)
++			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
++		else
++			module_lkd_send_status(COMMS_STS_OK,
++					       COMMS_SRAM, offset);
++		break;
++	case COMMS_DATA_RDY:
++		err = module_lkd_validate();
++		if (err)
++			module_lkd_send_status(COMMS_STS_VALID_ERR,
++					       COMMS_SRAM, 0);
++		else
++			module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
++
++		break;
++	case COMMS_EXEC:
++		err = module_lkd_run_exec();
++		if (err)
++			module_lkd_send_status(COMMS_STS_ERR, COMMS_SRAM, 0);
++		else
++			module_lkd_send_status(COMMS_STS_OK, COMMS_SRAM, 0);
++
++		break;
++	default:	/* should never get here */
++		preboot_puts_raw(__func__);
++		preboot_puts(": default case - err\n");
++	}
++
++	module_lkd_state_shift();
+ }
+ 
+ /* For devices that do not implement RST_DEV command, mimic WFE */
+@@ -207,4 +510,23 @@
+ {
+ 	if (is_legacy_comms(sts.cmd.val))
+ 		return module_lkd_run_noret_legacy();
++
++	/* we are not returning - clear comms status */
++	module_lkd_send_status(COMMS_STS_NOOP, COMMS_SRAM, 0);
++
++	/* depending on the current state machine, perform action */
++	switch (sts.do_cmd.cmd) {
++	case COMMS_EXEC:
++		module_lkd_run_noret_exec();
++		break;
++	case COMMS_RST_DEV:
++		module_lkd_run_noret_reset();
++		break;
++	case COMMS_GOTO_WFE:
++		module_lkd_run_noret_wfe();
++		break;
++	default:	/* should never get here */
++		preboot_puts_raw(__func__);
++		preboot_puts(": default case - err\n");
++	}
+ }
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 442c9ce..2a7da27 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -63,7 +63,7 @@
+ 		.disable = module_lkd_disable,
+ 		.run = module_lkd_run,
+ 		.enable = module_lkd_enable,
+-		.run_fast = noop,
++		.run_fast = module_lkd_run_fast,
+ 		.teardown = module_lkd_disable,
+ 		.run_noreturn = module_lkd_run_noret,
+ 	},

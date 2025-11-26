@@ -1,0 +1,158 @@
+From d2838d4c40306a28d3651bc9a549414be16c3dad Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sat, 16 Nov 2019 19:05:51 +0200
+Subject: [PATCH] [SW-6506] hl: refactor preboot_copy_spl()
+
+Separate it into building blocks so that overall code is more readable
+
+Change-Id: Iee43ed62f333445e156140f431d23120885aa1e8
+---
+
+diff --git a/common/preboot.c b/common/preboot.c
+index 45127ca..330ac37 100644
+--- a/common/preboot.c
++++ b/common/preboot.c
+@@ -24,67 +24,76 @@
+ #define PREBOOT_VER_STR	"Preboot version " PREBOOT_VER \
+ 	" (" PREBOOT_DATE " - " PREBOOT_TIME ")"
+ 
+-/*
+- * Using scratchpad registers for
+- * passing flash layout to CPU SW
+- */
+-static void preboot_copy_prepare(unsigned int *spl_off)
++/* Stable ID can be 0 or 1, if not defined return primary offset (0) */
++static u32 stable_image_offset(void)
+ {
+-	unsigned int spl_offset = 0xa0000;
+-	unsigned int uboot_offset = 0xb0000;
+-	unsigned int modifiable_image_pending;
+-	unsigned int image_base_offset;
+-	unsigned int next_image, next_image_stable, next_image_modifiable;
+-	bool try_new_image = false;
+-	char *spl_image = "candidate";
+-	u32 upd_pending_reg = get_upd_pending_sts_reg();
++	u32 stable_image_id;
+ 
+-	modifiable_image_pending = regmap_readl(upd_pending_reg);
+-	if (modifiable_image_pending == FLOPS_UPD_PENDING) {
+-		next_image_modifiable =
+-			(*(unsigned int *)(HL_SPI_BASE + 0x60004) & 0xff) - '1';
+-		if (next_image_modifiable < 2) {
+-			next_image = next_image_modifiable;
+-			regmap_writel((next_image + FLOPS_UPD_NXT_IMG1),
+-					upd_pending_reg);
+-			try_new_image = true;
+-		} else
+-			regmap_writel(FLOPS_UPD_NOOP, upd_pending_reg);
+-	}
++	spi_copy(&stable_image_id, HL_SPI_NEXT_IMAGE_OFF,
++		 sizeof(stable_image_id), "NEXT");
++	stable_image_id = (stable_image_id & 0xFF) - '1';
+ 
+-	if (!try_new_image) {
+-		spl_image = "stable";
+-		next_image_stable =
+-			(*(unsigned int *)(HL_SPI_BASE + 0x60000) & 0xff) - '1';
+-		if (next_image_stable < 2)
+-			next_image = next_image_stable;
+-		else
+-			next_image = 0;
+-	}
++	if (stable_image_id == 1)
++		return HL_SPI_SECONDARY_BASE;
+ 
+-	if (!next_image)
+-		image_base_offset = 0;
+-	else
+-		image_base_offset = 0x800000;
+-
+-	preboot_puts_raw("Preparing to run SPL ");
+-	preboot_puts_raw(spl_image);
+-	preboot_puts_hex_raw(" (offset: ", image_base_offset, false);
+-	preboot_puts(")\n");
+-
+-	*spl_off = image_base_offset + spl_offset;
+-	regmap_writel((image_base_offset + uboot_offset),
+-			mmPSOC_GLOBAL_CONF_SCRATCHPAD_30);
++	return HL_SPI_PRIMARY_BASE;
+ }
+ 
++static u32 modifiable_image_offset(bool *pending)
++{
++	u32 ret = HL_SPI_PRIMARY_BASE;
++	u32 modifiable_id;
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++
++	spi_copy(&modifiable_id, HL_SPI_MODIFI_IMAGE_OFF,
++		 sizeof(modifiable_id), "MODIFIABLE");
++	modifiable_id = (modifiable_id & 0xFF) - '1';
++
++	if (modifiable_id < 2) {
++		*pending = true;
++		if (!modifiable_id) {
++			regmap_writel(FLOPS_UPD_NXT_IMG1, upd_pending_reg);
++		} else {
++			regmap_writel(FLOPS_UPD_NXT_IMG2, upd_pending_reg);
++			ret = HL_SPI_SECONDARY_BASE;
++		}
++	} else { /* No valid modifiable image ID */
++		regmap_writel(FLOPS_UPD_NOOP, upd_pending_reg);
++	}
++
++	return ret;
++}
++
++static u32 next_image_offset(bool *pending)
++{
++	u32 upd_pending_reg = get_upd_pending_sts_reg();
++	u32 image_pending = regmap_readl(upd_pending_reg);
++
++	/* Check for normal boot */
++	if (image_pending != FLOPS_UPD_PENDING)
++		return stable_image_offset();
++
++	/* There is an update pending */
++	return modifiable_image_offset(pending);
++}
+ 
+ static void preboot_copy_spl(void)
+ {
+-	unsigned int spl_offset;
++	char *name = "SPL";
++	bool upgrade_pending = false;
++	u32 img_offset = next_image_offset(&upgrade_pending);
++	u32 spl_offset = img_offset + HL_SPI_SPL_OFF;
++	u32 uboot_offset = img_offset + HL_SPI_UBOOT_OFF;
++	char *spl_image = upgrade_pending ? "candidate" : "stable";
+ 
+-	preboot_copy_prepare(&spl_offset);
++	preboot_puts_raw("Preparing to run SPL ");
++	preboot_puts_raw(spl_image);
++	preboot_puts_hex_raw(" (offset: ", img_offset, false);
++	preboot_puts(")\n");
+ 
+-	spi_copy((void *)SPL_TEXT_BASE, spl_offset, SPL_SIZE, "SPL");
++	spi_copy((void *)SPL_TEXT_BASE, spl_offset, SPL_SIZE, name);
++
++	regmap_writel(uboot_offset, mmPSOC_GLOBAL_CONF_SCRATCHPAD_30);
+ }
+ 
+ static void preboot_pcie_init(void)
+diff --git a/common/preboot.h b/common/preboot.h
+index e9cf901..cfef8ed 100644
+--- a/common/preboot.h
++++ b/common/preboot.h
+@@ -30,6 +30,12 @@
+ #define SPL_SIZE		0x10000		/* 64KB */
+ #define HL_UART_BAUDRATE	115200
+ #define HL_SPI_FLASH_MAX_FREQ	25000000
++#define HL_SPI_NEXT_IMAGE_OFF	0x60000
++#define HL_SPI_MODIFI_IMAGE_OFF	0x60004
++#define HL_SPI_SPL_OFF		0xA0000
++#define HL_SPI_UBOOT_OFF	0xB0000
++#define HL_SPI_PRIMARY_BASE	0
++#define HL_SPI_SECONDARY_BASE	0x800000
+ 
+ typedef unsigned char u8;
+ typedef unsigned int u32;

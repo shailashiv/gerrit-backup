@@ -1,0 +1,247 @@
+From bfe4ae454033589f109348b707f6a09113dd84a4 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 05 Jan 2021 16:56:12 +0200
+Subject: [PATCH] [SW-20719] pll: sync with latest code in u-boot
+
+Bring all the fixes, workarounds, and additions from U-Boot.
+
+Change-Id: Ia51f1b5de497aae271adf3f4d11dba3d8377962b
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index d726254..7c80b49 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -20,6 +20,7 @@
+ #define HL_PLL_RST		0x134
+ #define HL_PLL_DIV_FACTOR_CMD	0x220
+ #define HL_PLL_CLK_GATER	0x300
++#define HL_PLL_CLK_RLX		0x310
+ 
+ #define TIMESTAMP_CNTCR		0x00
+ #define TIMESTAMP_CNTSR		0x04
+@@ -102,15 +103,10 @@
+ 		out_freq /= factor + 1;
+ 	}
+ 
+-	/*
+-	 * The clock relaxation is not accounted here.
+-	 * We might need to deal with it in the future.
+-	 */
+-
+ 	return out_freq;
+ }
+ 
+-static void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++__weak void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
+ {
+ 	regmap_writel(reset, cfg->base + HL_PLL_RST);
+ }
+@@ -118,6 +114,25 @@
+ __weak int hl_pll_is_locked(struct hl_pll_cfg *cfg)
+ {
+ 	return regmap_readl(cfg->base + HL_PLL_CFG) & HL_PLL_CFG_LOCK;
++}
++
++__weak void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg)
++{
++	u32 reg = regmap_readl(cfg->base + HL_PLL_CFG);
++
++	regmap_writel(reg & ~HL_PLL_CFG_LOCK, cfg->base + HL_PLL_CFG);
++}
++
++#define HL_PLL_CLK_RLX_RST_VAL	0x100010
++__weak void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg)
++{
++	int sel;
++	u32 reg;
++
++	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
++		reg = cfg->base + HL_PLL_CLK_RLX + (sel * sizeof(u32));
++		regmap_writel(HL_PLL_CLK_RLX_RST_VAL, reg);
++	}
+ }
+ 
+ __weak void hl_pll_cfg(struct hl_pll_cfg *cfg)
+@@ -139,15 +154,32 @@
+ 	udelay(HL_PLL_MAX_WAIT_TIME);
+ }
+ 
+-static void hl_pll_clk_switch_to_bypass(struct hl_pll_cfg *cfg)
++static void hl_pll_clk_switch_to_ref(struct hl_pll_cfg *cfg)
+ {
+ 	int sel;
+ 	u32 reg;
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+ 		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-		regmap_writel(HL_PLL_REF_CLK, reg);
++
++		switch (regmap_readl(reg)) {
++		case HL_PLL_DIV_PLL:
++			/* first change DIV_REF, then DIV_PLL */
++			regmap_writel(HL_PLL_DIV_REF, reg);
++			udelay(1);
++			/* no break */
++		case HL_PLL_PLL_CLK:
++		case HL_PLL_DIV_REF:
++			regmap_writel(HL_PLL_REF_CLK, reg);
++			break;
++		case HL_PLL_REF_CLK:
++		default:
++			break;
++		}
+ 	}
++
++	/* just to be on a safe side, wait for bypass to propagate */
++	udelay(1);
+ }
+ 
+ static void hl_pll_clk_switch_to_pll(struct hl_pll_cfg *cfg)
+@@ -157,10 +189,27 @@
+ 
+ 	for (sel = 0; sel < HL_PLL_DIV_SIZE; sel++) {
+ 		reg = cfg->base + HL_PLL_DIV_SEL + (sel * sizeof(u32));
+-		if (cfg->div_sel[sel] < 0 || cfg->div_sel[sel] > HL_PLL_DIV_PLL)
+-			continue;
+-		regmap_writel(cfg->div_sel[sel], reg);
++		switch (cfg->div_sel[sel]) {
++		case HL_PLL_DIV_REF:
++			regmap_writel(HL_PLL_DIV_REF, reg);
++			break;
++		case HL_PLL_PLL_CLK:
++			regmap_writel(HL_PLL_PLL_CLK, reg);
++			break;
++		case HL_PLL_DIV_PLL:
++			/* first change DIV_REF, then DIV_PLL */
++			regmap_writel(HL_PLL_DIV_REF, reg);
++			udelay(1);
++			regmap_writel(HL_PLL_DIV_PLL, reg);
++			break;
++		case HL_PLL_REF_CLK:
++		default:
++			break;
++		}
+ 	}
++
++	/* just to be on a safe side, wait for bypass to propagate */
++	udelay(1);
+ }
+ 
+ static void hl_pll_div_init(struct hl_pll_cfg *cfg)
+@@ -185,9 +234,10 @@
+ 	udelay(1);
+ }
+ 
+-static void hl_pll_wait_for_lock(struct hl_pll_cfg *cfg)
++static bool hl_pll_wait_for_lock(struct hl_pll_cfg *cfg)
+ {
+ 	int tout = HL_PLL_LOCK_TOUT;
++	bool is_locked = true;
+ 
+ 	while (!hl_pll_is_locked(cfg) && tout--)
+ 		udelay(1);
+@@ -195,22 +245,50 @@
+ 	if (tout < 0) {
+ 		preboot_puts_raw("PLL lock timedout for");
+ 		preboot_puts(cfg->name);
++		is_locked = false;
+ 	}
++
++	return is_locked;
+ }
++
++__weak void hl_pll_ack_int(struct hl_pll_cfg *cfg)
++{
++	regmap_writel(1, cfg->base + HL_PLL_LOCK_INTR);
++}
++
++__weak void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg) { }
+ 
+ static void hl_pll_set(struct hl_pll_cfg *cfg)
+ {
+-	hl_pll_clk_switch_to_bypass(cfg);
++	bool is_locked;
++	int retries = HL_PLL_LOCK_MAX_RETRY;
++
++	hl_pll_set_div_sel_delay(cfg);
++
++	hl_pll_clk_switch_to_ref(cfg);
++	hl_pll_clk_relax_reset(cfg);
+ 
+ 	hl_pll_cfg(cfg);
+ 
+-	/* Polling on PLL lock until lock is cleared or timed out */
+-	hl_pll_wait_for_lock(cfg);
+-
+ 	hl_pll_div_init(cfg);
+ 
+-	hl_pll_clk_switch_to_pll(cfg);
++	/* to be on a safe side, poll on the PLL lock status bit */
++	is_locked = hl_pll_wait_for_lock(cfg);
+ 
++	while (!is_locked && retries--) {
++		hl_pll_reset(cfg, true);
++		udelay(HL_PLL_MAX_WAIT_TIME);
++		hl_pll_reset(cfg, false);
++		is_locked = hl_pll_wait_for_lock(cfg);
++	}
++
++	/* w/a the h/w erratum: lock status bit isn't getting cleared */
++	hl_pll_clear_lock_status(cfg);
++
++	hl_pll_ack_int(cfg);
++
++	if (is_locked)
++		hl_pll_clk_switch_to_pll(cfg);
+ }
+ 
+ /**
+diff --git a/common/pll.h b/common/pll.h
+index 382c8f4..66a246d 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -15,6 +15,7 @@
+ #define USEC_PER_SEC		1000000
+ #define BYPASS_CYCLES_PER_USEC	(SYS_REF_CLOCK / USEC_PER_SEC)
+ #define HL_PLL_MAX_WAIT_TIME	20	/* 20 us */
++#define HL_PLL_LOCK_MAX_RETRY	3
+ 
+ #ifdef TARGET_IS_PLDM
+ #define HL_PLL_LOCK_TOUT	10	/* 10 us */
+diff --git a/goya2_arc_gnu/pll.c b/goya2_arc_gnu/pll.c
+index 5803eea..8fe6040 100644
+--- a/goya2_arc_gnu/pll.c
++++ b/goya2_arc_gnu/pll.c
+@@ -54,8 +54,10 @@
+ #define GOYA2_PLL_CFG		0x100
+ #define GOYA2_PLL_CFG_EN	BIT(0)
+ #define GOYA2_PLL_CFG_LOCK	BIT(16)
++#define GOYA2_PLL_DIV_SEL_DELAY	0x1E0
+ 
+-static void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
++
++void hl_pll_reset(struct hl_pll_cfg *cfg, bool reset)
+ {
+ 	u32 reg = regmap_readl(cfg->base + GOYA2_PLL_CFG);
+ 
+@@ -102,4 +104,18 @@
+ 	hl_pll_reset(cfg, true);
+ }
+ 
++void hl_pll_ack_int(struct hl_pll_cfg *cfg) { }
++
++void hl_pll_clear_lock_status(struct hl_pll_cfg *cfg) { }
++
++void hl_pll_clk_relax_reset(struct hl_pll_cfg *cfg)
++{
++	/* TODO: implement resetting the clock relaxation */
++}
++
++void hl_pll_set_div_sel_delay(struct hl_pll_cfg *cfg)
++{
++	regmap_writel(1, cfg->base + GOYA2_PLL_DIV_SEL_DELAY);
++}
++
+ #endif /* TARGET_IS_PLDM */

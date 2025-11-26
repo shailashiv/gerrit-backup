@@ -1,0 +1,74 @@
+From 1f2fbc487accba0c2a1ffe13ce5f06d51ddf22ed Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Thu, 22 Aug 2024 13:19:38 +0300
+Subject: [PATCH] [SW-188553] gaudi3: erom: store key num, svn, key revocation
+
+Store the loading firmware key number and svn into fw info.
+
+To avoid the below condition, store the key revocation & min svn
+value (present in efuse) to fw info, before the corresponding validation.
+
+1. flash the firmware signed with key1 and key0 is not revoked.
+2. Now, if we read the fw info, it will say none of the key is revoked.
+3. revoke key0 using key_revocation.itb.
+4. flash the firmware signed with key0 and it will fail at key validation.
+5. Now also fw info say none of the key is revoked
+
+Change-Id: I51d4d9b8e9908caa8444fc3b3d7aa48b7db2ee49
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/arch/gaudi3/common/security.c b/arch/gaudi3/common/security.c
+index e7d236c..35a4290 100644
+--- a/arch/gaudi3/common/security.c
++++ b/arch/gaudi3/common/security.c
+@@ -1188,10 +1188,10 @@
+ 	if (key_idx < 0 || key_idx >= SEC_KEY_HASH_COUNT_IN_ROM)
+ 		return true;
+ 
++	fw_info.sec_revoked_keys = sec_data.key_revoke;
++
+ 	if (sec_data.key_revoke & BIT(key_idx))
+ 		return true;
+-
+-	fw_info.sec_revoked_keys = sec_data.key_revoke;
+ 
+ 	return false;
+ }
+diff --git a/lib/common/security.c b/lib/common/security.c
+index 4029ed5..74c5f8b 100644
+--- a/lib/common/security.c
++++ b/lib/common/security.c
+@@ -7,6 +7,7 @@
+ #include <baremetal.h>
+ #include <hl_fit_if.h>
+ #include <hl_sec_if.h>
++#include <hl_fw_if.h>
+ 
+ #include <security.h>
+ #include <preboot/fit.h>
+@@ -24,6 +25,8 @@
+ 
+ 	if (min_svn < 0)
+ 		return false;
++
++	fw_info.sec_min_svn = min_svn;
+ 
+ 	if (sec_ver < min_svn || sec_ver > SVN_MAX_VERSIONS) {
+ 		preboot_puts_hex("Illegal security version: ", sec_ver, false);
+@@ -84,12 +87,15 @@
+ 		return 1;
+ 	}
+ 
++	fw_info.sec_curr_svn = fit_sec.sec_version;
++
+ 	if (preboot_security_key_is_revoked(fit_sec.key_num)) {
+ 		preboot_puts_hex("Key revoked: ", fit_sec.key_num, false);
+ 		*res = FIT_SEC_KEY_REVOKED;
+ 		return 1;
+ 	}
+ 
++	fw_info.sec_curr_key = fit_sec.key_num;
+ 	pub_key_fit = &fit_sec.pub_key;
+ 
+ 	if (!preboot_security_key_is_valid(fit_sec.key_num, pub_key_fit,

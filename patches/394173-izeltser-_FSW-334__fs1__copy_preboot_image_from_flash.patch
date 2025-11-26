@@ -1,0 +1,210 @@
+From 53fec2d83fbc11be216432fb49cebd582aaafdd6 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 07 Feb 2024 17:33:11 +0200
+Subject: [PATCH] [FSW-334] fs1: copy preboot image from flash
+
+Preboot image is copied from flash using the SPI DMA engine.
+Eventually PPBOOT will use the SPI DMA code from BOOTROM, but until
+then, for testing and HW validation SPI DMA code is implemented locally.
+Later on the SPI DMA implementation can be easily removed as it is
+wrapped with "#ifndef USE_BOOTROM_SPI_DMA"
+
+Change-Id: I6e306f848960c1f2dc615bc6a8cd6ab050cbf701
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 14e4001..2a42418 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -24,6 +24,8 @@
+ #include <axi_drain_wrap_regs.h>
+ #include <axi_drain_wrap_masks.h>
+ #include <pcie_wrap_regs.h>
++#include <parc_global_conf_regs.h>
++#include <parc_global_conf_masks.h>
+ #include <fs1_blocks_linux_driver.h>
+ 
+ #include <baremetal.h>
+@@ -228,11 +230,6 @@
+ 	hl_dev_psoc_pll_init();
+ }
+ 
+-void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+-{
+-	/* TODO: fill up copying procedure */
+-}
+-
+ void preboot_pcie_wait_for_link(void)
+ {
+ 	/* TODO: fill Pcie link offload to ARC0 */
+@@ -266,3 +263,125 @@
+ 
+ 	image_entry();
+ }
++
++static enum dma_dest_type preboot_get_dma_dest_type(uint64_t addr)
++{
++	if (addr >= HL_FW_SRAM_FULL_BASE &&
++	    addr < HL_FW_SRAM_FULL_BASE + HL_FW_SRAM_SIZE)
++		return DMA_DEST_SRAM;
++
++	return DMA_DEST_HBW;
++}
++
++#ifndef USE_BOOTROM_SPI_DMA
++
++static void dma_copy_image_internal(uint16_t image_size, uint32_t flash_offset,
++				    uint64_t dest_offset, uint8_t fw_sram_dst, bool first_chunk)
++{
++	uint32_t spi_dma_ctrl =  0;
++	uint32_t spi_dma_status;
++	uint32_t spi_dma_dst_addr_l = DMA_ADDRESS_LOW(dest_offset);
++	uint32_t spi_dma_dst_addr_h = DMA_ADDRESS_HIGH(dest_offset);
++	uint16_t flash_offset_1k = flash_offset / DMA_SRC_BLOCK_SIZE;
++	uint16_t image_size_4b = (image_size / DMA_DST_BLOCK_SIZE);
++
++	regmap_writel(spi_dma_dst_addr_l, mmIO_0_CFG_HALF_0_PSOC_PARC_CFG_MISC_BASE +
++					  mmPARC_GLOBAL_CONF_SPI_DMA_DST_ADDR_L);
++	regmap_writel(spi_dma_dst_addr_h, mmIO_0_CFG_HALF_0_PSOC_PARC_CFG_MISC_BASE +
++					  mmPARC_GLOBAL_CONF_SPI_DMA_DST_ADDR_H);
++
++	/* enable DMA transfer */
++	spi_dma_ctrl = PARC_GLOBAL_CONF_SPI_DMA_CTRL_EN_M;
++
++	/* sram=1 hbw=0 as destination */
++	spi_dma_ctrl |= fw_sram_dst << PARC_GLOBAL_CONF_SPI_DMA_CTRL_DST_SRAM_M;
++
++	/* # of 4bytes to DMA copy */
++	spi_dma_ctrl |= (uint32_t)image_size_4b << PARC_GLOBAL_CONF_SPI_DMA_CTRL_MEM_SIZE_S;
++
++	/* spi offset in 1k chunks */
++	spi_dma_ctrl |= (uint32_t)flash_offset_1k << PARC_GLOBAL_CONF_SPI_DMA_CTRL_ADDR_SHIFT_S;
++
++	/* mask crc error, fw will validate final crc */
++	spi_dma_ctrl |= PARC_GLOBAL_CONF_SPI_DMA_CTRL_MASK_CRC_ERR_M;
++
++	/* restart CRC for first chunk, accumulate for the following chunks */
++	spi_dma_ctrl |= first_chunk ? PARC_GLOBAL_CONF_SPI_DMA_CTRL_CRC_RESTART_M : 0;
++
++	regmap_writel(spi_dma_ctrl, mmIO_0_CFG_HALF_0_PSOC_PARC_CFG_MISC_BASE +
++				    mmPARC_GLOBAL_CONF_SPI_DMA_CTRL);
++
++	/*
++	 * wait for DMA finish
++	 * TODO: Naive temporary implementation, add transaction timeout monitoring
++	 */
++	do {
++		spi_dma_status = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_PARC_CFG_MISC_BASE +
++					      mmPARC_GLOBAL_CONF_SPI_DMA_STATUS);
++	} while (!(spi_dma_status & PARC_GLOBAL_CONF_SPI_DMA_STATUS_DONE_M));
++}
++
++static enum dma_error dma_copy_image_v3(uint32_t image_size, uint32_t flash_offset,
++					uint64_t dest_addr, enum dma_dest_type dest_type)
++{
++	uint32_t dma_chunks, dma_size, chunk_offset, copy_size = image_size;
++	uint32_t calc_crc, img_crc_addr, img_crc;
++	uint8_t i;
++
++	if (dest_type >= DMA_DEST_MAX)
++		return DMA_INVALID_DEST_TYPE;
++
++	if (dest_addr % ADDR_SIZE_ALIGNMENT)
++		return DMA_UNALIGNED_DEST_ADDR;
++
++	dma_chunks = image_size / MAX_DMA_SIZE;
++	if (image_size % MAX_DMA_SIZE)
++		dma_chunks++;
++
++	if (image_size < MIN_DMA_SIZE_CRC)
++		return DMA_INVALID_IMG_SIZE;
++
++	if ((image_size) % ADDR_SIZE_ALIGNMENT)
++		return DMA_UNALIGNED_IMG_SIZE;
++
++	for (i = 0; i < dma_chunks; i++) {
++		dma_size = copy_size > MAX_DMA_SIZE ? MAX_DMA_SIZE : copy_size;
++		chunk_offset = MAX_DMA_SIZE * i;
++		dma_copy_image_internal(dma_size, (flash_offset + chunk_offset),
++					(dest_addr + chunk_offset), dest_type, !i);
++
++		copy_size -= dma_size;
++	}
++
++	calc_crc = regmap_readl(mmIO_0_CFG_HALF_0_PSOC_PARC_CFG_MISC_BASE +
++				mmPARC_GLOBAL_CONF_SPI_DMA_CRC);
++
++	/* assumption: CRC is included in image_size and copied to dest location */
++	img_crc_addr = fs1_translate_arc_addr(dest_addr + image_size - sizeof(img_crc));
++	img_crc = *(u32 *)img_crc_addr;
++
++	if (calc_crc != img_crc) {
++		preboot_puts("SPI image CRC mismatch");
++		return DMA_INVALID_CRC_ERROR;
++	}
++
++	return DMA_SUCCESS;
++}
++
++#else
++/* TODO: use bootrom code when it is mature enough FSW-2070 */
++#endif /* USE_BOOTROM_SPI_DMA */
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	enum dma_error dma_err;
++	enum dma_dest_type dma_type;
++
++	preboot_puts_hex64("Preboot loadaddr: ", loadaddr, false);
++
++	dma_type = preboot_get_dma_dest_type(loadaddr);
++
++	dma_err = dma_copy_image_v3(size, offset, loadaddr, dma_type);
++	if (dma_err != DMA_SUCCESS)
++		preboot_puts_hex("DMA failed to copy preboot, err=", dma_err, false);
++}
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index e6e2b3f..3e75e29 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -38,6 +38,39 @@
+ 	err;											\
+ })
+ 
++#ifndef USE_BOOTROM_SPI_DMA
++
++/* copy max 63Kb of data because of HW issue H15B-311 */
++#define MAX_DMA_SIZE		0xFC00
++#define ADDR_SIZE_ALIGNMENT	16	/* 16 bytes */
++#define MIN_DMA_SIZE		16	/* 16 bytes */
++#define CRC32_SIZE		4
++#define MIN_DMA_SIZE_CRC	(MIN_DMA_SIZE + CRC32_SIZE)
++#define DMA_ADDRESS_LOW(x)	((x) & 0xFFFFFFFF)
++#define DMA_ADDRESS_HIGH(x)	(((x) >> 32) & 0xFFFFFFFF)
++#define DMA_SRC_BLOCK_SIZE	1024
++#define DMA_DST_BLOCK_SIZE	4
++
++enum dma_dest_type {
++	DMA_DEST_HBW = 0,
++	DMA_DEST_SRAM,
++	DMA_DEST_MAX
++};
++
++enum dma_error {
++	DMA_SUCCESS = 0,
++	DMA_INVALID_CRC_ERROR,
++	DMA_INVALID_DEST_TYPE,
++	DMA_UNALIGNED_IMG_SIZE,
++	DMA_UNALIGNED_DEST_ADDR,
++	DMA_INVALID_IMG_SIZE,
++	DMA_ERROR_MAX
++};
++
++#else /* USE_BOOTROM_SPI_DMA */
++/* TODO: use bootrom code when it is mature enough FSW-2070 */
++#endif /* USE_BOOTROM_SPI_DMA */
++
+ void hl_dev_psoc_pll_init(void);
+ 
+ #endif /* ARCH_FS1_ARC_HL_H_ */

@@ -1,0 +1,99 @@
+From d8cb608229ea3f075e696a9e5c1030d2c0d2e457 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Thu, 25 Mar 2021 14:02:34 +0200
+Subject: [PATCH] [SW-30456] boot info: remove get size limit
+
+In order to get data into smaller destination. Needed to resolve future
+compatibility issues where Linux stored an updated struct which is
+larger then the struct used by preboot.
+
+Change-Id: Ife128e2e59dd32cb2a085b2d61475d7bc3f9ba05
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/include/boot_info.h b/include/boot_info.h
+index 0779b03..41faf14 100644
+--- a/include/boot_info.h
++++ b/include/boot_info.h
+@@ -11,7 +11,6 @@
+ 
+ void boot_info_finalize(void);
+ int boot_info_set(u32 type, const void *data, u32 size);
+-int boot_info_get(u32 type, void *data, u32 max_data_size,
+-		  u32 *actual_data_size);
++int boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
+ 
+ #endif /* _BOOT_INFO_H_ */
+diff --git a/preboot/boot_info.c b/preboot/boot_info.c
+index 0bfcd8b..49902cb 100644
+--- a/preboot/boot_info.c
++++ b/preboot/boot_info.c
+@@ -139,19 +139,37 @@
+ 	return 0;
+ }
+ 
+-int boot_info_get(u32 type, void *data, u32 max_data_size,
+-		  u32 *actual_data_size)
++/*
++ * Apply memory copy with 32bit access limitation from src, make sure any
++ * reminder is also read using 32bit access.
++ * Both src and dst must be 32bit aligned addresses.
++ */
++static void boot_info_memcpy32(void *dst, void *src, u32 size)
++{
++	u32 *d, *s, rem;
++	int i, rem_sz;
++
++	d = dst;
++	s = src;
++
++	for (i = 0; i < size / sizeof(u32); i++)
++		d[i] = s[i];
++
++	rem_sz = size % sizeof(u32);
++	if (!rem_sz)
++		return;
++
++	rem = s[i];
++	memcpy(&d[i], &rem, rem_sz);
++}
++
++int boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
+ {
+ 	struct hl_boot_info_ptrs ptrs;
+ 	struct hl_boot_info_desc desc;
+-	u32 *offsets, *src, *dst, i, j;
++	u32 *offsets, i, cpy_sz;
+ 	u8 chksum[HL_CHKSUM_SIZE];
+-
+-	/* Size must be 32bit aligned */
+-	if (max_data_size & (sizeof(u32) - 1))
+-		return 1;
+-
+-	dst = data;
++	void *src;
+ 
+ 	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
+ 	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
+@@ -169,18 +187,15 @@
+ 		if (desc.magic != (HL_BOOT_INFO_DESC_MAGIC | type))
+ 			return 1;
+ 
+-		if (max_data_size < desc.size)
+-			return 1;
+-
++		cpy_sz = (max_size > desc.size) ? desc.size : max_size;
+ 		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
+-		for (j = 0; j < ROUND_UP4(desc.size) / sizeof(u32); j++)
+-			dst[j] = src[j];
++		boot_info_memcpy32(data, src, cpy_sz);
+ 
+ 		sha256_csum((u8 *)data, desc.size, chksum);
+ 		if (memcmp(chksum, desc.chksum, HL_CHKSUM_SIZE))
+ 			return 1;
+ 
+-		*actual_data_size = desc.size;
++		*copy_size = cpy_sz;
+ 
+ 		return 0;
+ 	}

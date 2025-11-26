@@ -1,0 +1,63 @@
+From 07ed1909d4bbc684c256f8bb692a8ff3b2eddcb8 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 12 Aug 2021 17:31:29 +0300
+Subject: [PATCH] [SW-0] gaudi: security: improve lbw handover
+
+To improve the BTL settings replacement w/o creating an opportunity
+window, closing the cfg space access from pcie before reconfiguring
+the rest of the range registers
+
+Change-Id: Id7a380e699c1316fcb2525b085e5750e8765f23c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/arch/gaudi/arm/security.c b/arch/gaudi/arm/security.c
+index 745d9e9..a5c1017 100644
+--- a/arch/gaudi/arm/security.c
++++ b/arch/gaudi/arm/security.c
+@@ -1506,6 +1506,7 @@
+  */
+ #define CFG_HIGH_GAP_BASE	0x7FFCFC9000ull
+ #define DBG_BASE		mmMME_S_ROM_TABLE_BASE
++#define HOST_PHYS_BASE		0x8000000000ull
+ 
+ static void preboot_secure_lbw(void)
+ {
+@@ -1517,6 +1518,28 @@
+ 	 * meaning - not inclusive, so we need to provide it the min address
+ 	 * below the forbidden one and max address above the forbidden one.
+ 	 */
++
++	/*
++	 * closing the cfg space before everything else in order to avoid
++	 * creating a security hole during the configuration of the range regs
++	 */
++	/* CFG LOW RANGE: RR(PCIE_DYN_RR_CFG_LOW) */
++	min = HL_CFG_BASE - 1;
++	max = mmPSOC_GLOBAL_CONF_BASE;
++	preboot_secure_pcie_rr(PCIE_DYN_RR_CFG_LOW, min, max);
++
++	/* CFG HIGH RANGE: RR(PCIE_DYN_RR_CFG_HIGH) */
++	min = mmPSOC_GPIO0_BASE - 1;
++	/*
++	 * The PCIe RR can take only values of 32 bits, then H/W is
++	 * extending these with 0x7F in the bits 32-39.
++	 * This means we cannot provide the HOST_PHYS_BASE as it will
++	 * just turn into 0x7F00000000 which is not what we want.
++	 * Subtract 1 from HOST_PHYS_BASE to hae a valid value.
++	 */
++	max = HOST_PHYS_BASE - 1;
++	preboot_secure_pcie_rr(PCIE_DYN_RR_CFG_HIGH, min, max);
++
+ 	/* MME1_QM: RR(LBW_RR_MME1_QM) */
+ 	min = mmMME1_QM_BASE - 1;
+ 	max = mmMME2_ACC_BASE;
+@@ -1887,7 +1910,6 @@
+ 
+ #define SRAM_SIZE	0x1400000	/* 20MB */
+ #define SRAM_END	(SDRAM_BASE + SRAM_SIZE)
+-#define HOST_PHYS_BASE	0x8000000000ull
+ 
+ enum preboot_sec_rr_names {
+ 	SRAM_BGN_TO_VERS = 0,

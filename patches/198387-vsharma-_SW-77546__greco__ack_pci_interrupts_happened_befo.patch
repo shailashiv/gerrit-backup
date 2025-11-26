@@ -1,0 +1,58 @@
+From 5d8f4e52524dd6b162975f921d7109d75836bc07 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Mon, 11 Apr 2022 06:52:39 +0300
+Subject: [PATCH] [SW-77546] greco: ack pci interrupts happened before lkd comes up
+
+PCIE_ADDR_DEC_ERR irq is showing after hard reset.
+As agreed with lkd and followed in gaudi/gaudi2, IRQs that are consequence
+of the reboot sequence should be cleared in preboot.
+
+Change-Id: Ie4f34d7b8dcc9f6ad61c177e4fc67e4bb4282a7e
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 047d93b..e56f70b 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -47,6 +47,8 @@
+ #include <greco/greco_boot_info.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_aux_masks.h>
++#include <gic_regs.h>
++#include <greco_irq.h>
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+ #define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
+@@ -801,3 +803,31 @@
+ 		}
+ 	}
+ }
++
++static void greco_ack_gic_irq(void)
++{
++	u32 i;
++
++	for (i = 0; i < GRECO_IRQ_SIZE; i++)
++		regmap_writel(i, mmGIC_DISTRIBUTOR__6_GICD_CLRSPI_NSR);
++}
++
++#define PCIE_INTR_ERR_INTR_BIT		(BIT(0) | BIT(1))
++static void greco_ack_pci_axi_irq(void)
++{
++	u32 reg = regmap_readl(mmPCIE_WRAP_PCIE_IC_SEI_INTR_IND);
++	u32 bitmask = reg & PCIE_INTR_ERR_INTR_BIT;
++
++	/* Reset the indication */
++	regmap_writel(reg & ~bitmask, mmPCIE_WRAP_PCIE_IC_SEI_INTR_IND);
++	/* Clear the interrupt */
++	regmap_writel(BIT(0), mmPCIE_WRAP_AXI_INTR);
++	/* Ack PCI drain indication */
++	regmap_writel(0, mmPCIE_WRAP_AXI_DRAIN_IND);
++}
++
++void preboot_ack_irq(void)
++{
++	greco_ack_pci_axi_irq();
++	greco_ack_gic_irq();
++}

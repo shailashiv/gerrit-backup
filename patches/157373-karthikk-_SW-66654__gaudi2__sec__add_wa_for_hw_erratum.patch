@@ -1,0 +1,110 @@
+From d3352ebe93873732d994d03e853c5b656edb9dab Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Thu, 16 Dec 2021 08:08:07 +0200
+Subject: [PATCH] [SW-66654] gaudi2: sec: add wa for hw erratum
+
+Erratum:GAUDI2_0110
+Problem:
+PCIe master interface maintain credits towards HBM and PCIe.
+However, due to hardware bug, there is a credit leakage.
+Thus, if the region is blocked the first two transactions will
+consume all the credits and all the transactions from the
+3rd transaction onwards will blocked.
+
+Implication:
+The device does not provide downstream completion which will
+cause the host to crash.
+
+Workaround:
+1) HBM- PCIE_MSTR_RR_MSTR_IF can be block only VA which is meaningless.
+Instead use the HMMU RR which are working on PA.
+
+2) PCIe (PCIe FW SRAM)- the memory should be removed from the BAR via
+the iATU.
+
+Changes in this patch for the above workarounds:
+For 1) HBM non-HMMU RR programming in preboot is removed.
+For 2) RR region for PCIe FW SRAM is removed in preboot as the region
+is to be removed from the BAR via iATU.
+
+Currently the issue was observed in PCIe FW SRAM and HBM as there two
+memories have the credit buffer mechanism, hence impacted by the
+credit leakage erratum. Other memories like SRAM, SP SRAM, DCCM/ICCM
+etc did not showcase this issue.
+
+In order to reproduce the issue, a pcie violation is to be triggered
+on any of these memories, and a crash will be observed always on the
+3rd violation(as the credit limit is 2).
+
+In case any other memories showcase a similar issue in future, the iatu
+region can be adapted accordingly as per requirement.
+
+Change-Id: I88359b6916d0b6ab47cc08359be0c5a72c1e6aea
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 15df4a5..995c7b2 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -177,7 +177,7 @@
+  */
+ enum gaudi2_sec_if_hbw_rrs {
+ 	HL_SEC_HBW_SPI_FLASH = 0,
+-	HL_SEC_HBW_ICCM0_TO_PCIE_FW_SRAM = 1,
++	HL_SEC_HBW_ICCM0_TO_SP_SRAM = 1,
+ 	HL_SEC_HBW_PSOC_LBW = 2,
+ 	HL_SEC_HBW_SRAM_BGN = 3,
+ 	HL_SEC_HBW_SRAM_IMG = 4,
+@@ -193,7 +193,6 @@
+ 	 * hence a full rr needs to be used.
+ 	 */
+ 	HL_SEC_HBW_SRAM_END = HL_SEC_HBW_SRAM,
+-	HL_SEC_HBW_HBM = 7,
+ 	HL_SEC_HBW_SRAM_RO = 8,
+ 	HL_SEC_HBW_SF_RO = 9,
+ 	HL_SEC_HBW_MAX_RR_IDX = 10,
+@@ -714,13 +713,13 @@
+ 	u64 min, max;
+ 
+ 	/*
+-	 * SPI FLASH END to PCI FW SRAM END
+-	 * Includes the reserved space at end of PCI FW SRAM.
++	 * SPI FLASH END to SP SRAM END
++	 * Includes the reserved space at end of SPSRAM.
+ 	 * 0x1000007FF7000000 - 0x1000007FF7FFF000
+ 	 */
+ 	min = SPI_FLASH_END;
+-	max = PCIE_FW_SRAM_RSVD_END;
+-	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_PCIE_FW_SRAM, min, max, rr_sel);
++	max = SCRATCHPAD_SRAM_ADDR + SCRATCHPAD_SRAM_SIZE;
++	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, min, max, rr_sel);
+ 
+ 	/*
+ 	 * Block Reserved space to HBM
+@@ -737,14 +736,6 @@
+ 	min = SPI_FLASH_BASE;
+ 	max = SPI_FLASH_END;
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, min, max, rr_sel);
+-
+-	/*
+-	 * Lock DRAM base to DRAM Reserved space end
+-	 * 0x1001000000000000 - 0x1001000010000000
+-	 */
+-	min = DRAM_PHYS_BASE;
+-	max = DRAM_RSVD_END;
+-	hl_secure_hbw_rr(HL_SEC_HBW_HBM, min, max, rr_sel);
+ }
+ 
+ static void ppboot_secure_hbw(void)
+@@ -916,10 +907,9 @@
+ 	/*
+ 	 * Open HBW RR that was closed in ppboot.
+ 	 */
+-	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_PCIE_FW_SRAM, 0, 0, rr_sel);
++	hl_secure_hbw_rr(HL_SEC_HBW_ICCM0_TO_SP_SRAM, 0, 0, rr_sel);
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SRAM, 0, 0, rr_sel);
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, 0, 0, rr_sel);
+-	hl_secure_hbw_rr(HL_SEC_HBW_HBM, 0, 0, rr_sel);
+ }
+ 
+ /* Reg format is <DCORE_NUM>_RTR<INST_NUM>_MSTR_IF */

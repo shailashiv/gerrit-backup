@@ -1,0 +1,150 @@
+From ff630898c3732839023378a94bc615176aa3a228 Mon Sep 17 00:00:00 2001
+From: Nadav Hugim <nhugim@habana.ai>
+Date: Wed, 12 Jan 2022 12:31:17 +0200
+Subject: [PATCH] [SW-62217] fit: rm/add msg from functions
+
+return new enum fit_format_result from func fit_get_load_type.
+add error msg if fail on func fit_load_images.
+add error msg if fail on func module_fwupd_load_type.
+remove printing from func fit_check_format if it fail
+
+Change-Id: I99fe728a9f2e520e3851516e3d70c28cb3a88807
+Signed-off-by: Nadav Hugim <nhugim@habana.ai>
+---
+
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 8781974..27d0854 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -191,24 +191,18 @@
+ 
+ int fit_check_format(const void *fit)
+ {
+-	if (fdt_check_header(fit)) {
+-		preboot_puts("FIT header check failed\n");
+-		return 0;
+-	}
++	if (fdt_check_header(fit))
++		return FIT_FORMAT_HEADER_CHECK_FAILED;
+ 
+ 	/* mandatory / node 'description' property */
+-	if (fdt_getprop(fit, 0, FIT_DESC_PROP, NULL) == NULL) {
+-		preboot_puts("Wrong FIT format: no description\n");
+-		return 0;
+-	}
++	if (fdt_getprop(fit, 0, FIT_DESC_PROP, NULL) == NULL)
++		return FIT_FORMAT_NO_DESCRIPTION;
+ 
+ 	/* mandatory subimages parent '/images' node */
+-	if (fdt_path_offset(fit, FIT_IMAGES_PATH) < 0) {
+-		preboot_puts("Wrong FIT format: no images parent node\n");
+-		return 0;
+-	}
++	if (fdt_path_offset(fit, FIT_IMAGES_PATH) < 0)
++		return FIT_FORMAT_NO_IMAGES_PARENT_NODE;
+ 
+-	return 1;
++	return FIT_FORMAT_SUCCESS;
+ }
+ 
+ static int fit_get_int(const void *fit, int node, const char *prop_name,
+@@ -962,7 +956,7 @@
+ 
+ 	memset(&images, 0x0, sizeof(images));
+ 
+-	err = !fit_check_format(fit);
++	err = fit_check_format(fit);
+ 	if (!err)
+ 		err = fit_copy_images(fit, &sec_res);
+ 
+@@ -970,26 +964,22 @@
+ 			    BIT_ULL(CPU_BOOT_ERR_SECURITY_FAIL), false);
+ 	switch (err) {
+ 	case FIT_LOAD_SUCCESS:
+-		return 0;
+-
+-	case FIT_LOAD_BAD_LOAD_ADDR:
+-	case FIT_LOAD_NOT_RUNNABLE:
+-	case FIT_LOAD_CORRUPTED:
+-		cpu_boot_err_set(CPU_BOOT_ERR_FIT_CORRUPTED);
+-		preboot_error_inform(HL_FW_ERR_FIT, err);
+-		preboot_puts("FIT loading failed, Retrying...\n");
+-		break;
++		return FIT_LOAD_SUCCESS;
+ 	case FIT_LOAD_SEC_FAILED:
+ 		cpu_boot_err_set(CPU_BOOT_ERR_SECURITY_FAIL);
+ 		preboot_error_inform(HL_FW_ERR_SECURITY,
+ 				     fwupd_sec_convert_min_error(sec_res));
+-		preboot_puts("FIT security validation failed, Retrying...\n");
++		break;
++	default:
++		cpu_boot_err_set(CPU_BOOT_ERR_FIT_CORRUPTED);
++		preboot_error_inform(HL_FW_ERR_FIT, err);
+ 		break;
+ 	}
+ 
+ 	fit_report_err(err, sec_res);
++	fit_load_print_error(err);
+ 
+-	return 1;
++	return err;
+ }
+ 
+ __weak void preboot_finalize_fw_info(void) {}
+@@ -1058,8 +1048,8 @@
+ 	int ret, len, conf;
+ 
+ 	ret = fit_check_format(fit);
+-	if (!ret)
+-		return 1;
++	if (ret)
++		return ret;
+ 
+ 	conf = fit_find_config_node(fit);
+ 	if (conf >= 0) {
+@@ -1067,23 +1057,19 @@
+ 		if (!cell) {
+ 			preboot_puts("No load type. Assuming old FIT version\n");
+ 			*load_type = type;
+-			return 0;
++			return FIT_FORMAT_SUCCESS;
+ 		}
+-		if (len != sizeof(*cell)) {
+-			preboot_puts("Currupted load type\n");
+-			return 1;
+-		}
++		if (len != sizeof(*cell))
++			return FIT_FORMAT_CURRUPTED_LOAD_TYPE;
+ 
+ 		type = fdt32_to_cpu(*cell);
+-		if (type >= FIT_LOAD_TYPE_COUNT) {
+-			preboot_puts_hex("Unsupported load type ", type, false);
+-			return 1;
+-		}
++		if (type >= FIT_LOAD_TYPE_COUNT)
++			return FIT_FORMAT_UNSUPPORTED_LOAD_TYPE;
+ 	}
+ 
+ 	*load_type = type;
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int fit_image_get_data(const void *fit, int noffset,
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index 7c49e49..f3c841e 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -627,8 +627,10 @@
+ 	int ret;
+ 
+ 	ret = fit_get_load_type(state->map_offset, &load_type);
+-	if (ret)
++	if (ret) {
++		fit_format_print_error(ret);
+ 		return 1;
++	}
+ 
+ 	switch (load_type) {
+ 	case FIT_LOAD_TYPE_NIC_EN_MASK:

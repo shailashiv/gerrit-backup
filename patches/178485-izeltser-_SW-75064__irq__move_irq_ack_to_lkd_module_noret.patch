@@ -1,0 +1,51 @@
+From c3187e23bf124f2bc928fc094d87368fafe3a6b4 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 14 Feb 2022 08:56:07 +0200
+Subject: [PATCH] [SW-75064] irq: move irq ack to lkd module noret
+
+So far the IRQ ack function call was in uart module teardown, but it
+has very little to do with the uart module.
+Since those IRQs are mostly relevant for the FW loaded by the LKD,
+this function call is moved to the cleanup phase of the LKD module,
+prior to running the FW image.
+
+Change-Id: Icc810c449bb3d1bb6b3c6db8b9fa64bd788f7edf
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 5e7cc31..ee3ebf9 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -619,6 +619,14 @@
+ 	u64 sts_msk = BIT_ULL(CPU_BOOT_DEV_STS_FW_HARD_RST_EN) |
+ 		      BIT_ULL(CPU_BOOT_DEV_STS_FW_LD_COM_EN);
+ 
++	/*
++	 * Some events (like RAZWI or PCI ERR) might appear during boot
++	 * due to async access from host side to locked range registers (PCI)
++	 * (i.e. during iatu initlization or reset flow, PCI access is
++	 * disabled). Therefore this ack is needed.
++	 */
++	preboot_ack_irq();
++
+ 	preboot_security_cleanup_before_run();
+ 	hl_ts_shutdown();
+ 	cpu_boot_dev_sts_clrset(sts_msk, false);
+diff --git a/lib/preboot/module_uart.c b/lib/preboot/module_uart.c
+index bbbecb6..0695b20 100644
+--- a/lib/preboot/module_uart.c
++++ b/lib/preboot/module_uart.c
+@@ -83,12 +83,4 @@
+ void module_uart_teardown(void)
+ {
+ 	preboot_uart_rbuf_flush();
+-
+-	/*
+-	 * Some events (like RAZWI or PCI ERR) might appear during boot
+-	 * due to async access from host side to locked range registers (PCI)
+-	 * (i.e. during iatu initlization or reset flow, PCI access is
+-	 * disabled). Therefore this ack is needed.
+-	 */
+-	preboot_ack_irq();
+ }

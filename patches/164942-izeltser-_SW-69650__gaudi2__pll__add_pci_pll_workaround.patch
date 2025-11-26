@@ -1,0 +1,83 @@
+From 9d3aa5c7a5a1587ddca01e44c074fbe1d392c363 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 09 Jan 2022 12:34:56 +0200
+Subject: [PATCH] [SW-69650] gaudi2: pll: add pci pll workaround
+
+Due to clock domain crossing issues in Gaudi2, pci pll div0 frequency
+must be equal or lower than div2 for pci phy fw upgrade.
+Otherwise the phy fw upgrade is very much likely to fail and pci link
+won't be established.
+As a workaround, at first pci pll div0 and div2 are both being set to
+1/5 pll clk (100MHz), and after pci link is up we move pci pll div0 to
+his nominal frequency which is pll clk (500MHz).
+
+Change-Id: If3a52134c1c87afe9494a4685a6f757240975651
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/asic.c b/arch/gaudi2/common/asic.c
+index c74a024..4d68720 100644
+--- a/arch/gaudi2/common/asic.c
++++ b/arch/gaudi2/common/asic.c
+@@ -24,6 +24,7 @@
+ #include <tpm2.h>
+ #include <lzo/unaligned.h>
+ #include <boot_if.h>
++#include "hl.h"
+ 
+ #define HBM_BAR_PF_NUM (1 << 4)
+ 
+@@ -92,6 +93,8 @@
+ 
+ 	return 0;
+ }
++
++#define PCI_TMP_DIV	4	/* temporary divider setting for pci pll div0 */
+ 
+ static struct hl_pll_cfg gaudi2_pll_cfg[] = {
+ 	{
+@@ -191,15 +194,44 @@
+ 
+ void hl_dev_pll_init(void)
+ {
++	unsigned int rst_src, i;
++
+ 	/* If FW skip enabled return */
+ 	if (hl_skip_fw_cfg())
+ 		return;
+ 
+ 	hl_arch_pll_init();
+ 
++	/* execute pci pll WA only when required */
++	rst_src = hl_rst_src_get();
++	if ((rst_src == HL_COLD_RST) || (rst_src == HL_PRSTN_RST)) {
++		for (i = 0; i < ARRAY_SIZE(gaudi2_pll_cfg); i++) {
++			if (strcmp(gaudi2_pll_cfg[i].name, "PCI_PLL") != 0)
++				continue;
++
++			gaudi2_pll_cfg[i].div_factor[0] = PCI_TMP_DIV;
++			gaudi2_pll_cfg[i].div_sel[0] = HL_PLL_DIV_PLL;
++			break;
++		}
++	}
++
+ 	hl_pll_init(gaudi2_pll_cfg, ARRAY_SIZE(gaudi2_pll_cfg));
+ }
+ 
++#define PCI_PLL_BASE	mmDCORE0_PCI_PLL_CTRL_BASE
++
++void hl_dev_pci_pll_wa(void)
++{
++	/*
++	 * Pci pll div0 frequency must be equal or lower than div2 for pci phy
++	 * fw upgrade.
++	 * After phy fw upgrade is complete and pci link is up we move div0
++	 * to his nominal clock frequency.
++	 */
++	hl_pll_clk_switch_to_ref(PCI_PLL_BASE, HL_PLL_DIV0);
++	hl_pll_clk_switch_to_pll(PCI_PLL_BASE, HL_PLL_DIV0, HL_PLL_PLL_CLK);
++}
++
+ u32 hl_skip_fw_cfg(void)
+ {
+ 	/* Use DumpSel[3] to skip FW config */

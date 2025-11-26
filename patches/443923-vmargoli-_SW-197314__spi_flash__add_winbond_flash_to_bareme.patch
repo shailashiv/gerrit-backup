@@ -1,0 +1,204 @@
+From 9d199a83b831f91a180db2c39079f4ae14630e2e Mon Sep 17 00:00:00 2001
+From: Vitaly Margolin <vmargolin@habana.ai>
+Date: Thu, 22 Aug 2024 15:10:47 +0300
+Subject: [PATCH] [SW-197314] spi_flash: add winbond flash to baremetal
+
+Add Winbond flash support to baremetal projects
+
+Signed-off-by: Vitaly Margolin <vmargolin@habana.ai>
+Change-Id: I1ca638fe91cfd45e0fd3eda21bdc77962dece5c0
+---
+
+diff --git a/arch/fs1/arc/common.h b/arch/fs1/arc/common.h
+index ac28fc2..338db3c 100644
+--- a/arch/fs1/arc/common.h
++++ b/arch/fs1/arc/common.h
+@@ -91,4 +91,10 @@
+  */
+ #define SPI_RX_POLL_TIMEOUT_US		1280 /* timeout in us */
+ 
++#ifdef PROT_MASK_WINBOND
++#undef PROT_MASK_WINBOND
++#endif
++/*  for winbond flash: BP0 == 0x1 - means 1 block - up to 256KB (eROM) */
++#define PROT_MASK_WINBOND	(READ_STATUS_BP0 | READ_STATUS_TB)
++
+ #endif /* COMMON_FS1_ARC_GNU_H_ */
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index 6c17e3e..e83b5a3 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -132,11 +132,11 @@
+ #include <spi_flash.h>
+ 
+ /* Let this file be included in any order and override the PROT_MASK */
+-#ifdef PROT_MASK
+-#undef PROT_MASK
++#ifdef PROT_MASK_MACRONIX
++#undef PROT_MASK_MACRONIX
+ #endif
+ /* Only BP1 == 0x2 - means 2 blocks - up to 128KB (eROM) */
+-#define PROT_MASK	(READ_STATUS_BP1 | READ_STATUS_SRWD)
++#define PROT_MASK_MACRONIX	(READ_STATUS_BP1 | READ_STATUS_SRWD)
+ 
+ void init_secondary(void);
+ extern void secondary_entry(void);
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 1ee9451..645676c 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -141,11 +141,17 @@
+ #include <spi_flash.h>
+ 
+ /* Let this file be included in any order and override the PROT_MASK */
+-#ifdef PROT_MASK
+-#undef PROT_MASK
++#ifdef PROT_MASK_MACRONIX
++#undef PROT_MASK_MACRONIX
+ #endif
+ /*  for macronix flash: BP0 | BP1 == 0x3 - means 4 blocks - up to 256KB (eROM) */
+-#define PROT_MASK	(READ_STATUS_BP0 | READ_STATUS_BP1 | READ_STATUS_SRWD)
++#define PROT_MASK_MACRONIX	(READ_STATUS_BP0 | READ_STATUS_BP1 | READ_STATUS_SRWD)
++
++#ifdef PROT_MASK_WINBOND
++#undef PROT_MASK_WINBOND
++#endif
++/*  for winbond flash: BP0 == 0x1 - means 1 block - up to 256KB (eROM) */
++#define PROT_MASK_WINBOND	(READ_STATUS_BP0 | READ_STATUS_TB)
+ 
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/include/spi_flash.h b/include/spi_flash.h
+index 78809cf..6853996 100644
+--- a/include/spi_flash.h
++++ b/include/spi_flash.h
+@@ -15,26 +15,44 @@
+ #define READ_STATUS_BP0			BIT(2)
+ #define READ_STATUS_BP1			BIT(3)
+ #define READ_STATUS_BP2			BIT(4)
++
++/* MACRONIX specific definitions */
+ #define READ_STATUS_BP3			BIT(5)
+ #define READ_STATUS_SRWD		BIT(7)
+ #define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | \
+ 					READ_STATUS_BP2 | READ_STATUS_BP3)
+-#define ALL_PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
++#define ALL_PROT_MASK_MACRONIX		(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
++
++/* WINBOND specific definitions */
++#define READ_STATUS_TB			BIT(5)
++#define READ_STATUS_SEC			BIT(6)
++#define READ_STATUS_SRP			BIT(7)
++#define READ_STATUS_2_CMP		BIT(6)
++#define READ_STATUS_BP0_2		(READ_STATUS_BP0 | READ_STATUS_BP1 | \
++					READ_STATUS_BP2)
++#define ALL_PROT_MASK_WINBOND		(READ_STATUS_BP0_2 | READ_STATUS_TB)
+ 
+ /* The PROT_MASK is meant to be overridden by device specific setting */
+-#ifndef PROT_MASK
+-#define PROT_MASK			ALL_PROT_MASK
++#ifndef PROT_MASK_MACRONIX
++#define PROT_MASK_MACRONIX		(ALL_PROT_MASK_MACRONIX)
+ #endif
++
++#ifndef PROT_MASK_WINBOND
++#define PROT_MASK_WINBOND		(ALL_PROT_MASK_WINBOND)
++#endif
++
++#define SPI_IS_MACRONIX(jedec_id_0)	(jedec_id_0 == 0xC2)
++#define SPI_IS_WINBOND(jedec_id_0)	(jedec_id_0 == 0xEF)
+ 
+ void spi_flash_init(void);
+ void spi_flash_copy(void *dst, unsigned int offset, unsigned int size,
+ 				char *name);
+-void spi_flash_copy_otp(void *dst, unsigned int offset, unsigned int size);
+ void spi_flash_prot(void);
+ int spi_flash_erase(unsigned int offset, unsigned int size);
+ void spi_flash_prot_early(void);
+ void spi_flash_prot_status(void);
+ void spi_flash_lock_access(bool is_lock);
++u8 spi_flash_get_prot_mask(void);
+ 
+ /* implemented per arch */
+ unsigned int get_cs_pad_sel_flash(void);
+diff --git a/lib/common/spi_flash.c b/lib/common/spi_flash.c
+index ea337f7..718b0f5 100644
+--- a/lib/common/spi_flash.c
++++ b/lib/common/spi_flash.c
+@@ -19,21 +19,29 @@
+ 
+ /* spi flash commands */
+ #define CMD_WRITE_STATUS		0x01
++#define CMD_WRITE_STATUS_2		0x31
+ #define CMD_READ			0x03
+ #define CMD_WRITE_DISABLE		0x04
+ #define CMD_READ_STATUS			0x05
++#define CMD_READ_STATUS_2		0x35
+ #define CMD_WRITE_ENABLE		0x06
+ #define CMD_FLAG_STATUS			0x70
+ #define CMD_ERASE			0xD8
++#define CMD_READ_JEDEC_ID		0x9F
++
+ #define READ_STATUS_PEC			(1 << 7)
+-
+-/* Used for Macronix flashes only. */
+-#define SPINOR_OP_ENSO			0xB1
+-#define SPINOR_OP_EXSO			0xC1
+-
+ #define PAGE_SIZE			SZ_64K
+ 
+ static struct spi_ctx flash_spi = {0};
++static u8 jedec_id_0;
++
++u8 spi_flash_get_prot_mask(void)
++{
++	if (SPI_IS_WINBOND(jedec_id_0))
++		return PROT_MASK_WINBOND;
++
++	return PROT_MASK_MACRONIX;
++}
+ 
+ static void spi_ssi_cs_init(void)
+ {
+@@ -70,6 +78,7 @@
+ 	flash_spi.release_bus = spi_flash_release_bus;
+ 	flash_spi.fifo_len = 0;
+ 	spi_init(&flash_spi);
++	spi_char_cmd_csel(&flash_spi, CMD_READ_JEDEC_ID, &jedec_id_0);
+ }
+ 
+ /*
+@@ -135,17 +144,6 @@
+ 	}
+ }
+ 
+-void spi_flash_copy_otp(void *dst, unsigned int offset, unsigned int size)
+-{
+-	if (spi_is_locked(&flash_spi))
+-		return;
+-
+-	spi_flash_init();
+-	spi_char_cmd_csel(&flash_spi, SPINOR_OP_ENSO, NULL);
+-	spi_flash_read(dst, offset, size);
+-	spi_char_cmd_csel(&flash_spi, SPINOR_OP_EXSO, NULL);
+-}
+-
+ void spi_flash_prot(void)
+ {
+ 	unsigned char sr;
+@@ -155,8 +153,14 @@
+ 
+ 	spi_flash_init();
+ 
++	if (SPI_IS_WINBOND(jedec_id_0)) {
++		spi_char_cmd_csel(&flash_spi, CMD_READ_STATUS_2, &sr);
++		sr &= ~READ_STATUS_2_CMP;
++		spi_flash_common_write(CMD_WRITE_STATUS_2, &sr, sizeof(sr), 1);
++	}
++
+ 	spi_char_cmd_csel(&flash_spi, CMD_READ_STATUS, &sr);
+-	sr |= PROT_MASK;
++	sr |= spi_flash_get_prot_mask();
+ 	spi_flash_common_write(CMD_WRITE_STATUS, &sr, sizeof(sr), 1);
+ }
+ 

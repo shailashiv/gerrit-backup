@@ -1,0 +1,164 @@
+From 573d384d7167afab36737f4c63682c31ee658fa4 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 25 Aug 2020 22:30:17 +0300
+Subject: [PATCH] [SW-17562] fit: security: add validation
+
+Add validation for SVN and public key before booting the FIT
+
+Change-Id: I1999766f023add44f22e14ceb08863afd55109a5
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index a0bd2d8..87edd06 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -143,7 +143,7 @@
+  * Boot strap pin for security is enabled or efuse bit
+  * for "security enabled" is true.
+  */
+-static bool preboot_security_is_enabled(void)
++bool preboot_security_is_enabled(void)
+ {
+ 	const struct hl_sec_efuse *fuse = preboot_security_get_fuse();
+ 
+diff --git a/preboot/fit.c b/preboot/fit.c
+index d22d078..8863066 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -23,6 +23,8 @@
+ #define FIT_LOADADDR_PROP	"loadaddr"
+ #define FIT_ARCH_PROP		"arch"
+ 
++#define FIT_SEC_VERSION		"hl-sec-version"
++#define FIT_SEC_KEY_IDX		"hl-sec-key-idx"
+ #define FIT_SIG_NODENAME	"signature"
+ #define FIT_VALUE_PROP		"value"
+ #define FIT_ALGO_PROP		"algo"
+@@ -38,9 +40,20 @@
+ struct fdt_region fdt_regions[MAX_FDT_REGIONS];
+ struct image_region region[MAX_FDT_REGIONS];
+ 
+-__weak int fit_need_verification(void)
++__weak bool preboot_security_is_enabled(void)
+ {
+-	return 0;
++	return false;
++}
++
++__weak bool preboot_security_key_is_valid(int key_idx, const void *pub_key,
++					  int pub_key_len)
++{
++	return false;
++}
++
++__weak bool preboot_security_svn_is_valid(int sec_ver)
++{
++	return false;
+ }
+ 
+ static const char *fit_loadables_name(const void *fit, int noffset, int id)
+@@ -281,8 +294,8 @@
+ static int fit_get_pub_key(const void *fit, int noffset,
+ 			   const void **pub_key_fit)
+ {
+-	int pub_key_fit_len;
+-	int node;
++	int node, key_idx, key_len;
++	const void *key_data;
+ 
+ 	node = fit_pub_key_node_get(fit, noffset);
+ 	if (node < 0) {
+@@ -290,13 +303,36 @@
+ 		return 1;
+ 	}
+ 
+-	*pub_key_fit = fdt_getprop(fit, node, FIT_DATA_PROP, &pub_key_fit_len);
+-	if (!(*pub_key_fit)) {
++	key_data = fdt_getprop(fit, node, FIT_DATA_PROP, &key_len);
++	if (!key_data) {
+ 		preboot_puts("Wrong FIT format: missing pubkey fit\n");
+ 		return 1;
+ 	}
+ 
++	key_idx = fit_get_int(fit, 0, FIT_SEC_KEY_IDX, -1);
++	if (key_idx < 0) {
++		preboot_puts("Wrong FIT format: missing key idx\n");
++		return 1;
++	}
++
++	if (!preboot_security_key_is_valid(key_idx, key_data, key_len))
++		return 1;
++
++	*pub_key_fit = key_data;
+ 	return 0;
++}
++
++static bool fit_svn_is_valid(const void *fit)
++{
++	int sec_ver;
++
++	sec_ver = fit_get_int(fit, 0, FIT_SEC_VERSION, -1);
++	if (sec_ver < 0) {
++		preboot_puts("Wrong FIT format: missing security version\n");
++		return false;
++	}
++
++	return preboot_security_svn_is_valid(sec_ver);
+ }
+ 
+ static int fit_verify_config_regions(const void *fit,
+@@ -310,6 +346,7 @@
+ 				    pub_key_fit);
+ }
+ 
++/* Checks the signed FIT and validate it againts the public key */
+ static int fit_verify_config(const void *fit, int noffset)
+ {
+ 	int sig_sub_node;
+@@ -327,10 +364,9 @@
+ 		return 1;
+ 	}
+ 
+-	if (fit_get_pub_key(fit, noffset, &pub_key_fit)) {
+-		preboot_puts("Wrong FIT format: missing pub_key\n");
++	if (fit_get_pub_key(fit, noffset, &pub_key_fit))
+ 		return 1;
+-	}
++
+ 	hashed_node_prop = fit_get_hashed_nodes(fit, sig_sub_node, &count,
+ 						node_inc);
+ 	if (!hashed_node_prop)
+@@ -358,6 +394,20 @@
+ 					 pub_key_fit);
+ }
+ 
++static int fit_verify_security(const void *fit, int noffset)
++{
++	if (!preboot_security_is_enabled())
++		return 0;
++
++	if (!fit_svn_is_valid(fit))
++		return 1;
++
++	/* Security in enabled and SV is valid all thats left is to check the
++	 * signature on the FIT.
++	 */
++	return fit_verify_config(fit, noffset);
++}
++
+ int fit_load_images(const void *fit, struct fit_image *images)
+ {
+ 	int node, len;
+@@ -371,9 +421,8 @@
+ 	if (conf < 0)
+ 		return 1;
+ 
+-	if (fit_need_verification())
+-		if (fit_verify_config(fit, conf))
+-			return 1;
++	if (fit_verify_security(fit, conf))
++		return 1;
+ 
+ 	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
+ 	if (num_images > FIT_MAX_IMAGES) {

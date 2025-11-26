@@ -1,0 +1,155 @@
+From da4f286380db59d7d741bf36d2d63c01d70245db Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 21 Feb 2024 17:31:13 +0200
+Subject: [PATCH] [SW-156330] hl: tpm: extract ppboot img hash
+
+In gaudi2 ppboot image hash is extracted from
+the ppboot image, while in gaudi3 it is extracted
+from the image descriptors. Added platform specific
+functions to get the ppboot img hash. Extracted hash
+will be used to extend the TPM PCR of ppboot.
+
+Change-Id: Idf1f33275f0c0f94767f3147f7fa925ab9e17070
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index ffc622e..837f726 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -1023,3 +1023,35 @@
+ {
+ 	preboot_pcie_wait_for_link();
+ }
++
++static uintptr_t hl_get_ppboot_data(void)
++{
++	uint32_t ppboot_pcie_size;
++
++	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
++
++	ppboot_pcie_size -= SIG_SIZE;
++	ppboot_pcie_size -= CRC32_SIZE;
++	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
++	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
++	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
++
++	return (uintptr_t)(HL_FWSRAM_BASE + ppboot_pcie_size);
++}
++
++bool get_ppboot_img_hash(u8 *hash)
++{
++	uintptr_t data;
++	uint32_t magic;
++
++	data = hl_get_ppboot_data();
++
++	memcpy(&magic, (void *)data, PPBOOT_HASH_MAGIC_SIZE);
++	if (magic != PPBOOT_SHA_MAGIC) {
++		preboot_puts("no ppboot sha magic found\n");
++		return false;
++	}
++
++	memcpy(hash, (void *)(data + PPBOOT_HASH_MAGIC_SIZE), SHA384_SUM_LEN);
++	return true;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 2811d0d..f7139f0 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1467,3 +1467,39 @@
+ {
+ 	return TPM2_PPBOOT_PCR_IDX;
+ }
++
++static bool get_ppboot_img_desc(struct boot_desc *desc)
++{
++	u32 idx;
++	bool is_valid = false;
++	enum fw_post_reset_cmd image_pending = regmap_readl(global_conf.upd_pending_sts_map);
++
++	if (!boot_desc_init()) {
++		preboot_puts_raw("Not a valid boot desc.");
++		return false;
++	}
++
++	idx = boot_desc_get_img_desc(image_pending, HL_FW_IMG_PPBOOT, desc);
++	if (idx == HL_FW_IMG_NOT_FOUND)
++		return false;
++
++	if (desc->desc_ver > 1)
++		is_valid = ppboot_is_valid_img_desc(desc);
++
++	return is_valid;
++}
++
++bool get_ppboot_img_hash(u8 *hash)
++{
++	struct boot_desc desc;
++	bool is_valid = false;
++
++	is_valid = get_ppboot_img_desc(&desc);
++	if (!is_valid) {
++		preboot_puts("ppboot sha not found\n");
++		return false;
++	}
++
++	memcpy(hash, desc.chksum, SHA384_SUM_LEN);
++	return is_valid;
++}
+diff --git a/lib/common/tpm.c b/lib/common/tpm.c
+index 1cd64d6..d97782c 100644
+--- a/lib/common/tpm.c
++++ b/lib/common/tpm.c
+@@ -33,20 +33,9 @@
+ {
+ 	return false;
+ }
+-
+-static uintptr_t hl_get_ppboot_data(void)
++__weak bool get_ppboot_img_hash(u8 *hash)
+ {
+-	uint32_t ppboot_pcie_size;
+-
+-	ppboot_pcie_size = *(uint32_t *)(HL_FWSRAM_BASE);
+-
+-	ppboot_pcie_size -= SIG_SIZE;
+-	ppboot_pcie_size -= CRC32_SIZE;
+-	ppboot_pcie_size -= TOTAL_PUB_KEY_PROPS_SZ;
+-	ppboot_pcie_size -= PPBOOT_SHA384_FOOTER;
+-	ppboot_pcie_size -= PPBOOT_HASH_MAGIC_SIZE;
+-
+-	return (uintptr_t)(HL_FWSRAM_BASE + ppboot_pcie_size);
++	return false;
+ }
+ 
+ __weak uint8_t get_ppboot_pcr_index(void)
+@@ -56,8 +45,7 @@
+ 
+ void ppboot_tpm_extend(void)
+ {
+-	uintptr_t data;
+-	uint32_t magic;
++	bool is_valid;
+ 	uint8_t hash[SHA384_SUM_LEN] = { 0 };
+ 	uint8_t ppboot_pcr_idx;
+ 
+@@ -74,16 +62,9 @@
+ 	if (tpm_startup())
+ 		return;
+ 
+-	data = hl_get_ppboot_data();
+-
+-	memcpy(&magic, (void *)data, PPBOOT_HASH_MAGIC_SIZE);
+-
+-	if (magic != PPBOOT_SHA_MAGIC) {
+-		preboot_puts("no ppboot sha magic found\n");
++	is_valid = get_ppboot_img_hash(hash);
++	if (!is_valid)
+ 		return;
+-	}
+-
+-	memcpy(hash, (void *)(data + PPBOOT_HASH_MAGIC_SIZE), SHA384_SUM_LEN);
+ 
+ 	ppboot_pcr_idx = get_ppboot_pcr_index();
+ 

@@ -1,0 +1,739 @@
+From aa049012fa20023b2dfee0effcbb1184d60db9f0 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 31 May 2021 19:09:59 +0300
+Subject: [PATCH] [SW-43066] mm: partition sram to separate modules
+
+All modules implementation is using the same memory location for images
+and other purposes. It is only a matter of time until they clash into
+each other. Moreover, there is also a possible security implication by
+using different modules that look at the same memory area.
+To remove all the threats together, partition the SRAM and provide
+different memory locations for different modules.
+This effectively also removes the FIT_IMG_BASE macro which was used as
+the base for images and stuff.
+
+Change-Id: I0122543340ef4300b68406d6028e73d9b24ca051
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index e9e0ecb..a76a9ac 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -106,7 +106,6 @@
+ void module_lkd_run_fast(void);
+ void module_lkd_run_noret(void);
+ void lkd_dev_specific_setup(void);
+-uintptr_t lkd_dev_spec_desc_offset(int size);
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs);
+ 
+ /* UART */
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 9eda3cd..df6fa69 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -33,6 +33,7 @@
+ #include <security.h>
+ #include <boot_info.h>
+ #include <cmd_module.h>
++#include <memory.h>
+ 
+ #include "common.h"
+ 
+@@ -297,7 +298,8 @@
+ 
+ bool hl_ppboot_is_valid(bool is_prime)
+ {
+-	u8 *buf = (u8 *)FIT_IMG_BASE; /* Use fit base as playground */
++	struct mem_desc desc;
++	u8 *buf;
+ 	u32 offset, memoff, memsz, crc_calc, crc_cmd;
+ 	u16 blk_num;
+ 	int i, op;
+@@ -307,6 +309,10 @@
+ 	else
+ 		offset = PPBOOT_OFFSET_SECONDARY;
+ 
++	if (preboot_get_mem_region(MEM_GP, &desc))
++		return false;
++
++	buf = (u8 *)desc.base;
+ 	spi_copy(buf, offset, PPBOOT_MAX_SIZE, NULL);
+ 
+ 	i = 0;
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 00411be..e932214 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -26,7 +26,6 @@
+ #define HL_SPI_BASE			0x7FF8000000ull
+ #define HL_CFG_BASE			0x7FFC000000ull
+ #define SDRAM_BASE			0x7FF0000000ull
+-#define FIT_IMG_BASE			0x7FF0200000ull
+ 
+ #define HOST_PHYS_BASE			0x8000000000ull
+ #define HOST_PHYS_SIZE			0x1000000000000ull
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 509ce06..5ca44ea 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -62,6 +62,7 @@
+ #include <sha256.h>
+ #include <hl_fw_if.h>
+ #include <preboot/fit.h>
++#include <memory.h>
+ 
+ #include "common.h"
+ 
+@@ -1628,8 +1629,6 @@
+ 
+ #define SRAM_SIZE	0x1400000	/* 20MB */
+ #define SRAM_END	(SDRAM_BASE + SRAM_SIZE)
+-#define FIT_IMG_MAX_SZ	0x100000	/* 1MB */
+-#define FIT_IMG_END	(FIT_IMG_BASE + FIT_IMG_MAX_SZ)
+ 
+ enum preboot_sec_rr_names {
+ 	SRAM_BGN_TO_VERS = 0,
+@@ -1660,16 +1659,16 @@
+ 	[VERS_END_TO_IMG] = {
+ 		.rr = PCIE_DYN_RR_SRAM_R2,
+ 		.min = 0,	/* version end */
+-		.max = FIT_IMG_BASE,
++		.max = 0,
+ 	},
+ 	[IMAGE] = {
+ 		.rr = PCIE_DYN_RR_SRAM_R3,
+-		.min = FIT_IMG_BASE - 1,
+-		.max = FIT_IMG_END,
++		.min = 0,
++		.max = 0,
+ 	},
+ 	[IMG_END_TO_SRAM_END] = {
+ 		.rr = PCIE_DYN_RR_SRAM_END,
+-		.min = FIT_IMG_END - 1,
++		.min = 0,
+ 		.max = SRAM_END,
+ 	},
+ 	[SPSRAM_IMAGE] = {
+@@ -1689,8 +1688,42 @@
+ 	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
+ }
+ 
+-void preboot_security_dynamic_img_sram_open(void)
++void preboot_security_dynamic_img_sram_open(enum mem_region img_region)
+ {
++	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	struct mem_desc mdesc;
++	u64 img_max;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	switch (img_region) {
++	case MEM_LKD_PCI:
++	case MEM_FWUPD_PCI:
++		if (preboot_get_mem_region(img_region, &mdesc))
++			preboot_puts_hex("SEC: failed requesting mem region ",
++					 img_region, false);
++		break;
++	default:
++		preboot_puts_hex("SEC: forbidden opening mem region ",
++				 img_region, false);
++		return;
++	}
++
++	/* Move the image window to the requested image memory region */
++	img_max = mdesc.base + mdesc.size;
++	preboot_sec_dyn_cfg[VERS_END_TO_IMG].max = mdesc.base;
++	preboot_sec_dyn_cfg[IMAGE].min = mdesc.base - 1;
++	preboot_sec_dyn_cfg[IMAGE].max = img_max;
++	preboot_sec_dyn_cfg[IMG_END_TO_SRAM_END].min = img_max - 1;
++
++	/* Apply the new window limits */
++	cfg = &preboot_sec_dyn_cfg[VERS_END_TO_IMG];
++	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
++	cfg = &preboot_sec_dyn_cfg[IMG_END_TO_SRAM_END];
++	preboot_secure_pcie_rr(cfg->rr, cfg->min, cfg->max);
++
++	/* Finally open the image memory space */
+ 	preboot_secure_pcie_rr(preboot_sec_dyn_cfg[IMAGE].rr, 0, 0);
+ }
+ 
+@@ -1741,11 +1774,21 @@
+ void preboot_security_dynamic_init(void)
+ {
+ 	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	struct mem_desc mdesc;
++	u64 img_max;
+ 	int i;
+ 
+ 	if (!preboot_security_is_enabled())
+ 		return;
+ 
++	/* Initialize image related configuration with default settings */
++	preboot_get_mem_region(MEM_LKD_PCI, &mdesc);
++	img_max = mdesc.base + mdesc.size;
++	preboot_sec_dyn_cfg[VERS_END_TO_IMG].max = mdesc.base;
++	preboot_sec_dyn_cfg[IMAGE].min = mdesc.base - 1;
++	preboot_sec_dyn_cfg[IMAGE].max = img_max;
++	preboot_sec_dyn_cfg[IMG_END_TO_SRAM_END].min = img_max - 1;
++
+ 	/*
+ 	 * TPC_3 is sharing SIF_7 RTR with PCIe, so we close its access to SRAM
+ 	 * via the secured level RRs. This is to prevent it from
+diff --git a/gaudi2/common.h b/gaudi2/common.h
+index 8ce8aea..bcff904 100644
+--- a/gaudi2/common.h
++++ b/gaudi2/common.h
+@@ -25,7 +25,6 @@
+ #define HL_SPI_BASE			0x3FF6000000ull
+ #define HL_CFG_BASE			0x3FF8000000ull
+ #define SDRAM_BASE			0x7FFD000000ull
+-#define FIT_IMG_BASE			0x7FFD200000ull
+ #define STM_FLASH_BASE			0x1000007FF4000000ull
+ #define BAR0_RSRVD_BASE			0x1000FFFFFC000000ull
+ #define DRAM_BASE			0x1001000000000000ull
+diff --git a/gaudi2_arc_gnu/common.h b/gaudi2_arc_gnu/common.h
+index f2cb811..88190ce 100644
+--- a/gaudi2_arc_gnu/common.h
++++ b/gaudi2_arc_gnu/common.h
+@@ -40,7 +40,6 @@
+ #define PPBOOT_DCCM_BASE	0x8000402C
+ 
+ #define SDRAM_BASE		0x11000000
+-#define FIT_IMG_BASE		0x11200000
+ #define HL_SPI_BASE		0x26000000
+ #define HL_CFG_BASE		0xF8000000
+ #define I2C_SLAVE_DEFAULT_INTR_MASK	0x48FF
+diff --git a/goya/common.h b/goya/common.h
+index 1c489be..7590718 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -27,7 +27,6 @@
+ #define HL_SPI_BASE			0x7FF8000000ull
+ #define HL_CFG_BASE			0x7FFC000000ull
+ #define SDRAM_BASE			0x7FF0000000ull
+-#define FIT_IMG_BASE			0x7FF0200000ull
+ 
+ #define FUSE_WORDS_PER_BANK	0x10
+ #define I2C_SLAVE_ADDRESS	0x4f
+diff --git a/greco/common.h b/greco/common.h
+index 091f731..98a2999 100644
+--- a/greco/common.h
++++ b/greco/common.h
+@@ -32,7 +32,6 @@
+ #define HL_SPI_BASE			0x7FF8000000ull
+ #define HL_CFG_BASE			0x7FFC000000ull
+ #define SDRAM_BASE			0x7FF0000000ull
+-#define FIT_IMG_BASE			0x7FF0200000ull
+ #define DRAM_BASE			0x1000000000000ull
+ 
+ #define HOST_PHYS_BASE			0x2000000000000ull
+diff --git a/greco_arc/common.h b/greco_arc/common.h
+index 611d37c..4ea11ab 100644
+--- a/greco_arc/common.h
++++ b/greco_arc/common.h
+@@ -30,7 +30,6 @@
+ #define PPBOOT_DCCM_BASE	0x80002000
+ 
+ #define SDRAM_BASE		0x10000000
+-#define FIT_IMG_BASE		0x10200000
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+ 
+diff --git a/greco_arc_gnu/common.h b/greco_arc_gnu/common.h
+index d2d80ca..0550e25 100644
+--- a/greco_arc_gnu/common.h
++++ b/greco_arc_gnu/common.h
+@@ -42,7 +42,6 @@
+ #define RECOVERY_SIZE		0x4000
+ 
+ #define SDRAM_BASE		0x10000000
+-#define FIT_IMG_BASE		0x10200000
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+ 
+diff --git a/include/memory.h b/include/memory.h
+new file mode 100644
+index 0000000..8be3476
+--- /dev/null
++++ b/include/memory.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ */
++
++#ifndef _MEMORY_H_
++#define _MEMORY_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#include <common.h>
++
++#define MEM_GP_BASE		(SDRAM_BASE + 0x40000)	/* SRAM_BASE + 256K */
++#define MEM_GP_SZ		0xC0000			/* 768K */
++#define MEM_LKD_PCI_BASE	(SDRAM_BASE + 0x200000)	/* SRAM_BASE + 2M */
++#define MEM_LKD_PCI_SZ		0x100000		/* 1M */
++#define MEM_FWUPD_PCI_BASE	(SDRAM_BASE + 0x600000)	/* SRAM_BASE + 6M */
++#define MEM_FWUPD_PCI_SZ	0x200000		/* 2M */
++#define MEM_I2C_BASE		(SDRAM_BASE + 0x800000)	/* SRAM_BASE + 8M */
++#define MEM_I2C_SZ		0x200000		/* 2M */
++
++enum mem_region {
++	MEM_GP,
++	MEM_LKD_PCI,
++	MEM_FWUPD_PCI,
++	MEM_I2C,
++	MEM_NOENT	/* terminator */
++};
++
++struct mem_desc {
++	uintptr_t base;
++	u32 size;
++};
++
++int preboot_get_mem_region(enum mem_region region, struct mem_desc *desc);
++
++
++#endif /* _MEMORY_H_ */
+diff --git a/include/security.h b/include/security.h
+index bb50024..7b6414b 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -8,13 +8,14 @@
+ #define _HL_SECURITY_H_
+ 
+ #include <preboot.h>
++#include <memory.h>
+ 
+ bool preboot_security_is_enabled(void);
+ void preboot_security_init(void);
+ void preboot_security_dynamic_init(void);
+ void preboot_security_dynamic_vers_init(u64 ver_off, u32 size);
+ void preboot_security_dynamic_img_sram_close(void);
+-void preboot_security_dynamic_img_sram_open(void);
++void preboot_security_dynamic_img_sram_open(enum mem_region img_region);
+ void preboot_security_dynamic_img_spsram_close(void);
+ void preboot_security_dynamic_img_spsram_open(void);
+ void preboot_security_cleanup_before_run(void);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index f529609..b87fff8 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -18,6 +18,8 @@
+ #include <hl_fw_if.h>
+ #include <boot_desc.h>
+ #include <spi.h>
++#include <memory.h>
++
+ #include "fit.h"
+ #include "i2cslave_indirect.h"
+ #include <rma_if.h>
+@@ -179,6 +181,7 @@
+ 
+ static void i2csi_req_load_fw(void)
+ {
++	struct mem_desc desc;
+ 	/*
+ 	 * Received firmware length is the last requset RDQL + previous
+ 	 * requests length which is calculate by the header offset.
+@@ -187,10 +190,12 @@
+ 	unsigned int fw_len = req_wd.hdr.rqdl +
+ 		(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
+ 
+-	if (fit_validate_size((void *)FIT_IMG_BASE, fw_len))
++	preboot_get_mem_region(MEM_I2C, &desc);
++
++	if (fit_validate_size((void *)desc.base, fw_len))
+ 		return; /* More data is needed */
+ 
+-	if (fit_load_images((void *)FIT_IMG_BASE))
++	if (fit_load_images((void *)desc.base))
+ 		req_sts.err = HL_I2CI_REQ_ERR_PROCESS;
+ 	else
+ 		i2cslave_fit_set_checked();
+@@ -369,6 +374,7 @@
+ {
+ 	int upper_bound, lower_bound;
+ 	u8 *data;
++	struct mem_desc mdesc;
+ 
+ 	switch (req_wd.hdr.opcode) {
+ 	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
+@@ -385,7 +391,8 @@
+ 		 * the offset int the header an index.
+ 		 * Integrity check is not supported for opcode 12 (fw load)
+ 		 */
+-		data = (u8 *)FIT_IMG_BASE +
++		preboot_get_mem_region(MEM_I2C, &mdesc);
++		data = (u8 *)mdesc.base +
+ 			(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
+ 		i2csi_req_wdata_wait_for(data, size);
+ 		break;
+@@ -453,6 +460,7 @@
+ static void i2csi_err_chksum_validate(void)
+ {
+ 	struct boot_desc desc;
++	struct mem_desc mdesc;
+ 	struct hl_i2ci_error_status_checksum_spi *spi;
+ 	enum fw_post_reset_cmd role[] = {
+ 		FLOPS_UPD_NOOP,		/* Primary */
+@@ -473,6 +481,8 @@
+ 		return;
+ 	}
+ 
++	preboot_get_mem_region(MEM_I2C, &mdesc);
++
+ 	for (i = 0; i < 2; i++) {
+ 		idx = boot_desc_get_img_desc(role[i], HL_FW_IMG_PREBOOT, &desc);
+ 		if (idx == HL_FW_IMG_NOT_FOUND)
+@@ -480,9 +490,9 @@
+ 
+ 		is_prime = !i;
+ 		/* Using fit image base as playground */
+-		spi_copy((void *)FIT_IMG_BASE, desc.spi_offset, desc.img_size,
++		spi_copy((void *)mdesc.base, desc.spi_offset, desc.img_size,
+ 			 NULL);
+-		sha256_csum((void *)FIT_IMG_BASE, desc.img_size, hash);
++		sha256_csum((void *)mdesc.base, desc.img_size, hash);
+ 		is_valid = !memcmp(hash, desc.chksum, ARRAY_SIZE(hash));
+ 
+ 		if (is_prime)
+diff --git a/preboot/memory.c b/preboot/memory.c
+new file mode 100644
+index 0000000..2caa977
+--- /dev/null
++++ b/preboot/memory.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <preboot.h>
++#include <memory.h>
++
++static struct mem_desc mem_desc[MEM_NOENT] = {
++	[MEM_GP] = {
++		.base = MEM_GP_BASE,
++		.size = MEM_GP_SZ,
++	},
++	[MEM_LKD_PCI] = {
++		.base = MEM_LKD_PCI_BASE,
++		.size = MEM_LKD_PCI_SZ,
++	},
++	[MEM_FWUPD_PCI] = {
++		.base = MEM_FWUPD_PCI_BASE,
++		.size = MEM_FWUPD_PCI_SZ,
++	},
++	[MEM_I2C] = {
++		.base = MEM_I2C_BASE,
++		.size = MEM_I2C_SZ,
++	},
++};
++
++__weak int preboot_get_dev_spec_mem_region(enum mem_region region,
++					   struct mem_desc *desc)
++{
++	return 1; /* not dev spec */
++}
++
++int preboot_get_mem_region(enum mem_region region, struct mem_desc *desc)
++{
++	int err;
++
++	switch (region) {
++	case MEM_GP:
++	case MEM_LKD_PCI:
++	case MEM_FWUPD_PCI:
++	case MEM_I2C:
++		break;
++	default:
++		return 1;
++	}
++
++	if (!desc)
++		return 1;
++
++	/* device defined memory regions */
++	err = preboot_get_dev_spec_mem_region(region, desc);
++	if (!err)
++		return err;
++
++	desc->base = mem_desc[region].base;
++	desc->size = mem_desc[region].size;
++
++	return 0;
++}
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index a842b76..a4844c7 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -15,6 +15,7 @@
+ #include <preboot.h>
+ #include <fit_load_type.h>
+ #include <security.h>
++#include <memory.h>
+ 
+ #include "cmd_module.h"
+ #include "uart.h"
+@@ -46,6 +47,7 @@
+ 	bool is_disabled;
+ 	bool use_security;
+ 	bool synced_no_return;
++	enum mem_region mregion;
+ };
+ 
+ static struct fwupd_state state;
+@@ -151,7 +153,7 @@
+ 	uintptr_t off = (uintptr_t)offset;
+ 
+ 	if (state->use_security && offset)
+-		preboot_security_dynamic_img_sram_open();
++		preboot_security_dynamic_img_sram_open(state->mregion);
+ 
+ 	status.val = 0;
+ 	status.status = sts;
+@@ -163,11 +165,18 @@
+ 				     struct hl_upd_proto_status *ret_status)
+ {
+ 	struct hl_upd_proto_status status;
++	struct mem_desc mdesc;
+ 	u32 sts_err, sts_serr;
+ 	int size = sizeof(status);
+ 	int err;
+ 
+-	state->map_offset = (void *)FIT_IMG_BASE;
++	err = preboot_get_mem_region(state->mregion, &mdesc);
++	if (err) {
++		preboot_puts("Failed requesting region for status FIT image\n");
++		return err;
++	}
++
++	state->map_offset = (void *)mdesc.base;
+ 
+ 	/*
+ 	 * Here we assume that the error is reported only once and
+@@ -264,6 +273,7 @@
+ 	state.cmd_readl = fwupd_cmd_readl;
+ 	state.sts_writel = fwupd_sts_writel;
+ 	state.use_security = true;
++	state.mregion = MEM_FWUPD_PCI;
+ 	module_fwupd_send_status(&state, HL_UPD_STS_RST_OK, NULL);
+ }
+ 
+@@ -273,6 +283,7 @@
+ 	i2c_state.sts_writel = i2c_fwupd_sts_writel;
+ 	i2c_state.use_security = false;
+ 	i2c_state.synced_no_return = true;
++	i2c_state.mregion = MEM_I2C;
+ 	module_fwupd_send_status(&i2c_state, HL_UPD_STS_RST_OK, NULL);
+ }
+ 
+@@ -401,12 +412,20 @@
+ 					unsigned int size, enum hl_upd_cmd cmd)
+ {
+ 	int err;
++	struct mem_desc mdesc;
+ 	enum hl_upd_sts sts = HL_UPD_STS_MAP_OK;
+-	uintptr_t base_offset = cmd == HL_UPD_MAP_SRAM ?
+-					FIT_IMG_BASE : FIT_IMG_SPSRAM_BASE;
++	uintptr_t base_offset;
++
++	err = preboot_get_mem_region(state->mregion, &mdesc);
++	if (err) {
++		preboot_puts("Failed requesting memory region for map\n");
++		return HL_UPD_STS_MAP_ERR;
++	}
++
++	base_offset = cmd == HL_UPD_MAP_SRAM ? mdesc.base : FIT_IMG_SPSRAM_BASE;
+ 
+ 	err = !preboot_is_valid_address_range(base_offset, size);
+-	if (err) {
++	if (err || size > mdesc.size) {
+ 		preboot_puts("Map address range is invalid\n");
+ 		return HL_UPD_STS_VALID_ERR;
+ 	}
+@@ -416,7 +435,7 @@
+ 
+ 	if (state->use_security) {
+ 		if (cmd == HL_UPD_MAP_SRAM)
+-			preboot_security_dynamic_img_sram_open();
++			preboot_security_dynamic_img_sram_open(state->mregion);
+ 		else
+ 			preboot_security_dynamic_img_spsram_open();
+ 	}
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index b2402d0..33c6e13 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -12,6 +12,7 @@
+ #include <boot_info.h>
+ #include <security.h>
+ #include <crc32.h>
++#include <memory.h>
+ 
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
+@@ -41,7 +42,7 @@
+ {
+ 	lkd_dev_specific_setup();
+ 	/* TODO: remove the below img open once we remove the old protocol */
+-	preboot_security_dynamic_img_sram_open();
++	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 	module_lkd_enable();
+ }
+ 
+@@ -152,13 +153,19 @@
+ 
+ static int module_lkd_run_fast_exec(void)
+ {
+-	struct lkd_fw_comms_msg *mcomms =
+-		(struct lkd_fw_comms_msg *)FIT_IMG_BASE;
++	struct mem_desc desc;
++	struct lkd_fw_comms_msg *mcomms;
+ 	int err;
++
++	err = preboot_get_mem_region(MEM_LKD_PCI, &desc);
++	if (err)
++		return err;
++
++	mcomms = (struct lkd_fw_comms_msg *)desc.base;
+ 
+ 	err = module_lkd_msg_process(mcomms);
+ 	if (err)
+-		preboot_security_dynamic_img_sram_open();
++		preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 
+ 	return err;
+ }
+@@ -364,23 +371,22 @@
+ static void module_lkd_run_legacy(void)
+ {
+ 	int err;
++	struct mem_desc desc;
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
+-	err = fit_load_images((void *)FIT_IMG_BASE);
++	preboot_get_mem_region(MEM_LKD_PCI, &desc);
++
++	err = fit_load_images((void *)desc.base);
+ 	if (err) {
+ 		sts.is_fit_ready_ignored = true;
+-		preboot_security_dynamic_img_sram_open();
++		preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 		return;
+ 	}
+ 
+ 	sts.is_fit_checked = true;
+ }
+ 
+-__weak uintptr_t lkd_dev_spec_desc_offset(int size)
+-{
+-	return FIT_IMG_BASE;
+-}
+ 
+ static int module_lkd_msg_validate(uintptr_t offset)
+ {
+@@ -399,21 +405,27 @@
+ static int module_lkd_validate(void)
+ {
+ 	int err;
++	struct mem_desc desc;
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
+-	/* validate if shared memory has fit image */
+-	err = fit_load_images((void *)FIT_IMG_BASE);
++	err = preboot_get_mem_region(MEM_LKD_PCI, &desc);
++	if (err) {
++		preboot_puts("LKD: failed requesting memory\n");
++		return err;
++	}
+ 
++	/* validate if shared memory has fit image */
++	err = fit_load_images((void *)desc.base);
+ 	if (!err) {
+ 		sts.exec_res = FOUND_NO_RETURN;
+ 		return 0;
+ 	}
+ 
+ 	/* shared mem doesn't contain fit image. */
+-	err = module_lkd_msg_validate(FIT_IMG_BASE);
++	err = module_lkd_msg_validate(desc.base);
+ 	if (err) {
+-		preboot_security_dynamic_img_sram_open();
++		preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 		sts.exec_res = NOT_FOUND;
+ 	}
+ 
+@@ -433,20 +445,24 @@
+ 
+ static int module_lkd_prep_desc(int size, u32 *offset)
+ {
+-	/* the same SRAM addr is used for both the descriptor and the image */
+-	uintptr_t comms_desc_base = lkd_dev_spec_desc_offset(size);
++	struct mem_desc mdesc;
+ 	struct lkd_fw_comms_desc *cdesc;
+ 	int err;
+ 	const char *preboot_ver, *fuse_data;
+ 	u8 *cdesc_data_off;
+ 
+-	err = !preboot_is_valid_address_range(comms_desc_base, size);
++	preboot_get_mem_region(MEM_LKD_PCI, &mdesc);
++
++	err = !preboot_is_valid_address_range(mdesc.base, size);
++	if (!err && size > mdesc.size)
++		err = 1;
++
+ 	if (err) {
+-		preboot_puts("Device returned invalid desc address!\n");
++		preboot_puts("Requested size is not supported!\n");
+ 		return err;
+ 	}
+ 
+-	cdesc = (struct lkd_fw_comms_desc *)comms_desc_base;
++	cdesc = (struct lkd_fw_comms_desc *)mdesc.base;
+ 	memset(cdesc, 0, sizeof(*cdesc));
+ 
+ 	lkd_dev_spec_regs(&cdesc->cpu_dyn_regs);
+@@ -454,7 +470,7 @@
+ 	memcpy(cdesc->fuse_ver, fuse_data, VERSION_MAX_LEN);
+ 	preboot_ver = preboot_get_version(PREBOOT_BTL_VER);
+ 	memcpy(cdesc->cur_fw_ver, preboot_ver, VERSION_MAX_LEN);
+-	cdesc->img_addr = comms_desc_base;
++	cdesc->img_addr = mdesc.base;
+ 
+ 	/* Header */
+ 	cdesc->header.magic = HL_COMMS_DESC_MAGIC;
+@@ -463,9 +479,10 @@
+ 	cdesc_data_off = (u8 *)cdesc + sizeof(cdesc->header);
+ 	cdesc->header.crc32 = crc32(0, cdesc_data_off, cdesc->header.size);
+ 
+-	*offset = (u32)comms_desc_base;
++	/* the same SRAM addr is used for both the descriptor and the image */
++	*offset = (u32)mdesc.base;
+ 
+-	preboot_security_dynamic_img_sram_open();
++	preboot_security_dynamic_img_sram_open(MEM_LKD_PCI);
+ 
+ 	return err;
+ }
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 096d28a..d099eb6 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -237,7 +237,7 @@
+ __weak void preboot_security_init(void) {}
+ __weak void preboot_security_dynamic_init(void) {}
+ __weak void preboot_security_dynamic_vers_init(u64 ver_off, u32 size) {}
+-__weak void preboot_security_dynamic_img_sram_open(void) {}
++__weak void preboot_security_dynamic_img_sram_open(enum mem_region img_reg) {}
+ __weak void preboot_security_dynamic_img_sram_close(void) {}
+ __weak void preboot_security_dynamic_img_spsram_open(void) {}
+ __weak void preboot_security_dynamic_img_spsram_close(void) {}

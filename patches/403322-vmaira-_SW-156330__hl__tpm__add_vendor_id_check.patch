@@ -1,0 +1,79 @@
+From 5c74cc9c91386df713a00b43e553e0e5ed3db22a Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 13 Mar 2024 20:24:56 +0200
+Subject: [PATCH] [SW-156330] hl: tpm: add vendor id check
+
+This patch adds checks to ensure that vendor
+ID and revision ID read from TPM matches with
+expected values. This check prevents the
+instances of erroneously indicating that TPM
+device is found, preventing false positives.
+
+Change-Id: I58f97ee1e00e5f07ef08beccf98fcedc47da6349
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/include/tpm2.h b/include/tpm2.h
+index 28bc93f..e5f318c 100644
+--- a/include/tpm2.h
++++ b/include/tpm2.h
+@@ -13,6 +13,9 @@
+ #include <stddef.h>
+ #include <hl_tpm2.h>
+ 
++#define TPM2_VENDOR_ID		0x104a
++#define TPM2_REV_ID		0x4E
++
+ #define TPM2_SHA384_DIGEST_SIZE 48
+ 
+ int tpm2_init(bool print);
+diff --git a/lib/common/tpm.c b/lib/common/tpm.c
+index 59c0c22..9115560 100644
+--- a/lib/common/tpm.c
++++ b/lib/common/tpm.c
+@@ -48,7 +48,7 @@
+ void ppboot_tpm_extend(void)
+ {
+ 	bool is_valid;
+-	uint8_t hash[SHA384_SUM_LEN] = { 0 };
++	uint8_t hash[SHA384_SUM_LEN] = {0};
+ 	uint8_t ppboot_pcr_idx;
+ 
+ 	if (!tpm_is_supported())
+diff --git a/lib/common/tpm2.c b/lib/common/tpm2.c
+index 595bb32..3c6a879 100644
+--- a/lib/common/tpm2.c
++++ b/lib/common/tpm2.c
+@@ -1008,8 +1008,8 @@
+ int tpm2_init(bool print)
+ {
+ 	int ret;
+-	u32 vend_dev;
+-	u8 rid;
++	u32 vend_dev = 0;
++	u8 rid = 0;
+ 
+ 	locality = 0;
+ 
+@@ -1028,15 +1028,15 @@
+ 	}
+ 
+ 	ret = tpm_tis_spi_read32(TPM_DID_VID(locality), &vend_dev);
+-	if (ret) {
+-		preboot_puts("TPM2: could not retrieve VendorID/DeviceID\n");
+-		return ret;
++	if (ret || (((vend_dev & 0xFFFF) != TPM2_VENDOR_ID))) {
++		preboot_puts_hex("TPM2: VendorID read fail/mismatch. VendID: ", vend_dev, false);
++		return -1;
+ 	}
+ 
+ 	ret = tpm_tis_spi_read(TPM_RID(locality), &rid, 1);
+-	if (ret) {
+-		preboot_puts("TPM2: could not retrieve RevisionID\n");
+-		return ret;
++	if (ret || (rid != TPM2_REV_ID)) {
++		preboot_puts_hex("TPM2: RevisionID read fail/mismatch. RevID: ", rid, false);
++		return -1;
+ 	}
+ 
+ 	if (print)

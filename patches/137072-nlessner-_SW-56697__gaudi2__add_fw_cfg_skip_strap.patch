@@ -1,0 +1,154 @@
+From abd11a92ac6708e1a6c7b842af36b1188c86907d Mon Sep 17 00:00:00 2001
+From: Noam.Lessner <nlessner@habana.ai>
+Date: Wed, 13 Oct 2021 17:37:48 +0300
+Subject: [PATCH] [SW-56697] gaudi2: add fw cfg skip strap
+
+Add support via strap to skip fw config of section done by LKD for
+poweron. If strap is set then skip:
+- hbm pll init
+- iATU
+- clock gating
+- axi-drian
+- PCIe drain
+
+For paladium and asic allow control via strap, for onix
+always run config.
+
+Signed-off-by: Noam.Lessner <nlessner@habana.ai>
+Change-Id: I81ad77a546a8e2806a022940a31f29a50129448d
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 5edb410..ee1ed86 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -242,6 +242,7 @@
+ __weak void ppboot_check_stack_mon_dev_specific(void) {}
+ __weak void preboot_delay(void) {}
+ __weak void sram_set_extension(void) {}
++__weak u32 hl_skip_fw_cfg(void) { return 0; }
+ 
+ void ppboot_init_stack_monitor(void)
+ {
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index d72e910..ccbc313 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -366,6 +366,7 @@
+ 	}
+ }
+ 
++__weak u32 hl_skip_fw_cfg(void) { return 0; }
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_process_last_rma_info(void) {}
+@@ -432,6 +433,9 @@
+ 	preboot_version();
+ 	fuse_version();
+ 	preboot_read_straps();
++	if (hl_skip_fw_cfg())
++		preboot_puts("FW_CFG_SKIP: enabled\n");
++
+ 	preboot_read_test_mode();
+ 	preboot_security_dynamic_vers_init(ver_off, sizeof(preboot_vers));
+ 
+diff --git a/arch/gaudi2/common/asic.c b/arch/gaudi2/common/asic.c
+index 72c0974..83e0d0b 100644
+--- a/arch/gaudi2/common/asic.c
++++ b/arch/gaudi2/common/asic.c
+@@ -115,7 +115,17 @@
+ 
+ void hl_dev_pll_init(void)
+ {
++	/* If FW skip enabled return */
++	if (hl_skip_fw_cfg())
++		return;
++
+ 	hl_pll_init(gaudi2_pll_cfg, ARRAY_SIZE(gaudi2_pll_cfg));
++}
++
++u32 hl_skip_fw_cfg(void)
++{
++	/* Use DumpSel[3] to skip FW config */
++	return hl_is_debug_mode(HL_DEBUG_HW_DRAM);
+ }
+ 
+ u64 hl_pll_timestamp_freq_get(void)
+@@ -169,6 +179,10 @@
+ 	int i;
+ 	struct hl_pci_outbound_region outbound_region;
+ 
++	/* If FW skip enabled return */
++	if (hl_skip_fw_cfg())
++		return;
++
+ 	for (i = 0; i < ARRAY_SIZE(gaudi2_pci_inbound_regions); ++i)
+ 		hl_pci_set_inbound_region(i, &gaudi2_pci_inbound_regions[i]);
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 6df4148..fa50710 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -501,6 +501,11 @@
+ 
+ __weak void hl_clock_gating_init(void)
+ {
++
++	/* If FW skip enabled return */
++	if (hl_skip_fw_cfg())
++		return;
++
+ 	gaudi2_enable_all_tpcs_clk_gating();
+ 
+ 	gaudi2_init_mme_clk_gating();
+@@ -961,6 +966,10 @@
+ 
+ void gaudi2_axi_drain_ena(void)
+ {
++	/* If FW skip enabled return */
++	if (hl_skip_fw_cfg())
++		return;
++
+ 	regmap_writel(AXI_DRAIN_TIMEOUT, mmPSOC_GLOBAL_CONF_AXI_DRAIN_TIMEOUT);
+ 	regmap_writel(1, mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
+ }
+@@ -970,6 +979,10 @@
+ 
+ void ppboot_pcie_drain_init(void)
+ {
++	/* If FW skip enabled return */
++	if (hl_skip_fw_cfg())
++		return;
++
+ 	regmap_writel(HBW_DRAIN_TIMEOUT, mmPCIE_WRAP_HBW_DRAIN_TIMEOUT);
+ 	regmap_writel(1, mmPCIE_WRAP_HBW_DRAIN_CFG);
+ 	regmap_writel(1, mmPCIE_WRAP_HBW_DRAIN_STAMP);
+diff --git a/arch/gaudi2/common/pldm.c b/arch/gaudi2/common/pldm.c
+index 2252c2e..d45b703 100644
+--- a/arch/gaudi2/common/pldm.c
++++ b/arch/gaudi2/common/pldm.c
+@@ -40,6 +40,12 @@
+ 	return SYS_CLOCK_FREQUENCY;
+ }
+ 
++u32 hl_skip_fw_cfg(void)
++{
++	/* Use DumpSel[3] to skip FW config */
++	return hl_is_debug_mode(HL_DEBUG_HW_DRAM);
++}
++
+ u32 hl_spi_baudr_get(void)
+ {
+ 	u32 factor = 2; /* Min Divider */
+diff --git a/include/preboot.h b/include/preboot.h
+index 663a844..d97dbc9 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -131,6 +131,7 @@
+ }
+ 
+ u32 hl_skip_pcie_init(void);
++u32 hl_skip_fw_cfg(void);
+ void hl_uart_init(void);
+ u32 hl_spi_baudr_get(void);
+ void hl_plat_early_init(void);

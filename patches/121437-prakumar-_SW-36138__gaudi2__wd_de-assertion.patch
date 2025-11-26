@@ -1,0 +1,83 @@
+From 3976127e12a5179ad9e28581e39782070919e01f Mon Sep 17 00:00:00 2001
+From: Prakash.Kumar <prakumar@habana.ai>
+Date: Tue, 17 Aug 2021 06:49:56 +0300
+Subject: [PATCH] [SW-36138] gaudi2: wd de-assertion
+
+At PRSTn CPLD asserts GPIO62 and starts WD timer.
+Before ppboot is loaded it checks GPIO2 to determine
+if recovery code to be executed. In normal flow GPIO2 is
+de-asserted, so PPBOOT, PREBOOT normal flow get executed.
+PREBOOT is supposed to de-asserts the GPIO62 pin to avoid
+expiry of WD timer. Failing to do so would result in expiry
+of WD timer which asserts GPIO2 and triggers PRSTn. So in the
+boot cycle, flow goes to recovery mode.
+
+This patch adds the de-assertion of GPIO62(i.e. port "GPIO3",
+pin 14). This de-assertion is done at the end of preboot when
+all initializations are done successfully.
+
+Change-Id: I922cc7e198bbc1629e94e7b29356c921f333cb28
+Signed-off-by: Prakash.Kumar <prakumar@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 62a5153..369aef6 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -374,6 +374,7 @@
+ __weak u32 preboot_device_id_get(void) { return 0; }
+ __weak void preboot_engines_init(void) {}
+ __weak void preboot_read_straps(void) {}
++__weak void preboot_clear_wd_gpio(void) {}
+ 
+ void preboot_main(void)
+ {
+@@ -438,6 +439,8 @@
+ 
+ 	preboot_engines_init();
+ 
++	preboot_clear_wd_gpio();
++
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
+ 
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0aa5c3c..270f836 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -10,6 +10,7 @@
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_global_conf_masks.h>
+ #include <psoc_gpio1_regs.h>
++#include <psoc_gpio3_regs.h>
+ #include <psoc_qspi_regs.h>
+ #include <psoc_efuse_regs.h>
+ #include <pcie_phy_regs.h>
+@@ -634,3 +635,15 @@
+ 
+ 	regmap_writel(0x0, run_req_offset);
+ }
++
++#define WD_ASSERTION_GPIO	14
++void preboot_clear_wd_gpio(void)
++{
++	u32 val, mask;
++
++	mask = BIT(WD_ASSERTION_GPIO);
++	regmap_writel(mask, mmPSOC_GPIO3_OUTENSET);
++	val  = regmap_readl(mmPSOC_GPIO3_DATAOUT);
++	val &= ~mask;
++	regmap_writel(val, mmPSOC_GPIO3_DATAOUT);
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 56254fe..3fa2736 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -207,6 +207,7 @@
+ void preboot_disable_pcie_ltr(void);
+ void preboot_init_pcie_phy(void);
+ void preboot_engines_init(void);
++void preboot_clear_wd_gpio(void);
+ 
+ void preboot_main(void);
+ 

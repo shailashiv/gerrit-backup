@@ -1,0 +1,88 @@
+From c40e9e58f98b8e04d7681d253980cb3d0c8ea9c0 Mon Sep 17 00:00:00 2001
+From: Sagi Maimon <smaimon@habana.ai>
+Date: Thu, 18 Feb 2021 16:27:55 +0200
+Subject: [PATCH] [SW-32460] gaudi: security: add fake security
+
+In fake security mode both OTP and fuse are located
+in a flash sector that can be rewritten.
+adding fake OTP and fuse handling routines.
+
+Change-Id: Ie8ffee6f35cb79e0f257c5ff474c102e835f3e23
+Signed-off-by: Sagi Maimon <smaimon@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 9b6a158..3de1ee8 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -115,8 +115,15 @@
+ 	struct hl_sec_otp *otp = &preboot_security_otp_cache.otp;
+ 
+ 	if (preboot_security_otp_cache.is_invalid) {
++
++#ifdef FAKE_SECURITY
++#define FAKE_OTP_OFFSET	(2 * 1024 * 1024)
++		spi_copy(otp, FAKE_OTP_OFFSET, sizeof(struct hl_sec_otp),
++			 "FAKE OTP");
++#else
+ 		spi_copy_otp(otp, OTP_SECURITY_OFFSET,
+ 			     sizeof(struct hl_sec_otp));
++#endif
+ 
+ 		if (otp->magic_number != OTP_SECURITY_MAGIC)
+ 			return NULL;
+@@ -127,6 +134,45 @@
+ 	return otp;
+ }
+ 
++#ifdef FAKE_SECURITY
++#define FAKE_FUSE_OFFSET ((2 * 1024 * 1024) + (64 * 1024))
++static const struct hl_sec_efuse *preboot_security_get_fuse(void)
++{
++	struct hl_sec_efuse *fuse;
++	u32 *val;
++	int i;
++
++	if (preboot_security_fuse_cache.is_invalid) {
++		fuse = &preboot_security_fuse_cache.fuse;
++		preboot_puts("preboot in fake security mode\n");
++		spi_copy(fuse, FAKE_FUSE_OFFSET +
++			 (EFUSE_SECURITY_OFFSET * sizeof(*val)), sizeof(*fuse),
++			 "FAKE FUSE");
++
++		/* Fake fuse data is stored in negative logic */
++		for (i = 0; i < ARRAY_SIZE(fuse->data); i++) {
++			val = &fuse->data[i];
++			*val = ~(*val);
++		}
++
++		preboot_security_fuse_cache.is_invalid = false;
++	}
++
++	return &preboot_security_fuse_cache.fuse;
++}
++
++static void preboot_security_sp_sram_write_efuse(void)
++{
++	const struct hl_sec_efuse *efuse;
++
++	efuse = preboot_security_get_fuse();
++	if (!efuse)
++		return;
++
++	boot_info_set(HL_BOOT_INFO_SECURITY_FUSE, efuse, sizeof(*efuse));
++}
++
++#else
+ static const struct hl_sec_efuse *preboot_security_get_fuse(void)
+ {
+ 	struct hl_sec_efuse *fuse;
+@@ -152,6 +198,8 @@
+ 	/* Do nothing for real eFuse */
+ }
+ 
++#endif /* FAKE_SECURITY */
++
+ static void preboot_security_sp_sram_write_otp(void)
+ {
+ 	const struct hl_sec_otp *otp;

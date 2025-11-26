@@ -1,0 +1,117 @@
+From 089d5f6b202850684b43cadcecb44c2f3ab2c862 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 15 Sep 2020 17:36:41 +0300
+Subject: [PATCH] [SW-17195] preboot: lkd: serialize fuse version
+
+Add fuse version serialization, to be used by device-specific code to
+produce a unified version format.
+
+Change-Id: Iec27da5dea12fc6f9f8d9ffdce4209df176121ca
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/include/preboot.h b/include/preboot.h
+index 010a7ae..7e72eb7 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -37,6 +37,7 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <stddef.h>
+ #include <stdbool.h>
+ #include "auto_generated.h"
+ 
+@@ -114,6 +115,25 @@
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);
+ 
++struct preboot_fuse_ver_data {
++	char *table_ver;
++	size_t table_ver_sz;
++	char *dev_id;
++	size_t dev_id_sz;
++	char *fab;
++	size_t fab_sz;
++	char *lot;
++	size_t lot_sz;
++	char *wafer;
++	size_t wafer_sz;
++	char *xaddr;
++	size_t xaddr_sz;
++	char *yaddr;
++	size_t yaddr_sz;
++};
++
++void preboot_fuse_version_serialize(char *ver, size_t size,
++				    struct preboot_fuse_ver_data *fuse_data);
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index e489993..82389ce 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -113,22 +113,58 @@
+ #define FUSE_VER_UNKNOWN	"unknown"
+ static char preboot_fuse_ver_str[VERSION_MAX_LEN] = FUSE_VER_PREFIX;
+ 
+-__weak int hl_fuse_get_devid(char *devid)
++__weak int hl_fuse_get_version(char *version, size_t size)
+ {
+ 	return 1;
++}
++
++struct preboot_str_size {
++	char *str;
++	size_t size;
++};
++
++void preboot_fuse_version_serialize(char *ver, size_t size,
++				    struct preboot_fuse_ver_data *ver_data)
++{
++	struct preboot_str_size ver_str[] = {
++		{ ver_data->table_ver, ver_data->table_ver_sz },
++		{ ver_data->dev_id, ver_data->dev_id_sz },
++		{ ver_data->fab, ver_data->fab_sz },
++		{ ver_data->lot, ver_data->lot_sz },
++		{ ver_data->wafer, ver_data->wafer_sz },
++		{ ver_data->xaddr, ver_data->xaddr_sz },
++		{ ver_data->yaddr, ver_data->yaddr_sz },
++	};
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(ver_str); i++) {
++		for (j = 0; j < ver_str[i].size; j++) {
++			if (!size)
++				break;
++			*ver++ = ver_str[i].str[j];
++			size--;
++		}
++		if (!size)
++			break;
++		*ver++ = '-';
++		size--;
++	}
++	/* Replace the last '-' with NULL terminator */
++	ver[-1] = '\0';
+ }
+ 
+ static void fuse_version(void)
+ {
+ 	unsigned long offset = (unsigned long)preboot_fuse_ver_str;
+-	char *devid = preboot_fuse_ver_str + sizeof(FUSE_VER_PREFIX) - 1;
++	size_t ver_prefix_len = sizeof(FUSE_VER_PREFIX) - 1;
++	char *version = preboot_fuse_ver_str + ver_prefix_len;
+ 	const char *unknown = FUSE_VER_UNKNOWN;
+ 	int err, i;
+ 
+-	err = hl_fuse_get_devid(devid);
++	err = hl_fuse_get_version(version, VERSION_MAX_LEN - ver_prefix_len);
+ 	if (err)
+ 		for (i = 0; i < sizeof(FUSE_VER_UNKNOWN); i++)
+-			devid[i] = unknown[i];
++			version[i] = unknown[i];
+ 
+ 	preboot_puts_raw(preboot_fuse_ver_str);
+ 	preboot_puts("\n");

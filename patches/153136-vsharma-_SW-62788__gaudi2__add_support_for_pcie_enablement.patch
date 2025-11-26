@@ -1,0 +1,78 @@
+From 19d4352511f3f7c84ceaf24b091ae119d836708d Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Fri, 03 Dec 2021 09:02:10 +0200
+Subject: [PATCH] [SW-62788] gaudi2: add support for pcie enablement/disablement
+
+This patch adds support for enabling/disabling pcie elbi using
+range registers and set/clr of MASK_REQ, HOST_ACCESS_TERMINATION
+registers required during hard reset sequence.
+
+Change-Id: Icdef9b83f7f41e33d262fe3e69eca1b48683177f
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 39906e7..8288409 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -46,6 +46,7 @@
+ #include <psoc_arc0_cfg_masks.h>
+ #include <psoc_arc1_cfg_regs.h>
+ #include <psoc_arc1_cfg_masks.h>
++#include <pcie_elbi_rr_mstr_if_rr_shrd_lbw_regs.h>
+ 
+ #include "hl.h"
+ #include "common.h"
+@@ -943,6 +944,52 @@
+ 	regmap_writel(0x0, run_req_offset);
+ }
+ 
++#define RR_PRIV_RANGE_RESET_VAL		0x7FFFFFF
++#define RR_PRIV_HIT_RESET_VAL		0x3FFFF
++#define PCIE_WRAP_OUTBOUND_MASK		0x78
++#define PCIE_WRAP_OUTBOUND_TIMEOUT_US	100
++void hl_pcie_enable_access(void)
++{
++	/* Enable the ELBI access */
++	regmap_writel(RR_PRIV_RANGE_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++
++	/* Disable HOST_ACCESS_TERMINATION */
++	regmap_writel(0, mmPCIE_WRAP_HOST_ACCESS_TERMINATION);
++
++	/* Re-enable, masked pcie requests */
++	regmap_writel(0, mmPCIE_WRAP_MASK_REQ);
++}
++
++void hl_pcie_disable_access(void)
++{
++	u64 start;
++
++	/* Disable the ELBI access */
++	regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++	regmap_writel(RR_PRIV_RANGE_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	regmap_writel(RR_PRIV_HIT_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW);
++	regmap_writel(RR_PRIV_HIT_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR);
++
++	/* Enable HOST_ACCESS_TERMINATION */
++	regmap_writel(1, mmPCIE_WRAP_HOST_ACCESS_TERMINATION);
++
++	/*
++	 * Isolate outbound memory, except toward_lbw/from_lbw/towards_hbw
++	 * as per https://jira.habana-labs.com/browse/SW-68000
++	 */
++	regmap_writel(PCIE_WRAP_OUTBOUND_MASK, mmPCIE_WRAP_MASK_REQ);
++
++	start = timestamp_get_us();
++	while (regmap_readl(mmPCIE_WRAP_OUTBOUND_OUTSTANDING)) {
++		if (timeout_expired(start, PCIE_WRAP_OUTBOUND_TIMEOUT_US)) {
++			preboot_puts_raw("Proceeding with reset even with outstanding transaction");
++			return;
++		}
++	}
++	preboot_puts_raw("Outstanding transaction are zero, proceeding with reset");
++}
++
+ #define WD_ASSERTION_GPIO	14
+ void preboot_clear_wd_gpio(void)
+ {

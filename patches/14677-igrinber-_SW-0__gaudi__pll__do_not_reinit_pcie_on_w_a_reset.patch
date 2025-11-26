@@ -1,0 +1,42 @@
+From 7dc929391cf14615b84571a33fcf40474bc884d2 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 30 Jun 2019 19:36:10 +0300
+Subject: [PATCH] [SW-0] gaudi: pll: do not reinit pcie on w/a reset
+
+While resetting the SoC as a W/A for NIC2_HBM PLL clock switch, do not
+reinitialize the PCIe (BTL). Doing so may result in breaking the PCIe
+link with host.
+Use the direct write to strap register to disable the BTL PCIe image
+execution.
+
+Change-Id: I429180a27f14d998b628c86f5b78b551bd6f3bd6
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 7decdd4..319331c 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -394,6 +394,7 @@
+ void hl_pll_wa(void)
+ {
+ 	int i;
++	u32 boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(gaudi_pll_cfg); i++) {
+ 		switch (gaudi_pll_cfg[i].base) {
+@@ -402,8 +403,14 @@
+ 		case mmNIC2_HBM_PLL_BASE:
+ 			if (gaudi_reset_soc_done()) {
+ 				regmap_writel(0, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++				/* reinitialize the PCIe on next reset */
++				boot_strap |= 0x2;
++				regmap_writel(boot_strap, mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
+ 			} else {
+ 				regmap_writel(1, mmPSOC_GLOBAL_CONF_COLD_RST_FLOPS_2);
++				/* Do not reinitialize the PCIe */
++				boot_strap &= ~0x2;
++				regmap_writel(boot_strap, mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS);
+ 				preboot_puts("NIC2_HBM configuration done, resetting...\n");
+ 				gaudi_reset_soc();
+ 			}

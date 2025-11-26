@@ -1,0 +1,155 @@
+From 169aeb000432c13cc04db8c96f8783d4d98a42b1 Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Mon, 08 Feb 2021 14:34:51 +0200
+Subject: [PATCH] [SW-31074] hl_pvt: implement shutdown seq
+
+PVT controller is configured in run continuous mode for reporting
+on-die temperature values through I2C slave interface. At preboot stage
+TPC and MME plls are running at REF clock
+
+As part of Zephyr boot, PLLs are configured at nominal values and PVT
+registers are re-configured with new clock freq.
+
+Mooretec team recommended to shutdown TS IP while pll clock changes are
+done.
+Implemented shutdown sequence to exit continuous mode and disable
+data acquisitions
+
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+Change-Id: Ib6aad9dc6719c357845a59f45ec7982f6e5dbd5e
+---
+
+diff --git a/include/preboot.h b/include/preboot.h
+index 95c475b..230ca42 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -93,6 +93,7 @@
+ u32 hl_spi_baudr_get(void);
+ void hl_plat_early_init(void);
+ void hl_ts_init(void);
++void hl_ts_shutdown(void);
+ void hl_plat_init(void);
+ bool hl_is_debug_mode(enum hl_debug_hw_func func);
+ bool hl_is_jtag_enabled(void);
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index a3f93c5..e7c5615 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -183,5 +183,6 @@
+ 
+ void module_fwupd_run_noret(void)
+ {
++	hl_ts_shutdown();
+ 	fit_run_image();
+ }
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 68f618e..52c3f66 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -124,6 +124,7 @@
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
+ 		preboot_security_cleanup_before_run();
++		hl_ts_shutdown();
+ 		/* We do not know if the FW we are loading supports hard rst */
+ 		cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN,
+ 									false);
+diff --git a/preboot/thermal.c b/preboot/thermal.c
+index e3143cc..5dca696 100644
+--- a/preboot/thermal.c
++++ b/preboot/thermal.c
+@@ -250,6 +250,19 @@
+ 	hl_dev_ts_init();
+ }
+ 
++__weak void hl_ts_pvt_shutdown(int ts) {}
++__weak void hl_ts_reset(void) {}
++
++void hl_ts_shutdown(void)
++{
++	u32 ts;
++
++	for (ts = 0; ts < hl_ts_get_count(); ts++)
++		hl_ts_pvt_shutdown(ts);
++
++	hl_ts_reset();
++}
++
+ __weak int get_sdif_data_offset(void)
+ {
+ 	return HL_TS_SDIF_DATA_OFFSET;
+diff --git a/preboot/thermal_v2.c b/preboot/thermal_v2.c
+index 677be85..8f70206 100644
+--- a/preboot/thermal_v2.c
++++ b/preboot/thermal_v2.c
+@@ -7,6 +7,7 @@
+ 
+ #include <goya2/goya2_reg_map.h>
+ #include <goya2_blocks_linux_driver.h>
++#include <psoc_global_conf_regs.h>
+ #include <dcon0_tstd_masks.h>
+ #include <dcon0_tstd_regs.h>
+ 
+@@ -21,6 +22,7 @@
+ 
+ #define HL_TS_IP_CTRL				0x00
+ #define HL_TS_IP_CTRL_AUTO_CONT_MODE		0x108
++#define HL_TS_IP_CTRL_RUN_ONCE			0x4
+ #define HL_TS_IP_CFG				0x01
+ #define HL_TS_IP_TMR				0x05
+ #define HL_TS_IP_TMR_DELAY			0xff
+@@ -47,6 +49,11 @@
+ #define HL_PVT_TM_SCRATCH			0x0c
+ #define HL_PVT_TM_SCRATCH_PATTERN		0xAAAAAAAA
+ #define HL_TS_PVT_INIT_FAILED			0x1
++#define HL_TS_IP_CTRL_SHUTDOWN			1
++
++#define UNIT_RST_N_L_MSK			0xF0000
++#define UNIT_RST_N_M_MSK			0x0
++#define UNIT_RST_N_H_MSK			0x0
+ 
+ void hl_set_calib_coeff(int ts, bool calib_enabled,
+ 		struct hl_tmp_opmode_info *calib_data)
+@@ -219,3 +226,42 @@
+ 
+ 	return 0;
+ }
++
++void hl_ts_pvt_shutdown(int ts)
++{
++	u32 addr = hl_ts_data[ts].base;
++
++	/* Exit the continuous mode of operation */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, HL_TS_IP_CTRL_RUN_ONCE, HL_TS_IP_CTRL, 1, 1);
++	else
++		preboot_puts_hex("Failed to exit continuous mode for ",
++					ts, false);
++
++	/* Ensure embedded IP is shut down ip_ctrl = 0x000001 */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, HL_TS_IP_CTRL_SHUTDOWN, HL_TS_IP_CTRL, 1, 1);
++	else
++		preboot_puts_hex("Failed to shutdown TS IP ",
++					ts, false);
++
++	/* Disable TS data acquisitions and ensure clock is shutdown fully */
++	if (hl_tmp_is_sdif_free(addr))
++		regmap_writel(0, hl_ts_data[ts].base + HL_TS_CMN_CLK_SYNTH);
++	else
++		preboot_puts_hex("Failed to disable TS data acquisitions for ",
++					ts, false);
++}
++
++void hl_ts_reset(void)
++{
++	preboot_puts("Performing RST of TS UNIT\n");
++	/* Perform unit address */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++	regmap_writel(UNIT_RST_N_L_MSK, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_M);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_H);
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++	udelay(1000);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++}

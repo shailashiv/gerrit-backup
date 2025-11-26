@@ -1,0 +1,115 @@
+From 259710caf9d71e8f77326c8f5f56f047eb4915ec Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Mon, 20 Jun 2022 14:24:51 +0300
+Subject: [PATCH] [SW-70527] gaudi2: ras: store sram repair results
+
+Added support to store sram repair results i.e.
+rings failed before built in soft repair and rings
+failed after built-in soft repair.
+These data is stored into a predefined memory location
+(ARC1 DCCM start address) as a temporary location.
+
+In preboot these would be read and stored in boot_info.
+
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+Change-Id: I59e8d94bcd15f28ee2f039602e713bfb43cfc549
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index d169794..56eeb41 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -5,6 +5,7 @@
+  *
+  */
+ 
++#include <string.h>
+ #include <gaudi2_blocks_linux_driver.h>
+ #include <psoc_global_conf_regs.h>
+ 
+@@ -25,6 +26,7 @@
+ #include "common.h"
+ #include <hl.h>
+ #include <errno.h>
++#include <gaudi2_bist.h>
+ #include <memory.h>
+ 
+ #define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
+@@ -46,6 +48,8 @@
+ 
+ #define GAUDI2_DFX_NUM			5
+ #define GAUDI2_MAX_RING_NUM		28
++
++struct hl_ras_sram_bist_data		*bist_data;
+ 
+ const static uint8_t dfx_value_table[] = { 0x27, 0x2b, 0x2f, 0x33, 0x37 };
+ const static uint8_t ring_count_table[] = { 28, 26, 15, 15, 22 };
+@@ -1062,10 +1066,13 @@
+ 				[SRAM_RING_TYPE_HMMU_MC] = gaudi2_hmmu_mc_ring_pattern
+ };
+ 
++#define GAUDI2_DFX_SHIFT_VAL		5
+ static void gaudi2_sram_self_repair(enum gaudi2_sram_self_repair_op op)
+ {
+ 	unsigned int dfx, ring;
+ 	enum gaudi2_sram_ring_type ring_type;
++	int ret;
++	u8 val, num;
+ 
+ 	gaudi2_sram_beginning_pattern();
+ 
+@@ -1075,7 +1082,23 @@
+ 			if (ring_type != SRAM_RING_TYPE_MAX) {
+ 				gaudi2_sram_id_sel();
+ 				gaudi2_sram_ring_sel(dfx_value_table[dfx], ring + 1);
+-				gaudi2_sram_region_ring_pattern[ring_type](op);
++				ret = gaudi2_sram_region_ring_pattern[ring_type](op);
++				if (ret > 0) {
++					val = (dfx << GAUDI2_DFX_SHIFT_VAL) | (ring + 1);
++					if (op == SRAM_SELF_REPAIR_OP_BIRA) {
++						num = bist_data->num_prebist_failed_rings;
++						bist_data->pre_bist_failed_rings[num] = val;
++						bist_data->num_prebist_failed_rings++;
++						preboot_puts_hex("bira failed val: ", val, 0);
++					} else if (op == SRAM_SELF_REPAIR_OP_BIST) {
++						num = bist_data->num_postbist_failed_rings;
++						bist_data->post_bist_failed_rings[num] = val;
++						bist_data->num_postbist_failed_rings++;
++						preboot_puts_hex("bist failed val: ", val, 0);
++					} else {
++						preboot_puts_hex("bisr failed val: ", val, 0);
++					}
++				}
+ 				gaudi2_sram_id_sel();
+ 			}
+ 		}
+@@ -1226,9 +1249,29 @@
+ 	regmap_writel(hbm_iso_val, mmPSOC_GLOBAL_CONF_HBM_ISO);
+ }
+ 
++static void init_sram_bist_data(void)
++{
++	struct mem_desc desc;
++
++	if (preboot_get_mem_region(MEM_SRAM_BIST, &desc))
++		return;
++
++	if (desc.size < sizeof(struct hl_ras_sram_bist_data))
++		return;
++
++	bist_data = (struct hl_ras_sram_bist_data *)desc.base;
++	if (!bist_data)
++		return;
++
++	memset(bist_data, 0, sizeof(struct hl_ras_sram_bist_data));
++	bist_data->magic_number = SRAM_BIST_MAGIC;
++}
++
+ #define DFT_APB_CONTROL_DEFAULT_VAL		0xFE
+ void hl_sram_self_repair(void)
+ {
++	init_sram_bist_data();
++
+ 	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BIRA);
+ 	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BISR);
+ 	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BIST);

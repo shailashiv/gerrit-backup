@@ -1,0 +1,188 @@
+From 077b24040e57dda42b76e73fb1aaabb416fa8d73 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 20 Apr 2020 00:24:58 +0300
+Subject: [PATCH] [SW-0] boot_if: introduce and use boot interface
+
+This is the boot interface with host which simplifies the usage of the
+boot progress status, boot command response, boot error, host command
+(msg) registers.
+All the above registers are used to communicate with the host.
+This also reduces the use of the regmap_{read,write}l() inline functions
+which might raise the code size when used extensively.
+
+Change-Id: Ib6862b8f3d8c7515f5853d20e010705c71d088b4
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/preboot.c b/app/preboot.c
+index 7af436c..4a5f2f9 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -19,6 +19,7 @@
+ #include "uart.h"
+ #include "spi.h"
+ #include "pll.h"
++#include "boot_if.h"
+ 
+ #define VERSION_MAX_LEN		128
+ 
+@@ -171,7 +172,9 @@
+ 
+ void preboot_main(void)
+ {
+-	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
++	/* Enable the errors communication */
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_ENABLED, true);
+ 
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+diff --git a/common/boot_if.c b/common/boot_if.c
+new file mode 100644
+index 0000000..0a5e69f
+--- /dev/null
++++ b/common/boot_if.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <stdbool.h>
++
++#include <psoc_global_conf_regs.h>
++
++#include <hl_boot_if.h>
++#include <preboot.h>
++
++void cpu_boot_cmd_clr(void)
++{
++	regmap_writel(KMD_MSG_NA, mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
++}
++
++enum kmd_msg cpu_boot_cmd_get(void)
++{
++	return regmap_readl(mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU);
++}
++
++void cpu_boot_sts_set(u32 val)
++{
++	regmap_writel(val, mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS);
++}
++
++/* We support only ERR0 for now */
++void cpu_boot_err_clrset(u32 mask, bool set)
++{
++	u32 val = regmap_readl(mmCPU_BOOT_ERR0) & ~mask;
++
++	if (set)
++		val |= mask;
++
++	regmap_writel(val, mmCPU_BOOT_ERR0);
++}
++
++void cpu_boot_rsp_set(enum cpu_msg_status sts)
++{
++	regmap_writel(sts, mmCPU_CMD_STATUS_TO_HOST);
++}
+diff --git a/common/boot_if.h b/common/boot_if.h
+new file mode 100644
+index 0000000..359fadd
+--- /dev/null
++++ b/common/boot_if.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2016-2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#ifndef _HL_BOOT_IF_H_
++#define _HL_BOOT_IF_H_
++
++#include <hl_boot_if.h>
++
++enum kmd_msg cpu_boot_cmd_get(void);
++void cpu_boot_cmd_clr(void);
++void cpu_boot_sts_set(u32 val);
++void cpu_boot_err_clrset(u32 mask, bool set);
++void cpu_boot_rsp_set(enum cpu_msg_status sts);
++
++#endif /* _HL_BOOT_IF_H_ */
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 931c8f4..aa50342 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -185,11 +185,6 @@
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_53;
+ }
+ 
+-u32 get_cpu_boot_status_reg(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
+-}
+-
+ /*
+  * Wait for Boot Manager to complete PCIe image execution
+  * and return to idle state, so it won't initiate UART access anymore
+diff --git a/goya/common.c b/goya/common.c
+index 95068d0..45ee006 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -157,11 +157,6 @@
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_53;
+ }
+ 
+-u32 get_cpu_boot_status_reg(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_WARM_REBOOT;
+-}
+-
+ void preboot_sync_btl(void) {}
+ 
+ int hl_pcie_init_only(void)
+diff --git a/goya2/common.c b/goya2/common.c
+index 75146ea..c845b5c 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -187,11 +187,6 @@
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+ }
+ 
+-u32 get_cpu_boot_status_reg(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
+-}
+-
+ /*
+  * Wait for Boot Manager to complete PCIe image execution
+  * and return to idle state, so it won't initiate UART access anymore
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index db634cd..1fe97be 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -171,11 +171,6 @@
+ 	return mmPSOC_GLOBAL_CONF_PAD_SEL_19;
+ }
+ 
+-u32 get_cpu_boot_status_reg(void)
+-{
+-	return mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS;
+-}
+-
+ void preboot_sync_btl(void) {}
+ 
+ 
+diff --git a/include/preboot.h b/include/preboot.h
+index 8f59326..97a4ad9 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -74,7 +74,6 @@
+ 	*((volatile u32 *)(HL_CFG_BASE + offset)) = val;
+ }
+ 
+-u32 get_cpu_boot_status_reg(void);
+ u32 hl_skip_pcie_init(void);
+ void hl_uart_init(void);
+ u32 hl_spi_baudr_get(void);

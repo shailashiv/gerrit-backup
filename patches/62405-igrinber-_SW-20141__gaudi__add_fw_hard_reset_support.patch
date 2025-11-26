@@ -1,0 +1,639 @@
+From 9c26766b6f070a5a3abe548d7081a8c9d7ee57b7 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 30 Nov 2020 02:10:47 +0200
+Subject: [PATCH] [SW-20141] gaudi: add fw hard reset support
+
+Add FW hard reset sequence flow to fix the rare bug when a transaction
+is stuck in the PCIE_IF and prevents the chip from normal execution
+after the reset.
+As a part of the new reset flow the PCIe is closed for accesses in both,
+the memory space access and the ELBI access. Therefore the new reset
+sequence depends on the fact that after the reset Ppboot knows to open
+the PCIe for requests.
+
+Change-Id: I8e0426ea4b4574357aa3db5803f804c19b4a320f
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/boot_if.c b/common/boot_if.c
+index e0f9e21..6badf23 100644
+--- a/common/boot_if.c
++++ b/common/boot_if.c
+@@ -16,9 +16,10 @@
+  * the LKD message register should be written by LKD solely.
+  *
+  * There is only one special case when this function can be used is only when
+- * the LKD performs hard reset, which may mean the H/W is not reliable and
+- * writing to PCI might not complete and result in the register not cleared.
+- * So to be on the safe side, when receiving the WFE, clear the message register
++ * the LKD performs by itself or requests FW to perform hard reset, which may
++ * mean the H/W is not reliable and writing to PCI might not complete and result
++ * in the register not cleared. So to be on the safe side, when receiving the
++ * WFE or RST_DEV command, clear the message register
+  */
+ void cpu_boot_cmd_clr_before_wfe(void)
+ {
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index c8efd26..0b9e229 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -90,6 +90,7 @@
+ void module_lkd_disable(void);
+ void module_lkd_run(void);
+ void module_lkd_run_noret(void);
++void lkd_dev_specific_setup(void);
+ 
+ /* UART */
+ enum cmd_check_res module_uart_check(void);
+diff --git a/gaudi/Makefile b/gaudi/Makefile
+index 8a3dc88..431525e 100644
+--- a/gaudi/Makefile
++++ b/gaudi/Makefile
+@@ -1,3 +1,4 @@
+ FW_SIZE := 0x4000
+ 
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/security.c)
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/reset.c)
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 3084393..e059375 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -18,6 +18,7 @@
+ #include <pcie_dbi_masks.h>
+ 
+ #include <hl_boot_if.h>
++#include <boot_if.h>
+ #include <gaudi/gaudi_reg_map.h>
+ #include <common/pci_ids.h>
+ 
+@@ -300,6 +301,11 @@
+ 	return mmCPU_TIMESTAMP_CNTCR;
+ }
+ 
++void lkd_dev_specific_setup(void)
++{
++	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN, true);
++}
++
+ /* Hard coded each of the gaudi on-chip TS device properties */
+ static struct hl_ts_cfg gaudi_hl_ts_data[HL_ASIC_TS_MAX_COUNT] = {
+ 	{.base = mmPSOC_TS_BASE & ~HL_CFG_BASE, .alarm_a = 110, .alarm_b = 120,
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 779ce26..0cf5524 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -24,6 +24,13 @@
+ #define I2C_SLAVE_ADDRESS		0x4f
+ #define I2C_SLAVE_ADDRESS_DBG		0x47
+ 
++#define GAUDI_NICS_NUM			5
++#define GAUDI_NIC_ENGS_NUM		(GAUDI_NICS_NUM * 2)
++#define GAUDI_QPCS_NUM			2
++#define GAUDI_TPCS_NUM			8
++#define GAUDI_MMES_NUM			4
++#define GAUDI_DMA_CHANNELS_NUM		8
++
+ #ifndef __ASSEMBLY__
+ #include <spi.h>
+ 
+diff --git a/gaudi/reset.c b/gaudi/reset.c
+new file mode 100644
+index 0000000..46ebc6e
+--- /dev/null
++++ b/gaudi/reset.c
+@@ -0,0 +1,467 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2020 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include <gaudi_blocks.h>
++#include <psoc_global_conf_regs.h>
++#include <pcie_wrap_regs.h>
++#include <pcie_core_regs.h>
++#include <pcie_dbi_regs.h>
++#include <nic0_rxb_regs.h>
++#include <nic0_qpc0_regs.h>
++#include <nic0_qm0_regs.h>
++#include <nic0_qm1_regs.h>
++#include <dma0_core_regs.h>
++#include <dma1_core_regs.h>
++#include <dma2_core_regs.h>
++#include <dma3_core_regs.h>
++#include <dma4_core_regs.h>
++#include <dma5_core_regs.h>
++#include <dma6_core_regs.h>
++#include <dma7_core_regs.h>
++#include <dma0_qm_regs.h>
++#include <dma1_qm_regs.h>
++#include <dma2_qm_regs.h>
++#include <dma3_qm_regs.h>
++#include <dma4_qm_regs.h>
++#include <dma5_qm_regs.h>
++#include <dma6_qm_regs.h>
++#include <dma7_qm_regs.h>
++#include <mme0_qm_regs.h>
++#include <mme2_qm_regs.h>
++#include <mme0_acc_regs.h>
++#include <mme0_sbab_regs.h>
++#include <tpc0_qm_regs.h>
++#include <tpc1_qm_regs.h>
++#include <tpc0_cfg_regs.h>
++#include <tpc1_cfg_regs.h>
++#include <sif_rtr_ctrl_7_regs.h>
++
++#include <psoc_global_conf_masks.h>
++#include <dma0_core_masks.h>
++#include <dma0_qm_masks.h>
++#include <mme0_qm_masks.h>
++#include <tpc0_qm_masks.h>
++#include <tpc0_cfg_masks.h>
++#include <nic0_qm0_masks.h>
++
++#include <preboot.h>
++
++#include "common.h"
++#include "pll.h"
++
++/* Bit shifts specific for Gaudi and used during reset routines */
++#define MME_ACC_ACC_STALL_R_SHIFT	0
++
++/* Unit reset shifts used by the reset routines */
++#define UNIT_RST_L_TPC_0_MSK	BIT(21)
++#define UNIT_RST_L_TPC_1_MSK	BIT(22)
++#define UNIT_RST_L_TPC_2_MSK	BIT(23)
++#define UNIT_RST_L_TPC_3_MSK	BIT(24)
++#define UNIT_RST_L_TPC_4_MSK	BIT(25)
++#define UNIT_RST_L_TPC_5_MSK	BIT(26)
++#define UNIT_RST_L_TPC_6_MSK	BIT(27)
++#define UNIT_RST_L_TPC_7_MSK	BIT(28)
++#define UNIT_RST_L_MME_0_MSK	BIT(29)
++#define UNIT_RST_L_MME_1_MSK	BIT(30)
++#define UNIT_RST_L_MME_2_MSK	BIT(31)
++
++#define UNIT_RST_H_MME_3_MSK	BIT(0)
++#define UNIT_RST_H_NIC_0_MSK	BIT(5)
++#define UNIT_RST_H_NIC_1_MSK	BIT(6)
++#define UNIT_RST_H_NIC_2_MSK	BIT(7)
++#define UNIT_RST_H_NIC_3_MSK	BIT(8)
++#define UNIT_RST_H_NIC_4_MSK	BIT(9)
++#define UNIT_RST_H_SM_0_MSK	BIT(10)
++#define UNIT_RST_H_SM_1_MSK	BIT(11)
++#define UNIT_RST_H_SM_2_MSK	BIT(12)
++#define UNIT_RST_H_SM_3_MSK	BIT(13)
++#define UNIT_RST_H_DMA_0_MSK	BIT(18)
++#define UNIT_RST_H_DMA_1_MSK	BIT(19)
++
++#define UNIT_RST_L_TPC_MSK	(UNIT_RST_L_TPC_0_MSK | UNIT_RST_L_TPC_1_MSK | \
++				 UNIT_RST_L_TPC_2_MSK | UNIT_RST_L_TPC_3_MSK | \
++				 UNIT_RST_L_TPC_4_MSK | UNIT_RST_L_TPC_5_MSK | \
++				 UNIT_RST_L_TPC_6_MSK | UNIT_RST_L_TPC_7_MSK)
++
++#define UNIT_RST_L_MME_MSK	(UNIT_RST_L_MME_0_MSK | UNIT_RST_L_MME_1_MSK | \
++				 UNIT_RST_L_MME_2_MSK)
++
++#define UNIT_RST_L_MSK		(UNIT_RST_L_TPC_MSK | UNIT_RST_L_MME_MSK)
++
++#define UNIT_RST_H_MME_MSK	(UNIT_RST_H_MME_3_MSK)
++
++#define UNIT_RST_H_NIC_MSK	(UNIT_RST_H_NIC_0_MSK | UNIT_RST_H_NIC_1_MSK | \
++				 UNIT_RST_H_NIC_2_MSK | UNIT_RST_H_NIC_3_MSK | \
++				 UNIT_RST_H_NIC_4_MSK)
++
++#define UNIT_RST_H_DMA_MSK	(UNIT_RST_H_DMA_0_MSK | UNIT_RST_H_DMA_1_MSK)
++
++#define UNIT_RST_H_SM_MSK	(UNIT_RST_H_SM_0_MSK | UNIT_RST_H_SM_0_MSK |   \
++				 UNIT_RST_H_SM_0_MSK | UNIT_RST_H_SM_0_MSK)
++
++#define UNIT_RST_H_MSK		(UNIT_RST_H_MME_MSK | UNIT_RST_H_NIC_MSK |     \
++				 UNIT_RST_H_DMA_MSK | UNIT_RST_H_SM_MSK)
++
++static void gaudi_nics_rxb_drop_reset(void)
++{
++	int i, j;
++	unsigned int off;
++
++	for (i = 0; i < GAUDI_NICS_NUM; i++) {
++		for (j = 0; j < 16; j++) {
++			off = mmNIC0_RXB_DROP_THRESHOLD_0 + j * 4 + i * 0x40000;
++			regmap_writel(0, off);
++		}
++	}
++}
++
++static void gaudi_nic_qpc_disable(unsigned int reg, int nic, int qpc)
++{
++	unsigned int off, mask = BIT(6);
++
++	off = reg + nic * 0x40000 + qpc * 0x1000;
++	reg = regmap_readl(off);
++	reg |= mask;
++	regmap_writel(reg, off);
++}
++
++static void gaudi_nics_qpcs_disable(void)
++{
++	int nic, qpc;
++
++	for (nic = 0; nic < GAUDI_NICS_NUM; nic++) {
++		for (qpc = 0; qpc < GAUDI_QPCS_NUM; qpc++) {
++			gaudi_nic_qpc_disable(mmNIC0_QPC0_REQ_STATIC_CONFIG,
++					      nic, qpc);
++			gaudi_nic_qpc_disable(mmNIC0_QPC0_RES_STATIC_CONFIG,
++					      nic, qpc);
++		}
++	}
++}
++
++static void gaudi_nics_handle(void)
++{
++	gaudi_nics_rxb_drop_reset();
++	gaudi_nics_qpcs_disable();
++}
++
++static void gaudi_disable_pci_dma_qmans(void)
++{
++	regmap_writel(0, mmDMA0_QM_GLBL_CFG0);
++	regmap_writel(0, mmDMA1_QM_GLBL_CFG0);
++	regmap_writel(0, mmDMA5_QM_GLBL_CFG0);
++}
++
++static void gaudi_disable_hbm_dma_qmans(void)
++{
++	regmap_writel(0, mmDMA2_QM_GLBL_CFG0);
++	regmap_writel(0, mmDMA3_QM_GLBL_CFG0);
++	regmap_writel(0, mmDMA4_QM_GLBL_CFG0);
++	regmap_writel(0, mmDMA6_QM_GLBL_CFG0);
++	regmap_writel(0, mmDMA7_QM_GLBL_CFG0);
++}
++
++static void gaudi_disable_mme_qmans(void)
++{
++	regmap_writel(0, mmMME2_QM_GLBL_CFG0);
++	regmap_writel(0, mmMME0_QM_GLBL_CFG0);
++}
++
++static void gaudi_disable_tpc_qmans(void)
++{
++	u32 tpc_offset = 0;
++	int tpc_id;
++
++	for (tpc_id = 0; tpc_id < GAUDI_TPCS_NUM; tpc_id++) {
++		regmap_writel(0, mmTPC0_QM_GLBL_CFG0 + tpc_offset);
++		tpc_offset += mmTPC1_QM_GLBL_CFG0 - mmTPC0_QM_GLBL_CFG0;
++	}
++}
++
++static void gaudi_disable_nic_qmans(void)
++{
++	u32 nic_offset = 0;
++	u32 nic_delta_between_qmans = mmNIC0_QM1_BASE - mmNIC0_QM0_BASE;
++	u32 nic_delta_between_nics = mmNIC1_QM0_BASE - mmNIC0_QM0_BASE;
++	int nic_id;
++
++	for (nic_id = 0; nic_id < GAUDI_NIC_ENGS_NUM; nic_id++) {
++		regmap_writel(0, mmNIC0_QM0_BASE + nic_offset);
++
++		nic_offset += nic_delta_between_qmans;
++		if (nic_id & 1) {
++			nic_offset -= nic_delta_between_qmans * 2;
++			nic_offset += nic_delta_between_nics;
++		}
++	}
++}
++
++static void gaudi_stop_pci_dma_qmans(void)
++{
++	u32 stop = 0x1F << DMA0_QM_GLBL_CFG1_CP_STOP_SHIFT;
++
++	/* Stop upper CPs of QMANs 0.0 to 1.3 and 5.0 to 5.3 */
++	regmap_writel(stop, mmDMA0_QM_GLBL_CFG1);
++	regmap_writel(stop, mmDMA1_QM_GLBL_CFG1);
++	regmap_writel(stop, mmDMA5_QM_GLBL_CFG1);
++}
++
++static void gaudi_stop_hbm_dma_qmans(void)
++{
++	u32 stop = 0x1F << DMA0_QM_GLBL_CFG1_CP_STOP_SHIFT;
++
++	/* Stop CPs of HBM DMA QMANs */
++	regmap_writel(stop, mmDMA2_QM_GLBL_CFG1);
++	regmap_writel(stop, mmDMA3_QM_GLBL_CFG1);
++	regmap_writel(stop, mmDMA4_QM_GLBL_CFG1);
++	regmap_writel(stop, mmDMA6_QM_GLBL_CFG1);
++	regmap_writel(stop, mmDMA7_QM_GLBL_CFG1);
++}
++
++static void gaudi_stop_mme_qmans(void)
++{
++	u32 stop = 0x1F << MME0_QM_GLBL_CFG1_CP_STOP_SHIFT;
++
++	/* Stop CPs of MME QMANs */
++	regmap_writel(stop, mmMME2_QM_GLBL_CFG1);
++	regmap_writel(stop, mmMME0_QM_GLBL_CFG1);
++}
++
++static void gaudi_stop_tpc_qmans(void)
++{
++	u32 stop = 0x1F << TPC0_QM_GLBL_CFG1_CP_STOP_SHIFT;
++	u32 qman_offset = mmTPC0_QM_GLBL_CFG1;
++	u32 tpcs_off_delta = mmTPC1_QM_GLBL_CFG1 - mmTPC0_QM_GLBL_CFG1;
++	int i;
++
++	for (i = 0; i < GAUDI_TPCS_NUM; i++)
++		regmap_writel(stop, qman_offset + i * tpcs_off_delta);
++}
++
++static void gaudi_stop_nic_qmans(void)
++{
++	/* The stop bits are at the same shift on all NICs QMANs */
++	u32 stop = 0xF << NIC0_QM0_GLBL_CFG1_CP_STOP_SHIFT;
++	u32 qman0_offset = mmNIC0_QM0_GLBL_CFG1;
++	u32 qman1_offset = mmNIC0_QM1_GLBL_CFG1;
++	u32 nics_off_delta = mmNIC1_QM0_BASE - mmNIC0_QM0_BASE;
++	int i;
++
++	for (i = 0; i < GAUDI_NICS_NUM; i++) {
++		regmap_writel(stop, qman0_offset + i * nics_off_delta);
++		regmap_writel(stop, qman1_offset + i * nics_off_delta);
++	}
++}
++
++static void gaudi_disable_clock_gating(void)
++{
++	u32 qman_offset;
++	int i;
++
++	for (i = 0, qman_offset = 0; i < GAUDI_DMA_CHANNELS_NUM; i++) {
++		regmap_writel(0, mmDMA0_QM_CGM_CFG + qman_offset);
++		regmap_writel(0, mmDMA0_QM_CGM_CFG1 + qman_offset);
++
++		qman_offset += mmDMA1_QM_CGM_CFG - mmDMA0_QM_CGM_CFG;
++	}
++
++	regmap_writel(0, mmMME0_QM_CGM_CFG);
++	regmap_writel(0, mmMME0_QM_CGM_CFG1);
++	regmap_writel(0, mmMME2_QM_CGM_CFG);
++	regmap_writel(0, mmMME2_QM_CGM_CFG1);
++
++	for (i = 0, qman_offset = 0; i < GAUDI_TPCS_NUM; i++) {
++		regmap_writel(0, mmTPC0_QM_CGM_CFG + qman_offset);
++		regmap_writel(0, mmTPC0_QM_CGM_CFG1 + qman_offset);
++
++		qman_offset += mmTPC1_QM_CGM_CFG - mmTPC0_QM_CGM_CFG;
++	}
++}
++
++static void gaudi_pci_dma_stall(void)
++{
++	u32 stall = BIT(DMA0_CORE_CFG_1_HALT_SHIFT);
++
++	regmap_writel(stall, mmDMA0_CORE_CFG_1);
++	regmap_writel(stall, mmDMA1_CORE_CFG_1);
++	regmap_writel(stall, mmDMA5_CORE_CFG_1);
++}
++
++static void gaudi_hbm_dma_stall(void)
++{
++	u32 stall = BIT(DMA0_CORE_CFG_1_HALT_SHIFT);
++
++	regmap_writel(stall, mmDMA2_CORE_CFG_1);
++	regmap_writel(stall, mmDMA3_CORE_CFG_1);
++	regmap_writel(stall, mmDMA4_CORE_CFG_1);
++	regmap_writel(stall, mmDMA6_CORE_CFG_1);
++	regmap_writel(stall, mmDMA7_CORE_CFG_1);
++}
++
++static void gaudi_mme_stall(void)
++{
++	/* both ACC and SBAB stall bits shifts are the same */
++	u32 stall = BIT(MME_ACC_ACC_STALL_R_SHIFT);
++	u32 acc_offset = mmMME0_ACC_ACC_STALL;
++	u32 sbab_offset = mmMME0_SBAB_SB_STALL;
++	/* MME offsets are the same between ACCs and SBABs */
++	u32 mmes_off_delta = mmMME1_ACC_BASE - mmMME0_ACC_BASE;
++	int i;
++
++	for (i = 0; i < GAUDI_MMES_NUM; i++) {
++		/* WA for H3-1800 bug: do ACC and SBAB writes twice */
++		regmap_writel(stall, acc_offset + i * mmes_off_delta);
++		regmap_writel(stall, acc_offset + i * mmes_off_delta);
++		regmap_writel(stall, sbab_offset + i * mmes_off_delta);
++		regmap_writel(stall, sbab_offset + i * mmes_off_delta);
++	}
++}
++
++static void gaudi_tpc_stall(void)
++{
++	u32 stall = BIT(TPC0_CFG_TPC_STALL_V_SHIFT);
++	u32 tpcs_off_delta = mmTPC1_CFG_TPC_STALL - mmTPC0_CFG_TPC_STALL;
++	u32 stall_offset = mmTPC0_CFG_TPC_STALL;
++	int i;
++
++	for (i = 0; i < GAUDI_TPCS_NUM; i++)
++		regmap_writel(stall, stall_offset + i * tpcs_off_delta);
++}
++
++static void gaudi_disable_timestamp(void)
++{
++	/* Disable the timestamp counter */
++	regmap_writel(0, mmPSOC_TIMESTAMP_BASE & ~HL_CFG_BASE);
++}
++
++static void gaudi_halt_engines(void)
++{
++	gaudi_disable_clock_gating();
++
++	/* stop Rx/Tx here to drain any queued packets */
++	gaudi_stop_nic_qmans();
++
++	gaudi_stop_mme_qmans();
++	gaudi_stop_tpc_qmans();
++	gaudi_stop_hbm_dma_qmans();
++	gaudi_stop_pci_dma_qmans();
++
++	udelay(1000);
++
++	gaudi_pci_dma_stall();
++	gaudi_hbm_dma_stall();
++	gaudi_tpc_stall();
++	gaudi_mme_stall();
++
++	udelay(1000);
++
++	gaudi_disable_nic_qmans();
++	gaudi_disable_mme_qmans();
++	gaudi_disable_tpc_qmans();
++	gaudi_disable_hbm_dma_qmans();
++	gaudi_disable_pci_dma_qmans();
++
++	gaudi_disable_timestamp();
++
++	gaudi_nics_handle();
++}
++
++static void gaudi_hw_fini(void)
++{
++	/* Restart BTL/BLR upon hard-reset */
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_BOOT_SEQ_RE_START);
++
++	udelay(1000);
++
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_SW_ALL_RST);
++}
++
++/*
++ * This function makes sure no access is done from host to the SoC units during
++ * the reset. All incoming downstream traffic is routed to RAZWI, so responses
++ * will be sent to the host and PCIe link will not break.
++ *
++ * Note: since we close all the access, the boot FW must enable the access back.
++ */
++static void gaudi_close_pcie_rr(void)
++{
++	/* RRs min/max HIT is not inclusive: min < hit < max */
++	u32 min = 0xF0000000 - 1, max = 0xFFFFFFFF;
++	u32 hmsk = 0x3FF80;
++
++	/* PCIe RR - CFG WP 0x7FF0000000 - 0x7FFFFFFFFF */
++	regmap_writel(min, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
++	regmap_writel(0xFCC01F64, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MAX_0);
++	/* Hole for VUART TX status 0x7FFCC01F64 - 0x7FFCC01F67 */
++	regmap_writel(0xFCC01F67, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_1);
++	regmap_writel(max, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MAX_1);
++	regmap_writel(min, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MIN_0);
++	regmap_writel(0xFCC01F60, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MAX_0);
++	/* Hole for VUART TX 0x7FFCC01F60 - 0x7FFCC01F67 */
++	regmap_writel(0xFCC01F67, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MIN_1);
++	regmap_writel(max, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MAX_1);
++
++	/* PCIe RTR RR - Full chip WP 0x0 - 0x07FFFFFFFFF */
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_LOW_AW_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_HIGH_AW_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_LOW_AW_0);
++	regmap_writel(hmsk, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_HIGH_AW_0);
++	/* PCIe RTR RR - WP Enable (hit) */
++	regmap_writel(0x1, mmSIF_RTR_CTRL_7_RANGE_PRIV_HIT_AW);
++
++	/* PCIe RTR RR - Full chip RP 0x0 - 0x07FFFFFFFFF */
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_LOW_AR_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_HIGH_AR_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_LOW_AR_0);
++	regmap_writel(hmsk, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_HIGH_AR_0);
++	/* PCIe RTR RR - RP Enable (hit) */
++	regmap_writel(0x1, mmSIF_RTR_CTRL_7_RANGE_PRIV_HIT_AR);
++}
++
++/*
++ * This function makes sure no access is done from host to the SoC's PCIe IF
++ * during the reset. The inbound memory requests are disabled. The ELBI access
++ * gets "retry" response. All channels provide responses to the host and PCIe
++ * link will not break.
++ *
++ * Note: since we close all the access, the boot FW must enable the access back.
++ */
++static void gaudi_pcie_disable_access(void)
++{
++	u32 reg;
++
++	/* Disable the ELBI access */
++	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Disable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg &= ~BIT(1);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
++
++static void gaudi_reset_soc_initiators(void)
++{
++	regmap_writel(UNIT_RST_L_MSK, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
++	regmap_writel(UNIT_RST_H_MSK, mmPSOC_GLOBAL_CONF_UNIT_RST_N_H);
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++
++	udelay(5000);	/* let reset propagate */
++
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_H);
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
++}
++
++void hl_dev_reset(void)
++{
++	gaudi_close_pcie_rr();
++	gaudi_halt_engines();
++	gaudi_pcie_disable_access();
++	gaudi_reset_soc_initiators();
++
++	gaudi_hw_fini();
++	wfe();
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 8ded23e..47f6047 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -109,6 +109,7 @@
+ bool hl_is_debug_mode(enum hl_debug_hw_func func);
+ bool hl_is_jtag_enabled(void);
+ void hl_enter_recovery(void);
++void hl_dev_reset(void);
+ 
+ void preboot_pcie_wait_for_link(void);
+ void preboot_delay(void);
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 2226480..e5f2bf3 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -26,8 +26,11 @@
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_WAITING_FOR_BOOT_FIT);
+ }
+ 
++__weak void lkd_dev_specific_setup(void) {}
++
+ void module_lkd_setup(void)
+ {
++	lkd_dev_specific_setup();
+ 	preboot_security_dynamic_img_open();
+ 	module_lkd_enable();
+ }
+@@ -61,6 +64,13 @@
+ 		cpu_boot_rsp_set(CPU_MSG_OK);
+ 		preboot_puts("LKD FIT RDY received\n");
+ 		break;
++	case KMD_MSG_RST_DEV:
++		res = FOUND_NO_RETURN;
++		/* RST DEV - we should clear the message/cmd register */
++		cpu_boot_cmd_clr_before_wfe();
++		cpu_boot_rsp_set(CPU_MSG_OK);
++		preboot_puts("LKD RST DEV received\n");
++		break;
+ 	case KMD_MSG_SKIP_BMC:
+ 		cpu_boot_rsp_set(CPU_MSG_ERR);
+ 		preboot_puts("LKD SKIP BMC received\n");
+@@ -92,6 +102,9 @@
+ 	sts.is_fit_checked = true;
+ }
+ 
++/* For devices that do not implement RST_DEV command, mimic WFE */
++__weak void hl_dev_reset(void) { wfe(); }
++
+ void module_lkd_run_noret(void)
+ {
+ 	switch (sts.msg_reg_val) {
+@@ -99,8 +112,15 @@
+ 		cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
+ 		wfe();
+ 		break;
++	case KMD_MSG_RST_DEV:
++		cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
++		hl_dev_reset();	/* should not return */
++		break;
+ 	case KMD_MSG_FIT_RDY:
+ 		preboot_security_cleanup_before_run();
++		/* We do not know if the FW we are loading supports hard rst */
++		cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN,
++									false);
+ 		fit_run_image();
+ 		/* no break */
+ 	default:

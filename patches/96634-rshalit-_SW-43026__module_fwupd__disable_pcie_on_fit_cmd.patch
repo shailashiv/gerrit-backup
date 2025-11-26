@@ -1,0 +1,67 @@
+From a0ff6814e37e75835a1d5a558f7de29d0f1398a6 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Sat, 22 May 2021 09:54:30 +0300
+Subject: [PATCH] [SW-43026] module_fwupd: disable pcie on fit cmd
+
+PCIe disabling mechanism is using a fit as a command for
+device to close any check on fw_upd module and to stop
+any further process of fw_upd module if given through pcie.
+This is used as protection and security mechanism in order to
+guarantee that fw_upd is disabled to pcie after the command
+is received and will remain close till power cycle of device.
+This fit is received using ELBI interface.
+A next patch will save the information in boot_info and
+also check boot_info on starting preboot, in order to
+keep the closure between sw reset and PRSTN reset.
+A later patch shall also use the state's flag in order
+to disable access fw_udp from pcie.
+
+Change-Id: I70fd476510ac018af6d290c0cfa4084621350859
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 566ed13..3686392 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -84,6 +84,7 @@
+ void module_fwupd_run_fast(void);
+ void module_fwupd_run(void);
+ void module_fwupd_run_noret(void);
++void module_fwupd_pcie_disable(bool is_pcie_disabled);
+ 
+ /* LKD */
+ void module_lkd_setup(void);
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index b483d6b..ead2990 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -39,6 +39,7 @@
+ 	enum cmd_check_res exec_res;
+ 	void (*sts_writel)(u32 val);
+ 	u32 (*cmd_readl)(void);
++	bool is_disabled;
+ };
+ 
+ static struct fwupd_state state;
+@@ -309,6 +310,11 @@
+ 	state->sending_error_flag = false;
+ }
+ 
++void module_fwupd_pcie_disable(bool is_pcie_disabled)
++{
++	state.is_disabled = is_pcie_disabled;
++}
++
+ static enum hl_upd_sts module_fwupd_map(struct fwupd_state *state,
+ 					unsigned int size, enum hl_upd_cmd cmd)
+ {
+@@ -471,6 +477,8 @@
+ 		return module_fwupd_load_type_nic_en(state->map_offset);
+ 	case FIT_LOAD_TYPE_RMA_ERASE:
+ 		return rma_erase();
++	case FIT_LOAD_TYPE_FW_UPD_CLOSURE:
++		module_fwupd_pcie_disable(true);
+ 	case FIT_LOAD_TYPE_RUN:
+ 		return module_fwupd_load_type_run(state, state->map_offset);
+ 	default:

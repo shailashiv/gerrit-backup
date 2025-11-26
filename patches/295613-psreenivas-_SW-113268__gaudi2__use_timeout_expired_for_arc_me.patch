@@ -1,0 +1,55 @@
+From fd01a14db0c22370163726401650a11a20b36294 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Wed, 25 Jan 2023 15:09:36 +0200
+Subject: [PATCH] [SW-113268] gaudi2: use timeout_expired for arc mem init
+
+As a part of ppboot boot sequence ppboot is initializing arc0
+iccm and dcmm in cold reset and iccm in warm reset. The udelay
+sleeps for 100ms and has 50 retries which will increase pcie
+initialzation time and can cause pcie link failure hence
+replacing udelay with timeout_expired ad keeping timeout of 1ms
+which should be enough for iccm and dccm init.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I824d2b7ce0d4cbf78ec785ea86662fe202e96045
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index e9df8c6..7a8e1f0 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -850,10 +850,10 @@
+ 	regmap_writel(0x1, rst_offset);
+ }
+ 
+-#define HL_INIT_ARC_MEM_RETRIES	50
++#define HL_ARC_MEMCPY_TIMEOUT_US	1000 /* 1ms */
+ void init_arc_mem(u8 id, u64 addr, u32 size)
+ {
+-	u32 retry = HL_INIT_ARC_MEM_RETRIES;
++	u64 start;
+ 	u32 mem_cfg, cpy_sts;
+ 
+ 	/* Use memblock to initialize dccm memory */
+@@ -872,18 +872,17 @@
+ 
+ 	/* Enable copy and wait for completion */
+ 	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	start = timestamp_get_us();
+ 	while (1) {
+ 		cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
+ 		if (cpy_sts)
+ 			break;
+ 
+-		retry--;
+-		if (!retry) {
++		if (timeout_expired(start, HL_ARC_MEMCPY_TIMEOUT_US)) {
+ 			preboot_puts_hex("Init DCCM timed-out for arc", id, false);
+ 			break;
+ 		}
+-		/* TODO: replace udelay with timeout_expired function */
+-		udelay(100000);
++
+ 	}
+ }
+ 

@@ -1,0 +1,118 @@
+From 40c8a3055b680ef4d2d49988ed53242c455a5aca Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 21 Jun 2021 21:54:15 +0300
+Subject: [PATCH] [SW-33447] preboot: implement common flr enable disable fn's
+
+In order to FLR interrupt handled by firmware, hw_ctrl and
+int_mask needs to be cleared and should be set back again while
+exiting preboot. This patch implements common function to
+enable/disable FLR to avoid code duplication and enable it
+for gaudi, gaudi2 and greco platform.
+
+Change-Id: Id0d18ce98a99522ec8bb973ec2e8afc7723c77ff
+---
+
+diff --git a/arch/goya/common.c b/arch/goya/common.c
+index d47d8e2..c59e0fa 100644
+--- a/arch/goya/common.c
++++ b/arch/goya/common.c
+@@ -30,6 +30,8 @@
+ 
+ #define BTL_COUNTER_MAX		BIT(22)
+ 
++void pci_dev_flr_enable(bool enable) {}
++
+ u32 get_efuse_read_reg(void)
+ {
+ 	return mmPSOC_EFUSE_READ;
+diff --git a/arch/goya/common.h b/arch/goya/common.h
+index 7590718..6d7981e 100644
+--- a/arch/goya/common.h
++++ b/arch/goya/common.h
+@@ -33,4 +33,14 @@
+ #define I2C_SLAVE_ADDRESS_DBG	0x47
+ #define I2C_SLAVE_DEFAULT_INTR_MASK	0x8FF
+ 
++/*
++ * Add dummy macros. These are only required for goya compilation
++ * as the register and masks used in common file are not
++ * available in goya. Note that below macro won't be used in code as
++ * function is override in common.c file.
++ */
++#define PCIE_AUX_FLR_CTRL_HW_CTRL_MASK		0x0
++#define PCIE_AUX_FLR_CTRL_INT_MASK_MASK		0x0
++#define mmPCIE_AUX_FLR_CTRL			0x0
++
+ #endif /* COMMON_GOYA_H_ */
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 3434a7e..f575741 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <pcie_aux_regs.h>
++#include <pcie_aux_masks.h>
+ #include <pcie_core_regs.h>
+ #include <psoc_global_conf_regs.h>
+ 
+@@ -39,6 +40,14 @@
+ __weak void pci_dev_specific_disable(void) {}
+ __weak void pci_dev_specific_enable(void) {}
+ 
++__weak void pci_dev_flr_enable(bool enable)
++{
++	u32 val = enable ? 0 : PCIE_AUX_FLR_CTRL_HW_CTRL_MASK |
++				PCIE_AUX_FLR_CTRL_INT_MASK_MASK;
++
++	regmap_writel(val, mmPCIE_AUX_FLR_CTRL);
++}
++
+ __weak void pci_dev_specific_hot_rst(void)
+ {
+ 	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+@@ -49,8 +58,10 @@
+ 
+ void module_pci_setup(void)
+ {
+-	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_setup();
++		pci_dev_flr_enable(true);
++	}
+ }
+ 
+ __weak enum cmd_check_res dev_specific_module_pci_check(void)
+@@ -86,8 +97,10 @@
+ 
+ void module_pci_disable(void)
+ {
+-	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_disable();
++		pci_dev_flr_enable(false);
++	}
+ }
+ 
+ void module_pci_run(void)
+@@ -132,14 +145,18 @@
+ 
+ void module_pci_enable(void)
+ {
+-	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_enable();
++		pci_dev_flr_enable(true);
++	}
+ }
+ 
+ void module_pci_teardown(void)
+ {
+-	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_teardown();
++		pci_dev_flr_enable(false);
++	}
+ }
+ 
+ bool hl_pci_link_is_up(void)

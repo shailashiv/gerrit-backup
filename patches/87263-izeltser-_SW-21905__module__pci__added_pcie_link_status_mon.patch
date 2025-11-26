@@ -1,0 +1,110 @@
+From 449e143b2715c90d94e0e381b7af60ffa48dadcb Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 24 Mar 2021 16:29:25 +0200
+Subject: [PATCH] [SW-21905] module: pci: added pcie link status monitoring
+
+Pcie link status is being monitored while preboot is waiting for
+commands, if link status is changed a message is emitted to console.
+
+We assume in preboot phase pcie link should be already up, so the
+default values of the internal variables are set accordingly, in
+order to avoid a redundant print in the beginning.
+
+In addition, when pcie link is going up, a HW workaround is executed
+for devices where it's required.
+
+Change-Id: Ib5e10d403cde9b368a5b0470747468f512af78af
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/goya/common.c b/goya/common.c
+index 08b0394..8e06d3a 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -113,6 +113,10 @@
+ 	}
+ }
+ 
++void preboot_pcie_exec_hw_wa(void)
++{
++}
++
+ /*
+  * Handle PCIe erratum: make sure reset_n de-asserted only after perst
+  * Assume PRSTn tied with cold reset
+diff --git a/include/preboot.h b/include/preboot.h
+index 952a92a..edfd46b 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -108,6 +108,7 @@
+ void preboot_sync_btl(void);
+ void preboot_led_on(void);
+ void preboot_pcie_enable(void);
++void preboot_pcie_exec_hw_wa(void);
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 4f767c3..44ba8a0 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -16,12 +16,25 @@
+ struct pci_status {
+ 	u32 flr_reg_val;
+ 	u32 hot_rst_reg_val;
++	u32 smlh_link_reg_val;
++	u32 rdlh_link_reg_val;
++	bool link_is_up;
+ };
+ 
+ static struct pci_status pci_sts = {
+ 	.flr_reg_val = ~1,
+ 	.hot_rst_reg_val = ~1,
++	.smlh_link_reg_val = 1,
++	.rdlh_link_reg_val = 1,
++	.link_is_up = true,
++
+ };
++
++__weak void preboot_pcie_exec_hw_wa(void)
++{
++	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
+ 
+ __weak void pci_dev_specific_setup(void) {}
+ __weak void pci_dev_specific_teardown(void) {}
+@@ -44,8 +57,14 @@
+ {
+ 	pci_sts.flr_reg_val = regmap_readl(mmPCIE_AUX_FLR_INT);
+ 	pci_sts.hot_rst_reg_val = regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
++	pci_sts.rdlh_link_reg_val = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++	pci_sts.smlh_link_reg_val = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+ 
+ 	if (pci_sts.flr_reg_val == 1 || pci_sts.hot_rst_reg_val == 1)
++		return FOUND_FAST_RETURN;
++
++	if ((pci_sts.rdlh_link_reg_val && pci_sts.smlh_link_reg_val) !=
++	    pci_sts.link_is_up)
+ 		return FOUND_FAST_RETURN;
+ 
+ 	return NOT_FOUND;
+@@ -78,6 +97,18 @@
+ 		pci_dev_specific_hot_rst();
+ 		preboot_puts("HOT RST received\n");
+ 	}
++
++	if ((pci_sts.rdlh_link_reg_val && pci_sts.smlh_link_reg_val) !=
++	    pci_sts.link_is_up) {
++		pci_sts.link_is_up = !pci_sts.link_is_up;
++		preboot_puts_raw("PCIe link is ");
++		if (pci_sts.link_is_up) {
++			preboot_puts("up\n");
++			preboot_pcie_exec_hw_wa();
++		} else {
++			preboot_puts("down\n");
++		}
++	}
+ }
+ 
+ void module_pci_enable(void)

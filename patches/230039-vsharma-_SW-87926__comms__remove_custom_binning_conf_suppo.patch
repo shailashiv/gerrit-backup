@@ -1,0 +1,152 @@
+From 07cd49fc09fbc42a6241c1bd520a1d828c46eaa9 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Fri, 08 Jul 2022 18:22:35 +0300
+Subject: [PATCH] [SW-87926] comms: remove custom binning conf support
+
+This patch remove support for sending binning conf
+to preboot from lkd via comms. This was used to test custom
+binning options during power-on or sival tests.
+New infra to set custom binning via debugfs is added,
+in which lkd will send custom binning masks by
+echo 1 | sudo tee /sys/kernel/debug/habanalabs/hl0/fw_binning_set
+which will be stored in bootinfo and will apply after next
+hard reset.
+
+Change-Id: I48d7232c9061682f14b35715b5c770b736c0ffd7
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index 8114b91..674a2f1 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -50,7 +50,6 @@
+ 
+ static struct hl_rsp_err pending_error;
+ static u64 preboot_en_caps;
+-static struct hl_binning_conf binning_conf;
+ static u8 fw_cfg_skip;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+@@ -581,20 +580,9 @@
+ 	fw_cfg_skip = skip;
+ }
+ 
+-void preboot_set_binning_conf(struct hl_binning_masks *masks)
+-{
+-	if (!binning_conf.is_valid) {
+-		memcpy(&binning_conf.masks, masks, sizeof(struct hl_binning_masks));
+-		binning_conf.is_valid = true;
+-	}
+-}
+-
+ void preboot_finalize_uboot_override(void)
+ {
+ 	if (fw_cfg_skip)
+ 		boot_info_set(HL_BOOT_INFO_FW_CFG_SKIP, &fw_cfg_skip, sizeof(fw_cfg_skip));
+ 
+-	if (binning_conf.is_valid)
+-		boot_info_set(HL_BOOT_INFO_BINNING_CONF, &binning_conf.masks,
+-			      sizeof(binning_conf.masks));
+ }
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0a6bfd7..57db88d 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -217,11 +217,6 @@
+ 	return true;
+ }
+ 
+-bool hl_binning_conf_is_supported(void)
+-{
+-	return true;
+-}
+-
+ void hl_ts_data_init(void)
+ {
+ 	u32 pll_freq;
+diff --git a/include/preboot.h b/include/preboot.h
+index be68257..dadbdb5 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -81,19 +81,6 @@
+ 	uint32_t bitmask;
+ };
+ 
+-struct hl_binning_masks {
+-	uint64_t tpc;
+-	uint32_t dec;
+-	uint32_t hbm;
+-	uint32_t edma;
+-	uint32_t mme;
+-};
+-
+-struct hl_binning_conf {
+-	bool is_valid;
+-	struct hl_binning_masks masks;
+-};
+-
+ extern uintptr_t _start;	/* Start of ppboot/preboot region */
+ extern uintptr_t __stack_top;	/* End of ppboot/preboot region */
+ extern u32 __stack;		/* stack last cell value */
+@@ -239,11 +226,9 @@
+ void preboot_engines_init(void);
+ void preboot_clear_wd_gpio(void);
+ void preboot_set_fw_cfg_skip(u8 skip);
+-void preboot_set_binning_conf(struct hl_binning_masks *masks);
+ void preboot_finalize_uboot_override(void);
+ void preboot_update_bar_sizes(void);
+ bool hl_fw_cfg_skip_is_supported(void);
+-bool hl_binning_conf_is_supported(void);
+ 
+ void ppboot_init_stack_mon_dev_specific(void);
+ void ppboot_check_stack_mon_dev_specific(void);
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 64f5486..24b4ef8 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -118,34 +118,6 @@
+ 	return 0;
+ }
+ 
+-__weak bool hl_binning_conf_is_supported(void) { return false; }
+-
+-static int module_lkd_msg_binning_conf(struct lkd_fw_comms_msg *mcomms)
+-{
+-	struct hl_binning_masks masks;
+-
+-	if (!hl_binning_conf_is_supported()) {
+-		preboot_puts("binning_conf is not supported\n");
+-		return -1;
+-	}
+-
+-	/*
+-	 * TODO:
+-	 * Currently binning information is received through LKD.
+-	 * Add a security enable precondition once the binning info
+-	 * is read from a valid efuse content.
+-	 */
+-
+-	masks.tpc = mcomms->tpc_binning_conf;
+-	masks.dec = mcomms->dec_binning_conf;
+-	masks.hbm = mcomms->hbm_binning_conf;
+-	masks.edma = mcomms->edma_binning_conf;
+-	masks.mme = mcomms->mme_redundancy_conf;
+-	preboot_set_binning_conf(&masks);
+-
+-	return 0;
+-}
+-
+ static int module_lkd_msg_process(struct lkd_fw_comms_msg *mcomms)
+ {
+ 	int err = 1;
+@@ -157,9 +129,6 @@
+ 	case HL_COMMS_FW_CFG_SKIP_TYPE:
+ 		err = module_lkd_msg_fw_cfg_skip(mcomms);
+ 		break;
+-	case HL_COMMS_BINNING_CONF_TYPE:
+-		err = module_lkd_msg_binning_conf(mcomms);
+-		/* no break */
+ 	default:
+ 		break;
+ 	}

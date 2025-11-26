@@ -1,0 +1,1248 @@
+From 30a1123d14b118905bd18536ff647d3c0af68929 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Fri, 23 Jul 2021 20:30:50 +0300
+Subject: [PATCH] [SW-45031] greco: remove duplicate code
+
+Target is to avoid duplicate code accorss different
+greco targets(i.e. arm, arc and arc_elf32). In this
+patch many functions common in greco/arm and greco_arc_elf32
+implementations are moved to common/common.c.
+
+As preboot_disable_pcie_ltr() needs to be non-static to have common
+implementation, relevant change required in relevant gaudi, gaudi2
+files too.
+
+Change-Id: I4d50dabf6cd0e9d5de928cd30e58bdc2afced303
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index cdb7ee7..b5707fc 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -184,7 +184,7 @@
+ 	return pci_dev_id & 0xffff;
+ }
+ 
+-static void preboot_disable_pcie_ltr(void)
++void preboot_disable_pcie_ltr(void)
+ {
+ 	u32 cap_hdr_cfg, dev_cap2_reg;
+ 
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index c860c5b..b773690 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -134,7 +134,7 @@
+ 
+ }
+ 
+-static void preboot_disable_pcie_ltr(void)
++void preboot_disable_pcie_ltr(void)
+ {
+ 	u32 cap_hdr_cfg, dev_cap2_reg;
+ 
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 9544254..76ef307 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -272,7 +272,7 @@
+ 	preboot_init_pcie_phy_fw_update();
+ }
+ 
+-static void preboot_disable_pcie_ltr(void)
++void preboot_disable_pcie_ltr(void)
+ {
+ 	u32 cap_hdr_cfg, dev_cap2_reg;
+ 
+diff --git a/arch/greco/arc/common.c b/arch/greco/arc/common.c
+index 381172e..2caa856 100644
+--- a/arch/greco/arc/common.c
++++ b/arch/greco/arc/common.c
+@@ -52,31 +52,6 @@
+ 	return (base | SDRAM_FULL_BASE);
+ }
+ 
+-__weak void preboot_init_pcie_phy(void)
+-{
+-	/* Reset PCIe PHY */
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+-
+-	/*
+-	 * Set PCIe PHY CR Para I/F to CFG.
+-	 * Select CR PARA I/F instead of JTAG
+-	 */
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_2);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_3);
+-
+-	/* Select indirect access to CR PARA I/F instead of PRBI */
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
+-
+-	/*
+-	 * Use PHY configuration from SoC online
+-	 * instead of default values
+-	 */
+-	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
+-	preboot_init_pcie_phy_fw_update();
+-}
+-
+ void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	/* Prepare the ARC SRAM address */
+diff --git a/arch/greco/arc/common.h b/arch/greco/arc/common.h
+index b381f4c..a9e85bd 100644
+--- a/arch/greco/arc/common.h
++++ b/arch/greco/arc/common.h
+@@ -52,4 +52,6 @@
+ #define HL_SPI_BASE		0x1A000000
+ #define HL_CFG_BASE		0xFC000000
+ 
++#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
++
+ #endif /* COMMON_GRECO_ARC_GNU_H_ */
+diff --git a/arch/greco/arc_elf32/common.c b/arch/greco/arc_elf32/common.c
+index dcbf634..06fe083 100644
+--- a/arch/greco/arc_elf32/common.c
++++ b/arch/greco/arc_elf32/common.c
+@@ -47,29 +47,9 @@
+ #include <boot_if.h>
+ 
+ #include "common.h"
++#include <greco.h>
+ 
+ #define PRODUCT_ID_STR_SIZE	0x8
+-
+-#define PCIE_LTR_DISABLE		0
+-#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+-
+-__weak void preboot_init_pcie_phy(void)
+-{
+-	/* Reset PCIe PHY */
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+-
+-	/*
+-	 * Set PCIe PHY CR Para I/F to CFG.
+-	 * Select CR PARA I/F instead of JTAG
+-	 */
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+-
+-	/* Select indirect access to CR PARA I/F instead of PRBI */
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
+-
+-	preboot_init_pcie_phy_fw_update();
+-}
+ 
+ static u32 pcie_dev_id;
+ 
+@@ -114,140 +94,6 @@
+ 	return pcie_dev_id;
+ }
+ 
+-static void preboot_pcie_device_id_vendor_id_set(void)
+-{
+-	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+-
+-	/* Update Vendor ID */
+-	regmap_writel(device_id_vendor_id,
+-		      mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+-
+-	/* Update subsystem Vendor ID */
+-	regmap_writel(device_id_vendor_id,
+-		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+-
+-}
+-
+-static void preboot_disable_pcie_ltr(void)
+-{
+-	u32 cap_hdr_cfg, dev_cap2_reg;
+-	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
+-	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
+-	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
+-	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
+-		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
+-	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
+-
+-	/* Disable LTR support, set bit-11 to '0' */
+-	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
+-	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
+-	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
+-		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
+-	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
+-}
+-
+-void preboot_init_pcie(void)
+-{
+-	u64 start;
+-
+-	preboot_init_pcie_phy();
+-
+-	preboot_pcie_device_id_vendor_id_set();
+-
+-	/* Disable the EQ REDO */
+-	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+-
+-	start = timestamp_get_us();
+-
+-	/* Wait for init_done before executing W/A */
+-	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0) &&
+-		 regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1))) {
+-		/*
+-		 * PCIe external load complete should take maximum of 300us
+-		 * to complete. Including some grace period 576us of
+-		 * timeout is used
+-		 */
+-		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for ext_ld_done!");
+-			break;
+-		}
+-	}
+-
+-	/* Execute the Synopsys W/A */
+-	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
+-	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+-	udelay(20);
+-
+-	/* PCIe disable LTR */
+-	preboot_disable_pcie_ltr();
+-
+-	/* Enable and Mask LTSSM (erratum 102) */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+-void preboot_pcie_wait_for_link(void)
+-{
+-	u64 start = timestamp_get_us();
+-
+-	/* init dev id as soon as possible, while waiting for prstn */
+-	preboot_device_id_init();
+-
+-	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
+-		/* If PRSTn does not happen in 5 seconds
+-		 * timeout and return
+-		 */
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PRSTn!\n");
+-			return;
+-		}
+-	}
+-
+-	/* Only after PRSTn is de-asserted */
+-	preboot_pcie_enable();
+-
+-	/* Reset start timer */
+-	start = timestamp_get_us();
+-
+-	while (1) {
+-		unsigned int prstn, ltssm, smlh, rdlh;
+-
+-		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+-		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+-		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+-
+-		if (prstn && smlh && rdlh) {
+-			preboot_puts("PCIe link is UP!\n");
+-			break;
+-		}
+-
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PCIe link UP!\n");
+-			break;
+-		}
+-
+-		/*
+-		 * Some host assert prstn during link up while moving to GEN3
+-		 * This cause BAR size to be reset
+-		 * We stop link up process by disabling ltssm
+-		 * till BAR is reconfigured
+-		 */
+-		if (!prstn && ltssm) {
+-			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-
+-		if (prstn && !ltssm) {
+-			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-	}
+-
+-	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+ void init_prstn(void)
+ {
+ 	/* Configure PRSTN to reset entire SoC */
+@@ -285,64 +131,6 @@
+ 	 * restart boot sequence.
+ 	 */
+ 	regmap_writel(0x770, mmPSOC_GLOBAL_CONF_BOOT_SEQ_RE_START);
+-}
+-
+-static void halt_n_reset_arc(u8 id)
+-{
+-	u32 val, halt_ack_offset, halt_req_offset;
+-	u32 retry = ARC_HALT_ACK_RETRIES;
+-	u32 halt_mask, halt_ack_mask;
+-	u32 rst_offset;
+-
+-	if (id) {
+-		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+-		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+-		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
+-		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+-
+-	} else {
+-		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+-		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+-		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
+-		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+-	}
+-
+-	val = regmap_readl(halt_ack_offset);
+-	if (val & halt_mask) {
+-		preboot_puts_hex("Skipping halt for ARC", id, false);
+-	} else {
+-		/* Halt ARC */
+-		regmap_writel(BIT(1), halt_req_offset);
+-		while (1) {
+-			val = regmap_readl(halt_ack_offset);
+-			if (val & halt_ack_mask)
+-				break;
+-			udelay(10);
+-			retry--;
+-			if (!retry) {
+-				preboot_puts_hex("No ack from ARC", id, false);
+-				break;
+-			}
+-		}
+-		regmap_writel(0x0, halt_req_offset);
+-	}
+-
+-	/* Reset ARC */
+-	regmap_writel(0x1, rst_offset);
+-}
+-
+-static void axi_enable_drain(void)
+-{
+-	u32 val;
+-
+-	/* Set timeout and enable drain */
+-	regmap_writel(PSOC_AXI_DRAIN_TIMEOUT,
+-			mmPSOC_GLOBAL_CONF_AXI_DRAIN_TIMEOUT);
+-	val = regmap_readl(mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
+-	val |= (0x1 << PSOC_GLOBAL_CONF_AXI_DRAIN_CTRL_EN_SHIFT);
+-	regmap_writel(val, mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
+ }
+ 
+ static void init_arc(void)
+diff --git a/arch/greco/arc_elf32/common.h b/arch/greco/arc_elf32/common.h
+index 3c4bc59..d7a67c2 100644
+--- a/arch/greco/arc_elf32/common.h
++++ b/arch/greco/arc_elf32/common.h
+@@ -50,11 +50,7 @@
+ 
+ #define ARC_RST_VALUE		0x110
+ #define ARC_RST_VEC_ADDR	0x0
+-#define ARC_HALT_ACK_RETRIES	10
+ 
+-#define PCIE_WAIT_TIMEOUT_US	(5 * USEC_PER_SEC)
+-#define PCIE_EXT_LD_TIMEOUT_US	576
+-
+-#define PSOC_AXI_DRAIN_TIMEOUT		0x4000 /* 16K cycles */
++#define FW_WORD_NUM		0x2200	/* FW_SIZE / 2 */
+ 
+ #endif /* COMMON_GRECO_ARC_H_ */
+diff --git a/arch/greco/arm/common.c b/arch/greco/arm/common.c
+index 01cfe89..e8f8fc1 100644
+--- a/arch/greco/arm/common.c
++++ b/arch/greco/arm/common.c
+@@ -9,14 +9,11 @@
+ 
+ #include <psoc_global_conf_regs.h>
+ #include <psoc_global_conf_masks.h>
+-#include <psoc_efuse_regs.h>
+ #include <psoc_gpio2_regs.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_wrap_masks.h>
+-#include <pcie_phy_regs.h>
+-#include <pcie_phy_masks.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+ #include <cpu_timestamp_regs.h>
+@@ -38,286 +35,16 @@
+ #include <string.h>
+ #include <spi.h>
+ #include <preboot/fit.h>
+-#include <efuse.h>
+ #include <boot_if.h>
+ #include <pci.h>
+ 
+ #include "common.h"
+ #include <greco.h>
+ 
+-#define PCIE_LTR_DISABLE		0
+-#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+-#define HOST_GPIO_I2C_DEBUG	44
+-
+-static void pcie_update_reg_range(u32 addr, u32 addr_end, u32 value)
+-{
+-	for (; addr <= addr_end ; addr += 4)
+-		regmap_writel(value, addr);
+-}
+-
+-static void pcie_wa_snps_case_01038891(void)
+-{
+-	u32 config_fuse, boot_strap;
+-	u8 separate_reference = 0;
+-	u32 reg = 0, val;
+-	u8 ssc_en = 0;
+-	int ret;
+-
+-	/* gpio bootstrap pin gpio17 = 0 */
+-	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
+-
+-	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK) {
+-		regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
+-		regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
+-	}
+-
+-	/* SRIS mode enable */
+-	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
+-		separate_reference = 1;
+-
+-	/* SRNS mode enable */
+-	if ((boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK) == 0)
+-		separate_reference = 1;
+-
+-	/* spread spectum clock enable */
+-	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK)
+-		ssc_en = 1;
+-
+-	/* read efuse bit 23 and check if SNPS WA needs to be enabled */
+-	ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
+-	if ((ret) || ((config_fuse & EFUSE_SYSCFG_WA_SNPS_CASE_01038891) != 0))
+-		return;
+-
+-	if (ssc_en) {
+-		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
+-				mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
+-		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
+-				mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
+-		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_PEAK,
+-				mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
+-		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE,
+-				mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
+-		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_PEAK,
+-				mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
+-		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE,
+-				mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
+-	}
+-
+-	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
+-			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
+-	pcie_update_reg_range(
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
+-		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
+-
+-	if (separate_reference) {
+-		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR;
+-
+-		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_SHIFT);
+-		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_SHIFT);
+-		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
+-
+-		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
+-		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
+-		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-	} else {
+-		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER;
+-
+-		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
+-		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH &
+-			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
+-			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
+-		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
+-	}
+-
+-	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER,
+-			mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
+-			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
+-	pcie_update_reg_range(mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
+-		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
+-
+-
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
+-	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
+-			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
+-
+-	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
+-}
+-
+-__weak void preboot_init_pcie_phy(void)
+-{
+-	/* Reset PCIe PHY */
+-	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+-
+-	/*
+-	 * Set PCIe PHY CR Para I/F to CFG.
+-	 * Select CR PARA I/F instead of JTAG
+-	 */
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+-
+-	/* Execute synopsys workaround (01038891) */
+-	pcie_wa_snps_case_01038891();
+-
+-	/* Select indirect access to CR PARA I/F instead of PRBI */
+-	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
+-
+-	preboot_init_pcie_phy_fw_update();
+-}
+-
+-static void preboot_disable_pcie_ltr(void)
+-{
+-	u32 cap_hdr_cfg, dev_cap2_reg;
+-
+-	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
+-	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
+-	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
+-	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
+-		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
+-	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
+-
+-	/* Disable LTR support, set bit-11 to '0' */
+-	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
+-	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
+-	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
+-		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
+-	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
+-}
+ 
+ u32 preboot_device_id_get(void)
+ {
+ 	return PCI_IDS_GRECO_ADDIN;
+-}
+-
+-void preboot_init_pcie(void)
+-{
+-	u64 start;
+-	u32 ven_id_dev_id = hl_pci_get_ven_id_dev_id();
+-
+-	preboot_init_pcie_phy();
+-
+-	/* Update Vendor ID */
+-	regmap_writel(ven_id_dev_id, mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
+-
+-	/* Update subsystem Vendor ID */
+-	regmap_writel(ven_id_dev_id,
+-		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
+-
+-	/* Disable the EQ REDO */
+-	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
+-
+-	start = timestamp_get_us();
+-
+-	/* Wait for init_done before executing W/A */
+-	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0) &&
+-		 regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1))) {
+-		/*
+-		 * PCIe external load complete should take maximum of 300us
+-		 * to complete. Including some grace period 576us of
+-		 * timeout is used
+-		 */
+-		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for ext_ld_done!");
+-			break;
+-		}
+-	}
+-
+-	/* Execute the Synopsys W/A */
+-	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
+-	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
+-	udelay(20);
+-
+-	/* PCIe disable LTR */
+-	preboot_disable_pcie_ltr();
+-
+-	/* Enable and Mask LTSSM (erratum 102) */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-}
+-
+-void preboot_pcie_wait_for_link(void)
+-{
+-	u64 start = timestamp_get_us();
+-
+-	/* init dev id as soon as possible, while waiting for prstn */
+-	preboot_device_id_init();
+-
+-	/* Wait for PRSTn */
+-	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
+-		/* If PRSTn does not happen in 5 seconds
+-		 * timeout and return
+-		 */
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PRSTn!\n");
+-			return;
+-		}
+-	}
+-
+-	/* Only after PRSTn is de-asserted */
+-	preboot_pcie_enable();
+-
+-	preboot_puts("Waiting for PCIe UP status\n");
+-
+-	/* Reset start timer */
+-	start = timestamp_get_us();
+-
+-	while (1) {
+-		unsigned int prstn, ltssm, smlh, rdlh;
+-
+-		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
+-		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+-		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+-
+-		if (prstn && smlh && rdlh) {
+-			preboot_puts("PCIe link is UP!\n");
+-			break;
+-		}
+-
+-		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
+-			preboot_puts("Timed-out waiting for PCIe link UP!\n");
+-			break;
+-		}
+-
+-		/*
+-		 * Some host assert prstn during link up while moving to GEN3
+-		 * This cause BAR size to be reset
+-		 * We stop link up process by disabling ltssm
+-		 * till BAR is reconfigured
+-		 */
+-		if (!prstn && ltssm) {
+-			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-
+-		if (prstn && !ltssm) {
+-			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+-			continue;
+-		}
+-	}
+-
+-	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
+-	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA	0xC14F60
+@@ -331,57 +58,6 @@
+ 	 */
+ 	regmap_writel(c, mmPCIE_WRAP_VUART_TX_DATA);
+ 	regmap_writel(1, mmPCIE_WRAP_VUART_TX_STATUS);
+-}
+-
+-static void halt_n_reset_arc(u8 id)
+-{
+-	u32 val, halt_ack_offset, halt_req_offset;
+-	u32 retry = ARC_HALT_ACK_RETRIES;
+-	u32 halt_mask, halt_ack_mask;
+-	u32 rst_offset;
+-	u32 cpu_boot_err_val;
+-
+-	if (id) {
+-		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+-		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+-		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
+-		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+-
+-	} else {
+-		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+-		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+-		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
+-		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+-	}
+-
+-	val = regmap_readl(halt_ack_offset);
+-	if (val & halt_mask) {
+-		preboot_puts_hex("Skipping halt for ARC", id, false);
+-	} else {
+-		/* Halt ARC */
+-		regmap_writel(BIT(1), halt_req_offset);
+-		while (1) {
+-			val = regmap_readl(halt_ack_offset);
+-			if (val & halt_ack_mask)
+-				break;
+-			udelay(10);
+-			retry--;
+-			if (!retry) {
+-				preboot_puts_hex("No ack from ARC", id, false);
+-				cpu_boot_err_val = (!id) ?
+-					CPU_BOOT_ERR0_ARC0_HALT_ACK_NOT_RCVD :
+-					CPU_BOOT_ERR0_ARC1_HALT_ACK_NOT_RCVD;
+-				cpu_boot_err_clrset(cpu_boot_err_val, true);
+-				break;
+-			}
+-		}
+-		regmap_writel(0x0, halt_req_offset);
+-	}
+-
+-	/* Reset ARC */
+-	regmap_writel(0x1, rst_offset);
+ }
+ 
+ void hl_plat_init(void)
+@@ -444,18 +120,6 @@
+ 		udelay(100000);
+ 	}
+ 
+-}
+-
+-static void axi_enable_drain(void)
+-{
+-	u32 val;
+-
+-	/* Set timeout and enable drain */
+-	regmap_writel(PSOC_AXI_DRAIN_TIMEOUT,
+-			mmPSOC_GLOBAL_CONF_AXI_DRAIN_TIMEOUT);
+-	val = regmap_readl(mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
+-	val |= (0x1 << PSOC_GLOBAL_CONF_AXI_DRAIN_CTRL_EN_SHIFT);
+-	regmap_writel(val, mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
+ }
+ 
+ static void axi_enable_pcie_drain(void)
+diff --git a/arch/greco/arm/common.h b/arch/greco/arm/common.h
+index f08a5c4..52dab79 100644
+--- a/arch/greco/arm/common.h
++++ b/arch/greco/arm/common.h
+@@ -49,38 +49,13 @@
+ 
+ #define ARC_RST_VALUE			0x110
+ #define ARC_RST_VEC_ADDR		0x0
+-#define ARC_HALT_ACK_RETRIES		10
+ 
+-#define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++#define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
++#define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
++
+ #define BTL_SYNC_TIMEOUT_US		(USEC_PER_SEC / 2)
+-#define PCIE_EXT_LD_TIMEOUT_US		576
+ #define HL_INIT_SP_SRAM_RETRIES		50
+ 
+-#define EFUSE_SYSCFG_WA_SNPS_CASE_01038891		BIT(23)
++#define FW_WORD_NUM		0x2000	/* FW_SIZE / 2 */
+ 
+-#define PCIE_PHY_EXT_MPLLB_SSC_PEAK			0x5000
+-#define PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE		0x19CE
+-#define PCIE_PHY_EXT_MPLLA_SSC_PEAK			0x6666
+-#define PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE		0x2108
+-
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER		0x50
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR	0xA0
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER		0x7D
+-#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0	0x30
+-#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0	0x30
+-#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0	0x30
+-#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0	0x30
+-
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW	0x25
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH	0x25
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW	0x25
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH	0x25
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW	0x1C3
+-#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH	0x1C3
+-
+-#define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF	0x5555
+-#define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF	0xFF
+-
+-#define PSOC_AXI_DRAIN_TIMEOUT				0x4000 /* 16K cycles */
+-#define PCIE_AXI_DRAIN_TIMEOUT				PSOC_AXI_DRAIN_TIMEOUT
+ #endif /* COMMON_GRECO_H_ */
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 5a3d933..7b59da6 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -8,8 +8,11 @@
+ #include <stdint.h>
+ 
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <pcie_wrap_regs.h>
+ #include <psoc_efuse_regs.h>
++#include <pcie_phy_regs.h>
++#include <pcie_phy_masks.h>
+ #include <pcie_aux_regs.h>
+ #include <psoc_gpio1_regs.h>
+ #include <psoc_qspi_regs.h>
+@@ -18,6 +21,7 @@
+ #include <psoc_arc1_cfg_regs.h>
+ #include <psoc_arc1_cfg_masks.h>
+ #include <pcie_core_regs.h>
++#include <pcie_phy_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <pcie_dbi_masks.h>
+ #include <cpu_timestamp_regs.h>
+@@ -30,8 +34,9 @@
+ #include <hl_boot_if.h>				/* requires stdint.h */
+ #include <pll.h>
+ #include <boot_if.h>
++#include <pci.h>
+ #include <preboot/thermal.h>
+-
++#include <efuse.h>
+ #include <greco.h>
+ 
+ 
+@@ -57,6 +62,14 @@
+ 	regmap_writel(0, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
+ 	regmap_writel(1, mmPSOC_GLOBAL_CONF_UNIT_RST_N);
+ }
++
++#define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
++#define PCIE_LTR_DISABLE		0
++#define PCIE_EXT_LD_TIMEOUT_US		576
++
++#define PCIE_WAIT_TIMEOUT_US		(5 * USEC_PER_SEC)
++#define ARC_HALT_ACK_RETRIES	10
++
+ 
+ bool hl_is_debug_mode(enum hl_debug_hw_func func)
+ {
+@@ -295,3 +308,339 @@
+ {
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_FW_HARD_RST_EN, true);
+ }
++
++void preboot_disable_pcie_ltr(void)
++{
++	u32 cap_hdr_cfg, dev_cap2_reg;
++	/* PCIe LTR configuration, set bits 31:20 to 0x1f8 */
++	cap_hdr_cfg = regmap_readl(mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++	cap_hdr_cfg &= ~(PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_MASK);
++	cap_hdr_cfg |= (PCIE_CAP_HDR_NXT_OFFSET <<
++		 PCIE_DBI_MARGIN_EXT_CAP_HDR_REG_NEXT_OFFSET_SHIFT);
++	regmap_writel(cap_hdr_cfg, mmPCIE_DBI_MARGIN_EXT_CAP_HDR_REG);
++
++	/* Disable LTR support, set bit-11 to '0' */
++	dev_cap2_reg = regmap_readl(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++	dev_cap2_reg &= ~(PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_MASK);
++	dev_cap2_reg |= (PCIE_LTR_DISABLE <<
++		 PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP_LTR_SUPP_SHIFT);
++	regmap_writel(dev_cap2_reg, mmPCIE_DBI_DEVICE_CAPABILITIES2_REG);
++}
++
++static void preboot_pcie_device_id_vendor_id_set(void)
++{
++	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
++
++	/* Update Vendor ID */
++	regmap_writel(device_id_vendor_id,
++		      mmPCIE_DBI_DEVICE_ID_VENDOR_ID_REG);
++
++	/* Update subsystem Vendor ID */
++	regmap_writel(device_id_vendor_id,
++		      mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG);
++
++}
++
++static void pcie_update_reg_range(u32 addr, u32 addr_end, u32 value)
++{
++	for (; addr <= addr_end ; addr += 4)
++		regmap_writel(value, addr);
++}
++
++static void pcie_wa_snps_case_01038891(void)
++{
++	u32 config_fuse, boot_strap;
++	u8 separate_reference = 0;
++	u32 reg = 0, val;
++	u8 ssc_en = 0;
++	int ret;
++
++	/* gpio bootstrap pin gpio17 = 0 */
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK) {
++		regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++		regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
++	}
++
++	/* SRIS mode enable */
++	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
++		separate_reference = 1;
++
++	/* SRNS mode enable */
++	if ((boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK) == 0)
++		separate_reference = 1;
++
++	/* spread spectum clock enable */
++	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK)
++		ssc_en = 1;
++
++	/* read efuse bit 23 and check if SNPS WA needs to be enabled */
++	ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
++	if ((ret) || ((config_fuse & EFUSE_SYSCFG_WA_SNPS_CASE_01038891) != 0))
++		return;
++
++	if (ssc_en) {
++		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++				mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
++		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++				mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
++		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_PEAK,
++				mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
++		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE,
++				mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
++		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_PEAK,
++				mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
++		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE,
++				mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
++	}
++
++	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
++			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++
++	if (separate_reference) {
++		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR;
++
++		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_SHIFT);
++		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_SHIFT);
++		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++
++		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
++		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
++		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER;
++
++		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
++		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
++		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER,
++			mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
++	pcie_update_reg_range(mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
++		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
++
++
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
++
++	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
++}
++
++__weak void preboot_init_pcie_phy(void)
++{
++	/* Reset PCIe PHY */
++	regmap_writel(0, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
++
++	/*
++	 * Set PCIe PHY CR Para I/F to CFG.
++	 * Select CR PARA I/F instead of JTAG
++	 */
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
++
++	/* Execute synopsys workaround (01038891) */
++	pcie_wa_snps_case_01038891();
++
++	/* Select indirect access to CR PARA I/F instead of PRBI */
++	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
++
++	preboot_init_pcie_phy_fw_update();
++}
++
++void preboot_init_pcie(void)
++{
++	u64 start;
++
++	preboot_init_pcie_phy();
++
++	preboot_pcie_device_id_vendor_id_set();
++
++	/* Disable the EQ REDO */
++	regmap_writel(0x00402801, mmPCIE_DBI_GEN3_RELATED_OFF);
++
++	start = timestamp_get_us();
++
++	/* Wait for init_done before executing W/A */
++	while (!(regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_0) &&
++		 regmap_readl(mmPCIE_PHY_PHYX_SRAM_INIT_DONE_1))) {
++		/*
++		 * PCIe external load complete should take maximum of 300us
++		 * to complete. Including some grace period 576us of
++		 * timeout is used
++		 */
++		if (timeout_expired(start, PCIE_EXT_LD_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for ext_ld_done!");
++			break;
++		}
++	}
++
++	/* Execute the Synopsys W/A */
++	regmap_writel(0xF, mmPCIE_PHY_CR_PARA_CTRL);
++	regmap_writel(0x0004A07D, mmPCIE_PHY_CR_PARA_CMD);
++	udelay(20);
++
++	/* PCIe disable LTR */
++	preboot_disable_pcie_ltr();
++
++	/* Enable and Mask LTSSM (erratum 102) */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++void preboot_pcie_wait_for_link(void)
++{
++	u64 start = timestamp_get_us();
++
++	/* init dev id as soon as possible, while waiting for prstn */
++	preboot_device_id_init();
++
++	/* Wait for PRSTn */
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN)) {
++		/* If PRSTn does not happen in 5 seconds
++		 * timeout and return
++		 */
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PRSTn!\n");
++			return;
++		}
++	}
++
++	/* Only after PRSTn is de-asserted */
++	preboot_pcie_enable();
++
++	preboot_puts("Waiting for PCIe UP status\n");
++
++	/* Reset start timer */
++	start = timestamp_get_us();
++
++	while (1) {
++		unsigned int prstn, ltssm, smlh, rdlh;
++
++		prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++		ltssm = regmap_readl(mmPCIE_AUX_LTSSM_EN);
++		smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++		rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++		if (prstn && smlh && rdlh) {
++			preboot_puts("PCIe link is UP!\n");
++			break;
++		}
++
++		if (timeout_expired(start, PCIE_WAIT_TIMEOUT_US)) {
++			preboot_puts("Timed-out waiting for PCIe link UP!\n");
++			break;
++		}
++
++		/*
++		 * Some host assert prstn during link up while moving to GEN3
++		 * This cause BAR size to be reset
++		 * We stop link up process by disabling ltssm
++		 * till BAR is reconfigured
++		 */
++		if (!prstn && ltssm) {
++			regmap_writel(0, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++
++		if (prstn && !ltssm) {
++			regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++			continue;
++		}
++	}
++
++	/* W/A H/W bug that may lead to have a wrong mask (0x1) in LTSSM */
++	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
++}
++
++void halt_n_reset_arc(u8 id)
++{
++	u32 val, halt_ack_offset, halt_req_offset;
++	u32 retry = ARC_HALT_ACK_RETRIES;
++	u32 halt_mask, halt_ack_mask;
++	u32 rst_offset;
++	u32 cpu_boot_err_val;
++
++	if (id) {
++		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
++		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++
++	} else {
++		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
++		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++	}
++
++	val = regmap_readl(halt_ack_offset);
++	if (val & halt_mask) {
++		preboot_puts_hex("Skipping halt for ARC", id, false);
++	} else {
++		/* Halt ARC */
++		regmap_writel(BIT(1), halt_req_offset);
++		while (1) {
++			val = regmap_readl(halt_ack_offset);
++			if (val & halt_ack_mask)
++				break;
++			udelay(10);
++			retry--;
++			if (!retry) {
++				preboot_puts_hex("No ack from ARC", id, false);
++				cpu_boot_err_val = (!id) ?
++					CPU_BOOT_ERR0_ARC0_HALT_ACK_NOT_RCVD :
++					CPU_BOOT_ERR0_ARC1_HALT_ACK_NOT_RCVD;
++				cpu_boot_err_clrset(cpu_boot_err_val, true);
++				break;
++			}
++		}
++		regmap_writel(0x0, halt_req_offset);
++	}
++
++	/* Reset ARC */
++	regmap_writel(0x1, rst_offset);
++}
++
++void axi_enable_drain(void)
++{
++	u32 val;
++
++	/* Set timeout and enable drain */
++	regmap_writel(PSOC_AXI_DRAIN_TIMEOUT,
++			mmPSOC_GLOBAL_CONF_AXI_DRAIN_TIMEOUT);
++	val = regmap_readl(mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
++	val |= (0x1 << PSOC_GLOBAL_CONF_AXI_DRAIN_CTRL_EN_SHIFT);
++	regmap_writel(val, mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
++}
+diff --git a/arch/greco/common/greco.h b/arch/greco/common/greco.h
+index b4f755d..9382b7e 100644
+--- a/arch/greco/common/greco.h
++++ b/arch/greco/common/greco.h
+@@ -3,16 +3,45 @@
+  * Copyright (C) 2021 HabanaLabs Ltd.
+  */
+ 
+-#ifndef ARCH_GRECO_COMMON_H_
+-#define ARCH_GRECO_COMMON_H_
++#ifndef ARCH_GRECO_COMMON_GRECO_H_
++#define ARCH_GRECO_COMMON_GRECO_H_
+ 
+ #include <goya2/goya2.h>
+ 
+ #define ARC_RUN_ACK_TIMEOUT_US		100
++#define PSOC_AXI_DRAIN_TIMEOUT				0x4000 /* 16K cycles */
++#define PCIE_AXI_DRAIN_TIMEOUT				PSOC_AXI_DRAIN_TIMEOUT
++
++#define EFUSE_SYSCFG_WA_SNPS_CASE_01038891		BIT(23)
++
++#define PCIE_PHY_EXT_MPLLB_SSC_PEAK			0x5000
++#define PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE		0x19CE
++#define PCIE_PHY_EXT_MPLLA_SSC_PEAK			0x6666
++#define PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE		0x2108
++
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER		0x50
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR	0xA0
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER		0x7D
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0	0x30
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0	0x30
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0	0x30
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0	0x30
++
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW	0x1C3
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH	0x1C3
++
++#define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF	0x5555
++#define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF	0xFF
+ 
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
+ 
+ void run_arc(u8 id);
++void halt_n_reset_arc(u8 id);
++void axi_enable_drain(void);
+ 
+-#endif /* ARCH_GRECO_COMMON_H_ */
++#endif /* ARCH_GRECO_COMMON_GRECO_H_ */
+diff --git a/include/preboot.h b/include/preboot.h
+index 8a06503..7f797fc 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -212,6 +212,8 @@
+ u32 preboot_device_id_get(void);
+ bool is_pcie_initialized(void);
+ void preboot_init_pcie_phy_fw_update(void);
++void preboot_disable_pcie_ltr(void);
++void preboot_init_pcie_phy(void);
+ 
+ #endif /* __ASSEMBLY__ */
+ 

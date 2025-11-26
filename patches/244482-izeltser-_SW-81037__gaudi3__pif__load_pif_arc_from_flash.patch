@@ -1,0 +1,321 @@
+From dc98b38aac51dc6c9864339ce6b01ea5fd76bb43 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 14 Aug 2022 09:18:24 +0300
+Subject: [PATCH] [SW-81037] gaudi3: pif: load pif arc from flash
+
+PIF ARC firmware is stored on the SPI flash, ppboot is responsible
+for loading the FW from flash to the CCM memories, and starting
+the PIF ARC execution.
+
+PIF CCMs have some limitations, access time from psoc is quite slow
+and unaligned address access is not allowed. In addition they are
+connected on the LBW bus, it's not possible to use efficient copying
+engines such as psoc mem copy and spi dma.
+Therefore the images are copied from SPI Flash to ARC1 ICCM (SPI DMA),
+validated, and then copied using SW memcpy to the PIF CCMs.
+
+Change-Id: I321d0d9f2239344a2641a57a4cfdeb2757c44287
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index ed3844d..d2ee94b 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -25,11 +25,15 @@
+ #include <d0_parc_global_conf_masks.h>
+ #include <d0_pif_arc_special_regs.h>
+ #include <d0_g4_pci_pll_ctrl_regs.h>
++#include <d0_pif_arc_masks.h>
++#include <d0_parc_global_conf_regs.h>
++#include <d0_parc_global_conf_masks.h>
+ #include <d1_pcie_aux_regs.h>
+ #include <d1_pcie_core_regs.h>
+ #include <d1_pcie_dbi_sig_regs.h>
+ #include <d1_pif_arc_regs.h>
+ #include <d1_pif_arc_special_regs.h>
++#include <d1_psoc_boot_conf_regs.h>
+ #include <gaudi3_blocks_linux_driver.h>
+ 
+ #include <gaudi3/gaudi3_boot_info.h>
+@@ -39,6 +43,7 @@
+ 
+ #include "common.h"
+ #include <preboot.h>
++#include "hl.h"
+ #include <device.h>
+ #include <boot_if.h>
+ #include <uart.h>
+@@ -49,6 +54,17 @@
+ #include <address_space.h>
+ #include <boot_desc.h>
+ #include <boot_info.h>
++#include <pll.h>
++
++#define PIF_ARC_NUM_OF_MEM	2
++
++struct cpu_load_data {
++	u32 cpu_cfg_base;
++	u64 inter_buffer_addr;
++	enum gaudi3_die_id die_id;
++	enum hl_fw_img_type img_type[PIF_ARC_NUM_OF_MEM];
++	u8 img_idx;
++};
+ 
+ u32 hl_pll_timestamp_base_get(void)
+ {
+@@ -112,11 +128,6 @@
+ 	u32 rst_src = regmap_readl(mmD0_PSOC_GLOBAL_CONF_RST_SRC);
+ 
+ 	return gaudi3_rst_src_fixup(rst_src);
+-}
+-
+-void preboot_pcie_wait_for_link(void)
+-{
+-	/* TODO: implement pcie wait for link routine for gaudi3 */
+ }
+ 
+ void init_prstn(void)
+@@ -524,3 +535,211 @@
+ {
+ 	return boot_info_get(type, data, max_size, copy_size);
+ }
++
++#define CCM_TERMINATE_MASK	(D0_PIF_ARC_CCM_TERMINATE_D_EN_M | D0_PIF_ARC_CCM_TERMINATE_I_EN_M)
++#define PIF_CCM_TERM_OFF	(mmD0_PIF_ARC_CCM_TERMINATE - mmD0_PIF_ARC_BASE)
++
++static void pif_arc_mem_init(struct cpu_load_data *data, struct boot_desc *desc)
++{
++	u32 buff_addr;
++	u32 ccm_terminate_reg = data->cpu_cfg_base + PIF_CCM_TERM_OFF;
++	u32 mem_addr = ppboot_get_arc_addr(desc->loadaddr);
++
++	/* By default CCM termination is enabled, should be disabled when accessing the CCMs */
++	regmap_writel(~CCM_TERMINATE_MASK, ccm_terminate_reg);
++
++	buff_addr = ppboot_get_arc_addr(data->inter_buffer_addr);
++
++	/*
++	 * copying PIF_ARC_CCM_SIZE of bytes, in a single memcpy the image is copied
++	 * from ICCM1 to PIF CCM, and the rest of the PIF CCM is initialized.
++	 */
++	memcpy((void *)mem_addr, (void *)buff_addr, PIF_ARC_CCM_SIZE);
++	/* wait for all writes to complete */
++	while (!regmap_readl(mmD0_PIF_ARC_CONF_NO_WR_INFLIGHT))
++		;
++
++	regmap_writel(CCM_TERMINATE_MASK, ccm_terminate_reg);
++}
++
++static int pif_is_valid_image(struct cpu_load_data *data, struct boot_desc *pif_img_desc)
++{
++	struct boot_desc desc = {
++		.img_size = pif_img_desc->img_size,
++		.loadaddr = data->inter_buffer_addr,
++	};
++
++	memcpy(desc.chksum, pif_img_desc->chksum, SHA_SUM_LEN);
++
++	return ppboot_is_valid_img_desc(&desc);
++}
++
++static int ppboot_copy_pif_arc_img(struct cpu_load_data *data)
++{
++	struct boot_desc desc;
++	enum dma_error dma_err;
++	enum dma_dest_type dma_type;
++	enum hl_fw_img_type img_type;
++	u32 idx;
++
++	img_type = data->img_type[data->img_idx];
++	idx = boot_desc_get_img_desc(FLOPS_UPD_NOOP, img_type, &desc);
++	if (idx == HL_FW_IMG_NOT_FOUND) {
++		preboot_puts("image not found, err loading pif fw\n");
++		return -1;
++	}
++
++	dma_type = preboot_get_dma_dest_type(data->inter_buffer_addr);
++	dma_err = dma_copy_image_v2(desc.img_size, desc.spi_offset, data->inter_buffer_addr,
++				    dma_type, false);
++	if (dma_err != DMA_SUCCESS) {
++		preboot_puts("failed copying pif fw from flash\n");
++		return -1;
++	}
++
++	if (!pif_is_valid_image(data, &desc)) {
++		preboot_puts("pif fw hash validation failed\n");
++		return -1;
++	}
++
++	pif_arc_mem_init(data, &desc);
++
++	return 0;
++}
++
++#define PIF_RUN_HALT_REQ_OFF	(mmD0_PIF_ARC_RUN_HALT_REQ - mmD0_PIF_ARC_BASE)
++#define PIF_RUN_HALT_ACK_OFF	(mmD0_PIF_ARC_RUN_HALT_ACK - mmD0_PIF_ARC_BASE)
++#define ARC_RUN_ACK_TIMEOUT_US	100
++
++static void ppboot_run_pif_arc(struct cpu_load_data *data)
++{
++	u32 run_ack_reg = data->cpu_cfg_base + PIF_RUN_HALT_ACK_OFF;
++	u32 run_req_reg = data->cpu_cfg_base + PIF_RUN_HALT_REQ_OFF;
++	u64 start;
++
++	/* Set ARC in running state */
++	regmap_writel(D0_PIF_ARC_RUN_HALT_REQ_RUN_REQ_M, run_req_reg);
++
++	start = timestamp_get_us();
++	while (!(regmap_readl(run_ack_reg) & D0_PIF_ARC_RUN_HALT_ACK_RUN_ACK_M)) {
++		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
++			preboot_puts_hex("No running state ack from PIF ARC ",
++					 data->die_id, false);
++			break;
++		}
++	}
++
++	regmap_writel(0x0, run_req_reg);
++}
++
++#define PIF_ARC_RST_OFF		(mmD0_PIF_ARC_ARC_RST - mmD0_PIF_ARC_BASE)
++#define ARC_HALT_ACK_TIMEOUT_US	100
++
++static void ppboot_halt_n_reset_pif_arc(u32 cpu_cfg_base)
++{
++	u32 halt_ack_reg = cpu_cfg_base + PIF_RUN_HALT_ACK_OFF;
++	u32 halt_req_reg = cpu_cfg_base + PIF_RUN_HALT_REQ_OFF;
++	u32 rst_reg = cpu_cfg_base + PIF_ARC_RST_OFF;
++	u32 val;
++	u64 start;
++
++	/* Check if already in reset state */
++	val = regmap_readl(rst_reg);
++	if (val & D0_PIF_ARC_ARC_RST_CORE_M)
++		return;
++
++	val = regmap_readl(halt_ack_reg);
++	if (!(val & D0_PIF_ARC_RUN_HALT_ACK_SYS_HALT_R_M)) {
++		/* Halt ARC incase it is not halted already */
++		regmap_writel(D0_PIF_ARC_RUN_HALT_REQ_HALT_REQ_M, halt_req_reg);
++		start = timestamp_get_us();
++		while (true) {
++			val = regmap_readl(halt_ack_reg);
++			if (val & D0_PIF_ARC_RUN_HALT_ACK_HALT_ACK_M)
++				break;
++
++			if (timeout_expired(start, ARC_HALT_ACK_TIMEOUT_US)) {
++				preboot_puts("No halt state ack from PIF ARC\n");
++				break;
++			}
++		}
++		regmap_writel(0x0, halt_req_reg);
++	}
++
++	/* Reset ARC */
++	regmap_writel(D0_PIF_ARC_ARC_RST_CORE_M, rst_reg);
++}
++
++#define PIF_RST_VEC_ADDR_OFF	(mmD0_PIF_ARC_RST_VEC_ADDR - mmD0_PIF_ARC_BASE)
++#define PIF_ARC_ICCM_IDX	0
++#define PIF_ARC_DCCM_IDX	1
++
++static void ppboot_load_and_run_pif_arc(struct cpu_load_data *data)
++{
++	u32 rst_vec_reg = data->cpu_cfg_base + PIF_RST_VEC_ADDR_OFF;
++	u32 rst_reg = data->cpu_cfg_base + PIF_ARC_RST_OFF;
++
++	ppboot_halt_n_reset_pif_arc(data->cpu_cfg_base);
++
++	/*
++	 * Program Reset vector address for PIF ARC to ICCM 0x0 location
++	 * where vector table first entry will be available and then
++	 * bring PIF ARC out of reset. ARC when out of reset is by default
++	 * in halt state.
++	 */
++	regmap_writel(ARC_RST_VEC_ADDR, rst_vec_reg);
++	regmap_writel(D0_PIF_ARC_ARC_RST_PRESETDBGN_M, rst_reg);
++
++	if (hl_rst_src_get() == HL_COLD_RST) {
++		if (!boot_desc_init()) {
++			preboot_puts("No boot desc, err loading pif fw\n");
++			return;
++		}
++
++		data->img_idx = PIF_ARC_ICCM_IDX;
++		if (ppboot_copy_pif_arc_img(data)) {
++			preboot_puts("Error loading pif ICCM fw\n");
++			return;
++		}
++
++		data->img_idx = PIF_ARC_DCCM_IDX;
++		if (ppboot_copy_pif_arc_img(data)) {
++			preboot_puts("Error loading pif DCCM fw\n");
++			return;
++		}
++	}
++
++	ppboot_run_pif_arc(data);
++}
++
++static bool hl_is_slave_pif_isolated(void)
++{
++	return !!regmap_readl(mmD1_PSOC_BOOT_CONF_D1_PIF_ISO);
++}
++
++void preboot_pcie_wait_for_link(void)
++{
++	struct cpu_load_data load_data = {
++		.cpu_cfg_base = mmD0_PIF_ARC_BASE,
++		.img_type[PIF_ARC_ICCM_IDX] = HL_FW_IMG_D0_PIF_ICCM,
++		.img_type[PIF_ARC_DCCM_IDX] = HL_FW_IMG_D0_PIF_DCCM,
++		.inter_buffer_addr = ARC1_ICCM_FULL_BASE,
++		.die_id = GAUDI3_MASTER_DIE_ID,
++	};
++
++	ppboot_load_and_run_pif_arc(&load_data);
++
++	if (!hl_is_dual_die_sku())
++		return;
++
++	if (hl_is_slave_pif_isolated())
++		return;
++
++	load_data.cpu_cfg_base = mmD1_PIF_ARC_BASE;
++	load_data.img_type[PIF_ARC_ICCM_IDX] = HL_FW_IMG_D1_PIF_ICCM;
++	load_data.img_type[PIF_ARC_DCCM_IDX] = HL_FW_IMG_D1_PIF_DCCM;
++	load_data.die_id = GAUDI3_SLAVE_DIE_ID;
++	ppboot_load_and_run_pif_arc(&load_data);
++
++	/* TODO: if slave pif is isolated, load and run d1 psoc arc (SW-98975) */
++}
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 79a4e49..d486669 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -79,5 +79,10 @@
+ 
+ #define PIF_ARC_ICCM_LOCAL_BASE		0
+ #define PIF_ARC_DCCM_LOCAL_BASE		0x80000000
++#define D0_PIF_ARC_ICCM_BASE		0xFC419000
++#define D0_PIF_ARC_DCCM_BASE		0xFC41A000
++#define D1_PIF_ARC_ICCM_BASE		0xFCC19000
++#define D1_PIF_ARC_DCCM_BASE		0xFCC1A000
++#define PIF_ARC_CCM_SIZE		SZ_4K
+ 
+ #endif /* COMMON_GAUDI3_ARC_GNU_H_ */
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 9c56d54..ce0ea44 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -21,6 +21,11 @@
+ 	HL_ECC_DERR_RST = 256
+ };
+ 
++enum gaudi3_die_id {
++	GAUDI3_MASTER_DIE_ID,
++	GAUDI3_SLAVE_DIE_ID,
++};
++
+ u32 hl_get_die_id(void);
+ bool hl_is_dual_die_sku(void);
+ u64 gaudi3_dma_addr_fixup(u64 loadaddr);

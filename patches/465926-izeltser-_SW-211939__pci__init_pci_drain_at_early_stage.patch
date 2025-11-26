@@ -1,0 +1,103 @@
+From e1028d5e3e90b138b2e8eb2a5d1f20395d8a2927 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 11 Dec 2024 12:27:10 +0200
+Subject: [PATCH] [SW-211939] pci: init pci drain at early stage
+
+Until now PCI drain was initialized after pci init, which might be too
+late. it is moved to early init stage.
+In addition, in gaudi3, the pci init code is accessing pcos regs from
+the PIF ARC and we see that sometimes there is a drain, probably because
+PLLs are not initialized yet. To solve this the PCI LBW drain timeout is
+increased for gaudi3.
+
+Change-Id: I4c35981dbd3220fbc601818f74daa5ca379c56cd
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 4664fc6..84606b1 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -244,8 +244,6 @@
+ 
+ __weak void hl_init_pcie_phy_fw(void) {}
+ 
+-__weak void ppboot_pcie_drain_init(void) {}
+-
+ __weak void hl_plat_init(void) {}
+ __weak void ppboot_send_version(void) {}
+ 
+@@ -356,7 +354,6 @@
+ 		hl_pcie_enable_elbi_access();
+ 	ppboot_time_critical_section_end();
+ 	/**********time critical section end************/
+-	ppboot_pcie_drain_init();
+ 	hl_check_pcie_link_up_by_erom();
+ 	ppboot_version();
+ 	rst_src_dump();
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 74ed06c..678834e 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -216,7 +216,7 @@
+ 			   mmPMMU_PCIE_WRAP_LBW_DRAIN_CFG);
+ }
+ 
+-void ppboot_pcie_drain_init(void)
++static void ppboot_pcie_drain_init(void)
+ {
+ 	plat_pcie_drain_init();
+ }
+@@ -280,6 +280,7 @@
+ void hl_plat_early_init(void)
+ {
+ 	hl_psoc_drain_init();
++	ppboot_pcie_drain_init();
+ 	hl_init_cpu_ids();
+ 	hl_lbw_early_write_resp_enable();
+ 	hl_dev_pll_init();
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 8eaefb8..f015f48 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -196,6 +196,7 @@
+ 		cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ 
+ 	gaudi2_axi_drain_ena();
++	ppboot_pcie_drain_init();
+ 
+ 	/* set reset source */
+ 	hl_reset_src_init();
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 3990446..3a6c448 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -138,6 +138,7 @@
+ 		cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_IATU_CONF_EN);
+ 
+ 	gaudi2_axi_drain_ena();
++	ppboot_pcie_drain_init();
+ 
+ 	/* set reset source */
+ 	hl_reset_src_init();
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 0718c37..38eb258 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -334,7 +334,7 @@
+ To be reverted after root cause is identified */
+ 
+ #define HBW_DRAIN_TIMEOUT	0xF0000
+-#define LBW_DRAIN_TIMEOUT	0xF000
++#define LBW_DRAIN_TIMEOUT	0xF0000
+ 
+ void ppboot_pcie_drain_init(void)
+ {
+@@ -382,6 +382,7 @@
+ void hl_plat_early_init(void)
+ {
+ 	hl_psoc_drain_init();
++	ppboot_pcie_drain_init();
+ 	hl_lbw_early_write_resp_enable(true);
+ 	init_prstn();
+ 	hl_dev_cpu_pll_init();

@@ -1,0 +1,137 @@
+From 36f4dfda0234682103b9fd239df89d8399475948 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 01 Dec 2021 16:25:54 +0200
+Subject: [PATCH] [SW-64797] gaudi2: sec: refactor security enabled
+
+Currently pcie dev id is hardcoded for gaudi2. In order to support a
+dedicated pcie dev id for a secured device, we require to read the
+sec_en bit from efuse.
+
+The code to initialize the pcie dev id is also compiled as a part of
+erom binaries (recovery and pcie). This creates an chain of dependency
+of erom compilation to security.c. Hence the code is refactored such
+that these functions which are a part of erom, ppboot and preboot
+compilation are moved to the common.c file.
+
+This is in preparation to support dedicated pcie dev id for secured
+devices.
+
+Change-Id: If66dc1adba02954e10ca9f236de94695ae4cec00
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 26b6468..723af20 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -39,6 +39,7 @@
+ #include <pci.h>
+ #include <hl.h>
+ #include <address_space.h>
++#include <gaudi2/gaudi2_security.h>
+ 
+ #define PRODUCT_ID_STR_SIZE	0x8
+ 
+@@ -422,3 +423,29 @@
+ {
+ 	return gaudi2_translate_addr(addr);
+ }
++
++u32 sp_sram_readl(u32 offset)
++{
++	u32 reg = *((volatile u32 *) (HL_SCRATCHPAD_SRAM_BASE + offset));
++	return reg;
++}
++
++#define EFUSE_SYSCFG_ENABLE_VALIDATION_MASK	BIT(10)
++#define EFUSE_SYSCFG_SECURITY_EN_MASK		BIT(15)
++
++static bool preboot_sec_efuse_is_set(u32 mask)
++{
++	u32 config_efuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
++
++	return !!(config_efuse & mask);
++}
++
++bool preboot_security_is_enabled(void)
++{
++	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK);
++}
++
++bool preboot_img_validation_is_enabled(void)
++{
++	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
++}
+diff --git a/arch/gaudi2/arc/security.c b/arch/gaudi2/arc/security.c
+index 36a6858..f0a0d0c 100644
+--- a/arch/gaudi2/arc/security.c
++++ b/arch/gaudi2/arc/security.c
+@@ -12,32 +12,6 @@
+ #include <sha512.h>
+ #include <gaudi2/gaudi2_security.h>
+ 
+-#define EFUSE_SYSCFG_ENABLE_VALIDATION_MASK	BIT(10)
+-#define EFUSE_SYSCFG_SECURITY_EN_MASK		BIT(15)
+-
+-static u32 sp_sram_readl(u32 offset)
+-{
+-	u32 reg = *((volatile u32 *) (HL_SCRATCHPAD_SRAM_BASE + offset));
+-	return reg;
+-}
+-
+-static bool preboot_sec_efuse_is_set(u32 mask)
+-{
+-	u32 config_efuse = sp_sram_readl(SECURITY_EFUSE_SYS_CFG_OFFSET);
+-
+-	return !!(config_efuse & mask);
+-}
+-
+-bool preboot_security_is_enabled(void)
+-{
+-	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_SECURITY_EN_MASK);
+-}
+-
+-bool preboot_img_validation_is_enabled(void)
+-{
+-	return preboot_sec_efuse_is_set(EFUSE_SYSCFG_ENABLE_VALIDATION_MASK);
+-}
+-
+ bool preboot_security_key_is_revoked(int key_idx)
+ {
+ 	u32 key_revoke;
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index eca8b59..3b5afcb 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -55,6 +55,7 @@
+ #include <pll.h>
+ #include <pci.h>
+ #include <boot_if.h>
++#include <spi_flash.h>
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+diff --git a/arch/greco/arc/security.c b/arch/greco/arc/security.c
+index 4413e4b..4255fa3 100644
+--- a/arch/greco/arc/security.c
++++ b/arch/greco/arc/security.c
+@@ -39,7 +39,7 @@
+ 	preboot_secure_arc();
+ }
+ 
+-static u32 sp_sram_readl(u32 offset)
++u32 sp_sram_readl(u32 offset)
+ {
+ 	u32 reg = *((volatile u32 *) (HL_SCRATCHPAD_SRAM_BASE + offset));
+ 	return reg;
+diff --git a/include/preboot.h b/include/preboot.h
+index 8543dbc..4cd55f7 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -162,6 +162,7 @@
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);
++u32 sp_sram_readl(u32 offset);
+ 
+ struct preboot_fuse_ver_data {
+ 	char *table_ver;

@@ -1,0 +1,203 @@
+From 3ea74afef3832ee5ea328a564433eafcfe1e3f3d Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 19 Jan 2021 20:37:55 +0200
+Subject: [PATCH] [SW-20810] fit: lzo: add decompression support
+
+Add LZO decompression support for FIT images.
+
+Agents wrapped with FIT are loaded to the device via a slow
+interface (I2C).
+Without compression, loading a simple agent take 140s while
+the same compressed agent transferred in 25s.
+
+LZO is not enabled for Goya2
+
+Change-Id: I484f2c1f7cd3f33e5f2b0c3e564ebea15f14aa0a
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 4deff31..63c9554 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,6 +25,7 @@
+ 
+ PREBOOT_SRCS_C := $(shell ls common/*.c)
+ PREBOOT_SRCS_C += $(shell ls preboot/*.c)
++PREBOOT_SRCS_C += $(shell ls lzo/*.c)
+ PREBOOT_SRCS_C := $(filter-out preboot/thermal_v2.c, $(PREBOOT_SRCS_C))
+ PPBOOT_SRCS_C := $(shell ls common/*.c)
+ PPBOOT_SRCS_C += $(shell ls ppboot/*.c)
+diff --git a/goya2/common.c b/goya2/common.c
+index 2a22d2e..e0c376d 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -501,6 +501,13 @@
+ 		memcpy((void *)dst, buf, len);
+ }
+ 
++int preboot_decompress_image(u64 dst, const void *buf, int len,
++			     const char *arch, const char *compression)
++{
++	preboot_puts("Compression is not supported\n");
++	return 1;
++}
++
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	preboot_puts_hex_raw("Preboot loadaddr: ",
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index 7d520be..a63d749 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -157,6 +157,13 @@
+ 	memcpy((void *)arc_dst, buf, len);
+ }
+ 
++int preboot_decompress_image(u64 dst, const void *buf, int len,
++			     const char *arch, const char *compression)
++{
++	preboot_puts("Compression is not supported\n");
++	return 1;
++}
++
+ void preboot_start_image(u64 startaddr)
+ {
+ 	void (*image_entry)(void);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 8609515..09a5534 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -12,6 +12,7 @@
+ #include <boot_if.h>
+ #include <fit_load_type.h>
+ #include <boot_info.h>
++#include <lzo/lzo.h>
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
+@@ -30,6 +31,7 @@
+ #define FIT_LOADADDR_PROP	"loadaddr"
+ #define FIT_STARTADDR_PROP	"startaddr"
+ #define FIT_ARCH_PROP		"arch"
++#define FIT_COMPRESSION_PROP	"compression"
+ 
+ #define FIT_SEC_VERSION		"hl-sec-version"
+ #define FIT_SEC_KEY_IDX		"hl-sec-key-idx"
+@@ -48,6 +50,12 @@
+ #define IMAGE_MAX_HASHED_NODES	20
+ 
+ #define FIT_MAX_IMAGES		8
++
++/*
++ * For checking decompressed image bounderies, assume the compression factor to
++ * be 5 times bigger than the compressed data.
++ */
++#define COMPRESSION_FACTOR	5
+ 
+ struct fit_image {
+ 	u64 loadaddr;
+@@ -74,6 +82,31 @@
+ 			       const char *arch)
+ {
+ 	memcpy((void *)(uintptr_t)dst, buf, len);
++}
++
++__weak int preboot_decompress_image(u64 dst, const void *buf, int len,
++				    const char *arch, const char *cmpr)
++{
++	void *dstptr = (void *)(uintptr_t)dst;
++	size_t dst_len = SIZE_MAX;
++	int err;
++
++	if (!strcmp(cmpr, "lzo")) {
++		preboot_puts_raw("LZO decompressing ");
++		err = lzop_decompress(buf, len, dstptr, &dst_len);
++		if (err)
++			preboot_puts_hex("error: ", -err, false);
++		else
++			preboot_puts_hex("done ", dst_len, false);
++
++		return err;
++	}
++
++	preboot_puts_raw("Unknown compression method: ");
++	preboot_puts_raw(cmpr);
++	preboot_puts("\n");
++
++	return 1;
+ }
+ 
+ __weak bool preboot_security_is_enabled(void)
+@@ -510,14 +543,20 @@
+ 	return 0;
+ }
+ 
+-static void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
++static int fit_copy_image(u64 dst, const void *buf, int len, const char *arch,
++			  const char *cmpr)
+ {
+ 	preboot_puts_raw("FIT loadaddr: 0x");
+ 	if (sizeof(void *) > sizeof(u32))
+ 		preboot_puth_raw((u32)(dst >> 32), false);
+ 	preboot_puth((u32)dst, false);
+ 
+-	preboot_copy_image(dst, buf, len, arch);
++	if (!strcmp(cmpr, "none")) {
++		preboot_copy_image(dst, buf, len, arch);
++		return 0;
++	}
++
++	return preboot_decompress_image(dst, buf, len, arch, cmpr);
+ }
+ 
+ static bool fit_load_is_runnable(const void *fit, int conf)
+@@ -548,10 +587,11 @@
+ 
+ static enum fit_load_result fit_copy_images(const void *fit)
+ {
+-	int node, len;
++	int node, len, image_len;
+ 	int conf, num_images, i;
+ 	const u8 *buf;
+ 	u64 load, start;
++	const char *cmpr;
+ 
+ 	/* Get number of images in preboot configuration */
+ 	conf = fit_find_config_node(fit);
+@@ -591,7 +631,24 @@
+ 			return FIT_LOAD_CORRUPTED;
+ 		}
+ 
+-		if (!preboot_is_valid_address_range(load, len)) {
++		cmpr = (const char *)fdt_getprop(fit, node,
++						 FIT_COMPRESSION_PROP,
++						 NULL);
++		if (!cmpr) {
++			/*
++			 * mkimage is adding compression, if it's missing then
++			 * something is wrong.
++			 */
++			preboot_puts_hex("Wrong FIT format: missing compression: ", i, false);
++			return FIT_LOAD_CORRUPTED;
++		}
++
++		if (!strcmp(cmpr, "none"))
++			image_len = len;
++		else
++			image_len = len * COMPRESSION_FACTOR;
++
++		if (!preboot_is_valid_address_range(load, image_len)) {
+ 			preboot_puts_hex("FIT: invalid load address for image: ", i, false);
+ 			return FIT_LOAD_CORRUPTED;
+ 		}
+@@ -606,7 +663,8 @@
+ 		images[i].loadaddr = load;
+ 		images[i].startaddr = start;
+ 
+-		fit_copy_image(load, buf, len, images[i].arch);
++		if (fit_copy_image(load, buf, len, images[i].arch, cmpr))
++			return FIT_LOAD_CORRUPTED;
+ 	}
+ 
+ 	preboot_security_sp_sram_write_key_idx(&preboot_key_idx);

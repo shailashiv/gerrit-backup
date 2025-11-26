@@ -1,0 +1,218 @@
+From 0687f3eeb6db8d1c364a864b683da2dd8d976d15 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 08 Jul 2024 15:26:36 +0300
+Subject: [PATCH] [FSW-7134] boot_desc: use dev spec descriptor parsing
+
+For FS1 the descriptor structure will change significantly, so the
+common parsing code of the descriptor used for G2/G3 can't be used
+for FS1. As a preparation for the new descriptor structure, the
+code parsing the descriptor is moved to device specific code, and in the
+following patch the implementation for FS1 will be added.
+
+Change-Id: Ia9eed3a8c4b71aa66f875730f6fb9f9b84c655c5
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 729ef0f..3774e25 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -44,6 +44,7 @@
+ #include <iopoll.h>
+ #include <pll.h>
+ #include <efuse.h>
++#include <boot_desc.h>
+ #include "common.h"
+ #include "hl.h"
+ 
+@@ -498,3 +499,10 @@
+ 
+ 	return 0;
+ }
++
++u32 dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
++			  struct boot_desc *desc)
++{
++	/* TODO: parse FS1 descriptor */
++	return 0;
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 21a1e96..f3cc25f 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -67,6 +67,7 @@
+ #include <spi_flash.h>
+ #include <boot_info.h>
+ #include <hl_boot_desc.h>
++#include <boot_desc.h>
+ #include <efuse.h>
+ 
+ #define PCIE_LTR_DISABLE		0
+@@ -1379,3 +1380,32 @@
+ 
+ 	return true;
+ }
++
++bool dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	if (img_desc->idx >= 2)
++		return false;
++
++	return true;
++}
++
++u32 dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
++			  struct boot_desc *desc)
++{
++	u32 idx = desc_ptr->idx;
++
++	if (upd_status == FLOPS_UPD_PENDING)
++		idx = (idx + 1) % 2;
++
++	preboot_puts_hex(" - found! using index: ", idx, false);
++	desc->spi_offset = desc_ptr->offset[idx];
++	desc->img_size = desc_ptr->size[idx];
++	desc->loadaddr = ((u64)desc_ptr->load_high[idx] << 32) | desc_ptr->load_low[idx];
++	desc->desc_ver = desc_ptr->desc_ver;
++	if (desc->desc_ver >= MULTI_CSUM_BOOT_VER)
++		memcpy(desc->chksum, desc_ptr->chksum2[idx], ARRAY_SIZE(desc->chksum));
++	else
++		memcpy(desc->chksum, desc_ptr->chksum[idx], ARRAY_SIZE(desc->chksum));
++
++	return idx;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index b5ef9ce..2f9a0fc 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1552,3 +1552,32 @@
+ 			preboot_puts("please perform cold reset\n");
+ 		}
+ }
++
++bool dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	if (img_desc->idx >= 2)
++		return false;
++
++	return true;
++}
++
++u32 dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
++			  struct boot_desc *desc)
++{
++	u32 idx = desc_ptr->idx;
++
++	if (upd_status == FLOPS_UPD_PENDING)
++		idx = (idx + 1) % 2;
++
++	preboot_puts_hex(" - found! using index: ", idx, false);
++	desc->spi_offset = desc_ptr->offset[idx];
++	desc->img_size = desc_ptr->size[idx];
++	desc->loadaddr = ((u64)desc_ptr->load_high[idx] << 32) | desc_ptr->load_low[idx];
++	desc->desc_ver = desc_ptr->desc_ver;
++	if (desc->desc_ver >= MULTI_CSUM_BOOT_VER)
++		memcpy(desc->chksum, desc_ptr->chksum2[idx], ARRAY_SIZE(desc->chksum));
++	else
++		memcpy(desc->chksum, desc_ptr->chksum[idx], ARRAY_SIZE(desc->chksum));
++
++	return idx;
++}
+diff --git a/include/boot_desc.h b/include/boot_desc.h
+index 6134a04..fe721b4 100644
+--- a/include/boot_desc.h
++++ b/include/boot_desc.h
+@@ -14,6 +14,11 @@
+ #include <sha.h>
+ 
+ #define HL_FW_IMG_NOT_FOUND	((u32)-1)
++/*
++ * from this version, 2 checksums are present in desc. per device the relevant checksum should be
++ * used.
++ */
++#define MULTI_CSUM_BOOT_VER	3
+ 
+ struct boot_desc {
+ 	u32 desc_ver;
+@@ -46,5 +51,8 @@
+ 			   enum hl_fw_img_type type, struct boot_desc *desc);
+ 
+ bool is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs);
++bool dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc);
++u32 dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
++			  struct boot_desc *desc);
+ 
+ #endif /* _BOOT_DESC_H_ */
+diff --git a/lib/common/boot_desc.c b/lib/common/boot_desc.c
+index 031240b..4c2f033 100644
+--- a/lib/common/boot_desc.c
++++ b/lib/common/boot_desc.c
+@@ -39,6 +39,8 @@
+ 	preboot_puts_hex(" value: ", magic->val, true);
+ }
+ 
++__weak bool dev_spec_img_desc_is_valid(struct hl_fw_img_desc *img_desc) { return true; }
++
+ static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+ {
+ 	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
+@@ -49,10 +51,7 @@
+ 	if (img_desc->desc_ver == 0 || img_desc->desc_ver == ~0)
+ 		return false;
+ 
+-	if (img_desc->idx >= 2)
+-		return false;
+-
+-	return true;
++	return dev_spec_img_desc_is_valid(img_desc);
+ }
+ 
+ __weak int ppboot_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size) { return 1; }
+@@ -163,11 +162,18 @@
+ 
+ #endif /* BOOT_DESC_SRC_BOOT_INFO */
+ 
+-#define MULTI_CSUM_BOOT_VER	3
++__weak u32 dev_spec_get_img_desc(struct hl_fw_img_desc *desc_ptr, enum fw_post_reset_cmd upd_status,
++				 struct boot_desc *desc)
++{
++	preboot_puts("error: dev spec get img desc not implemented\n");
++
++	return HL_FW_IMG_NOT_FOUND;
++}
++
+ u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+ 			   enum hl_fw_img_type type, struct boot_desc *desc)
+ {
+-	int i, idx;
++	int i, ret;
+ 	struct hl_fw_img_desc *desc_ptr;
+ 
+ 	preboot_puts_hex_raw("Looking for image type: ", type, false);
+@@ -176,24 +182,9 @@
+ 		if (desc_ptr->magic.type != type)
+ 			continue;
+ 
+-		idx = desc_ptr->idx;
+-		if (upd_status == FLOPS_UPD_PENDING)
+-			idx = (idx + 1) % 2;
++		ret = dev_spec_get_img_desc(desc_ptr, upd_status, desc);
+ 
+-		preboot_puts_hex(" - found! using index: ", idx, false);
+-		desc->spi_offset = desc_ptr->offset[idx];
+-		desc->img_size = desc_ptr->size[idx];
+-		desc->loadaddr = ((u64)desc_ptr->load_high[idx] << 32) |
+-					desc_ptr->load_low[idx];
+-		desc->desc_ver = desc_ptr->desc_ver;
+-		if (desc->desc_ver >= MULTI_CSUM_BOOT_VER)
+-			memcpy(desc->chksum, desc_ptr->chksum2[idx],
+-			       ARRAY_SIZE(desc->chksum));
+-		else
+-			memcpy(desc->chksum, desc_ptr->chksum[idx],
+-			       ARRAY_SIZE(desc->chksum));
+-
+-		return idx;
++		return ret;
+ 	}
+ 
+ 	preboot_puts(" - not found!\n");

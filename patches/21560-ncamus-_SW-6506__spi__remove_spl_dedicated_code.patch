@@ -1,0 +1,104 @@
+From df6d799ce4dffa249791cb929ca472cae085a860 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sat, 16 Nov 2019 15:58:57 +0200
+Subject: [PATCH] [SW-6506] spi: remove spl dedicated code
+
+turn this to be generic spi copy operation from any offset to any
+destination memory
+
+Change-Id: I57c8deece1ba13f3bd795d1a7893010f4f5e9f03
+---
+
+diff --git a/common/preboot.c b/common/preboot.c
+index ab5ebcd..45127ca 100644
+--- a/common/preboot.c
++++ b/common/preboot.c
+@@ -80,11 +80,11 @@
+ 
+ static void preboot_copy_spl(void)
+ {
+-	unsigned int  spl_offset;
++	unsigned int spl_offset;
+ 
+ 	preboot_copy_prepare(&spl_offset);
+ 
+-	spi_copy_spl(spl_offset);
++	spi_copy((void *)SPL_TEXT_BASE, spl_offset, SPL_SIZE, "SPL");
+ }
+ 
+ static void preboot_pcie_init(void)
+diff --git a/common/preboot.h b/common/preboot.h
+index 264fd44..e9cf901 100644
+--- a/common/preboot.h
++++ b/common/preboot.h
+@@ -27,6 +27,7 @@
+ 
+ #define PREBOOT_VER_BASE			(SPL_TEXT_BASE - 0x1000)
+ 
++#define SPL_SIZE		0x10000		/* 64KB */
+ #define HL_UART_BAUDRATE	115200
+ #define HL_SPI_FLASH_MAX_FREQ	25000000
+ 
+diff --git a/common/spi.c b/common/spi.c
+index 41a50ba..6d2d94d 100644
+--- a/common/spi.c
++++ b/common/spi.c
+@@ -14,7 +14,6 @@
+ #include "spi.h"
+ #include "uart.h"
+ 
+-#define SPL_SIZE			0x10000		/* 64KB */
+ #define CMD_WRITE_STATUS		0x01
+ #define CMD_READ			0x03
+ #define CMD_WRITE_DISABLE		0x04
+@@ -175,16 +174,15 @@
+ 	return sr;
+ }
+ 
+-static void spi_read_spl(unsigned int offset)
++static void spi_read(void *dst, unsigned int offset, unsigned int size)
+ {
+-	void *dst = (void *)SPL_TEXT_BASE;
+ 	unsigned int cmd = (CMD_READ << 24) | offset;
+ 	int i;
+ 
+ 	spi_claim_bus();
+ 	spi_dev_update_frame_size(sizeof(cmd));
+ 	spi_dev_dword_cmd(cmd, NULL);
+-	for (i = 0; i < SPL_SIZE; i += sizeof(unsigned int))
++	for (i = 0; i < size; i += sizeof(unsigned int))
+ 		spi_dev_dword_cmd(0, dst + i);
+ 	spi_dev_dword_cmd(0, NULL);
+ 	spi_release_bus();
+@@ -207,14 +205,15 @@
+ 	regmap_writel(0x00000001, mmPSOC_SPI_SSIENR);
+ }
+ 
+-void spi_copy_spl(unsigned int spl_offset)
++void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name)
+ {
+ 	unsigned char sr;
+ 
+ 	spi_init();
+-	spi_read_spl(spl_offset);
++	spi_read(dst, offset, size);
+ 	sr = spi_prot();
+-	preboot_puts("SPL copying from flash is completed\n");
++	preboot_puts(name);
++	preboot_puts(" copying from flash is completed\n");
+ 	if ((sr & PROT_MASK) == PROT_MASK)
+ 		preboot_puts("Flash may be protected, depend on WP# signal\n");
+ 	else
+diff --git a/common/spi.h b/common/spi.h
+index bba7f04..ebbbac6 100644
+--- a/common/spi.h
++++ b/common/spi.h
+@@ -8,7 +8,7 @@
+ #ifndef _HL_SPI_H_
+ #define _HL_SPI_H_
+ 
+-void spi_copy_spl(unsigned int spl_offset);
++void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name);
+ u32 get_cs_pad_sel(void);
+ 
+ #endif /* _HL_SPI_H_ */

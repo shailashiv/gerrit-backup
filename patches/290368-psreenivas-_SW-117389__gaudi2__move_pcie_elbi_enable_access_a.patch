@@ -1,0 +1,73 @@
+From c605a4fea01fff49ec30091024685ce4e4550ed0 Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Mon, 16 Jan 2023 12:14:04 +0200
+Subject: [PATCH] [SW-117389] gaudi2: move pcie elbi enable access after init
+
+Due to time constraint in bringing pcie link it is decided to
+store ppboot hash into tpm PCR after invoking arc0 to initialize
+pcie link up in ppboot and the pcie elbi access should be
+enabled after storing the hash hence moving pcie elbi access
+after pcie init. The ppboot tpm extended storing is added
+in later patch.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: I34066ddf448d4291a33465a51f1cf2a0cb15f3e8
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index c47b2e4..c52abdc 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -190,11 +190,13 @@
+ }
+ 
+ __weak void ppboot_log_waiting_for_pcie(void) {}
++static bool link_is_up;
+ 
+ void hl_pcie_init(void)
+ {
+ 	if (hl_pcie_link_up()) {
+ 		hl_pcie_enable_access();
++		link_is_up = true;
+ 		preboot_puts("PCIe link is already UP!\n");
+ 		return;
+ 	}
+@@ -302,6 +304,7 @@
+ __weak void hl_sram_self_repair(void) {}
+ __weak void ppboot_init_fw_info(void) {}
+ __weak void ppboot_plls_init(void) {}
++__weak void hl_pcie_enable_elbi_access(void) {}
+ 
+ void ppboot_main(void)
+ {
+@@ -332,6 +335,8 @@
+ 	spi_flash_prot_early();
+ 	ppboot_security_init();
+ 	hl_pcie_init();
++	if (link_is_up)
++		hl_pcie_enable_elbi_access();
+ 	ppboot_time_critical_section_end();
+ 	/**********time critical section end************/
+ 	ppboot_pcie_drain_init();
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 743ee9a..2777498 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -941,12 +941,16 @@
+ #define RR_PRIV_HIT_RESET_VAL		0x3FFFF
+ #define PCIE_WRAP_OUTBOUND_MASK		0x78
+ #define PCIE_WRAP_OUTBOUND_TIMEOUT_US	100
+-void hl_pcie_enable_access(void)
++void hl_pcie_enable_elbi_access(void)
+ {
+ 	/* Enable the ELBI access */
+ 	regmap_writel(RR_PRIV_RANGE_RESET_VAL,
+ 		      mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+ 	regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++}
++
++void hl_pcie_enable_access(void)
++{
+ 	regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
+ 
+ 	/* Disable HOST_ACCESS_TERMINATION */

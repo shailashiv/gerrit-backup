@@ -1,0 +1,72 @@
+From 93b27a9bd4495aff0c66050693b81989b513379d Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 12 Feb 2023 17:31:59 +0200
+Subject: [PATCH] [SW-120178] fwupd: add reset device
+
+Add reset device support for fwupd protocol. This is needed for reset
+which is being sent to eROM recovery (with no agent involved).
+Without this patch, eROM will ignore the HL_UPD_RST_DEV command and no
+reset will be either responded, or performed.
+
+Change-Id: I8baa686a38ba1196444369be1a72ec20c207cc85
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/lib/preboot/module_fwupd.c b/lib/preboot/module_fwupd.c
+index 44e4471..ab9e1ca 100644
+--- a/lib/preboot/module_fwupd.c
++++ b/lib/preboot/module_fwupd.c
+@@ -335,6 +335,9 @@
+ 	case HL_UPD_GET_PROTO_STATUS:
+ 		res = FOUND_SLOW_RETURN;
+ 		break;
++	case HL_UPD_RST_DEV:
++		res = FOUND_NO_RETURN;
++		break;
+ 	case HL_UPD_RST_STATE:
+ 	case HL_UPD_MAP_SRAM:
+ 	case HL_UPD_MAP_ELBI:
+@@ -384,6 +387,7 @@
+ 	case HL_UPD_RUN_SRAM:
+ 	case HL_UPD_RUN_ELBI:
+ 	case HL_UPD_GET_PROTO_STATUS:
++	case HL_UPD_RST_DEV:
+ 		res = FOUND_FAST_RETURN;
+ 		break;
+ 	default:
+@@ -565,6 +569,10 @@
+ 	case HL_UPD_GET_PROTO_STATUS:
+ 		cmd_str = "proto_status";
+ 		module_fwupd_send_status(state, HL_UPD_STS_ACK, NULL);
++		break;
++	case HL_UPD_RST_DEV:
++		cmd_str = "rst_dev";
++		module_fwupd_send_status(state, HL_UPD_STS_RST_ACK, NULL);
+ 		break;
+ 	default:
+ 		cmd_str = "unknown";
+@@ -763,10 +771,23 @@
+ 	__module_fwupd_run(&i2c_state);
+ }
+ 
++static void module_fwupd_run_noret_reset(void)
++{
++	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_WFE);
++	hl_dev_reset();	/* should not return */
++}
++
+ void __module_fwupd_run_noret(struct fwupd_state *state)
+ {
+ 	hl_ts_shutdown();
+-	fit_run_image();
++
++	switch (state->wfc_cmd.cmd) {
++	case HL_UPD_RST_DEV:
++		module_fwupd_run_noret_reset();
++		break;
++	default:
++		fit_run_image();
++	}
+ }
+ 
+ void module_fwupd_run_noret(void)

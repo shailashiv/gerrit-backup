@@ -1,0 +1,118 @@
+From 51096f5e46d8276fc6e30dfe5d34e14e889b8007 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 23 Sep 2024 16:18:58 +0300
+Subject: [PATCH] [FSW-2071] fs1: init pcie&noc plls
+
+Pci&Noc Plls are initialized in order to optimize the access to PIF
+during PHY FW copy and PIF ARC application init.
+
+Change-Id: I716c6d03cea889806fbdbbb41c80ed8a3d18553a
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 8ac5ee5..9dfe0f6 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -55,6 +55,29 @@
+ 
+ extern unsigned long __SDATA_LOAD;
+ 
++static struct hl_pll_cfg pll_cfg[] = {
++	{
++		.name = "PCIE", .base = mmIO_0_CFG_HALF_0_SOC_0_PLL_0_PCIE_PLL_BASE,
++		.nr = 1, .nf = 240, .od = 2, .nb = 1,
++		.div_factor = { 0, 1, 3, 19 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	},
++	{
++		.name = "NOC", .base = mmIO_0_CFG_HALF_1_SOC_1_PLL_1_NOC_PLL_BASE,
++		.nr = 1, .nf = 244, .od = 6, .nb = 0,
++		.div_factor = { 0, 1, 2, 7 },
++		.div_sel = { HL_PLL_PLL_CLK,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL,
++			     HL_PLL_DIV_PLL
++		},
++	},
++};
++
+ u32 hl_pll_timestamp_base_get(void)
+ {
+ 	return mmIO_0_CFG_HALF_0_PSOC_PSOC_CFG_TIMESTAMP_BASE;
+@@ -234,7 +257,13 @@
+ 					   mmARC_ARC_NUM);
+ }
+ 
+-__weak void hl_dev_psoc_pll_init(void) {}
++__weak void hl_plat_pll_init(void) {}
++
++__weak void hl_dev_pll_init(void)
++{
++	hl_pll_init(pll_cfg, 2);
++	hl_plat_pll_init();
++}
+ 
+ #define DRAIN_STAMP_ENA_MASK	(AXI_DRAIN_WRAP_RSP_ERR_DRAIN_STAMP_RD_EN_M | \
+ 				 AXI_DRAIN_WRAP_RSP_ERR_DRAIN_STAMP_WR_EN_M)
+@@ -253,7 +282,7 @@
+ 	hl_psoc_drain_init();
+ 	hl_init_cpu_ids();
+ 	hl_lbw_early_write_resp_enable();
+-	hl_dev_psoc_pll_init();
++	hl_dev_pll_init();
+ }
+ 
+ #define SPSRAM_ADDR_MASK	0xFFFFF
+diff --git a/arch/fs1/arc/hl.h b/arch/fs1/arc/hl.h
+index 2dfe0cf..c41a696 100644
+--- a/arch/fs1/arc/hl.h
++++ b/arch/fs1/arc/hl.h
+@@ -72,7 +72,7 @@
+ /* TODO: use bootrom code when it is mature enough FSW-2070 */
+ #endif /* USE_BOOTROM_SPI_DMA */
+ 
+-void hl_dev_psoc_pll_init(void);
++void hl_plat_pll_init(void);
+ int fs1_mem_copy(uint64_t src, uint64_t dst, uint32_t size, bool is_hbw);
+ void plat_pcie_drain_init(void);
+ size_t get_csr_locations_data_size(void);
+diff --git a/arch/fs1/arc/onix.c b/arch/fs1/arc/onix.c
+index 4f16bfe..e8fc14a 100644
+--- a/arch/fs1/arc/onix.c
++++ b/arch/fs1/arc/onix.c
+@@ -63,3 +63,5 @@
+ 
+ /* Init cpu-id not available in Onix */
+ void hl_init_cpu_ids(void) {}
++
++void hl_dev_pll_init(void) {}
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+index 4cc38dc..e0627a5 100644
+--- a/arch/fs1/arc/palad.c
++++ b/arch/fs1/arc/palad.c
+@@ -82,7 +82,7 @@
+ #define PSOC_CFG_DIV_ID		2
+ #define PSOC_UART_DIV_ID	3
+ 
+-void hl_dev_psoc_pll_init(void)
++static void hl_dev_psoc_pll_init(void)
+ {
+ 	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_UART_DIV_ID);
+ 	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_HBW_DIV_ID);
+@@ -90,6 +90,11 @@
+ 	hl_pll_reconfig_div(fs1_psoc_pll_cfg, PSOC_CFG_DIV_ID);
+ }
+ 
++void hl_plat_pll_init(void)
++{
++	hl_dev_psoc_pll_init();
++}
++
+ static bool is_cxl_mode(void)
+ {
+ 	u32 val;

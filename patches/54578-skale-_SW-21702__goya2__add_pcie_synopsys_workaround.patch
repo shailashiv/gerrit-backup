@@ -1,0 +1,201 @@
+From 42cbbc4f3f22abe3bd372d9512f403c672c4a884 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 07 Oct 2020 22:31:47 +0300
+Subject: [PATCH] [SW-21702] goya2: add pcie synopsys workaround
+
+This patch adds synopsys workaround (case 01038891) as part of
+PCIe link bring up suggested by HW team. The changes are in alignment
+with the workaround added in arcboot as part of pcie recovery flow.
+
+This changes are already tested multiple times by HW team and has
+requested to release this changes.
+
+Change-Id: Idb957a15302bc72558c475983a4e226d94e29828
+---
+
+diff --git a/goya2/common.c b/goya2/common.c
+index b5fef08..65c2300 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -13,6 +13,7 @@
+ #include <pcie_core_regs.h>
+ #include <pcie_wrap_regs.h>
+ #include <pcie_phy_regs.h>
++#include <pcie_phy_masks.h>
+ #include <pcie_dbi_regs.h>
+ 
+ #include <cpu_timestamp_regs.h>
+@@ -30,6 +31,7 @@
+ #include <string.h>
+ #include <spi.h>
+ #include <preboot/fit.h>
++#include <efuse.h>
+ 
+ #include "common.h"
+ 
+@@ -78,6 +80,122 @@
+ 	regmap_writel(1, mmPSOC_GLOBAL_CONF_PCIE_PHY_RST_N);
+ }
+ 
++static void pcie_update_reg_range(u32 addr, u32 addr_end, u32 value)
++{
++	for (; addr <= addr_end ; addr += 4)
++		regmap_writel(value, addr);
++}
++
++static void pcie_wa_snps_case_01038891(void)
++{
++	u32 config_fuse, boot_strap;
++	u8 separate_reference = 0;
++	u32 reg = 0, val;
++	u8 ssc_en = 0;
++	int ret;
++
++	/* gpio bootstrap pin gpio17 = 0 */
++	boot_strap = regmap_readl(mmPSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++
++	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK) {
++		regmap_writel(1, mmPCIE_PHY_PIPE_RX_SRIS_MODE_EN);
++		regmap_writel(1, mmPCIE_AUX_APP_SRIS_MODE);
++	}
++
++	/* SRIS mode enable */
++	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_SRIS_MODE_MASK)
++		separate_reference = 1;
++
++	/* SRNS mode enable */
++	if ((boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_EN_MASK) == 0)
++		separate_reference = 1;
++
++	/* spread spectum clock enable */
++	if (boot_strap & PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L_BTL_ROM_EN_MASK)
++		ssc_en = 1;
++
++	/* read efuse bit 23 and check if SNPS WA needs to be enabled */
++	ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
++	if ((ret) || ((config_fuse & EFUSE_SYSCFG_WA_SNPS_CASE_01038891) != 0))
++		return;
++
++	if (ssc_en) {
++		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLB_SSC_EN_0,
++				mmPCIE_PHY_PHYX_MPLLB_SSC_EN_1, 0x1);
++		pcie_update_reg_range(mmPCIE_PHY_PHYX_MPLLA_SSC_EN_0,
++				mmPCIE_PHY_PHYX_MPLLA_SSC_EN_1, 0x1);
++		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_PEAK,
++				mmPCIE_PHY_EXT_MPLLB_SSC_PEAK);
++		regmap_writel(PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE,
++				mmPCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE);
++		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_PEAK,
++				mmPCIE_PHY_EXT_MPLLA_SSC_PEAK);
++		regmap_writel(PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE,
++				mmPCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE);
++	}
++
++	pcie_update_reg_range(mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G1,
++			mmPCIE_PHY_EXT_TX_DCC_CTRL_RANGE_G4, 0xC);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G1_7, 0x1);
++	pcie_update_reg_range(
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_0,
++		mmPCIE_PHY_PROTOCOL0_EXT_RX_CDR_VCO_CONFIG_G2_7, 0x1);
++
++	if (separate_reference) {
++		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR;
++
++		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_LOW_SHIFT);
++		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_HIGH_SHIFT);
++		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH);
++
++		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
++		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
++		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	} else {
++		reg = PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER;
++
++		val = ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW_SHIFT);
++		val |= ((PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH &
++			PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_MASK)
++			<< PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH_SHIFT);
++		regmap_writel(val, mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH);
++	}
++
++	regmap_writel(reg, mmPCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER,
++			mmPCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0,
++			mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0);
++	pcie_update_reg_range(mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G1,
++		mmPCIE_PHY_PROTOCOL0_EXT_TX_EQ_POST_G4, 0);
++
++
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3);
++	regmap_writel(PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF,
++			mmPCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4);
++
++	regmap_writel(1, mmPCIE_PHY_PHY_EXT_CTRL_SEL);
++}
++
+ __weak void preboot_init_pcie_phy(void)
+ {
+ 	/* Reset PCIe PHY */
+@@ -90,6 +208,9 @@
+ 	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_0);
+ 	regmap_writel(1, mmPCIE_PHY_CR_PARA_SEL_1);
+ 
++	/* Execute synopsys workaround (01038891) */
++	pcie_wa_snps_case_01038891();
++
+ 	/* Select indirect access to CR PARA I/F instead of PRBI */
+ 	regmap_writel(1, mmPCIE_PHY_CR_PARA_CFG);
+ 
+diff --git a/goya2/common.h b/goya2/common.h
+index 689a5d7..f4d4907 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -50,3 +50,28 @@
+ 			;						       \
+ 		regmap_writel(0x0, mmPSOC_ARC##id##_CFG_RUN_HALT_REQ);	       \
+ 	} while (0)
++
++#define EFUSE_SYSCFG_WA_SNPS_CASE_01038891		BIT(23)
++
++#define PCIE_PHY_EXT_MPLLB_SSC_PEAK			0x5000
++#define PCIE_PHY_EXT_MPLLB_SSC_STEP_SIZE		0x19CE
++#define PCIE_PHY_EXT_MPLLA_SSC_PEAK			0x6666
++#define PCIE_PHY_EXT_MPLLA_SSC_STEP_SIZE		0x2108
++
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER		0x50
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_MULTIPLIER_SR	0xA0
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_MULTIPLIER		0x7D
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G1_SLICE0	0x30
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G2_SLICE0	0x30
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G3_SLICE0	0x30
++#define PCIE_PHY_PROTOCOL0_EXT_TX_EQ_MAIN_G4_SLICE0	0x30
++
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_LOW	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLA_BANDWIDTH_SR_HIGH	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_LOW	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_SR_HIGH	0x25
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_LOW	0x1C3
++#define PCIE_PHY_PROTOCOL0_EXT_MPLLB_BANDWIDTH_HIGH	0x1C3
++
++#define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF	0x5555
++#define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF	0xFF

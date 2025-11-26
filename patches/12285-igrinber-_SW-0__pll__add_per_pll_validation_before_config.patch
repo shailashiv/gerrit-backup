@@ -1,0 +1,219 @@
+From dcca95a20281d425aeaa700151748c66d4216f70 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 06 May 2019 20:35:35 +0300
+Subject: [PATCH] [SW-0] pll: add per pll validation before config
+
+Add a device hook for controlling the PLL configuration enablement.
+This enables a device to make the configuration decision prior to
+configurring any PLL from its list.
+Implement the hook for each device.
+For Goya and Gaudi, do not permit the CPU PLL initialization.
+For Gaudi, do not permit if already done.
+For Onix and PLDM, there are no PLLs, so always restrict.
+
+Change-Id: I41743ce4ecb59f77f5eec8c3fdcbfb252e2a19a6
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 71e3da8..3a7633c 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -204,6 +204,10 @@
+ 
+ 	pll_num = hl_pll_get_cfg(&hl_pll_cfg);
+ 
+-	for (i = 0; i < pll_num; i++)
++	for (i = 0; i < pll_num; i++) {
++		if (!hl_pll_is_configurable(hl_pll_cfg + i))
++			continue;
++
+ 		hl_pll_set(hl_pll_cfg + i);
++	}
+ }
+diff --git a/common/pll.h b/common/pll.h
+index f1ab877..f1662a4 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -8,6 +8,8 @@
+ #ifndef _HL_PLL_H_
+ #define _HL_PLL_H_
+ 
++#include <stdbool.h>
++
+ #define HL_PLL_NR		0x100
+ #define HL_PLL_NF		0x104
+ #define HL_PLL_OD		0x108
+@@ -63,5 +65,6 @@
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg);
+ u64 hl_pll_get_cpu_cycles_per_usec(void);
+ u32 hl_pll_get_freq(u64 pll_base, enum hl_pll_div_out div);
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg);
+ 
+ #endif /* _HL_PLL_H_ */
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 922e4a6..d060208 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <stdbool.h>
++
+ #include <psoc_global_conf_regs.h>
+ 
+ #include <preboot.h>
+@@ -171,6 +173,31 @@
+ 	},
+ };
+ 
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	enum hl_pll_bypass_val bval;
++
++	switch (cfg->base) {
++	case mmMESH_W_PLL_BASE:
++	case mmMESH_E_PLL_BASE:
++	case mmIF_W_PLL_BASE:
++	case mmIF_E_PLL_BASE:
++	case mmPSOC_PCI_PLL_BASE:
++		/* DIV0 is the undivided PLL output */
++		bval = hl_pll_bypass_get(cfg->base, HL_PLL_DIV0);
++		if (bval == HL_PLL_PLL_CLK || bval == HL_PLL_DIV_PLL)
++			return false;
++		break;
++	case mmPSOC_CPU_PLL_BASE:
++		/* No CPU PLL configuration while running on it */
++		return false;
++	default:
++		break;
++	}
++
++	return true;
++}
++
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
+ {
+ 	int pll_num = ARRAY_SIZE(gaudi_pll_cfg);
+diff --git a/gaudi/onix.c b/gaudi/onix.c
+index 2e8a818..f3e924b 100644
+--- a/gaudi/onix.c
++++ b/gaudi/onix.c
+@@ -5,12 +5,19 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <stdbool.h>
++
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	35000000ULL
+ 
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return false;
++}
++
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
+ {
+ 	return 0;
+diff --git a/gaudi/pldm.c b/gaudi/pldm.c
+index 559ac27..c0993fb 100644
+--- a/gaudi/pldm.c
++++ b/gaudi/pldm.c
+@@ -5,12 +5,19 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <stdbool.h>
++
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	153000ULL
+ 
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return false;
++}
++
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
+ {
+ 	return 0;
+diff --git a/goya/asic.c b/goya/asic.c
+index 174e586..54a183b 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <stdbool.h>
++
+ #include <psoc_global_conf_regs.h>
+ 
+ #include <preboot.h>
+@@ -35,6 +37,11 @@
+ 	},
+ };
+ 
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return cfg->base != mmCPU_PLL_BASE;
++}
++
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
+ {
+ 	int pll_num = ARRAY_SIZE(goya_pll_cfg);
+diff --git a/goya/onix.c b/goya/onix.c
+index 9d12335..5cc536b 100644
+--- a/goya/onix.c
++++ b/goya/onix.c
+@@ -5,12 +5,19 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <stdbool.h>
++
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	50000000ULL
+ 
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return false;
++}
++
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
+ {
+ 	return 0;
+diff --git a/goya/pldm.c b/goya/pldm.c
+index 68b6864..24422e8 100644
+--- a/goya/pldm.c
++++ b/goya/pldm.c
+@@ -5,12 +5,19 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#include <stdbool.h>
++
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	150000ULL
+ 
++bool hl_pll_is_configurable(struct hl_pll_cfg *cfg)
++{
++	return false;
++}
++
+ int hl_pll_get_cfg(struct hl_pll_cfg **hl_pll_cfg)
+ {
+ 	return 0;

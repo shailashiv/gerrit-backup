@@ -1,0 +1,148 @@
+From 263138286652388ff638624b060071eb13a098e9 Mon Sep 17 00:00:00 2001
+From: Arnon Kaufman <akaufman@habana.ai>
+Date: Tue, 20 Apr 2021 08:27:26 +0300
+Subject: [PATCH] [SW-26273] compatibility: error data infrastruct
+
+As part of compatibility, the firmware error indications should be send
+out as a FWUPD FIT response.
+It should be meaningful, and more descriptive.
+
+Due to responding back with a fit, a SLOW MODE is required to prevent
+starvation of the time sensitive modules (e.g. I2C).
+
+NOTE: Till all functionality will step in, the slow/fast state is
+disabled
+
+Change-Id: I79abffddcb484755d352605e7da245936856e69b
+Signed-off-by: Arnon Kaufman <akaufman@habana.ai>
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/include/preboot.h b/include/preboot.h
+index 815b9dd..0042794 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -188,6 +188,9 @@
+ 			   enum fit_sec_failure *res);
+ size_t preboot_get_img_sec_desc_size(void);
+ 
++u32 preboot_error_read_and_clr(u32 *major, u32 *minor);
++bool preboot_error_inform(u32 major, u32 minor);
++bool preboot_error_is_pending(void);
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 7556014..2b853bf 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -932,10 +932,12 @@
+ 	case FIT_LOAD_NOT_RUNNABLE:
+ 	case FIT_LOAD_CORRUPTED:
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
++		preboot_error_inform(HL_FW_ERR_FIT, err);
+ 		preboot_puts("FIT loading failed, Retrying...\n");
+ 		break;
+ 	case FIT_LOAD_SEC_FAILED:
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_FAIL, true);
++		preboot_error_inform(HL_FW_ERR_SECURITY, sec_res);
+ 		preboot_puts("FIT security validation failed, Retrying...\n");
+ 		break;
+ 	}
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 852e12b..9e3f389 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -45,6 +45,17 @@
+ {
+ 	struct hl_upd_status status;
+ 	uintptr_t off = (uintptr_t)offset;
++	u32 err, serr;
++
++	/*
++	 * reads the errors and clear the error registration
++	 * then printing it out
++	 * it is a preparation code
++	 */
++	if (preboot_error_read_and_clr(&err, &serr)) {
++		preboot_puts_hex_raw("STS: ERR = ", err, 0);
++		preboot_puts_hex(", SUB-ERR = ", serr, 0);
++	}
+ 
+ 	status.val = 0;
+ 	status.status = sts;
+@@ -94,7 +105,7 @@
+ 	 * can't be change to a specific state therefore a flag was added
+ 	 * other option is to add an internal cmd level.
+ 	 */
+-	if (state.sending_error_flag)
++	if (state.sending_error_flag && preboot_error_is_pending())
+ 		return FOUND_SLOW_RETURN;
+ 
+ 	if (state.exec_res != NOT_FOUND)
+@@ -406,7 +417,7 @@
+ 	enum hl_upd_sts sts = HL_UPD_STS_NOOP;
+ 	int err = 0;
+ 
+-	if (state.sending_error_flag) {
++	if (state.sending_error_flag && preboot_error_is_pending()) {
+ 		preboot_puts("FW UPD prepare ERROR_STATUS\n");
+ 		state.sending_error_flag = false;
+ 	}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 2dfa787..3836f39 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -33,8 +33,19 @@
+ #include "rma_info.h"
+ #include <spi.h>
+ 
++struct hl_rsp_err {
++	union {
++		struct {
++			u32 major;
++			u32 minor;
++		};
++		u64 error;
++	};
++};
++
+ struct hl_fw_info_compat fw_info;
+ 
++static struct hl_rsp_err pending_error;
+ static u64 preboot_en_caps;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+@@ -400,3 +411,32 @@
+ 
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }
++
++bool preboot_error_inform(u32 major, u32 minor)
++{
++	/*
++	 * ensuring sending the first error occurrence
++	 * to reset the error just use the clr_on_read
++	 */
++	if (!pending_error.error) {
++		pending_error.major = major;
++		pending_error.minor = minor;
++		return true;
++	}
++
++	return false;
++}
++
++bool preboot_error_is_pending(void)
++{
++	return !!pending_error.error;
++}
++
++u32 preboot_error_read_and_clr(u32 *major, u32 *minor)
++{
++	*major = pending_error.major;
++	*minor = pending_error.minor;
++
++	pending_error.error = 0;
++	return *major;
++}

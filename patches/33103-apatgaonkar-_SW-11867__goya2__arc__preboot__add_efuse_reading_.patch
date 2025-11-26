@@ -1,0 +1,164 @@
+From 8d65c0736717609d41567dba1b60886fd2b2d1d3 Mon Sep 17 00:00:00 2001
+From: Abhishek <apatgaonkar@habana.ai>
+Date: Tue, 21 Apr 2020 12:43:40 +0300
+Subject: [PATCH] [SW-11867] goya2: arc: preboot: add efuse reading capability
+
+Ppboot and preboot needs efuse reading capability to decide
+pci device id for different board types.
+e.g. For Dual-M2 card,
+product id string in efuse "HL1120*" => 0x20 PCI device id
+For PCIe Addin card,
+product id string in efuse "HL1170*" => 0x30 PCI device id
+
+Change-Id: I8d418d7b64f99b5cf369e7cb0d713cb426591125
+---
+
+diff --git a/common/efuse.c b/common/efuse.c
+new file mode 100644
+index 0000000..2be8dfb
+--- /dev/null
++++ b/common/efuse.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <unistd.h>
++#include <psoc_efuse_regs.h>
++#include <psoc_dft_efuse_regs.h>
++#include "efuse.h"
++#include "common.h"
++#include "preboot.h"
++#include "uart.h"
++#include "spi.h"
++#include "pll.h"
++
++/*
++ * fuse box is divided into half for redundancy
++ * each half is bank of FUSE_WORDS_PER_BANK words
++ * NOTE: bank1 is a complete duplication of bank0
++ */
++#define FUSE_TIMEOUT_US		100000
++#define FUSE_DELAY_US		20
++#define FUSE_RETRIES		(FUSE_TIMEOUT_US / FUSE_DELAY_US)
++
++static int efuse_init;
++
++int preboot_fuse_init(void)
++{
++	int i;
++
++	if (efuse_init == 1)
++		return -1;
++
++	regmap_writel(1, mmPSOC_EFUSE_READ);
++
++	for (i = 0; i < FUSE_RETRIES; i++)
++		if (regmap_readl(mmPSOC_EFUSE_READ))
++			udelay(FUSE_DELAY_US);
++		else
++			break;
++
++	if (i == FUSE_RETRIES)
++		return -2;
++
++	efuse_init = 1;
++	return 0;
++}
++
++int preboot_fuse_read(u32 word, u32 *val)
++{
++	int offset, ret;
++	u32 read_val;
++
++	if (word >= FUSE_WORDS_PER_BANK) {
++		preboot_puts("Invalid efuse word offset\n");
++		return -1;
++	}
++
++	ret = preboot_fuse_init();
++	if (ret == -2) {
++		preboot_puts("Efuse not initialized\n");
++		return ret;
++	}
++
++	/* read value from bank0 */
++	offset = (word * sizeof(u32));
++	read_val = regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
++
++	/* read value from bank1 and OR with value from bank0 */
++	offset = ((FUSE_WORDS_PER_BANK + word) * sizeof(u32));
++	read_val |= regmap_readl(mmPSOC_EFUSE_DATA_0 + offset);
++
++	*val = read_val;
++
++	return 0;
++}
+diff --git a/common/efuse.h b/common/efuse.h
+new file mode 100644
+index 0000000..a967633
+--- /dev/null
++++ b/common/efuse.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _EFUSE_H_
++#define _EFUSE_H_
++
++#include <preboot.h>
++
++#define EFUSE_READ_RANGE_ALL		0x3F80
++#define EFUSE_PRODUCT_ID_OFFSET		0x1
++
++int preboot_fuse_init(void);
++int preboot_fuse_read(u32 word, u32 *val);
++
++#endif /* _EFUSE_H_ */
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 2ea200b..a8b3319 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -31,3 +31,5 @@
+ #define mmNIC1_PLL_BASE			0xD39000
+ #define mmNIC2_MME_PLL_BASE		0xD79000
+ #define mmNIC2_TPC_PLL_BASE		0xD7A000
++
++#define FUSE_WORDS_PER_BANK		0x10
+diff --git a/goya/common.h b/goya/common.h
+index 0437e15..d1784b5 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -21,3 +21,5 @@
+ #define mmPSOC_MME_PLL_BASE	0xC71000
+ #define mmPSOC_PCI_PLL_BASE	0xC72000
+ #define mmTPC_PLL_BASE		0xE01000
++
++#define FUSE_WORDS_PER_BANK	0x10
+diff --git a/goya2/common.h b/goya2/common.h
+index 06d79c5..1fbf575 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -17,3 +17,5 @@
+ #define PREBOOT_TEXT_BASE		(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
+ #define mmPSOC_PCI_PLL_BASE		(mmPSOC_PCI_PLL_CTRL_BASE & 0x00FFFFFF)
++
++#define FUSE_WORDS_PER_BANK		0x40
+diff --git a/goya2_arc_gnu/common.h b/goya2_arc_gnu/common.h
+index 7165f97..aa3a2b3 100644
+--- a/goya2_arc_gnu/common.h
++++ b/goya2_arc_gnu/common.h
+@@ -23,3 +23,5 @@
+ #define mmPSOC_MME_PLL_BASE	0xC71000
+ #define mmPSOC_PCI_PLL_BASE	0xC72000
+ #define mmTPC_PLL_BASE		0xE01000
++
++#define FUSE_WORDS_PER_BANK	0x40

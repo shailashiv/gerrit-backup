@@ -1,0 +1,127 @@
+From bf842409911131b517f8a1776c2411792b65e317 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 29 Oct 2020 22:25:45 +0200
+Subject: [PATCH] [SW-21856] module_pci: add en/disable callbacks
+
+Add enable()/disable() callbacks to PCIe handling module.
+This should prevent FLR request from racing other modules (e.g. I2C)
+which take significant time to execute in regard to the FLR request
+timeout.
+Implement the callbacks for Gaudi.
+
+Change-Id: I3f45a5a78e9be71d9d2275160f67fa3f0105539b
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index efa5e7c..1753bae 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -67,9 +67,13 @@
+ /* PCI */
+ void module_pci_setup(void);
+ enum cmd_check_res module_pci_check(void);
++void module_pci_disable(void);
+ void module_pci_run(void);
++void module_pci_enable(void);
+ void module_pci_teardown(void);
+ void pci_dev_specific_setup(void);
++void pci_dev_specific_disable(void);
++void pci_dev_specific_enable(void);
+ void pci_dev_specific_teardown(void);
+ void pci_dev_specific_hot_rst(void);
+ 
+diff --git a/gaudi/common.c b/gaudi/common.c
+index cae6495..1e509d4 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -307,14 +307,19 @@
+ 	spi_copy((void *)loadaddr, offset, size, name);
+ }
+ 
+-void pci_dev_specific_setup(void)
++/* Move FLR handling to S/W */
++void pci_dev_specific_enable(void)
+ {
+-	/* to be handled by SW - enable */
+ 	regmap_writel(0, mmPCIE_AUX_FLR_CTRL);
+ }
+ 
++void pci_dev_specific_setup(void)
++{
++	pci_dev_specific_enable();
++}
++
+ /* Move FLR handling to H/W */
+-void pci_dev_specific_teardown(void)
++void pci_dev_specific_disable(void)
+ {
+ 	u32 val = PCIE_AUX_FLR_CTRL_HW_CTRL_MASK |
+ 			PCIE_AUX_FLR_CTRL_INT_MASK_MASK;
+@@ -322,6 +327,11 @@
+ 	regmap_writel(val, mmPCIE_AUX_FLR_CTRL);
+ }
+ 
++void pci_dev_specific_teardown(void)
++{
++	pci_dev_specific_disable();
++}
++
+ void pci_dev_specific_hot_rst(void)
+ {
+ 	regmap_writel(0x10, mmPCIE_CORE_HOT_RST);
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index 7f9acbc..1e7b0e8 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -24,6 +24,8 @@
+ 
+ __weak void pci_dev_specific_setup(void) {}
+ __weak void pci_dev_specific_teardown(void) {}
++__weak void pci_dev_specific_disable(void) {}
++__weak void pci_dev_specific_enable(void) {}
+ 
+ __weak void pci_dev_specific_hot_rst(void)
+ {
+@@ -56,6 +58,12 @@
+ 	return dev_specific_module_pci_check();
+ }
+ 
++void module_pci_disable(void)
++{
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++		pci_dev_specific_disable();
++}
++
+ void module_pci_run(void)
+ {
+ 	if (pci_sts.flr_reg_val == 1) {
+@@ -71,6 +79,12 @@
+ 	}
+ }
+ 
++void module_pci_enable(void)
++{
++	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
++		pci_dev_specific_enable();
++}
++
+ void module_pci_teardown(void)
+ {
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE))
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 900511b..2dce446 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -23,9 +23,9 @@
+ 	{	/* PCI module */
+ 		.setup = module_pci_setup,
+ 		.check = module_pci_check,
+-		.disable = noop,
++		.disable = module_pci_disable,
+ 		.run = noop,
+-		.enable = noop,
++		.enable = module_pci_enable,
+ 		.run_fast = module_pci_run,
+ 		.teardown = module_pci_teardown,
+ 		.run_noreturn = noop,

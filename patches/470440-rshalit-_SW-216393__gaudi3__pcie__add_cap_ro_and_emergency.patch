@@ -1,0 +1,87 @@
+From 489a9fb79463ccaf8034f9ebe12b7b1a17a447b8 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Wed, 22 Jan 2025 16:19:12 +0200
+Subject: [PATCH] [SW-216393] gaudi3: pcie: add cap ro and emergency
+
+Change-Id: I98f660e7d52fb97169b96a9d473d1862e006ad1d
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 0318de0..f545c47 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -321,7 +321,7 @@
+ #define GPIO_CARD_TYPE_BIT	BIT(GPIO_CARD_TYPE % 16)
+ #define PSOC_GPIO5_DATA_REG	mmPSOC_GPIO5_BASE
+ 
+-static bool is_card_type_pcie(void)
++bool is_card_type_pcie(void)
+ {
+ 	uint32_t val;
+ 	uint32_t is_pcie;
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index be1a35c..32d0d64 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1037,14 +1037,23 @@
+ }
+ 
+ #define EMR_PWR_M	PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP2_EMERGENCY_PWR_RED_SUPPORT_M
++#define PCIE_ENABLE_PWRBRK_CTRL_VAL	0x1
+ #define ENABLE_PWRBRK_CTRL_VAL	0x2
+ 
+ static void pif_arc_config_dbi_params(void)
+ {
++	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_MISC_CONTROL_1_OFF),
++				1, PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M);
++
+ 	regmap_writel(0x02402801, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_GEN3_RELATED_OFF));
+ 	regmap_writel(0x05026031, D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_GEN3_EQ_CONTROL_OFF));
+-	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG),
++	if (is_card_type_pcie()) {
++		regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG),
++						PCIE_ENABLE_PWRBRK_CTRL_VAL, EMR_PWR_M);
++	} else {
++		regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_DEVICE_CAPABILITIES2_REG),
+ 					ENABLE_PWRBRK_CTRL_VAL, EMR_PWR_M);
++	}
+ 
+ 	/* remove Vital Product Data (VPD) reporting capability */
+ 	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_PCI_MSIX_CAP_ID_NEXT_CTRL_REG), 0,
+@@ -1062,6 +1071,10 @@
+ 	/* disable tx precoding */
+ 	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_PL32G_STATUS_REG), 0,
+ 			PCIE_DBI_PL32G_STATUS_REG_TX_PRECODE_REQ_M);
++
++	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_MISC_CONTROL_1_OFF),
++				0, PCIE_DBI_MISC_CONTROL_1_OFF_DBI_RO_WR_EN_M);
++
+ }
+ 
+ __weak void preboot_update_bar_sizes(void) {}
+diff --git a/arch/gaudi3/common/common.c b/arch/gaudi3/common/common.c
+index b13806c..afdf2cd 100644
+--- a/arch/gaudi3/common/common.c
++++ b/arch/gaudi3/common/common.c
+@@ -153,7 +153,7 @@
+ #define GPIO_CARD_TYPE		23
+ #define GPIO_CARD_TYPE_BIT	BIT(GPIO_CARD_TYPE % 16)
+ 
+-static bool is_card_type_pcie(void)
++bool is_card_type_pcie(void)
+ {
+ 	uint32_t val;
+ 	uint32_t is_pcie;
+diff --git a/include/baremetal.h b/include/baremetal.h
+index 97dfd8d..41a43be 100644
+--- a/include/baremetal.h
++++ b/include/baremetal.h
+@@ -278,6 +278,7 @@
+ 
+ int preboot_set_sram_sf_access(bool is_enable);
+ void preboot_device_id_init(void);
++bool is_card_type_pcie(void);
+ u32 preboot_device_id_get(void);
+ bool is_pcie_initialized(void);
+ void preboot_init_pcie_phy_fw_update(void);

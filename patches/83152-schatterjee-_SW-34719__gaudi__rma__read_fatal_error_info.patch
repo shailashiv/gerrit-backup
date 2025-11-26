@@ -1,0 +1,130 @@
+From 15cb67c338318ea21d2927486c1c9a8a44859922 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Thu, 18 Mar 2021 15:31:39 +0200
+Subject: [PATCH] [SW-34719] gaudi: rma: read fatal error info
+
+Added code to read RMA header table to check for any
+fatal error. On getting fatal error, ERR_STS direct register value
+is updated to indicate HL_ERROR_STATUS_FATAL_ERROR error to BMC.
+
+Change-Id: Icb021f3fc73c4a4e489894213a370b04e162231c
+Signed-off-by: Subrata Chatterjee <schatterjee@habana.ai>
+---
+
+diff --git a/gaudi/rma_info.c b/gaudi/rma_info.c
+index 3f700f0..8d0a233 100644
+--- a/gaudi/rma_info.c
++++ b/gaudi/rma_info.c
+@@ -11,13 +11,23 @@
+ #include <string.h>
+ #include "uart.h"
+ #include "rma_if.h"
++#include "module_i2c_slave.h"
++#include "hl_i2c_slave_events.h"
+ 
+ #define ROUND_UP4(n)	(((n) + sizeof(u32) - 1) & ~(sizeof(u32) - 1))
+-#define MAX_SIZE_ONE_RMA_TABLE	sizeof(struct rma_sram_ecc_entry)
+-#define RMA_TABLE_HEADER_SIZE	sizeof(struct table_header)
++#define RMA_HEADER_ENTRY_SIZE		sizeof(struct rma_entry)
++#define RMA_SRAM_ECC_ENTRY_SIZE		sizeof(struct rma_sram_ecc_entry)
++#define RMA_HBM_ECC_ENTRY_SIZE		sizeof(struct rma_hbm_ecc_entry)
++#define RMA_HBM_PARITY_ENTRY_SIZE	sizeof(struct rma_hbm_parity_entry)
++#define MAX_SIZE_ONE_RMA_TABLE		RMA_SRAM_ECC_ENTRY_SIZE
++#define RMA_TABLE_HEADER_SIZE		sizeof(struct table_header)
+ 
+ #define MAX_INFO_DESC_DATA	\
+ 	((MAX_SRAM_ECC_ENTRIES * MAX_SIZE_ONE_RMA_TABLE) + RMA_TABLE_HEADER_SIZE)
++
++/* Number of RMA HEADER is 1 */
++#define MAX_RMA_HEADER_DATA	\
++		(RMA_HEADER_ENTRY_SIZE + RMA_TABLE_HEADER_SIZE)
+ 
+ #define FLASH_STORAGE_BLOCK0	0x100000
+ #define FLASH_STORAGE_BLOCK1	(FLASH_STORAGE_BLOCK0 + 0x10000)
+@@ -91,8 +101,7 @@
+ 	return 0;
+ }
+ 
+-/* TODO: __attribute__((unused)) to be removed in a patch which would use this function */
+-__attribute__((unused)) static int rma_info_get(u32 type, void *data, u32 *size)
++static int rma_info_get(u32 type, void *data, u32 *size)
+ {
+ 	struct hl_boot_info_ptrs ptrs;
+ 	struct hl_boot_info_desc desc;
+@@ -137,8 +146,39 @@
+ 			return 1;
+ 
+ 		*size = desc.size;
++
+ 		return 0;
+ 	}
+ 
+ 	return 1;
+ }
++
++/* Read RMA header table */
++static void preboot_process_rma_header(void)
++{
++	u32 size = MAX_RMA_HEADER_DATA;
++	int ret;
++	/* Buffer to store RMA info from flash */
++	u8 rma_buf[MAX_RMA_HEADER_DATA];
++	struct rma_entry *rma_header;
++
++	ret = rma_info_get(RMA_HEADER_TABLE, rma_buf, &size);
++	if (ret)
++		return;
++
++	rma_header = (struct rma_entry *) &rma_buf[RMA_TABLE_HEADER_SIZE];
++	/* Update ERR_STS if any error */
++	if (rma_header->rma_failure.sram_ecc ||
++		rma_header->rma_failure.hbm_ecc ||
++		rma_header->rma_failure.hbm_parity ||
++		rma_header->rma_failure.row_replacement ||
++		rma_header->rma_failure.hbm_init) {
++		err_sts_reg_val |= HL_ERROR_STATUS_FATAL_ERROR;
++		preboot_puts_hex("Fatal error:", rma_header->rma_failure.data, 0);
++	}
++}
++
++void preboot_process_last_rma_info(void)
++{
++	preboot_process_rma_header();
++}
+diff --git a/include/rma_info.h b/include/rma_info.h
+new file mode 100644
+index 0000000..2bceb9b
+--- /dev/null
++++ b/include/rma_info.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2021 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#ifndef _RMA_INFO_H_
++#define _RMA_INFO_H_
++
++void preboot_process_last_rma_info(void);
++
++#endif /* _RMA_INFO_H_ */
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 3888d02..d4e92ab 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -30,6 +30,7 @@
+ #include "cmd_module.h"
+ #include "i2cslave_indirect.h"
+ #include "hl_i2c_slave_events.h"
++#include "rma_info.h"
+ 
+ static u64 preboot_en_caps;
+ 
+@@ -357,5 +358,6 @@
+ 	preboot_dev_enable_caps();
+ 	crc32_init_lookup();
+ 	preboot_process_last_boot_info();
++	preboot_process_last_rma_info();
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }

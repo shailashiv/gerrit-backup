@@ -1,0 +1,354 @@
+From ccedfa5473bd7ab4b90f25f632471c657f033009 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Mon, 19 Apr 2021 19:04:42 +0300
+Subject: [PATCH] [SW-39707] gaudi: hbm: mask dword repaired lanes
+
+On ATE stage, a defective lane between HBM device to the SoC might be
+detected. In case it's possible, an HARD lane repair procedure will be
+followed and the defective lane will be replaced by a redundent lane.
+DC connectivity test is not aware of the new lane. Thus, it can fail
+due to the defective lane. DC-connectivty test failure should result in
+HBM init failure.
+This patch takes care to skip the repaired lane on DC-connectivity test.
+
+HARD lane repair on ATE is capable of repairing max of 8 DWORD lanes
+and 2 AWORD lanes per channel.
+
+Change-Id: I8e3c4f0084bcd8fed090549558ca43a3e0729ca2
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/gaudi/hbm.c b/gaudi/hbm.c
+index 8f7c1cb..74b0e69 100644
+--- a/gaudi/hbm.c
++++ b/gaudi/hbm.c
+@@ -39,9 +39,18 @@
+ #define EXTEST_WDR_REG_NUM		7
+ #define EXTEST_WRITE_INST		1
+ #define EXTEST_READ_INST		0
++#define EXTEST_WDR_BYTE_OFFSET		12
++#define EXTEST_WDR_DWORD_OFFSET		48
+ 
+ #define SZ_16G				_AC(0x400000000, ULL)
+ #define SZ_32G				_AC(0x800000000, ULL)
++
++#define BYTES_PER_DWORD			4
++#define DWORDS_PER_PC			2
++#define PC_PER_CH			2
++
++#define HLR_DWORD_CODE_SHIFT		16
++#define MAX_REPAIRED_LANES_PER_CH	10 //8DW + 2AW
+ 
+ #define RREG32(c)			regmap_readl(c)
+ #define WREG32(c, v)			regmap_writel((v), (c))
+@@ -80,6 +89,25 @@
+ 	 */
+ 	.training_delay = 7,
+ 	.hardware_training_repeat = 1, /* range 1-4 */
++};
++
++struct hlr_count {
++	int pc0;
++	int pc1;
++	int aw;
++};
++
++struct ch_lane_repair_info {
++	u32 dw01_code;
++	u32 dw23_code;
++	u16 aw_code;
++	bool status;
++	struct hlr_count count;
++};
++
++struct extest_skip_info {
++	u32 wdr_entry;
++	u32 bit;
+ };
+ 
+ enum phy_state {
+@@ -209,6 +237,7 @@
+ static u32 aword[GAUDI_HBM_CHANNELS][4];
+ static u32 dword_wr[GAUDI_HBM_CHANNELS][4][4];
+ static u32 dword_rd[GAUDI_HBM_CHANNELS][4][4];
++static struct ch_lane_repair_info hlr_info[GAUDI_HBM_CHANNELS];
+ 
+ static const u32 extest_wdr_pattern[EXTEST_WDR_PTRNS_NUM * EXTEST_WDR_REG_NUM] = {
+ 	/* pattern 0 */
+@@ -339,14 +368,74 @@
+ 	WREG32(base + 0x9034, 0);
+ }
+ 
++int get_lane_skip_info(int ch, struct extest_skip_info lane_skip_info_arr[])
++{
++	u32 pc_code, dw_code;
++	u32 byte_code, adj_byte_code;
++	int pc_idx, dw_idx, byte_idx;
++	u32 extest_wdr_entry, bit_to_clear;
++	u32 extest_wdr_bit_pos;
++	int info_arr_idx;
++
++	/* EXTEST WDR mask value corresponds to lane_repair WDR value */
++	u32 hlr_dword_code_to_extest_map[] = {
++			0, 1, 2, 3, 4, 7, 8, 9, 10, 11
++	};
++
++	if (!hlr_info[ch].status)
++		return 0;
++
++	info_arr_idx = 0;
++
++	for (pc_idx = 0; pc_idx < PC_PER_CH; pc_idx++) {
++		pc_code = (pc_idx == 0) ? hlr_info[ch].dw01_code : hlr_info[ch].dw23_code;
++		for (dw_idx = 0; dw_idx < DWORDS_PER_PC; dw_idx++) {
++			dw_code = (pc_code >> (dw_idx * HLR_DWORD_CODE_SHIFT)) & 0xFFFF;
++			/* Looping over byte-paires inside a DWORD */
++			for (byte_idx = 0; byte_idx < BYTES_PER_DWORD; byte_idx += 2) {
++				byte_code = (dw_code  >> (4 * byte_idx)) & 0xF;
++				adj_byte_code = (dw_code >> (4 * (byte_idx + 1))) & 0xF;
++
++				if  (byte_code != 0xF && adj_byte_code == 0xE) {
++					extest_wdr_bit_pos = hlr_dword_code_to_extest_map[byte_code] +
++							     byte_idx * EXTEST_WDR_BYTE_OFFSET +
++							     dw_idx * EXTEST_WDR_DWORD_OFFSET;
++					extest_wdr_entry = extest_wdr_bit_pos / 32;
++					bit_to_clear = extest_wdr_bit_pos - (32 * extest_wdr_entry);
++
++					lane_skip_info_arr[info_arr_idx].bit = bit_to_clear;
++					lane_skip_info_arr[info_arr_idx].wdr_entry = extest_wdr_entry;
++					info_arr_idx++;
++				} else if (byte_code == 0xE && adj_byte_code != 0xF) {
++					extest_wdr_bit_pos = hlr_dword_code_to_extest_map[adj_byte_code] +
++							     (byte_idx + 1) * EXTEST_WDR_BYTE_OFFSET +
++							     dw_idx * EXTEST_WDR_DWORD_OFFSET;
++					extest_wdr_entry = extest_wdr_bit_pos / 32;
++					bit_to_clear = extest_wdr_bit_pos - (32 * extest_wdr_entry);
++
++					lane_skip_info_arr[info_arr_idx].bit = bit_to_clear;
++					lane_skip_info_arr[info_arr_idx].wdr_entry = extest_wdr_entry;
++					info_arr_idx++;
++				}
++			}
++		}
++	}
++	return info_arr_idx;
++}
++
+ static int extest_rx(int device)
+ {
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 received, expected, mask, addr, idx;
+-	int pat, ch, i, err = 0;
++	int pat, ch, i, j, err = 0;
++	struct extest_skip_info lane_skip_info[GAUDI_HBM_CHANNELS][MAX_REPAIRED_LANES_PER_CH];
++	int num_repaired_lanes[GAUDI_HBM_CHANNELS] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+ 	/* Enable all outputs, except for HBM TX-only signals */
+ 	for (ch = 0 ; ch < GAUDI_HBM_CHANNELS ; ch++) {
++		num_repaired_lanes[ch] = get_lane_skip_info(ch, &lane_skip_info[ch][0]);
++
++		/* Enable all outputs, except for HBM TX-only signals */
+ 		WREG32(base + ch * 0x1000 + 0x920, 0x60000000);
+ 		WREG32(base + ch * 0x1000 + 0x924, 0x00000200);
+ 		WREG32(base + ch * 0x1000 + 0x928, 0x02006000);
+@@ -354,6 +443,11 @@
+ 		WREG32(base + ch * 0x1000 + 0x930, 0x20060000);
+ 		WREG32(base + ch * 0x1000 + 0x934, 0x00000000);
+ 		WREG32(base + ch * 0x1000 + 0x938, 0x00002006);
++
++		/* Skip repaired signals */
++		for (j = 0; j < num_repaired_lanes[ch]; j++)
++			RMWREG32(base + ch * 0x1000 + 0x920 + lane_skip_info[ch][j].wdr_entry * 0x4,
++				 0x1, 1 << lane_skip_info[ch][j].bit);
+ 	}
+ 
+ 	/* Patterns loop */
+@@ -411,6 +505,11 @@
+ 				received = RREG32(addr);
+ 
+ 				mask = extest_wdr_rx_mask[i];
++				/* executed 16 times (per pattern) */
++				for (j = 0; j < num_repaired_lanes[ch]; j++) {
++					if (lane_skip_info[ch][j].wdr_entry == i)
++						mask &= ~(1 << lane_skip_info[ch][j].bit);
++				}
+ 
+ 				if ((received & mask) != (expected & mask)) {
+ 					err++;
+@@ -433,13 +532,22 @@
+ {
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 received, expected, mask, addr, idx;
+-	int pat, ch, i, err = 0;
++	int pat, ch, i, j, err = 0;
++	struct extest_skip_info lane_skip_info[GAUDI_HBM_CHANNELS][MAX_REPAIRED_LANES_PER_CH];
++	int num_repaired_lanes[GAUDI_HBM_CHANNELS] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+-	/* Disable all outputs */
+ 	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++		/* Disable all outputs */
+ 		for (i = 0; i < EXTEST_WDR_REG_NUM; i++)
+ 			WREG32(base + ch * 0x1000 + 0x920 + (i * 4),
+ 					0xFFFFFFFF);
++
++		num_repaired_lanes[ch] = get_lane_skip_info(ch, &lane_skip_info[ch][0]);
++
++		/* Skip repaired lanes */
++		for (j = 0; j < num_repaired_lanes[ch]; j++)
++			RMWREG32(base + ch * 0x1000 + 0x920 + lane_skip_info[ch][j].wdr_entry * 0x4,
++				 0x0, 1 << lane_skip_info[ch][j].bit);
+ 	}
+ 
+ 	/*
+@@ -476,6 +584,11 @@
+ 								+ (i * 4));
+ 
+ 				mask = extest_wdr_tx_mask[i];
++
++				for (j = 0; j < num_repaired_lanes[ch]; j++) {
++					if (lane_skip_info[ch][j].wdr_entry == i)
++						mask &= ~(1 << lane_skip_info[ch][j].bit);
++				}
+ 
+ 				if ((received & mask) != (expected & mask))
+ 					err++;
+@@ -547,6 +660,11 @@
+ 								+ (i * 4));
+ 
+ 				mask = extest_wdr_tx_mask[i];
++
++				for (j = 0; j < num_repaired_lanes[ch]; j++) {
++					if (lane_skip_info[ch][j].wdr_entry == i)
++						mask &= ~(1 << lane_skip_info[ch][j].bit);
++				}
+ 
+ 				if ((received & mask) != (expected & mask))
+ 					err++;
+@@ -1531,12 +1649,22 @@
+ 		WREG32(base + ch * 0x1000 + 0x900, 1);
+ 
+ 	rc = extest_rx(device);
+-	if (rc)
++	if (rc) {
++		/* Exit IODC mode */
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++			WREG32(base + ch * 0x1000 + 0x900, 0);
++
+ 		return rc;
++	}
+ 
+ 	rc = extest_tx(device);
+-	if (rc)
++	if (rc) {
++		/* Exit IODC mode */
++		for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
++			WREG32(base + ch * 0x1000 + 0x900, 0);
++
+ 		return rc;
++	}
+ 
+ 	/* Exit IODC mode */
+ 	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++)
+@@ -1549,28 +1677,68 @@
+ {
+ 	u32 base = GAUDI_HBM_CFG_BASE + device * GAUDI_HBM_CFG_OFFSET;
+ 	u32 reg_800, reg_804, reg_808;
+-	u32 remap_info_dw01, remap_info_dw23, remap_info_aw;
+-	int ch;
++	u32 dw01_repair_code, dw23_repair_code, aw_repair_code;
++	int mc_ch;
+ 
+-	for (ch = 0; ch < GAUDI_HBM_CHANNELS; ch++) {
++	/* Clearing HLR information for all channels */
++	for (mc_ch = 0; mc_ch < GAUDI_HBM_CHANNELS; mc_ch++) {
++		hlr_info[mc_ch].count.pc0 = 0;
++		hlr_info[mc_ch].count.pc1 = 0;
++		hlr_info[mc_ch].count.aw = 0;
++		hlr_info[mc_ch].status = false;
++	}
++
++	for (mc_ch = 0; mc_ch < GAUDI_HBM_CHANNELS; mc_ch++) {
+ 		/* Read HBM lane repair eFuse information */
+-		ieee1500_inst(device, ch, ieee1500_hard_lane_repair,
+-			      EXTEST_READ_INST);
++		ieee1500_inst(device, hbm_ch_mapping[mc_ch],
++			      ieee1500_hard_lane_repair, EXTEST_READ_INST);
+ 		reg_800 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
+-							0x800 + (ch * 0x100));
++				 0x800 + (hbm_ch_mapping[mc_ch] * 0x100));
+ 		reg_804 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
+-							0x804 + (ch * 0x100));
++				 0x804 + (hbm_ch_mapping[mc_ch] * 0x100));
+ 		reg_808 = RREG32(base + (GAUDI_HBM_CENTER_CHANNEL * 0x1000) +
+-							0x808 + (ch * 0x100));
++				 0x808 + (hbm_ch_mapping[mc_ch] * 0x100));
++
++		dw01_repair_code = reg_800;
++		aw_repair_code = reg_804 & 0xFF;
++		dw23_repair_code = ((reg_804 & 0xFFFFFF00) >> 8) |
++						((reg_808 & 0xFF) << 24);
+ 
+ 		/* Configure MLB according to remapped lanes */
+-		remap_info_dw01 = reg_800;
+-		remap_info_aw   = reg_804 & 0xFF;
+-		remap_info_dw23 = ((reg_804 & 0xFFFFFF00) >> 8) |
+-						((reg_808 & 0xFF) << 24);
+-		WREG32(base + (ch*0x1000) + 0x2F0, remap_info_dw01);
+-		WREG32(base + (ch*0x1000) + 0x2F4, remap_info_dw23);
+-		WREG32(base + (ch*0x1000) + 0x2F8, remap_info_aw);
++		if (dw01_repair_code != 0xFFFFFFFF) {
++			hlr_info[mc_ch].dw01_code = dw01_repair_code;
++			hlr_info[mc_ch].count.pc0 = 1;
++			if (((dw01_repair_code & 0xFFFF) != 0xFFFF) &&
++			    (((dw01_repair_code >> 16) & 0xFFFF) != 0xFFFF))
++				hlr_info[mc_ch].count.pc0 = 2;
++
++			hlr_info[mc_ch].status = true;
++
++			WREG32(base + (mc_ch * 0x1000) + 0x2F0,
++			       dw01_repair_code);
++		}
++
++		if (dw23_repair_code != 0xFFFFFFFF) {
++			hlr_info[mc_ch].dw23_code = dw23_repair_code;
++			hlr_info[mc_ch].count.pc1 = 1;
++			if (((dw23_repair_code & 0xFFFF) != 0xFFFF) &&
++			    (((dw23_repair_code >> 16) & 0xFFFF) != 0xFFFF))
++				hlr_info[mc_ch].count.pc1 = 2;
++
++			hlr_info[mc_ch].status = true;
++
++			WREG32(base + (mc_ch * 0x1000) + 0x2F4,
++			       dw23_repair_code);
++		}
++
++		if (aw_repair_code != 0xFF) {
++			hlr_info[mc_ch].aw_code = aw_repair_code;
++			hlr_info[mc_ch].count.aw = 1;
++			hlr_info[mc_ch].status = true;
++
++			WREG32(base + (mc_ch * 0x1000) + 0x2F8,
++			       aw_repair_code);
++		}
+ 	}
+ }
+ 
+@@ -1633,6 +1801,9 @@
+ 		phy_init(dev);
+ 		dram_rstn(dev, cke_state_low);
+ 
++		/* Lane remapping */
++		lane_remap(dev);
++
+ 		/* Internal Loopback (bring-up only) */
+ 		if (internal_loopback_test(hbm, dev)) {
+ 			preboot_puts("HBM intern loopback failed\n");
+@@ -1646,8 +1817,6 @@
+ 		}
+ 		dram_rstn(dev, cke_state_low);
+ 
+-		/* Lane remapping */
+-		lane_remap(dev);
+ 
+ 		/* Training */
+ 		hardware_training(hbm, dev);

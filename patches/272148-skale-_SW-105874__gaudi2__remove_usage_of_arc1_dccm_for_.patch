@@ -1,0 +1,110 @@
+From b2ee336e0925e4c02da1425d60a922adf5931f45 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 07 Nov 2022 14:14:45 +0200
+Subject: [PATCH] [SW-105874] gaudi2: remove usage of arc1 dccm for arc0
+
+Currently, ARC0 performs pcie initialization sequence where ARC0
+uses global variables from ARC1 DCCM using DMI address which are
+initialized by ppboot running on ARC1. This requires the DCCM
+address to be defined as DMI address so that ARC0 make use of ARC1 DCCM.
+
+This also causes ARC1 to use its own DCCM using DMI address which leads
+ARC stall issue in signature verification ROM function when DCCM is
+accessed from internal and DMI address (details provided in SW-105874).
+
+In order to overcome above mentioned issue, this patch add changes to
+make ARC0 to use its own DCCM address and initialize required data
+structures for pcie link routine. This change also make sure both
+ARCs use its own DCCM via internal address so no access to DCCM
+is performed via DMI.
+
+Change-Id: Id28da75fab257059b6eb5d4bf6d24040f98b42de
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 4d8723f..754743e 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -49,6 +49,7 @@
+ #include <gaudi2/arc/dev_security.h>
+ #include <tpm2.h>
+ #include <errno.h>
++#include <device.h>
+ 
+ #define PRODUCT_ID_STR_SIZE			0x8
+ 
+@@ -703,8 +704,26 @@
+ 	wfe();
+ }
+ 
++static void secondary_device_init(void)
++{
++	/*
++	 * Perform data structure initialization only for the
++	 * global structures which are used by ARC0 for PCIe
++	 * bring up sequence.
++	 * Note: If any additional functionality is added
++	 * in PCIe routine which make use of new global data
++	 * structure, should be initialized here before use.
++	 */
++	device_init_efuse();
++	device_init_pci();
++	device_init_pll();
++	udelay_init();
++	preboot_device_id_init();
++}
++
+ void secondary_main(void)
+ {
++	secondary_device_init();
+ 	preboot_pcie_monitoring();
+ 
+ 	/* Put secondary CPU in sleep state until further notice */
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index 64e7d00..380f833 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -80,7 +80,7 @@
+  * Let PPBoot start from the offset of 0x4030, for using DCCM
+  * for its own BSS and Stack.
+  */
+-#define PPBOOT_DCCM_BASE	0x27064030
++#define PPBOOT_DCCM_BASE	0x80004030
+ #define PPBOOT_DCCM_SZ		0x2000	/* 8KB */
+ 
+ #define SRAM_BIST_DATA_BASE	(PPBOOT_DCCM_BASE + PPBOOT_DCCM_SZ)
+diff --git a/arch/gaudi2/arc/secondary.S b/arch/gaudi2/arc/secondary.S
+index 2c0e567..cef77bb 100644
+--- a/arch/gaudi2/arc/secondary.S
++++ b/arch/gaudi2/arc/secondary.S
+@@ -7,12 +7,28 @@
+ 
+ .global secondary_entry
+ secondary_entry:
+-	/* stack top set to secondary CPU DCCM 1k offset (internal address) */
+-	mov	sp, 0x80000400
++	mov	sp, __stack_top
+ 	mov	fp, sp
+ 
+ 	/* Disable un-aligned checks on data memory */
+ 	lr r0, [STATUS32]
+ 	bset r0, r0, 0x13
+ 	kflag r0
++
++	/*
++	 * ARC0 DCCM init is performed by ppboot code running on ARC1
++	 * before putting ARC0 in running state.
++	 * copy data and sdata sections from FWSRAM to ARC0 DCCM
++	 */
++	mov_s   r1, @_erodata           ; r1 = end of the text/ro section
++	mov_s   r2, @_data
++	sub     r3, @_esdata, r2        ; r3 = size of total data in bytes
++
++	asr_s   r13, r3
++	asr.f   lp_count, r13
++
++	lpnz    1f
++	ld.ab   r5,[r1,4]
++	st.ab   r5,[r2,4]
++1:
+ 	bl	secondary_main

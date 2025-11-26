@@ -1,0 +1,279 @@
+From 8fa685b68d0145c96a7e78b19927bfc077d0d68b Mon Sep 17 00:00:00 2001
+From: Varun <vyaparla@habana.ai>
+Date: Tue, 08 Feb 2022 06:29:01 +0200
+Subject: [PATCH] [SW-69281] gaudi2: add fit support via elbi interface
+
+This change adds FIT download support via ELBI interface.
+Gaudi uses spsram  as backend storage for fit to be
+downloaded via elbi interface and gaudi2 uses arc farm
+arc0 dccm as backend storage. This change generalize
+elbi changes as backend storage agnostic
+
+Change-Id: Ib756f155cf4fdb1184d992844545182d8967b996
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index bd29f30..adb8216 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -45,6 +45,10 @@
+ 	if ((base >= SP_SRAM_BASE) && (base < SP_SRAM_BASE + HL_SP_SRAM_SIZE))
+ 		return (base & ~SP_SRAM_BASE) | HL_AXI_GENERAL_BASE;
+ 
++	if ((base >= ARC_FARM_ARC0_DCCM0_BASE) &&
++		(base <= ARC_FARM_ARC0_DCCM0_BASE + FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE))
++		return (base | HL_AXI_GENERAL_BASE);
++
+ 	return (base & ~SDRAM_BASE) | SDRAM_BASE_FULL;
+ }
+ 
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 060170d..f1a2132 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -708,6 +708,10 @@
+ 	    (u64)(addr + (u64)len) <= (u64)(ARM_SDRAM_BASE + ARM_SDRAM_SIZE))
+ 		return true;
+ 
++	if (addr >= ARC_FARM_ARC0_DCCM0_BASE &&
++		addr + len <= ARC_FARM_ARC0_DCCM0_BASE + FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE)
++		return true;
++
+ 	preboot_puts_hex64("ERROR: invalid address range addr = ",
+ 			   addr, true);
+ 
+diff --git a/arch/gaudi2/arm/asic.c b/arch/gaudi2/arm/asic.c
+index f27aa34..7f916a0 100644
+--- a/arch/gaudi2/arm/asic.c
++++ b/arch/gaudi2/arm/asic.c
+@@ -11,6 +11,9 @@
+ #include <sha512.h>
+ #include <boot_desc.h>
+ 
++#include "common.h"
++#include <hl.h>
++
+ #define SDRAM_BASE_FULL 0x1000FFFFFD000000ull
+ 
+ u64 lkd_dev_spec_get_img_addr(uintptr_t base)
+@@ -19,6 +22,10 @@
+ 	if ((base >= HL_SP_SRAM_BASE) && (base <= HL_SP_SRAM_BASE + HL_SP_SRAM_SIZE))
+ 		return ((base & ~HL_SP_SRAM_BASE) | HL_SP_SRAM_BASE_FULL);
+ 
++	if ((base >= ARC_FARM_ARC0_DCCM0_BASE) &&
++		(base <= ARC_FARM_ARC0_DCCM0_BASE + FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE))
++		return (base | HL_AXI_GENERAL_BASE);
++
+ 	return ((base & ~SDRAM_BASE) | SDRAM_BASE_FULL);
+ }
+ 
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 92da6c3..69facc2 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -340,6 +340,10 @@
+ 	    addr + len < ARC1_ICCM_BASE_ADDR + ARC1_MEM_SIZE)
+ 		return true;
+ 
++	if (addr >= ARC_FARM_ARC0_DCCM0_BASE &&
++		addr + len <= ARC_FARM_ARC0_DCCM0_BASE + FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE)
++		return true;
++
+ 	return false;
+ }
+ 
+diff --git a/arch/gaudi2/arm/common.h b/arch/gaudi2/arm/common.h
+index 122161b..56a0437 100644
+--- a/arch/gaudi2/arm/common.h
++++ b/arch/gaudi2/arm/common.h
+@@ -46,6 +46,7 @@
+ #define HL_CFG_BASE			0x3FF8000000ull
+ 
+ #define HL_SP_SRAM_BASE			0x3FF7FE0000ULL
++#define HL_AXI_GENERAL_BASE		0x1000007FF0000000ULL
+ #define HL_SP_SRAM_BASE_FULL		0x1000007FF7FE0000ULL
+ #define HL_SP_SRAM_INIT_CTRL		0x1000007FFCC4BD80ULL
+ #define HL_SP_SRAM_SIZE			SZ_64K
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index b9af41b..509fd3f 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -9,6 +9,7 @@
+ #include <preboot.h>
+ #include <sizes.h>
+ #include <limits.h>
++#include <arc_farm_arc0_dccm0_regs.h>
+ 
+ #ifdef TARGET_IS_PLDM
+ 	#define MME_MASK 0x0
+@@ -42,6 +43,9 @@
+ #define ARC1_DCCM_FULL_BASE			0x1000007FF7060000ull
+ #define ARC1_DCCM_SIZE				SZ_32K
+ 
++#define ARC_FARM_ARC0_DCCM0_BASE		(HL_CFG_BASE + mmARC_FARM_ARC0_DCCM0_DCCM_BASE_ADDR)
++#define FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE	SZ_16K
++
+ #define NUM_OF_DCORES			4
+ #define NUM_OF_EDMA_PER_DCORE		2
+ #define NUM_OF_HIF_PER_DCORE		4
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 5d3835d..91e5425 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -24,6 +24,7 @@
+ #include <sha256.h>
+ #include <gaudi2/gaudi2_security.h>
+ #include <preboot/fit.h>
++#include <hl_fw_if.h>
+ #include <psoc_arc0_mstr_if_core_hbw_regs.h>
+ #include <psoc_arc0_mstr_if_core_lbw_regs.h>
+ #include <psoc_arc1_mstr_if_core_hbw_regs.h>
+@@ -48,6 +49,9 @@
+ #include <i2c_s_mstr_if_core_hbw_regs.h>
+ #include <smi_mstr_if_core_hbw_regs.h>
+ #include <psoc_cs_trace_regs.h>
++#include <arc_farm_arc0_aux_regs.h>
++#include <arc_farm_arc0_dccm0_regs.h>
++#include <pll.h>
+ #include "common.h"
+ 
+ static struct hl_sec_rrs_cfg hl_sec_lbw_rrs_tbl[] = {
+@@ -1281,3 +1285,138 @@
+ 	}
+ 
+ }
++
++#define ARC_FARM_ARC0_RUN_HALT_ACK_SYS_HALT_R_MASK	BIT(8)
++#define ARC_FARM_ARC0_RUN_HALT_ACK_HALT_ACK_MASK	BIT(4)
++#define ARC_FARM_ARC0_HALT_RETRIES			1000
++
++static int halt_arc_farm_arc0(void)
++{
++	int ret = 0;
++	u32 val;
++	u32 retry = ARC_FARM_ARC0_HALT_RETRIES;
++
++	val = regmap_readl(mmARC_FARM_ARC0_AUX_RUN_HALT_ACK);
++	if (!(val & ARC_FARM_ARC0_RUN_HALT_ACK_SYS_HALT_R_MASK)) {
++		/* Halt ARC incase if it is not already halted */
++		preboot_puts("Halting ARC farm ARC0\n");
++		regmap_writel(BIT(1), mmARC_FARM_ARC0_AUX_RUN_HALT_REQ);
++		while (1) {
++			val = regmap_readl(mmARC_FARM_ARC0_AUX_RUN_HALT_ACK);
++			if (val & ARC_FARM_ARC0_RUN_HALT_ACK_HALT_ACK_MASK)
++				break;
++
++			udelay(1);
++			retry--;
++			if (!retry) {
++				preboot_puts("No ack from ARC farm ARC0\n");
++				ret = 1;
++				break;
++			}
++		}
++		/* Clear HALT_REQ bit */
++		regmap_writel(0x0, mmARC_FARM_ARC0_AUX_RUN_HALT_REQ);
++	}
++
++	return ret;
++}
++
++static void reset_arc_farm_arc0(void)
++{
++	/* Reset ARC */
++	regmap_writel(BIT(0), mmARC_FARM_ARC0_AUX_ARC_RST);
++}
++
++static void arc_farm_arc0_out_of_reset(void)
++{
++	/*
++	 * Bring ARC out of reset
++	 * Clear CORE BIT(0) and set PRESETDBGN BIT(4)
++	 */
++	regmap_writel(BIT(4), mmARC_FARM_ARC0_AUX_ARC_RST);
++
++	/* Disable DCCM_TERMINATE_EN to enable writes to DCCM memory */
++	regmap_writel(0x0, mmARC_FARM_ARC0_AUX_CFG_DCCM_TERMINATE_EN);
++}
++
++static int init_arc_farm_arc0_dccm0(void)
++{
++	if (halt_arc_farm_arc0())
++		return 1;
++
++	reset_arc_farm_arc0();
++	mdelay(1);
++	arc_farm_arc0_out_of_reset();
++
++	return 0;
++}
++
++uintptr_t preboot_get_elbi_reg_base(void)
++{
++	if (init_arc_farm_arc0_dccm0())
++		return 0;
++
++	return (uintptr_t)ARC_FARM_ARC0_DCCM0_BASE;
++}
++
++u32 preboot_get_elbi_reg_size(void)
++{
++	return FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE;
++}
++
++u32 preboot_get_elbi_reg_offset_from_base(uintptr_t address)
++{
++	u32 offset = 0;
++
++	if (address > ARC_FARM_ARC0_DCCM0_BASE)
++		offset = (u32)((address - ARC_FARM_ARC0_DCCM0_BASE) & ~HL_UPD_STS_OFFSET_MASK);
++
++	return offset;
++}
++
++void preboot_security_dynamic_img_elbi_reg_open(void)
++{
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++
++	rr_sel.noc = true;
++	rr_sel.pcie = true;
++
++	hl_secure_lbw_rr(HL_SEC_LBW_ELBI_FIT_REGION, 0x0, 0x0, rr_sel);
++}
++
++void preboot_security_dynamic_img_elbi_reg_close(void)
++{
++	u64 min, max;
++	struct hl_rr_eng_select rr_sel;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++
++	rr_sel.noc = true;
++	rr_sel.pcie = true;
++
++	/*
++	 * ARC_FARM_ARC0_DCCM0_DCCM_BASE_FULL to
++	 * (ARC_FARM_ARC0_DCCM0_DCCM_BASE_FULL + FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE)
++	 * 0x1000007FFCE90000 - 0x1000007FFCE94000
++	 */
++	min = CFG_BASE + mmARC_FARM_ARC0_DCCM0_DCCM_BASE_ADDR;
++	max = CFG_BASE + mmARC_FARM_ARC0_DCCM0_DCCM_BASE_ADDR + FIT_IMG_ARC_FARM_ARC0_DCCM0_SIZE;
++	hl_secure_lbw_rr(HL_SEC_LBW_ELBI_FIT_REGION, min, max, rr_sel);
++}
++
++void preboot_dynamic_img_elbi_reg_cleanup(void *map_addr, u32 size)
++{
++	memset(map_addr, 0, size);
++	preboot_security_dynamic_img_elbi_reg_open();
++
++	/* Enable DCCM_TERMINATE_EN to disable writes to DCCM memory */
++	regmap_writel(BIT(0), mmARC_FARM_ARC0_AUX_CFG_DCCM_TERMINATE_EN);
++
++	/* reset ARC */
++	reset_arc_farm_arc0();
++}

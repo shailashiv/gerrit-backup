@@ -1,0 +1,161 @@
+From 4595300daeb4eb4d5cf46bfc6b57885e9bac4112 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 28 Nov 2024 14:56:23 +0200
+Subject: [PATCH] [SW-195710] erom: g3: set bis device in erom
+
+In Gaudi3 (unlike G2) EROM is not disabled in BIS mode, so it should
+be able to identify BIS mode and set the PCI revision respectively.
+
+To maintain platform specific functionality in Erom an erom.c module
+is added to all platforms. At the moment only gaudi2 erom.c has content,
+for the other platforms the erom.c is a place holder for future
+erom specific platform specific code.
+
+Change-Id: Iafcfa3b02c2a0929350971498e6efbb547c7cf69
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 1fe6ad9..2ccc555 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -56,6 +56,7 @@
+ 	$(HL_DEV_ARCH)/$(HL_TARGET).o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
+ 	$(HL_DEV_ARCH)/../common/common.o \
++	$(HL_DEV_ARCH)/../common/erom.o \
+ 	$(HL_DEV_ARCH)/common.o \
+ 	$(EMB_COMMON_MOD_DIR)/lib/common/lib_common.o \
+ 	$(EMB_COMMON_MOD_DIR)/lib/common/pci.o \
+@@ -90,6 +91,7 @@
+ 	$(HL_DEV_ARCH)/../common/pll.o \
+ 	$(HL_DEV_ARCH)/../common/sha.o \
+ 	$(HL_DEV_ARCH)/../common/$(HL_TARGET).o \
++	$(HL_DEV_ARCH)/../common/erom.o \
+ 	$(HL_DEV_ARCH_COMMON)/reset.o \
+ 	$(HL_DEV_ARCH)/$(HL_TARGET).o \
+ 	$(EMB_COMMON_MOD_DIR)/lib/common/lib_common.o \
+diff --git a/app/ext_rom/erom_pcie.c b/app/ext_rom/erom_pcie.c
+index 8dc23c2..29a065f 100644
+--- a/app/ext_rom/erom_pcie.c
++++ b/app/ext_rom/erom_pcie.c
+@@ -198,14 +198,3 @@
+ 	ppboot_security_init();
+ 	erom_pcie_init();
+ }
+-
+-/*
+- * There is no eROM for bis compliant, hence no need to check
+- * bis compliant as part of eROM. Therefore, this function is declared
+- * here as a strong function with an empty implementation, and
+- * in security module the function is declared as a weak function.
+- */
+-bool preboot_is_bis_compliant_mode(void)
+-{
+-	return false;
+-}
+diff --git a/arch/fs1/common/erom.c b/arch/fs1/common/erom.c
+new file mode 100644
+index 0000000..41666a6
+--- /dev/null
++++ b/arch/fs1/common/erom.c
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * (C) Copyright 2024 HabanaLabs, Ltd.
++ */
+diff --git a/arch/gaudi2/common/erom.c b/arch/gaudi2/common/erom.c
+new file mode 100644
+index 0000000..1931cc6
+--- /dev/null
++++ b/arch/gaudi2/common/erom.c
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * (C) Copyright 2024 HabanaLabs, Ltd.
++ */
++
++#include <baremetal.h>
++
++/*
++ * There is no eROM for bis compliant in Gaudi2, hence no need to check
++ * bis compliant as part of eROM. Therefore, this function is declared
++ * here as a strong function with an empty implementation, and
++ * in security module the function is declared as a weak function.
++ */
++bool preboot_is_bis_compliant_mode(void)
++{
++	return false;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 9ab02d7..c30b5d8 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1013,6 +1013,13 @@
+ 
+ #define BIS_DEVICE_PCIE_REVISION	0x4
+ 
++void set_bis_compliant_device_pci_rev(void)
++{
++	regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_CLASS_CODE_REVISION_ID),
++			BIS_DEVICE_PCIE_REVISION,
++			PCIE_DBI_CLASS_CODE_REVISION_ID_REVISION_ID_M);
++}
++
+ static void pif_arc_pcie_device_id_vendor_id_set(void)
+ {
+ 	u32 device_id_vendor_id = hl_pci_get_ven_id_dev_id();
+@@ -1025,9 +1032,7 @@
+ 			D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_SUBSYSTEM_ID_SUBSYSTEM_VENDOR_ID_REG));
+ 
+ 	if (pif_is_bis_compliant_device())
+-		regmap_rmwritel(D0_PCIE_DBI_SIG_REG(mmPCIE_DBI_CLASS_CODE_REVISION_ID),
+-				BIS_DEVICE_PCIE_REVISION,
+-				PCIE_DBI_CLASS_CODE_REVISION_ID_REVISION_ID_M);
++		set_bis_compliant_device_pci_rev();
+ }
+ 
+ #define EMR_PWR_M	PCIE_DBI_DEVICE_CAPABILITIES2_REG_PCIE_CAP2_EMERGENCY_PWR_RED_SUPPORT_M
+@@ -1694,7 +1699,7 @@
+ 	return true;
+ }
+ 
+-__weak bool preboot_is_bis_compliant_mode(void)
++bool preboot_is_bis_compliant_mode(void)
+ {
+ 	return ppboot_sys_cfg_efuse_is_set(EFUSE_BIS_COMPLIANT_EN_MASK);
+ }
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index 5fbcb1c..dc23030 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -71,5 +71,6 @@
+ u32 gaudi3_count_set_bit(u32 n);
+ void gaudi3_clean_hot_reset_intr(void);
+ int ppboot_boot_info_set(u32 type, void *data, u32 size);
++void set_bis_compliant_device_pci_rev(void);
+ 
+ #endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/common/erom.c b/arch/gaudi3/common/erom.c
+new file mode 100644
+index 0000000..41666a6
+--- /dev/null
++++ b/arch/gaudi3/common/erom.c
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * (C) Copyright 2024 HabanaLabs, Ltd.
++ */
+diff --git a/arch/gaudi3/common/pci.c b/arch/gaudi3/common/pci.c
+index c97cb57..36e7462 100644
+--- a/arch/gaudi3/common/pci.c
++++ b/arch/gaudi3/common/pci.c
+@@ -142,6 +142,8 @@
+ 		pcie_phy_set_sram_ext_ld_done();
+ 
+ 		pcie_set_pcie_device_vendor_id();
++		if (preboot_is_bis_compliant_mode())
++			set_bis_compliant_device_pci_rev();
+ 
+ 		hl_pcie_clear_boot_termination();
+ 

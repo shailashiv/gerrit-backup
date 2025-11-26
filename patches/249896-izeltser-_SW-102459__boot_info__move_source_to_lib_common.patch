@@ -1,0 +1,641 @@
+From 3a07a4ca7f20effb4e08115a1a8da2394c8ef93f Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 30 Aug 2022 18:46:59 +0300
+Subject: [PATCH] [SW-102459] boot_info: move source to lib common
+
+Since boot info functions will be used for gaudi3 ppboot, the source
+file is moved to lib/common folder. crc32 source is moved as well
+because it's being used by the boot info.
+
+Change-Id: I6d1c1cc01a8123c9252278796ee1b997c6184cd2
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 9afd66e..10a1bf3 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -80,15 +80,15 @@
+ 	$(PREBOOT_ROOT_DIR)/lib/common/pci.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/lib_common.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/common/module_pci.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/boot_info.o \
++	$(PREBOOT_ROOT_DIR)/lib/common/crc32.o \
+ 	$(PREBOOT_ROOT_DIR)/app/preboot/preboot.o \
+-	$(PREBOOT_ROOT_DIR)/lib/preboot/boot_info.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/fit_regions.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_fwupd.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_uart.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/fit_rsa.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_i2c_slave.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/crc8.o \
+-	$(PREBOOT_ROOT_DIR)/lib/preboot/crc32.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/i2cslave_indirect.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/module_lkd.o \
+ 	$(PREBOOT_ROOT_DIR)/lib/preboot/thermal.o \
+diff --git a/arch/greco/arc_elf32/common.h b/arch/greco/arc_elf32/common.h
+index 28af0b4..da99dbf 100644
+--- a/arch/greco/arc_elf32/common.h
++++ b/arch/greco/arc_elf32/common.h
+@@ -54,6 +54,9 @@
+ #define ARC_RST_VEC_ADDR	0x0
+ #define ARC_I2C_2_IRQ_MASK	0x80
+ 
++/* dummy value for build purposes */
++#define BOOT_INFO_BASE		SP_SRAM_BASE
++
+ #ifndef __ASSEMBLY__
+ extern void secondary_entry(void);
+ #endif
+diff --git a/lib/common/boot_info.c b/lib/common/boot_info.c
+new file mode 100644
+index 0000000..aa4c59b
+--- /dev/null
++++ b/lib/common/boot_info.c
+@@ -0,0 +1,226 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <string.h>
++#include <stdbool.h>
++#include <preboot.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++#include <sha256.h>
++#include <crc32.h>
++
++#include "boot_info.h"
++#include "uart.h"
++
++static struct boot_info boot_info = { .ptrs = { .count = 0 } };
++
++static inline void *offset2ptr(u32 offset, uintptr_t base)
++{
++	return (void *)(base + offset);
++}
++
++static inline u32 ptr2offset(const void *ptr, uintptr_t base)
++{
++	return (u32)((uintptr_t)ptr) - base;
++}
++
++static struct hl_boot_info_desc *boot_info_get_desc(u32 type)
++{
++	int i;
++
++	for (i = 0; i < boot_info.ptrs.count; i++)
++		if (boot_info.descs[i].type == type)
++			return &boot_info.descs[i];
++
++	return NULL;
++}
++
++static void create_sha_csum(const unsigned char *input, unsigned int ilen,
++			    struct hl_boot_info_desc *desc)
++{
++	uint32_t crc32_res;
++	uint16_t boot_info_version = hl_get_boot_info_ver();
++
++	if (!boot_info_version) {
++		sha256_csum(input, ilen, desc->chksum);
++	} else {
++		crc32_res = crc32(0, input, ilen);
++		memcpy(&desc->crc32, &crc32_res, sizeof(crc32_res));
++	}
++}
++
++static int validate_sha_csum(struct hl_boot_info_ptrs *ptrs,
++			     const unsigned char *input,
++			     unsigned int ilen,
++			     struct hl_boot_info_desc *desc)
++{
++	u8 chksum[HL_BOOT_INFO_CSUM_SIZE];
++	u32 crc32_res;
++
++	if (!ptrs->desc_ver) {
++		sha256_csum(input, ilen, chksum);
++		return memcmp(chksum, desc->chksum, HL_BOOT_INFO_CSUM_SIZE);
++	}
++
++	/* for version >= 1 */
++	crc32_res = crc32(0, input, ilen);
++	return memcmp(&crc32_res, &desc->crc32, CRC32_NUM_BYTES);
++}
++
++void boot_info_finalize(void)
++{
++	struct hl_boot_info_desc *desc;
++	u32 offsets[MAX_INFO_DESCS];
++	u32 offset, copy_sz;
++	const u32 *src;
++	u32 *dst;
++	int i, j;
++	struct hl_boot_info_desc descs[MAX_INFO_DESCS];
++
++	if (!boot_info.ptrs.count)
++		return;
++
++	boot_info.ptrs.magic = HL_BOOT_INFO_MAGIC;
++	boot_info.ptrs.desc_ver = hl_get_boot_info_ver();
++	boot_info.ptrs.desc_sz = sizeof(struct hl_boot_info_desc);
++
++	/* Data offset */
++	offset = sizeof(struct hl_boot_info_ptrs) +
++		(sizeof(struct hl_boot_info_desc) + sizeof(u32)) *
++		boot_info.ptrs.count;
++
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++
++	memcpy(descs, boot_info.descs, sizeof(descs));
++	/* Store data */
++	for (i = 0; i < boot_info.ptrs.count; i++) {
++		desc = &descs[i];
++		src = offset2ptr(desc->offset, PREBOOT_TEXT_BASE);
++		create_sha_csum((u8 *)src, desc->size, desc);
++		copy_sz = ROUND_UP4(desc->size);
++
++		for (j = 0; j < copy_sz / sizeof(u32); j++)
++			dst[j] = src[j];
++
++		desc->offset = ptr2offset(dst, BOOT_INFO_BASE);
++		dst += j;
++	}
++
++	/* Store descriptors */
++	offset = sizeof(struct hl_boot_info_ptrs) +
++		(sizeof(u32)) * boot_info.ptrs.count;
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++	for (i = 0; i < boot_info.ptrs.count; i++) {
++		src = (u32 *)&descs[i];
++		copy_sz = ROUND_UP4(sizeof(struct hl_boot_info_desc));
++
++		for (j = 0; j < copy_sz / sizeof(u32); j++)
++			dst[j] = src[j];
++
++		offsets[i] = ptr2offset(dst, BOOT_INFO_BASE);
++		dst += j;
++	}
++
++	/* Store offsets array */
++	offset = sizeof(struct hl_boot_info_ptrs);
++	dst = offset2ptr(offset, BOOT_INFO_BASE);
++	for (i = 0; i < boot_info.ptrs.count; i++)
++		dst[i] = offsets[i];
++
++	/* Store the ptr */
++	dst = offset2ptr(0, BOOT_INFO_BASE);
++	for (i = 0; i < sizeof(boot_info.ptrs) / sizeof(u32); i++)
++		dst[i] = boot_info.data[i];
++}
++
++int boot_info_set(u32 type, const void *data, u32 size)
++{
++	struct hl_boot_info_desc *desc;
++
++	desc = boot_info_get_desc(type);
++	if (!desc) {
++		if (boot_info.ptrs.count >= MAX_INFO_DESCS) {
++			preboot_puts_hex("reached max desc count ", type, 0);
++			return 1;
++		}
++
++		desc = &boot_info.descs[boot_info.ptrs.count];
++		boot_info.ptrs.count++;
++	}
++
++	desc->type = type;
++	desc->size = size;
++	desc->magic = HL_BOOT_INFO_DESC_MAGIC | type;
++	/* Store offset relative to preboot text */
++	desc->offset = ptr2offset(data, PREBOOT_TEXT_BASE);
++
++	return 0;
++}
++
++/*
++ * Apply memory copy with 32bit access limitation from src, make sure any
++ * reminder is also read using 32bit access.
++ * Both src and dst must be 32bit aligned addresses.
++ */
++static void boot_info_memcpy32(void *dst, void *src, u32 size)
++{
++	u32 *d, *s, rem;
++	int i, rem_sz;
++
++	d = dst;
++	s = src;
++
++	for (i = 0; i < size / sizeof(u32); i++)
++		d[i] = s[i];
++
++	rem_sz = size % sizeof(u32);
++	if (!rem_sz)
++		return;
++
++	rem = s[i];
++	memcpy(&d[i], &rem, rem_sz);
++}
++
++int boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
++{
++	struct hl_boot_info_ptrs ptrs;
++	struct hl_boot_info_desc desc;
++	u32 *offsets, i, cpy_sz;
++	void *src;
++	int ret;
++
++	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
++	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
++		return 1;
++
++	offsets = (u32 *)offset2ptr(sizeof(struct hl_boot_info_ptrs),
++				    BOOT_INFO_BASE);
++
++	for (i = 0; i < ptrs.count; i++) {
++		desc = *(struct hl_boot_info_desc *)offset2ptr(offsets[i],
++							       BOOT_INFO_BASE);
++		if (type != desc.type)
++			continue;
++
++		if (desc.magic != (HL_BOOT_INFO_DESC_MAGIC | type))
++			return 1;
++
++		cpy_sz = (max_size > desc.size) ? desc.size : max_size;
++		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
++		boot_info_memcpy32(data, src, cpy_sz);
++
++		ret = validate_sha_csum(&ptrs, (u8 *)data, desc.size,
++					&desc);
++		if (ret)
++			return 1;
++
++		*copy_size = cpy_sz;
++
++		return 0;
++	}
++
++	return 1;
++}
+diff --git a/lib/common/crc32.c b/lib/common/crc32.c
+new file mode 100644
+index 0000000..c999a1d
+--- /dev/null
++++ b/lib/common/crc32.c
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <preboot.h>
++#include <uart.h>
++
++/*
++ * Compute CRC32 using 256 deep lookup table.
++ * Taken from Linux implementation of Sarwate algorithm with additional bit
++ * flip for pre and post CRC.
++ * This implementation is only good for little endian processor.
++ */
++
++#define CRC32_POLY	0xedb88320
++#define CRC_BITS	8
++#define TABLE_SIZE	256
++
++static u32 crc32table[256];
++static bool is_crc32_table_initialized;
++
++void crc32_init_lookup(void)
++{
++	unsigned int i, j;
++	u32 crc = 1;
++
++	crc32table[0] = 0;
++
++	for (i = TABLE_SIZE >> 1; i; i >>= 1) {
++		crc = (crc >> 1) ^ ((crc & 1) ? CRC32_POLY : 0);
++		for (j = 0; j < TABLE_SIZE; j += 2 * i)
++			crc32table[i + j] = crc ^ crc32table[j];
++	}
++	for (i = 0; i < TABLE_SIZE; i++) {
++		crc = crc32table[i];
++		crc = crc32table[crc & 0xff] ^ (crc >> 8);
++	}
++}
++
++u32 crc32(u32 crc, unsigned char const *p, size_t len)
++{
++	crc = ~crc;
++
++	if (!is_crc32_table_initialized) {
++		crc32_init_lookup();
++		is_crc32_table_initialized = true;
++	}
++
++	while (len--) {
++		crc ^= *p++;
++		crc = (crc >> 8) ^ crc32table[crc & 255];
++	}
++
++	return ~crc;
++}
+diff --git a/lib/preboot/boot_info.c b/lib/preboot/boot_info.c
+deleted file mode 100644
+index aa4c59b..0000000
+--- a/lib/preboot/boot_info.c
++++ /dev/null
+@@ -1,226 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-#include <string.h>
+-#include <stdbool.h>
+-#include <preboot.h>
+-#include <hl_boot_desc.h>
+-#include <common.h>
+-#include <sha256.h>
+-#include <crc32.h>
+-
+-#include "boot_info.h"
+-#include "uart.h"
+-
+-static struct boot_info boot_info = { .ptrs = { .count = 0 } };
+-
+-static inline void *offset2ptr(u32 offset, uintptr_t base)
+-{
+-	return (void *)(base + offset);
+-}
+-
+-static inline u32 ptr2offset(const void *ptr, uintptr_t base)
+-{
+-	return (u32)((uintptr_t)ptr) - base;
+-}
+-
+-static struct hl_boot_info_desc *boot_info_get_desc(u32 type)
+-{
+-	int i;
+-
+-	for (i = 0; i < boot_info.ptrs.count; i++)
+-		if (boot_info.descs[i].type == type)
+-			return &boot_info.descs[i];
+-
+-	return NULL;
+-}
+-
+-static void create_sha_csum(const unsigned char *input, unsigned int ilen,
+-			    struct hl_boot_info_desc *desc)
+-{
+-	uint32_t crc32_res;
+-	uint16_t boot_info_version = hl_get_boot_info_ver();
+-
+-	if (!boot_info_version) {
+-		sha256_csum(input, ilen, desc->chksum);
+-	} else {
+-		crc32_res = crc32(0, input, ilen);
+-		memcpy(&desc->crc32, &crc32_res, sizeof(crc32_res));
+-	}
+-}
+-
+-static int validate_sha_csum(struct hl_boot_info_ptrs *ptrs,
+-			     const unsigned char *input,
+-			     unsigned int ilen,
+-			     struct hl_boot_info_desc *desc)
+-{
+-	u8 chksum[HL_BOOT_INFO_CSUM_SIZE];
+-	u32 crc32_res;
+-
+-	if (!ptrs->desc_ver) {
+-		sha256_csum(input, ilen, chksum);
+-		return memcmp(chksum, desc->chksum, HL_BOOT_INFO_CSUM_SIZE);
+-	}
+-
+-	/* for version >= 1 */
+-	crc32_res = crc32(0, input, ilen);
+-	return memcmp(&crc32_res, &desc->crc32, CRC32_NUM_BYTES);
+-}
+-
+-void boot_info_finalize(void)
+-{
+-	struct hl_boot_info_desc *desc;
+-	u32 offsets[MAX_INFO_DESCS];
+-	u32 offset, copy_sz;
+-	const u32 *src;
+-	u32 *dst;
+-	int i, j;
+-	struct hl_boot_info_desc descs[MAX_INFO_DESCS];
+-
+-	if (!boot_info.ptrs.count)
+-		return;
+-
+-	boot_info.ptrs.magic = HL_BOOT_INFO_MAGIC;
+-	boot_info.ptrs.desc_ver = hl_get_boot_info_ver();
+-	boot_info.ptrs.desc_sz = sizeof(struct hl_boot_info_desc);
+-
+-	/* Data offset */
+-	offset = sizeof(struct hl_boot_info_ptrs) +
+-		(sizeof(struct hl_boot_info_desc) + sizeof(u32)) *
+-		boot_info.ptrs.count;
+-
+-	dst = offset2ptr(offset, BOOT_INFO_BASE);
+-
+-	memcpy(descs, boot_info.descs, sizeof(descs));
+-	/* Store data */
+-	for (i = 0; i < boot_info.ptrs.count; i++) {
+-		desc = &descs[i];
+-		src = offset2ptr(desc->offset, PREBOOT_TEXT_BASE);
+-		create_sha_csum((u8 *)src, desc->size, desc);
+-		copy_sz = ROUND_UP4(desc->size);
+-
+-		for (j = 0; j < copy_sz / sizeof(u32); j++)
+-			dst[j] = src[j];
+-
+-		desc->offset = ptr2offset(dst, BOOT_INFO_BASE);
+-		dst += j;
+-	}
+-
+-	/* Store descriptors */
+-	offset = sizeof(struct hl_boot_info_ptrs) +
+-		(sizeof(u32)) * boot_info.ptrs.count;
+-	dst = offset2ptr(offset, BOOT_INFO_BASE);
+-	for (i = 0; i < boot_info.ptrs.count; i++) {
+-		src = (u32 *)&descs[i];
+-		copy_sz = ROUND_UP4(sizeof(struct hl_boot_info_desc));
+-
+-		for (j = 0; j < copy_sz / sizeof(u32); j++)
+-			dst[j] = src[j];
+-
+-		offsets[i] = ptr2offset(dst, BOOT_INFO_BASE);
+-		dst += j;
+-	}
+-
+-	/* Store offsets array */
+-	offset = sizeof(struct hl_boot_info_ptrs);
+-	dst = offset2ptr(offset, BOOT_INFO_BASE);
+-	for (i = 0; i < boot_info.ptrs.count; i++)
+-		dst[i] = offsets[i];
+-
+-	/* Store the ptr */
+-	dst = offset2ptr(0, BOOT_INFO_BASE);
+-	for (i = 0; i < sizeof(boot_info.ptrs) / sizeof(u32); i++)
+-		dst[i] = boot_info.data[i];
+-}
+-
+-int boot_info_set(u32 type, const void *data, u32 size)
+-{
+-	struct hl_boot_info_desc *desc;
+-
+-	desc = boot_info_get_desc(type);
+-	if (!desc) {
+-		if (boot_info.ptrs.count >= MAX_INFO_DESCS) {
+-			preboot_puts_hex("reached max desc count ", type, 0);
+-			return 1;
+-		}
+-
+-		desc = &boot_info.descs[boot_info.ptrs.count];
+-		boot_info.ptrs.count++;
+-	}
+-
+-	desc->type = type;
+-	desc->size = size;
+-	desc->magic = HL_BOOT_INFO_DESC_MAGIC | type;
+-	/* Store offset relative to preboot text */
+-	desc->offset = ptr2offset(data, PREBOOT_TEXT_BASE);
+-
+-	return 0;
+-}
+-
+-/*
+- * Apply memory copy with 32bit access limitation from src, make sure any
+- * reminder is also read using 32bit access.
+- * Both src and dst must be 32bit aligned addresses.
+- */
+-static void boot_info_memcpy32(void *dst, void *src, u32 size)
+-{
+-	u32 *d, *s, rem;
+-	int i, rem_sz;
+-
+-	d = dst;
+-	s = src;
+-
+-	for (i = 0; i < size / sizeof(u32); i++)
+-		d[i] = s[i];
+-
+-	rem_sz = size % sizeof(u32);
+-	if (!rem_sz)
+-		return;
+-
+-	rem = s[i];
+-	memcpy(&d[i], &rem, rem_sz);
+-}
+-
+-int boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
+-{
+-	struct hl_boot_info_ptrs ptrs;
+-	struct hl_boot_info_desc desc;
+-	u32 *offsets, i, cpy_sz;
+-	void *src;
+-	int ret;
+-
+-	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
+-	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
+-		return 1;
+-
+-	offsets = (u32 *)offset2ptr(sizeof(struct hl_boot_info_ptrs),
+-				    BOOT_INFO_BASE);
+-
+-	for (i = 0; i < ptrs.count; i++) {
+-		desc = *(struct hl_boot_info_desc *)offset2ptr(offsets[i],
+-							       BOOT_INFO_BASE);
+-		if (type != desc.type)
+-			continue;
+-
+-		if (desc.magic != (HL_BOOT_INFO_DESC_MAGIC | type))
+-			return 1;
+-
+-		cpy_sz = (max_size > desc.size) ? desc.size : max_size;
+-		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
+-		boot_info_memcpy32(data, src, cpy_sz);
+-
+-		ret = validate_sha_csum(&ptrs, (u8 *)data, desc.size,
+-					&desc);
+-		if (ret)
+-			return 1;
+-
+-		*copy_size = cpy_sz;
+-
+-		return 0;
+-	}
+-
+-	return 1;
+-}
+diff --git a/lib/preboot/crc32.c b/lib/preboot/crc32.c
+deleted file mode 100644
+index c999a1d..0000000
+--- a/lib/preboot/crc32.c
++++ /dev/null
+@@ -1,58 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <preboot.h>
+-#include <uart.h>
+-
+-/*
+- * Compute CRC32 using 256 deep lookup table.
+- * Taken from Linux implementation of Sarwate algorithm with additional bit
+- * flip for pre and post CRC.
+- * This implementation is only good for little endian processor.
+- */
+-
+-#define CRC32_POLY	0xedb88320
+-#define CRC_BITS	8
+-#define TABLE_SIZE	256
+-
+-static u32 crc32table[256];
+-static bool is_crc32_table_initialized;
+-
+-void crc32_init_lookup(void)
+-{
+-	unsigned int i, j;
+-	u32 crc = 1;
+-
+-	crc32table[0] = 0;
+-
+-	for (i = TABLE_SIZE >> 1; i; i >>= 1) {
+-		crc = (crc >> 1) ^ ((crc & 1) ? CRC32_POLY : 0);
+-		for (j = 0; j < TABLE_SIZE; j += 2 * i)
+-			crc32table[i + j] = crc ^ crc32table[j];
+-	}
+-	for (i = 0; i < TABLE_SIZE; i++) {
+-		crc = crc32table[i];
+-		crc = crc32table[crc & 0xff] ^ (crc >> 8);
+-	}
+-}
+-
+-u32 crc32(u32 crc, unsigned char const *p, size_t len)
+-{
+-	crc = ~crc;
+-
+-	if (!is_crc32_table_initialized) {
+-		crc32_init_lookup();
+-		is_crc32_table_initialized = true;
+-	}
+-
+-	while (len--) {
+-		crc ^= *p++;
+-		crc = (crc >> 8) ^ crc32table[crc & 255];
+-	}
+-
+-	return ~crc;
+-}

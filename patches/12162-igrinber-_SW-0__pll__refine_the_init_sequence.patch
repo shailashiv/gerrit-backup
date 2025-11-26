@@ -1,0 +1,83 @@
+From 3a9af9c76d82369a4fb4dd9ea250456859b65f5f Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Sun, 05 May 2019 10:36:23 +0300
+Subject: [PATCH] [SW-0] pll: refine the init sequence
+
+We move the waiting for lock into a separate function and call
+it later on after we also have finished the divisors initialization.
+In addition, we move the clock switch to after the interrupt ack
+routine.
+This make the sequence according to the latest architects'
+recommendations.
+
+Change-Id: I53566d15647614fb6dfa970e430c86be701af3ee
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 8684593..961ff01 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -64,8 +64,6 @@
+ 
+ static int hl_pll_cfg(struct hl_pll_cfg *cfg)
+ {
+-	int tout = HL_PLL_LOCK_TOUT;
+-
+ 	hl_pll_reset(cfg, true);
+ 
+ 	regmap_writel(cfg->nr, cfg->base + HL_PLL_NR);
+@@ -81,17 +79,6 @@
+ 
+ 	/* Wait >500 (10us) reference cycles until PLL re-locks. */
+ 	hl_pll_udelay(HL_PLL_MAX_WAIT_TIME);
+-
+-	/* to be on a safe side, poll on the PLL lock status bit */
+-	while (!hl_pll_is_locked(cfg) && tout--)
+-		hl_pll_udelay(1);
+-
+-	if (!tout) {
+-		preboot_puts_raw("PLL: Timeout waiting for ");
+-		preboot_puts_raw(cfg->name);
+-		preboot_puts_raw(" PLL lock...\n\r");
+-		return 1;
+-	}
+ 
+ 	/* w/a the h/w erratum: lock status bit isn't getting cleared */
+ 	hl_pll_clear_lock_status(cfg);
+@@ -144,6 +131,20 @@
+ 	hl_pll_udelay(1);
+ }
+ 
++static void hl_pll_wait_for_lock(struct hl_pll_cfg *cfg)
++{
++	int tout = HL_PLL_LOCK_TOUT;
++
++	while (!hl_pll_is_locked(cfg) && tout--)
++		hl_pll_udelay(1);
++
++	if (!tout) {
++		preboot_puts_raw("PLL: Timeout waiting for ");
++		preboot_puts_raw(cfg->name);
++		preboot_puts_raw(" PLL lock...\n\r");
++	}
++}
++
+ static void hl_pll_ack_int(struct hl_pll_cfg *cfg)
+ {
+ 	regmap_writel(1, cfg->base + HL_PLL_LOCK_INTR);
+@@ -159,10 +160,13 @@
+ 
+ 	hl_pll_div_init(cfg);
+ 
+-	hl_pll_bypass(cfg, false);
++	/* to be on a safe side, poll on the PLL lock status bit */
++	hl_pll_wait_for_lock(cfg);
+ 
+ 	hl_pll_ack_int(cfg);
+ 
++	hl_pll_bypass(cfg, false);
++
+ 	return ret;
+ }
+ 

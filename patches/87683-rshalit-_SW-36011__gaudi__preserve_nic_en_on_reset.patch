@@ -1,0 +1,134 @@
+From fc85f69a943fc577033f690d6cc3e3872a61d230 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Fri, 09 Apr 2021 10:55:09 +0300
+Subject: [PATCH] [SW-36011] gaudi: preserve nic en on reset
+
+NIC enable info till now was saved in scrachpad by first
+saving it in boot_info of spsram and only when loading
+u-boot it was finalized into scrachpad sram.
+Yet, if the fit is received more than once, or in other
+scenario, we need the capability to finalize it only once
+and yet assure that it is preserved it in scratchpad.
+This patch takes care for both saving boot_info and for
+finalize into spsram on reset and when loading image.
+
+Change-Id: I8defbc745fde3200266c7e8d8495136eb950a5a5
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index b45f89d..745b3b5 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -497,5 +497,10 @@
+ 	nic_en.bitmask = nic_en_;
+ 	enable_nic_regs(nic_en_);
+ 	preboot_puts_hex("nic_en ", nic_en_, true);
+-	boot_info_set(HL_BOOT_INFO_NIC_EN, &nic_en, sizeof(nic_en));
++}
++
++void preboot_finalize_nic_en(void)
++{
++	if (nic_en.is_valid)
++		boot_info_set(HL_BOOT_INFO_NIC_EN, &nic_en.bitmask, sizeof(u32));
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index 7603a0e..d4536f1 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -127,6 +127,7 @@
+ void preboot_led_on(void);
+ void preboot_pcie_enable(void);
+ void preboot_pcie_exec_hw_wa(void);
++void preboot_nic_en(u32 nic_en_);
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);
+@@ -166,6 +167,7 @@
+ bool hl_pci_link_is_up(void);
+ 
+ void preboot_finalize_fw_info(void);
++void preboot_finalize_nic_en(void);
+ void preboot_boot_info_set_fw_info(void);
+ 
+ #endif /* __ASSEMBLY__ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 580623a..4bd9868 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ #include <security.h>
+ #include <hl_boot_if.h>
++#include <hl_boot_desc.h>
+ #include <preboot.h>
+ #include <boot_if.h>
+ #include <fit_load_type.h>
+@@ -864,6 +865,7 @@
+ 		break;
+ 	}
+ 
++	preboot_finalize_nic_en();
+ 	preboot_finalize_fw_info();
+ 	preboot_finalize_enabled_caps();
+ 	boot_info_finalize();
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 9ffeeb0..d88a150 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -8,6 +8,7 @@
+ #include <hl_boot_if.h>
+ #include <preboot.h>
+ #include <boot_if.h>
++#include <boot_info.h>
+ #include <security.h>
+ 
+ #include "cmd_module.h"
+@@ -173,13 +174,24 @@
+ 	wfe();
+ }
+ 
++__weak void preboot_finalize_nic_en(void) {}
++
++static void module_lkd_preserve_sp_info(void)
++{
++	preboot_finalize_fw_info();
++	preboot_finalize_nic_en();
++	boot_info_finalize();
++}
++
+ static void module_lkd_run_noret_legacy(void)
+ {
+ 	switch (sts.cmd.val) {
+ 	case KMD_MSG_GOTO_WFE:
++		module_lkd_preserve_sp_info();
+ 		module_lkd_run_noret_wfe();
+ 		break;
+ 	case KMD_MSG_RST_DEV:
++		module_lkd_preserve_sp_info();
+ 		module_lkd_run_noret_reset();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 6c53dd8..442c9ce 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -286,6 +286,7 @@
+ 	struct hl_fw_info_compat fw_info_local = {};
+ 	u32 boot_err = HL_FW_FIT_BOOT_ERR_NONE;
+ 	u32 data_size;
++	u32 nic_en_local;
+ 
+ 	if (!boot_info_get(HL_BOOT_INFO_FIT_BOOT_ERROR, &boot_err,
+ 			   sizeof(boot_err), &data_size)) {
+@@ -307,6 +308,10 @@
+ 		i2csi_set_boot_err(boot_err, true);
+ 	}
+ 
++	if (!boot_info_get(HL_BOOT_INFO_NIC_EN, &nic_en_local,
++			   sizeof(nic_en_local), &data_size))
++		preboot_nic_en(nic_en_local);
++
+ 	if (!boot_info_get(HL_BOOT_INFO_FW_INFO, &fw_info_local,
+ 			   sizeof(fw_info_local), &data_size)) {
+ 		if (fw_info_local.version == HL_FW_INFO_VERSION)

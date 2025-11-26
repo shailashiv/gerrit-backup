@@ -1,0 +1,207 @@
+From ef84ac1c28da47b68163faa9835db4a7ffd88d74 Mon Sep 17 00:00:00 2001
+From: Christine Gharzuzi <cgharzuzi@habana.ai>
+Date: Tue, 08 Dec 2020 13:52:23 +0200
+Subject: [PATCH] [SW-15002] gaudi: security: secure elbi
+
+secure DBI registers but leave SNPS access open for LKD use.
+
+After LKD is done, lock up DBI.
+
+Since LKD will always attempt to configure access to iATU
+razwi event will be triggered in secured systems and cleared
+in the FW before u-boot is loaded.
+
+Change-Id: Ifbc7deb0cc55f1410615e24c72f438d25eb7f778
+Signed-off-by: Christine Gharzuzi <cgharzuzi@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 29b8765..6056805 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -13,6 +13,7 @@
+ #include <pcie_phy_regs.h>
+ #include <pcie_dbi_regs.h>
+ #include <cpu_timestamp_regs.h>
++#include <gic_regs.h>
+ 
+ #include <pcie_aux_masks.h>
+ #include <pcie_dbi_masks.h>
+@@ -33,6 +34,7 @@
+ #include <boot_if.h>
+ #include <boot_info.h>
+ #include <hl_fw_if.h>
++#include <security.h>
+ 
+ #include "common.h"
+ 
+@@ -351,3 +353,30 @@
+ {
+ 	preboot_set_enabled_cap(HL_FW_EN_CAPS_HARD_RESET);
+ }
++
++void preboot_conf_iatu_access(bool enable)
++{
++	u32 reg = enable ? 0x00300000 : 0;
++
++	regmap_writel(reg, mmPCIE_AUX_DBI);
++}
++
++#define GAUDI_IRQ_SIZE	512
++static void preboot_ack_razwi_irq(void)
++{
++	u32 i;
++
++	regmap_writel(1, mmPSOC_GLOBAL_CONF_RAZWI);
++	for (i = 0; i < GAUDI_IRQ_SIZE; i++)
++		regmap_writel(i, mmGIC_DISTRIBUTOR__6_GICD_CLRSPI_NSR);
++}
++
++void preboot_disable_iatu_access(void)
++{
++	if (!preboot_security_is_enabled())
++		return;
++
++	preboot_conf_iatu_access(false);
++	preboot_ack_razwi_irq();
++	preboot_security_dbi_lock();
++}
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 95fea41..c49e8d4 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1112,13 +1112,12 @@
+ 	preboot_secure_lbw_rr(3, min, max);
+ 	preboot_secure_pcie_rr(3, min, max);
+ 
+-	/* TODO: the below is in comment till we solve the ELBI access ticket */
+-	/* PCIE_DBI up to MMU_UP: RR_4 */
+-/*	min = mmPCIE_DBI_BASE - 1;
++	/* PCIE_CORE up to MMU_UP: RR_4 */
++	min = mmPCIE_CORE_BASE - 1;
+ 	max = mmMMU_UP_BASE;
+ 	preboot_secure_lbw_rr(4, min, max);
+ 	preboot_secure_pcie_rr(4, min, max);
+-*/
++
+ 	/* PSOC_I2C_M0 up to PSOC_TIMESTAMP: RR_5 */
+ 	min = mmPSOC_I2C_M0_BASE - 1;
+ 	max = mmPSOC_TIMESTAMP_BASE;
+@@ -1496,8 +1495,6 @@
+ 
+ void preboot_security_cleanup_before_run(void)
+ {
+-	if (!preboot_security_is_enabled())
+-		return;
+ 
+ 	/* Enable the SIF7 HBW SRAM_IF_DYN_RR_BGN - SRAM_IF_DYN_RR_END */
+ 	preboot_secure_hbw_sram();
+@@ -1509,3 +1506,19 @@
+ {
+ 	boot_info_set(HL_BOOT_INFO_KEY_IDX, key_idx, sizeof(u32));
+ }
++
++void preboot_security_dbi_lock(void)
++{
++	u64 min, max;
++
++	if (!preboot_security_is_enabled())
++		return;
++
++	preboot_puts("security dbi lock\n");
++
++	/* PCIE_DBI up to MMU_UP: RR_4 */
++	min = mmPCIE_DBI_BASE - 1;
++	max = mmMMU_UP_BASE;
++	preboot_secure_lbw_rr(4, min, max);
++	preboot_secure_pcie_rr(4, min, max);
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index 4c04371..fad29d7 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -151,6 +151,9 @@
+ void preboot_dev_enable_caps(void);
+ void preboot_set_enabled_cap(enum hl_fw_en_caps en_cap);
+ void preboot_finalize_enabled_caps(void);
++void preboot_conf_iatu_access(bool enable);
++void preboot_disable_iatu_access(void);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/include/security.h b/include/security.h
+index 8f26059..12a826f 100644
+--- a/include/security.h
++++ b/include/security.h
+@@ -16,5 +16,6 @@
+ void preboot_security_dynamic_img_close(void);
+ void preboot_security_dynamic_img_open(void);
+ void preboot_security_cleanup_before_run(void);
++void preboot_security_dbi_lock(void);
+ 
+ #endif /* _HL_SECURITY_H_ */
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index e5f2bf3..68f618e 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -35,6 +35,8 @@
+ 	module_lkd_enable();
+ }
+ 
++__weak void preboot_disable_iatu_access(void) {}
++
+ enum cmd_check_res module_lkd_check(void)
+ {
+ 	enum cmd_check_res res;
+@@ -57,12 +59,14 @@
+ 			cpu_boot_rsp_set(CPU_MSG_OK);
+ 			res = FOUND_NO_RETURN;
+ 		}
++		preboot_disable_iatu_access();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
+ 		res = FOUND_SLOW_RETURN;
+ 		/* Tell LKD we got the message */
+ 		cpu_boot_rsp_set(CPU_MSG_OK);
+ 		preboot_puts("LKD FIT RDY received\n");
++		preboot_disable_iatu_access();
+ 		break;
+ 	case KMD_MSG_RST_DEV:
+ 		res = FOUND_NO_RETURN;
+@@ -70,10 +74,12 @@
+ 		cpu_boot_cmd_clr_before_wfe();
+ 		cpu_boot_rsp_set(CPU_MSG_OK);
+ 		preboot_puts("LKD RST DEV received\n");
++		preboot_disable_iatu_access();
+ 		break;
+ 	case KMD_MSG_SKIP_BMC:
+ 		cpu_boot_rsp_set(CPU_MSG_ERR);
+ 		preboot_puts("LKD SKIP BMC received\n");
++		preboot_disable_iatu_access();
+ 		/* no break */
+ 	default:
+ 		res = NOT_FOUND;
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 0853cef..bd8f8e8 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -247,7 +247,7 @@
+ }
+ 
+ __weak void hl_clock_gating_init(void) {}
+-
++__weak void preboot_conf_iatu_access(bool enable) {}
+ void preboot_main(void)
+ {
+ 	u64 ver_off = (uintptr_t)preboot_vers;
+@@ -269,6 +269,9 @@
+ 
+ 	preboot_sp_sram_init();
+ 
++	/* Enable access to iATU before locking PCIE_AUX */
++	preboot_conf_iatu_access(true);
++
+ 	preboot_security_init();
+ 	preboot_security_dynamic_init();
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_SECURITY_READY);

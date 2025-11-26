@@ -1,0 +1,138 @@
+From 17b1754d449f2767f7d92008a09f323bb2a04736 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Sun, 20 Dec 2020 12:56:08 +0200
+Subject: [PATCH] [SW-26558] gaudi: block pci access to SYNC_MNGR
+
+Block PCIe access to SYNC_MNGR with RR registers.
+Only if initiator is PCIe then access to SYNC_MNGR is blocked.
+Otherwise, when using other initiators, such QMAN for example,
+it is still possible to access SYNC_MNGR.
+This patch is done as part of security access requirements.
+
+Change-Id: I9f1e34f9d4583c10d7cf275e29adf1869824ae83
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index 4ec4563..beb8bf6 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -28,6 +28,7 @@
+ #include <psoc_global_conf_regs.h>
+ #include <dma_if_w_s_down_ch0_regs.h>
+ #include <dma_if_w_s_regs.h>
++#include <sync_mngr_w_s_regs.h>
+ #include <gic_regs.h>
+ 
+ #include <cpu_if_masks.h>
+@@ -1079,9 +1080,13 @@
+ 	}
+ }
+ 
++#define SYNC_MNGR_DIST		0x20000
++#define SYNC_MNGR_SIZE		0x10000
++
+ static void preboot_secure_lbw(void)
+ {
+-	u64 min, max;
++	int i;
++	u64 min, max, base;
+ 
+ 	/*
+ 	 * NOTE: The LBW and PCIe RRs HIT is: min < hit < max
+@@ -1100,53 +1105,61 @@
+ 	preboot_secure_lbw_rr(1, min, max);
+ 	preboot_secure_pcie_rr(1, min, max);
+ 
+-	/* HBM_CFG up to GIC_L: RR_2 */
++	/* SYNC_MNGR: RR_2 up to RR_5 */
++	for (i = 0; i < 4; i++) {
++		base = mmSYNC_MNGR_GLBL_W_S_BASE + SYNC_MNGR_DIST * i;
++		min = base - 1;
++		max = base + SYNC_MNGR_SIZE;
++		preboot_secure_pcie_rr(2 + i, min, max);
++	}
++
++	/* HBM_CFG up to GIC_L: RR_6 */
+ 	min = mmHBM0_BASE - 1;
+ 	max = HL_CFG_BASE + mmGIC_DISTRIBUTOR__5_GICD_SETSPI_NSR;
+-	preboot_secure_lbw_rr(2, min, max);
+-	preboot_secure_pcie_rr(2, min, max);
+-
+-	/* GIC_H up to PCIE_WRAP: RR_3 */
+-	min = max + sizeof(u32) - 1;
+-	max = mmPCIE_WRAP_BASE;
+-	preboot_secure_lbw_rr(3, min, max);
+-	preboot_secure_pcie_rr(3, min, max);
+-
+-	/* PCIE_CORE up to MMU_UP: RR_4 */
+-	min = mmPCIE_CORE_BASE - 1;
+-	max = mmMMU_UP_BASE;
+-	preboot_secure_lbw_rr(4, min, max);
+-	preboot_secure_pcie_rr(4, min, max);
+-
+-	/* PSOC_I2C_M0 up to PSOC_TIMESTAMP: RR_5 */
+-	min = mmPSOC_I2C_M0_BASE - 1;
+-	max = mmPSOC_TIMESTAMP_BASE;
+-	preboot_secure_lbw_rr(5, min, max);
+-	preboot_secure_pcie_rr(5, min, max);
+-
+-	/* PSOC_GPIO0 up to NIC0_MAC_CH0: RR_6 */
+-	min = mmPSOC_GPIO0_BASE - 1;
+-	max = mmNIC0_MAC_CH0_BASE;
+ 	preboot_secure_lbw_rr(6, min, max);
+ 	preboot_secure_pcie_rr(6, min, max);
+ 
+-	/* NIC0_TS up to NIC1_MAC_CH0: RR_7 */
+-	min = mmNIC0_TS_BASE - 1;
+-	max = mmNIC1_MAC_CH0_BASE;
++	/* GIC_H up to PCIE_WRAP: RR_7 */
++	min = max + sizeof(u32) - 1;
++	max = mmPCIE_WRAP_BASE;
+ 	preboot_secure_lbw_rr(7, min, max);
+ 	preboot_secure_pcie_rr(7, min, max);
+ 
+-	/* NIC1_TS up to NIC2_MAC_CH0: RR_8 */
+-	min = mmNIC1_TS_BASE - 1;
+-	max = mmNIC2_MAC_CH0_BASE;
++	/* PCIE_CORE up to MMU_UP: RR_8 */
++	min = mmPCIE_CORE_BASE - 1;
++	max = mmMMU_UP_BASE;
+ 	preboot_secure_lbw_rr(8, min, max);
+ 	preboot_secure_pcie_rr(8, min, max);
+ 
+-	/* NIC3_TS up to NIC4_MAC_CH0: RR_9 */
+-	min = mmNIC3_TS_BASE - 1;
+-	max = mmNIC4_MAC_CH0_BASE;
++	/* PSOC_I2C_M0 up to PSOC_TIMESTAMP: RR_9 */
++	min = mmPSOC_I2C_M0_BASE - 1;
++	max = mmPSOC_TIMESTAMP_BASE;
+ 	preboot_secure_lbw_rr(9, min, max);
+ 	preboot_secure_pcie_rr(9, min, max);
++
++	/* PSOC_GPIO0 up to NIC0_MAC_CH0: RR_10 */
++	min = mmPSOC_GPIO0_BASE - 1;
++	max = mmNIC0_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(10, min, max);
++	preboot_secure_pcie_rr(10, min, max);
++
++	/* NIC0_TS up to NIC1_MAC_CH0: RR_11 */
++	min = mmNIC0_TS_BASE - 1;
++	max = mmNIC1_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(11, min, max);
++	preboot_secure_pcie_rr(11, min, max);
++
++	/* NIC1_TS up to NIC2_MAC_CH0: RR_12 */
++	min = mmNIC1_TS_BASE - 1;
++	max = mmNIC2_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(12, min, max);
++	preboot_secure_pcie_rr(12, min, max);
++
++	/* NIC3_TS up to NIC4_MAC_CH0: RR_13 */
++	min = mmNIC3_TS_BASE - 1;
++	max = mmNIC4_MAC_CH0_BASE;
++	preboot_secure_lbw_rr(13, min, max);
++	preboot_secure_pcie_rr(13, min, max);
+ }
+ 
+ static void preboot_secure_hbw_rr(int rr, u64 base, u64 mask)

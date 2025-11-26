@@ -1,0 +1,181 @@
+From 8dc7fc3f038e3c2e21208e42df28c003d9f281a4 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 29 Jun 2020 09:18:26 +0300
+Subject: [PATCH] [SW-14252] preboot: goya2: load multiple fit images
+
+Currently for goya2 ARC based target, boot FIT contains only uboot
+image which is loaded on ARM by preboot running on ARC1. From now on,
+boot FIT will contain zephyr images along with uboot which needs to be
+loaded on ARC0 and ARC1.
+
+This patch adds support in preboot to load multiple images available
+in boot FIT.
+
+Change-Id: I637c1337c5007ec358a0181c7f931d4374e9b38a
+---
+
+diff --git a/preboot/fit.c b/preboot/fit.c
+index d3588c8..c821ac8 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -20,6 +20,7 @@
+ #define FIT_LOADABLE_PROP	"loadables"
+ #define FIT_DATA_PROP		"data"
+ #define FIT_LOADADDR_PROP	"loadaddr"
++#define FIT_ARCH_PROP		"arch"
+ 
+ #define FIT_SIG_NODENAME	"signature"
+ #define FIT_VALUE_PROP		"value"
+@@ -260,40 +261,64 @@
+ 	return ret;
+ }
+ 
+-int fit_load_image(const void *fit, u64 *dest)
++int fit_load_images(const void *fit, struct fit_image *images)
+ {
+ 	int node, len, copy_image = 1;
++	int conf, num_images, i;
+ 	const u8 *buf;
+ 	const u32 *loadaddr;
+ 	u64 dst = 0;
+ 
+-	node = fit_loadables_node_get(fit, 0);
+-	if (node < 0) {
+-		preboot_puts("Wrong FIT format: no loadable image node\n");
++	/* Get number of images in preboot configuration */
++	conf = fit_find_config_node(fit);
++	num_images = fdt_stringlist_count(fit, conf, FIT_LOADABLE_PROP);
++	if (num_images > FIT_MAX_IMAGES) {
++		preboot_puts_hex("Images in fit exceeds max limit: ",
++					FIT_MAX_IMAGES, false);
+ 		return 1;
+ 	}
+ 
+-	loadaddr = fdt_getprop(fit, node, FIT_LOADADDR_PROP, &len);
+-	if (!loadaddr || len != sizeof(u64)) {
+-		preboot_puts("Wrong FIT format: no image loadaddr\n");
+-		return 1;
++	for (i = 0; i < num_images; i++) {
++		node = fit_loadables_node_get(fit, i);
++		if (node < 0) {
++			preboot_puts_hex("Wrong FIT format: loadable image not found: ", i, false);
++			return 1;
++		}
++
++		loadaddr = fdt_getprop(fit, node, FIT_LOADADDR_PROP, &len);
++		if (!loadaddr || len != sizeof(u64)) {
++			preboot_puts_hex("Wrong FIT format: loadaddr not found for image: ", i, false);
++			return 1;
++		}
++
++		dst = ((u64)fdt32_to_cpu(loadaddr[0])) << 32;
++		dst |= fdt32_to_cpu(loadaddr[1]);
++
++		buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
++		if (!buf) {
++			preboot_puts_hex("Wrong FIT format: data empty for image: ", i, false);
++			return 1;
++		}
++
++		images[i].arch = (const char *)fdt_getprop(fit, node,
++							FIT_ARCH_PROP, NULL);
++		if (!images[i].arch) {
++			preboot_puts_hex("Wrong FIT format: arch empty for image: ", i, false);
++			return 1;
++		}
++
++		if (fit_need_image_verification())
++			copy_image = !fit_verify_image(fit, node, buf, &len);
++
++		images[i].loadaddr = dst;
++
++		if (copy_image) {
++			fit_copy_image(dst, buf, len);
++		} else {
++			preboot_puts_hex("Verification failed for image: ", i, false);
++			return 1;
++		}
+ 	}
+ 
+-	dst = ((u64)fdt32_to_cpu(loadaddr[0])) << 32;
+-	dst |= fdt32_to_cpu(loadaddr[1]);
+-
+-	buf = fdt_getprop(fit, node, FIT_DATA_PROP, &len);
+-	if (!buf) {
+-		preboot_puts("Wrong FIT format: image data empty\n");
+-		return 1;
+-	}
+-
+-	if (fit_need_image_verification())
+-		copy_image = !fit_verify_image(fit, node, buf, &len);
+-
+-	if (copy_image) {
+-		fit_copy_image(dst, buf, len);
+-		*dest = dst;
+-	}
+ 	return 0;
+ }
+diff --git a/preboot/fit.h b/preboot/fit.h
+index ed9919a..4f39242 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -8,7 +8,15 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
+-int fit_load_image(const void *fit, u64 *dest);
++#define FIT_MAX_IMAGES		8
++#define FIT_UBOOT_INDEX		0
++
++struct fit_image {
++	u64 loadaddr;
++	const char *arch;
++};
++
++int fit_load_images(const void *fit, struct fit_image *images);
+ int fit_check_format(const void *fit);
+ void fit_copy_image(u64 dst, const void *buf, int len);
+ 
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index f067ad0..ee6d087 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -4,6 +4,7 @@
+  * All Rights Reserved.
+  */
+ 
++#include <string.h>
+ #include <hl_boot_if.h>
+ #include <preboot.h>
+ 
+@@ -15,7 +16,7 @@
+ struct lkd_status {
+ 	int fit_not_checked;	/* negative logic */
+ 	u32 msg_reg_val;
+-	u64 loadaddr;
++	struct fit_image images[FIT_MAX_IMAGES];
+ };
+ 
+ static struct lkd_status sts = {
+@@ -71,9 +72,11 @@
+ 	int err;
+ 	void *fit = (void *)FIT_IMG_BASE;
+ 
++	memset(&sts.images, 0x0, sizeof(sts.images));
++
+ 	err = !fit_check_format(fit);
+ 	if (!err)
+-		err = fit_load_image(fit, &sts.loadaddr);
++		err = fit_load_images(fit, sts.images);
+ 
+ 	if (err) {/* Report the FIT is bad */
+ 		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+@@ -94,7 +97,7 @@
+ 		wfe();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
+-		image_start(sts.loadaddr);
++		image_start(sts.images[FIT_UBOOT_INDEX].loadaddr);
+ 		/* no break */
+ 	default:
+ 		break;

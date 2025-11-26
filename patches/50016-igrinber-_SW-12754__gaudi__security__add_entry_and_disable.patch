@@ -1,0 +1,132 @@
+From 1d730b48fe100fe34ea3a36cd85b85aeaecc6a54 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Fri, 04 Sep 2020 12:31:40 +0300
+Subject: [PATCH] [SW-12754] gaudi: security: add entry and disable
+
+Add the main entry to security initialization and disable the protection
+enabled by BTL.
+Once we implement the security fully, we should call the disable
+function only if security is not enabled.
+
+Change-Id: I1820610e8cccd01ef4aac06316c550887e3fcfef
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/gaudi/Makefile b/gaudi/Makefile
+index 508c03f..8a3dc88 100644
+--- a/gaudi/Makefile
++++ b/gaudi/Makefile
+@@ -1 +1,3 @@
+ FW_SIZE := 0x4000
++
++PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/security.c)
+diff --git a/gaudi/security.c b/gaudi/security.c
+new file mode 100644
+index 0000000..b35135d
+--- /dev/null
++++ b/gaudi/security.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * (C) Copyright 2020 HabanaLabs, Ltd.
++ * All rights reserved.
++ *
++ */
++
++#include <stdbool.h>
++
++#include <gaudi_blocks.h>
++#include <pcie_wrap_regs.h>
++#include <sif_rtr_ctrl_7_regs.h>
++
++#include <preboot.h>
++#include <uart.h>
++#include <hl_boot_if.h>
++#include <boot_if.h>
++
++static void preboot_security_pci_disable(void)
++{
++	preboot_puts("Disabling security temporarily till all implemented\n");
++
++	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MIN_0);
++	regmap_writel(0, mmPCIE_WRAP_RR_WR_PRV_RANGE_REG_MAX_0);
++	regmap_writel(0, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MIN_0);
++	regmap_writel(0, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MAX_0);
++	regmap_writel(0, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MIN_1);
++	regmap_writel(0, mmPCIE_WRAP_RR_RD_PRV_RANGE_REG_MAX_1);
++	preboot_puts("Disabled PCIe RRs\n");
++
++	/* PCIe RTR RR - HBM WP 0x0 - 0x07FFFFFFFF */
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_LOW_AW_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_HIGH_AW_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_LOW_AW_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_HIGH_AW_0);
++	/* PCIe RTR RR - HBM RP 0x0 - 0x07FFFFFFFF */
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_LOW_AR_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_BASE_HIGH_AR_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_LOW_AR_0);
++	regmap_writel(0, mmSIF_RTR_CTRL_7_RANGE_PRIV_MASK_HIGH_AR_0);
++	preboot_puts("Disabled SIF RRs\n");
++}
++
++void preboot_security_init(void)
++{
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, true);
++
++	/*
++	 * TODO: check the efuse and boot strap for security enablement
++	 *	 and call the below function if security is disabled.
++	 *
++	 *	 Meanwhile, keep the below call until we have finished
++	 *	 initializing all the security and there is no worry
++	 *	 to brick a device.
++	 */
++	preboot_security_pci_disable();
++
++	/* TODO: implement security enablement */
++
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_NOT_RDY, false);
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index de0212e..e2ab612 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -108,6 +108,7 @@
+ void preboot_delay(void);
+ void preboot_putc_virt_uart(const char c);
+ void preboot_sync_btl(void);
++void preboot_security_init(void);
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name);
+ void image_start(u64 loadaddr);
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 27d4178..0e3cef4 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -109,13 +109,13 @@
+ 	regmap_writel((u32)(offset & ~SDRAM_BASE), mmPREBOOT_VER_OFFSET);
+ }
+ 
++__weak void preboot_security_init(void) {}
++
+ void preboot_main(void)
+ {
+ 	cpu_boot_sts_set(CPU_BOOT_STATUS_IN_PREBOOT);
+ 	/* Enable the errors communication */
+ 	cpu_boot_err_clrset(CPU_BOOT_ERR0_ENABLED, true);
+-
+-	cpu_boot_sts_set(CPU_BOOT_STATUS_SECURITY_READY);
+ 
+ 	/*
+ 	 * Note: we assume CPU frequency is not changed while CPU is running,
+@@ -124,6 +124,10 @@
+ 	udelay_init();
+ 
+ 	hl_uart_init();
++
++	preboot_security_init();
++	cpu_boot_sts_set(CPU_BOOT_STATUS_SECURITY_READY);
++
+ 	hl_ts_init();
+ 	preboot_version();
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));

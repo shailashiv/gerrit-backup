@@ -1,0 +1,198 @@
+From 9a2628ed4b7c9d007348fd93c27a90a1c6ef8bad Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Tue, 13 Apr 2021 09:22:51 +0300
+Subject: [PATCH] [SW-28013] pci: adding race protection for iatu init
+
+In order to avoid any access from the host to configuration registers
+and memory space during the iATU initialization, we temporary disable
+pcie access while programming the iATU registers.
+During that period The ELBI access gets "retry" response, and memory
+access will read 0xFF.
+when iATU init is done the pcie communication is enabled.
+
+Change-Id: Ib0bac080619eb76072b711e82ca025033b1b7d30
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/common/pci.c b/common/pci.c
+index 37af2c8..7051d23 100644
+--- a/common/pci.c
++++ b/common/pci.c
+@@ -38,6 +38,9 @@
+ 	return 0;
+ }
+ 
++__weak void hl_pcie_enable_access(void) {}
++__weak void hl_pcie_disable_access(void) {}
++
+ /*
+  * hl_pci_set_inbound_region() - Configure inbound region
+  * @region: Inbound region number.
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index 45a2f6e..cb60251 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -328,6 +328,8 @@
+ 	struct hl_pci_inbound_region inbound_region;
+ 	struct hl_pci_outbound_region outbound_region;
+ 
++	hl_pcie_disable_access();
++
+ 	/* Inbound Region 0 - Bar 0 - Point to SRAM + CFG */
+ 	inbound_region.mode = PCI_BAR_MATCH_MODE;
+ 	inbound_region.bar = PCI_BAR_ID_0;
+@@ -364,4 +366,6 @@
+ 	outbound_region.addr = HOST_PHYS_BASE;
+ 	outbound_region.size = HOST_PHYS_SIZE;
+ 	hl_pci_set_outbound_region(&outbound_region);
++
++	hl_pcie_enable_access();
+ }
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 745b3b5..ef233a6 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -194,7 +194,26 @@
+ 	regmap_writel(3, mmPCIE_AUX_LTSSM_EN);
+ }
+ 
+-void ppboot_pcie_enable_access(void)
++/*
++ * This function makes sure no access is done from host to the SoC's PCIe IF.
++ * The inbound memory requests are disabled. The ELBI access gets "retry"
++ * response. All channels provide responses to the host and PCIe
++ * link will not break.
++ */
++void hl_pcie_disable_access(void)
++{
++	u32 reg;
++
++	/* Disable the ELBI access */
++	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++
++	/* Disable the PCIe inbound memory requests */
++	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
++	reg &= ~BIT(1);
++	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
++}
++
++void hl_pcie_enable_access(void)
+ {
+ 	u32 reg;
+ 
+diff --git a/gaudi/reset.c b/gaudi/reset.c
+index 6e0857a..4890fde 100644
+--- a/gaudi/reset.c
++++ b/gaudi/reset.c
+@@ -492,27 +492,6 @@
+ 	regmap_writel(0x1, mmSIF_RTR_CTRL_7_RANGE_PRIV_HIT_AR);
+ }
+ 
+-/*
+- * This function makes sure no access is done from host to the SoC's PCIe IF
+- * during the reset. The inbound memory requests are disabled. The ELBI access
+- * gets "retry" response. All channels provide responses to the host and PCIe
+- * link will not break.
+- *
+- * Note: since we close all the access, the boot FW must enable the access back.
+- */
+-static void gaudi_pcie_disable_access(void)
+-{
+-	u32 reg;
+-
+-	/* Disable the ELBI access */
+-	regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
+-
+-	/* Disable the PCIe inbound memory requests */
+-	reg = regmap_readl(mmPCIE_DBI_STATUS_COMMAND_REG);
+-	reg &= ~BIT(1);
+-	regmap_writel(reg, mmPCIE_DBI_STATUS_COMMAND_REG);
+-}
+-
+ static void gaudi_reset_soc_initiators(void)
+ {
+ 	regmap_writel(UNIT_RST_L_MSK, mmPSOC_GLOBAL_CONF_UNIT_RST_N_L);
+@@ -530,7 +509,7 @@
+ {
+ 	gaudi_halt_engines();
+ 	gaudi_close_pcie_rr();
+-	gaudi_pcie_disable_access();
++	hl_pcie_disable_access();
+ 	gaudi_reset_soc_initiators();
+ 
+ 	gaudi_hw_fini();
+diff --git a/gaudi2_arm/asic.c b/gaudi2_arm/asic.c
+index 220f29f..41c5890 100644
+--- a/gaudi2_arm/asic.c
++++ b/gaudi2_arm/asic.c
+@@ -82,6 +82,9 @@
+ 	struct hl_pci_inbound_region inbound_region;
+ 	struct hl_pci_outbound_region outbound_region;
+ 
++	/* TODO: implement hl_pcie_disable_access() for gaudi2 */
++	hl_pcie_disable_access();
++
+ 	hl_pci_get_bar_phys_addr(PCI_BAR_ID_0, &inbound_region.pcie_bar_phys);
+ 
+ 	/* Inbound Region 0 - Bar 0 - Point to CFG */
+@@ -110,4 +113,7 @@
+ 	outbound_region.addr = HOST_PHYS_BASE_0;
+ 	outbound_region.size = HOST_PHYS_SIZE_0;
+ 	hl_pci_set_outbound_region(&outbound_region);
++
++	/* TODO: implement hl_pcie_enable_access() for gaudi2 */
++	hl_pcie_enable_access();
+ }
+diff --git a/greco/asic.c b/greco/asic.c
+index dd2eef7..3b8045b 100644
+--- a/greco/asic.c
++++ b/greco/asic.c
+@@ -82,6 +82,9 @@
+ 	struct hl_pci_inbound_region inbound_region;
+ 	struct hl_pci_outbound_region outbound_region;
+ 
++	/* TODO: implement hl_pcie_disable_access() for greco */
++	hl_pcie_disable_access();
++
+ 	/* Inbound Region 0 - Bar - - Point to SRAM and CFG */
+ 	inbound_region.mode = PCI_BAR_MATCH_MODE;
+ 	inbound_region.bar = PCI_BAR_ID_0;
+@@ -98,4 +101,7 @@
+ 	outbound_region.addr = HOST_PHYS_BASE;
+ 	outbound_region.size = HOST_PHYS_SIZE;
+ 	hl_pci_set_outbound_region(&outbound_region);
++
++	/* TODO: implement hl_pcie_enable_access() for greco */
++	hl_pcie_enable_access();
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index d4536f1..63e70a2 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -165,6 +165,8 @@
+ void hl_ram_init(void);
+ void hl_pci_iatu_init(void);
+ bool hl_pci_link_is_up(void);
++void hl_pcie_enable_access(void);
++void hl_pcie_disable_access(void);
+ 
+ void preboot_finalize_fw_info(void);
+ void preboot_finalize_nic_en(void);
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+index 50e199b..ba2c980 100644
+--- a/ppboot/ppboot.c
++++ b/ppboot/ppboot.c
+@@ -178,12 +178,11 @@
+ }
+ 
+ __weak void ppboot_log_waiting_for_pcie(void) {}
+-__weak void ppboot_pcie_enable_access(void) {}
+ 
+ static void ppboot_pcie_init(void)
+ {
+ 	if (hl_pcie_link_up()) {
+-		ppboot_pcie_enable_access();
++		hl_pcie_enable_access();
+ 		preboot_puts("PCIe link is already UP!\n");
+ 		return;
+ 	}

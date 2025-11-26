@@ -1,0 +1,64 @@
+From d59ac45997782164be21c146d7e17f8984f11e04 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Wed, 01 Apr 2020 13:14:15 +0300
+Subject: [PATCH] [SW-0] ppboot: fix preboot designation print
+
+Current code always prints the Preboot stable is loaded, even if it
+loads the new candidate...
+Rework the code to print the actual Preboot designator according to
+FLOPS_UPD value.
+
+Change-Id: I7e939ccd7dd35195b12457111c500308786bd05b
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index d46f216..3110eb8 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -28,26 +28,37 @@
+ 	return (id == 1) ? HL_SPI_SECONDARY_BASE : HL_SPI_PRIMARY_BASE;
+ }
+ 
+-static u32 preboot_image_offset(void)
++static enum fw_post_reset_cmd preboot_image_offset(u32 *offset)
+ {
+ 	u32 upd_pending_reg = get_upd_pending_sts_reg();
+ 	u32 image_pending = regmap_readl(upd_pending_reg);
++	u32 next_img_off = HL_SPI_NEXT_IMAGE_OFF;
++	char *name = "NEXT";
+ 
+-	/* Check for normal boot */
+-	if (image_pending != FLOPS_UPD_PENDING)
+-		return next_image_offset(HL_SPI_NEXT_IMAGE_OFF, "NEXT");
++	/* Check for normal boot or update pending */
++	if (image_pending == FLOPS_UPD_PENDING) {
++		next_img_off = HL_SPI_MODIFI_IMAGE_OFF;
++		name = "MODIFIABLE";
++	}
+ 
+-	/* There is an update pending */
+-	return next_image_offset(HL_SPI_MODIFI_IMAGE_OFF, "MODIFIABLE");
++	*offset = next_image_offset(next_img_off, name);
++
++	return image_pending;
+ }
+ 
+ static void copy_preboot(void)
+ {
+ 	char *name = "PREBOOT";
+-	u32 img_offset = preboot_image_offset();
++	u32 img_offset;
++	enum fw_post_reset_cmd upd_pending = preboot_image_offset(&img_offset);
+ 	u32 preboot_offset = img_offset + HL_SPI_PREBOOT_OFF;
+ 
+-	preboot_puts_raw("Preparing to run Preboot stable");
++	preboot_puts_raw("Preparing to run Preboot ");
++	if (upd_pending != FLOPS_UPD_PENDING)
++		preboot_puts_raw("stable");
++	else
++		preboot_puts_raw("candidate");
++
+ 	preboot_puts_hex_raw(" (offset: ", preboot_offset, false);
+ 	preboot_puts(")\n");
+ 

@@ -1,0 +1,158 @@
+From b50bf996995960fa7eddfd0918d4bfbc95fea007 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Thu, 11 Apr 2024 06:01:41 +0300
+Subject: [PATCH] [SW-180536] gaudi3: tpm: pcr extend manifest hash
+
+For Gaudi3, instead of separately extending PCRs for
+individual ppboot and preboot images, the process is
+consolidated by extending the PCR of the manifest.
+Given that, hashes of all images are embedded in the
+manifest, this approach would effectively extend the
+PCR for all images.
+
+Manifest hash is computed at ppboot stage via SHA384
+operation on manifest image copied to ARC1 ICCM by
+boot rom. Contents of ICCM are overwritten when preboot
+execution starts. Therefore, manifest hash computation
+is done only once after rom freshly transfers manifest
+from flash to ICCM. This hash is then stored in boot
+info. For resets that don't involve transfer of manifest
+image from flash to ICCM, the manifest hash is instead
+retrieved from boot info. Manifest hash is then used
+to extend the TPM PCR
+
+Change-Id: I0877c3e56a66838202a46cf3ab5030335b389c80
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 29478e8..2e84640 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -7,6 +7,7 @@
+ #include <global_conf_regs.h>
+ #include <psoc_boot_conf_regs.h>
+ #include <psoc_boot_conf_masks.h>
++#include <psoc_security_regs.h>
+ #include <gpio_regs.h>
+ #include <qspi_regs.h>
+ #include <pcie_aux_regs.h>
+@@ -1470,39 +1471,77 @@
+ 	return count;
+ }
+ 
+-static bool get_ppboot_img_desc(struct boot_desc *desc)
++bool ppboot_boot_info_read_img_ptr_hash(u8 *hash)
+ {
+-	u32 idx;
+-	bool is_valid = false;
+-	enum fw_post_reset_cmd image_pending = regmap_readl(global_conf.upd_pending_sts_map);
++	u32 copy_size;
+ 
+-	if (!boot_desc_init()) {
+-		preboot_puts_raw("Not a valid boot desc.");
++	if (ppboot_boot_info_get(HL_BOOT_INFO_MANIFEST_HASH, (void *)hash,
++				 SHA384_SUM_LEN, &copy_size)) {
++		preboot_puts("BOOT_INFO: Failed to read image pointer hash\n");
+ 		return false;
+ 	}
+ 
+-	idx = boot_desc_get_img_desc(image_pending, HL_FW_IMG_PPBOOT, desc);
+-	if (idx == HL_FW_IMG_NOT_FOUND)
+-		return false;
++	return true;
++}
+ 
+-	if (desc->desc_ver > 1)
+-		is_valid = ppboot_is_valid_img_desc(desc);
++void ppboot_boot_info_write_img_ptr_hash(u8 *hash)
++{
++	if (ppboot_boot_info_set(HL_BOOT_INFO_MANIFEST_HASH, (void *)hash,
++				 SHA384_SUM_LEN))
++		preboot_puts("BOOT_INFO: Failed to write image pointer hash\n");
++}
+ 
+-	return is_valid;
++bool is_img_ptr_transfer_done(void)
++{
++	u32 sw_status_0_reg;
++
++	/*
++	 * SW_STATUS_0 register's bit 4 is set by the bootrom when it begins the
++	 * SPI DMA transfer of the manifest. As we're presently in the ppboot
++	 * execution stage, the bootrom has executed the SPI DMA transfer of
++	 * the manifest without encountering any errors, this indicates a successful
++	 * transfer.
++	 */
++	sw_status_0_reg = regmap_readl(D0_PSOC_SECURITY_REG(mmPSOC_SECURITY_SW_STATUS_0));
++
++	return ((sw_status_0_reg & SW_STATUS_SPI_BOOT_DESC_DMA_START_MASK) != 0);
++}
++
++void ppboot_compute_img_ptr_hash(u8 *hash)
++{
++	u32 img_ptrs_size, img_ptrs_sig_size, img_plus_key_len;
++	u8 crc_bytes, num_crc;
++
++	memcpy(&img_ptrs_size, (void *)(uintptr_t)IMG_PTRS_SIZE_OFFSET, 4);
++	memcpy(&img_ptrs_sig_size, (void *)(uintptr_t)IMG_PTRS_SIG_SIZE_OFFSET, 4);
++
++	num_crc = ppboot_get_num_crc(img_ptrs_size);
++	crc_bytes = num_crc * CRC32_SIZE;
++	img_plus_key_len = img_ptrs_size - img_ptrs_sig_size - crc_bytes;
++
++	sha384_csum((void *)(uintptr_t)IMG_PTRS_OFFSET, img_plus_key_len, hash, 0);
+ }
+ 
+ bool get_ppboot_img_hash(u8 *hash)
+ {
+-	struct boot_desc desc;
+-	bool is_valid = false;
++	bool is_valid;
+ 
+-	is_valid = get_ppboot_img_desc(&desc);
+-	if (!is_valid) {
+-		preboot_puts("ppboot sha not found\n");
+-		return false;
+-	}
++	/*
++	 * Bootrom copies image pointers from flash to ICCM only if cold flops
++	 * validation done bit is not set. Image pointers in ICCM are overwritten
++	 * when mgmt zephyr execution starts. Image pointers hash is computed
++	 * only if rom freshly copies image pointers from flash to ICCM. This
++	 * hash is then stored in boot info. For resets that don't involve
++	 * transfer of manifest image from flash to ICCM, the manifest hash is
++	 * instead retrieved from boot info.
++	 */
++	if (is_img_ptr_transfer_done()) {
++		ppboot_compute_img_ptr_hash(hash);
++		ppboot_boot_info_write_img_ptr_hash(hash);
++		is_valid = true;
++	} else
++		is_valid = ppboot_boot_info_read_img_ptr_hash(hash);
+ 
+-	memcpy(hash, desc.chksum, SHA384_SUM_LEN);
+ 	return is_valid;
+ }
+ 
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index f8a3cfe..7b7a17c 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -109,6 +109,16 @@
+ #define GPIOS_PER_BANK			16
+ #define TPM_CS_GPIO_PIN			18
+ 
++/* Image pointers in SPI flash are DMA transferred to ARC1 ICCM at offset 0 */
++#define IMG_PTRS_OFFSET		ARC1_ICCM_BASE
++#define IMG_PTRS_SIZE_OFFSET		(IMG_PTRS_OFFSET + \
++					offsetof(struct hl_fw_boot_ptrs, boot_ptrs_img_sz))
++#define IMG_PTRS_SIG_SIZE_OFFSET	(IMG_PTRS_OFFSET + \
++					offsetof(struct hl_fw_boot_ptrs, sig_sz))
++
++#define SW_STATUS_SPI_BOOT_DESC_DMA_START	4
++#define SW_STATUS_SPI_BOOT_DESC_DMA_START_MASK	BIT(SW_STATUS_SPI_BOOT_DESC_DMA_START)
++
+ /*
+  * RX poll timeout is configured at 2.56ms, which is duration
+  * required for the transfer of 4kB of data over SPI at a

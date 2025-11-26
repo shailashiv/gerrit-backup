@@ -1,0 +1,207 @@
+From 2354a1818049170f49cbd4c725ec974dd3934ada Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Tue, 11 May 2021 09:03:32 +0300
+Subject: [PATCH] [SW-41920] gaudi: remove global fit offset
+
+In preboot we used global fit offset with getter
+and setter function. This is problematic because
+the global can be changed from various command
+interfaces. Also is was only partly used in some
+of the interfaces, which introduced bugs in load
+types such as nic enable and rma erase. This patch
+fix it by using the offset as a function argument
+instead of using a global.
+
+Change-Id: Ia920700f92e4bdaf1c433552501b40ec9f19fefa
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/include/preboot.h b/include/preboot.h
+index 13e2dd7..0bd441e 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -181,9 +181,6 @@
+ void preboot_boot_info_set_fw_info(void);
+ void preboot_finalize_rma_tables(void);
+ 
+-uintptr_t preboot_shm_get_offset(void);
+-void preboot_shm_set_offset(uintptr_t offset);
+-
+ bool preboot_is_image_sig_supported(void);
+ int preboot_verify_img_sig(const void *fit, size_t img_size,
+ 			   enum fit_sec_failure *res);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index d89dfe8..a7b8c90 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -931,11 +931,10 @@
+ 	return serr;
+ }
+ 
+-int fit_load_images(void)
++int fit_load_images(void *fit)
+ {
+ 	enum fit_sec_failure sec_res = FIT_SEC_NONE;
+ 	int err;
+-	void *fit = (void *)preboot_shm_get_offset();
+ 
+ 	memset(&images, 0x0, sizeof(images));
+ 
+@@ -998,9 +997,8 @@
+ 	return 0;
+ }
+ 
+-int fit_validate_size(int len)
++int fit_validate_size(const void *fit, int len)
+ {
+-	const void *fit = (const void *)preboot_shm_get_offset();
+ 	size_t img_size = ROUND_UP4(fdt_totalsize(fit));
+ 
+ 	if (fdt_check_header(fit)) {
+@@ -1014,9 +1012,8 @@
+ 	return img_size != len;
+ }
+ 
+-int fit_get_load_type(u32 *load_type)
++int fit_get_load_type(const void *fit, u32 *load_type)
+ {
+-	const void *fit = (const void *)preboot_shm_get_offset();
+ 	const u32 *cell;
+ 	u32 type = FIT_LOAD_TYPE_RUN;
+ 	int ret, len, conf;
+diff --git a/preboot/fit.h b/preboot/fit.h
+index a3b03e0..5088c38 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -8,10 +8,10 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
+-int fit_load_images(void);
++int fit_load_images(void *fit);
+ void fit_run_image(void);
+-int fit_validate_size(int len);
+-int fit_get_load_type(u32 *load_type);
++int fit_validate_size(const void *fit, int len);
++int fit_get_load_type(const void *fit, u32 *load_type);
+ int fit_image_get_loadable_data(const void *fit, const void **data,
+ 				size_t size);
+ int fit_init_resp(void *fit, size_t sz);
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index 74808b5..3e56a3a 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -177,10 +177,10 @@
+ 	unsigned int fw_len = req_wd.hdr.rqdl +
+ 		(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
+ 
+-	if (fit_validate_size(fw_len))
++	if (fit_validate_size((void *)FIT_IMG_BASE, fw_len))
+ 		return; /* More data is needed */
+ 
+-	if (fit_load_images())
++	if (fit_load_images((void *)FIT_IMG_BASE))
+ 		req_sts.err = HL_I2CI_REQ_ERR_PROCESS;
+ 	else
+ 		i2cslave_fit_set_checked();
+@@ -375,7 +375,7 @@
+ 		 * the offset int the header an index.
+ 		 * Integrity check is not supported for opcode 12 (fw load)
+ 		 */
+-		data = (u8 *)preboot_shm_get_offset() +
++		data = (u8 *)FIT_IMG_BASE +
+ 			(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
+ 		i2csi_req_wdata_wait_for(data, size);
+ 		break;
+diff --git a/preboot/module_fwupd.c b/preboot/module_fwupd.c
+index 7279f3f..b00859b 100644
+--- a/preboot/module_fwupd.c
++++ b/preboot/module_fwupd.c
+@@ -412,11 +412,11 @@
+ 	return 1;
+ }
+ 
+-static int module_fwupd_load_type_run(void)
++static int module_fwupd_load_type_run(void *fit)
+ {
+ 	int err;
+ 
+-	err = fit_load_images();
++	err = fit_load_images(fit);
+ 
+ 	state.exec_res = err ? NOT_FOUND : FOUND_NO_RETURN;
+ 
+@@ -428,7 +428,7 @@
+ 	u32 load_type;
+ 	int ret;
+ 
+-	ret = fit_get_load_type(&load_type);
++	ret = fit_get_load_type(state.map_offset, &load_type);
+ 	if (ret)
+ 		return 1;
+ 
+@@ -438,7 +438,7 @@
+ 	case FIT_LOAD_TYPE_RMA_ERASE:
+ 		return rma_erase();
+ 	case FIT_LOAD_TYPE_RUN:
+-		return module_fwupd_load_type_run();
++		return module_fwupd_load_type_run(state.map_offset);
+ 	default:
+ 		preboot_puts("Unknown FIT load type\n");
+ 		return 1;
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 4521074..ebce196 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -89,8 +89,6 @@
+ 		if (sts.is_fit_ready_ignored)
+ 			return NOT_FOUND;
+ 
+-		preboot_shm_set_offset(FIT_IMG_BASE);
+-
+ 		res = FOUND_SLOW_RETURN;
+ 		/* Tell LKD we got the message */
+ 		cpu_boot_rsp_set(CPU_MSG_OK);
+@@ -378,8 +376,7 @@
+ 
+ 	preboot_security_dynamic_img_sram_close();
+ 
+-	preboot_shm_set_offset(FIT_IMG_BASE);
+-	err = fit_load_images();
++	err = fit_load_images((void *)FIT_IMG_BASE);
+ 	if (err) {
+ 		sts.is_fit_ready_ignored = true;
+ 		preboot_security_dynamic_img_sram_open();
+@@ -416,8 +413,7 @@
+ 	preboot_security_dynamic_img_sram_close();
+ 
+ 	/* validate if shared memory has fit image */
+-	preboot_shm_set_offset(FIT_IMG_BASE);
+-	err = fit_load_images();
++	err = fit_load_images((void *)FIT_IMG_BASE);
+ 
+ 	if (!err) {
+ 		sts.exec_res = FOUND_NO_RETURN;
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 3836f39..e0f53c1 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -334,18 +334,6 @@
+ 	}
+ }
+ 
+-static uintptr_t shm_base_offset;
+-
+-uintptr_t preboot_shm_get_offset(void)
+-{
+-	return shm_base_offset ? shm_base_offset : FIT_IMG_BASE;
+-}
+-
+-void preboot_shm_set_offset(uintptr_t offset)
+-{
+-	shm_base_offset = offset;
+-}
+-
+ __weak void hl_dev_pll_init(void) {}
+ __weak void hl_clock_gating_init(void) {}
+ __weak void preboot_conf_iatu_access(bool enable) {}

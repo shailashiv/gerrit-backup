@@ -1,0 +1,154 @@
+From 42ec398f2093065f055d9803c761544b3d5ff972 Mon Sep 17 00:00:00 2001
+From: Ran Shalit <rshalit@habana.ai>
+Date: Thu, 05 Dec 2024 15:15:52 +0200
+Subject: [PATCH] [SW-212051] fs1: fix missing get_64bit_addr_from_32bit_addr imp
+
+Implementation for get_64bit_addr_from_32bit_addr was not linked
+in code, which results in wrong return address, and FW
+getting stuck as part of updating pcie phy.
+
+Fixing composed of 2 parts:
+1. added fs1 implementation for get_64bit_addr_from_32bit_addr
+2. skip pcie phy update if it is not implemented
+
+Temporary the implementation is done for palladium only because
+coral memcpy is not implemented yet - see SW-212050
+
+Change-Id: If4e9d9de311725a45c28d44b56db14c32029e48e
+Signed-off-by: Ran Shalit <rshalit@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index e7f4123..bc6efb9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -52,6 +52,7 @@
+ PPBOOT_SRCS_C += $(shell ls app/ppboot/*.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(HL_DEV_ARCH)/$(HL_TARGET).c)
++PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/arch/$(HL_DEV_ARCH)/common.c)
+ PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/lib/common/lib_common.c)
+ PPBOOT_SRCS_C += $(shell ls $(EMB_COMMON_MOD_DIR)/lib/common/pci.c)
+ PPBOOT_APP_S := $(shell ls app/ppboot/crt0_ppboot.S)
+diff --git a/arch/fs1/arc/common.c b/arch/fs1/arc/common.c
+index 866ba06..14474bf 100644
+--- a/arch/fs1/arc/common.c
++++ b/arch/fs1/arc/common.c
+@@ -49,12 +49,8 @@
+ #include <efuse.h>
+ #include <boot_desc.h>
+ #include <address_space.h>
+-#include <lib_common.h>
+ #include "common.h"
+ #include "hl.h"
+-#include "auto_gen_pcie_phy_csr_locations.h"
+-
+-extern unsigned long __SDATA_LOAD;
+ 
+ static struct hl_pll_cfg pll_cfg[] = {
+ 	{
+@@ -577,28 +573,9 @@
+ 	return 0;
+ }
+ 
+-size_t get_csr_locations_data_size(void)
+-{
+-	/* this size is taken from: auto_gen_pcie_phy_csr_locations.h */
+-	return csr_locations_size;
+-}
+-
+-#define ALIGN_TO_16_BYTES(addr) (((addr) + 15) & ~0xF)
+-#define PPBOOT_LAST_ADDR ((uint32_t) (&__SDATA_LOAD))
+-
+ __weak void hl_pcie_phy_fw_copy(void)
+ {
+-	/* sram_loc_addr located at PPBOOT_LAST_ADDR, aligned to 16 bytes */
+-	uint32_t sram_loc_addr = ALIGN_TO_16_BYTES(PPBOOT_LAST_ADDR);
+-	const uint32_t *csr_loc_data = get_csr_locations();
+-
+-	/* Copy SRAM_LOCATIONS to IO0_PCIE_FW_SRAM_FULL_BASE */
+-	fs1_mem_copy(get_64bit_addr_from_32bit_addr(sram_loc_addr),
+-		    IO0_PCIE_FW_SRAM_FULL_BASE,
+-		    (uint32_t)PHY_FW_SIZE, false, false);
+-
+-	/* Copy CSR_LOC_DATA to IO0_PCIE_FW_CSR_BASE */
+-	memcpy((void *)IO0_PCIE_FW_CSR_BASE, (const void *)csr_loc_data, get_csr_locations_data_size());
++	preboot_puts("Skipping phy init\n");
+ }
+ 
+ void hl_init_pcie_phy_fw(void)
+diff --git a/arch/fs1/arc/onix.c b/arch/fs1/arc/onix.c
+index 36bfc6d..e8fc14a 100644
+--- a/arch/fs1/arc/onix.c
++++ b/arch/fs1/arc/onix.c
+@@ -17,8 +17,6 @@
+ 	return SYS_CLOCK_FREQUENCY;
+ }
+ 
+-void hl_pcie_phy_fw_copy(void) {}
+-
+ u32 hl_skip_pcie_init(void)
+ {
+ 	return 1;
+diff --git a/arch/fs1/arc/palad.c b/arch/fs1/arc/palad.c
+index 86f06af..822bdf2 100644
+--- a/arch/fs1/arc/palad.c
++++ b/arch/fs1/arc/palad.c
+@@ -25,11 +25,18 @@
+ #include <efuse.h>
+ #include <hl.h>
+ #include <address_space.h>
++#include <lib_common.h>
++#include "auto_gen_pcie_phy_csr_locations.h"
++
++#include <pcie_fw_sram_regs.h>
++#include <string.h>
+ 
+ #define SYS_CLOCK_FREQUENCY	250000000ULL /* PCI PLL DIV3 Emulation clk */
+ 
+ #define UART_CLOCK_FREQUENCY	SYS_CLOCK_FREQUENCY
+ #define PALAD_UART_BAUDRATE	300
++
++extern unsigned long __SDATA_LOAD;
+ 
+ /*
+  * This cfg specific to PALAD bumps up uart freq
+@@ -232,6 +239,38 @@
+ 				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V128GB_M | \
+ 				 PCIE_DBI_VF_RESBAR_CAP_REG_2_REG_V64GB_M)
+ 
++#define ALIGN_TO_16_BYTES(addr) (((addr) + 15) & ~0xF)
++#define PPBOOT_LAST_ADDR ((uint32_t) (&__SDATA_LOAD))
++
++size_t get_csr_locations_data_size(void)
++{
++	/* this size is taken from: auto_gen_pcie_phy_csr_locations.h */
++	return csr_locations_size;
++}
++
++/* Temporarly implemented in paladium only because of coral issue */
++void hl_pcie_phy_fw_copy(void)
++{
++	uint64_t full_addr;
++	/* sram_loc_addr located at PPBOOT_LAST_ADDR, aligned to 16 bytes */
++	uint32_t sram_loc_addr = ALIGN_TO_16_BYTES(PPBOOT_LAST_ADDR);
++	const uint32_t *csr_loc_data = get_csr_locations();
++
++	full_addr = get_64bit_addr_from_32bit_addr(sram_loc_addr);
++	if (!full_addr) {
++		preboot_puts("Skipping phy init\n");
++		return;
++	}
++
++	/* Copy SRAM_LOCATIONS to IO0_PCIE_FW_SRAM_FULL_BASE */
++	fs1_mem_copy(full_addr,
++		IO0_PCIE_FW_SRAM_FULL_BASE,
++		(uint32_t)PHY_FW_SIZE, false, false);
++
++	/* Copy CSR_LOC_DATA to IO0_PCIE_FW_CSR_BASE */
++	memcpy((void *)IO0_PCIE_FW_CSR_BASE, (const void *)csr_loc_data, get_csr_locations_data_size());
++}
++
+ static void palad_pcie_params_init(void)
+ {
+ 	u32 val;

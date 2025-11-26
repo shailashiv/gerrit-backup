@@ -1,0 +1,121 @@
+From bba79974de8e86638cb9133357ab2c997fe08922 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 23 Jun 2021 20:10:49 +0300
+Subject: [PATCH] [SW-46517] greco: add run arc function
+
+This patch ports run_arc function which performs error checks
+while setting ARCs in running state.
+
+Change-Id: Ia7142a595733b7f121f2ba72cea755181aa53b7f
+---
+
+diff --git a/arch/greco_arc_gnu/common.c b/arch/greco_arc_gnu/common.c
+index f262d72..e598026 100644
+--- a/arch/greco_arc_gnu/common.c
++++ b/arch/greco_arc_gnu/common.c
+@@ -9,6 +9,7 @@
+ 
+ #include <pcie_phy_regs.h>
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <psoc_gpio1_regs.h>
+ #include <psoc_gpio2_regs.h>
+ #include <psoc_qspi_regs.h>
+@@ -26,6 +27,10 @@
+ #include <cpu_if_masks.h>
+ 
+ #include <cpu_timestamp_regs.h>
++#include <psoc_arc0_cfg_regs.h>
++#include <psoc_arc0_cfg_masks.h>
++#include <psoc_arc1_cfg_regs.h>
++#include <psoc_arc1_cfg_masks.h>
+ 
+ #include <hl_boot_if.h>				/* requires stdint.h */
+ #include <greco/greco_reg_map.h>
+@@ -183,11 +188,57 @@
+ 	memcpy((void *)arc_dst, buf, len);
+ }
+ 
++int preboot_decompress_image(u64 dst, const void *buf, int len,
++			     const char *arch, const char *compression)
++{
++	preboot_puts("Compression is not supported\n");
++	return 1;
++}
++
++/*
++ * Set ARC in running state
++ * 1. Set run bit in RUN_HALT_REQ register
++ * 2. Wait for ACK from core in RUN_HALT_ACK register
++ * 3. Clear run bit in RUN_HALT_REQ register
++ */
++static void run_arc(u8 id)
++{
++	u32 run_ack_offset, run_req_offset;
++	u32 run_ack_mask;
++	u64 start;
++
++	if (id) {
++		run_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	} else {
++		run_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		run_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		run_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK;
++
++	}
++
++	/* Set ARC in running state */
++	regmap_writel(BIT(0), run_req_offset);
++
++	start = timestamp_get_us();
++	while (!(regmap_readl(run_ack_offset) & run_ack_mask)) {
++
++		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
++			preboot_puts_hex("No running state ack from ARC ",
++					id, false);
++			break;
++		}
++	}
++
++	regmap_writel(0x0, run_req_offset);
++}
++
+ void preboot_start_image(u64 startaddr)
+ {
+ 	void (*image_entry)(void);
+ 	u32 lsb, msb;
+-	u64 start;
+ 
+ 	if (startaddr) {
+ 		lsb = (u32)startaddr;
+@@ -201,25 +252,8 @@
+ 		regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+ 	}
+ 
+-	/*
+-	 * Set ARC0 in running state
+-	 * 1. Set run bit in RUN_HALT_REQ register
+-	 * 2. Wait for ACK from core in RUN_HALT_ACK register
+-	 * 3. Clear run bit in RUN_HALT_REQ register
+-	 */
+-	regmap_writel(BIT(0), mmPSOC_ARC0_CFG_RUN_HALT_REQ);
+-
+-	start = timestamp_get_us();
+-	while (!(regmap_readl(mmPSOC_ARC0_CFG_RUN_HALT_ACK) &
+-			PSOC_ARC0_CFG_RUN_HALT_ACK_RUN_ACK_MASK)) {
+-
+-		if (timeout_expired(start, ARC_RUN_ACK_TIMEOUT_US)) {
+-			preboot_puts("No running state ack from ARC0");
+-			break;
+-		}
+-	}
+-
+-	regmap_writel(0x0, mmPSOC_ARC0_CFG_RUN_HALT_REQ);
++	 /* Set ARC0 in running state */
++	run_arc(0);
+ 
+ 	/*
+ 	 * Jump to __reset of zephyr. After image_entry, control is not

@@ -1,0 +1,1521 @@
+From cae065a5de9e9b7360c8a59493055e6fa81d86b1 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 18 May 2020 13:10:11 +0300
+Subject: [PATCH] [SW-11875] ppboot: move ppboot files in separate directory
+
+This patch adds changes to move files used only by ppboot to ppboot
+directory.
+
+The idea here to compile ppboot only with the files ppboot binary
+uses. In order to achieve that, files in common folders are segregated
+where files used by ppboot only are moved to ppboot folder and files
+used by both preboot and ppboot are kept in common folder. This helps
+to add single entries in Makefile instead of individual files. Along
+with this, ppboot files under app folder are also moved in ppboot
+directory.
+
+Also Makefile is updated to compile ppboot only with ppboot files.
+
+Change-Id: I2ae91e18911e19d5ec3a5fb1e8a0886e98f901c6
+---
+
+diff --git a/Makefile b/Makefile
+index e83054e..ce2fdae 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,6 +25,8 @@
+ 
+ PREBOOT_SRCS_C := $(shell ls common/*.c)
+ PREBOOT_SRCS_C := $(filter-out common/thermal_v2.c, $(PREBOOT_SRCS_C))
++PPBOOT_SRCS_C := $(shell ls common/*.c)
++PPBOOT_SRCS_C := $(filter-out common/thermal_v2.c, $(PPBOOT_SRCS_C))
+ 
+ include $(HL_DEV)/Makefile
+ 
+@@ -32,14 +34,15 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+ PREBOOT_APP_S := $(shell ls preboot/crt0_preboot.S)
+-PPBOOT_APP_S := $(shell ls app/crt0_ppboot.S)
+-PPBOOT_APP_C := $(shell ls app/ppboot.c)
++PPBOOT_SRCS_C += $(shell ls ppboot/*.c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
++PPBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
++PPBOOT_APP_S := $(shell ls ppboot/crt0_ppboot.S)
+ 
+ PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+ PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
+-PPBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
++PPBOOT_OBJECTS := $(PPBOOT_SRCS_C:.c=.o)
+ PPBOOT_OBJECTS += $(PPBOOT_APP_S:.S=.o)
+-PPBOOT_OBJECTS += $(PPBOOT_APP_C:.c=.o)
+ AUTO_GENERATED_FILE := auto_generated.h
+ 
+ BINDIR = bin
+diff --git a/app/crt0_ppboot.S b/app/crt0_ppboot.S
+deleted file mode 100644
+index b4bd0bb..0000000
+--- a/app/crt0_ppboot.S
++++ /dev/null
+@@ -1,33 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-/*
+- * This is preboot entry point
+- * Setting sp/fp/lr and jumping to C code
+- */
+-.globl	_start
+-_start:
+-
+-#ifdef __arc__
+-/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
+-.global	lf2flt
+-lf2flt:
+-#endif
+-
+-#ifdef __aarch64__
+-	ldr	x0, =__stack_top
+-	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
+-	mov	x29, sp		/* Set FP (x29) */
+-#endif
+-#ifdef __arc__
+-	push_s	blink
+-#endif
+-	bl	ppboot_main	/* Set LR (x30) */
+-#ifdef __arc__
+-	pop_s	blink
+-	j_s	[blink]
+-#endif
+diff --git a/app/ppboot.c b/app/ppboot.c
+deleted file mode 100644
+index fea6c37..0000000
+--- a/app/ppboot.c
++++ /dev/null
+@@ -1,178 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-
+-#include <psoc_global_conf_regs.h>
+-#include <pcie_aux_regs.h>
+-#include <cpu_ca53_cfg_regs.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_if.h>
+-#include <preboot.h>
+-#include <boot_desc.h>
+-
+-#include "common.h"
+-#include "uart.h"
+-#include "spi.h"
+-#include "pll.h"
+-
+-static enum fw_post_reset_cmd preboot_image_offset(struct boot_desc *desc)
+-{
+-	u32 image_pending = regmap_readl(mmUPD_PENDING_STS);
+-	u32 idx;
+-
+-	if (boot_desc_init()) {
+-		idx = boot_desc_get_img_desc(image_pending,
+-					     HL_FW_IMG_PREBOOT, desc);
+-		if (idx != HL_FW_IMG_NOT_FOUND)
+-			return image_pending;
+-	}
+-
+-	preboot_puts("No boot descriptors detected, need recovery!!!\n");
+-	preboot_puts("Trying hard coded Preboot offsets (might hang)...\n");
+-
+-	desc->spi_offset = HL_SPI_LEGACY_PREBOOT_OFF;
+-	desc->img_size = PREBOOT_SIZE;
+-	desc->loadaddr = PREBOOT_TEXT_BASE;
+-
+-	return image_pending;
+-}
+-
+-static u64 copy_preboot(void)
+-{
+-	char *name = "PREBOOT";
+-	struct boot_desc desc;
+-	enum fw_post_reset_cmd upd_pending = preboot_image_offset(&desc);
+-
+-	preboot_puts_raw("Preparing to run Preboot ");
+-	if (upd_pending != FLOPS_UPD_PENDING)
+-		preboot_puts_raw("stable");
+-	else
+-		preboot_puts_raw("candidate");
+-
+-	preboot_puts_hex_raw(" (offset: ", desc.spi_offset, false);
+-	preboot_puts_hex_raw(", size: ", desc.img_size, false);
+-	preboot_puts(")\n");
+-
+-	ppboot_cp_preboot(desc.loadaddr, desc.spi_offset, desc.img_size, name);
+-	return desc.loadaddr;
+-}
+-
+-static void rst_src_dump(void)
+-{
+-	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
+-	char *cause;
+-
+-	switch (rst_src) {
+-	case HL_COLD_RST:
+-		cause = "cold";
+-		break;
+-	case HL_MANUAL_RST:
+-		cause = "manual";
+-		break;
+-	case HL_PRSTN_RST:
+-		cause = "prstn";
+-		break;
+-	case HL_WD_RST:
+-		cause = "watch dog";
+-		break;
+-	case HL_SW_ALL_RST:
+-		cause = "software all";
+-		break;
+-	default:
+-		cause = "unknown";
+-		break;
+-	}
+-	preboot_puts_raw("Last reset cause is: ");
+-	preboot_puts_raw(cause);
+-	preboot_puts(" reset\n");
+-}
+-
+-static bool hl_pcie_link_up(void)
+-{
+-	unsigned int prstn, smlh, rdlh, rst_src;
+-
+-	/* check source of reset */
+-	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
+-	if (rst_src < HL_WD_RST)
+-		return false;
+-
+-	prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
+-	smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
+-	rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+-
+-	if (prstn && smlh && rdlh)
+-		return true;
+-
+-	return false;
+-}
+-
+-__attribute__((weak)) u32 preboot_clr_flops_reset_cause(void) { return 0; }
+-__attribute__((weak)) void ppboot_log_waiting_for_pcie(void) {}
+-
+-static void ppboot_pcie_init(void)
+-{
+-	if (hl_pcie_link_up()) {
+-		preboot_clr_flops_reset_cause();
+-		preboot_puts("PCIe link is already UP!\n");
+-		return;
+-	}
+-
+-	if (hl_skip_pcie_init()) {
+-		preboot_puts("PCIe initialization is skipped!\n");
+-		return;
+-	}
+-
+-	/* let the log be device specific according to its restrictions */
+-	ppboot_log_waiting_for_pcie();
+-	preboot_pcie_wait_for_link();
+-	preboot_puts("PCIe link is UP!\n");
+-}
+-
+-static void hl_jtag_init(void)
+-{
+-	u32 reg, nPRESETDBG = BIT(12);
+-
+-	/* Enable JTAG attach */
+-	reg = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
+-	reg |= nPRESETDBG;
+-	regmap_writel(reg, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+-}
+-
+-__attribute__((weak)) void hl_init_pcie_phy_fw(void) {}
+-
+-static inline void ppboot_version(void)
+-{
+-	preboot_puts("Ppboot " VERSION_STR "\n");
+-}
+-
+-void ppboot_main(void)
+-{
+-	u64 loadaddr;
+-
+-	hl_plat_init();
+-	hl_init_pcie_phy_fw();
+-	hl_jtag_init();
+-	/*
+-	 * Note: we assume CPU frequency is not changed while CPU is running,
+-	 * so the udelay init is done once before we start.
+-	 */
+-	udelay_init();
+-
+-	preboot_sync_btl();
+-	hl_uart_init();
+-	ppboot_pcie_init();
+-	ppboot_version();
+-	rst_src_dump();
+-
+-	/* check if we are done here */
+-	if (hl_pcie_init_only())
+-		return;
+-
+-	preboot_delay();
+-	loadaddr = copy_preboot();
+-
+-	image_start(loadaddr);
+-}
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+deleted file mode 100644
+index 35db95d..0000000
+--- a/common/boot_desc.c
++++ /dev/null
+@@ -1,111 +0,0 @@
+-// SPDX-License-Identifier:     GPL-2.0+
+-/*
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-#include <stdbool.h>
+-#include <preboot.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_desc.h>
+-#include <common.h>
+-
+-#include "boot_desc.h"
+-#include "spi.h"
+-#include "uart.h"
+-
+-#define MAX_IMGS		5
+-
+-#define BOOT_PTRS_SZ		sizeof(struct hl_fw_boot_ptrs)
+-#define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
+-
+-static struct hl_fw_boot_ptrs boot_ptrs;
+-static struct hl_fw_img_desc img_desc[MAX_IMGS];
+-
+-static void boot_desc_print_magic(char *name, struct hl_fw_boot_magic *magic)
+-{
+-	int i;
+-
+-	preboot_puts_raw(name);
+-	preboot_puts_raw(" magic: ");
+-	/* Strings do not obey endianness - print in reverse order */
+-	for (i = ARRAY_SIZE(magic->name) - 1; i >= 0; i--)
+-		preboot_putc_raw(magic->name[i]);
+-
+-	preboot_puts_hex_raw(" type: ", magic->type, false);
+-	preboot_puts_hex(" value: ", magic->val, true);
+-}
+-
+-static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
+-{
+-	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
+-
+-	if ((img_desc->magic.val & 0xFFFFFF00) != HL_FW_IMG_DESC_MAGIC)
+-		return false;
+-
+-	if (img_desc->desc_ver > HL_FW_IMG_DESC_CUR_VER)
+-		return false;
+-
+-	if (img_desc->idx >= 2)
+-		return false;
+-
+-	return true;
+-}
+-
+-int boot_desc_init(void)
+-{
+-	unsigned int count, i;
+-	u32 spi_off = HL_FW_BOOT_PTRS_BASE;
+-	u32 desc_offs[MAX_IMGS] = { 0 };
+-
+-	/* Read the main boot pointers structure */
+-	spi_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
+-	boot_desc_print_magic("FW boot PTRs", &boot_ptrs.magic);
+-
+-	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
+-		return 0;
+-
+-	count = boot_ptrs.count;
+-
+-	/* Read all the descriptors offsets */
+-	spi_off += sizeof(struct hl_fw_boot_ptrs);
+-	spi_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
+-
+-	/* Read all descriptors */
+-	for (i = 0; i < count; i++) {
+-		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
+-		spi_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
+-		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
+-			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+-			return 0;
+-		}
+-	}
+-
+-	return count;
+-}
+-
+-u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+-			   enum hl_fw_img_type type, struct boot_desc *desc)
+-{
+-	int i, idx;
+-
+-	preboot_puts_hex_raw("Looking for image type: ", type, false);
+-	for (i = 0; i < boot_ptrs.count; i++) {
+-		if (img_desc[i].magic.type != type)
+-			continue;
+-
+-		idx = img_desc[i].idx;
+-		if (upd_status == FLOPS_UPD_PENDING)
+-			idx = (idx + 1) % 2;
+-
+-		preboot_puts_hex(" - found! using index: ", idx, false);
+-		desc->spi_offset = img_desc[i].offset[idx];
+-		desc->img_size = img_desc[i].size[idx];
+-		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
+-					img_desc[i].load_low[idx];
+-		return idx;
+-	}
+-
+-	preboot_puts(" - not found!\n");
+-	return HL_FW_IMG_NOT_FOUND;
+-}
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+deleted file mode 100644
+index ef52ef0..0000000
+--- a/common/boot_desc.h
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/* SPDX-License-Identifier:     GPL-2.0+
+- *
+- * Copyright (C) 2017-2020 HabanaLabs Ltd.
+- * All Rights Reserved.
+- *
+- */
+-#ifndef _BOOT_DESC_H_
+-#define _BOOT_DESC_H_
+-
+-#include <preboot.h>
+-#include <hl_fw_if.h>
+-#include <hl_boot_desc.h>
+-
+-#define HL_FW_IMG_NOT_FOUND	((u32)-1)
+-
+-struct boot_desc {
+-	u32 spi_offset;
+-	u32 img_size;
+-	u64 loadaddr;
+-};
+-
+-/*
+- * boot_desc_init() - read and initialize the boot image pointers structures
+- *
+- * Returns: the amount of images available, or 0 - no images available - legacy
+- */
+-int boot_desc_init(void);
+-
+-/*
+- * boot_desc_get_img_desc() - get the struct boot_desc of the requested image
+- *
+- * @upd_status	- FLOPS_UPD_PENDING - for modifiable image offset,
+- *		  other values - for stable image offset
+- * @type	- the image type to look for
+- * @desc	- pointer to the struct boot_desc for placing the image data
+- *
+- * Returns:
+- * On success: the index of the image to load
+- * On failure: (u32)-1 (no image by the requested type)
+- */
+-u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+-			   enum hl_fw_img_type type, struct boot_desc *desc);
+-
+-#endif /* _BOOT_DESC_H_ */
+diff --git a/common/efuse.c b/common/efuse.c
+index 2be8dfb..febb5b9 100644
+--- a/common/efuse.c
++++ b/common/efuse.c
+@@ -12,7 +12,7 @@
+ #include "common.h"
+ #include "preboot.h"
+ #include "uart.h"
+-#include "spi.h"
++#include "ppboot/spi.h"
+ #include "pll.h"
+ 
+ /*
+diff --git a/common/spi.c b/common/spi.c
+deleted file mode 100644
+index c818647..0000000
+--- a/common/spi.c
++++ /dev/null
+@@ -1,243 +0,0 @@
+-/*
+- * (C) Copyright 2017 HabanaLabs, Ltd.
+- * Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#include <stddef.h>
+-
+-#include <psoc_gpio3_regs.h>
+-#include <psoc_spi_regs.h>
+-
+-#include "preboot.h"
+-#include "common.h"
+-#include "spi.h"
+-#include "uart.h"
+-
+-/* Registers */
+-#define CTRLR0				0x0
+-#define SSIENR				0x8
+-#define SER				0x10
+-#define BAUDR				0x14
+-#define TXFTLR				0x18
+-#define RXFTLR				0x1C
+-#define TXFLR				0x20
+-#define RXFLR				0x24
+-#define IMR				0x2C
+-#define DR0				0x60
+-
+-#define CMD_WRITE_STATUS		0x01
+-#define CMD_READ			0x03
+-#define CMD_WRITE_DISABLE		0x04
+-#define CMD_READ_STATUS			0x05
+-#define CMD_WRITE_ENABLE		0x06
+-#define frame_size_bits(b)		((b) << 16)
+-
+-static unsigned int spi_regs;
+-/*
+- * SSI device Chip Select (CS0) is combined with GPIO53
+- * Using this we can really do SSI bus claim/release
+- * GPIO53 is set through mmPSOC_GPIO3 where each
+- * mmPSOC_GPIO serve 16 GPIOs
+- * Note: CS0 is active low
+- */
+-__attribute__((weak)) void spi_ssi_cs0_get(unsigned int *mask,
+-					   unsigned int *data_offset,
+-					   unsigned int *out_en_offset)
+-{
+-	*mask = BIT(53 % 16);
+-	*data_offset = mmPSOC_GPIO3_DATAOUT;
+-	*out_en_offset = mmPSOC_GPIO3_OUTENSET;
+-}
+-
+-static void spi_ssi_cs0_init(void)
+-{
+-	unsigned int reg, mask, data, out_en;
+-
+-	spi_ssi_cs0_get(&mask, &data, &out_en);
+-	reg  = regmap_readl(data);
+-	reg  &= ~mask;
+-	regmap_writel(reg, data);
+-
+-	reg = regmap_readl(out_en);
+-	reg |=  mask;
+-	regmap_writel(reg, out_en);
+-}
+-
+-static void spi_claim_bus(void)
+-{
+-	regmap_writel(1, get_cs_pad_sel());
+-}
+-
+-static void spi_release_bus(void)
+-{
+-	regmap_writel(0, get_cs_pad_sel());
+-}
+-
+-static inline void spi_dev_update_frame_size(unsigned int len)
+-{
+-	regmap_writel(0, spi_regs + SSIENR);
+-	regmap_writel(frame_size_bits((len * 8) - 1), spi_regs + CTRLR0);
+-	regmap_writel(1, spi_regs + SSIENR);
+-}
+-
+-static inline int spi_fifo_is_empty(unsigned int level_reg)
+-{
+-	return !regmap_readl(level_reg);
+-}
+-
+-static void spi_dev_dword_cmd(unsigned int cmd, unsigned int *val)
+-{
+-	unsigned int tmp;
+-
+-	while (!spi_fifo_is_empty(spi_regs + TXFLR))
+-		;
+-	regmap_writel(cmd, spi_regs + DR0);
+-
+-	while (spi_fifo_is_empty(spi_regs + RXFLR))
+-		;
+-	tmp = regmap_readl(spi_regs + DR0);
+-
+-	if (val)
+-		*val = tmp;
+-}
+-
+-static void spi_special_cmd(unsigned int cmd, unsigned char *val)
+-{
+-	unsigned char tmp;
+-
+-	spi_dev_update_frame_size(sizeof(tmp));
+-
+-	while (!spi_fifo_is_empty(spi_regs + TXFLR))
+-		;
+-	regmap_writeb(cmd, spi_regs + DR0);
+-
+-	while (spi_fifo_is_empty(spi_regs + RXFLR))
+-		;
+-	tmp = regmap_readb(spi_regs + DR0);
+-
+-	if (val)
+-		*val = tmp;
+-}
+-
+-/* Hold chip select (CS) during transaction */
+-static void spi_char_cmd_csel(unsigned char cmd, unsigned char *val)
+-{
+-	spi_claim_bus();
+-
+-	spi_special_cmd(cmd, NULL);
+-	if (val)
+-		spi_special_cmd(0, val);
+-
+-	spi_release_bus();
+-}
+-
+-static void spi_special_cmd_csel(unsigned int cmd, unsigned char *val,
+-								size_t size)
+-{
+-	int i;
+-
+-	spi_claim_bus();
+-
+-	spi_dev_update_frame_size(sizeof(*val));
+-
+-	while (!spi_fifo_is_empty(spi_regs + TXFLR))
+-		;
+-	regmap_writeb(cmd, spi_regs + DR0);
+-	for (i = 0; i < size; i++) {
+-		while (!spi_fifo_is_empty(spi_regs + TXFLR))
+-			;
+-		regmap_writeb(val[i], spi_regs + DR0);
+-	}
+-
+-	while (spi_fifo_is_empty(spi_regs + RXFLR))
+-		;
+-	regmap_readb(spi_regs + DR0);
+-	for (i = 0; i < size; i++) {
+-		while (spi_fifo_is_empty(spi_regs + RXFLR))
+-			;
+-		regmap_readb(spi_regs + DR0);
+-	}
+-
+-	spi_release_bus();
+-}
+-
+-static void spi_common_write(unsigned int cmd, unsigned char *buf, size_t size)
+-{
+-	unsigned char sr;
+-
+-	spi_char_cmd_csel(CMD_WRITE_ENABLE, NULL);
+-	spi_special_cmd_csel(cmd, buf, size);
+-	do
+-		spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-	while (sr & READ_STATUS_WIP);
+-	spi_char_cmd_csel(CMD_WRITE_DISABLE, NULL);
+-}
+-
+-static unsigned char spi_prot(void)
+-{
+-	unsigned char sr;
+-
+-	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
+-	sr |= PROT_MASK;
+-	spi_common_write(CMD_WRITE_STATUS, &sr, sizeof(sr));
+-
+-	return sr;
+-}
+-
+-static void spi_read(void *dst, unsigned int offset, unsigned int size)
+-{
+-	unsigned int cmd = (CMD_READ << 24) | offset;
+-	int i;
+-
+-	spi_claim_bus();
+-	spi_dev_update_frame_size(sizeof(cmd));
+-	spi_dev_dword_cmd(cmd, NULL);
+-	for (i = 0; i < size; i += sizeof(unsigned int))
+-		spi_dev_dword_cmd(0, dst + i);
+-	spi_dev_dword_cmd(0, NULL);
+-	spi_release_bus();
+-}
+-
+-__attribute__((weak)) void spi_base_get(unsigned int *regs)
+-{
+-	*regs = mmPSOC_SPI_CTRLR0;
+-}
+-
+-static void spi_init(void)
+-{
+-	u32 baudr = hl_spi_baudr_get();
+-
+-	/* Validate that baudr is even */
+-	baudr = (baudr + 1) & ~1;
+-
+-	spi_base_get(&spi_regs);
+-	spi_ssi_cs0_init();
+-	regmap_writel(0x00000000, spi_regs + SSIENR);
+-	regmap_writel(baudr, spi_regs + BAUDR);
+-	regmap_writel(0x00000000, spi_regs + RXFTLR);
+-	regmap_writel(0x00000000, spi_regs + TXFTLR);
+-	regmap_writel(0x0000003F, spi_regs + IMR);	/* Disable Interrupts */
+-	regmap_writel(0x00000001, spi_regs + SER);
+-	regmap_writel(0x00000001, spi_regs + SSIENR);
+-}
+-
+-void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name)
+-{
+-	unsigned char sr;
+-	static bool prot_flash = true;
+-
+-	spi_init();
+-	spi_read(dst, offset, size);
+-	preboot_puts_raw(name);
+-	preboot_puts(" copying from flash is completed\n");
+-	if (prot_flash) {
+-		prot_flash = false;
+-		sr = spi_prot();
+-		if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD))
+-			preboot_puts("Flash may be protected, depend on WP# signal\n");
+-		else
+-			preboot_puts("Flash is not protected\n");
+-	}
+-}
+diff --git a/common/spi.h b/common/spi.h
+deleted file mode 100644
+index faa710d..0000000
+--- a/common/spi.h
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/*
+- * Copyright (C) 2017 HabanaLabs Ltd.
+- *   Author: Noam Camus <noamikong@gmail.com>
+- *
+- * SPDX-License-Identifier:     GPL-2.0+
+- */
+-
+-#ifndef _HL_SPI_H_
+-#define _HL_SPI_H_
+-
+-/* The Status Register (SR) in use bits definition */
+-#define READ_STATUS_WIP			BIT(0)
+-#define READ_STATUS_BP0			BIT(2)
+-#define READ_STATUS_BP1			BIT(3)
+-#define READ_STATUS_BP2			BIT(4)
+-#define READ_STATUS_BP3			BIT(5)
+-#define READ_STATUS_SRWD		BIT(7)
+-#define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | \
+-					READ_STATUS_BP2 | READ_STATUS_BP3)
+-#define ALL_PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
+-
+-/* The PROT_MASK is meant to be overridden by device specific setting */
+-#ifndef PROT_MASK
+-#define PROT_MASK			ALL_PROT_MASK
+-#endif
+-
+-void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name);
+-u32 get_cs_pad_sel(void);
+-
+-#endif /* _HL_SPI_H_ */
+diff --git a/gaudi/common.c b/gaudi/common.c
+index e4ac6eb..98ae2cd 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -21,7 +21,7 @@
+ #include <pll.h>
+ #include <uart.h>
+ #include <string.h>
+-#include <spi.h>
++#include <ppboot/spi.h>
+ #include <thermal.h>
+ 
+ #include "common.h"
+diff --git a/gaudi/common.h b/gaudi/common.h
+index 046ec26..5a7fee2 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -40,7 +40,7 @@
+ #define I2C_SLAVE_ADDRESS		0x4f
+ 
+ #ifndef __ASSEMBLY__
+-#include "spi.h"
++#include "ppboot/spi.h"
+ 
+ /* Let this file be included in any order and override the PROT_MASK */
+ #ifdef PROT_MASK
+diff --git a/gaudi/ppboot.lds.S b/gaudi/ppboot.lds.S
+index 68d58f1..e078b30 100644
+--- a/gaudi/ppboot.lds.S
++++ b/gaudi/ppboot.lds.S
+@@ -16,7 +16,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_ppboot.o (.text*)
++		ppboot/crt0_ppboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/goya/common.c b/goya/common.c
+index 5076969..13b862f 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -18,7 +18,7 @@
+ #include <pll.h>
+ #include <uart.h>
+ #include <string.h>
+-#include <spi.h>
++#include <ppboot/spi.h>
+ #include <thermal.h>
+ #include <string.h>
+ 
+diff --git a/goya/ppboot.lds.S b/goya/ppboot.lds.S
+index 68d58f1..e078b30 100644
+--- a/goya/ppboot.lds.S
++++ b/goya/ppboot.lds.S
+@@ -16,7 +16,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_ppboot.o (.text*)
++		ppboot/crt0_ppboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/goya2/common.c b/goya2/common.c
+index 37cc4f7..e216bb7 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -23,7 +23,7 @@
+ #include <pll.h>
+ #include <uart.h>
+ #include <string.h>
+-#include <spi.h>
++#include <ppboot/spi.h>
+ 
+ #include "common.h"
+ 
+diff --git a/goya2/ppboot.lds.S b/goya2/ppboot.lds.S
+index 68d58f1..e078b30 100644
+--- a/goya2/ppboot.lds.S
++++ b/goya2/ppboot.lds.S
+@@ -16,7 +16,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_ppboot.o (.text*)
++		ppboot/crt0_ppboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/goya2_arc_gnu/ppboot.lds.S b/goya2_arc_gnu/ppboot.lds.S
+index 9115076..d074a40 100644
+--- a/goya2_arc_gnu/ppboot.lds.S
++++ b/goya2_arc_gnu/ppboot.lds.S
+@@ -18,7 +18,7 @@
+ {
+ 	.text : {
+ 		. = ALIGN(8);
+-		app/crt0_ppboot.o (.text*)
++		ppboot/crt0_ppboot.o (.text*)
+ 		* (.text*)
+ 	} >.sram
+ 
+diff --git a/ppboot/boot_desc.c b/ppboot/boot_desc.c
+new file mode 100644
+index 0000000..35db95d
+--- /dev/null
++++ b/ppboot/boot_desc.c
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <stdbool.h>
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
++#include <common.h>
++
++#include "boot_desc.h"
++#include "spi.h"
++#include "uart.h"
++
++#define MAX_IMGS		5
++
++#define BOOT_PTRS_SZ		sizeof(struct hl_fw_boot_ptrs)
++#define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
++
++static struct hl_fw_boot_ptrs boot_ptrs;
++static struct hl_fw_img_desc img_desc[MAX_IMGS];
++
++static void boot_desc_print_magic(char *name, struct hl_fw_boot_magic *magic)
++{
++	int i;
++
++	preboot_puts_raw(name);
++	preboot_puts_raw(" magic: ");
++	/* Strings do not obey endianness - print in reverse order */
++	for (i = ARRAY_SIZE(magic->name) - 1; i >= 0; i--)
++		preboot_putc_raw(magic->name[i]);
++
++	preboot_puts_hex_raw(" type: ", magic->type, false);
++	preboot_puts_hex(" value: ", magic->val, true);
++}
++
++static bool boot_desc_img_desc_is_valid(struct hl_fw_img_desc *img_desc)
++{
++	boot_desc_print_magic("FW IMG DESC", &img_desc->magic);
++
++	if ((img_desc->magic.val & 0xFFFFFF00) != HL_FW_IMG_DESC_MAGIC)
++		return false;
++
++	if (img_desc->desc_ver > HL_FW_IMG_DESC_CUR_VER)
++		return false;
++
++	if (img_desc->idx >= 2)
++		return false;
++
++	return true;
++}
++
++int boot_desc_init(void)
++{
++	unsigned int count, i;
++	u32 spi_off = HL_FW_BOOT_PTRS_BASE;
++	u32 desc_offs[MAX_IMGS] = { 0 };
++
++	/* Read the main boot pointers structure */
++	spi_copy(&boot_ptrs, spi_off, BOOT_PTRS_SZ, "BOOT PTRS");
++	boot_desc_print_magic("FW boot PTRs", &boot_ptrs.magic);
++
++	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
++		return 0;
++
++	count = boot_ptrs.count;
++
++	/* Read all the descriptors offsets */
++	spi_off += sizeof(struct hl_fw_boot_ptrs);
++	spi_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
++
++	/* Read all descriptors */
++	for (i = 0; i < count; i++) {
++		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
++		spi_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
++		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
++			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
++			return 0;
++		}
++	}
++
++	return count;
++}
++
++u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
++			   enum hl_fw_img_type type, struct boot_desc *desc)
++{
++	int i, idx;
++
++	preboot_puts_hex_raw("Looking for image type: ", type, false);
++	for (i = 0; i < boot_ptrs.count; i++) {
++		if (img_desc[i].magic.type != type)
++			continue;
++
++		idx = img_desc[i].idx;
++		if (upd_status == FLOPS_UPD_PENDING)
++			idx = (idx + 1) % 2;
++
++		preboot_puts_hex(" - found! using index: ", idx, false);
++		desc->spi_offset = img_desc[i].offset[idx];
++		desc->img_size = img_desc[i].size[idx];
++		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
++					img_desc[i].load_low[idx];
++		return idx;
++	}
++
++	preboot_puts(" - not found!\n");
++	return HL_FW_IMG_NOT_FOUND;
++}
+diff --git a/ppboot/boot_desc.h b/ppboot/boot_desc.h
+new file mode 100644
+index 0000000..ef52ef0
+--- /dev/null
++++ b/ppboot/boot_desc.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#ifndef _BOOT_DESC_H_
++#define _BOOT_DESC_H_
++
++#include <preboot.h>
++#include <hl_fw_if.h>
++#include <hl_boot_desc.h>
++
++#define HL_FW_IMG_NOT_FOUND	((u32)-1)
++
++struct boot_desc {
++	u32 spi_offset;
++	u32 img_size;
++	u64 loadaddr;
++};
++
++/*
++ * boot_desc_init() - read and initialize the boot image pointers structures
++ *
++ * Returns: the amount of images available, or 0 - no images available - legacy
++ */
++int boot_desc_init(void);
++
++/*
++ * boot_desc_get_img_desc() - get the struct boot_desc of the requested image
++ *
++ * @upd_status	- FLOPS_UPD_PENDING - for modifiable image offset,
++ *		  other values - for stable image offset
++ * @type	- the image type to look for
++ * @desc	- pointer to the struct boot_desc for placing the image data
++ *
++ * Returns:
++ * On success: the index of the image to load
++ * On failure: (u32)-1 (no image by the requested type)
++ */
++u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
++			   enum hl_fw_img_type type, struct boot_desc *desc);
++
++#endif /* _BOOT_DESC_H_ */
+diff --git a/ppboot/crt0_ppboot.S b/ppboot/crt0_ppboot.S
+new file mode 100644
+index 0000000..b4bd0bb
+--- /dev/null
++++ b/ppboot/crt0_ppboot.S
+@@ -0,0 +1,33 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++/*
++ * This is preboot entry point
++ * Setting sp/fp/lr and jumping to C code
++ */
++.globl	_start
++_start:
++
++#ifdef __arc__
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++#endif
++
++#ifdef __aarch64__
++	ldr	x0, =__stack_top
++	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
++	mov	x29, sp		/* Set FP (x29) */
++#endif
++#ifdef __arc__
++	push_s	blink
++#endif
++	bl	ppboot_main	/* Set LR (x30) */
++#ifdef __arc__
++	pop_s	blink
++	j_s	[blink]
++#endif
+diff --git a/ppboot/ppboot.c b/ppboot/ppboot.c
+new file mode 100644
+index 0000000..f034450
+--- /dev/null
++++ b/ppboot/ppboot.c
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <pcie_aux_regs.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <hl_fw_if.h>
++#include <hl_boot_if.h>
++#include <preboot.h>
++
++#include "common.h"
++#include "uart.h"
++#include "spi.h"
++#include "boot_desc.h"
++#include "pll.h"
++
++static enum fw_post_reset_cmd preboot_image_offset(struct boot_desc *desc)
++{
++	u32 image_pending = regmap_readl(mmUPD_PENDING_STS);
++	u32 idx;
++
++	if (boot_desc_init()) {
++		idx = boot_desc_get_img_desc(image_pending,
++					     HL_FW_IMG_PREBOOT, desc);
++		if (idx != HL_FW_IMG_NOT_FOUND)
++			return image_pending;
++	}
++
++	preboot_puts("No boot descriptors detected, need recovery!!!\n");
++	preboot_puts("Trying hard coded Preboot offsets (might hang)...\n");
++
++	desc->spi_offset = HL_SPI_LEGACY_PREBOOT_OFF;
++	desc->img_size = PREBOOT_SIZE;
++	desc->loadaddr = PREBOOT_TEXT_BASE;
++
++	return image_pending;
++}
++
++static u64 copy_preboot(void)
++{
++	char *name = "PREBOOT";
++	struct boot_desc desc;
++	enum fw_post_reset_cmd upd_pending = preboot_image_offset(&desc);
++
++	preboot_puts_raw("Preparing to run Preboot ");
++	if (upd_pending != FLOPS_UPD_PENDING)
++		preboot_puts_raw("stable");
++	else
++		preboot_puts_raw("candidate");
++
++	preboot_puts_hex_raw(" (offset: ", desc.spi_offset, false);
++	preboot_puts_hex_raw(", size: ", desc.img_size, false);
++	preboot_puts(")\n");
++
++	ppboot_cp_preboot(desc.loadaddr, desc.spi_offset, desc.img_size, name);
++	return desc.loadaddr;
++}
++
++static void rst_src_dump(void)
++{
++	unsigned int rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	char *cause;
++
++	switch (rst_src) {
++	case HL_COLD_RST:
++		cause = "cold";
++		break;
++	case HL_MANUAL_RST:
++		cause = "manual";
++		break;
++	case HL_PRSTN_RST:
++		cause = "prstn";
++		break;
++	case HL_WD_RST:
++		cause = "watch dog";
++		break;
++	case HL_SW_ALL_RST:
++		cause = "software all";
++		break;
++	default:
++		cause = "unknown";
++		break;
++	}
++	preboot_puts_raw("Last reset cause is: ");
++	preboot_puts_raw(cause);
++	preboot_puts(" reset\n");
++}
++
++static bool hl_pcie_link_up(void)
++{
++	unsigned int prstn, smlh, rdlh, rst_src;
++
++	/* check source of reset */
++	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	if (rst_src < HL_WD_RST)
++		return false;
++
++	prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++	smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++	rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++	if (prstn && smlh && rdlh)
++		return true;
++
++	return false;
++}
++
++__attribute__((weak)) u32 preboot_clr_flops_reset_cause(void) { return 0; }
++__attribute__((weak)) void ppboot_log_waiting_for_pcie(void) {}
++
++static void ppboot_pcie_init(void)
++{
++	if (hl_pcie_link_up()) {
++		preboot_clr_flops_reset_cause();
++		preboot_puts("PCIe link is already UP!\n");
++		return;
++	}
++
++	if (hl_skip_pcie_init()) {
++		preboot_puts("PCIe initialization is skipped!\n");
++		return;
++	}
++
++	/* let the log be device specific according to its restrictions */
++	ppboot_log_waiting_for_pcie();
++	preboot_pcie_wait_for_link();
++	preboot_puts("PCIe link is UP!\n");
++}
++
++static void hl_jtag_init(void)
++{
++	u32 reg, nPRESETDBG = BIT(12);
++
++	/* Enable JTAG attach */
++	reg = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	reg |= nPRESETDBG;
++	regmap_writel(reg, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
++__attribute__((weak)) void hl_init_pcie_phy_fw(void) {}
++
++static inline void ppboot_version(void)
++{
++	preboot_puts("Ppboot " VERSION_STR "\n");
++}
++
++void ppboot_main(void)
++{
++	u64 loadaddr;
++
++	hl_plat_init();
++	hl_init_pcie_phy_fw();
++	hl_jtag_init();
++	/*
++	 * Note: we assume CPU frequency is not changed while CPU is running,
++	 * so the udelay init is done once before we start.
++	 */
++	udelay_init();
++
++	preboot_sync_btl();
++	hl_uart_init();
++	ppboot_pcie_init();
++	ppboot_version();
++	rst_src_dump();
++
++	/* check if we are done here */
++	if (hl_pcie_init_only())
++		return;
++
++	preboot_delay();
++	loadaddr = copy_preboot();
++
++	image_start(loadaddr);
++}
+diff --git a/ppboot/spi.c b/ppboot/spi.c
+new file mode 100644
+index 0000000..c818647
+--- /dev/null
++++ b/ppboot/spi.c
+@@ -0,0 +1,243 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <stddef.h>
++
++#include <psoc_gpio3_regs.h>
++#include <psoc_spi_regs.h>
++
++#include "preboot.h"
++#include "common.h"
++#include "spi.h"
++#include "uart.h"
++
++/* Registers */
++#define CTRLR0				0x0
++#define SSIENR				0x8
++#define SER				0x10
++#define BAUDR				0x14
++#define TXFTLR				0x18
++#define RXFTLR				0x1C
++#define TXFLR				0x20
++#define RXFLR				0x24
++#define IMR				0x2C
++#define DR0				0x60
++
++#define CMD_WRITE_STATUS		0x01
++#define CMD_READ			0x03
++#define CMD_WRITE_DISABLE		0x04
++#define CMD_READ_STATUS			0x05
++#define CMD_WRITE_ENABLE		0x06
++#define frame_size_bits(b)		((b) << 16)
++
++static unsigned int spi_regs;
++/*
++ * SSI device Chip Select (CS0) is combined with GPIO53
++ * Using this we can really do SSI bus claim/release
++ * GPIO53 is set through mmPSOC_GPIO3 where each
++ * mmPSOC_GPIO serve 16 GPIOs
++ * Note: CS0 is active low
++ */
++__attribute__((weak)) void spi_ssi_cs0_get(unsigned int *mask,
++					   unsigned int *data_offset,
++					   unsigned int *out_en_offset)
++{
++	*mask = BIT(53 % 16);
++	*data_offset = mmPSOC_GPIO3_DATAOUT;
++	*out_en_offset = mmPSOC_GPIO3_OUTENSET;
++}
++
++static void spi_ssi_cs0_init(void)
++{
++	unsigned int reg, mask, data, out_en;
++
++	spi_ssi_cs0_get(&mask, &data, &out_en);
++	reg  = regmap_readl(data);
++	reg  &= ~mask;
++	regmap_writel(reg, data);
++
++	reg = regmap_readl(out_en);
++	reg |=  mask;
++	regmap_writel(reg, out_en);
++}
++
++static void spi_claim_bus(void)
++{
++	regmap_writel(1, get_cs_pad_sel());
++}
++
++static void spi_release_bus(void)
++{
++	regmap_writel(0, get_cs_pad_sel());
++}
++
++static inline void spi_dev_update_frame_size(unsigned int len)
++{
++	regmap_writel(0, spi_regs + SSIENR);
++	regmap_writel(frame_size_bits((len * 8) - 1), spi_regs + CTRLR0);
++	regmap_writel(1, spi_regs + SSIENR);
++}
++
++static inline int spi_fifo_is_empty(unsigned int level_reg)
++{
++	return !regmap_readl(level_reg);
++}
++
++static void spi_dev_dword_cmd(unsigned int cmd, unsigned int *val)
++{
++	unsigned int tmp;
++
++	while (!spi_fifo_is_empty(spi_regs + TXFLR))
++		;
++	regmap_writel(cmd, spi_regs + DR0);
++
++	while (spi_fifo_is_empty(spi_regs + RXFLR))
++		;
++	tmp = regmap_readl(spi_regs + DR0);
++
++	if (val)
++		*val = tmp;
++}
++
++static void spi_special_cmd(unsigned int cmd, unsigned char *val)
++{
++	unsigned char tmp;
++
++	spi_dev_update_frame_size(sizeof(tmp));
++
++	while (!spi_fifo_is_empty(spi_regs + TXFLR))
++		;
++	regmap_writeb(cmd, spi_regs + DR0);
++
++	while (spi_fifo_is_empty(spi_regs + RXFLR))
++		;
++	tmp = regmap_readb(spi_regs + DR0);
++
++	if (val)
++		*val = tmp;
++}
++
++/* Hold chip select (CS) during transaction */
++static void spi_char_cmd_csel(unsigned char cmd, unsigned char *val)
++{
++	spi_claim_bus();
++
++	spi_special_cmd(cmd, NULL);
++	if (val)
++		spi_special_cmd(0, val);
++
++	spi_release_bus();
++}
++
++static void spi_special_cmd_csel(unsigned int cmd, unsigned char *val,
++								size_t size)
++{
++	int i;
++
++	spi_claim_bus();
++
++	spi_dev_update_frame_size(sizeof(*val));
++
++	while (!spi_fifo_is_empty(spi_regs + TXFLR))
++		;
++	regmap_writeb(cmd, spi_regs + DR0);
++	for (i = 0; i < size; i++) {
++		while (!spi_fifo_is_empty(spi_regs + TXFLR))
++			;
++		regmap_writeb(val[i], spi_regs + DR0);
++	}
++
++	while (spi_fifo_is_empty(spi_regs + RXFLR))
++		;
++	regmap_readb(spi_regs + DR0);
++	for (i = 0; i < size; i++) {
++		while (spi_fifo_is_empty(spi_regs + RXFLR))
++			;
++		regmap_readb(spi_regs + DR0);
++	}
++
++	spi_release_bus();
++}
++
++static void spi_common_write(unsigned int cmd, unsigned char *buf, size_t size)
++{
++	unsigned char sr;
++
++	spi_char_cmd_csel(CMD_WRITE_ENABLE, NULL);
++	spi_special_cmd_csel(cmd, buf, size);
++	do
++		spi_char_cmd_csel(CMD_READ_STATUS, &sr);
++	while (sr & READ_STATUS_WIP);
++	spi_char_cmd_csel(CMD_WRITE_DISABLE, NULL);
++}
++
++static unsigned char spi_prot(void)
++{
++	unsigned char sr;
++
++	spi_char_cmd_csel(CMD_READ_STATUS, &sr);
++	sr |= PROT_MASK;
++	spi_common_write(CMD_WRITE_STATUS, &sr, sizeof(sr));
++
++	return sr;
++}
++
++static void spi_read(void *dst, unsigned int offset, unsigned int size)
++{
++	unsigned int cmd = (CMD_READ << 24) | offset;
++	int i;
++
++	spi_claim_bus();
++	spi_dev_update_frame_size(sizeof(cmd));
++	spi_dev_dword_cmd(cmd, NULL);
++	for (i = 0; i < size; i += sizeof(unsigned int))
++		spi_dev_dword_cmd(0, dst + i);
++	spi_dev_dword_cmd(0, NULL);
++	spi_release_bus();
++}
++
++__attribute__((weak)) void spi_base_get(unsigned int *regs)
++{
++	*regs = mmPSOC_SPI_CTRLR0;
++}
++
++static void spi_init(void)
++{
++	u32 baudr = hl_spi_baudr_get();
++
++	/* Validate that baudr is even */
++	baudr = (baudr + 1) & ~1;
++
++	spi_base_get(&spi_regs);
++	spi_ssi_cs0_init();
++	regmap_writel(0x00000000, spi_regs + SSIENR);
++	regmap_writel(baudr, spi_regs + BAUDR);
++	regmap_writel(0x00000000, spi_regs + RXFTLR);
++	regmap_writel(0x00000000, spi_regs + TXFTLR);
++	regmap_writel(0x0000003F, spi_regs + IMR);	/* Disable Interrupts */
++	regmap_writel(0x00000001, spi_regs + SER);
++	regmap_writel(0x00000001, spi_regs + SSIENR);
++}
++
++void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name)
++{
++	unsigned char sr;
++	static bool prot_flash = true;
++
++	spi_init();
++	spi_read(dst, offset, size);
++	preboot_puts_raw(name);
++	preboot_puts(" copying from flash is completed\n");
++	if (prot_flash) {
++		prot_flash = false;
++		sr = spi_prot();
++		if ((sr & READ_STATUS_BP0_3) && (sr & READ_STATUS_SRWD))
++			preboot_puts("Flash may be protected, depend on WP# signal\n");
++		else
++			preboot_puts("Flash is not protected\n");
++	}
++}
+diff --git a/ppboot/spi.h b/ppboot/spi.h
+new file mode 100644
+index 0000000..faa710d
+--- /dev/null
++++ b/ppboot/spi.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (C) 2017 HabanaLabs Ltd.
++ *   Author: Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifndef _HL_SPI_H_
++#define _HL_SPI_H_
++
++/* The Status Register (SR) in use bits definition */
++#define READ_STATUS_WIP			BIT(0)
++#define READ_STATUS_BP0			BIT(2)
++#define READ_STATUS_BP1			BIT(3)
++#define READ_STATUS_BP2			BIT(4)
++#define READ_STATUS_BP3			BIT(5)
++#define READ_STATUS_SRWD		BIT(7)
++#define READ_STATUS_BP0_3		(READ_STATUS_BP0 | READ_STATUS_BP1 | \
++					READ_STATUS_BP2 | READ_STATUS_BP3)
++#define ALL_PROT_MASK			(READ_STATUS_BP0_3 | READ_STATUS_SRWD)
++
++/* The PROT_MASK is meant to be overridden by device specific setting */
++#ifndef PROT_MASK
++#define PROT_MASK			ALL_PROT_MASK
++#endif
++
++void spi_copy(void *dst, unsigned int offset, unsigned int size, char *name);
++u32 get_cs_pad_sel(void);
++
++#endif /* _HL_SPI_H_ */

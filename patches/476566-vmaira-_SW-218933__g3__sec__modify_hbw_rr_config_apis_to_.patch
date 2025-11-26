@@ -1,0 +1,247 @@
+From 1ef5bd67b749ff97c2b5a744002825efe41b8091 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 02 Apr 2025 12:44:37 +0300
+Subject: [PATCH] [SW-218933] g3: sec: modify hbw rr config apis to take prot type
+
+This patch modifies the apis related to HBW RR configuration to take an
+additional additional argument, prot_type. This parameter enables api
+users to specify whether the HBW region should be read-protected,
+write-protected, or both.
+
+Change-Id: I4e2aa61026b1714ef588e8e50f0a2452b9143521
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/gaudi3/common/security.c b/arch/gaudi3/common/security.c
+index 95bf847..7e4cabf 100644
+--- a/arch/gaudi3/common/security.c
++++ b/arch/gaudi3/common/security.c
+@@ -388,20 +388,35 @@
+ 	}
+ }
+ 
+-void hl_secure_range_enable(uint32_t rr_dest, bool write_only, int die)
++static void hl_secure_range_enable(uint32_t rr_dest, int die, enum hl_security_prot_type prot_type)
+ {
+-	if (die)
+-		mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
+-	else
+-		regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
+-
+-	if (write_only)
++	if (prot_type == HL_SEC_RD_PROT) {
++		if (die) {
++			mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++			mirror_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++		} else {
++			regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++			regmap_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++		}
+ 		return;
++	} else if (prot_type == HL_SEC_WR_PROT) {
++		if (die) {
++			mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++			mirror_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++		} else {
++			regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
++			regmap_rmwritel(rr_dest, 0, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++		}
++		return;
++	}
+ 
+-	if (die)
++	if (die) {
++		mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
+ 		mirror_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
+-	else
++	} else {
++		regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_WR_M);
+ 		regmap_rmwritel(rr_dest, 1, MSTR_IF_RR_LBW_PRIV_RANGE_EN_RD_M);
++	}
+ }
+ 
+ void hl_secure_range_disable(uint32_t rr_dest, bool write_only, int die)
+@@ -441,7 +456,7 @@
+ 
+ 	rr_dest = rr_base + rr_reg->range_en;
+ 	if (enable)
+-		hl_secure_range_enable(rr_dest, false, die);
++		hl_secure_range_enable(rr_dest, die, HL_SEC_RD_WR_PROT);
+ 	else
+ 		hl_secure_range_disable(rr_dest, false, die);
+ 
+@@ -495,7 +510,8 @@
+ /* shift bits to get address regions for 16KB granularity */
+ #define HL_SEC_SHIFT_16K_POS			14
+ 
+-static void hl_secure_update_rr_reg_hbw(int rr_idx, uint32_t inst_offset, struct hbw_rr_reg *rr_reg, int die)
++static void hl_secure_update_rr_reg_hbw(int rr_idx, uint32_t inst_offset, struct hbw_rr_reg *rr_reg, int die,
++			enum hl_security_prot_type prot_type)
+ {
+ 	uint64_t rr_base, rr_dest;
+ 	uint32_t data_max_hi = ((uint32_t)(rr_reg->data_max >> HL_SEC_BITS_IN_REG));
+@@ -527,13 +543,14 @@
+ 		regmap_writel(data_max_hi, rr_dest);
+ 
+ 	rr_dest = rr_base + rr_reg->range_en;
+-	hl_secure_range_enable(rr_dest, false, die);
++	hl_secure_range_enable(rr_dest, die, prot_type);
+ 
+ 	hl_secure_update_hit_reg(rr_idx, inst_offset, &rr_reg->hit, false, die);
+ }
+ 
+ static void hl_secure_hbw_rr_gen(int rr_idx, uint64_t min, uint64_t max, int dist,
+-						int inst_num, enum hl_sec_engine_type type, int die)
++						int inst_num, enum hl_sec_engine_type type, int die,
++						enum hl_security_prot_type prot_type)
+ {
+ 	int i;
+ 	struct hbw_rr_reg rr_reg;
+@@ -558,7 +575,7 @@
+ 	rr_reg.range_en = cfg->range_en_full_breg + dist;
+ 
+ 	for (i = 0; i < inst_num; i++)
+-		hl_secure_update_rr_reg_hbw(rr_idx, cfg->instances_dist * i, &rr_reg, die);
++		hl_secure_update_rr_reg_hbw(rr_idx, cfg->instances_dist * i, &rr_reg, die, prot_type);
+ }
+ 
+ #define HL_SEC_LBW_RR_MAX_NUMBER	18
+@@ -729,7 +746,8 @@
+ /* For pcie need to configure only PCIE_MSTR_RR_MSTR_IF for HBW */
+ #define HL_SEC_HBW_PCIE_INST_NUM        1
+ static void hl_secure_hbw_rr_common(struct hl_security_drv_data *data, int rr_idx, uint64_t min,
+-				uint64_t max, struct hl_security_rr_engine_select rr_sel)
++				uint64_t max, struct hl_security_rr_engine_select rr_sel,
++				enum hl_security_prot_type prot_type)
+ {
+ 	uint32_t die1_hdcore_offset, num_of_hdcores, hdcore, die;
+ 	/*
+@@ -757,7 +775,7 @@
+ 			for (hdcore = 0; hdcore < GAUDI3_NUM_HDCORES_PER_DIE; hdcore++)
+ 				hl_secure_hbw_rr_gen(rr_idx, min, max, ((HDCORE_OFFSET * hdcore) +
+ 						die1_hdcore_offset), GAUDI3_NUM_RRTR_PER_HDCORE,
+-						HL_SEC_ENGINE_IF_RTR, die);
++						HL_SEC_ENGINE_IF_RTR, die, prot_type);
+ 
+ 		}
+ 
+@@ -775,7 +793,7 @@
+ 			die = (hdcore < GAUDI3_NUM_HDCORES_PER_DIE) ? 0 : 1;
+ 
+ 			hl_secure_hbw_rr_gen(rr_idx, min, max, (HDCORE_OFFSET * hdcore), 1,
+-									HL_SEC_ENGINE_RIF_RTR, die);
++									HL_SEC_ENGINE_RIF_RTR, die, prot_type);
+ 		}
+ 	}
+ 
+@@ -785,15 +803,15 @@
+ 				log_require, HL_SEC_RR_SEL_PSOC);
+ 		for (die = 0; die <= data->sku; die++)
+ 			hl_secure_hbw_rr_gen(rr_idx, min, max, (DIE_OFFSET * die),
+-					HL_SEC_PSOC_INST_NUM, HL_SEC_ENGINE_PSOC, die);
++					HL_SEC_PSOC_INST_NUM, HL_SEC_ENGINE_PSOC, die, prot_type);
+ 	}
+ 
+ 	if (rr_sel.pcie) {
+ 		/* pcie on die1 is not used, So configure for only die0 pcie */
+ 		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_HBW_PCIE_INST_NUM,
+-				HL_SEC_ENGINE_PCIE, 0);
++				HL_SEC_ENGINE_PCIE, 0, prot_type);
+ 
+-		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, 1, HL_SEC_ENGINE_NRTR, 0);
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, 1, HL_SEC_ENGINE_NRTR, 0, prot_type);
+ 	}
+ 
+ 	if (true == log_require) {
+@@ -823,7 +841,7 @@
+ 		min = RR_HBW_PRIV_RANGE_MIN;
+ 		max = RR_HBW_PRIV_RANGE_MAX;
+ 
+-		hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_7, min, max, rr_sel);
++		hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_7, min, max, rr_sel, HL_SEC_RD_WR_PROT);
+ 	}
+ 
+ 	rr_sel.pcie = HL_SECURITY_PCIE_MSTR_RR;
+@@ -838,11 +856,11 @@
+ 
+ 	min = RR_HBW_PRIV_START_HBW;
+ 	max = SRAM_BASE_ADDR - 1;
+-	hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_0, min, max, rr_sel);
++	hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_0, min, max, rr_sel, HL_SEC_RD_WR_PROT);
+ 
+ 	min = SRAM_BASE_ADDR + DRAM_MAX_SIZE;
+ 	max = RR_HBW_PRIV_END_RSVD;
+-	hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_7, min, max, rr_sel);
++	hl_secure_hbw_rr_common(&data, HL_SEC_HBW_RR_7, min, max, rr_sel, HL_SEC_RD_WR_PROT);
+ }
+ 
+ static void preboot_secure_lbw(void)
+@@ -1026,7 +1044,8 @@
+ 	}
+ }
+ 
+-static void hl_sec_config_dyn_hbw_rr(int rr, uint64_t min64, uint64_t max64)
++static void hl_sec_config_dyn_hbw_rr(int rr, uint64_t min64, uint64_t max64,
++		enum hl_security_prot_type prot_type)
+ {
+ 	struct hl_security_rr_engine_select rr_sel;
+ 	struct hl_security_drv_data data;
+@@ -1040,7 +1059,7 @@
+ 	/* Block pcie RR for dyn rr */
+ 	rr_sel.pcie = HL_SECURITY_PCIE_MSTR_RR;
+ 
+-	hl_secure_hbw_rr_common(&data, rr, min64, max64, rr_sel);
++	hl_secure_hbw_rr_common(&data, rr, min64, max64, rr_sel, prot_type);
+ }
+ 
+ #define IMAGE_OFFSET_MASK	0xFFFFFF
+@@ -1083,7 +1102,7 @@
+ 	 * So, first close (0x1D2AF000 - RR_HBW_PRIV_END_RSVD) and close
+ 	 * (RR_HBW_PRIV_START_HBW - 0x1D200000), which will open only the required region.
+ 	 */
+-	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_7, img_max, RR_HBW_PRIV_END_RSVD);
++	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_7, img_max, RR_HBW_PRIV_END_RSVD, HL_SEC_RD_WR_PROT);
+ 
+ 	/*
+ 	 * In gaudi3 when RR are programmed max address is included.
+@@ -1091,7 +1110,7 @@
+ 	 * earlier that image base address (HBW are configured in 16K pages aligned)
+ 	 */
+ 	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_0, RR_HBW_PRIV_START_HBW,
+-				(image_base_full - SZ_16K));
++				(image_base_full - SZ_16K), HL_SEC_RD_WR_PROT);
+ }
+ 
+ void preboot_security_dynamic_img_sram_close(void)
+@@ -1103,11 +1122,11 @@
+ 
+ 	min = RR_HBW_PRIV_START_HBW;
+ 	max = RR_HBW_PRIV_END_HBW;
+-	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_0, min, max);
++	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_0, min, max, HL_SEC_RD_WR_PROT);
+ 
+ 	min = RR_HBW_PRIV_START_RSVD;
+ 	max = RR_HBW_PRIV_END_RSVD;
+-	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_7, min, max);
++	hl_sec_config_dyn_hbw_rr(HL_SEC_HBW_RR_7, min, max, HL_SEC_RD_WR_PROT);
+ }
+ 
+ void preboot_security_boot_info_write_key_idx(u32 *key_idx)
+diff --git a/arch/gaudi3/common/security_defs.h b/arch/gaudi3/common/security_defs.h
+index 52fb4d6..f247669 100644
+--- a/arch/gaudi3/common/security_defs.h
++++ b/arch/gaudi3/common/security_defs.h
+@@ -32,6 +32,13 @@
+ 	GAUDI3_DUAL_DIE_SKU,
+ };
+ 
++enum hl_security_prot_type {
++	HL_SEC_RD_PROT = 0x1,
++	HL_SEC_WR_PROT = 0x2,
++};
++
++#define HL_SEC_RD_WR_PROT (HL_SEC_RD_PROT | HL_SEC_WR_PROT)
++
+ struct gaudi3_redundancy_ctx {
+ 	uint8_t initialized;
+ 	uint8_t num_of_dies;

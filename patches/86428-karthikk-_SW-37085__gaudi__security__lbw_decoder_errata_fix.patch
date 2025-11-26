@@ -1,0 +1,73 @@
+From 7f3398f4603f5a46d3f6a3696f99da7b0db59857 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Mon, 05 Apr 2021 17:32:34 +0300
+Subject: [PATCH] [SW-37085] gaudi: security: lbw decoder errata fix
+
+Due to a LBW address decoder bug, all the
+access to DBG address area via MESH needs
+to be restricted.
+
+This patch implements the suggested
+workaround for this hardware errata by
+adding a LBW RR to restrict the DBG
+address access via all RTR paths.
+
+Change-Id: Ic45d273f80895782c8c7da2a6a391fa4cefb0355
+Signed-off-by: Karthikeyan K <karthikk@habana.ai>
+---
+
+diff --git a/gaudi/security.c b/gaudi/security.c
+index c0c76e2..6f345bb 100644
+--- a/gaudi/security.c
++++ b/gaudi/security.c
+@@ -1218,12 +1218,17 @@
+ 	}
+ }
+ 
+-static void preboot_secure_lbw_rr(int rr, u64 min, u64 max)
++static void preboot_secure_lbw_rr_if(int rr, u64 min, u64 max)
+ {
+ 	preboot_secure_lbw_rr_gen(rr, min, max, IF_RTR);
+ 	preboot_secure_lbw_rr_gen(rr, min, max, DMA_IF_SOB);
+ 	preboot_secure_lbw_rr_gen(rr, min, max, DMA_IF_CH0);
+ 	preboot_secure_lbw_rr_gen(rr, min, max, DMA_IF_CH1);
++}
++
++static void preboot_secure_lbw_rr(int rr, u64 min, u64 max)
++{
++	preboot_secure_lbw_rr_if(rr, min, max);
+ 	preboot_secure_pcie_rr(rr, min, max);
+ }
+ 
+@@ -1241,7 +1246,7 @@
+ 	LBW_RR_NIC1_TS_NIC2_MAC_CH,
+ 	LBW_RR_NIC3_MAC_CH,
+ 	LBW_RR_NIC3_TS_NIC4_MAC_CH,
+-	LBW_RR_ETR,
++	LBW_RR_DBG_ETR,
+ };
+ 
+ #define SYNC_MNGR_DIST		0x20000
+@@ -1330,7 +1335,21 @@
+ 	/* mmPSOC_ETR_AXICTL (single register): RR(LBW_RR_ETR) */
+ 	min = HL_CFG_BASE + mmPSOC_ETR_AXICTL - 1;
+ 	max = HL_CFG_BASE + mmPSOC_ETR_AXICTL + sizeof(u32);
+-	preboot_secure_lbw_rr(LBW_RR_ETR, min, max);
++	preboot_secure_pcie_rr(LBW_RR_DBG_ETR, min, max);
++
++	/*
++	 * H3_errata:
++	 * Due to Router LBW address decoder bug
++	 * RR is defined for DBG block such that
++	 * DBG access via the address decoder are
++	 * blocked. Only PCIe/CA53/PSOC are allowed
++	 * to access as they do not contain address
++	 * decoding.
++	 */
++	/* Debug address space : 0x7FFE000000 - 0x7FFFFFFFFF */
++	min = mmMME_S_ROM_TABLE_BASE - 1;
++	max = mmTPC7_EML_CS_BASE + TPC7_EML_CS_MAX_OFFSET;
++	preboot_secure_lbw_rr_if(LBW_RR_DBG_ETR, min, max);
+ 
+ 	/* SYNC_MNGR: PCIe only! PCIe RR_28 up to PCIe RR_31 */
+ 	for (i = 0; i < 4; i++) {

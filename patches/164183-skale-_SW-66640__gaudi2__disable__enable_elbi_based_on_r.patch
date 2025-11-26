@@ -1,0 +1,63 @@
+From eafaf3bafc2bbb19ca28b9029f4b6c262c31cc61 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 05 Jan 2022 15:18:57 +0200
+Subject: [PATCH] [SW-66640] gaudi2: disable, enable elbi based on reset type
+
+The sequence for disabling and enabling ELBI depends on the
+reset type. For FLR and warm reset, ELBI can be enable/disable by
+configuring CRS however this method is not allowed for SW_ALL
+and FW RST for which ELBI is enabled/disabled using RR. This
+patch add support to check reset type and disable/enable ELBI
+accordingly.
+
+Change-Id: I40c8db5e27ed605512e5f7fd27715c274f1689b8
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 62db4c9..0d4acf2 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -955,9 +955,16 @@
+ #define PCIE_WRAP_OUTBOUND_TIMEOUT_US	100
+ void hl_pcie_enable_access(void)
+ {
++	unsigned int rst_src = hl_rst_src_get();
++
+ 	/* Enable the ELBI access */
+-	regmap_writel(RR_PRIV_RANGE_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-	regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	if ((rst_src == HL_FLR_RST) || (rst_src == HL_PRSTN_RST)) {
++		regmap_writel(0, mmPCIE_CORE_REQ_RETRY_EN);
++	} else {
++		regmap_writel(RR_PRIV_RANGE_RESET_VAL,
++				mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++		regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++	}
+ 
+ 	/* Disable HOST_ACCESS_TERMINATION */
+ 	regmap_writel(0, mmPCIE_WRAP_HOST_ACCESS_TERMINATION);
+@@ -969,12 +976,20 @@
+ void hl_pcie_disable_access(void)
+ {
+ 	u64 start;
++	unsigned int rst_src = hl_rst_src_get();
+ 
+ 	/* Disable the ELBI access */
+-	regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
+-	regmap_writel(RR_PRIV_RANGE_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
+-	regmap_writel(RR_PRIV_HIT_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW);
+-	regmap_writel(RR_PRIV_HIT_RESET_VAL, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR);
++	if ((rst_src == HL_FLR_RST) || (rst_src == HL_PRSTN_RST)) {
++		regmap_writel(1, mmPCIE_CORE_REQ_RETRY_EN);
++	} else {
++		regmap_writel(0, mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0);
++		regmap_writel(RR_PRIV_RANGE_RESET_VAL,
++				mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_0);
++		regmap_writel(RR_PRIV_HIT_RESET_VAL,
++				mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AW);
++		regmap_writel(RR_PRIV_HIT_RESET_VAL,
++				mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR);
++	}
+ 
+ 	/* Enable HOST_ACCESS_TERMINATION */
+ 	regmap_writel(1, mmPCIE_WRAP_HOST_ACCESS_TERMINATION);

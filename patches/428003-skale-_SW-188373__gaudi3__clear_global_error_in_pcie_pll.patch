@@ -1,0 +1,67 @@
+From 46693d5b51a937513ce53e3624bb48682eb1694b Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Wed, 26 Jun 2024 20:59:52 +0300
+Subject: [PATCH] [SW-188373] gaudi3: clear global error in pcie pll block
+
+Due to unmapped register access in HW FSM [H9-5613], PARC interrupt
+is generated with global error cause set in PCI PLL block in
+both DIEs. Currenlty we clear PARC interrupt, however the global
+error interrupt is not cleared which shows up when arcevent process
+any SEI interrupt. This causes incorrect global error info to LKD.
+
+This patch clears global error cause as part of parc interrupt clear
+sequence.
+
+Change-Id: Ib9464e590a4c66d97b8681f93d619368aae15434
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 5410deb..d24b9a8 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -77,6 +77,7 @@
+ #include <mstr_if_v1_xresp_lbw_regs.h>
+ #include <mstr_if_v1_xresp_lbw_masks.h>
+ #include <rtr_ctrl_lbw_2_ch_razwi_lbw_ch1_regs.h>
++#include <pll_special_regs.h>
+ 
+ #define PIF_ARC_NUM_OF_MEM	2
+ 
+@@ -385,6 +386,7 @@
+ static void clear_parc_interrupt(void)
+ {
+ 	uint32_t cause, cause_offset, clr_offset, rz_clr_offset, mstrif_clr_offset;
++	uint32_t glbl_err_cause_offset, glbl_err_cause;
+ 	uint32_t die_offset = mmD1_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE -
+ 				mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE;
+ 
+@@ -402,6 +404,7 @@
+ 			mmRTR_CTRL_LBW_2_CH_RAZWI_LBW_CH1_ADEC_RAZWI_AW_CLR);
+ 	mstrif_clr_offset =
+ 		D0_PARC_MSTR_IF_XRESP_LBW_REG(mmMSTR_IF_V1_XRESP_LBW_INTR_CTRL_CLEAR);
++	glbl_err_cause_offset = D0_G4_PCI_PLL_SPECIAL_REG(mmPLL_SPECIAL_GLBL_ERR_CAUSE);
+ 
+ 	/* Die 0 */
+ 	cause = regmap_readl(cause_offset);
+@@ -415,6 +418,10 @@
+ 		      mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE +
+ 		      mmINT_AGG_SHARED_SEI_INT_MSG_STS_0);
+ 
++	/* clear interrupt at global special block */
++	glbl_err_cause = regmap_readl(glbl_err_cause_offset);
++	regmap_writel(glbl_err_cause, glbl_err_cause_offset);
++
+ 	if (hl_is_dual_die_sku()) {
+ 		/* Die 1 */
+ 		cause = mirror_readl(cause_offset + die_offset);
+@@ -427,6 +434,10 @@
+ 		mirror_writel(AGG_SEI_PARC_INT_IDX_STS,
+ 			      mmD0_CPU_INT_AGG_SHARED_SEI_INT_MSG_BASE +
+ 			      mmINT_AGG_SHARED_SEI_INT_MSG_STS_0 + die_offset);
++
++		/* clear interrupt at global special block */
++		glbl_err_cause = mirror_readl(glbl_err_cause_offset + die_offset);
++		mirror_writel(glbl_err_cause, glbl_err_cause_offset + die_offset);
+ 	}
+ }
+ 

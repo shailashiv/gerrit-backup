@@ -1,0 +1,199 @@
+From 525f1ae7854351ed55382b7a302eb1d690029dfc Mon Sep 17 00:00:00 2001
+From: Christine Gharzuzi <cgharzuzi@habana.ai>
+Date: Mon, 18 Oct 2021 10:17:54 +0300
+Subject: [PATCH] [SW-55053] gaudi2: implement w/a for reset src reg
+
+Due to a HW bug in Gaudi2 mmPSOC_GLOBAL_CONF_RST_SRC
+register (cannot be cleared), detecting the reset
+source is problematic when more than 1 bit in register
+is set.
+
+As a W/A, all resets handled by FW will be mirrored
+in a shadow register that is reserved after reset,
+
+The rest of the reset events that are not handled
+by FW will be handled by CPLD and visible to FW
+using a GPIO drived by CPLD.
+
+Change-Id: Ic102806c0769c5994247f442585d4239049e5c6a
+Signed-off-by: Christine Gharzuzi <cgharzuzi@habana.ai>
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 000c91d..16128c4 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -103,6 +103,9 @@
+ 
+ 	gaudi2_axi_drain_ena();
+ 
++	/* set reset source */
++	hl_reset_src_init();
++
+ 	init_secondary();
+ 
+ 	/* This W/A is to be done before pcie link is established */
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index aca4c25..cf93999 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -128,6 +128,9 @@
+ 
+ 	/* This W/A is to be done before pcie link is established */
+ 	set_pci_msix_pba_offset_val();
++
++	/* set reset source */
++	hl_reset_src_init();
+ }
+ 
+ void ppboot_log_waiting_for_pcie(void)
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 2d60d83..17d45db 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -101,6 +101,61 @@
+ 	FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_G2F_TH_MASK, 0x10) | \
+ 	FIELD_PREP(DCORE0_TPC0_QM_CGM_CFG_EN_MASK, 0x1))
+ 
++#define HL_GPIO_DATA		0x0
++#define HL_GPIO_DATAOUT		0x4
++#define HL_GPIO_OUTENSET	0x10
++#define HL_GPIO_OUTENCLR	0x14
++#define GPIOS_PER_BANK		16
++
++/* Gaudi2 has 6 GPIO banks */
++#define GPIO2BANK(g)						\
++	({ typeof(g) _g = (g);					\
++	(_g) < (GPIOS_PER_BANK * 1) ? mmPSOC_GPIO0_BASE :	\
++	(_g) < (GPIOS_PER_BANK * 2) ? mmPSOC_GPIO1_BASE :	\
++	(_g) < (GPIOS_PER_BANK * 3) ? mmPSOC_GPIO2_BASE :	\
++	(_g) < (GPIOS_PER_BANK * 4) ? mmPSOC_GPIO3_BASE :	\
++	(_g) < (GPIOS_PER_BANK * 5) ? mmPSOC_GPIO4_BASE :	\
++	(_g) < (GPIOS_PER_BANK * 6) ? mmPSOC_GPIO5_BASE : 0; })
++
++static uint64_t hl_gpio_to_bank(int gpio)
++{
++	return gpio < 0 ? 0 : GPIO2BANK(gpio);
++}
++
++static uint32_t gaudi2_gpio_read(uint32_t gpio_pin)
++{
++	uint32_t val;
++	uint32_t gpio_pin_offset = gpio_pin % GPIOS_PER_BANK;
++	uint32_t gpio_pin_mask = BIT(gpio_pin_offset);
++	uint64_t gpio_reg_addr = hl_gpio_to_bank(gpio_pin);
++
++	/* Set GPIO direction to input */
++	regmap_writel(gpio_pin_mask, gpio_reg_addr + HL_GPIO_OUTENCLR);
++
++	/* read GPIO value */
++	val = regmap_readl(gpio_reg_addr + HL_GPIO_DATA);
++
++	return (val & gpio_pin_mask) >> gpio_pin_offset;
++}
++
++static void gaudi2_gpio_write(uint32_t gpio_pin, uint32_t val)
++{
++	uint32_t reg_val;
++	uint32_t gpio_pin_offset = gpio_pin % GPIOS_PER_BANK;
++	uint32_t gpio_pin_mask = BIT(gpio_pin_offset);
++	uint64_t gpio_reg_addr = hl_gpio_to_bank(gpio_pin);
++
++	reg_val = regmap_readl(gpio_reg_addr + HL_GPIO_DATAOUT);
++	reg_val &= ~(gpio_pin_mask);
++	reg_val |= (val << gpio_pin_offset);
++
++	/* set GPIO value */
++	regmap_writel(reg_val, gpio_reg_addr + HL_GPIO_DATAOUT);
++
++	/* Set GPIO direction to output */
++	regmap_writel(gpio_pin_mask, gpio_reg_addr + HL_GPIO_OUTENSET);
++}
++
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+ {
+ 	regs->cpu_pq_base_addr_low = mmCPU_IF_PQ_BASE_ADDR_LOW;
+@@ -217,8 +272,15 @@
+ 
+ u32 hl_rst_src_get(void)
+ {
+-	/* TODO: implement the W/A for the reset source bug erratum */
+-	return regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	uint32_t orig_rst_source;
++
++	orig_rst_source = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++
++	/* In case of cold reset, only 1 bit will be set */
++	if (orig_rst_source == HL_COLD_RST)
++		return HL_COLD_RST;
++
++	return regmap_readl(mmRST_SRC);
+ }
+ 
+ void preboot_init_pcie_phy_fw_update(void)
+@@ -1002,3 +1064,53 @@
+ {
+ 	return HL_BOOT_INFO_VERSION;
+ }
++
++enum gaudi2_cpld_reset_event {
++	CPLD_RST_UNKNOWN,
++	CPLD_RST_PERSTN,
++	CPLD_RST_WD,
++	CPLD_RST_ECC_SERR_DERR,
++};
++
++#define GAUDI2_RST_SRC_0_GPIO	66 /* GP_66 */
++#define GAUDI2_RST_SRC_1_GPIO	67 /* GP_67 */
++#define GAUDI2_RST_SRC_CLR_GPIO	68 /* GP_68 */
++static uint32_t gaudi2_get_cpld_rst_event(void)
++{
++	uint32_t rst_src_0, rst_src_1, cpld_rst_src;
++
++	rst_src_0 = gaudi2_gpio_read(GAUDI2_RST_SRC_0_GPIO);
++	rst_src_1 = gaudi2_gpio_read(GAUDI2_RST_SRC_1_GPIO);
++	cpld_rst_src = (rst_src_1 << 1) | rst_src_0;
++
++	/* clear CPLD reset src event */
++	gaudi2_gpio_write(GAUDI2_RST_SRC_CLR_GPIO, 0x1);
++
++	return cpld_rst_src;
++}
++
++/*
++ * Check reset events reported by cpld and set it in the reset source reg.
++ * possible reset events from cpld are:
++ * 1. Watchdog
++ * 2. PERSTN
++ * 3. ECC DERR/SERR.
++ */
++void hl_reset_src_init(void)
++{
++	uint32_t cpld_rst = gaudi2_get_cpld_rst_event();
++
++	switch (cpld_rst) {
++	case CPLD_RST_PERSTN:
++		regmap_writel(HL_PRSTN_RST, mmRST_SRC);
++		break;
++	case CPLD_RST_WD:
++		regmap_writel(HL_WD_RST, mmRST_SRC);
++		break;
++	case CPLD_RST_ECC_SERR_DERR:
++		regmap_writel(HL_ECC_DERR_RST, mmRST_SRC);
++		break;
++	default:
++		break;
++	}
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index d97dbc9..49c006a 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -144,6 +144,7 @@
+ void hl_dev_reset(void);
+ void hl_esc_key_handle(void);
+ u32 hl_rst_src_get(void);
++void hl_reset_src_init(void);
+ 
+ void preboot_pcie_wait_for_link(void);
+ void preboot_delay(void);

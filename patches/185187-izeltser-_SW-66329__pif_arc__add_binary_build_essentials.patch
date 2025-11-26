@@ -1,0 +1,244 @@
+From 3e8c00b70b724b3fec5013975eb5c89059b09dae Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 06 Mar 2022 18:22:16 +0200
+Subject: [PATCH] [SW-66329] pif_arc: add binary build essentials
+
+This patch adds the files required for building and executing
+the flr handling routine on the pif Arc CPU, such as
+main c routine, makefile script, linker script and pre-execution
+assembly code.
+
+Change-Id: Ic90e487c5046941ad2f64415120f9da53d111e6c
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/Makefile b/app/pcie_pif/Makefile
+new file mode 100644
+index 0000000..001fc5c
+--- /dev/null
++++ b/app/pcie_pif/Makefile
+@@ -0,0 +1,53 @@
++CC = $(CROSS_COMPILE)gcc
++OBJCOPY = $(CROSS_COMPILE)objcopy
++BASE_DEV_NAME := $(shell echo $(HL_DEV) | cut -d'_' -f1)
++HL_DEV_SUBTYPE := $(shell echo $(HL_DEV) | cut -d'_' -s -f2,3)
++HL_DEV_ARCH := arch/$(BASE_DEV_NAME)/$(HL_DEV_SUBTYPE)
++HL_DEV_ARCH_COMMON := arch/$(BASE_DEV_NAME)/common
++PREBOOT_ROOT_DIR := ../..
++
++CFLAGS += -I$(SPECS_DIR)
++CFLAGS += -I$(SPECS_EMBEDDED_DIR)
++CFLAGS += -I$(SPECS_DIR)/$(BASE_DEV_NAME)/asic_reg
++CFLAGS += -Wall -Werror
++CFLAGS += -g -c
++CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/
++
++CFLAGS += -Os -fdata-sections -ffunction-sections
++SFLAGS := $(CFLAGS) -D__ASSEMBLY__
++
++PIF_ARC_LD_SCRIPT := pcie_pif.lds
++LDFLAGS := -g -nostdlib -static
++LDFLAGS += -Wl,--gc-sections
++LDLIBS := -lgcc
++
++PIF_ARC_SRCS_C := $(shell ls *.c)
++PIF_ARC_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/lib/common/*.c)
++PIF_ARC_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH_COMMON)/common.c)
++PIF_ARC_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/common.c)
++PIF_ARC_SRCS_C += $(shell ls $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/$(HL_TARGET).c)
++PIF_ARC_APP_S := $(shell ls crt0_pcie_pif.S)
++
++PIF_ARC_OBJECTS := $(PIF_ARC_SRCS_C:.c=.o)
++PIF_ARC_OBJECTS += $(PIF_ARC_APP_S:.S=.o)
++
++# TODO: add version info
++
++all: pcie_pif.elf
++
++pcie_pif.elf: $(PIF_ARC_OBJECTS) $(PIF_ARC_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(PIF_ARC_LD_SCRIPT) -o $@ -Wl,--start-group $(PIF_ARC_OBJECTS) $(LDLIBS) -Wl,--end-group
++
++%.lds: %.lds.S
++	@$(CC) $(SFLAGS) -E -P -nostdinc -o $@ $<
++
++%.o: %.c
++	@$(CC) $(CFLAGS) -o $@ $<
++
++%.o: %.S
++	@$(CC) $(SFLAGS) -o $@ $<
++
++clean:
++	rm -f $(PIF_ARC_OBJECTS)
++
++.PHONY: clean
+diff --git a/app/pcie_pif/crt0_pcie_pif.S b/app/pcie_pif/crt0_pcie_pif.S
+new file mode 100644
+index 0000000..7cc8d29
+--- /dev/null
++++ b/app/pcie_pif/crt0_pcie_pif.S
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2022 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++.globl	_start
++_start:
++
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++	mov	sp, __stack_top
++	mov	fp, sp
++
++	/* Disable un-aligned checks on data memory */
++	lr r0, [STATUS32]
++	bset r0, r0, 0x13
++	kflag r0
++
++	/* Clear BSS and stack areas */
++	mov	r5, __bss_start
++	sub	r6, __stack_top, r5
++	lsr.f	lp_count, r6, 2
++	lpnz	1f
++	st.ab	0, [r5, 4]
++1:
++	/* jump to main */
++	bl	pcie_pif_main
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+new file mode 100644
+index 0000000..89e34d4
+--- /dev/null
++++ b/app/pcie_pif/pcie_pif.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <stddef.h>
++#include <preboot.h>
++#include <device.h>
++#include "cmd_module.h"
++
++static struct cmd_module_ops cmd_ops[] = {
++	{	/* PCI module */
++		.setup = module_pci_setup,
++		.check = module_pci_check,
++		.disable = module_pci_disable,
++		.run = module_pci_run,
++		.enable = module_pci_enable,
++		.run_fast = noop,
++		.teardown = noop,
++		.run_noreturn = noop,
++	},
++};
++
++static void device_init(void)
++{
++	device_init_global_conf();
++	device_init_pci();
++}
++
++void module_run_uncond_each_loop(void) {}
++void module_print_waiting_msg(void) {}
++void pci_init_wait_dbg(void) {}
++
++void pcie_pif_main(void)
++{
++	device_init();
++
++	/* Handle commands */
++	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
++}
+diff --git a/app/pcie_pif/pcie_pif.lds.S b/app/pcie_pif/pcie_pif.lds.S
+new file mode 100644
+index 0000000..1bb74e3
+--- /dev/null
++++ b/app/pcie_pif/pcie_pif.lds.S
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2022 HabanaLabs, Ltd.
++ * All Rights Reserved.
++ */
++
++#include "common.h"
++
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++
++MEMORY
++{
++	ICCM 	: ORIGIN = PIF_ARC_ICCM_LOCAL_BASE, LENGTH = 4K
++	DCCM	: ORIGIN = PIF_ARC_DCCM_LOCAL_BASE, LENGTH = 4K
++}
++
++REGION_ALIAS("REGION_TEXT",	ICCM)
++REGION_ALIAS("REGION_RODATA",	ICCM)
++REGION_ALIAS("REGION_DATA",	DCCM)
++REGION_ALIAS("REGION_SDATA",	DCCM)
++REGION_ALIAS("REGION_BSS",	DCCM)
++REGION_ALIAS("REGION_STACK",	DCCM)
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(4);
++		crt0_pcie_pif.o (.text*)
++		*(.text .text.*)
++		_etext = . ;
++	} > REGION_TEXT
++
++	.rodata : AT ( LOADADDR(.text) + SIZEOF(.text) ) {
++		_rodata = .;
++		*(.rodata .rodata.*)
++		_erodata = . ;
++        } > REGION_RODATA
++
++	.data : {
++		. = ALIGN(4);
++		_data = .;
++		*(.data .data.*)
++		_edata = .;
++        } > REGION_DATA
++
++	.sdata : AT ( LOADADDR(.data) + SIZEOF(.data) ) {
++		. = ALIGN(4);
++		_sdata = .;
++		*(.sdata .sdata.* .gnu.linkonce.s.*)
++		_esdata = . ;
++        } > REGION_SDATA
++
++	.bss : {
++		. = ALIGN(4);
++		__bss_start = . ;
++		*(.bss*)
++		__bss_end = . ;
++	} > REGION_BSS
++
++	.stack : {
++		. = ALIGN(4);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > REGION_STACK
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > ICCM
++}
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index cb7de0b..6d3e48d 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -69,4 +69,7 @@
+ #define TS_CALIB_A_G_COEFF		82600
+ #define TS_CALIB_B_H_COEFF		262600
+ 
++#define PIF_ARC_ICCM_LOCAL_BASE		0
++#define PIF_ARC_DCCM_LOCAL_BASE		0x80000000
++
+ #endif /* COMMON_GAUDI3_ARC_GNU_H_ */

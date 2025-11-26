@@ -1,0 +1,67 @@
+From b6d7652e3e0c0774f027fac7151440064a08204f Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 22 Feb 2023 15:09:11 +0200
+Subject: [PATCH] [SW-66289] gaudi3: set arcs as privileged
+
+PSOC ARCs and PIF ARC are set as privileged early in the ppboot flow,
+same as in a previous platform, to avoid the scenario of an arc failing
+to access a privileged register during the boot flow.
+
+Since it's a time critical section, and we don't have d2d link yet,
+only master die ARCs privilege level is being set. The rest will
+be configured as part of the security driver functionality.
+
+configuration is performed according to embedded PRM section 13
+
+Change-Id: I7299472420fa75991b58fd5667ca221e7af29db6
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 57d10f0..55ddcc8 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1273,3 +1273,43 @@
+ 	if (ppboot_boot_info_set(HL_BOOT_INFO_FW_INFO, fw_info, fw_info_sz))
+ 		preboot_puts("BOOT_INFO: Failed to set last reset cause in fw_info\n");
+ }
++
++#define AXPROT_PERM_BITS	3
++#define AXPROT_PERM_GROUPS	2	/* read and write */
++#define AXPROT_PERM_GRP_SZ	0x10
++
++/* AxPROT values to set privileged permission level */
++#define AXPROT_PRIV_OVRD	0x11	/* AxPROT bit 0 */
++#define AXPROT_SECURE_OVRD	0x01	/* AxPROT bit 1 */
++#define AXPROT_RSVD_OVRD	0x01	/* AxPROT bit 2 */
++
++static const u32 axprot_perm_priv_val[AXPROT_PERM_BITS] = { AXPROT_PRIV_OVRD, AXPROT_SECURE_OVRD,
++							    AXPROT_RSVD_OVRD };
++
++static void hl_set_mstr_if_axprot_to_priv(u32 axprot_base)
++{
++	uint32_t addr;
++	unsigned int protbit, grp;
++
++	for (grp = 0; grp < AXPROT_PERM_GROUPS; grp++) {
++		addr = axprot_base + grp * AXPROT_PERM_GRP_SZ;
++		for (protbit = 0; protbit < AXPROT_PERM_BITS; protbit++) {
++			regmap_writel(axprot_perm_priv_val[protbit], addr);
++			addr += sizeof(uint32_t);
++		}
++	}
++}
++
++void ppboot_secure_arc(void)
++{
++	/* D0 PSOC ARCs */
++	hl_set_mstr_if_axprot_to_priv(mmD0_PARC_ARC0_MSTR_IF_AXPROT_HBW_BASE);
++	hl_set_mstr_if_axprot_to_priv(mmD0_PARC_ARC1_MSTR_IF_AXPROT_HBW_BASE);
++	hl_set_mstr_if_axprot_to_priv(mmD0_PARC_ARC2_MSTR_IF_AXPROT_HBW_BASE);
++	hl_set_mstr_if_axprot_to_priv(mmD0_PARC_ARC0_MSTR_IF_AXPROT_LBW_BASE);
++	hl_set_mstr_if_axprot_to_priv(mmD0_PARC_ARC1_MSTR_IF_AXPROT_LBW_BASE);
++	hl_set_mstr_if_axprot_to_priv(mmD0_PARC_ARC2_MSTR_IF_AXPROT_LBW_BASE);
++
++	/* D0 PIF ARC, has LBW bus only*/
++	hl_set_mstr_if_axprot_to_priv(mmD0_PIF_ARC_MSTR_IF_AXPROT_LBW_BASE);
++}

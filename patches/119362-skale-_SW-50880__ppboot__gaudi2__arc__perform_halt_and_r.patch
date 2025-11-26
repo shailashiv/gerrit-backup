@@ -1,0 +1,199 @@
+From 6041cdcdda25eb02d6859588530ca7800f0af6e9 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Sat, 14 Aug 2021 19:59:36 +0300
+Subject: [PATCH] [SW-50880] ppboot: gaudi2: arc: perform halt and reset of arc
+
+As part of ppboot, initialization of ARC0 is performed to make sure it
+is ready for next operations. Currently, only setting of reset vector
+and bringing ARC0 out of reset is performed. There is possibility
+that ARC0 might be in running state. This patch add support
+to halt and reset ARC0 as part of ppboot to make sure ARC is
+stopped and correct reset sequence is applied.
+
+Change-Id: Ic7ba9b1e21f8182d4b45432b5df6da655405400a
+---
+
+diff --git a/arch/gaudi2/arc/common.c b/arch/gaudi2/arc/common.c
+index 8c26d2e..38d3443 100644
+--- a/arch/gaudi2/arc/common.c
++++ b/arch/gaudi2/arc/common.c
+@@ -81,8 +81,10 @@
+ 	regmap_writel(0x0, mmPSOC_GLOBAL_CONF_BOOT_SEQ_EXT_LD);
+ }
+ 
+-static void init_arc0(void)
++static void init_secondary(void)
+ {
++	halt_n_reset_arc(0);
++
+ 	/*
+ 	 * Program Reset vector address for ARC0 to ICCM 0x0 location
+ 	 * where vector table first entry will be available and then
+@@ -98,7 +100,7 @@
+ 	/* Functionality used to be done in BTL */
+ 	init_prstn();
+ 
+-	init_arc0();
++	init_secondary();
+ 
+ 	/* This W/A is to be done before pcie link is established */
+ 	set_pci_msix_pba_offset_val();
+diff --git a/arch/gaudi2/arm/common.c b/arch/gaudi2/arm/common.c
+index 3a7ae8c..13411d3 100644
+--- a/arch/gaudi2/arm/common.c
++++ b/arch/gaudi2/arm/common.c
+@@ -164,54 +164,6 @@
+ 
+ }
+ 
+-static void halt_n_reset_arc(u8 id)
+-{
+-	u32 val, halt_ack_offset, halt_req_offset;
+-	u32 halt_mask, halt_ack_mask;
+-	u32 rst_offset;
+-	u64 start;
+-
+-	if (id) {
+-		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
+-		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
+-		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
+-		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+-
+-	} else {
+-		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
+-		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
+-		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
+-		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
+-		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
+-	}
+-
+-	val = regmap_readl(halt_ack_offset);
+-	if (val & halt_mask) {
+-		preboot_puts_hex("Skipping halt for ARC", id, false);
+-	} else {
+-		/* Halt ARC */
+-		regmap_writel(BIT(1), halt_req_offset);
+-		start = timestamp_get_us();
+-		while (1) {
+-			val = regmap_readl(halt_ack_offset);
+-			if (val & halt_ack_mask)
+-				break;
+-			/* If copy does not happen in 5 seconds
+-			 * timeout and return
+-			 */
+-			if (timeout_expired(start, ARC_HALT_ACK_TIMEOUT_US)) {
+-				preboot_puts_hex("No ack from ARC", id, false);
+-				break;
+-			}
+-		}
+-		regmap_writel(0x0, halt_req_offset);
+-	}
+-
+-	/* Reset ARC */
+-	regmap_writel(0x1, rst_offset);
+-}
+-
+ static void init_arc(void)
+ {
+ 	halt_n_reset_arc(0);
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index 44a0e09..f79ea66 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -35,6 +35,11 @@
+ #include <dcore1_xbar_dma_pll_asif_slv_regs.h>
+ #include <dcore2_xbar_dma_pll_asif_slv_regs.h>
+ #include <dcore3_xbar_dma_pll_asif_slv_regs.h>
++#include <psoc_arc0_cfg_regs.h>
++#include <psoc_arc0_cfg_masks.h>
++#include <psoc_arc1_cfg_regs.h>
++#include <psoc_arc1_cfg_masks.h>
++
+ #include "hl.h"
+ 
+ #include <common/pci_ids.h>
+@@ -42,6 +47,7 @@
+ #include <uart.h>
+ #include <pll.h>
+ #include <pci.h>
++#include <boot_if.h>
+ 
+ #define PCIE_LTR_DISABLE		0
+ #define PCIE_CAP_HDR_NXT_OFFSET		0x1f8
+@@ -49,6 +55,8 @@
+ 
+ #define DUMP_SEL_SRNS_MASK		0x1
+ #define DUMP_SEL_SSC_MASK		0x2
++
++#define ARC_HALT_ACK_RETRIES		100
+ 
+ void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
+ {
+@@ -592,3 +600,55 @@
+ 	preboot_puts_hex_raw("Boot strap pins legacy ", boot_strap, false);
+ 	preboot_puts("\n");
+ }
++
++void halt_n_reset_arc(u8 id)
++{
++	u32 val, halt_ack_offset, halt_req_offset;
++	u32 retry = ARC_HALT_ACK_RETRIES;
++	u32 halt_mask, halt_ack_mask;
++	u32 rst_offset;
++	u32 cpu_boot_err_val;
++
++	if (id) {
++		halt_ack_offset = mmPSOC_ARC1_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC1_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC1_CFG_ARC_RST;
++		halt_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC1_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++
++	} else {
++		halt_ack_offset = mmPSOC_ARC0_CFG_RUN_HALT_ACK;
++		halt_req_offset = mmPSOC_ARC0_CFG_RUN_HALT_REQ;
++		rst_offset = mmPSOC_ARC0_CFG_ARC_RST;
++		halt_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_SYS_HALT_R_MASK;
++		halt_ack_mask = PSOC_ARC0_CFG_RUN_HALT_ACK_HALT_ACK_MASK;
++	}
++
++	val = regmap_readl(halt_ack_offset);
++	if (val & halt_mask) {
++		preboot_puts_hex("Skipping halt for ARC", id, false);
++	} else {
++		/* Halt ARC */
++		regmap_writel(BIT(1), halt_req_offset);
++		while (1) {
++			val = regmap_readl(halt_ack_offset);
++			if (val & halt_ack_mask)
++				break;
++
++			retry--;
++			if (!retry) {
++				preboot_puts_hex("No ack from ARC", id, false);
++				cpu_boot_err_val = (!id) ?
++					CPU_BOOT_ERR0_ARC0_HALT_ACK_NOT_RCVD :
++					CPU_BOOT_ERR0_ARC1_HALT_ACK_NOT_RCVD;
++				cpu_boot_err_clrset(cpu_boot_err_val, true);
++				break;
++			}
++		}
++		regmap_writel(0x0, halt_req_offset);
++	}
++
++	/* Reset ARC */
++	regmap_writel(0x1, rst_offset);
++}
++
+diff --git a/arch/gaudi2/common/hl.h b/arch/gaudi2/common/hl.h
+index a581a80..e721776 100644
+--- a/arch/gaudi2/common/hl.h
++++ b/arch/gaudi2/common/hl.h
+@@ -20,5 +20,6 @@
+ 
+ void set_pci_msix_pba_offset_val(void);
+ void set_slv_cfg_reg_val(void);
++void halt_n_reset_arc(u8 id);
+ 
+ #endif /* ARCH_GAUDI2_COMMON_HL_H_ */

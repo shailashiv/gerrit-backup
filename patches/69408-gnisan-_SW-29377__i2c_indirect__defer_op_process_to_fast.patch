@@ -1,0 +1,198 @@
+From 0847137c519954fc2b450e3847e8d6043da205dc Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Sun, 10 Jan 2021 20:03:56 +0200
+Subject: [PATCH] [SW-29377] i2c indirect: defer op process to fast
+
+Process I2C indirect OP within "fast" context instead of "slow". This is
+needed when an OP has interaction with other preboot modules.
+
+In this case the motivation is while performing config access "read"
+from CPU status register (mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS) it
+contains different status within "slow" context vs. normal flow.
+This affects interoperability when integrating hl-fw-loader OOB.
+
+Change-Id: I01ef4700921b593fb7c115cb2f1d0ea1fdb8fc2d
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/common/cmd_module.h b/common/cmd_module.h
+index 0b9e229..bce61db 100644
+--- a/common/cmd_module.h
++++ b/common/cmd_module.h
+@@ -101,6 +101,7 @@
+ enum cmd_check_res module_i2c_s_check(void);
+ void module_i2c_s_disable(void);
+ void module_i2c_s_run(void);
++void module_i2c_s_run_fast(void);
+ void module_i2c_s_teardown(void);
+ void module_i2c_s_run_noret(void);
+ 
+diff --git a/common/module_i2c_slave.c b/common/module_i2c_slave.c
+index fa04fae..7684d10 100644
+--- a/common/module_i2c_slave.c
++++ b/common/module_i2c_slave.c
+@@ -168,6 +168,13 @@
+ 	    (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK))
+ 		return FOUND_SLOW_RETURN;
+ 
++	if (i2cslave_indirect_is_process_op()) {
++		if (i2cslave_indirect_op_is_fast())
++			return FOUND_FAST_RETURN;
++		else
++			return FOUND_SLOW_RETURN;
++	}
++
+ 	return NOT_FOUND;
+ }
+ 
+@@ -305,8 +312,15 @@
+ 	 */
+ 	if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RX_FULL_MASK)
+ 		module_i2c_s_do_write();
+-	else
++	else if (stat & PSOC_I2C_S_IC_INTR_STAT_R_RD_REQ_MASK)
+ 		module_i2c_s_do_read();
++	else
++		i2cslave_indirect_process_op();
++}
++
++void module_i2c_s_run_fast(void)
++{
++	i2cslave_indirect_process_op();
+ }
+ 
+ void module_i2c_s_teardown(void)
+diff --git a/common/module_i2c_slave.h b/common/module_i2c_slave.h
+index 81a4c63..e6fbedf 100644
+--- a/common/module_i2c_slave.h
++++ b/common/module_i2c_slave.h
+@@ -15,5 +15,8 @@
+ void i2cslave_fit_set_checked(void);
+ bool i2cslave_fit_is_checked(void);
+ void i2cslave_fit_run_image(void);
++bool i2cslave_indirect_is_process_op(void);
++bool i2cslave_indirect_op_is_fast(void);
++void i2cslave_indirect_process_op(void);
+ 
+ #endif /* _MODULE_I2C_SLAVE_H_ */
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index b297529..a0f5ae0 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -313,8 +313,6 @@
+ 	if (i2csi_req.chunk.offset == i2csi_req.wd.hdr.rqdl) {
+ 		i2csi_req.chunk.offset = 0;
+ 		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+-		i2csi_req_process_write_opcode();
+-		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
+ 	}
+ 
+ 	return 0;
+@@ -338,8 +336,6 @@
+ 
+ 	/* Payload received */
+ 	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+-	i2csi_req_process_write_opcode();
+-	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
+ 	return 0;
+ }
+ 
+@@ -529,3 +525,28 @@
+ 	i2csi_req.sts.rsdl = 0;
+ 	i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
+ }
++
++void i2csi_req_handle_process_op(void)
++{
++	i2csi_req_process_write_opcode();
++	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++}
++
++bool i2csi_req_is_process_op(void)
++{
++	return i2csi_req.sts.sm_sts == HL_I2CI_REQ_ST_PROCESS;
++}
++
++bool i2csi_req_op_is_fast(void)
++{
++	switch (i2csi_req.wd.hdr.opcode) {
++	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
++	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
++	case HL_I2CI_REQ_OP_MEMCPY_DATA:
++		return true;
++	case HL_I2CI_REQ_OP_FW_LOADER:
++		/* Fall through */
++	default:
++		return false;
++	}
++}
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+index 47397d0..9833524 100644
+--- a/preboot/i2cslave_indirect.h
++++ b/preboot/i2cslave_indirect.h
+@@ -14,5 +14,8 @@
+ u32 i2csi_req_handle_cfg(u8 **data, u8 cnt);
+ void i2csi_req_set_idle(void);
+ void i2csi_req_handle_sync_error(void);
++void i2csi_req_handle_process_op(void);
++bool i2csi_req_is_process_op(void);
++bool i2csi_req_op_is_fast(void);
+ 
+ #endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index abb2eb6..15714bf 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -112,3 +112,18 @@
+ {
+ 	fit_run_image();
+ }
++
++bool i2cslave_indirect_is_process_op(void)
++{
++	return i2csi_req_is_process_op();
++}
++
++void i2cslave_indirect_process_op(void)
++{
++	i2csi_req_handle_process_op();
++}
++
++bool i2cslave_indirect_op_is_fast(void)
++{
++	return i2csi_req_op_is_fast();
++}
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index 7326bbf..ef5b81c 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -73,7 +73,7 @@
+ 		.disable = module_i2c_s_disable,
+ 		.run = module_i2c_s_run,
+ 		.enable = module_i2c_s_setup,
+-		.run_fast = noop,
++		.run_fast = module_i2c_s_run_fast,
+ 		.teardown = module_i2c_s_teardown,
+ 		.run_noreturn = module_i2c_s_run_noret,
+ 	},
+diff --git a/recovery/module_i2c_slave.c b/recovery/module_i2c_slave.c
+index 5337d50..9d6d7d4 100644
+--- a/recovery/module_i2c_slave.c
++++ b/recovery/module_i2c_slave.c
+@@ -45,3 +45,16 @@
+ }
+ 
+ void i2cslave_fit_run_image(void) {}
++
++
++bool i2cslave_indirect_is_process_op(void)
++{
++	return false;
++}
++
++void i2cslave_indirect_process_op(void) {}
++
++bool i2cslave_indirect_op_is_fast(void)
++{
++	return false;
++}

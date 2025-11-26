@@ -1,0 +1,155 @@
+From c79dd2583316f15cac60187c3df01b63bae9cf93 Mon Sep 17 00:00:00 2001
+From: Subrata Chatterjee <schatterjee@habana.ai>
+Date: Wed, 22 Jun 2022 17:27:06 +0300
+Subject: [PATCH] [SW-95263] gaudi2: ras: use sram unit reset
+
+In this patch SRAM UNIT reset is used in place of
+explicit scrubbing after running sram self repair.
+
+Scrubbing using MEM_CPY takes several seconds of time.
+So faster alternative of UNIT reset is used. This is required
+to avoid in ECC after BIST.
+
+Change-Id: I6025d0a2b800675df65d9baaf1259cbec41638a6
+---
+
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index ceba629..c57b3b0 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -1105,111 +1105,6 @@
+ 	}
+ }
+ 
+-static void gaudi2_mask_sram_ecc(bool enable)
+-{
+-	u32 val;
+-	int dcore, sram;
+-	u32 dcore_offset = 0x200000;
+-	u32 sram_offset = 0x8000;
+-	u32 offset;
+-
+-	if (enable) {
+-		regmap_writel(CPU_IF_SRAM_DERR_INTR_MASK_VAL_MASK, mmCPU_IF_SRAM_DERR_INTR_MASK);
+-		regmap_writel(CPU_IF_SRAM_SERR_INTR_MASK_VAL_MASK, mmCPU_IF_SRAM_SERR_INTR_MASK);
+-		val = DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_GLBL_ERR_MASK_DERR_MASK |
+-				DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_GLBL_ERR_MASK_SERR_MASK;
+-	} else {
+-		regmap_writel(0, mmCPU_IF_SRAM_SERR_INTR_MASK);
+-		regmap_writel(0, mmCPU_IF_SRAM_DERR_INTR_MASK);
+-		val = 0;
+-	}
+-
+-	for (dcore = 0; dcore < NUM_OF_DCORES ; dcore++) {
+-		offset = dcore * dcore_offset;
+-		for (sram = 0; sram < NUM_OF_SRAM_BANK_PER_DCORE; sram++) {
+-			regmap_writel(val, mmDCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_GLBL_ERR_MASK
+-											+ offset);
+-			offset += sram_offset;
+-		}
+-	}
+-}
+-
+-static void gaudi2_mask_clear_sram_ecc(void)
+-{
+-	int dcore, sram, wrap;
+-	u32 dcore_offset = 0x200000;
+-	u32 sram_offset = 0x8000;
+-	u32 offset;
+-	u32 num_mem_wrapper = 0;
+-
+-	num_mem_wrapper = regmap_readl(mmDCORE0_SRAM0_BANK_SPECIAL_MEM_NUMOF);
+-	for (dcore = 0; dcore < NUM_OF_DCORES ; dcore++) {
+-		offset = dcore * dcore_offset;
+-		for (sram = 0; sram < NUM_OF_SRAM_BANK_PER_DCORE; sram++) {
+-			for (wrap = 0; wrap < num_mem_wrapper; wrap++) {
+-				regmap_writel(wrap,
+-						mmDCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_SEL + offset);
+-				regmap_writel((
+-					DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_CTL_DERR_CLR_MASK |
+-					DCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_CTL_SERR_CLR_MASK),
+-					mmDCORE0_SRAM0_BANK_SPECIAL_MEM_ECC_CTL + offset);
+-			}
+-			offset += sram_offset;
+-		}
+-	}
+-}
+-
+-#define SRAM_NUM_MEM_CPY_XFERS			48 /* (48*1024*1024)/(65535*16) */
+-static void gaudi2_mask_scrub_sram(void)
+-{
+-	u32 retry = 1000;
+-	u32 mem_cfg, cpy_sts;
+-	u32 size = 0xFFFF0; /* (65535*16) bytes */
+-	u32 block;
+-	u64 addr;
+-
+-	for (block = 0; block <= SRAM_NUM_MEM_CPY_XFERS; block++) {
+-		addr = SDRAM_BASE_FULL + size * block;
+-		if (block == SRAM_NUM_MEM_CPY_XFERS) /* last block */
+-			size = 768; /* (48*1024*1024) - (48*65535*16) bytes */
+-
+-		/* Use memblock to initialize dccm memory */
+-		regmap_writel((u32)addr, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
+-		regmap_writel((u32)(addr >> 32), mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
+-
+-		mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
+-		mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
+-
+-		/* set size of in granuality of 16 bytes */
+-		mem_cfg |= ((size >> 4) & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_MASK);
+-		mem_cfg |= BIT(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_SHIFT);
+-
+-		regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
+-		/* Enable copy and wait for completion */
+-		regmap_writel(BIT(0), mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
+-		while (1) {
+-			cpy_sts = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS);
+-			if (cpy_sts)
+-				break;
+-
+-			retry--;
+-			if (!retry) {
+-				preboot_puts("sram mem_cpy timedout");
+-				break;
+-			}
+-			udelay(DELAY_100K_USEC);
+-		}
+-	}
+-}
+-
+-static void gaudi2_scrub_sram(void)
+-{
+-	gaudi2_mask_sram_ecc(true);
+-	gaudi2_mask_scrub_sram();
+-	gaudi2_mask_clear_sram_ecc();
+-	gaudi2_mask_sram_ecc(false);
+-}
+-
+ static void gaudi2_reset_engines(void)
+ {
+ 	u32 tpc_iso_val, hbm_iso_val, nic_iso_val;
+@@ -1229,6 +1124,7 @@
+ 	regmap_writel(PSOC_RESET_CONF_MME_EUS_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_MME_EUS_UNIT_RST);
+ 	regmap_writel(PSOC_RESET_CONF_NIC_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_NIC_UNIT_RST);
+ 	regmap_writel(PSOC_RESET_CONF_NIC_PRT_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_NIC_PRT_UNIT_RST);
++	regmap_writel(PSOC_RESET_CONF_SRAM_UNIT_RST_EN_MASK, mmPSOC_RESET_CONF_SRAM_UNIT_RST);
+ 	regmap_writel(PSOC_RESET_CONF_UNIT_RST_N_IND_MASK, mmPSOC_RESET_CONF_UNIT_RST_N);
+ 	udelay(DELAY_1K_USEC); /* TODO: confirm the delay */
+ 	regmap_writel(0, mmPSOC_RESET_CONF_UNIT_RST_N);
+@@ -1240,6 +1136,7 @@
+ 	regmap_writel(0, mmPSOC_RESET_CONF_MME_EUS_UNIT_RST);
+ 	regmap_writel(0, mmPSOC_RESET_CONF_NIC_UNIT_RST);
+ 	regmap_writel(0, mmPSOC_RESET_CONF_NIC_PRT_UNIT_RST);
++	regmap_writel(0, mmPSOC_RESET_CONF_SRAM_UNIT_RST);
+ 	udelay(DELAY_1K_USEC); /* TODO: confirm the delay */
+ 
+ 	/* Restore original iso value */
+@@ -1276,7 +1173,6 @@
+ 	gaudi2_sram_self_repair(SRAM_SELF_REPAIR_OP_BIST);
+ 	/* Get back to normal from DFT mode */
+ 	regmap_writel(DFT_APB_CONTROL_DEFAULT_VAL, mmPSOC_GLOBAL_CONF_DFT_APB_CONTROL);
+-	gaudi2_scrub_sram(); /* TODO: Replace this by UNIT reset (Refer SIV-1088) */
+ 	gaudi2_reset_engines();
+ 	preboot_puts("sram bist done\n");
+ }

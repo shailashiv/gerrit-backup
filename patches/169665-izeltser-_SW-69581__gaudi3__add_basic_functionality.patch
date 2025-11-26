@@ -1,0 +1,425 @@
+From c81d2ca6479c3aa1d484ae06fc40628927913d51 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 19 Jan 2022 14:44:32 +0200
+Subject: [PATCH] [SW-69581] gaudi3: add basic functionality
+
+Added basic functionality required to build of a minimal
+ppboot/preboot/recovery images.
+Large portions of the functionality is still should be revised
+and device specific implementation should be added.
+
+Change-Id: I76b177f56102fe0bf61ac82ac315a30fefaf339b
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/asic.c b/arch/gaudi3/arc/asic.c
+index 14add40..a9c359e 100644
+--- a/arch/gaudi3/arc/asic.c
++++ b/arch/gaudi3/arc/asic.c
+@@ -2,3 +2,44 @@
+ /*
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
++
++#include <d0_psoc_global_conf_regs.h>
++#include <d0_g4_pci_pll_ctrl_regs.h>
++
++#include <preboot.h>
++#include <uart.h>
++#include <pll.h>
++
++u32 hl_skip_pcie_init(void)
++{
++	return hl_is_debug_mode(HL_DEBUG_HW_PCIE);
++}
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	/* As per Gaudi3 Frequencies.xlsx, PCI PLL Div[3] drives CPU ts */
++	return hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_CFG, HL_PLL_DIV3);
++}
++
++void hl_uart_init(void)
++{
++	/* As per Gaudi3 Frequencies.xlsx, PCI PLL Div[3] drives uart */
++	u32 uart_clk_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_CFG, HL_PLL_DIV3);
++
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_48);	/* UART0 RXD */
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_49);	/* UART0 TXD */
++	preboot_uart_init(uart_clk_freq / HL_UART_BAUDRATE);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor, pcie_div3_freq;
++
++	pcie_div3_freq = hl_pll_get_freq(mmD0_G4_PCI_PLL_CTRL_CFG, HL_PLL_DIV3);
++	factor = pcie_div3_freq / HL_SPI_FLASH_MAX_FREQ;
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	factor = (factor < 2) ? 2 : factor;
++
++	return (factor + 1) & 0xFFFE;
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 6927945..4ecde35 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -3,4 +3,147 @@
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
+ 
++#include <d0_psoc_global_conf_regs.h>
++#include <d0_cpu_timestamp_regs.h>
++#include <d0_psoc_gpio0_regs.h>
++#include <d0_psoc_qspi_regs.h>
++#include <d0_pcie_aux_regs.h>
++#include <d0_psoc_reset_conf_regs.h>
++#include <d0_psoc_efuse_regs.h>
++#include <d0_parc_arc0_cfg_regs.h>
++#include <gaudi3/gaudi3_boot_info.h>
++
++#include <bitops.h>
++
+ #include "common.h"
++#include <preboot.h>
++#include <boot_if.h>
++#include <uart.h>
++#include <spi_flash.h>
++
++u32 hl_pll_timestamp_base_get(void)
++{
++	return mmD0_CPU_TIMESTAMP_CNTCR;
++}
++
++unsigned int get_cs_pad_sel_flash(void)
++{
++	return mmD0_PSOC_GLOBAL_CONF_PAD_SEL_8;
++}
++
++void spi_ssi_cs0_get(unsigned int *mask, unsigned int *data_offset,
++		     unsigned int *out_en_offset)
++{
++	*mask = BIT(8);
++	*data_offset = mmD0_PSOC_GPIO0_DATAOUT;
++	*out_en_offset = mmD0_PSOC_GPIO0_OUTENSET;
++}
++
++void spi_flash_base_get(unsigned int *regs)
++{
++	*regs = mmD0_PSOC_QSPI_CTRLR0;
++}
++
++void preboot_putc_virt_uart(const char c)
++{
++	regmap_writel(c, mmVUART1_TX_DATA);
++	regmap_writel(1, mmVUART1_TX_STATUS);
++}
++
++void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
++{
++	u32 laddr = (u32)loadaddr;
++
++	preboot_puts_hex("Preboot loadaddr: ", laddr, false);
++
++	spi_flash_copy((void *)laddr, offset, size, name);
++}
++
++u32 hl_rst_src_get(void)
++{
++	return regmap_readl(mmD0_PSOC_GLOBAL_CONF_RST_SRC);
++}
++
++void preboot_pcie_wait_for_link(void)
++{
++	/* TODO: implement pcie wait for link routine for gaudi3 */
++}
++
++void init_prstn(void)
++{
++	/* Configure PRSTN to reset entire SoC */
++	regmap_writel(0x1, mmD0_PSOC_RESET_CONF_PSOC_PRSTN_RST_CFG);
++	regmap_writel(0x7, mmD0_PSOC_RESET_CONF_ARC_PRSTN_RST_CFG);
++
++	/* Clear masking of PRSTN from SW reset */
++	regmap_writel(0x0, mmD0_PSOC_GLOBAL_CONF_PRSTN_MASK);
++
++	/*
++	 * Hold PCIe controller at reset during PRSTn
++	 * Configure Boot Sequencer to wait for PRSTn
++	 * instead of PCLK stable
++	 */
++	regmap_writel(0x1, mmD0_PSOC_GLOBAL_CONF_PHY_STABLE);
++}
++
++void hl_plat_early_init(void)
++{
++	init_prstn();
++}
++
++void preboot_sync_btl(void)
++{
++	/* not relevant in case of arcboot */
++}
++
++void image_start(u64 loadaddr)
++{
++	u32 lsb = (u32)loadaddr;
++	void (*image_entry)(void) = (void *)lsb;
++
++	image_entry();
++}
++
++bool hl_is_debug_mode(enum hl_debug_hw_func func)
++{
++	u32 boot_strap = regmap_readl(mmD0_PSOC_GLOBAL_CONF_BOOT_STRAP_PINS_L);
++	u32 strap_mask;
++
++	/* TODO: verify relevant straps for debug functions */
++	switch (func) {
++	case HL_DEBUG_HW_PCIE:
++		strap_mask = BIT(12); /* Dump Select[11] */
++		break;
++	case HL_DEBUG_HW_DRAM:
++		strap_mask = BIT(11); /* Dump Select[10] */
++		break;
++	case HL_DEBUG_HW_I2C:
++		strap_mask = BIT(10); /* Dump Select[9] */
++		break;
++	default:
++		preboot_puts_hex("Unknown H/W function ", func, false);
++		return 0;
++	}
++
++	return boot_strap & strap_mask;
++}
++
++u32 get_efuse_read_reg(void)
++{
++	return mmD0_PSOC_EFUSE_RD;
++}
++
++u16 hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
++
++void lkd_dev_specific_setup(void)
++{
++	cpu_boot_dev_sts_set(CPU_BOOT_DEV_STS_FW_HARD_RST_EN);
++}
++
++void lkd_dev_spec_regs(struct cpu_dyn_regs *regs)
++{
++	/* TODO: add cpu_dyn_regs asigments */
++}
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index 14a8c48..5817bd4 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -6,7 +6,68 @@
+ #ifndef COMMON_GAUDI3_ARC_GNU_H_
+ #define COMMON_GAUDI3_ARC_GNU_H_
+ 
++#include <sizes.h>
++
+ #define PPBOOT_SIZE			0x4000		/* 16KB */
+ #define PREBOOT_SIZE			0x20000		/* 128KB */
+ 
++#define HL_FW_BOOT_PTRS_BASE		0x80000
++
++#define HL_SP_SRAM_BASE			0x300007FD3120000ULL
++#define HL_SP_SRAM_SIZE			SZ_64K
++
++#define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
++#define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)
++
++#define ARC0_ICCM_FULL_BASE		0x300007FD3000000ull
++#define ARC0_ICCM_SIZE			SZ_128K
++#define ARC0_DCCM_FULL_BASE		0x300007FD3020000ull
++#define ARC0_DCCM_SIZE			SZ_32K
++#define ARC1_ICCM_FULL_BASE		0x300007FD3040000ull
++#define ARC1_ICCM_SIZE			SZ_256K
++#define ARC1_DCCM_FULL_BASE		0x300007FD3080000ull
++#define ARC1_DCCM_SIZE			SZ_64K
++
++#define FW_MEM_REGION_BASE		0x20000000
++#define HL_CFG_BASE			0xF0000000
++#define SDRAM_SIZE			(SZ_32M + SZ_16M) /* single die mode */
++#define SDRAM_BASE			(FW_MEM_REGION_BASE - SDRAM_SIZE)
++#define PCIE_FW_SRAM_BASE		(FW_MEM_REGION_BASE + 0x7F00000)
++#define FW_SRAM_BASE			(FW_MEM_REGION_BASE + 0x30E0000)
++#define SP_SRAM_BASE			(FW_MEM_REGION_BASE + 0x30D0000)
++#define ARC1_ICCM_BASE			(FW_MEM_REGION_BASE + 0x3040000)
++#define ARC0_ICCM_BASE			(FW_MEM_REGION_BASE + 0x3000000)
++#define HL_SPI_BASE			(FW_MEM_REGION_BASE + 0x2000000)
++
++/*
++ * preboot is running from the upper half of Arc1 ICCM, and loads arcmgmt app
++ * to the lower half of Arc1 ICCM
++ */
++#define PREBOOT_TEXT_BASE		(ARC1_ICCM_SIZE / 2)
++#define PPBOOT_TEXT_BASE		FW_SRAM_BASE
++#define RECOVERY_TEXT_BASE		0x0
++#define RECOVERY_SIZE			SZ_16K
++
++#define BOOT_INFO_BASE			SP_SRAM_BASE
++
++/* In order not to conflict with ARC BOOTROM's usage of DCCM,
++ * Let PPBoot start from the offset of 0x4030, for using DCCM
++ * for its own BSS and Stack.
++ */
++#define PPBOOT_DCCM_BASE		0x23064030
++
++#define FUSE_WORDS_PER_BANK		0x80
++#define I2C_SLAVE_ADDRESS		0x6A
++#define I2C_SLAVE_ADDRESS_DBG		I2C_SLAVE_ADDRESS
++#define I2C_SLAVE_DEFAULT_INTR_MASK	0x48FF
++
++#define ARC_RST_VALUE			0x110
++#define ARC_RST_VEC_ADDR		0x0
++
++/* TODO: replace with true TS calibration values when available */
++#define TS_UNCALIB_A_G_COEFF		81100
++#define TS_UNCALIB_B_H_COEFF		255200
++#define TS_CALIB_A_G_COEFF		82600
++#define TS_CALIB_B_H_COEFF		262600
++
+ #endif /* COMMON_GAUDI3_ARC_GNU_H_ */
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+new file mode 100644
+index 0000000..1f674af
+--- /dev/null
++++ b/arch/gaudi3/arc/hl.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#ifndef ARCH_GAUDI3_ARC_HL_H_
++#define ARCH_GAUDI3_ARC_HL_H_
++
++enum gaudi3_rst_src {
++	HL_COLD_RST = 1,
++	HL_MANUAL_RST = 2,
++	HL_PRSTN_RST = 4,
++	HL_SOFT_RST = 8,
++	HL_WD_RST = 16,
++	HL_FW_ALL_RST = 32,
++	HL_SW_ALL_RST = 64,
++	HL_FLR_RST = 128,
++	HL_ECC_DERR_RST = 256
++};
++
++#endif /* ARCH_GAUDI3_ARC_HL_H_ */
+diff --git a/arch/gaudi3/arc/onix.c b/arch/gaudi3/arc/onix.c
+index 14add40..78abd17 100644
+--- a/arch/gaudi3/arc/onix.c
++++ b/arch/gaudi3/arc/onix.c
+@@ -2,3 +2,37 @@
+ /*
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
++
++#include <d0_psoc_global_conf_regs.h>
++
++#include <preboot.h>
++#include <uart.h>
++
++#define SYS_CLOCK_FREQUENCY	35000000ULL
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return SYS_CLOCK_FREQUENCY;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 1;
++}
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_48);	/* UART0 RXD */
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_49);	/* UART0 TXD */
++	preboot_uart_init(SYS_CLOCK_FREQUENCY / (HL_UART_BAUDRATE / 2));
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor = SYS_CLOCK_FREQUENCY / HL_SPI_FLASH_MAX_FREQ;
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	factor = (factor < 2) ? 2 : factor;
++
++	return (factor + 1) & 0xFFFE;
++}
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index 14add40..4174de2 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -2,3 +2,40 @@
+ /*
+  * (C) Copyright 2022 HabanaLabs, Ltd.
+  */
++
++#include <d0_psoc_global_conf_regs.h>
++
++#include <preboot.h>
++#include <uart.h>
++
++#define SYS_CLOCK_FREQUENCY	155000ULL
++
++#define UART_CLOCK_FREQUENCY	11900ULL
++#define PLDM_UART_BAUDRATE	300
++
++u64 hl_pll_timestamp_freq_get(void)
++{
++	return SYS_CLOCK_FREQUENCY;
++}
++
++u32 hl_skip_pcie_init(void)
++{
++	return 0;
++}
++
++void hl_uart_init(void)
++{
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_48);	/* UART0 RXD */
++	regmap_writel(1, mmD0_PSOC_GLOBAL_CONF_PAD_SEL_49);	/* UART0 TXD */
++	preboot_uart_init(UART_CLOCK_FREQUENCY / PLDM_UART_BAUDRATE);
++}
++
++u32 hl_spi_baudr_get(void)
++{
++	u32 factor = SYS_CLOCK_FREQUENCY / HL_SPI_FLASH_MAX_FREQ;
++
++	/* baud rate doesn't support odd number and must not be 0 */
++	factor = (factor < 2) ? 2 : factor;
++
++	return (factor + 1) & 0xFFFE;
++}
+diff --git a/arch/gaudi3/arc/sha.h b/arch/gaudi3/arc/sha.h
+new file mode 100644
+index 0000000..5129427
+--- /dev/null
++++ b/arch/gaudi3/arc/sha.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier:     GPL-2.0+
++ *
++ * Copyright (C) 2022 HabanaLabs Ltd.
++ */
++
++#include <sha512.h>
++#include <preboot/fit_rsa.h>
++
++#define SHA_SUM_LEN			SHA384_SUM_LEN
++#define SHA_DER_LEN			SHA384_DER_LEN
++#define SHA_DER_PRE			sha384_der_prefix
++#define FIT_SHA				"sha384"
++#define FIT_ALGO_PROP_EXPECTED_VALUE	"sha384,rsa3072"
++
++void sha_csum(const unsigned char *input, unsigned int ilen, unsigned char *output);
++
++void sha_csum_regions(const struct image_region region[], int region_count, u8 *output);

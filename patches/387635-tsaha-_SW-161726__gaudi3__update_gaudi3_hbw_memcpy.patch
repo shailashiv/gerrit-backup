@@ -1,0 +1,136 @@
+From 4d0f46a88189e320826efc42b4edf6dd0dd1e4e1 Mon Sep 17 00:00:00 2001
+From: Tamal Saha <tasaha@habana.ai>
+Date: Thu, 25 Jan 2024 12:14:04 +0200
+Subject: [PATCH] [SW-161726] gaudi3: update gaudi3_hbw_memcpy
+
+modify gaudi3_hbw_memcpy function to accommodate
+memory initialization and copy usecase in same
+function.
+
+Change-Id: I710fa01153465f62409500f24d3c9032785750be
+Signed-off-by: Tamal Saha <tasaha@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 0af9a4c..771b825 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -1143,7 +1143,7 @@
+ #define MEM_CPY_SIZE_SHIFT_MASK		(BIT(MEM_CPY_SIZE_SHIFT) - 1)
+ #define HL_MEM_CPY_TIMEOUT_US		10000
+ 
+-int gaudi3_hbw_memcpy(uint64_t src, uint64_t dst, uint32_t size)
++int gaudi3_hbw_memcpy(uint64_t src, uint64_t dst, uint32_t size, enum gaudi3_hbw_mem_ops ops)
+ {
+ 	u64 start = timestamp_get_us();
+ 	u32 mem_cfg, cpy_sts, copy_sz;
+@@ -1153,17 +1153,33 @@
+ 		return -1;
+ 	}
+ 
+-	regmap_writel((uint32_t)src,
+-				D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_START_ADDR_L));
+-	regmap_writel((uint32_t)(src >> 32),
+-				D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_START_ADDR_H));
++	mem_cfg = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_CTRL2));
++
++	if (ops == GAUDI3_HBW_MEM_CPY) {
++		/* this block is for mem_cpy functionality */
++		regmap_writel((uint32_t)src,
++			D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_START_ADDR_L));
++		regmap_writel((uint32_t)(src >> 32),
++			D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_START_ADDR_H));
++		mem_cfg &= ~GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_M;
++
++	} else if (ops == GAUDI3_HBW_MEM_INIT) {
++		/* this block is for mem_init functionality.
++		 * this block will configure memcpy engine to write 0x0
++		 * starting from address 'dst' to 'dst + size'
++		 */
++		mem_cfg |= GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_M;
++		regmap_writel(0x0, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_CONST));
++	} else {
++		preboot_puts("invalid gaudi3_hbw_mem ops\n");
++		return -1;
++	}
++
+ 	regmap_writel((uint32_t)dst, D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_DEST_ADDR_L));
+ 	regmap_writel((uint32_t)(dst >> 32),
+ 				D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_DEST_ADDR_H));
+ 
+-	mem_cfg = regmap_readl(D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_MEM_CPY_CTRL2));
+ 	mem_cfg &= ~GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M;
+-	mem_cfg &= ~GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_M;
+ 
+ 	/* set size of in granuality of 16 bytes */
+ 	copy_sz = size >> MEM_CPY_SIZE_SHIFT;
+@@ -1232,7 +1248,7 @@
+ 	actual_size = desc.img_size - (num_crc * CRC32_SIZE);
+ 	src = desc.loadaddr + actual_size - PHY_FW_SIZE;
+ 
+-	err = gaudi3_hbw_memcpy(src, HL_PCIE_FW_SRAM_BASE_FULL, PHY_FW_SIZE);
++	err = gaudi3_hbw_memcpy(src, HL_PCIE_FW_SRAM_BASE_FULL, PHY_FW_SIZE, GAUDI3_HBW_MEM_CPY);
+ 	if (err)
+ 		preboot_puts_hex("failed to copy phy fw to pcie sram, err 0x", err, false);
+ 
+diff --git a/arch/gaudi3/arc/hl.h b/arch/gaudi3/arc/hl.h
+index f276177..449b89e 100644
+--- a/arch/gaudi3/arc/hl.h
++++ b/arch/gaudi3/arc/hl.h
+@@ -45,11 +45,22 @@
+ 	GAUDI3_SLAVE_DIE_ID,
+ };
+ 
++enum gaudi3_hbw_mem_ops {
++	GAUDI3_HBW_MEM_INIT,
++	GAUDI3_HBW_MEM_CPY,
++};
++
+ u32 hl_get_die_id(void);
+ bool hl_is_dual_die_sku(void);
+ u64 gaudi3_dma_addr_fixup(u64 loadaddr);
+ void pif_arc_pcie_monitoring(void);
+-int gaudi3_hbw_memcpy(u64 src, u64 dst, u32 size);
++
++/* gaudi3_hbw_memcpy() is used for either memory copy
++ * or initialization.
++ * ops = GAUDI3_HBW_MEM_INIT for memory initialize by 0,
++ *     = GAUDI3_HBW_MEM_CPY for memory copy.
++ */
++int gaudi3_hbw_memcpy(u64 src, u64 dst, u32 size, enum gaudi3_hbw_mem_ops ops);
+ void pif_arc_init_pcie(void);
+ void hl_pcie_clear_boot_termination(void);
+ void gaudi3_print_cpu_pll(void);
+diff --git a/arch/gaudi3/arc/pldm.c b/arch/gaudi3/arc/pldm.c
+index 5c7f369..349d599 100644
+--- a/arch/gaudi3/arc/pldm.c
++++ b/arch/gaudi3/arc/pldm.c
+@@ -205,7 +205,8 @@
+ 	 * exceeds ICCM0 size, the rest is stored in ICCM2.
+ 	 * An efuse bit is controlling whether the application binary is larger than ICCM0 size.
+ 	 */
+-	gaudi3_hbw_memcpy(ARC0_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE, ARC0_ICCM_SIZE);
++	gaudi3_hbw_memcpy(ARC0_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE, ARC0_ICCM_SIZE,
++		GAUDI3_HBW_MEM_CPY);
+ 
+ 	err = preboot_fuse_read(EFUSE_APP_SIZE_OFFSET, &val);
+ 	if (err)
+@@ -217,7 +218,7 @@
+ 		return;
+ 
+ 	gaudi3_hbw_memcpy(ARC2_ICCM_FULL_BASE, ARC1_ICCM_FULL_BASE + ARC0_ICCM_SIZE,
+-			  ARC1_ICCM_SIZE - ARC0_ICCM_SIZE);
++			  ARC1_ICCM_SIZE - ARC0_ICCM_SIZE, GAUDI3_HBW_MEM_CPY);
+ }
+ 
+ static void btldr_copy_bootinfo(void)
+@@ -229,7 +230,8 @@
+ 	 * Since SPSRAM content is erazed on cold reboot, fresh copy stored in DCCM0 and copied
+ 	 * back to the SPSRAM as part of the preparation to run preboot rtos.
+ 	 */
+-	gaudi3_hbw_memcpy(ARC0_DCCM_FULL_BASE, HL_SP_SRAM_BASE, ARC0_DCCM_SIZE);
++	gaudi3_hbw_memcpy(ARC0_DCCM_FULL_BASE, HL_SP_SRAM_BASE, ARC0_DCCM_SIZE,
++		GAUDI3_HBW_MEM_CPY);
+ }
+ 
+ void btldr_copy_data(void)

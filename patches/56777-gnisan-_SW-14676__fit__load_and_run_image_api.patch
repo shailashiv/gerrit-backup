@@ -1,0 +1,391 @@
+From 5a8583e932fcb46f4edd58224233368dbed4e656 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Thu, 22 Oct 2020 13:03:47 +0300
+Subject: [PATCH] [SW-14676] fit: load and run image api
+
+In preparation of loading FIT images by other transports than LKD, FIT
+image load and run logic is moved from LKD into the FIT module.
+This prevents duplicate coding and simplify the API for FIT handling for
+other transports to use.
+
+Change-Id: If9446bca5b8c6a53fc9d895e82f7952d2e68cb2f
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 8a6c03c..c1a9a63 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -284,34 +284,6 @@
+ 	image_entry();
+ }
+ 
+-void preboot_fit_start_images(struct fit_image *image)
+-{
+-	void (*image_entry)(void) = NULL;
+-	u32 i;
+-
+-	for (i = 0; i < FIT_MAX_IMAGES; i++) {
+-		if (strcmp(image[i].arch, "arm64"))
+-			continue;
+-
+-		image_entry = (void *)image[i].startaddr;
+-		break;
+-	}
+-
+-	/*
+-	 * After image_entry, control is not expected to return
+-	 * here and continue.
+-	 */
+-	image_entry();
+-}
+-
+-void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
+-{
+-	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
+-	preboot_puth((u32)dst, false);
+-
+-	memcpy((void *)dst, buf, len);
+-}
+-
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	preboot_puts_hex_raw("Preboot loadaddr: ",
+diff --git a/goya/common.c b/goya/common.c
+index e8b2438..967eb31 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -196,34 +196,6 @@
+ 	image_entry();
+ }
+ 
+-void preboot_fit_start_images(struct fit_image *image)
+-{
+-	void (*image_entry)(void) = NULL;
+-	u32 i;
+-
+-	for (i = 0; i < FIT_MAX_IMAGES; i++) {
+-		if (strcmp(image[i].arch, "arm64"))
+-			continue;
+-
+-		image_entry = (void *)image[i].startaddr;
+-		break;
+-	}
+-
+-	/*
+-	 * After image_entry, control is not expected to return
+-	 * here and continue.
+-	 */
+-	image_entry();
+-}
+-
+-void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
+-{
+-	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
+-	preboot_puth((u32)dst, false);
+-
+-	memcpy((void *)dst, buf, len);
+-}
+-
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+ {
+ 	preboot_puts_hex_raw("Preboot loadaddr: ",
+diff --git a/goya2/common.c b/goya2/common.c
+index 4b4596a..6b514b5 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -405,19 +405,8 @@
+ 	image_entry();
+ }
+ 
+-void preboot_fit_start_images(struct fit_image *image)
++void preboot_start_image(u64 startaddr)
+ {
+-	void (*image_entry)(void) = NULL;
+-	u32 i;
+-
+-	for (i = 0; i < FIT_MAX_IMAGES; i++) {
+-		if (strcmp(image[i].arch, "arm64"))
+-			continue;
+-
+-		image_entry = (void *)image[i].startaddr;
+-		break;
+-	}
+-
+ 	/* Set ARC0 and ARC1 in running state */
+ 	RUN_ARC(0);
+ 	RUN_ARC(1);
+@@ -426,7 +415,7 @@
+ 	 * After image_entry, control is not expected to return
+ 	 * here and continue.
+ 	 */
+-	image_entry();
++	image_start(startaddr);
+ }
+ 
+ static void fit_copy_arc_image(u64 dst, const void *buf, int len)
+@@ -470,11 +459,8 @@
+ 
+ }
+ 
+-void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
++void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+-	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
+-	preboot_puth((u32)dst, false);
+-
+ 	if (!strcmp(arch, "arc"))
+ 		fit_copy_arc_image(dst, buf, len);
+ 	else
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index 6e25d0c..0b7f89c 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -138,28 +138,22 @@
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+ 
+-void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
++void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	/* Prepare the ARC SRAM address */
+ 	u32 arc_dst = ((u32)dst & 0xFFFFFFF) | BIT(28);
+ 
+-	preboot_puts_hex("FIT loadaddr: ", arc_dst, false);
+-
+ 	memcpy((void *)arc_dst, buf, len);
+ }
+ 
+-void preboot_fit_start_images(struct fit_image *image)
++void preboot_start_image(u64 startaddr)
+ {
+ 	void (*image_entry)(void);
+ 	u32 lsb, msb;
+-	u32 i;
+ 
+-	for (i = 0; i < FIT_MAX_IMAGES; i++) {
+-		if (strcmp(image[i].arch, "arm64"))
+-			continue;
+-
+-		lsb = (u32)image[i].startaddr;
+-		msb = (u32)(image[i].startaddr >> 32);
++	if (startaddr) {
++		lsb = (u32)startaddr;
++		msb = (u32)(startaddr >> 32);
+ 		/* Set CPU0 Reset address to U-Boot */
+ 		regmap_writel(lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_0);
+ 		regmap_writel(msb, mmCPU_CA53_CFG_RST_ADDR_MSB_0);
+@@ -167,7 +161,6 @@
+ 		/* Wake up CPU0, after we put all CPUs in reset */
+ 		regmap_writel(0x0, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+ 		regmap_writel(0x10111, mmCPU_CA53_CFG_ARM_RST_CONTROL);
+-		break;
+ 	}
+ 
+ 	/*
+diff --git a/preboot/fit.c b/preboot/fit.c
+index e349975..cff802e 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -7,11 +7,15 @@
+ 
+ #include <libfdt.h>
+ #include <security.h>
++#include <hl_boot_if.h>
++#include <preboot.h>
++#include <boot_if.h>
+ #include "common.h"
+ #include "uart.h"
+ #include "fit.h"
+ #include "fit_rsa.h"
+ #include "fit_regions.h"
++#include "cmd_module.h"
+ 
+ #define FIT_IMAGES_PATH		"/images"
+ #define FIT_CONFS_PATH		"/configurations"
+@@ -40,8 +44,34 @@
+ #define MAX_FDT_REGIONS		20
+ #define IMAGE_MAX_HASHED_NODES	20
+ 
++#define FIT_MAX_IMAGES		8
++
++struct fit_image {
++	u64 loadaddr;
++	u64 startaddr;
++	const char *arch;
++};
++
++enum fit_load_result {
++	FIT_LOAD_SUCCESS = 0,
++	FIT_LOAD_CORRUPTED,
++	FIT_LOAD_SEC_FAILED,
++};
++
++struct fit_image images[FIT_MAX_IMAGES];
+ struct fdt_region fdt_regions[MAX_FDT_REGIONS];
+ struct image_region region[MAX_FDT_REGIONS];
++
++__weak void preboot_start_image(u64 startaddr)
++{
++	image_start(startaddr);
++}
++
++__weak void preboot_copy_image(u64 dst, const void *buf, int len,
++			       const char *arch)
++{
++	memcpy((void *)(uintptr_t)dst, buf, len);
++}
+ 
+ __weak bool preboot_security_is_enabled(void)
+ {
+@@ -473,7 +503,17 @@
+ 	return 0;
+ }
+ 
+-enum fit_load_result fit_load_images(const void *fit, struct fit_image *images)
++static void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
++{
++	preboot_puts_raw("FIT loadaddr: 0x");
++	if (sizeof(void *) > sizeof(u32))
++		preboot_puth_raw((u32)(dst >> 32), false);
++	preboot_puth((u32)dst, false);
++
++	preboot_copy_image(dst, buf, len, arch);
++}
++
++static enum fit_load_result fit_copy_images(const void *fit)
+ {
+ 	int node, len;
+ 	int conf, num_images, i;
+@@ -530,3 +570,48 @@
+ 
+ 	return FIT_LOAD_SUCCESS;
+ }
++
++int fit_load_images(void)
++{
++	void *fit = (void *)FIT_IMG_BASE;
++	int err;
++
++	memset(&images, 0x0, sizeof(images));
++
++	err = !fit_check_format(fit);
++	if (!err)
++		err = fit_copy_images(fit);
++
++	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED |
++			    CPU_BOOT_ERR0_SECURITY_FAIL, false);
++	switch (err) {
++	case FIT_LOAD_SUCCESS:
++		return 0;
++	case FIT_LOAD_CORRUPTED:
++		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
++		preboot_puts("FIT loading failed, Retrying...\n");
++		break;
++	case FIT_LOAD_SEC_FAILED:
++		cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_FAIL, true);
++		preboot_puts("FIT security validation failed, Retrying...\n");
++		break;
++	}
++
++	return 1;
++}
++
++void fit_run_image(void)
++{
++	u64 startaddr = 0;
++	u32 i;
++
++	for (i = 0; i < FIT_MAX_IMAGES; i++) {
++		if (strcmp(images[i].arch, "arm64"))
++			continue;
++
++		startaddr = images[i].startaddr;
++		break;
++	}
++
++	preboot_start_image(startaddr);
++}
+diff --git a/preboot/fit.h b/preboot/fit.h
+index ddb60b0..f80e7dc 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -8,23 +8,7 @@
+ #ifndef _HL_FIT_H_
+ #define _HL_FIT_H_
+ 
+-#define FIT_MAX_IMAGES		8
+-
+-struct fit_image {
+-	u64 loadaddr;
+-	u64 startaddr;
+-	const char *arch;
+-};
+-
+-enum fit_load_result {
+-	FIT_LOAD_SUCCESS = 0,
+-	FIT_LOAD_CORRUPTED,
+-	FIT_LOAD_SEC_FAILED,
+-};
+-
+-enum fit_load_result fit_load_images(const void *fit, struct fit_image *images);
+-int fit_check_format(const void *fit);
+-void fit_copy_image(u64 dst, const void *buf, int len, const char *arch);
+-void preboot_fit_start_images(struct fit_image *image);
++int fit_load_images(void);
++void fit_run_image(void);
+ 
+ #endif /* _HL_FIT_H_ */
+diff --git a/preboot/module_lkd.c b/preboot/module_lkd.c
+index 84613d2..508af85 100644
+--- a/preboot/module_lkd.c
++++ b/preboot/module_lkd.c
+@@ -16,7 +16,6 @@
+ struct lkd_status {
+ 	int fit_not_checked;	/* negative logic */
+ 	u32 msg_reg_val;
+-	struct fit_image images[FIT_MAX_IMAGES];
+ };
+ 
+ static struct lkd_status sts = {
+@@ -69,30 +68,7 @@
+ 
+ void module_lkd_run(void)
+ {
+-	int err;
+-	void *fit = (void *)FIT_IMG_BASE;
+-
+-	memset(&sts.images, 0x0, sizeof(sts.images));
+-
+-	err = !fit_check_format(fit);
+-	if (!err)
+-		err = fit_load_images(fit, sts.images);
+-
+-	cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED |
+-			    CPU_BOOT_ERR0_SECURITY_FAIL, false);
+-	switch (err) {
+-	case FIT_LOAD_SUCCESS:
+-		sts.fit_not_checked = 0;
+-		break;
+-	case FIT_LOAD_CORRUPTED:
+-		cpu_boot_err_clrset(CPU_BOOT_ERR0_FIT_CORRUPTED, true);
+-		preboot_puts("FIT loading failed, Retrying...\n");
+-		break;
+-	case FIT_LOAD_SEC_FAILED:
+-		cpu_boot_err_clrset(CPU_BOOT_ERR0_SECURITY_FAIL, true);
+-		preboot_puts("FIT security validation failed, Retrying...\n");
+-		break;
+-	}
++	sts.fit_not_checked = !!fit_load_images();
+ }
+ 
+ void module_lkd_run_noret(void)
+@@ -103,7 +79,7 @@
+ 		wfe();
+ 		break;
+ 	case KMD_MSG_FIT_RDY:
+-		preboot_fit_start_images(sts.images);
++		fit_run_image();
+ 		/* no break */
+ 	default:
+ 		break;

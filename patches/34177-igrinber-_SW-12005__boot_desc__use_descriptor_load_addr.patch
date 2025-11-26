@@ -1,0 +1,202 @@
+From 1b07c1b74b0e732a9fa58c70743f1fd61b1435cd Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Thu, 30 Apr 2020 20:16:52 +0300
+Subject: [PATCH] [SW-12005] boot_desc: use descriptor load addr
+
+Now that the descriptor has its image load address inside, we can start
+using it.
+Replace usage of the hard coded load address and use the one provided by
+the image descriptor.
+
+Change-Id: Id4eb9160d03d3b944892f5274019d83cbee56b41
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/app/ppboot.c b/app/ppboot.c
+index 67062e6..2ad40dd 100644
+--- a/app/ppboot.c
++++ b/app/ppboot.c
+@@ -44,6 +44,8 @@
+ 	desc->spi_offset = next_image_base_offset(next_img_off, name) +
+ 						HL_SPI_LEGACY_PREBOOT_OFF;
+ 	desc->img_size = PREBOOT_SIZE;
++	desc->loadaddr = PREBOOT_TEXT_BASE;
++
+ 	return image_pending;
+ }
+ 
+@@ -64,7 +66,7 @@
+ 	return preboot_image_offset_legacy(image_pending, desc);
+ }
+ 
+-static void copy_preboot(void)
++static void *copy_preboot(void)
+ {
+ 	char *name = "PREBOOT";
+ 	struct boot_desc desc;
+@@ -78,10 +80,12 @@
+ 
+ 	preboot_puts_hex_raw(" (offset: ", desc.spi_offset, false);
+ 	preboot_puts_hex_raw(", size: ", desc.img_size, false);
++	preboot_puts_hex_raw(", addr: ", (u32)(desc.loadaddr >> 32), false);
++	preboot_puth_raw((u32)desc.loadaddr, false);
+ 	preboot_puts(")\n");
+ 
+-	spi_copy((void *)PREBOOT_TEXT_BASE,
+-		 desc.spi_offset, desc.img_size, name);
++	spi_copy((void *)desc.loadaddr, desc.spi_offset, desc.img_size, name);
++	return (void *)desc.loadaddr;
+ }
+ 
+ static void rst_src_dump(void)
+@@ -169,7 +173,7 @@
+ 
+ void ppboot_main(void)
+ {
+-	void (*preboot_start)(void) = (void *)PREBOOT_TEXT_BASE;
++	void (*preboot_start)(void);
+ 
+ 	hl_plat_init();
+ 	hl_init_pcie_phy_fw();
+@@ -190,7 +194,7 @@
+ 		return;
+ 
+ 	preboot_delay();
+-	copy_preboot();
++	preboot_start = copy_preboot();
+ 
+ 	preboot_start();
+ }
+diff --git a/app/preboot.c b/app/preboot.c
+index 1192e68..0da7d68 100644
+--- a/app/preboot.c
++++ b/app/preboot.c
+@@ -86,6 +86,8 @@
+ 
+ 	desc->spi_offset = base_off + HL_SPI_LEGACY_UBOOT_OFF;
+ 	desc->img_size = UBOOT_SIZE;
++	desc->loadaddr = UBOOT_TEXT_BASE;
++
+ 	return pending;
+ }
+ 
+@@ -112,7 +114,13 @@
+ 	return next_image_offset_legacy(image_pending, desc);
+ }
+ 
+-static void preboot_copy_uboot(void)
++__attribute__((weak))
++void preboot_do_spi_cp(u64 dst, u32 offset, u32 size, char *name)
++{
++	spi_copy((void *)dst, offset, size, name);
++}
++
++static u64 preboot_copy_uboot(void)
+ {
+ 	char *name = "U-Boot";
+ 	struct boot_desc desc;
+@@ -123,9 +131,13 @@
+ 	preboot_puts_raw(uboot_image);
+ 	preboot_puts_hex_raw(" (offset: ", desc.spi_offset, false);
+ 	preboot_puts_hex_raw(", size: ", desc.img_size, false);
++	preboot_puts_hex_raw(", addr: ", (u32)(desc.loadaddr >> 32), false);
++	preboot_puth_raw((u32)desc.loadaddr, false);
+ 	preboot_puts(")\n");
+ 
+-	spi_copy((void *)UBOOT_TEXT_BASE, desc.spi_offset, desc.img_size, name);
++	preboot_do_spi_cp(desc.loadaddr, desc.spi_offset, desc.img_size, name);
++
++	return desc.loadaddr;
+ }
+ 
+ #ifndef TARGET_IS_TESTER
+@@ -170,15 +182,17 @@
+ __attribute__((weak)) void preboot_version(void) {}
+ #endif	/* TARGET_IS_TESTER */
+ 
+-__attribute__((weak)) void uboot_start(void)
++__attribute__((weak)) void uboot_start(u64 loadaddr)
+ {
+-	void (*uboot_entry)(void) = (void *)UBOOT_TEXT_BASE;
++	void (*uboot_entry)(void) = (void *)loadaddr;
+ 
+ 	uboot_entry();
+ }
+ 
+ void preboot_main(void)
+ {
++	u64 loadaddr;
++
+ 	regmap_writel(CPU_BOOT_STATUS_IN_PREBOOT, get_cpu_boot_status_reg());
+ 
+ 	/*
+@@ -189,7 +203,7 @@
+ 
+ 	hl_uart_init();
+ 	preboot_version();
+-	preboot_copy_uboot();
++	loadaddr = preboot_copy_uboot();
+ 
+-	uboot_start();
++	uboot_start(loadaddr);
+ }
+diff --git a/common/boot_desc.c b/common/boot_desc.c
+index 033b588..9c81bc0 100644
+--- a/common/boot_desc.c
++++ b/common/boot_desc.c
+@@ -102,6 +102,8 @@
+ 		preboot_puts_hex(" - found! using index: ", idx, false);
+ 		desc->spi_offset = img_desc[i].offset[idx];
+ 		desc->img_size = img_desc[i].size[idx];
++		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
++					img_desc[i].load_low[idx];
+ 		return idx;
+ 	}
+ 
+diff --git a/common/boot_desc.h b/common/boot_desc.h
+index 3c8c19d..ef52ef0 100644
+--- a/common/boot_desc.h
++++ b/common/boot_desc.h
+@@ -16,6 +16,7 @@
+ struct boot_desc {
+ 	u32 spi_offset;
+ 	u32 img_size;
++	u64 loadaddr;
+ };
+ 
+ /*
+diff --git a/goya2_arc/common.c b/goya2_arc/common.c
+index 333d12e..8ac3eca 100644
+--- a/goya2_arc/common.c
++++ b/goya2_arc/common.c
+@@ -22,6 +22,7 @@
+ #include <preboot.h>
+ #include <pll.h>
+ #include <uart.h>
++#include <spi.h>
+ 
+ #include "common.h"
+ 
+@@ -233,9 +234,20 @@
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+ 
+-void uboot_start(void)
++void preboot_do_spi_cp(u64 dst, u32 offset, u32 size, char *name)
+ {
+-	unsigned int lsb = 0xf0000000 | UBOOT_TEXT_BASE, msb = 0x7f;
++	/* Prepare the ARC SRAM address */
++	u32 arc_dst = ((u32)dst & 0xFFFFFFF) | BIT(28);
++
++	preboot_puts_hex("ARC loadaddr: ", arc_dst, false);
++
++	spi_copy((void *)arc_dst, offset, size, name);
++}
++
++void uboot_start(u64 loadaddr)
++{
++	unsigned int lsb = (u32)loadaddr, msb = (u32)(loadaddr >> 32);
++
+ 	/* Set CPU0 Reset address to U-Boot */
+ 	regmap_writel(lsb, mmCPU_CA53_CFG_RST_ADDR_LSB_0);
+ 	regmap_writel(msb, mmCPU_CA53_CFG_RST_ADDR_MSB_0);

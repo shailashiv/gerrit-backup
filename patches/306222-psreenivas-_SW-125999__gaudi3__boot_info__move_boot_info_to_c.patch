@@ -1,0 +1,227 @@
+From 4212b5bb589592545fadd82d90451a3cfa7136bf Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Fri, 03 Mar 2023 06:05:01 +0200
+Subject: [PATCH] [SW-125999] gaudi3: boot_info: move boot info to common code
+
+The code for merging exisiting boot info can be reused for
+gaudi2 erom. This patch adds support to move all the reusable
+functions to common boot_info file.
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: Ibfdb0df264746ba42b4202a35e52c90ea2c4529b
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 55ddcc8..a9d62b6 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -90,7 +90,7 @@
+ 
+ static struct rst_src_data rst_src;
+ 
+-static struct hl_boot_info_desc *hl_boot_info_get_desc(int idx)
++struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx)
+ {
+ 	struct hl_boot_info_desc *desc = NULL;
+ 	struct hl_boot_info_ptrs *ptrs;
+@@ -106,19 +106,6 @@
+ 	return desc;
+ }
+ 
+-static int hl_boot_info_get_num_descs(void)
+-{
+-	struct hl_boot_info_ptrs *ptrs =
+-		(struct hl_boot_info_ptrs *)BOOT_INFO_BASE;
+-
+-	if (ptrs->magic != HL_BOOT_INFO_MAGIC) {
+-		preboot_puts("Failed to read boot info root node (bad magic)");
+-		return 0;
+-	}
+-
+-	return ptrs->count;
+-}
+-
+ /*
+  * Gaudi3 ppboot uses bootinfo API from arcboot which doesn't support merge of existing boot info
+  * data, so prior to using boot_info_finalize_no_merge(), the bootinfo data on spsram memory needs
+@@ -127,60 +114,33 @@
+  */
+ static int ppboot_boot_info_set(u32 type, void *data, u32 size)
+ {
+-	struct mem_desc mem_region_desc;
+-	struct hl_boot_info_desc *desc;
+-	u32 desc_count = hl_boot_info_get_num_descs();
+-	uintptr_t mem_base, mem_base_end;
+-	u32 i, actual_size, ret = 0;
++	int ret = boot_info_sync_data();
+ 
+-	if (preboot_get_mem_region(MEM_BOOT_INFO, &mem_region_desc)) {
+-		preboot_puts("boot_info_set: failed to get mem region MEM_BOOT_INFO\n");
+-		return 1;
+-	}
++	if (ret == BOOT_INFO_MEMERR)
++		return ret;
++	else if (ret == BOOT_INFO_MEMFULL)
++		goto merge_and_exit;
+ 
+-	mem_base = mem_region_desc.base;
+-	mem_base_end = mem_base + mem_region_desc.size;
+-	for (i = 0; i < desc_count; i++) {
+-		desc = hl_boot_info_get_desc(i);
+-		if (!desc) {
+-			preboot_puts_hex("boot_info_set: failed to get pointer to desc index ", i,
+-					 false);
+-			continue;
+-		}
++	ret = boot_info_set_no_merge(type, data, size);
+ 
+-		/* copy boot info memory into BOOT_INFO mem region */
+-		if (mem_base + desc->size > mem_base_end) {
+-			preboot_puts("boot_info_set: not enough space for bootinfo\n");
+-			ret = 1;
+-			goto merge_and_exit;
+-		}
+-
+-		if (boot_info_get_no_merge(desc->type, (void *)mem_base, desc->size,
+-					   &actual_size)) {
+-			preboot_puts_hex("boot_info_set: failed to get type ", desc->type,
+-					 false);
+-			continue;
+-		}
+-
+-		if (boot_info_set_no_merge(desc->type, (void *)mem_base, desc->size)) {
+-			preboot_puts_hex("boot_info_set: bootinfo set failure for type ",
+-					 desc->type, false);
+-			continue;
+-		}
+-
+-		mem_base += desc->size;
+-	}
+-
+-	if (boot_info_set_no_merge(type, data, size)) {
++	if (ret)
+ 		preboot_puts_hex("boot_info_set: failed to set boot info type:", type, false);
+-		return 1;
+-	}
+ 
+ merge_and_exit:
+ 	boot_info_finalize_no_merge();
+ 	return ret;
+ }
+ 
++int hl_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size)
++{
++	return boot_info_get_no_merge(type, data, max_size, copy_size);
++}
++
++int hl_boot_info_set(u32 type, void *data, u32 size)
++{
++	return boot_info_set_no_merge(type, data, size);
++}
++
+ u32 gaudi3_die_timestamp_base_get(u32 die_id)
+ {
+ 	if (die_id == GAUDI3_SLAVE_DIE_ID)
+diff --git a/include/boot_info.h b/include/boot_info.h
+index 8d9c3e4..f3f09b4 100644
+--- a/include/boot_info.h
++++ b/include/boot_info.h
+@@ -9,9 +9,17 @@
+ 
+ #include <preboot.h>
+ 
++#define BOOT_INFO_SUCCESS	0
++#define BOOT_INFO_MEMERR	1
++#define BOOT_INFO_MEMFULL	2
++
+ void boot_info_finalize(void);
+ int boot_info_set(u32 type, const void *data, u32 size);
+ int boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
+ u16 hl_get_boot_info_ver(void);
++int boot_info_sync_data(void);
++struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx);
++int hl_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
++int hl_boot_info_set(u32 type, void *data, u32 size);
+ 
+ #endif /* _BOOT_INFO_H_ */
+diff --git a/lib/common/boot_info.c b/lib/common/boot_info.c
+index aa4c59b..9055d1d 100644
+--- a/lib/common/boot_info.c
++++ b/lib/common/boot_info.c
+@@ -14,6 +14,7 @@
+ 
+ #include "boot_info.h"
+ #include "uart.h"
++#include "memory.h"
+ 
+ static struct boot_info boot_info = { .ptrs = { .count = 0 } };
+ 
+@@ -224,3 +225,68 @@
+ 
+ 	return 1;
+ }
++
++static int boot_info_get_num_descs(void)
++{
++	struct hl_boot_info_ptrs *ptrs =
++		(struct hl_boot_info_ptrs *)BOOT_INFO_BASE;
++
++	if (ptrs->magic != HL_BOOT_INFO_MAGIC) {
++		preboot_puts("Failed to read boot info root node (bad magic)");
++		return 0;
++	}
++
++	return ptrs->count;
++}
++
++__weak struct hl_boot_info_desc *hl_boot_info_get_desc(u32 idx) { return NULL; }
++__weak int hl_boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size) { return 1; }
++__weak int hl_boot_info_set(u32 type, void *data, u32 size) { return 1; }
++
++int boot_info_sync_data(void)
++{
++	struct mem_desc mem_region_desc;
++	struct hl_boot_info_desc *desc;
++	u32 desc_count = boot_info_get_num_descs();
++	uintptr_t mem_base, mem_base_end;
++	u32 idx, actual_size;
++
++	if (preboot_get_mem_region(MEM_BOOT_INFO, &mem_region_desc)) {
++		preboot_puts("boot_info_set: failed to get mem region MEM_BOOT_INFO\n");
++		return BOOT_INFO_MEMERR;
++	}
++
++	mem_base = mem_region_desc.base;
++	mem_base_end = mem_base + mem_region_desc.size;
++	for (idx = 0; idx < desc_count; idx++) {
++		desc = hl_boot_info_get_desc(idx);
++		if (!desc) {
++			preboot_puts_hex("boot_info_set: failed to get pointer to desc index ", idx,
++					 false);
++			continue;
++		}
++
++		/* copy boot info memory into BOOT_INFO mem region */
++		if (mem_base + desc->size > mem_base_end) {
++			preboot_puts("boot_info_set: not enough space for bootinfo\n");
++			return BOOT_INFO_MEMFULL;
++		}
++
++		if (hl_boot_info_get(desc->type, (void *)mem_base, desc->size,
++					   &actual_size)) {
++			preboot_puts_hex("boot_info_set: failed to get type ", desc->type,
++					 false);
++			continue;
++		}
++
++		if (hl_boot_info_set(desc->type, (void *)mem_base, desc->size)) {
++			preboot_puts_hex("boot_info_set: bootinfo set failure for type ",
++					 desc->type, false);
++			continue;
++		}
++
++		mem_base += desc->size;
++	}
++
++	return BOOT_INFO_SUCCESS;
++}

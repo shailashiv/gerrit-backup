@@ -1,0 +1,220 @@
+From 2388098443db4b16c762fc9fc36587ffaa1cb050 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 04 Jan 2024 10:42:29 +0200
+Subject: [PATCH] [SW-169995] efuse: refactor for multiple instances
+
+in some devices there are multiple instances of the efuse block.
+to support that, the efuse code is refactored to get the efuse block
+base address so multiple instances of efuse can be handled per device.
+
+Change-Id: I13dc6fc717d259ed855e8f02f994077d63dd6e3a
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/pcie_pif/pcie_pif.c b/app/pcie_pif/pcie_pif.c
+index ab8d547..12cb7b5 100644
+--- a/app/pcie_pif/pcie_pif.c
++++ b/app/pcie_pif/pcie_pif.c
+@@ -277,7 +277,7 @@
+  * components (arcboot/ppboot) prior to running the pif arc code. So
+  * efuse initialization is not required here.
+  */
+-int preboot_fuse_init(void) { return 0; }
++int hl_fuse_init(u32 efuse_base) { return 0; }
+ void fuse_notify_init_fail(void) {}
+ void fuse_notify_invalid_offset(void) {}
+ 
+diff --git a/app/pldm_bloader/pldm_bloader.c b/app/pldm_bloader/pldm_bloader.c
+index d048810..bf94585 100644
+--- a/app/pldm_bloader/pldm_bloader.c
++++ b/app/pldm_bloader/pldm_bloader.c
+@@ -14,7 +14,7 @@
+ 
+ #include "pldm_bloader.h"
+ 
+-int preboot_fuse_init(void) { return 0; }
++int hl_fuse_init(u32 efuse_base) { return 0; }
+ 
+ static void device_init(void)
+ {
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index bc5ed29..3b4f662 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1187,9 +1187,9 @@
+ 
+ void device_init_efuse(void)
+ {
+-	efuse.read_address_reg = mmPSOC_EFUSE_READ_ADDRESS;
+-	efuse.data_0_reg = mmPSOC_EFUSE_DATA_0;
+-	efuse.read_reg = mmPSOC_EFUSE_READ_CTRL;
++	efuse.read_address_off = mmPSOC_EFUSE_READ_ADDRESS - mmPSOC_EFUSE_BASE;
++	efuse.data_0_off = mmPSOC_EFUSE_DATA_0 - mmPSOC_EFUSE_BASE;
++	efuse.read_ctrl_off = mmPSOC_EFUSE_READ_CTRL - mmPSOC_EFUSE_BASE;
+ 	efuse.addr_range = EFUSE_READ_RANGE_ALL;
+ 	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
+ }
+@@ -1310,3 +1310,13 @@
+ }
+ 
+ void preboot_dev_spec_legacy_vers_setup(enum preboot_vers vers_type, u32 offset) {}
++
++int preboot_fuse_init(void)
++{
++	return hl_fuse_init(mmPSOC_EFUSE_BASE);
++}
++
++int preboot_fuse_read(u32 word, u32 *val)
++{
++	return hl_fuse_read(mmPSOC_EFUSE_BASE, word, val);
++}
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 11cf902..c8b23ee 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -507,9 +507,9 @@
+ 
+ void device_init_efuse(void)
+ {
+-	efuse.read_address_reg = D0_PSOC_EFUSE_REG(mmEFUSE_READ_ADDRESS);
+-	efuse.data_0_reg = D0_PSOC_EFUSE_REG(mmEFUSE_DATA_0);
+-	efuse.read_reg = D0_PSOC_EFUSE_REG(mmEFUSE_RD);
++	efuse.read_address_off = mmEFUSE_READ_ADDRESS;
++	efuse.data_0_off = mmEFUSE_DATA_0;
++	efuse.read_ctrl_off = mmEFUSE_RD;
+ 	efuse.addr_range = GAUDI3_EFUSE_READ_RANGE_ALL;
+ 	efuse.words_per_bank = FUSE_WORDS_PER_BANK;
+ }
+@@ -1336,3 +1336,14 @@
+ {
+ 	gaudi3_print_cpu_pll();
+ }
++
++/* by default Die0 fuse is read */
++int preboot_fuse_read(u32 word, u32 *val)
++{
++	return hl_fuse_read(mmD0_PSOC_EFUSE_BASE, word, val);
++}
++
++int preboot_fuse_init(void)
++{
++	return hl_fuse_init(mmD0_PSOC_EFUSE_BASE);
++}
+diff --git a/include/device.h b/include/device.h
+index f8302df..d239ca8 100644
+--- a/include/device.h
++++ b/include/device.h
+@@ -6,9 +6,9 @@
+  */
+ 
+ struct device_efuse {
+-	u32 read_address_reg;
+-	u32 data_0_reg;
+-	u32 read_reg;
++	u32 read_address_off;
++	u32 data_0_off;
++	u32 read_ctrl_off;
+ 	u32 addr_range;
+ 	u32 words_per_bank;
+ };
+diff --git a/lib/common/efuse.c b/lib/common/efuse.c
+index b5721fb..713aa81 100644
+--- a/lib/common/efuse.c
++++ b/lib/common/efuse.c
+@@ -16,6 +16,22 @@
+ #include "pll.h"
+ 
+ /*
++ * to support multiple fuses in a device, each device should implement fuse init and fuse read
++ * default functions
++ */
++__weak int preboot_fuse_init(void)
++{
++	preboot_puts("fuse_init() not implemented\n");
++	return 0;
++}
++
++__weak int preboot_fuse_read(u32 word, u32 *val)
++{
++	preboot_puts("fuse_read() not implemented\n");
++	return 0;
++}
++
++/*
+  * fuse box is divided into half for redundancy
+  * each half is bank of FUSE_WORDS_PER_BANK words
+  * NOTE: bank1 is a complete duplication of bank0
+@@ -28,7 +44,7 @@
+ 
+ static int efuse_init;
+ 
+-__weak int preboot_fuse_init(void)
++__weak int hl_fuse_init(u32 efuse_base)
+ {
+ 	int i, offset;
+ 	u32 read_reg;
+@@ -36,11 +52,11 @@
+ 	if (efuse_init == 1)
+ 		return -1;
+ 
+-	regmap_writel(efuse.addr_range, efuse.read_address_reg);
+-	regmap_writel(1, efuse.read_reg);
++	regmap_writel(efuse.addr_range, efuse_base + efuse.read_address_off);
++	regmap_writel(1, efuse_base + efuse.read_ctrl_off);
+ 
+ 	for (i = 0; i < FUSE_RETRIES; i++)
+-		if (regmap_readl(efuse.read_reg))
++		if (regmap_readl(efuse_base + efuse.read_ctrl_off))
+ 			udelay(FUSE_DELAY_US);
+ 		else
+ 			break;
+@@ -51,11 +67,11 @@
+ 	for (i = 0; i < FUSE_WORDS_PER_BANK; i++) {
+ 		/* read value from bank0 */
+ 		offset = (i * sizeof(u32));
+-		read_reg = regmap_readl(efuse.data_0_reg + offset);
++		read_reg = regmap_readl(efuse_base + efuse.data_0_off + offset);
+ 
+ 		/* read value from bank1 and OR with value from bank0 */
+ 		offset = ((FUSE_WORDS_PER_BANK + i) * sizeof(u32));
+-		read_reg |= regmap_readl(efuse.data_0_reg + offset);
++		read_reg |= regmap_readl(efuse_base + efuse.data_0_off + offset);
+ 	}
+ 
+ 	efuse_init = 1;
+@@ -74,7 +90,7 @@
+ 	preboot_puts("Invalid efuse word offset\n");
+ }
+ 
+-__weak int preboot_fuse_read(u32 word, u32 *val)
++__weak int hl_fuse_read(u32 efuse_base, u32 word, u32 *val)
+ {
+ 	int offset, ret;
+ 	u32 read_val;
+@@ -92,11 +108,11 @@
+ 
+ 	/* read value from bank0 */
+ 	offset = (word * sizeof(u32));
+-	read_val = regmap_readl(efuse.data_0_reg + offset);
++	read_val = regmap_readl(efuse_base + efuse.data_0_off + offset);
+ 
+ 	/* read value from bank1 and OR with value from bank0 */
+ 	offset = ((efuse.words_per_bank + word) * sizeof(u32));
+-	read_val |= regmap_readl(efuse.data_0_reg + offset);
++	read_val |= regmap_readl(efuse_base + efuse.data_0_off + offset);
+ 
+ 	*val = read_val;
+ 
+diff --git a/lib/common/efuse.h b/lib/common/efuse.h
+index d32cabd..ade215d 100644
+--- a/lib/common/efuse.h
++++ b/lib/common/efuse.h
+@@ -20,6 +20,7 @@
+ int preboot_fuse_read(u32 word, u32 *val);
+ void fuse_notify_init_fail(void);
+ void fuse_notify_invalid_offset(void);
+-
++int hl_fuse_init(u32 efuse_base);
++int hl_fuse_read(u32 efuse_base, u32 word, u32 *val);
+ 
+ #endif /* _EFUSE_H_ */

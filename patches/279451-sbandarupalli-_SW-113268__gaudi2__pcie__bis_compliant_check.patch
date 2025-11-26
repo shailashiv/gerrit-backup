@@ -1,0 +1,66 @@
+From c8aa2a20005e350403570ff0843dd185e79f8ffb Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Wed, 07 Dec 2022 07:06:48 +0200
+Subject: [PATCH] [SW-113268] gaudi2: pcie: bis compliant check
+
+New PCIe revision(2) should be configured by ppboot incase
+BIS Compliant efuse is set.
+
+For BIS Compliant check, ppboot needs to read only BIT 16
+at offset 0x3A. But currrent code reads 5 dwords from real
+fuse or fake fuse (SPI flash) which introduces delay in PCIe
+link up and PCIe link doesn't come up consistently after PRSTN
+
+Modified code to read the BIS Compliant bit from efuse shadow
+registers. Before PCIe link up fake fuse contents are not used
+(Ex: PCIe gen limit). 
+
+No need to check for fake security is enabled or not
+
+Change-Id: I97b8fed2d4e72add10f90cf90719f590a797f3f5
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.h b/arch/gaudi2/common/common.h
+index 732d8a0..d43d992 100644
+--- a/arch/gaudi2/common/common.h
++++ b/arch/gaudi2/common/common.h
+@@ -62,6 +62,8 @@
+ #define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_MODE_G3_CONF	0x5555
+ #define PCIE_PHY_PROTOCOL0_EXT_RX_ADAPT_SEL_G4_CONF	0xFF
+ 
++#define EFUSE_SYSCFG_BIS_COMPLIANT_MODE		BIT(16)
++
+ /*
+  * TODO: These are temporary macros
+  * and to be removed after GAUDI2 PO
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index c0d13bd..b08e2ee 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -1501,17 +1501,15 @@
+ 
+ bool preboot_check_bis_compliant_mode(void)
+ {
+-	const struct hl_sec_efuse *efuse;
++	u32 config_fuse;
++	int ret = preboot_fuse_read(EFUSE_SYSCFG_OFFSET, &config_fuse);
+ 
+-	if (preboot_fake_security_is_enabled())
+-		efuse = preboot_get_hl_sec_fake_efuse();
+-	else
+-		efuse = preboot_get_hl_sec_real_efuse();
+-
+-	if (!efuse) {
+-		preboot_puts("failed to read efuse, forcing bis compliant mode.\n");
++	/*
++	 * failed to read efuse, forcing bis compliant mode
++	 * No print is added here as this code is run before link up
++	 */
++	if (ret)
+ 		return true;
+-	}
+ 
+-	return efuse->bis_compliant;
++	return !!(config_fuse & EFUSE_SYSCFG_BIS_COMPLIANT_MODE);
+ }

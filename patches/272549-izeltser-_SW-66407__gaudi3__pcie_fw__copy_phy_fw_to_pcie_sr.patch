@@ -1,0 +1,198 @@
+From 00ead42d9caa23a61c84cdd475a60af2f7438a80 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Sun, 13 Nov 2022 19:08:11 +0200
+Subject: [PATCH] [SW-66407] gaudi3: pcie_fw: copy phy fw to pcie sram
+
+Pcie phy fw is copied from flash to FW sram along with the PPBOOT
+app by the bootrom. But in order to perform the Pcie Phy FW upgrade
+it should be placed in the PCIE SRAM. On cold boot PPBOOT app
+is copying the phy fw from FW SRAM to PCIE SRAM using the PSOC
+MEM_CPY engine.
+
+Change-Id: Ic640402b76b9b01dc373a461517396bf8b00b63e
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/app/ext_rom/Makefile b/app/ext_rom/Makefile
+index 09bf19e..a77071a 100644
+--- a/app/ext_rom/Makefile
++++ b/app/ext_rom/Makefile
+@@ -18,6 +18,8 @@
+ CFLAGS += -include $(HL_DEV_ARCH)/dev_ext_rom.h
+ CFLAGS += -D DEF_HL_FW_COMP_EROM
+ CFLAGS += -I ${EMBEDDED_ROOT}/arcboot/arch
++# dummy parameter, real one required only for ppboot build
++CFLAGS += -DPHY_FW_SIZE=0
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+diff --git a/app/pcie_pif/Makefile b/app/pcie_pif/Makefile
+index 001fc5c..cad2210 100644
+--- a/app/pcie_pif/Makefile
++++ b/app/pcie_pif/Makefile
+@@ -14,6 +14,9 @@
+ CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
++# dummy parameter, real one required only for ppboot build
++CFLAGS += -DPHY_FW_SIZE=0
++
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+ 
+ PIF_ARC_LD_SCRIPT := pcie_pif.lds
+diff --git a/app/recovery/Makefile b/app/recovery/Makefile
+index a06936e..a4aa7ab 100644
+--- a/app/recovery/Makefile
++++ b/app/recovery/Makefile
+@@ -17,6 +17,9 @@
+ CFLAGS += -I $(PREBOOT_ROOT_DIR)/include/ -I $(PREBOOT_ROOT_DIR)/ -I $(PREBOOT_ROOT_DIR)/lib/common/ -I $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/
+ 
+ CFLAGS += -Os -fdata-sections -ffunction-sections
++# dummy parameter, real one required only for ppboot build
++CFLAGS += -DPHY_FW_SIZE=0
++
+ SFLAGS := $(CFLAGS) -D__ASSEMBLY__
+ 
+ RECOVERY_LD_SCRIPT := $(PREBOOT_ROOT_DIR)/$(HL_DEV_ARCH)/recovery.lds
+diff --git a/arch/gaudi3/arc/Makefile b/arch/gaudi3/arc/Makefile
+index 8487857..f8ea49d 100644
+--- a/arch/gaudi3/arc/Makefile
++++ b/arch/gaudi3/arc/Makefile
+@@ -8,5 +8,7 @@
+ #	LDFLAGS += -Wl,--just-symbols $(HL_DEV_ARCH)/exports.elf
+ LDFLAGS += -Wl,--just-symbols $(PREBOOT_ROOT_DIR)/../arcboot-custom/exports.elf
+ 
++CFLAGS += -DPHY_FW_SIZE=$(PHY_FW_SIZE)
++
+ image_validation: image_validation_common
+ image_validation: image_validation_preboot
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index c3017c4..4533c02 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -30,6 +30,7 @@
+ #include <d0_pif_arc_masks.h>
+ #include <d0_parc_global_conf_regs.h>
+ #include <d0_parc_global_conf_masks.h>
++#include <d0_psoc_global_conf_masks.h>
+ #include <d1_pcie_aux_regs.h>
+ #include <d1_pcie_core_regs.h>
+ #include <d1_pcie_dbi_sig_regs.h>
+@@ -42,6 +43,7 @@
+ 
+ #include <bitops.h>
+ #include <string.h>
++#include <sizes.h>
+ 
+ #include "common.h"
+ #include <preboot.h>
+@@ -755,3 +757,97 @@
+ }
+ 
+ u32 hl_get_pll_div_fix(void) { return 1; }
++
++#define MEM_CPY_ERRATA_WR_OS_VAL	62	/* wr os should be 62 per HW errata GAUDI3_0315 */
++#define MEM_CPY_ERRATA_RD_OS_VAL	0	/* rd os should be 0 per HW errata GAUDI3_0306 */
++#define MEM_CPY_SIZE_LIMIT		(SZ_1M - SZ_16)
++#define MEM_CPY_SIZE_SHIFT		4
++#define MEM_CPY_SIZE_SHIFT_MASK		(BIT(MEM_CPY_SIZE_SHIFT) - 1)
++#define HL_MEM_CPY_TIMEOUT_US		1000
++
++static int gaudi3_hbw_memcpy(uint64_t src, uint64_t dst, uint32_t size)
++{
++	u64 start = timestamp_get_us();
++	u32 mem_cfg, cpy_sts, copy_sz;
++
++	if (size > MEM_CPY_SIZE_LIMIT) {
++		preboot_puts("size exceeds MEM_CPY engine limit\n");
++		return -1;
++	}
++
++	regmap_writel((uint32_t)src, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_L);
++	regmap_writel((uint32_t)(src >> 32), mmD0_PSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_H);
++	regmap_writel((uint32_t)dst, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((uint32_t)(dst >> 32), mmD0_PSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++
++	mem_cfg = regmap_readl(mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M;
++	mem_cfg &= ~D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_USE_CONST_M;
++
++	/* set size of in granuality of 16 bytes */
++	copy_sz = size >> MEM_CPY_SIZE_SHIFT;
++	if (size & MEM_CPY_SIZE_SHIFT_MASK) {
++		preboot_puts("MEM_CPY size not aligned, rounding up\n");
++		copy_sz++;
++	}
++	mem_cfg |= (copy_sz & D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_MEM_SIZE_M);
++
++	/*
++	 * WA for HW errata GAUDI3_0315
++	 */
++	mem_cfg |= (MEM_CPY_ERRATA_WR_OS_VAL << D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_WR_OS_S);
++
++	/*
++	 * WA for HW errata GAUDI3_0306
++	 */
++	mem_cfg |= (MEM_CPY_ERRATA_RD_OS_VAL << D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_RD_OS_S);
++
++	regmap_writel(mem_cfg, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(D0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL_EN_M, mmD0_PSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	while (1) {
++		cpy_sts = regmap_readl(mmD0_PSOC_GLOBAL_CONF_MEM_CPY_STATUS);
++		if (cpy_sts & D0_PSOC_GLOBAL_CONF_MEM_CPY_STATUS_DONE_M)
++			break;
++
++		if (timeout_expired(start, HL_MEM_CPY_TIMEOUT_US)) {
++			preboot_puts("error: MEM_CPY engine timeout\n");
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++void hl_init_pcie_phy_fw(void)
++{
++	struct boot_desc desc;
++	u64 src;
++	u32 idx, actual_size, rst_src = hl_rst_src_get();
++	unsigned int num_crc;
++	int err;
++
++	/* PHY FW is copied only after cold boot, remains in the memory after other resets */
++	if (rst_src != HL_COLD_RST)
++		return;
++
++	if (!boot_desc_init()) {
++		preboot_puts("No boot desc, err loading Phy FW\n");
++		return;
++	}
++
++	idx = boot_desc_get_img_desc(FLOPS_UPD_NOOP, HL_FW_IMG_PPBOOT, &desc);
++	if (idx == HL_FW_IMG_NOT_FOUND) {
++		preboot_puts("ppboot descriptor, err loading Phy FW\n");
++		return;
++	}
++
++	num_crc = ppboot_get_num_crc(desc.img_size);
++	actual_size = desc.img_size - (num_crc * CRC32_SIZE);
++	src = desc.loadaddr + actual_size - PHY_FW_SIZE;
++
++	err = gaudi3_hbw_memcpy(src, HL_PCIE_FW_SRAM_BASE_FULL, PHY_FW_SIZE);
++	if (err)
++		preboot_puts_hex("failed to copy phy fw to pcie sram, err 0x", err, false);
++}
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index d486669..d5d705e 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -22,6 +22,7 @@
+ #define HL_FW_MEM_SIZE			SZ_256M
+ #define HL_CFG_MEM_BASE_FULL		0x300007FFC000000ULL
+ #define HL_CFG_MEM_SIZE			SZ_64M
++#define HL_PCIE_FW_SRAM_BASE_FULL	0x300007FD7F00000ULL
+ 
+ #define ARC0_MEM_SIZE			(ARC0_ICCM_SIZE + ARC0_DCCM_SIZE)
+ #define ARC1_MEM_SIZE			(ARC1_ICCM_SIZE + ARC1_DCCM_SIZE)

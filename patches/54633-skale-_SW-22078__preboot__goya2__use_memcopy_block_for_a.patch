@@ -1,0 +1,169 @@
+From b2c042408c7d46a702bb1ec0a0f2ea3ff6f3fcbc Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 08 Oct 2020 11:18:34 +0300
+Subject: [PATCH] [SW-22078] preboot: goya2: use memcopy block for arc fit images
+
+Currently on goya2 ASIC, inconsistent behaviour is observed while copying
+ARC fit images to ICCM/DCCM regions from ARM and content is not seen as
+expected on ARC ICCM/DCCM regions. Till HW team provide resolution to
+this issue, this patch adds workaround and make use of memcopy block to
+copy ARC ICCM/DCCM images from ARM as per below sequence.
+
+1. Copy FIT image to scratchpad SRAM base region
+2. Copy from scratchpad SRAM to ICCM/DCCM region using memcopy block.
+
+The reason to copy to scratchpad SRAM (step 1) is the fit source address
+for image may not be 16 bytes aligned and memcopy block has requirement
+of source and destination address to be 16 bytes aligned.
+
+Change-Id: Ieba0668af6b3a08dd66dc971203365a8b27a7710
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index 3509ccd..05e511e 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -271,7 +271,7 @@
+ 	image_entry();
+ }
+ 
+-void fit_copy_image(u64 dst, const void *buf, int len)
++void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
+ 	preboot_puth((u32)dst, false);
+diff --git a/goya/common.c b/goya/common.c
+index d5ebe9b..4caf0da 100644
+--- a/goya/common.c
++++ b/goya/common.c
+@@ -214,7 +214,7 @@
+ 	image_entry();
+ }
+ 
+-void fit_copy_image(u64 dst, const void *buf, int len)
++void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
+ 	preboot_puth((u32)dst, false);
+diff --git a/goya2/common.c b/goya2/common.c
+index 3495869..e604ab6 100644
+--- a/goya2/common.c
++++ b/goya2/common.c
+@@ -8,6 +8,7 @@
+ #include <psoc_gpio1_regs.h>
+ #include <psoc_qspi_regs.h>
+ #include <psoc_global_conf_regs.h>
++#include <psoc_global_conf_masks.h>
+ #include <pcie_aux_regs.h>
+ #include <pcie_core_regs.h>
+ #include <pcie_wrap_regs.h>
+@@ -284,12 +285,56 @@
+ 	image_entry();
+ }
+ 
+-void fit_copy_image(u64 dst, const void *buf, int len)
++static void fit_copy_arc_image(u64 dst, const void *buf, int len)
++{
++	u32 mem_cfg;
++
++	/*
++	 * For ARC images:
++	 * 1. Copy FIT image to scratchpad SRAM base. This is required
++	 *    for using memcopy block as memcopy requires source and
++	 *    destination addressess to be 16 bytes aligned.
++	 * 2. Copy from scratchpad SRAM to ICCM/DCCM using memcopy block.
++	 */
++	memcpy((void *)HL_SP_SRAM_BASE, buf, len);
++
++	/* Set source and destination address in memcopy block */
++	regmap_writel((u32)dst, mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_L);
++	regmap_writel((u32)(dst >> 32), mmPSOC_GLOBAL_CONF_MEM_CPY_DEST_ADDR_H);
++	regmap_writel((u32)HL_SP_SRAM_BASE,
++			mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_L);
++	regmap_writel((u32)(HL_SP_SRAM_BASE >> 32),
++			mmPSOC_GLOBAL_CONF_MEM_CPY_START_ADDR_H);
++
++
++	/* Align length to 16 bytes */
++	if (len % 16)
++		len += (16 - (len % 16));
++
++	/* Set length in memcopy register in granuality of 16 bytes */
++	len = len >> 4;
++	mem_cfg = regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++	mem_cfg &= ~(PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	mem_cfg |= (len & PSOC_GLOBAL_CONF_MEM_CPY_CTRL2_FLD_SIZE_MASK);
++	regmap_writel(mem_cfg, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL2);
++
++	/* Enable copy and wait for completion */
++	regmap_writel(0x1, mmPSOC_GLOBAL_CONF_MEM_CPY_CTRL);
++	while (!regmap_readl(mmPSOC_GLOBAL_CONF_MEM_CPY_STATUS))
++		;
++
++
++}
++
++void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	preboot_puts_hex_raw("FIT loadaddr: ", (u32)(dst >> 32), false);
+ 	preboot_puth((u32)dst, false);
+ 
+-	memcpy((void *)dst, buf, len);
++	if (!strcmp(arch, "arc"))
++		fit_copy_arc_image(dst, buf, len);
++	else
++		memcpy((void *)dst, buf, len);
+ }
+ 
+ void ppboot_cp_preboot(u64 loadaddr, u32 offset, u32 size, char *name)
+diff --git a/goya2/common.h b/goya2/common.h
+index 6458a71..0f82de8 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -11,6 +11,7 @@
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+ 
++#define HL_SP_SRAM_BASE			0x7FFBFE0000ULL
+ #define PPBOOT_TEXT_BASE		0x7FF0000000
+ #define PREBOOT_TEXT_BASE		(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+ 
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index aabd318..e2005db 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -125,7 +125,7 @@
+ 	*regs = mmPSOC_QSPI_CTRLR0;
+ }
+ 
+-void fit_copy_image(u64 dst, const void *buf, int len)
++void fit_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+ 	/* Prepare the ARC SRAM address */
+ 	u32 arc_dst = ((u32)dst & 0xFFFFFFF) | BIT(28);
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 90bca49..3dd0ab5 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -524,7 +524,7 @@
+ 		images[i].loadaddr = load;
+ 		images[i].startaddr = start;
+ 
+-		fit_copy_image(load, buf, len);
++		fit_copy_image(load, buf, len, images[i].arch);
+ 	}
+ 
+ 	return FIT_LOAD_SUCCESS;
+diff --git a/preboot/fit.h b/preboot/fit.h
+index 272036c..ddb60b0 100644
+--- a/preboot/fit.h
++++ b/preboot/fit.h
+@@ -24,7 +24,7 @@
+ 
+ enum fit_load_result fit_load_images(const void *fit, struct fit_image *images);
+ int fit_check_format(const void *fit);
+-void fit_copy_image(u64 dst, const void *buf, int len);
++void fit_copy_image(u64 dst, const void *buf, int len, const char *arch);
+ void preboot_fit_start_images(struct fit_image *image);
+ 
+ #endif /* _HL_FIT_H_ */

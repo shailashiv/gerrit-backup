@@ -1,0 +1,62 @@
+From 8c582a61d5c438fad7aa0c21422858d7e5713339 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Wed, 30 Mar 2022 18:34:42 +0300
+Subject: [PATCH] [SW-78771] pci: check pci init state before en/dis
+
+Accessing PCIe registers such as FLR, must be done only
+when PCIe module is out of reset.
+During PRSTN assertion, PCIe blocks cannot be accessed.
+
+Before accessing any of the pcie blocks we wait for ARC0
+to complete PCIe code execution (reach HALT state),
+which indicates that the PCIe initialization sequence
+is complete and PCIe link is up.
+Then we can be sure the PRSTN is de-asserted and all PCIe
+blocks are operational.
+
+Checking if PCIe initialized is done inside PCIE check
+routine, but it was missing in enable, disable and teardown
+routines, which are actually called in state machine
+whenever another module enters run or run_fast state.
+The missing protection, resulted in an exception
+observed in HLS2 machines, OAM0.
+This patch adds a checking as required.
+
+Change-Id: Ie57cefb43d0e8f750003bed10ce0dfeca442fbd9
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/lib/preboot/module_pci.c b/lib/preboot/module_pci.c
+index 6aed3d4..da56534 100644
+--- a/lib/preboot/module_pci.c
++++ b/lib/preboot/module_pci.c
+@@ -162,6 +162,9 @@
+ 
+ void module_pci_disable(void)
+ {
++	if (!is_pcie_initialized())
++		return;
++
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_disable();
+ 		pci_dev_flr_enable(false);
+@@ -226,6 +229,9 @@
+ 
+ void module_pci_enable(void)
+ {
++	if (!is_pcie_initialized())
++		return;
++
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_enable();
+ 		pci_dev_flr_enable(true);
+@@ -236,6 +242,9 @@
+ 
+ void module_pci_teardown(void)
+ {
++	if (!is_pcie_initialized())
++		return;
++
+ 	if (!hl_is_debug_mode(HL_DEBUG_HW_PCIE)) {
+ 		pci_dev_specific_teardown();
+ 		pci_dev_flr_enable(false);

@@ -1,0 +1,121 @@
+From 685aa5e628f03c3ef7261ea1219d341b1bb17078 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Mon, 30 Nov 2020 07:24:03 +0200
+Subject: [PATCH] [SW-1833] gaudi: reset: add as enabled capability
+
+Add hard reset as enabled capability of the firmware. This will be used
+by the boot image to make sure is can perform hard reset which closes
+PCI while relying on the firmware to open it.
+
+Change-Id: I99178230724988d4f67a5bd118df21f0c817969c
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+(cherry picked from commit 3458f486845a09d81a2256e6ba9cdd42dc425e9c)
+---
+
+diff --git a/gaudi/common.c b/gaudi/common.c
+index cfbee96..29b8765 100644
+--- a/gaudi/common.c
++++ b/gaudi/common.c
+@@ -31,6 +31,8 @@
+ #include <preboot/thermal.h>
+ #include <efuse.h>
+ #include <boot_if.h>
++#include <boot_info.h>
++#include <hl_fw_if.h>
+ 
+ #include "common.h"
+ 
+@@ -344,3 +346,8 @@
+ 
+ 	cpu_boot_dev_sts_clrset(CPU_BOOT_DEV_STS0_SP_SRAM_EN, true);
+ }
++
++void preboot_dev_enable_caps(void)
++{
++	preboot_set_enabled_cap(HL_FW_EN_CAPS_HARD_RESET);
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index db9532d..4384cf5 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -39,6 +39,7 @@
+ 
+ #include <stddef.h>
+ #include <stdbool.h>
++#include <hl_fw_if.h>
+ #include "auto_generated.h"
+ 
+ #define VERSION_MAX_LEN		128
+@@ -145,6 +146,10 @@
+ 				    struct preboot_fuse_ver_data *fuse_data);
+ bool preboot_sram_is_valid_address_range(u64 addr, int len);
+ bool preboot_is_valid_address_range(u64 addr, int len);
++
++void preboot_dev_enable_caps(void);
++void preboot_set_enabled_cap(enum hl_fw_en_caps en_cap);
++void preboot_finalize_enabled_caps(void);
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* COMMON_PREBOOT_H_ */
+diff --git a/preboot/fit.c b/preboot/fit.c
+index 6bccd43..632c59a 100644
+--- a/preboot/fit.c
++++ b/preboot/fit.c
+@@ -650,6 +650,7 @@
+ 		break;
+ 	}
+ 
++	preboot_finalize_enabled_caps();
+ 	boot_info_finalize();
+ 	preboot_start_image(startaddr);
+ }
+diff --git a/preboot/preboot.c b/preboot/preboot.c
+index e3a6e3b..09ccce1 100644
+--- a/preboot/preboot.c
++++ b/preboot/preboot.c
+@@ -15,11 +15,15 @@
+ #include <hl_boot_if.h>
+ #include <boot_if.h>
+ #include <security.h>
++#include <boot_info.h>
++#include <hl_boot_desc.h>
+ 
+ #include "common.h"
+ #include "uart.h"
+ #include "pll.h"
+ #include "cmd_module.h"
++
++static u64 preboot_en_caps;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+ 	{	/* PCI module */
+@@ -226,6 +230,22 @@
+ bool preboot_is_valid_address_range(u64 addr, int len)
+ 	__attribute__((weak, alias("preboot_sram_is_valid_address_range")));
+ 
++__weak void preboot_dev_enable_caps(void) {}
++
++void preboot_set_enabled_cap(enum hl_fw_en_caps en_cap)
++{
++	preboot_en_caps |= BIT(en_cap);
++}
++
++void preboot_finalize_enabled_caps(void)
++{
++	if (!preboot_en_caps)
++		return;
++
++	boot_info_set(HL_BOOT_INFO_EN_CAPS, &preboot_en_caps,
++		      sizeof(preboot_en_caps));
++}
++
+ void preboot_main(void)
+ {
+ 	u64 ver_off = (uintptr_t)preboot_vers;
+@@ -259,5 +279,6 @@
+ 
+ 	preboot_led_on();
+ 	sram_scrambling_init();
++	preboot_dev_enable_caps();
+ 	module_handle_cmds(cmd_ops, ARRAY_SIZE(cmd_ops));
+ }

@@ -1,0 +1,72 @@
+From 0aa7c41b87cea6c2e76e6b1ae5e8b04dae9ed3d2 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Sun, 05 Mar 2023 20:28:49 +0200
+Subject: [PATCH] [SW-126295] gaudi2: print wdog reset cause
+
+Wdog reset can happen for several reasons:
+arm hearbeat failure
+arcpid heartbeat failure,
+or if arcmgmt did not feed watchdog.
+
+Arcmgmt save the information, and on watchdog
+reset the information is passed using cold_rst
+flop register.
+
+Change-Id: I01e752619680a85bdaa7543d85bac0b0f5024380
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index bbffefa..cdef38d 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -128,6 +128,8 @@
+ 
+ }
+ 
++__weak void wd_cause_dump(void) {}
++
+ void rst_src_dump(void)
+ {
+ 	unsigned int rst_src = hl_rst_src_get();
+@@ -168,6 +170,9 @@
+ 	preboot_puts_raw("Last reset cause is: ");
+ 	preboot_puts_raw(cause);
+ 	preboot_puts(" reset\n");
++
++	if (rst_src == HL_WD_RST)
++		wd_cause_dump();
+ }
+ 
+ static bool hl_pcie_link_up(void)
+diff --git a/arch/gaudi2/arc/asic.c b/arch/gaudi2/arc/asic.c
+index 543b44c..e2e26b7 100644
+--- a/arch/gaudi2/arc/asic.c
++++ b/arch/gaudi2/arc/asic.c
+@@ -479,3 +479,26 @@
+ 	gaudi2_sram_ecc_init();
+ 	preboot_puts("bist done for 48MB SRAM\n");
+ }
++
++void wd_cause_dump(void)
++{
++	struct gaudi2_cold_rst_data cold_rst_data;
++
++	cold_rst_data.data = regmap_readl(mmCOLD_RST_DATA);
++
++	if (cold_rst_data.wd_rst_cause_arm)
++		preboot_puts_raw("wd cause: ARM heartbeat\n");
++
++	if (cold_rst_data.wd_rst_cause_arcpid)
++		preboot_puts_raw("wd cause: ARCPID heartbeat\n");
++
++	if ((!cold_rst_data.wd_rst_cause_arm) &&
++		(!cold_rst_data.wd_rst_cause_arcpid))
++		preboot_puts_raw("wd cause: ARCMGMT heartbeat\n");
++
++
++	cold_rst_data.wd_rst_cause_arm = 0;
++	cold_rst_data.wd_rst_cause_arcpid = 0;
++
++	regmap_writel(cold_rst_data.data, mmCOLD_RST_DATA);
++}

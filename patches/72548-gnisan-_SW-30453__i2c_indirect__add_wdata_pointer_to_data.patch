@@ -1,0 +1,339 @@
+From f60e67368ae84cb02aeb2c5cd61b28566d2422f6 Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Tue, 26 Jan 2021 18:46:42 +0200
+Subject: [PATCH] [SW-30453] i2c indirect: add wdata pointer to data
+
+In preparation to CRC compute, refactor WDATA handling so that the
+received data is available for CRC digest.
+
+Change-Id: I1044b1f288d70a143617cbb038ac6159e3f8f5a9
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+index ab4d0a0..a526ce7 100644
+--- a/preboot/i2cslave_indirect.c
++++ b/preboot/i2cslave_indirect.c
+@@ -36,6 +36,7 @@
+ };
+ 
+ struct i2csi_wdata_write_context {
++	u8 *data;   /* Pointer to written data */
+ 	u16 offset; /* Offset of overall written data */
+ 	u16 length; /* Length of bytes to write in a single iteration */
+ 	struct hl_i2ci_wdata_hdr hdr;
+@@ -159,8 +160,19 @@
+ 	return (u8 *)(uintptr_t)(op_memcpy.address + op_memcpy_offset);
+ }
+ 
+-static inline u8 *i2csi_req_buffer_get_writable(u16 rsize, u8 *data,
+-						int dlow, int dhigh)
++static inline void i2csi_req_wdata_wait_for(u8 *data, u16 length)
++{
++	req_wd.data = data;
++	req_wd.length = length;
++}
++
++static inline void i2csi_req_wdata_done(void)
++{
++	i2csi_req_wdata_wait_for(NULL, 0);
++}
++
++static void i2csi_req_buffer_get_writable(u16 rsize, u8 *data, int dlow,
++					  int dhigh)
+ {
+ 	int rlow = req_wd.hdr.offset + req_wd.offset;
+ 	int rhigh = req_wd.hdr.offset + rsize;
+@@ -171,8 +183,8 @@
+ 		if (!req_wd.offset)
+ 			req_sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
+ 
+-		req_wd.length = rhigh - rlow;
+-		return NULL;
++		i2csi_req_wdata_wait_for(NULL, rhigh - rlow);
++		return;
+ 	}
+ 
+ 	/*
+@@ -181,8 +193,8 @@
+ 	 * the next iteration is valid.
+ 	 */
+ 	if (rlow < dlow) {
+-		req_wd.length = dlow - rlow;
+-		return NULL;
++		i2csi_req_wdata_wait_for(NULL, dlow - rlow);
++		return;
+ 	}
+ 
+ 	/*
+@@ -192,20 +204,22 @@
+ 	if (rhigh > dhigh)
+ 		rhigh = dhigh;
+ 
+-	req_wd.length = rhigh - rlow;
+-	return &data[rlow];
++	i2csi_req_wdata_wait_for(&data[rlow], rhigh - rlow);
+ }
+ 
+-static inline u8 *i2csi_req_opcode_get_buffer(u16 size)
++static void i2csi_req_opcode_get_buffer(u16 size)
+ {
+ 	int upper_bound;
++	u8 *data;
+ 
+ 	switch (req_wd.hdr.opcode) {
+ 	case HL_I2CI_REQ_OP_CONFIG_ACCESS:
+ 		upper_bound = offsetof(struct hl_i2ci_config_access, status);
+ 
+-		return i2csi_req_buffer_get_writable(size, (u8 *)&op_config,
+-						     0, upper_bound);
++		i2csi_req_buffer_get_writable(size, (u8 *)&op_config, 0,
++					      upper_bound);
++		break;
++
+ 	case HL_I2CI_REQ_OP_FW_LOADER:
+ 		/*
+ 		 * The firmware data is being placed directly to FIT base
+@@ -213,26 +227,31 @@
+ 		 * the offset int the header an index.
+ 		 * Integrity check is not supported for opcode 12 (fw load)
+ 		 */
+-		req_wd.length = size;
+-		return (u8 *)FIT_IMG_BASE +
++		data = (u8 *)FIT_IMG_BASE +
+ 			(req_wd.hdr.offset * HL_I2CI_REQ_MAX_RQDL);
++		i2csi_req_wdata_wait_for(data, size);
++		break;
+ 
+ 	case HL_I2CI_REQ_OP_MEMCPY_CTRL:
+ 		upper_bound = offsetof(struct hl_i2ci_memcpy_ctrl, status);
+ 
+-		return i2csi_req_buffer_get_writable(size, (u8 *)&op_memcpy,
+-						     0, upper_bound);
++		i2csi_req_buffer_get_writable(size, (u8 *)&op_memcpy, 0,
++					      upper_bound);
++		break;
++
+ 	case HL_I2CI_REQ_OP_MEMCPY_DATA:
+ 		i2csi_req_memcpy_iterate();
+ 
+ 		if (op_memcpy.command != HL_I2CI_MEMCPY_CMD_WRITE)
+ 			op_memcpy.status = HL_I2CI_MEMCPY_STS_FAIL;
+ 
+-		return i2csi_req_memcpy_rw(&req_wd.length);
++		data = i2csi_req_memcpy_rw(&size);
++		i2csi_req_wdata_wait_for(data, size);
++		break;
++
+ 	default:
+ 		/* Data will be consumed from HW but not stored anywhere */
+-		req_wd.length = size;
+-		return NULL;
++		i2csi_req_wdata_wait_for(NULL, size);
+ 	}
+ }
+ 
+@@ -299,18 +318,14 @@
+ 	}
+ }
+ 
+-static inline u32 i2csi_req_wdata_handle_chunk(u8 **data, u8 cnt)
++static void i2csi_req_wdata_handle_chunk(u8 cnt)
+ {
+-	register u8 *buf;
+-
+ 	if (cnt == 2) { /* Chunk (partial payload) is expected */
+-		buf = i2csi_req_opcode_get_buffer(req_chunk.hdr.rqcl);
+-		if (buf)
+-			buf += req_chunk.offset;
++		i2csi_req_opcode_get_buffer(req_chunk.hdr.rqcl);
++		if (req_wd.data)
++			req_wd.data += req_chunk.offset;
+ 
+-		*data = buf;
+-
+-		return req_wd.length;
++		return;
+ 	}
+ 
+ 	/* Chuck received */
+@@ -322,28 +337,20 @@
+ 		req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+ 	}
+ 
+-	return 0;
++	i2csi_req_wdata_done();
+ }
+ 
+-static inline bool i2csi_req_wdata_is_complete(void)
+-{
+-	u16 written = req_wd.length + req_wd.offset;
+-
+-	return written >= req_wd.hdr.rqdl;
+-}
+-
+-static inline u32 i2csi_req_wdata_handle_payload(u8 **data, u8 cnt)
++static void i2csi_req_wdata_handle_payload(void)
+ {
+ 	/* Payload is expected */
+-	if (cnt == 1 || !i2csi_req_wdata_is_complete()) {
+-		req_wd.offset += req_wd.length;
+-		*data = i2csi_req_opcode_get_buffer(req_wd.hdr.rqdl);
+-		return req_wd.length;
++	if (req_wd.offset < req_wd.hdr.rqdl) {
++		i2csi_req_opcode_get_buffer(req_wd.hdr.rqdl);
++		return;
+ 	}
+ 
+ 	/* Payload received */
+ 	req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
+-	return 0;
++	i2csi_req_wdata_done();
+ }
+ 
+ static inline void i2csi_req_reset(void)
+@@ -355,6 +362,52 @@
+ 	req_rd.length = 0;
+ 	req_wd.length = 0;
+ 	req_wd.offset = 0;
++}
++
++void i2csi_req_wdata_handle_write(u8 cnt)
++{
++	if (cnt > 1) /* Skip the header */
++		req_wd.offset += req_wd.length;
++
++	if (req_chunk.hdr.rqcl)
++		i2csi_req_wdata_handle_chunk(cnt);
++	else
++		i2csi_req_wdata_handle_payload();
++}
++
++void i2csi_req_wdata_handle_read(u8 cnt)
++{
++	req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++
++	/* Data read with chunks is not supported */
++	if (req_chunk.hdr.rqcl)
++		req_sts.err = HL_I2CI_REQ_ERR_P_DATA_SIZE;
++	else
++		i2csi_req_process_read_opcode();
++
++	if (req_rd.data) {
++		if (req_wd.hdr.offset < req_rd.length) {
++			/* Adjust the read offset */
++			req_rd.data += req_wd.hdr.offset;
++			req_rd.length -= req_wd.hdr.offset;
++		} else {
++			/* Offset overshoots the read data */
++			req_rd.data = NULL;
++			req_rd.length = 0;
++		}
++
++		/* In case master requested partial data */
++		if (req_wd.hdr.rqdl < req_rd.length)
++			req_rd.length = req_wd.hdr.rqdl;
++
++		req_rd.hdr.rsdl = req_wd.hdr.rqdl;
++		req_sts.rsdl = req_wd.hdr.rqdl;
++		req_sts.sm_sts = HL_I2CI_REQ_ST_TRANSMIT;
++	} else {
++		req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	}
++
++	i2csi_req_wdata_done();
+ }
+ 
+ /*
+@@ -371,72 +424,42 @@
+  * - 4. [cnt=3,chunks]    - payload was written, done this WDATA command
+  *
+  * Arguments:
+- * - data: needs to be set to a designated buffer on which a new data will be
+- *         written into.
+  * - cnt:  the number of time this function is called per current command
+  *         context.
+- *
+- * Returns:
+- *   The number of bytes the lower layer should write into supplied buffer
+- *   before calling this function again. Returning 0 means the command handling
+- *   was finished.
+- */
+-u32 i2csi_req_handle_wdata(u8 **data, u8 cnt)
++  */
++static void i2csi_req_wdata_process_data(u8 cnt)
+ {
+ 	switch (cnt) {
+ 	case 0: /* Header is expected */
+ 		req_sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
+ 		i2csi_req_reset();
+-		*data = req_wd.hdr.data;
+-		return HL_I2CI_REQ_WDATA_LEN;
++		i2csi_req_wdata_wait_for(req_wd.hdr.data,
++					 HL_I2CI_REQ_WDATA_LEN);
++		return;
++
+ 	case 1: /* Chunk header or payload are expected */
+ 		if (HL_I2CI_REQ_RQCL_IS_EXISTS(req_wd.hdr)) {
+-			*data = req_chunk.hdr.data;
+-			return HL_I2CI_REQ_CHUNK_LEN;
++			i2csi_req_wdata_wait_for(req_chunk.hdr.data,
++						 HL_I2CI_REQ_CHUNK_LEN);
++			return;
+ 		}
+ 		/* Fall through */
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (req_wd.hdr.write) {
+-		if (req_chunk.hdr.rqcl)
+-			return i2csi_req_wdata_handle_chunk(data, cnt);
+-		else
+-			return i2csi_req_wdata_handle_payload(data, cnt);
+-	} else {
+-		req_sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++	if (req_wd.hdr.write)
++		i2csi_req_wdata_handle_write(cnt);
++	else
++		i2csi_req_wdata_handle_read(cnt);
++}
+ 
+-		/* Data read with chunks is not supported */
+-		if (req_chunk.hdr.rqcl)
+-			req_sts.err = HL_I2CI_REQ_ERR_P_DATA_SIZE;
+-		else
+-			i2csi_req_process_read_opcode();
++u32 i2csi_req_handle_wdata(u8 **data, u8 cnt)
++{
++	i2csi_req_wdata_process_data(cnt);
++	*data = req_wd.data;
+ 
+-		if (req_rd.data) {
+-			if (req_wd.hdr.offset < req_rd.length) {
+-				/* Adjust the read offset */
+-				req_rd.data += req_wd.hdr.offset;
+-				req_rd.length -= req_wd.hdr.offset;
+-			} else {
+-				/* Offset overshoots the read data */
+-				req_rd.data = NULL;
+-				req_rd.length = 0;
+-			}
+-
+-			/* In case master requested partial data */
+-			if (req_wd.hdr.rqdl < req_rd.length)
+-				req_rd.length = req_wd.hdr.rqdl;
+-
+-			req_rd.hdr.rsdl = req_wd.hdr.rqdl;
+-			req_sts.rsdl = req_wd.hdr.rqdl;
+-			req_sts.sm_sts = HL_I2CI_REQ_ST_TRANSMIT;
+-		} else {
+-			req_sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
+-		}
+-
+-		return 0;
+-	}
++	return req_wd.length;
+ }
+ 
+ /*

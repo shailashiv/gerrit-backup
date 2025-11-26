@@ -1,0 +1,84 @@
+From c558fda8dbd6d5eff5244df6740cc850c2354e77 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Tue, 04 Jun 2019 11:51:10 +0300
+Subject: [PATCH] [SW-0] version: move string to SRAM
+
+Since we now run in scratch pad SRAM, some of the transactions do not
+work with values not aligned to 32 bit.
+In order for us to be able to manipulate the string and keep providing
+versions for upper level S/W, move the version string to the real SRAM.
+
+Consequently, we no longer need the version string in the global scope,
+so move them into the function scope.
+
+Change-Id: Iee616dbd94e616994394a893634b94394a1871cc
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/preboot.c b/common/preboot.c
+index 34c5925..4137a58 100644
+--- a/common/preboot.c
++++ b/common/preboot.c
+@@ -101,36 +101,39 @@
+ }
+ 
+ #ifndef TARGET_IS_TESTER
+-static const char *preboot_ver_str = PREBOOT_VER_STR;
+-static char preboot_btl_ver_str[VERSION_MAX_LEN] = "BTL version ";
+-
+ static void preboot_version(void)
+ {
+-	u64 offset = (u64) preboot_btl_ver_str;
++	const char *btl_ver_tag = "BTL version ";
++	const char *preboot_ver_str = PREBOOT_VER_STR;
++	char *dst_version_str = (char *)PREBOOT_VER_BASE;
++	u64 offset = (u64)dst_version_str;
+ 	u32 btlver = regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_28);
+ 	int i, btl_ver_sz;
+ 
+ 	preboot_puts("\n");
+-	preboot_puts_raw(preboot_btl_ver_str);
++	preboot_puts_raw(btl_ver_tag);
+ 	preboot_puth(btlver, true);
+ 	preboot_puts_raw(preboot_ver_str);
+ 	preboot_puts("\n");
+ 
+-	/* get to the end of the predefined btl string */
+-	for (i = 0; i < VERSION_MAX_LEN; i++)
+-		if (preboot_btl_ver_str[i] == '\0')
++	/* Copy the BTL version tag to destination (SRAM) address */
++	for (i = 0; i < VERSION_MAX_LEN; i++) {
++		if (btl_ver_tag[i] == '\0')
+ 			break;
+ 
++		dst_version_str[i] = btl_ver_tag[i];
++	}
++
+ 	/* convert and copy the btl version */
+-	i += preboot_uint2hexstring(&preboot_btl_ver_str[i], btlver, true);
++	i += preboot_uint2hexstring(&dst_version_str[i], btlver, true);
+ 
+ 	/* separate the btl from preboot */
+-	preboot_btl_ver_str[i++] = '\n';
++	dst_version_str[i++] = '\n';
+ 	btl_ver_sz = i;
+ 
+ 	/* copy the preboot version */
+ 	for (int j = 0; j < VERSION_MAX_LEN - btl_ver_sz - 1; j++) {
+-		preboot_btl_ver_str[i++] = preboot_ver_str[j];
++		dst_version_str[i++] = preboot_ver_str[j];
+ 		if (preboot_ver_str[j] == '\0')
+ 			break;
+ 	}
+diff --git a/common/preboot.h b/common/preboot.h
+index 787deea..e17b16b 100644
+--- a/common/preboot.h
++++ b/common/preboot.h
+@@ -15,6 +15,7 @@
+ #define HL_CFG_BASE				0x7FFC000000ull
+ #define SDRAM_BASE				0x7ff0000000ull
+ #define SPL_TEXT_BASE				0x7ff0080000ull
++#define PREBOOT_VER_BASE			(SPL_TEXT_BASE - 0x1000)
+ 
+ #define HL_UART_BAUDRATE	115200
+ #define HL_SPI_FLASH_MAX_FREQ	25000000

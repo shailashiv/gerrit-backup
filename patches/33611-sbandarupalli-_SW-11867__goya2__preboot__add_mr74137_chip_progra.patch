@@ -1,0 +1,424 @@
+From fb9bbe5e8c703db5963b29bbc2d8827bcf8c8a69 Mon Sep 17 00:00:00 2001
+From: Sailaja <sbandarupalli@habana.ai>
+Date: Sun, 26 Apr 2020 14:37:17 +0300
+Subject: [PATCH] [SW-11867] goya2: preboot: add mr74137 chip programming
+
+This patch adds programming sequences required for initializing and
+coniguring mr74137 on-chip tstd sensors(TMP464)
+
+register programming is done as per Moortec Embedded Temperature Sensor
+and PVT controller datasheets. TS properties are hardcoded as per Goya2
+board since DTS is not available at preboot
+
+Note : patch is not tested on onix platform as temp sensors are not
+available
+
+Change-Id: Icca9c9263427a526e8b13d68bf1cb2dc5237d68f
+Signed-off-by: Sailaja <sbandarupalli@habana.ai>
+---
+
+diff --git a/Makefile b/Makefile
+index 2d042ac..e8678fa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,9 +23,11 @@
+ LDLIBS := -lgcc
+ PREBOOT_LDLIBS = $(LDLIBS) -lfdt
+ 
++PREBOOT_SRCS_C := $(shell ls common/*.c)
++PREBOOT_SRCS_C := $(filter-out common/thermal_v2.c, $(PREBOOT_SRCS_C))
++
+ include $(HL_DEV)/Makefile
+ 
+-PREBOOT_SRCS_C += $(shell ls common/*.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/common.c)
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+ PREBOOT_APP_S := $(shell ls app/crt0_preboot.S)
+diff --git a/common/thermal.c b/common/thermal.c
+index a805597..3d29429 100644
+--- a/common/thermal.c
++++ b/common/thermal.c
+@@ -136,7 +136,7 @@
+ 	memset(hl_ts_data, 0, sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
+ }
+ 
+-void hl_ts_init(void)
++__attribute__((weak)) void hl_dev_ts_init(void)
+ {
+ 	u32 efuse_word, ts;
+ 
+@@ -168,6 +168,11 @@
+ 	}
+ }
+ 
++void hl_ts_init(void)
++{
++	hl_dev_ts_init();
++}
++
+ __attribute__((weak)) int get_sdif_data_offset(void)
+ {
+ 	return HL_TS_SDIF_DATA_OFFSET;
+diff --git a/common/thermal_v2.c b/common/thermal_v2.c
+new file mode 100644
+index 0000000..d25f468
+--- /dev/null
++++ b/common/thermal_v2.c
+@@ -0,0 +1,289 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#include <goya2/goya2_reg_map.h>
++#include <goya2_blocks_linux_driver.h>
++#include <dcon0_tstd_masks.h>
++#include <dcon0_tstd_regs.h>
++
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include <thermal.h>
++#include <string.h>
++
++#include "common.h"
++
++#define HL_TS_CMN_SDIF_WDATA_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_SHIFT
++#define HL_TS_CMN_SDIF_WDATA_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_WDATA_MASK
++#define HL_TS_CMN_SDIF_ADDR_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_SHIFT
++#define HL_TS_CMN_SDIF_ADDR_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_ADDR_MASK
++#define HL_TS_CMN_SDIF_WRN_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_SHIFT
++#define HL_TS_CMN_SDIF_WRN_MASK		DCON0_TSTD_TS_CMN_SDIF_SDIF_WRN_MASK
++#define HL_TS_CMN_SDIF_PROG_SHIFT	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_SHIFT
++#define HL_TS_CMN_SDIF_PROG_MASK	DCON0_TSTD_TS_CMN_SDIF_SDIF_PROG_MASK
++#define HL_TS_CMN_SDIF_STATUS_BUSY_MASK	\
++	DCON0_TSTD_VM_CMN_SDIF_STATUS_SDIF_BUSY_MASK
++/*
++ * sample_data register width is 16 bits, as per MR74137 spec resolution is
++ * from 8 - 12 bits only.
++ */
++#define HL_TS_00_SDIF_DATA_SMPL_DATA_MASK 0xFFF
++#define HL_TS_CMN_CLK_SYNTH_LO_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_LO_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_LO_MASK
++#define HL_TS_CMN_CLK_SYNTH_HI_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HI_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HI_MASK
++#define HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_HOLD_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYNTH_HOLD_MASK
++#define HL_TS_CMN_CLK_SYNTH_ENA_SHIFT	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_SHIFT
++#define HL_TS_CMN_CLK_SYNTH_ENA_MASK	\
++	DCON0_TSTD_TS_CMN_CLK_SYNTH_CLK_SYTH_EN_MASK
++
++#define HL_TS_CMN_SDIF_STATUS		(mmDCON0_TSTD_TS_CMN_SDIF_STATUS & 0xFF)
++#define HL_TS_CMN_SDIF			(mmDCON0_TSTD_TS_CMN_SDIF & 0xFF)
++#define HL_TS_00_SDIF_DATA		(mmDCON0_TSTD_TS_00_SDIF_DATA & 0xFF)
++#define HL_TS_CMN_CLK_SYNTH		(mmDCON0_TSTD_TS_CMN_CLK_SYNTH & 0xFF)
++#define HL_TS_00_ALARMA_CFG		(mmDCON0_TSTD_TS_00_ALARMA_CFG & 0xFF)
++#define HL_TS_00_ALARMB_CFG		(mmDCON0_TSTD_TS_00_ALARMB_CFG & 0xFF)
++
++#define HL_TS_IP_CTRL				0x00
++#define HL_TS_IP_CTRL_AUTO_CONT_MODE		0x108
++#define HL_TS_IP_CFG				0x01
++#define HL_TS_IP_TMR				0x05
++#define HL_TS_IP_TMR_DELAY			0xff
++
++/*
++ * Synthetic clock should be between 4MHz and 8MHz (Use 6MHz)
++ * TODO: confirm clock rate.
++ */
++#define HL_TMP_CLK_RATE				6000000
++
++/*
++ * Note that coefficients are multiplied by 100 for better
++ * accuracy in result.
++ */
++#define TS_CALIB_A_G_COEFF			5740
++#define TS_CALIB_B_H_COEFF			24940
++#define TS_CALIB_DIV_COEFF			4096
++#define TS_UNCALIB_A_G_COEFF			6567
++#define TS_UNCALIB_B_H_COEFF			25410
++#define TS_UNCALIB_DIV_COEFF			4096
++
++#define HL_PVT_COMP_ID				0x00
++#define HL_PVT_COMP_ID_VALUE			0x9b487060
++#define HL_PVT_TM_SCRATCH			0x0c
++#define HL_PVT_TM_SCRATCH_PATTERN		0xAAAAAAAA
++#define HL_TS_PVT_INIT_FAILED			0x1
++
++/* Hard coded each of the goya2 on-chip TS device properties */
++static struct hl_ts_cfg goya2_hl_ts_data[] = {
++	{.base = mmDCORE0_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 10, .hl_tmp_data = { 0 }},
++	{.base = mmDCON0_TSTD_BASE, .alarm_a = 102, .alarm_b =  120,
++		.use_calib = true, .calib_offset = 9, .hl_tmp_data = { 0 }},
++	{.base = mmDCORE1_MME_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 8, .hl_tmp_data = { 0 }},
++	{.base = mmDCON2_TSTD_BASE, .alarm_a = 102, .alarm_b = 120,
++		.use_calib = true, .calib_offset = 7, .hl_tmp_data = { 0 }}
++};
++
++void hl_ts_data_init(void)
++{
++	goya2_hl_ts_data[0].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	goya2_hl_ts_data[1].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	goya2_hl_ts_data[2].freq = hl_pll_get_freq(mmPSOC_SIF_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	goya2_hl_ts_data[3].freq = hl_pll_get_freq(mmPSOC_MME_PLL_CTRL_BASE,
++						HL_PLL_DIV3);
++	memcpy(hl_ts_data, goya2_hl_ts_data,
++			sizeof(struct hl_ts_cfg) * HL_ASIC_TS_MAX_COUNT);
++}
++
++void hl_set_calib_coeff(int ts, bool calib_enabled,
++		struct hl_tmp_opmode_info *calib_data)
++{
++	if (calib_enabled) {
++		calib_data->coef_a_g = TS_CALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_CALIB_B_H_COEFF;
++		calib_data->coef_div = TS_CALIB_DIV_COEFF;
++		calib_data->opmode = true;
++	} else {
++		calib_data->coef_a_g = TS_UNCALIB_A_G_COEFF;
++		calib_data->coef_b_h = TS_UNCALIB_B_H_COEFF;
++		calib_data->coef_div = TS_UNCALIB_DIV_COEFF;
++		calib_data->opmode = false;
++	}
++}
++
++static bool hl_tmp_is_sdif_free(u32 addr)
++{
++	unsigned int regval;
++	int retry = 5;
++
++	do {
++		regval = regmap_readl(addr + HL_TS_CMN_SDIF_STATUS);
++		if ((regval & HL_TS_CMN_SDIF_STATUS_BUSY_MASK) == 0)
++			return true;
++
++		retry--;
++		udelay(100);
++	} while (retry != 0);
++
++	return false;
++}
++
++static inline void sdif_write(u32 reg_add, u32 wdata, u8 addr,
++		bool wrn, bool prog)
++{
++
++	u32 regval = (wdata << HL_TS_CMN_SDIF_WDATA_SHIFT)
++		& HL_TS_CMN_SDIF_WDATA_MASK;
++	regval |= (addr << HL_TS_CMN_SDIF_ADDR_SHIFT)
++		& HL_TS_CMN_SDIF_ADDR_MASK;
++	regval |= (wrn << HL_TS_CMN_SDIF_WRN_SHIFT)
++		& HL_TS_CMN_SDIF_WRN_MASK;
++	regval |= (prog << HL_TS_CMN_SDIF_PROG_SHIFT)
++		& HL_TS_CMN_SDIF_PROG_MASK;
++
++	regmap_writel(regval, reg_add + HL_TS_CMN_SDIF);
++}
++
++void hl_ts_sdif_set(u32 addr, bool use_calib)
++{
++	/* program sensor power up delay */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, HL_TS_IP_TMR_DELAY, HL_TS_IP_TMR, 1, 1);
++
++	/* configure sensor mode */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, use_calib, HL_TS_IP_CFG, 1, 1);
++
++	/* power up sensor in continuous mode */
++	if (hl_tmp_is_sdif_free(addr))
++		sdif_write(addr, HL_TS_IP_CTRL_AUTO_CONT_MODE, HL_TS_IP_CTRL,
++				1, 1);
++}
++
++void hl_ts_clk_set(u32 addr, unsigned int clk)
++{
++	unsigned int synth_clk;
++	unsigned int val;
++
++	synth_clk = ((clk / HL_TMP_CLK_RATE) / 2) - 1;
++
++	val = (synth_clk << HL_TS_CMN_CLK_SYNTH_LO_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_LO_MASK;
++	val |= (synth_clk << HL_TS_CMN_CLK_SYNTH_HI_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_HI_MASK;
++	val |= (1 << HL_TS_CMN_CLK_SYNTH_HOLD_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_HOLD_MASK;
++	val |= (1 << HL_TS_CMN_CLK_SYNTH_ENA_SHIFT)
++		& HL_TS_CMN_CLK_SYNTH_ENA_MASK;
++
++	regmap_writel(val, addr + + HL_TS_CMN_CLK_SYNTH);
++}
++
++/*
++ * convert 12-bit HL_TMP register value to milliCelsius
++ *
++ * Mode 1: output conversion (calibrated)
++ * Temp = A + B * Eqbs
++ *
++ * Mode 2: output conversion (uncalibrated)
++ * Temp = G + H * Eqbs
++ *
++ * Eqbs = Nbs / cal5 - 0.5
++ *
++ */
++
++long hl_tmp_temp_reg_to_mC(int val, int ts)
++{
++	long tmp = (val & HL_TS_00_SDIF_DATA_SMPL_DATA_MASK);
++	u32 coef_a_g, coef_b_h, coef_div;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++
++	tmp = coef_a_g + ((coef_b_h * (((tmp * 1000) / coef_div) -
++					500)) / 1000);
++
++	/*
++	 * result of equation has to be multiplied
++	 * by 1000, since coefficients are multiplied by 100 an extra
++	 * multiplication of 10 is required.
++	 */
++	tmp *= 10;
++
++	return tmp;
++}
++
++/* convert milliCelsius to 12-bit HL_TMP register value */
++u32 hl_tmp_mC_to_temp_reg(long val, int ts)
++{
++	u32 reg_val;
++	u32 coef_a_g, coef_b_h, coef_div;
++
++	coef_a_g = hl_ts_data[ts].hl_tmp_data.coef_a_g;
++	coef_b_h = hl_ts_data[ts].hl_tmp_data.coef_b_h;
++	coef_div = hl_ts_data[ts].hl_tmp_data.coef_div;
++
++	reg_val = ((coef_div * ((val / 10) -
++					coef_a_g + (coef_b_h / 2))) / coef_b_h);
++
++	return reg_val & HL_TS_00_SDIF_DATA_SMPL_DATA_MASK;
++}
++
++int get_alarma_offset(void)
++{
++	return HL_TS_00_ALARMA_CFG;
++}
++
++int get_alarmb_offset(void)
++{
++	return HL_TS_00_ALARMB_CFG;
++}
++
++int get_sdif_data_offset(void)
++{
++	return HL_TS_00_SDIF_DATA;
++}
++
++int get_sdif_offset(void)
++{
++	return HL_TS_CMN_SDIF;
++}
++
++int hl_ts_pvt_init(int ts)
++{
++	unsigned int regval;
++
++	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_COMP_ID);
++	if (regval !=  HL_PVT_COMP_ID_VALUE)
++		return HL_TS_PVT_INIT_FAILED;
++
++	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH);
++	if (regval !=  0x0)
++		return HL_TS_PVT_INIT_FAILED;
++
++	regmap_writel(HL_PVT_TM_SCRATCH_PATTERN,
++			(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH));
++	regval = regmap_readl(hl_ts_data[ts].base + HL_PVT_TM_SCRATCH);
++	if (regval !=  HL_PVT_TM_SCRATCH_PATTERN)
++		return HL_TS_PVT_INIT_FAILED;
++
++	return 0;
++}
+diff --git a/goya2/Makefile b/goya2/Makefile
+index 861ab3b..a448026 100644
+--- a/goya2/Makefile
++++ b/goya2/Makefile
+@@ -1 +1,2 @@
+ FW_SIZE := 0x4400
++PREBOOT_SRCS_C += $(shell ls common/thermal_v2.c)
+diff --git a/goya2/common.h b/goya2/common.h
+index 36f6cf1..6cd52a8 100644
+--- a/goya2/common.h
++++ b/goya2/common.h
+@@ -6,15 +6,13 @@
+  */
+ 
+ #include <preboot.h>
+-#include <goya2_blocks.h>
++#include <goya2_blocks_linux_driver.h>
+ 
+ #define HL_FW_BOOT_PTRS_BASE		0x80000
+ #define HL_SPI_LEGACY_PREBOOT_OFF	0xC0000
+ 
+ #define PPBOOT_TEXT_BASE		0x7FF0000000
+ #define PREBOOT_TEXT_BASE		(PPBOOT_TEXT_BASE + PPBOOT_SIZE)
+-
+-#define mmPSOC_PCI_PLL_BASE		(mmPSOC_PCI_PLL_CTRL_BASE & 0x00FFFFFF)
+ 
+ #define FUSE_WORDS_PER_BANK		0x40
+ #define I2C_SLAVE_ADDRESS		0x6A
+diff --git a/goya2/onix.c b/goya2/onix.c
+index 27d60f0..de1219e 100644
+--- a/goya2/onix.c
++++ b/goya2/onix.c
+@@ -50,3 +50,5 @@
+ }
+ 
+ void preboot_sync_btl(void) {}
++
++void hl_dev_ts_init(void) {}
+diff --git a/goya2_arc_gnu/Makefile b/goya2_arc_gnu/Makefile
+index 9c22872..bdefa90 100644
+--- a/goya2_arc_gnu/Makefile
++++ b/goya2_arc_gnu/Makefile
+@@ -1,3 +1,4 @@
+ FW_SIZE := 0x8000
+ 
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/pll.c)
++PREBOOT_SRCS_C += $(shell ls common/thermal_v2.c)
+diff --git a/goya2_arc_gnu/common.c b/goya2_arc_gnu/common.c
+index e1bcba0..2098852 100644
+--- a/goya2_arc_gnu/common.c
++++ b/goya2_arc_gnu/common.c
+@@ -21,6 +21,7 @@
+ #include <hl_boot_if.h>
+ #include <goya2/goya2_reg_map.h>
+ #include <pci_ids.h>
++#include <goya2_blocks_linux_driver.h>
+ 
+ #include <preboot.h>
+ #include <pll.h>
+diff --git a/goya2_arc_gnu/onix.c b/goya2_arc_gnu/onix.c
+index 6d86fbc..d3e55fd 100644
+--- a/goya2_arc_gnu/onix.c
++++ b/goya2_arc_gnu/onix.c
+@@ -55,3 +55,4 @@
+ 
+ void preboot_init_pcie_phy(void) {}
+ 
++void hl_dev_ts_init(void) {}

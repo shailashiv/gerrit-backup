@@ -1,0 +1,184 @@
+From 2064c4205c08d3ff12470b36044813d893cdd0e2 Mon Sep 17 00:00:00 2001
+From: ran shalit <rshalit@habana.ai>
+Date: Mon, 18 Oct 2021 20:35:47 +0300
+Subject: [PATCH] [SW-56241] boot_info: add crc32 checksum
+
+Add crc32 in hl_boot_info_desc struct.
+In addition, a version represent the checksum
+algo and the checksum data in struct, i.e.
+version #0 is for sha256 with checksum field in
+struct, and version #1 is for crc32 with crc32 field
+in struct (version number is set in zephyr config).
+This design is more generic then code dependent,
+and was proposed by IgorG.
+
+Change-Id: I61eb79fa47f34368757129f9603a2a0ba92ca7fb
+Signed-off-by: ran shalit <rshalit@habana.ai>
+---
+
+diff --git a/arch/gaudi/arm/common.c b/arch/gaudi/arm/common.c
+index a51cadf..91dad3a 100644
+--- a/arch/gaudi/arm/common.c
++++ b/arch/gaudi/arm/common.c
+@@ -26,6 +26,7 @@
+ #include <hl_boot_if.h>			/* requires stdint.h */
+ #include <boot_if.h>
+ #include <gaudi/gaudi_reg_map.h>
++#include <gaudi/gaudi_boot_info.h>
+ #include <gaudi/gaudi_fw_if.h>
+ #include <common/pci_ids.h>
+ #include <cpu_ca53_cfg_regs.h>
+@@ -616,3 +617,8 @@
+ 	if (__stack2 != STACK_CANARY_MAGIC_WORD)
+ 		cpu_boot_err_set(CPU_BOOT_ERR_BOOT_FW_CRIT_ERR);
+ }
++
++u16 hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index fa50710..2d60d83 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -28,6 +28,7 @@
+ #include <preboot.h>
+ #include <cmd_module.h>
+ #include <gaudi2/gaudi2_reg_map.h>
++#include <gaudi2/gaudi2_boot_info.h>
+ #include <psoc_reset_conf_regs.h>
+ #include <psoc_reset_conf_masks.h>
+ #include <gaudi2_blocks_linux_driver.h>
+@@ -996,3 +997,8 @@
+ {
+ 	return ((u32)base - SDRAM_BASE);
+ }
++
++u16 hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
+diff --git a/arch/greco/common/common.c b/arch/greco/common/common.c
+index 0fd48ee..ee0fbc0 100644
+--- a/arch/greco/common/common.c
++++ b/arch/greco/common/common.c
+@@ -38,7 +38,7 @@
+ #include <preboot/thermal.h>
+ #include <efuse.h>
+ #include <hl.h>
+-
++#include <greco/greco_boot_info.h>
+ 
+ #define mmPCIE_WRAP_VUART_TX_DATA       0xC15F60
+ #define mmPCIE_WRAP_VUART_TX_STATUS     0xC15F64
+@@ -574,3 +574,8 @@
+ 	val |= (0x1 << PSOC_GLOBAL_CONF_AXI_DRAIN_CTRL_EN_SHIFT);
+ 	regmap_writel(val, mmPSOC_GLOBAL_CONF_AXI_DRAIN_CTRL);
+ }
++
++u16 hl_get_boot_info_ver(void)
++{
++	return HL_BOOT_INFO_VERSION;
++}
+diff --git a/include/boot_info.h b/include/boot_info.h
+index 41faf14..8d9c3e4 100644
+--- a/include/boot_info.h
++++ b/include/boot_info.h
+@@ -12,5 +12,6 @@
+ void boot_info_finalize(void);
+ int boot_info_set(u32 type, const void *data, u32 size);
+ int boot_info_get(u32 type, void *data, u32 max_size, u32 *copy_size);
++u16 hl_get_boot_info_ver(void);
+ 
+ #endif /* _BOOT_INFO_H_ */
+diff --git a/lib/preboot/boot_info.c b/lib/preboot/boot_info.c
+index 72bbbee..1e3f345 100644
+--- a/lib/preboot/boot_info.c
++++ b/lib/preboot/boot_info.c
+@@ -10,6 +10,7 @@
+ #include <hl_boot_desc.h>
+ #include <common.h>
+ #include <sha256.h>
++#include <crc32.h>
+ 
+ #include "boot_info.h"
+ #include "uart.h"
+@@ -52,6 +53,38 @@
+ 	return NULL;
+ }
+ 
++static void create_sha_csum(const unsigned char *input, unsigned int ilen,
++			    struct hl_boot_info_desc *desc)
++{
++	uint32_t crc32_res;
++	uint16_t boot_info_version = hl_get_boot_info_ver();
++
++	if (!boot_info_version) {
++		sha256_csum(input, ilen, desc->chksum);
++	} else {
++		crc32_res = crc32(0, input, ilen);
++		memcpy(&desc->crc32, &crc32_res, sizeof(crc32_res));
++	}
++}
++
++static int validate_sha_csum(struct hl_boot_info_ptrs *ptrs,
++			     const unsigned char *input,
++			     unsigned int ilen,
++			     struct hl_boot_info_desc *desc)
++{
++	u8 chksum[HL_BOOT_INFO_CSUM_SIZE];
++	u32 crc32_res;
++
++	if (!ptrs->desc_ver) {
++		sha256_csum(input, ilen, chksum);
++		return memcmp(chksum, desc->chksum, HL_BOOT_INFO_CSUM_SIZE);
++	}
++
++	/* for version >= 1 */
++	crc32_res = crc32(0, input, ilen);
++	return memcmp(&crc32_res, &desc->crc32, CRC32_NUM_BYTES);
++}
++
+ void boot_info_finalize(void)
+ {
+ 	struct hl_boot_info_desc *desc;
+@@ -66,6 +99,8 @@
+ 		return;
+ 
+ 	boot_info.ptrs.magic = HL_BOOT_INFO_MAGIC;
++	boot_info.ptrs.desc_ver = hl_get_boot_info_ver();
++	boot_info.ptrs.desc_sz = sizeof(struct hl_boot_info_desc);
+ 
+ 	/* Data offset */
+ 	offset = sizeof(struct hl_boot_info_ptrs) +
+@@ -79,7 +114,7 @@
+ 	for (i = 0; i < boot_info.ptrs.count; i++) {
+ 		desc = &descs[i];
+ 		src = offset2ptr(desc->offset, PREBOOT_TEXT_BASE);
+-		sha256_csum((u8 *)src, desc->size, desc->chksum);
++		create_sha_csum((u8 *)src, desc->size, desc);
+ 		copy_sz = ROUND_UP4(desc->size);
+ 
+ 		for (j = 0; j < copy_sz / sizeof(u32); j++)
+@@ -169,8 +204,8 @@
+ 	struct hl_boot_info_ptrs ptrs;
+ 	struct hl_boot_info_desc desc;
+ 	u32 *offsets, i, cpy_sz;
+-	u8 chksum[SHA256_SUM_LEN];
+ 	void *src;
++	int ret;
+ 
+ 	ptrs = *(struct hl_boot_info_ptrs *)offset2ptr(0, BOOT_INFO_BASE);
+ 	if (ptrs.magic != HL_BOOT_INFO_MAGIC)
+@@ -192,8 +227,9 @@
+ 		src = offset2ptr(desc.offset, BOOT_INFO_BASE);
+ 		boot_info_memcpy32(data, src, cpy_sz);
+ 
+-		sha256_csum((u8 *)data, desc.size, chksum);
+-		if (memcmp(chksum, desc.chksum, SHA256_SUM_LEN))
++		ret = validate_sha_csum(&ptrs, (u8 *)data, desc.size,
++					&desc);
++		if (ret)
+ 			return 1;
+ 
+ 		*copy_size = cpy_sz;

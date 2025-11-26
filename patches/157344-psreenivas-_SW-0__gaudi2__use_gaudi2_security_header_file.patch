@@ -1,0 +1,473 @@
+From 8cab392d783669976554f2ec4bc57ce0e4515dae Mon Sep 17 00:00:00 2001
+From: Pavan S <psreenivas@habana.ai>
+Date: Thu, 16 Dec 2021 05:42:25 +0200
+Subject: [PATCH] [SW-0] gaudi2: use gaudi2_security header file
+
+This patch reuses the structures and macros defined
+in gaudi2_security.h header file defined in specs
+
+Signed-off-by: Pavan S <psreenivas@habana.ai>
+Change-Id: Ie595b411df6213827ca5cad5ec3c99a12aa94536
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index 443cca3..a59cbd3 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -9,6 +9,7 @@
+ #include <uart.h>
+ #include <memory.h>
+ #include <gaudi2/gaudi2.h>
++#include <gaudi2/gaudi2_security.h>
+ #include <gaudi2_blocks.h>
+ #include <security.h>
+ #include <uart.h>
+@@ -35,182 +36,9 @@
+ #include <dcore0_vdec0_mstr_if_core_lbw_regs.h>
+ #include <pmmu_hbw_mstr_if_core_hbw_regs.h>
+ 
+-/*
+- * instances_num : Number of instances of RR to program.
+- * instances_dist : Distance between consecutive instances.
+- * type : full/short
+- * min_<type>_breg : base register for RR min register.
+- * max_<type>_breg : base register for RR max register.
+- * hit_wr_breg : base register for hit write.
+- * hit_wr_breg : base register for hit read.
+- */
+-struct hl_sec_rrs_cfg {
+-	u32 instances_dist;
+-	u32 min_short_breg;
+-	u32 max_short_breg;
+-	u32 min_full_breg;
+-	u32 max_full_breg;
+-	u32 hit_wr_breg;
+-	u32 hit_rd_breg;
+-};
+-
+-/*
+- * Structure to select the engine rr
+- * to be configured. Allows the flexibility
+- * to use common api to choose specific
+- * engines.
+- *
+- * noc : selects rtr and sft rrs
+- * psoc : selects psoc rrs
+- * pcie : selects pcie rrs
+- */
+-struct hl_rr_eng_select {
+-	u8 noc;
+-	u8 pcie;
+-	u8 psoc;
+-	u8 pad;
+-};
+-
+-struct hbw_rr_addr {
+-	u32 lo;
+-	u32 hi;
+-};
+-
+-struct hl_sec_rrs_cfg_hbw {
+-	u32 instances_dist;
+-	struct hbw_rr_addr min_short;
+-	struct hbw_rr_addr max_short;
+-	struct hbw_rr_addr min_full;
+-	struct hbw_rr_addr max_full;
+-	u32 hit_wr_breg;
+-	u32 hit_rd_breg;
+-};
+-
+-struct hit_regs {
+-	u32 hit_wr;
+-	u32 hit_rd;
+-};
+-
+-/*
+- * Single instance of range register. Helper structure
+- * to generalize implementation between short and full.
+- */
+-struct lbw_rr_reg {
+-	u32 rr_idx_calc;
+-	u32 data_min;
+-	u32 data_max;
+-	u32 reg_min;
+-	u32 reg_max;
+-	struct hit_regs hit;
+-};
+-
+-struct hbw_rr_reg {
+-	u32 rr_idx_calc;
+-	u64 data_min;
+-	u64 data_max;
+-	struct hbw_rr_addr reg_min;
+-	struct hbw_rr_addr reg_max;
+-	struct hit_regs hit;
+-};
+-
+-enum hl_sec_engine_type {
+-	HL_SEC_ENGINE_IF_RTR,
+-	HL_SEC_ENGINE_PCIE,
+-	HL_SEC_ENGINE_PSOC,
+-	HL_SEC_ENGINE_SFT,
+-};
+-
+-/*
+- * There are 18(0..17 rr idx) RRs for LBW.
+- * The classification and apis are as listed below:
+- *
+- * 1) 14(0..13 rr idx) Regions with 4KB granularity
+- * API: hl_secure_lbw_rr(rr idx, min addr, max addr, rr sel)
+- *
+- * 2) 4(14..17 rr idx) Regions with full address range.
+- * API: hl_secure_lbw_rr(rr idx, min addr, max addr, rr sel)
+- *
+- * rr idx type : gaudi2_sec_if_lbw_rrs
+- * Based on the rr idx mentioned above the api would use
+- * the short/full rrs.
+- * NOTE: The apis listed above will block all read and write
+- * transactions for the input address range.
+- */
+-enum gaudi2_sec_if_lbw_rrs {
+-	HL_SEC_LBW_DBG_CFG_SPACE = 0,
+-	HL_SEC_LBW_PSOC_GLBL_CONF = 1,
+-	HL_SEC_LBW_MAX_RR_IDX = 18,
+-};
+-
+-/*
+- * There are 10(0..9 rr idx) RRs for HBW
+- * NOTE: All the RRs for HBW are of 4KB granularity
+- *
+- * 1) 6(0..5 rr idx) Regions with 39 bit addressing
+- * API: hl_secure_hbw_rr(rr idx, min addr, max addr, rr sel)
+- *
+- * 2) 2(6..7 rr idx) Regions with 50 bit addressing.
+- * API: hl_secure_hbw_rr(rr idx, min addr, max addr, rr sel)
+- *
+- * 3) 2(8..9 rr idx) Regions with 50 bit addressing, to block only write.
+- * API: hl_secure_hbw_rr(rr idx, min addr, max addr,  rr sel)
+- *
+- * rr idx type : gaudi2_sec_if_hbw_rrs
+- */
+-enum gaudi2_sec_if_hbw_rrs {
+-	HL_SEC_HBW_SPI_FLASH = 0,
+-	HL_SEC_HBW_ICCM0_TO_SP_SRAM = 1,
+-	HL_SEC_HBW_PSOC_LBW = 2,
+-	HL_SEC_HBW_SRAM_BGN = 3,
+-	HL_SEC_HBW_SRAM_IMG = 4,
+-	/*
+-	 * HL_SEC_HBW_PSOC_LBW is a special case RR, because
+-	 * for gaudi2 JT/MSTR/I2C RRs do not have a dedicated
+-	 * LBW RR, but instead can use the HBW RRs to block
+-	 * LBW Ranges.
+-	 */
+-	HL_SEC_HBW_SRAM = 6,
+-	/*
+-	 * SRAM END points to the first byte of HBM
+-	 * hence a full rr needs to be used.
+-	 */
+-	HL_SEC_HBW_SRAM_END = HL_SEC_HBW_SRAM,
+-	HL_SEC_HBW_SRAM_RO = 8,
+-	HL_SEC_HBW_SF_RO = 9,
+-	HL_SEC_HBW_MAX_RR_IDX = 10,
+-};
+-
+-enum preboot_sec_dyn_rr_window {
+-	SRAM_BGN_TO_IMG = 0,
+-	IMAGE,
+-	IMG_END_TO_SRAM_END,
+-};
+-
+-struct preboot_sec_dyn_pcie_rr_cfg {
+-	int rr;
+-	u64 min;
+-	u64 max;
+-};
+-
+-#define DCORE_DIST	0x200000
+-#define SFT_DIST	0x10000
+-#define IF_RTR_DIST	0x8000
+-#define PCIE_INST_NUM	3 /* ELBI, LBW, MSTR */
+-#define PCIE_INST_DIST	0x1000
+-#define PSOC_INST_NUM	3 /* JTAG, SMI, I2C */
+-#define PSOC_INST_DIST	0x1000
+-#define SFT_INST_NUM	1
+-#define SHIFT_4K_POS	12
+-#define PCIE_HBW_NUM	1
+-/*
+- * Number of RTRs which allow pcie traffic
+- * (DCORE0 RTR0 for gaudi2)
+- */
+-#define PCIE_RTR_NUM	1
+-
+ static struct hl_sec_rrs_cfg hl_sec_lbw_rrs_tbl[] = {
+ 	[HL_SEC_ENGINE_IF_RTR] = {
+-		.instances_dist = IF_RTR_DIST,
++		.instances_dist = HL_SEC_IF_RTR_DIST,
+ 		.min_short_breg = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_SHORT_0,
+ 		.max_short_breg = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_SHORT_0,
+ 		.min_full_breg = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
+@@ -219,7 +47,7 @@
+ 		.hit_rd_breg = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_LBW_PRIV_HIT_AR,
+ 	},
+ 	[HL_SEC_ENGINE_PCIE] = {
+-		.instances_dist = PCIE_INST_DIST,
++		.instances_dist = HL_SEC_PCIE_INST_DIST,
+ 		.min_short_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_SHORT_0,
+ 		.max_short_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MAX_SHORT_0,
+ 		.min_full_breg = mmPCIE_ELBI_RR_MSTR_IF_RR_SHRD_LBW_PRIV_RANGE_MIN_0,
+@@ -238,12 +66,9 @@
+ 	}
+ };
+ 
+-#define HBW_SFT_DIST		0x4000
+-#define HBW_SFT_INST_NUM	2
+-
+ static struct hl_sec_rrs_cfg_hbw hl_sec_hbw_rrs_tbl[] = {
+ 	[HL_SEC_ENGINE_IF_RTR] = {
+-		.instances_dist = IF_RTR_DIST,
++		.instances_dist = HL_SEC_IF_RTR_DIST,
+ 		.min_short.lo = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
+ 		.min_short.hi = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
+ 		.max_short.lo = mmDCORE0_RTR0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
+@@ -269,7 +94,7 @@
+ 		.hit_rd_breg = mmPCIE_MSTR_RR_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
+ 	},
+ 	[HL_SEC_ENGINE_PSOC] = {
+-		.instances_dist = PSOC_INST_DIST,
++		.instances_dist = HL_SEC_PSOC_INST_DIST,
+ 		.min_short.lo = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
+ 		.min_short.hi = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
+ 		.max_short.lo = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
+@@ -282,7 +107,7 @@
+ 		.hit_rd_breg = mmJT_MSTR_IF_RR_SHRD_HBW_PRIV_HIT_AR,
+ 	},
+ 	[HL_SEC_ENGINE_SFT] = {
+-		.instances_dist = HBW_SFT_DIST,
++		.instances_dist = HL_SEC_HBW_SFT_DIST,
+ 		.min_short.lo = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_LO_0,
+ 		.min_short.hi = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MIN_SHORT_HI_0,
+ 		.max_short.lo = mmSFT0_HBW_RTR_IF0_MSTR_IF_RR_SHRD_HBW_PRIV_RANGE_MAX_SHORT_LO_0,
+@@ -298,7 +123,7 @@
+ 
+ #define SRAM_END	(SRAM_BASE_ADDR + SRAM_SIZE)
+ 
+-static struct preboot_sec_dyn_pcie_rr_cfg preboot_sec_dyn_cfg[] = {
++static struct hl_sec_dyn_pcie_rr_cfg preboot_sec_dyn_cfg[] = {
+ 	[SRAM_BGN_TO_IMG] = {
+ 		.rr = HL_SEC_HBW_SRAM_BGN,
+ 		.min = SRAM_BASE_ADDR,
+@@ -334,22 +159,17 @@
+ 	regmap_writel(hit | BIT(rr_idx), rr_dest);
+ }
+ 
+-#define BITS_IN_REG			32
+-#define GAUDI2_HBW_SHORT_MASK		0xF
+-#define GAUDI2_MAX_HBW_SHORT_RR		6
+-#define GAUDI2_HBW_WRITE_ONLY_RR_IDX	8
+-
+ static void hl_secure_update_rr_reg_hbw(int rr_idx, u32 inst_offset,
+ 		struct hbw_rr_reg *rr_reg)
+ {
+ 	u32 rr_base, rr_dest;
+-	u32 data_max_hi = ((u32)(rr_reg->data_max >> BITS_IN_REG));
+-	u32 data_min_hi = ((u32)(rr_reg->data_min >> BITS_IN_REG));
+-	bool write_only = rr_idx >= GAUDI2_HBW_WRITE_ONLY_RR_IDX;
++	u32 data_max_hi = ((u32)(rr_reg->data_max >> HL_SEC_BITS_IN_REG));
++	u32 data_min_hi = ((u32)(rr_reg->data_min >> HL_SEC_BITS_IN_REG));
++	bool write_only = rr_idx >= HL_SEC_GAUDI2_HBW_WRITE_ONLY_RR_IDX;
+ 
+-	if (rr_idx < GAUDI2_MAX_HBW_SHORT_RR) {
+-		data_max_hi &= GAUDI2_HBW_SHORT_MASK;
+-		data_min_hi &= GAUDI2_HBW_SHORT_MASK;
++	if (rr_idx < HL_SEC_GAUDI2_MAX_HBW_SHORT_RR) {
++		data_max_hi &= HL_SEC_GAUDI2_HBW_SHORT_MASK;
++		data_min_hi &= HL_SEC_GAUDI2_HBW_SHORT_MASK;
+ 	}
+ 
+ 	rr_base = rr_reg->rr_idx_calc * sizeof(u32) + inst_offset;
+@@ -372,15 +192,15 @@
+ 	struct hbw_rr_reg rr_reg;
+ 	struct hl_sec_rrs_cfg_hbw *cfg = &hl_sec_hbw_rrs_tbl[type];
+ 
+-	rr_reg.data_min = min >> SHIFT_4K_POS;
+-	rr_reg.data_max = max >> SHIFT_4K_POS;
++	rr_reg.data_min = min >> HL_SEC_SHIFT_4K_POS;
++	rr_reg.data_max = max >> HL_SEC_SHIFT_4K_POS;
+ 
+-	if (rr_idx < GAUDI2_MAX_HBW_SHORT_RR) {
++	if (rr_idx < HL_SEC_GAUDI2_MAX_HBW_SHORT_RR) {
+ 		rr_reg.rr_idx_calc = rr_idx;
+ 		rr_reg.reg_min = cfg->min_short;
+ 		rr_reg.reg_max = cfg->max_short;
+ 	} else {
+-		rr_reg.rr_idx_calc = rr_idx - GAUDI2_MAX_HBW_SHORT_RR;
++		rr_reg.rr_idx_calc = rr_idx - HL_SEC_GAUDI2_MAX_HBW_SHORT_RR;
+ 		rr_reg.reg_min = cfg->min_full;
+ 		rr_reg.reg_max = cfg->max_full;
+ 	}
+@@ -423,8 +243,8 @@
+ 
+ 	if (rr_idx < MAX_LBW_SHORT_RR) {
+ 		rr_reg.rr_idx_calc = rr_idx;
+-		rr_reg.data_min >>= SHIFT_4K_POS;
+-		rr_reg.data_max >>= SHIFT_4K_POS;
++		rr_reg.data_min >>= HL_SEC_SHIFT_4K_POS;
++		rr_reg.data_max >>= HL_SEC_SHIFT_4K_POS;
+ 		rr_reg.reg_min = cfg->min_short_breg;
+ 		rr_reg.reg_max = cfg->max_short_breg;
+ 	} else {
+@@ -447,29 +267,26 @@
+ 	int i;
+ 
+ 	if (rr_sel.noc) {
+-		for (i = 0; i < NUM_OF_DCORES; i++) {
+-			hl_secure_lbw_rr_gen(rr_idx, min, max, DCORE_DIST * i,
++		for (i = 0; i < HL_SEC_NUM_OF_DCORES; i++) {
++			hl_secure_lbw_rr_gen(rr_idx, min, max, HL_SEC_DCORE_DIST * i,
+ 					NUM_OF_RTR_PER_DCORE, HL_SEC_ENGINE_IF_RTR);
+ 
+-			hl_secure_lbw_rr_gen(rr_idx, min, max, SFT_DIST * i,
+-					SFT_INST_NUM, HL_SEC_ENGINE_SFT);
++			hl_secure_lbw_rr_gen(rr_idx, min, max, HL_SEC_SFT_DIST * i,
++					HL_SEC_SFT_INST_NUM, HL_SEC_ENGINE_SFT);
+ 		}
+ 	}
+ 
+ 	if (rr_sel.pcie) {
+-		hl_secure_lbw_rr_gen(rr_idx, min, max, 0, PCIE_INST_NUM, HL_SEC_ENGINE_PCIE);
++		hl_secure_lbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_INST_NUM, HL_SEC_ENGINE_PCIE);
+ 		if (!rr_sel.noc)
+-			hl_secure_lbw_rr_gen(rr_idx, min, max, 0, PCIE_RTR_NUM,
++			hl_secure_lbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_RTR_NUM,
+ 						HL_SEC_ENGINE_IF_RTR);
+ 	}
+ 
+ 	if (rr_sel.psoc)
+-		hl_secure_hbw_rr_gen(HL_SEC_HBW_PSOC_LBW, min, max, 0, PSOC_INST_NUM,
++		hl_secure_hbw_rr_gen(HL_SEC_HBW_PSOC_LBW, min, max, 0, HL_SEC_PSOC_INST_NUM,
+ 					HL_SEC_ENGINE_PSOC);
+ }
+-
+-#define EN_ARC_SEC_PRIV				0x3
+-#define AXPROT_OVRD_SEC				0x1
+ 
+ /* protection bits configurations to open some selective registers */
+ static u32 gaudi2_protbits_data0[] = { 0x400, 0xc103 };
+@@ -486,20 +303,20 @@
+ void ppboot_secure_arc(void)
+ {
+ 	/* enable security and privilege mode for arc0 and arc1 */
+-	regmap_writel(EN_ARC_SEC_PRIV,
++	regmap_writel(HL_SEC_EN_ARC_SEC_PRIV,
+ 		mmPSOC_ARC0_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-	regmap_writel(EN_ARC_SEC_PRIV,
++	regmap_writel(HL_SEC_EN_ARC_SEC_PRIV,
+ 		 mmPSOC_ARC0_MSTR_IF_CORE_LBW_AXPROT_OVRD);
+-	regmap_writel(EN_ARC_SEC_PRIV,
++	regmap_writel(HL_SEC_EN_ARC_SEC_PRIV,
+ 		 mmPSOC_ARC1_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+-	regmap_writel(EN_ARC_SEC_PRIV,
++	regmap_writel(HL_SEC_EN_ARC_SEC_PRIV,
+ 		 mmPSOC_ARC1_MSTR_IF_CORE_LBW_AXPROT_OVRD);
+ }
+ 
+ static void ppboot_secure_elbi(void)
+ {
+ 	/* make transactions via ELBI as secured */
+-	regmap_writel(AXPROT_OVRD_SEC, mmPCIE_ELBI_RR_MSTR_IF_CORE_LBW_AXPROT_OVRD);
++	regmap_writel(HL_SEC_AXPROT_OVRD_SEC, mmPCIE_ELBI_RR_MSTR_IF_CORE_LBW_AXPROT_OVRD);
+ }
+ 
+ static void preboot_secure_pcie(void)
+@@ -643,17 +460,17 @@
+ 	int i;
+ 
+ 	if (rr_sel.noc) {
+-		for (i = 0; i < NUM_OF_DCORES; i++) {
+-			hl_secure_hbw_rr_gen(rr_idx, min, max, DCORE_DIST * i,
+-					NUM_OF_RTR_PER_DCORE, HL_SEC_ENGINE_IF_RTR);
++		for (i = 0; i < HL_SEC_NUM_OF_DCORES; i++) {
++			hl_secure_hbw_rr_gen(rr_idx, min, max, HL_SEC_DCORE_DIST * i,
++					HL_SEC_NUM_OF_RTR_PER_DCORE, HL_SEC_ENGINE_IF_RTR);
+ 
+-			hl_secure_hbw_rr_gen(rr_idx, min, max, SFT_DIST * i,
+-					HBW_SFT_INST_NUM, HL_SEC_ENGINE_SFT);
++			hl_secure_hbw_rr_gen(rr_idx, min, max, HL_SEC_SFT_DIST * i,
++					HL_SEC_HBW_SFT_INST_NUM, HL_SEC_ENGINE_SFT);
+ 		}
+ 	}
+ 
+ 	if (rr_sel.pcie) {
+-		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, PCIE_HBW_NUM, HL_SEC_ENGINE_PCIE);
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_HBW_NUM, HL_SEC_ENGINE_PCIE);
+ 		/* Apart from the pcie mstr if, pcie traffic is also routed
+ 		 * through dcore0 rtr0 if. Hence configuring pcie mstr if range
+ 		 * registers alone is not enough to block/allow pcie traffic.
+@@ -664,12 +481,12 @@
+ 		 * as a part of noc select itself, hence not required to reconfigure in such case.
+ 		 */
+ 		if (!rr_sel.noc)
+-			hl_secure_hbw_rr_gen(rr_idx, min, max, 0, PCIE_RTR_NUM,
++			hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PCIE_RTR_NUM,
+ 						HL_SEC_ENGINE_IF_RTR);
+ 	}
+ 
+ 	if (rr_sel.psoc)
+-		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, PSOC_INST_NUM, HL_SEC_ENGINE_PSOC);
++		hl_secure_hbw_rr_gen(rr_idx, min, max, 0, HL_SEC_PSOC_INST_NUM, HL_SEC_ENGINE_PSOC);
+ }
+ 
+ #define SPI_FLASH_SIZE		0x1000000ull /* 16MB */
+@@ -759,7 +576,7 @@
+ 
+ void preboot_security_dynamic_init(void)
+ {
+-	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	struct hl_sec_dyn_pcie_rr_cfg *cfg;
+ 	struct mem_desc mdesc;
+ 	u64 img_max, image_base_full;
+ 	int i;
+@@ -788,7 +605,7 @@
+ void preboot_security_dynamic_img_sram_open(enum mem_region img_region,
+ 				enum preboot_mem_access_mode mode)
+ {
+-	struct preboot_sec_dyn_pcie_rr_cfg *cfg;
++	struct hl_sec_dyn_pcie_rr_cfg *cfg;
+ 	struct mem_desc mdesc;
+ 	u64 img_max, image_base_full;
+ 
+@@ -829,7 +646,7 @@
+ 
+ void preboot_security_dynamic_img_sram_close(void)
+ {
+-	struct preboot_sec_dyn_pcie_rr_cfg *cfg = &preboot_sec_dyn_cfg[IMAGE];
++	struct hl_sec_dyn_pcie_rr_cfg *cfg = &preboot_sec_dyn_cfg[IMAGE];
+ 
+ 	if (!preboot_security_is_enabled())
+ 		return;
+@@ -884,16 +701,6 @@
+ 	hl_secure_hbw_rr(HL_SEC_HBW_SPI_FLASH, 0, 0, rr_sel);
+ }
+ 
+-/* Reg format is <DCORE_NUM>_RTR<INST_NUM>_MSTR_IF */
+-struct axprot_regs {
+-	u32 base_reg;
+-	u32 value;
+-	int dcore_dist;
+-	int inst_dist;
+-	u8 dcore_num;
+-	u8 inst_num;
+-};
+-
+ #define PROT_OVR_SECURE		0
+ #define PROT_OVR_PRIV		BIT(0)
+ #define PROT_OVR_USER		BIT(1)
+@@ -904,7 +711,7 @@
+ static void preboot_secure_pmmu(void)
+ {
+ 	/* Set ppmu to secure level */
+-	regmap_writel(AXPROT_SEC_VAL, mmPMMU_HBW_MSTR_IF_CORE_HBW_AXPROT_OVRD);
++	regmap_writel(HL_SEC_AXPROT_SEC_VAL, mmPMMU_HBW_MSTR_IF_CORE_HBW_AXPROT_OVRD);
+ }
+ 
+ void preboot_security_init(void)

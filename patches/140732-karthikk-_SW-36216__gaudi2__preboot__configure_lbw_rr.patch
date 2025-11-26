@@ -1,0 +1,86 @@
+From 4eb1e73b07c080744a62c26a1d6a06aa4b369478 Mon Sep 17 00:00:00 2001
+From: Karthikeyan K <karthikk@habana.ai>
+Date: Wed, 17 Nov 2021 18:03:04 +0200
+Subject: [PATCH] [SW-36216] gaudi2: preboot: configure lbw rr
+
+As per the gaudi2 lbw spec we open psoc global conf for non-privileged
+access in preboot.
+
+Change-Id: I277331af5a12fa7cb58b186f710c7c284d2745ef
+---
+
+diff --git a/arch/gaudi2/common/security.c b/arch/gaudi2/common/security.c
+index b95e0e5..82c59bd 100644
+--- a/arch/gaudi2/common/security.c
++++ b/arch/gaudi2/common/security.c
+@@ -333,6 +333,64 @@
+ 	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
+ }
+ 
++static void preboot_secure_lbw(void)
++{
++	u64 min, max;
++	struct hl_rr_eng_select rr_sel;
++
++	memset(&rr_sel, 0, sizeof(struct hl_rr_eng_select));
++
++	/*
++	 * TODO:Add psoc rrs once determined for lbw.
++	 */
++
++	/*
++	 * In order to open psoc global space in preboot,
++	 * a new RR LBW_PSOC_GLBL_CONF is used to lock
++	 * global conf end to cfg space end and then the
++	 * existing RR LBW_DBG_CFG_SPACE is re-used to lock
++	 * RR cfg space base to global conf base. This overlap
++	 * ensures that psoc global conf is opened while
++	 * not opening any other regions during the process.
++	 */
++
++	/*
++	 * Block complete config space for noc rrs. pcie rr was
++	 * blocked for the same in ppboot before pcie linkup. Hence blocking
++	 * the others here, to ensure the config space is blocked before
++	 * reconfiguring in preboot.
++	 */
++	rr_sel.noc = true;
++
++	/* CFG SPACE: 0x1000007FF8000000 - 0x1000007FFFFFFFFF */
++	min = CFG_BASE;
++	max = CFG_BASE + CFG_SIZE - 1;
++	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
++
++	/*
++	 * As per LBW spec noc and pcie rtrs are reconfigured.
++	 */
++	rr_sel.noc = true;
++	rr_sel.pcie = true;
++	rr_sel.psoc = false;
++
++	/*
++	 * PCIE GLOBAL CONF end to CFG SPACE end
++	 * 0x1000007FFCC4C000 - 0x1000007FFFFFFFFF
++	 */
++	min = mmPSOC_GLOBAL_CONF_BASE + PSOC_GLOBAL_CONF_MAX_OFFSET;
++	max = CFG_BASE + CFG_SIZE - 1;
++	hl_secure_lbw_rr(HL_SEC_LBW_PSOC_GLBL_CONF, min, max, rr_sel);
++
++	/*
++	 * CFG SPACE base to PSOC GLOBAL CONF base
++	 * 0x1000007FF8000000 - 0x1000007FFCC4B000
++	 */
++	min = CFG_BASE;
++	max = mmPSOC_GLOBAL_CONF_BASE;
++	hl_secure_lbw_rr(HL_SEC_LBW_DBG_CFG_SPACE, min, max, rr_sel);
++}
++
+ void ppboot_security_init(void)
+ {
+ 	/* Initialize only if security is enabled */
+@@ -351,4 +409,5 @@
+ 		return;
+ 
+ 	hl_dev_prot_bits_init();
++	preboot_secure_lbw();
+ }

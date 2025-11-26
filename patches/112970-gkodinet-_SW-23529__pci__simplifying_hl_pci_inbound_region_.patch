@@ -1,0 +1,180 @@
+From adc52f9fd793ecf0a91f3a8ada79936350d7fadf Mon Sep 17 00:00:00 2001
+From: Gleb Kodinets <gkodinets@habana.ai>
+Date: Mon, 19 Jul 2021 17:40:16 +0300
+Subject: [PATCH] [SW-23529] pci: simplifying hl_pci_inbound_region struct
+
+This patch removes unnecessary field pcie_bar_phys,
+because it can be retrieved in place by bar id.
+
+Change-Id: Ib40d697cb3e40c665c3c2733c12b045d0a1663e7
+---
+
+diff --git a/arch/gaudi/arm/asic.c b/arch/gaudi/arm/asic.c
+index 62fba44..ee2c3e4 100644
+--- a/arch/gaudi/arm/asic.c
++++ b/arch/gaudi/arm/asic.c
+@@ -398,8 +398,6 @@
+ 	inbound_region.addr = DRAM_BASE;
+ 	hl_pci_set_inbound_region(1, &inbound_region);
+ 
+-	hl_pci_get_bar_phys_addr(PCI_BAR_ID_2, &inbound_region.pcie_bar_phys);
+-
+ 	/* Inbound Region 2 - Bar 2 - SPI FLASH till start of SP SRAM */
+ 	inbound_region.mode = PCI_ADDRESS_MATCH_MODE;
+ 	inbound_region.bar = PCI_BAR_ID_2;
+diff --git a/arch/gaudi2/arm/asic.c b/arch/gaudi2/arm/asic.c
+index 517b76f..a9b70f7 100644
+--- a/arch/gaudi2/arm/asic.c
++++ b/arch/gaudi2/arm/asic.c
+@@ -86,8 +86,6 @@
+ 	/* TODO: implement hl_pcie_disable_access() for gaudi2 */
+ 	hl_pcie_disable_access();
+ 
+-	hl_pci_get_bar_phys_addr(PCI_BAR_ID_0, &inbound_region.pcie_bar_phys);
+-
+ 	/* Inbound Region 0 - Bar 0 - Point to CFG */
+ 	inbound_region.mode = PCI_ADDRESS_MATCH_MODE;
+ 	inbound_region.bar = PCI_BAR_ID_0;
+diff --git a/lib/common/pci.c b/lib/common/pci.c
+index e9c844c..249142d 100644
+--- a/lib/common/pci.c
++++ b/lib/common/pci.c
+@@ -43,6 +43,45 @@
+ __weak void hl_pcie_disable_access(void) {}
+ 
+ /*
++ * hl_pci_get_bar_phys_addr() - get physical address of a bar
++ * @bar_id: bar number
++ * @bar_phys_addr: returned bar physical address
++ *
++ * the physical address is the address allocated by the host to each bar.
++ */
++static int hl_pci_get_bar_phys_addr(enum hl_pci_bar_id bar_id, u64 *bar_phys_addr)
++{
++	u32 bar_reg, bar_addr_low, bar_addr_high;
++	u32 aux_dbi_reg;
++
++	switch (bar_id) {
++	case PCI_BAR_ID_0:
++		bar_reg = mmPCIE_DBI_BAR0_REG;
++		break;
++	case PCI_BAR_ID_2:
++		bar_reg = mmPCIE_DBI_BAR2_REG;
++		break;
++	case PCI_BAR_ID_4:
++		bar_reg = mmPCIE_DBI_BAR4_REG;
++		break;
++	default:
++		return -1;
++	}
++
++	aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
++	regmap_writel(IATU_ACCESS_DISABLE_VAL, mmPCIE_AUX_DBI);
++
++	bar_addr_low = regmap_readl(bar_reg) & ~0xF;
++	bar_addr_high = regmap_readl(bar_reg + sizeof(u32));
++
++	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
++
++	*bar_phys_addr = (u64)bar_addr_high << 32 | bar_addr_low;
++
++	return 0;
++}
++
++/*
+  * hl_pci_set_inbound_region() - Configure inbound region
+  * @region: Inbound region number.
+  * @pci_region: Inbound region parameters.
+@@ -52,7 +91,7 @@
+ void hl_pci_set_inbound_region(u8 region,
+ 			       struct hl_pci_inbound_region *pci_region)
+ {
+-	u64 bar_phys_base, region_base, region_end_address;
++	u64 bar_phys_base = 0, region_base, region_end_address;
+ 	u32 offset = dev_pci_dbi_cfg_offset_get();
+ 	u32 ctrl_reg_val;
+ 	u32 aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
+@@ -63,7 +102,7 @@
+ 	offset += (IATU_REGION_SIZE * region) + IATU_REGION_INBOUND_OFF;
+ 
+ 	if (pci_region->mode == PCI_ADDRESS_MATCH_MODE) {
+-		bar_phys_base = pci_region->pcie_bar_phys;
++		hl_pci_get_bar_phys_addr(pci_region->bar, &bar_phys_base);
+ 		region_base = bar_phys_base + pci_region->offset_in_bar;
+ 		region_end_address = region_base + pci_region->size - 1;
+ 
+@@ -134,45 +173,6 @@
+ 
+ 	/* restore iATU access state */
+ 	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
+-}
+-
+-/*
+- * hl_pci_get_bar_phys_addr() - get physical address of a bar
+- * @bar_id: bar number
+- * @bar_phys_addr: returned bar physical address
+- *
+- * the physical address is the address allocated by the host to each bar.
+- */
+-int hl_pci_get_bar_phys_addr(enum hl_pci_bar_id bar_id, u64 *bar_phys_addr)
+-{
+-	u32 bar_reg, bar_addr_low, bar_addr_high;
+-	u32 aux_dbi_reg;
+-
+-	switch (bar_id) {
+-	case PCI_BAR_ID_0:
+-		bar_reg = mmPCIE_DBI_BAR0_REG;
+-		break;
+-	case PCI_BAR_ID_2:
+-		bar_reg = mmPCIE_DBI_BAR2_REG;
+-		break;
+-	case PCI_BAR_ID_4:
+-		bar_reg = mmPCIE_DBI_BAR4_REG;
+-		break;
+-	default:
+-		return -1;
+-	}
+-
+-	aux_dbi_reg = regmap_readl(mmPCIE_AUX_DBI);
+-	regmap_writel(IATU_ACCESS_DISABLE_VAL, mmPCIE_AUX_DBI);
+-
+-	bar_addr_low = regmap_readl(bar_reg) & ~0xF;
+-	bar_addr_high = regmap_readl(bar_reg + sizeof(u32));
+-
+-	regmap_writel(aux_dbi_reg, mmPCIE_AUX_DBI);
+-
+-	*bar_phys_addr = (u64)bar_addr_high << 32 | bar_addr_low;
+-
+-	return 0;
+ }
+ 
+ /*
+diff --git a/lib/common/pci.h b/lib/common/pci.h
+index 55ffac8..2d03dc5 100644
+--- a/lib/common/pci.h
++++ b/lib/common/pci.h
+@@ -37,8 +37,6 @@
+  * @size: region size in bytes
+  * @offset_in_bar: offset within bar (address match mode)
+  * @bar: bar id
+- * @pcie_bar_phys: PCIe bar physical address.
+- *		   (required only for PCI address match mode)
+  */
+ struct hl_pci_inbound_region {
+ 	enum hl_pci_match_mode mode;
+@@ -46,7 +44,6 @@
+ 	u64 size;
+ 	u64 offset_in_bar;
+ 	u8 bar;
+-	u64 pcie_bar_phys;
+ };
+ 
+ /*
+@@ -62,7 +59,6 @@
+ void hl_pci_set_inbound_region(u8 region,
+ 			       struct hl_pci_inbound_region *pci_region);
+ void hl_pci_set_outbound_region(struct hl_pci_outbound_region *pci_region);
+-int hl_pci_get_bar_phys_addr(enum hl_pci_bar_id bar_id, u64 *bar_phys_addr);
+ bool hl_pci_is_mem_enabled(void);
+ u32 dev_pci_dbi_cfg_offset_get(void);
+ u32 hl_pci_get_ven_id_dev_id(void);

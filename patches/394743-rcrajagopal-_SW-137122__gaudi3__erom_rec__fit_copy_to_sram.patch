@@ -1,0 +1,89 @@
+From 4a1ebbfc1fd831f74d7eadbbd29056c9a8ea7192 Mon Sep 17 00:00:00 2001
+From: chandavath <rcrajagopal@habana.ai>
+Date: Fri, 09 Feb 2024 16:15:57 +0200
+Subject: [PATCH] [SW-137122] gaudi3: erom rec: fit copy to sram
+
+In fwupd, fit will be copied to sram. so we added
+proper sram address check and modified fit copying
+dest address to sram address.
+
+Change-Id: I497da9ac9036877fa7caf8d7c94eb03841c857f2
+Signed-off-by: chandavath <rcrajagopal@habana.ai>
+---
+
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 1ef51ae..6b97bf3 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -429,13 +429,7 @@
+ 
+ void preboot_copy_image(u64 dst, const void *buf, int len, const char *arch)
+ {
+-	u32 arc_dst;
+-
+-	/*
+-	 * ARC_ADDR_MASK trancates the address to the 256MB region accesible by
+-	 * Arc. MSB of 0x2 points to the FW_MEM_REGION.
+-	 */
+-	arc_dst = ((u32)dst & ARC_ADDR_MASK) | BIT(29);
++	u32 arc_dst = (u32)arcboot_rom_get_arc_addr(dst);
+ 
+ 	memcpy((void *)arc_dst, buf, len);
+ }
+@@ -450,7 +444,7 @@
+ void preboot_start_image(u64 startaddr, bool valid_arc_img)
+ {
+ 	void (*image_entry)(void);
+-	u32 arc1_addr = (u32)(startaddr);
++	u32 arc1_addr = (u32)arcboot_rom_get_arc_addr(startaddr);
+ 
+ 	/* TODO: add start for ARC0 and ARC2 */
+ 
+@@ -458,7 +452,7 @@
+ 	 * Jump to __reset of zephyr. After image_entry, control is not
+ 	 * expected to return here and continue.
+ 	 */
+-	image_entry = (void *)(*(u32 *)arc1_addr);
++	image_entry = (void *)(arc1_addr);
+ 	image_entry();
+ }
+ 
+@@ -649,6 +643,9 @@
+ 	    addr + len < ARC1_ICCM_FULL_BASE + ARC1_MEM_SIZE)
+ 		return true;
+ 
++	if (addr >= HL_SRAM_BASE_FULL && addr + len <= HL_SRAM_BASE_FULL + SDRAM_SIZE)
++		return true;
++
+ 	if (addr >= SDRAM_BASE && addr + len < SDRAM_BASE + SDRAM_SIZE)
+ 		return true;
+ 
+diff --git a/arch/gaudi3/common/common.c b/arch/gaudi3/common/common.c
+index b896fbb..9acb497 100644
+--- a/arch/gaudi3/common/common.c
++++ b/arch/gaudi3/common/common.c
+@@ -117,3 +117,11 @@
+ 	regmap_writel(cold_rst_data.data,
+ 		D0_PSOC_GLOBAL_CONF_REG(mmGLOBAL_CONF_COLD_RST_FLOPS_2));
+ }
++
++bool preboot_sram_is_valid_address_range(u64 addr, int len)
++{
++	if (addr >= SDRAM_BASE && addr + len <= SDRAM_BASE + SRAM_SIZE)
++		return !preboot_is_overlap_address_range(addr, len);
++
++	return false;
++}
+diff --git a/lib/preboot/fit.c b/lib/preboot/fit.c
+index 1d343c4..4c0dd3b 100644
+--- a/lib/preboot/fit.c
++++ b/lib/preboot/fit.c
+@@ -826,7 +826,7 @@
+ 		}
+ 
+ 		if (fit_node_check_hash(fit, node, buf, len)) {
+-			preboot_puts_hex("FIT loadable currupted: bad hash for image: ", i, false);
++			preboot_puts_hex("FIT loadable corrupted: bad hash for image: ", i, false);
+ 			return FIT_LOAD_CORRUPTED;
+ 		}
+ 

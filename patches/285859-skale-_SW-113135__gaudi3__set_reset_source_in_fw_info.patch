@@ -1,0 +1,79 @@
+From 28a035624fb2a917f947e905528ed0ae23e32762 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Mon, 26 Dec 2022 07:55:34 +0200
+Subject: [PATCH] [SW-113135] gaudi3: set reset source in fw info
+
+Since ppboot reads the rst source from BTM FIFO, it needs
+to propagate the information to other FW components. This patch
+add changes to set reset source read from BTM FIFO as part of
+fw info and store it in boot info.
+
+Change-Id: I9c00f21c5612631ebdec6dfaf80b96f0031bddaf
+---
+
+diff --git a/app/ppboot/ppboot.c b/app/ppboot/ppboot.c
+index 73d9f31..e27e0f6 100644
+--- a/app/ppboot/ppboot.c
++++ b/app/ppboot/ppboot.c
+@@ -300,6 +300,7 @@
+ __weak void ppboot_security_init(void) {}
+ __weak void ppboot_secure_arc(void) {}
+ __weak void hl_sram_self_repair(void) {}
++__weak void ppboot_init_fw_info(void) {}
+ 
+ void ppboot_main(void)
+ {
+@@ -342,6 +343,8 @@
+ 
+ 	hl_sram_self_repair();
+ 
++	ppboot_init_fw_info();
++
+ 	ret = ppboot_load_preboot_img(&loadaddr);
+ 	ppboot_check_stack_monitor();
+ 	preboot_puts("Ppboot resigned\n\r\n");
+diff --git a/arch/gaudi3/arc/common.c b/arch/gaudi3/arc/common.c
+index 6306382..9f7f1ad 100644
+--- a/arch/gaudi3/arc/common.c
++++ b/arch/gaudi3/arc/common.c
+@@ -70,6 +70,7 @@
+ #include <pci.h>
+ #include <pif_ts.h>
+ #include <hl_pif_arc_if.h>
++#include <hl_fw_if.h>
+ 
+ #define PIF_ARC_NUM_OF_MEM	2
+ 
+@@ -1232,3 +1233,32 @@
+ 				 sizeof(PREBOOT_VER)))
+ 		preboot_puts("BOOT_INFO: Failed to set ppboot version\n");
+ }
++
++void ppboot_init_fw_info(void)
++{
++	struct mem_desc mem_region_desc;
++	struct hl_fw_info_compat *fw_info;
++	u32 copy_sz, fw_info_sz;
++
++	if (preboot_get_mem_region(MEM_GP, &mem_region_desc)) {
++		preboot_puts("Failed to get mem region MEM_GP\n");
++		return;
++	}
++
++	fw_info = (struct hl_fw_info_compat *)mem_region_desc.base;
++	fw_info_sz = sizeof(struct hl_fw_info_compat);
++	memset((void *)fw_info, 0x0, fw_info_sz);
++
++	if (rst_src.src == HL_COLD_RST)
++		goto fw_info_set;
++
++	if (boot_info_get_no_merge(HL_BOOT_INFO_FW_INFO, fw_info, mem_region_desc.size, &copy_sz))
++		preboot_puts("BOOT_INFO: Failed to get fw_info\n");
++	else
++		fw_info_sz = copy_sz;
++
++fw_info_set:
++	fw_info->last_reset_source = rst_src.src;
++	if (ppboot_boot_info_set(HL_BOOT_INFO_FW_INFO, fw_info, fw_info_sz))
++		preboot_puts("BOOT_INFO: Failed to set last reset cause in fw_info\n");
++}

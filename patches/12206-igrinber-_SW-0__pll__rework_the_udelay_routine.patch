@@ -1,0 +1,115 @@
+From 4f9e4b094971ed635c82552eb1b672820e5ac7e2 Mon Sep 17 00:00:00 2001
+From: Igor Grinberg <igrinberg@habana.ai>
+Date: Mon, 06 May 2019 10:34:17 +0300
+Subject: [PATCH] [SW-0] pll: rework the udelay routine
+
+Current udelay code is buggy in following ways:
+1) it makes various transactions during its invocation which hurts
+   the delay accuracy.
+2) it uses the CPU PLL DIV1 which is not the CPU clock but the time
+   stamp clock for CPU timer. We do not use the timer here, so we
+   should check the real CPU clock.
+3) the assumption that the CPU PLL is the first in the PLLs array is
+   not necessary.
+
+So simplify the handling and make the necessary preparations before
+the udelay code is invoked. In the udelay code, only do the really
+necessary calculations and the delay loop itself.
+
+Change-Id: Ib8ed1a2e896bcf7c941c545c04ddbeca00cba4b4
+Signed-off-by: Igor Grinberg <igrinberg@habana.ai>
+---
+
+diff --git a/common/pll.c b/common/pll.c
+index 2048db3..c717f61 100644
+--- a/common/pll.c
++++ b/common/pll.c
+@@ -9,6 +9,13 @@
+ #include "uart.h"
+ #include "pll.h"
+ 
++static u64 cycles_per_usec = BYPASS_CYCLES_PER_USEC;
++
++static inline void hl_pll_udelay_init(void)
++{
++	cycles_per_usec = hl_pll_get_cpu_cycles_per_usec();
++}
++
+ enum hl_pll_bypass_val hl_pll_bypass_get(u64 pll_base, enum hl_pll_div_out out)
+ {
+ 	int offset = out * sizeof(u32);
+@@ -16,29 +23,9 @@
+ 	return regmap_readl(pll_base + HL_PLL_DIV_SEL + offset);
+ }
+ 
+-static void hl_pll_udelay(unsigned int usec)
++static inline void hl_pll_udelay(unsigned int usec)
+ {
+-	int pll_num;
+-	long cnt;
+-	struct hl_pll_cfg *hl_pll_cfg;
+-	enum hl_pll_bypass_val bval = HL_PLL_REF_CLK;
+-
+-	pll_num = hl_pll_get_cfg(&hl_pll_cfg);
+-	if (pll_num) {
+-		/*
+-		 * Assumptions:
+-		 * 1) the CPU PLL offset in the array is 0
+-		 * 2) DIV1 is the PLL output to timestamp counter.
+-		 */
+-		bval = hl_pll_bypass_get(hl_pll_cfg->base, HL_PLL_DIV1);
+-	}
+-
+-	if (bval == HL_PLL_REF_CLK || bval == HL_PLL_DIV_REF)
+-		cnt = BYPASS_CYCLES_PER_USEC;
+-	else
+-		cnt = hl_pll_get_cpu_cycles_per_usec();
+-
+-	cnt = (cnt * usec) / MIN_CYCLES_PER_ITER;
++	u64 cnt = (cycles_per_usec * usec) / MIN_CYCLES_PER_ITER;
+ 
+ 	while (cnt--)
+ 		;
+@@ -208,6 +195,12 @@
+ 	struct hl_pll_cfg *hl_pll_cfg;
+ 	enum hl_pll_bypass_val bval;
+ 
++	/*
++	 * Note: we assume CPU frequency is not changed while CPU is running,
++	 * so the udelay init is done once before we start.
++	 */
++	hl_pll_udelay_init();
++
+ 	pll_num = hl_pll_get_cfg(&hl_pll_cfg);
+ 	if (!pll_num)
+ 		return 1;
+diff --git a/gaudi/asic.c b/gaudi/asic.c
+index b093674..a4aefae 100644
+--- a/gaudi/asic.c
++++ b/gaudi/asic.c
+@@ -201,7 +201,9 @@
+ 
+ u64 hl_pll_get_cpu_cycles_per_usec(void)
+ {
+-	return 1200000000ULL / USEC_PER_SEC;
++	u32 cpu_div0_freq = hl_pll_get_freq(mmPSOC_CPU_PLL_BASE, HL_PLL_DIV0);
++
++	return cpu_div0_freq / USEC_PER_SEC;
+ }
+ 
+ void hl_uart_init(void)
+diff --git a/goya/asic.c b/goya/asic.c
+index 185c9e5..2fdc652 100644
+--- a/goya/asic.c
++++ b/goya/asic.c
+@@ -61,7 +61,9 @@
+ 
+ u64 hl_pll_get_cpu_cycles_per_usec(void)
+ {
+-	return 1330000000ULL / USEC_PER_SEC;
++	u32 cpu_div0_freq = hl_pll_get_freq(mmCPU_PLL_BASE, HL_PLL_DIV0);
++
++	return cpu_div0_freq / USEC_PER_SEC;
+ }
+ 
+ void hl_uart_init(void)

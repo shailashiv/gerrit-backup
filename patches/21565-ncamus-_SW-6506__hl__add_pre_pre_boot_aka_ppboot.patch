@@ -1,0 +1,387 @@
+From 7f40ad2b5789b7aae6ff4ebcd195b2b8e8a98337 Mon Sep 17 00:00:00 2001
+From: Noam Camus <ncamus@habana.ai>
+Date: Sun, 17 Nov 2019 07:19:19 +0200
+Subject: [PATCH] [SW-6506] hl: add pre pre boot aka ppboot
+
+The ppboot app is doing 2 things
+1) bringup of PCIe link
+2) pass handling to preboot
+
+This way we got further reduced image that BTL needs to copy (2620B)
+
+Note: Still needs to connect BTL with ppboot
+
+Change-Id: I23e187517ef6fd4a9fb68035fbe6a3dc2f6851e5
+---
+
+diff --git a/Makefile b/Makefile
+index d3a1847..996d8f5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@
+ CFLAGS += -I$(dir $(BR2_EXTERNAL))/embedded/specs
+ CFLAGS += -Wall -Werror
+ CFLAGS += -g -c
+-CFLAGS += -I ./include/ -I ./ -I ./common/
++CFLAGS += -I ./include/ -I ./ -I ./common/ -I ./$(HL_DEV)/
+ 
+ ifeq ($(HL_TARGET),pldm)
+ 	CFLAGS += -DTARGET_IS_PLDM
+@@ -18,6 +18,7 @@
+ SFLAGS := $(CFLAGS)
+ 
+ PREBOOT_LD_SCRIPT := $(HL_DEV)/preboot.lds
++PPBOOT_LD_SCRIPT := $(HL_DEV)/ppboot.lds
+ LDFLAGS := -g -nostdlib -static
+ LDFLAGS += -Wl,--gc-sections
+ LDLIBS := -lgcc
+@@ -29,13 +30,18 @@
+ PREBOOT_SRCS_C += $(shell ls $(HL_DEV)/$(HL_TARGET).c)
+ PREBOOT_APP_S := $(shell ls app/crt0_preboot.S)
+ PREBOOT_APP_C := $(shell ls app/preboot.c)
++PPBOOT_APP_S := $(shell ls app/crt0_ppboot.S)
++PPBOOT_APP_C := $(shell ls app/ppboot.c)
+ 
+ PREBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
+ PREBOOT_OBJECTS += $(PREBOOT_APP_S:.S=.o)
+ PREBOOT_OBJECTS += $(PREBOOT_APP_C:.c=.o)
++PPBOOT_OBJECTS := $(PREBOOT_SRCS_C:.c=.o)
++PPBOOT_OBJECTS += $(PPBOOT_APP_S:.S=.o)
++PPBOOT_OBJECTS += $(PPBOOT_APP_C:.c=.o)
+ AUTO_GENERATED_FILE := auto_generated.h
+ 
+-all: preboot.bin common/pcie_phy_fw.bin
++all: ppboot.bin preboot.bin common/pcie_phy_fw.bin
+ 
+ %.bin: %
+ 	$(OBJCOPY) -O binary -R .note.gnu.build-id $< $@
+@@ -43,6 +49,9 @@
+ preboot: $(PREBOOT_OBJECTS) $(PREBOOT_LD_SCRIPT)
+ 	@$(CC) $(LDFLAGS) -T $(PREBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PREBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
+ 
++ppboot: $(PPBOOT_OBJECTS) $(PPBOOT_LD_SCRIPT)
++	@$(CC) $(LDFLAGS) -T $(PPBOOT_LD_SCRIPT) -o $@ -Wl,--start-group $(PPBOOT_OBJECTS) $(LDLIBS) -Wl,--end-group
++
+ $(AUTO_GENERATED_FILE): localversion-habanalabs $(PREBOOT_SRCS_C) $(PREBOOT_SRCS_S)
+ 	@( printf '#define PREBOOT_VER "%s"\n' '$(shell cut -d- -f2- localversion-habanalabs)' ) > $@
+ 	@LANG=en_us date +'#define PREBOOT_DATE "%b %d %Y"' >> $@
+diff --git a/app/crt0_ppboot.S b/app/crt0_ppboot.S
+new file mode 100644
+index 0000000..c80926f
+--- /dev/null
++++ b/app/crt0_ppboot.S
+@@ -0,0 +1,30 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++/*
++ * This is preboot entry point
++ * Setting sp/fp/lr and jumping to C code
++ */
++.globl	_start
++_start:
++
++#ifdef __arc__
++/* lf2flt: to avoid compiler (buildroot wrapper) warning during linkage */
++.global	lf2flt
++lf2flt:
++
++	mov	sp, __stack_top
++	mov	fp, sp
++#endif
++
++#ifdef __aarch64__
++	ldr	x0, =__stack_top
++	bic	sp, x0, #0xf	/* 16-byte alignment for ABI compliance */
++	mov	x29, sp		/* Set FP (x29) */
++#endif
++
++	bl	ppboot_main	/* Set LR (x30) */
+diff --git a/app/ppboot.c b/app/ppboot.c
+new file mode 100644
+index 0000000..d03695a
+--- /dev/null
++++ b/app/ppboot.c
+@@ -0,0 +1,100 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <psoc_global_conf_regs.h>
++#include <pcie_aux_regs.h>
++#include <cpu_ca53_cfg_regs.h>
++#include <hl_boot_if.h>
++
++#include "common.h"
++#include "preboot.h"
++#include "uart.h"
++#include "spi.h"
++
++/* Taking preboot from where ppboot (btl) is used */
++static u32 preboot_image_offset(void)
++{
++	u32 ppboot_id = regmap_readl(mmPSOC_GLOBAL_CONF_SCRATCHPAD_31);
++
++	if (ppboot_id == '2')
++		return HL_SPI_SECONDARY_BASE;
++
++	return HL_SPI_PRIMARY_BASE;
++}
++
++static void copy_preboot(void)
++{
++	char *name = "PREBOOT";
++	u32 img_offset = preboot_image_offset();
++	u32 preboot_offset = img_offset + HL_SPI_PREBOOT_OFF;
++
++	preboot_puts_raw("Preparing to run Preboot stable");
++	preboot_puts_hex_raw(" (offset: ", img_offset, false);
++	preboot_puts(")\n");
++
++	spi_copy((void *)PREBOOT_TEXT_BASE, preboot_offset, PREBOOT_SIZE, name);
++}
++
++static bool hl_pcie_link_up(void)
++{
++	unsigned int prstn, smlh, rdlh, rst_src;
++
++	/* check source of reset */
++	rst_src = regmap_readl(mmPSOC_GLOBAL_CONF_RST_SRC);
++	if (rst_src < HL_WD_RST)
++		return false;
++
++	prstn = regmap_readl(mmPSOC_GLOBAL_CONF_PRSTN);
++	smlh = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++	rdlh = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
++
++	if (prstn && smlh && rdlh)
++		return true;
++
++	return false;
++}
++
++static void ppboot_pcie_init(void)
++{
++	if (hl_pcie_link_up()) {
++		preboot_puts("PCIe link is already UP!\n");
++		return;
++	}
++
++	if (hl_skip_pcie_init()) {
++		preboot_puts("PCIe initialization is skipped!\n");
++		return;
++	}
++
++	//preboot_puts("Waiting for PCIe link...\n");
++	preboot_pcie_wait_for_link();
++	preboot_puts("PCIe link is UP!\n");
++}
++
++static void hl_jtag_init(void)
++{
++	u32 reg, nPRESETDBG = BIT(12);
++
++	/* Enable JTAG attach */
++	reg = regmap_readl(mmCPU_CA53_CFG_ARM_RST_CONTROL);
++	reg |= nPRESETDBG;
++	regmap_writel(reg, mmCPU_CA53_CFG_ARM_RST_CONTROL);
++}
++
++void ppboot_main(void)
++{
++	void (*preboot_start)(void) = (void *)PREBOOT_TEXT_BASE;
++
++	hl_jtag_init();
++	preboot_sync_btl();
++	hl_uart_init();
++	ppboot_pcie_init();
++	preboot_delay();
++	copy_preboot();
++
++	preboot_start();
++}
+diff --git a/gaudi/common.h b/gaudi/common.h
+index e43837b..44edcbb 100644
+--- a/gaudi/common.h
++++ b/gaudi/common.h
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#define PREBOOT_TEXT_BASE		0x7FFBFE4000ull
++
+ #define mmDMA_W_PLL_BASE		0x487000
+ #define mmIF_W_PLL_BASE			0x488000
+ #define mmIF_E_PLL_BASE			0x4A7000
+diff --git a/gaudi/ppboot.lds.S b/gaudi/ppboot.lds.S
+new file mode 100644
+index 0000000..3c198df
+--- /dev/null
++++ b/gaudi/ppboot.lds.S
+@@ -0,0 +1,29 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++MEMORY { .sram : ORIGIN = 0x7FFBFE0000, LENGTH = 0x10000 }
++
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		app/crt0_ppboot.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/goya/common.h b/goya/common.h
+index f6e0b2d..334d52c 100644
+--- a/goya/common.h
++++ b/goya/common.h
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#define PREBOOT_TEXT_BASE	0x7FF0004000ull
++
+ #define mmCPU_PLL_BASE		0x4A2000
+ #define mmIC_PLL_BASE		0x4A3000
+ #define mmPSOC_EMMC_PLL_BASE	0xC70000
+diff --git a/goya/ppboot.lds.S b/goya/ppboot.lds.S
+new file mode 100644
+index 0000000..ecaa722
+--- /dev/null
++++ b/goya/ppboot.lds.S
+@@ -0,0 +1,29 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++MEMORY { .sram : ORIGIN = 0x7ff0000000, LENGTH = 0x10000 }
++
++OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
++OUTPUT_ARCH(aarch64)
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		app/crt0_ppboot.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/goya2_arc/common.h b/goya2_arc/common.h
+index f6e0b2d..334d52c 100644
+--- a/goya2_arc/common.h
++++ b/goya2_arc/common.h
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier:     GPL-2.0+
+  */
+ 
++#define PREBOOT_TEXT_BASE	0x7FF0004000ull
++
+ #define mmCPU_PLL_BASE		0x4A2000
+ #define mmIC_PLL_BASE		0x4A3000
+ #define mmPSOC_EMMC_PLL_BASE	0xC70000
+diff --git a/goya2_arc/ppboot.lds.S b/goya2_arc/ppboot.lds.S
+new file mode 100644
+index 0000000..d95ae31
+--- /dev/null
++++ b/goya2_arc/ppboot.lds.S
+@@ -0,0 +1,31 @@
++/*
++ * (C) Copyright 2017 HabanaLabs, Ltd.
++ * Noam Camus <noamikong@gmail.com>
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#ifdef __arc__
++MEMORY { .sram : ORIGIN = 0xf0000000, LENGTH = 0x10000 }
++OUTPUT_FORMAT("elf32-littlearc", "elf32-bigarc", "elf32-littlearc")
++OUTPUT_ARCH(arc)
++#endif
++
++ENTRY(_start)
++SECTIONS
++{
++	.text : {
++		. = ALIGN(8);
++		app/crt0_ppboot.o (.text*)
++		* (.text*)
++	} >.sram
++
++	.stack : {
++		. = ALIGN(8);
++		__stack = . ;
++		. = . + 512 ;
++		__stack_top = . ;
++	} > .sram
++
++	.note.gnu.build-id : { *(.note.gnu.build-id) } > .sram
++}
+diff --git a/include/preboot.h b/include/preboot.h
+index cfef8ed..22f57a9 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -26,10 +26,12 @@
+ #endif
+ 
+ #define PREBOOT_VER_BASE			(SPL_TEXT_BASE - 0x1000)
++#define PREBOOT_SIZE		0x4000		/* 16KB */
+ 
+ #define SPL_SIZE		0x10000		/* 64KB */
+ #define HL_UART_BAUDRATE	115200
+ #define HL_SPI_FLASH_MAX_FREQ	25000000
++#define HL_SPI_PREBOOT_OFF	0x50000
+ #define HL_SPI_NEXT_IMAGE_OFF	0x60000
+ #define HL_SPI_MODIFI_IMAGE_OFF	0x60004
+ #define HL_SPI_SPL_OFF		0xA0000
+@@ -41,6 +43,14 @@
+ typedef unsigned int u32;
+ typedef unsigned long long u64;
+ 
++enum hl_rst_src {
++	HL_COLD_RST,
++	HL_MANUAL_RST,
++	HL_PRSTN_RST = 2,
++	HL_WD_RST = 4,
++	HL_SW_ALL_RST = 8,
++};
++
+ static inline u8 regmap_readb(u32 offset)
+ {
+ 	u32 reg = *((volatile u32 *)(HL_CFG_BASE + offset));

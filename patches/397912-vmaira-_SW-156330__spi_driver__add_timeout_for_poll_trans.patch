@@ -1,0 +1,107 @@
+From d3205947f89ca6dc41c594083b1c567b5aacdaa3 Mon Sep 17 00:00:00 2001
+From: Varsha Maira <vmaira@habana.ai>
+Date: Wed, 21 Feb 2024 19:47:28 +0200
+Subject: [PATCH] [SW-156330] spi driver: add timeout for poll transfer
+
+In scenarios where communication with SPI controller
+is broken, FW may fail to read SPI controller's FIFO
+depth. This has the potential to turn the SPI
+transfer polling loop into an infinite loop. Adding
+timeout to this loop to prevent ppboot hang.
+
+Change-Id: I00b87483acb8e159b4feab612fe6b4741bddeae1
+Signed-off-by: Varsha Maira <vmaira@habana.ai>
+---
+
+diff --git a/arch/fs1/arc/common.h b/arch/fs1/arc/common.h
+index aaa664d..57f6157 100644
+--- a/arch/fs1/arc/common.h
++++ b/arch/fs1/arc/common.h
+@@ -75,5 +75,12 @@
+ 
+ #define ARC_ADDR_MASK			0xFFFFFFFull
+ 
++/*
++ * RX poll timeout is configured at 1.28ms, which is duration
++ * required for the transfer of 4kB of data over SPI at a
++ * frequency of 25MHz.
++ * This is TODO for FS1
++ */
++#define SPI_RX_POLL_TIMEOUT_US		1280 /* timeout in us */
+ 
+ #endif /* COMMON_FS1_ARC_GNU_H_ */
+diff --git a/arch/gaudi2/arc/common.h b/arch/gaudi2/arc/common.h
+index f78935a..6c17e3e 100644
+--- a/arch/gaudi2/arc/common.h
++++ b/arch/gaudi2/arc/common.h
+@@ -121,6 +121,13 @@
+ #define TS_CALIB_A_G_COEFF	82600
+ #define TS_CALIB_B_H_COEFF	262600
+ 
++/*
++ * RX poll timeout is configured at 1.28ms, which is duration
++ * required for the transfer of 4kB of data over SPI at a
++ * frequency of 25MHz
++ */
++#define SPI_RX_POLL_TIMEOUT_US		1280 /* timeout in us */
++
+ #ifndef __ASSEMBLY__
+ #include <spi_flash.h>
+ 
+diff --git a/arch/gaudi2/arm/common.h b/arch/gaudi2/arm/common.h
+index 4d3e02d..c05c633 100644
+--- a/arch/gaudi2/arm/common.h
++++ b/arch/gaudi2/arm/common.h
+@@ -120,6 +120,13 @@
+ #define MEM_CPY_TIMEOUT_US				(5 * USEC_PER_SEC)
+ #define SP_SRAM_INIT_TIMEOUT_US				(5 * USEC_PER_SEC)
+ 
++/*
++ * RX poll timeout is configured at 1.28ms, which is duration
++ * required for the transfer of 4kB of data over SPI at a
++ * frequency of 25MHz
++ */
++#define SPI_RX_POLL_TIMEOUT_US		1280 /* timeout in us */
++
+ #ifndef __ASSEMBLY__
+ #include <types.h>
+ 
+diff --git a/arch/gaudi3/arc/common.h b/arch/gaudi3/arc/common.h
+index c2bfe5a..3d807dd 100644
+--- a/arch/gaudi3/arc/common.h
++++ b/arch/gaudi3/arc/common.h
+@@ -103,4 +103,11 @@
+ #define GPIOS_PER_BANK			16
+ #define TPM_CS_GPIO_PIN			18
+ 
++/*
++ * RX poll timeout is configured at 2.56ms, which is duration
++ * required for the transfer of 4kB of data over SPI at a
++ * frequency of 12.5MHz. Gaudi3 TPM works at 12.5MHz
++ */
++#define SPI_RX_POLL_TIMEOUT_US		2560 /* timeout in us */
++
+ #endif /* COMMON_GAUDI3_ARC_GNU_H_ */
+diff --git a/lib/common/spi.c b/lib/common/spi.c
+index 59d69cb..cfd91ed 100644
+--- a/lib/common/spi.c
++++ b/lib/common/spi.c
+@@ -315,10 +315,17 @@
+ 
+ static int poll_transfer(struct xfer_priv *priv)
+ {
++	u64 start = timestamp_get_us();
++	bool poll_timeout_expired = false;
++
+ 	do {
+ 		dw_writer(priv);
+ 		dw_reader(priv);
+-	} while (priv->rx_end > priv->rx);
++		poll_timeout_expired = timeout_expired(start, SPI_RX_POLL_TIMEOUT_US);
++	} while ((priv->rx_end > priv->rx) && !poll_timeout_expired);
++
++	if (poll_timeout_expired)
++		preboot_puts("SPI txfer poll timed out.\n");
+ 
+ 	return 0;
+ }

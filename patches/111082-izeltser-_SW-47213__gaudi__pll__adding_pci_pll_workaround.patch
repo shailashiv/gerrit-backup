@@ -1,0 +1,144 @@
+From 6e0cf39f47c9b020953a1685d7109ba5eceb7569 Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Wed, 14 Jul 2021 10:03:42 +0300
+Subject: [PATCH] [SW-47213] gaudi: pll: adding pci pll workaround
+
+Due to clock domain crossing issues in Gaudi1, pci pll div0 frequency
+must be equal or lower than div2 for pci phy fw upgrade.
+otherwise the phy fw upgrade is very much likely to fail and pci link
+won't be established.
+On the other hand we must be able to execute BMC commands reagrdless
+of the pci state, which requires a minimum of pci pll div0 frequency
+of ~200Mhz.
+As a workaround, at first pci pll div0 and div2 are both being set to
+1/4 pll clk, and after pci link is up we move pci pll div0 to pll clk
+and div2 to pll/8.
+
+Change-Id: I4c7c01fafbc809d508b1396f42de01ef1f187f63
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi/pll.c b/arch/gaudi/pll.c
+index 3b4e426..ba95279 100644
+--- a/arch/gaudi/pll.c
++++ b/arch/gaudi/pll.c
+@@ -7,10 +7,14 @@
+ #include <stddef.h>
+ 
+ #include <gaudi_blocks.h>
++#include <psoc_pci_pll_regs.h>
+ #include <preboot.h>
+ #include <pll.h>
+ 
+ #include "common.h"
++
++#define PCI_TMP_DIV	3	/* temporary divider setting for pci pll */
++#define PCI_DIV2_FACTOR	7
+ 
+ static struct hl_pll_cfg gaudi_pll_cfg[] = {
+ 	{
+@@ -70,8 +74,8 @@
+ 	}, {
+ 		.name = "PCI", .base = mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE,
+ 		.nr = 4, .nf = 331, .od = 3, .nb = 165, /* 830 */
+-		.div_factor = { 0, 0, 7, 9 },
+-		.div_sel = { HL_PLL_PLL_CLK,
++		.div_factor = { PCI_TMP_DIV, 0, PCI_TMP_DIV, 9 },
++		.div_sel = { HL_PLL_DIV_PLL,	/* temporary setting */
+ 			     HL_PLL_PLL_CLK,
+ 			     HL_PLL_DIV_PLL,
+ 			     HL_PLL_DIV_PLL
+@@ -132,3 +136,23 @@
+ 	for (i = 0; i < ARRAY_SIZE(gaudi_pll_ref_cfg); i++)
+ 		hl_pll_switch_to_ref(&gaudi_pll_ref_cfg[i]);
+ }
++
++#define PCI_PLL_BASE	(mmPSOC_PCI_PLL_BASE & ~HL_CFG_BASE)
++
++void hl_dev_pci_pll_wa(void)
++{
++	/*
++	 * pci pll div0 frequency must be equal or lower than div2 for pci phy
++	 * fw upgrade.
++	 * after phy fw upgrade is complete and pci link is up we move div0
++	 * and div2 to their nominal clock frequencies.
++	 */
++	hl_pll_clk_switch_to_ref(PCI_PLL_BASE, HL_PLL_DIV0);
++	hl_pll_clk_switch_to_pll(PCI_PLL_BASE, HL_PLL_DIV0, HL_PLL_PLL_CLK);
++
++	hl_pll_clk_switch_to_ref(PCI_PLL_BASE, HL_PLL_DIV2);
++	regmap_writel(PCI_DIV2_FACTOR, mmPSOC_PCI_PLL_DIV_FACTOR_2);
++	regmap_writel(1, mmPSOC_PCI_PLL_DIV_FACTOR_CMD_2);
++	hl_pll_clk_switch_to_pll(PCI_PLL_BASE, HL_PLL_DIV2, HL_PLL_DIV_PLL);
++	hl_uart_init();
++}
+diff --git a/common/pll.h b/common/pll.h
+index ce6d348..491635a 100644
+--- a/common/pll.h
++++ b/common/pll.h
+@@ -62,6 +62,7 @@
+ void udelay(unsigned int usec);
+ u64 timestamp_get_us(void);
+ bool timeout_expired(u64 start_tv, u32 delay);
++void hl_dev_pci_pll_wa(void);
+ 
+ static inline void mdelay(unsigned int msec) { udelay(1000 * msec); }
+ 
+diff --git a/preboot/module_pci.c b/preboot/module_pci.c
+index a8aebca..86159bb 100644
+--- a/preboot/module_pci.c
++++ b/preboot/module_pci.c
+@@ -15,6 +15,7 @@
+ #include "cmd_module.h"
+ #include "uart.h"
+ #include "pci.h"
++#include "pll.h"
+ 
+ struct pci_status {
+ 	u32 flr_reg_val;
+@@ -24,6 +25,7 @@
+ 	bool link_is_up;
+ 	bool mem_enabled;
+ 	bool mem_enabled_prev;
++	bool pci_pll_initialized;
+ };
+ 
+ static struct pci_status pci_sts = {
+@@ -33,6 +35,7 @@
+ 	.rdlh_link_reg_val = 1,
+ 	.link_is_up = false,
+ 	.mem_enabled_prev = false,
++	.pci_pll_initialized = false,
+ };
+ 
+ __weak void pci_dev_specific_setup(void) {}
+@@ -63,6 +66,7 @@
+ 
+ __weak void hl_pci_iatu_init(void) {}
+ __weak bool is_pcie_initialized(void) {return true; }
++__weak void hl_dev_pci_pll_wa(void) {}
+ 
+ void module_pci_setup(void)
+ {
+@@ -85,6 +89,9 @@
+ 	pci_sts.hot_rst_reg_val = regmap_readl(mmPCIE_CORE_HOT_RST) & BIT(0);
+ 	pci_sts.rdlh_link_reg_val = regmap_readl(mmPCIE_AUX_RDLH_LINK_UP);
+ 	pci_sts.smlh_link_reg_val = regmap_readl(mmPCIE_AUX_SMLH_LINK_UP);
++
++	if (!pci_sts.pci_pll_initialized)
++		return FOUND_FAST_RETURN;
+ 
+ 	if (pci_sts.flr_reg_val == 1 || pci_sts.hot_rst_reg_val == 1)
+ 		return FOUND_FAST_RETURN;
+@@ -122,6 +129,11 @@
+ {
+ 	unsigned int rst_src;
+ 
++	if (!pci_sts.pci_pll_initialized) {
++		hl_dev_pci_pll_wa();
++		pci_sts.pci_pll_initialized = true;
++	}
++
+ 	if (pci_sts.flr_reg_val == 1) {
+ 		pci_dev_specific_flr();
+ 		preboot_puts("FLR received\n");

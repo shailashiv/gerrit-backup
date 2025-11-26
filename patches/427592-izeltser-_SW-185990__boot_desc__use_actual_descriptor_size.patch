@@ -1,0 +1,207 @@
+From 6eaf90fd162d5f6e999d2e978ad3e7c9f00cbafa Mon Sep 17 00:00:00 2001
+From: Igal Zeltser <izeltser@habana.ai>
+Date: Thu, 27 Jun 2024 18:41:43 +0300
+Subject: [PATCH] [SW-185990] boot_desc: use actual descriptor size
+
+Remove the descriptor size assumption and use the actual descriptor
+size that read from the hl_fw_boot_ptrs structure.
+
+For legacy descriptor (relevant for G2 EROM decriptors only) known
+constant size is assumed.
+
+Change-Id: Iaae52becfd0ff426aece1780172e84890d2cc2a8
+Signed-off-by: Igal Zeltser <izeltser@habana.ai>
+---
+
+diff --git a/arch/gaudi2/common/common.c b/arch/gaudi2/common/common.c
+index d7e5065..e178930 100644
+--- a/arch/gaudi2/common/common.c
++++ b/arch/gaudi2/common/common.c
+@@ -1369,3 +1369,25 @@
+ {
+ 	return hl_fuse_read(mmPSOC_EFUSE_BASE, word, val);
+ }
++
++/*
++ * The legacy boot descriptors meta structure contains two fields - next & mod.
++ * those fields are of size 32 bits, and their content is "0000" & "1111" respectively
++ */
++
++#define BOOT_PTRS_NEXT_MAGIC	0x31313131
++#define BOOT_PTRS_MOD_MAGIC	0x30303030
++
++bool is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs)
++{
++	int i;
++	uint32_t *magic = &boot_ptrs->next;
++
++	for (i = 0; i < 2; i++) {
++		if (magic[i] != BOOT_PTRS_NEXT_MAGIC &&
++		    magic[i] != BOOT_PTRS_MOD_MAGIC)
++			return false;
++	}
++
++	return true;
++}
+diff --git a/include/boot_desc.h b/include/boot_desc.h
+index 8cc69ab..6134a04 100644
+--- a/include/boot_desc.h
++++ b/include/boot_desc.h
+@@ -45,4 +45,6 @@
+ u32 boot_desc_get_img_desc(enum fw_post_reset_cmd upd_status,
+ 			   enum hl_fw_img_type type, struct boot_desc *desc);
+ 
++bool is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs);
++
+ #endif /* _BOOT_DESC_H_ */
+diff --git a/lib/common/boot_desc.c b/lib/common/boot_desc.c
+index 6507868..031240b 100644
+--- a/lib/common/boot_desc.c
++++ b/lib/common/boot_desc.c
+@@ -22,7 +22,7 @@
+ #define IMG_DESC_SZ		sizeof(struct hl_fw_img_desc)
+ 
+ static struct hl_fw_boot_ptrs boot_ptrs;
+-static struct hl_fw_img_desc img_desc[BOOT_DESC_MAX_IMGS];
++static u8 desc_buf[BOOT_DESC_MAX_IMGS * IMG_DESC_SZ];
+ static bool desc_initialized;
+ 
+ static void boot_desc_print_magic(char *name, struct hl_fw_boot_magic *magic)
+@@ -64,6 +64,7 @@
+ 	struct hl_fw_desc_info desc_info;
+ 	uint32_t copy_sz;
+ 	unsigned int i;
++	struct hl_fw_img_desc *desc_ptr;
+ 
+ 	if (desc_initialized)
+ 		return boot_ptrs.count;
+@@ -78,19 +79,23 @@
+ 	boot_ptrs.img_desc_sz = desc_info.desc_size;
+ 	boot_ptrs.count = desc_info.count;
+ 
+-	if (boot_ptrs.count > BOOT_DESC_MAX_IMGS) {
+-		preboot_puts("Warning: Too many image descriptors, truncating\n");
+-		boot_ptrs.count = BOOT_DESC_MAX_IMGS;
++	if (boot_ptrs.count * boot_ptrs.img_desc_sz > sizeof(desc_buf)) {
++		while (boot_ptrs.count * boot_ptrs.img_desc_sz > sizeof(desc_buf))
++			boot_ptrs.count--;
++
++		preboot_puts_hex("Warning: Too many image descriptors, truncating to ",
++				 boot_ptrs.count, false);
+ 	}
+ 
+-	if (ppboot_boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA, (uint8_t *)(&img_desc),
+-				  sizeof(img_desc), &copy_sz)) {
++	if (ppboot_boot_info_get(HL_BOOT_INFO_IMG_DESC_DATA, desc_buf, sizeof(desc_buf),
++				 &copy_sz)) {
+ 		preboot_puts("Failed to copy image desc from bootinfo\n");
+ 		return 0;
+ 	}
+ 
+ 	for (i = 0; i < boot_ptrs.count; i++) {
+-		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
++		desc_ptr = (struct hl_fw_img_desc *)(desc_buf + i * boot_ptrs.img_desc_sz);
++		if (!boot_desc_img_desc_is_valid(desc_ptr)) {
+ 			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+ 			return 0;
+ 		}
+@@ -103,11 +108,16 @@
+ 
+ #else
+ 
++__weak bool is_legacy_boot_descs(struct hl_fw_boot_ptrs *boot_ptrs) { return false; }
++
++#define LEGACY_IMAGE_DESCRIPTOR_SIZE	220
++
+ int boot_desc_init(void)
+ {
+-	unsigned int count, i;
++	unsigned int i;
+ 	u32 spi_off = HL_FW_BOOT_PTRS_BASE;
+ 	u32 desc_offs[BOOT_DESC_MAX_IMGS] = { 0 };
++	u8 *buff_ptr;
+ 
+ 	if (desc_initialized)
+ 		return boot_ptrs.count;
+@@ -119,17 +129,28 @@
+ 	if (boot_ptrs.magic.val != HL_FW_BOOT_MAGIC)
+ 		return 0;
+ 
+-	count = boot_ptrs.count;
++	/* legacy descriptors don't have size field. so constant value is used */
++	if (is_legacy_boot_descs(&boot_ptrs))
++		boot_ptrs.img_desc_sz = LEGACY_IMAGE_DESCRIPTOR_SIZE;
++
++	if (boot_ptrs.count * boot_ptrs.img_desc_sz > sizeof(desc_buf)) {
++		while (boot_ptrs.count * boot_ptrs.img_desc_sz > sizeof(desc_buf))
++			boot_ptrs.count--;
++
++		preboot_puts_hex("Warning: Too many image descriptors, truncating to ",
++				 boot_ptrs.count, false);
++	}
+ 
+ 	/* Read all the descriptors offsets */
+ 	spi_off += sizeof(struct hl_fw_boot_ptrs);
+-	spi_flash_copy(desc_offs, spi_off, sizeof(u32) * count, "DESC OFFS");
++	spi_flash_copy(desc_offs, spi_off, sizeof(u32) * boot_ptrs.count, "DESC OFFS");
+ 
+ 	/* Read all descriptors */
+-	for (i = 0; i < count; i++) {
++	for (i = 0; i < boot_ptrs.count; i++) {
+ 		spi_off = HL_FW_BOOT_PTRS_BASE + desc_offs[i];
+-		spi_flash_copy(&img_desc[i], spi_off, IMG_DESC_SZ, "IMG DESC");
+-		if (!boot_desc_img_desc_is_valid(&img_desc[i])) {
++		buff_ptr = desc_buf + i * boot_ptrs.img_desc_sz;
++		spi_flash_copy(buff_ptr, spi_off, boot_ptrs.img_desc_sz, "IMG DESC");
++		if (!boot_desc_img_desc_is_valid((struct hl_fw_img_desc *)buff_ptr)) {
+ 			preboot_puts_hex_raw("Bad boot descriptor: ", i, false);
+ 			return 0;
+ 		}
+@@ -137,7 +158,7 @@
+ 
+ 	desc_initialized = true;
+ 
+-	return count;
++	return boot_ptrs.count;
+ }
+ 
+ #endif /* BOOT_DESC_SRC_BOOT_INFO */
+@@ -147,27 +168,29 @@
+ 			   enum hl_fw_img_type type, struct boot_desc *desc)
+ {
+ 	int i, idx;
++	struct hl_fw_img_desc *desc_ptr;
+ 
+ 	preboot_puts_hex_raw("Looking for image type: ", type, false);
+ 	for (i = 0; i < boot_ptrs.count; i++) {
+-		if (img_desc[i].magic.type != type)
++		desc_ptr = (struct hl_fw_img_desc *)(desc_buf + i * boot_ptrs.img_desc_sz);
++		if (desc_ptr->magic.type != type)
+ 			continue;
+ 
+-		idx = img_desc[i].idx;
++		idx = desc_ptr->idx;
+ 		if (upd_status == FLOPS_UPD_PENDING)
+ 			idx = (idx + 1) % 2;
+ 
+ 		preboot_puts_hex(" - found! using index: ", idx, false);
+-		desc->spi_offset = img_desc[i].offset[idx];
+-		desc->img_size = img_desc[i].size[idx];
+-		desc->loadaddr = ((u64)img_desc[i].load_high[idx] << 32) |
+-					img_desc[i].load_low[idx];
+-		desc->desc_ver = img_desc[i].desc_ver;
++		desc->spi_offset = desc_ptr->offset[idx];
++		desc->img_size = desc_ptr->size[idx];
++		desc->loadaddr = ((u64)desc_ptr->load_high[idx] << 32) |
++					desc_ptr->load_low[idx];
++		desc->desc_ver = desc_ptr->desc_ver;
+ 		if (desc->desc_ver >= MULTI_CSUM_BOOT_VER)
+-			memcpy(desc->chksum, img_desc[i].chksum2[idx],
++			memcpy(desc->chksum, desc_ptr->chksum2[idx],
+ 			       ARRAY_SIZE(desc->chksum));
+ 		else
+-			memcpy(desc->chksum, img_desc[i].chksum[idx],
++			memcpy(desc->chksum, desc_ptr->chksum[idx],
+ 			       ARRAY_SIZE(desc->chksum));
+ 
+ 		return idx;

@@ -1,0 +1,319 @@
+From 5f66403d0fd9fdcdfeadce40bd431ea4419d144a Mon Sep 17 00:00:00 2001
+From: Guy Nisan <gnisan@habana.ai>
+Date: Wed, 21 Oct 2020 17:40:52 +0300
+Subject: [PATCH] [SW-20810] i2c: add indirect protocol
+
+This protocol will be used in order to transfer a firmware to preboot.
+
+The indirect protocol defines a request port can be used for large data
+transfters.
+
+This review implements the write functionality of the indirect protocol
+or WDATA.
+
+This code is optimized in order to avaoid HW queue overflow. This means
+indirect protocol functionality is only called when all the needed data
+have received. After the indirect protocol is being processed, more data
+can be requested by the command procedure. When the requested data is
+available, the same command procedure is being called. This goes on
+until no more data is needed by the command procedure.
+
+Change-Id: Ifd18d02e82c63f05ff9e4fc77ad092fc4fb6741c
+Signed-off-by: Guy Nisan <gnisan@habana.ai>
+---
+
+diff --git a/preboot/i2cslave_indirect.c b/preboot/i2cslave_indirect.c
+new file mode 100644
+index 0000000..8299e2a
+--- /dev/null
++++ b/preboot/i2cslave_indirect.c
+@@ -0,0 +1,202 @@
++// SPDX-License-Identifier:     GPL-2.0+
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include <preboot.h>
++#include <uart.h>
++#include <common/module_i2c_slave.h>
++#include <hl_i2c_indirect.h>
++#include <hl_i2c_slave_events.h>
++#include "fit.h"
++
++struct i2csi_wdata_chunk_context {
++	u16 offset; /* Chunk offset within the request */
++	struct hl_i2ci_wdata_chunk_hdr hdr;
++};
++
++struct i2cslave_indirect_req {
++	struct hl_i2ci_wdata_hdr hdr;
++	struct hl_i2ci_req_cfg cfg;
++	struct hl_i2ci_req_sts sts;
++	struct i2csi_wdata_chunk_context chunk;
++};
++
++static struct i2cslave_indirect_req i2csi_req;
++
++static inline u8 *i2csi_req_opcode_alloc_buffer(void)
++{
++	/* Data will be consumed from HW but not stored anywhere */
++	return NULL;
++}
++
++static inline void i2csi_req_process_opcode(void)
++{
++	i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_OPCODE;
++}
++
++static inline u32 i2csi_req_wdata_handle_chunk(u8 **data, u8 cnt)
++{
++	register u8 *buf;
++
++	if (cnt == 2) { /* Chunk (partial payload) is expected */
++		buf = i2csi_req_opcode_alloc_buffer();
++		if (buf)
++			buf += i2csi_req.chunk.offset;
++
++		*data = buf;
++
++		return i2csi_req.chunk.hdr.rqcl;
++	}
++
++	/* Chuck received */
++	i2csi_req.chunk.offset += i2csi_req.chunk.hdr.rqcl;
++
++	/* Payload fully received */
++	if (i2csi_req.chunk.offset == i2csi_req.hdr.rqdl) {
++		i2csi_req.chunk.offset = 0;
++		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++		i2csi_req_process_opcode();
++		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	}
++
++	return 0;
++}
++
++static inline u32 i2csi_req_wdata_handle_payload(u8 **data, u8 cnt)
++{
++	if (cnt == 1) { /* Payload is expected */
++		*data = i2csi_req_opcode_alloc_buffer();
++		return i2csi_req.hdr.rqdl;
++	}
++
++	/* Payload received */
++	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_PROCESS;
++	i2csi_req_process_opcode();
++	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	return 0;
++}
++
++/*
++ * Handle request port WDATA command. This command holds a data buffer which
++ * is being transferred by the master. The request may be divided into chunks
++ * and this function also handles this possibility.
++ *
++ * This function is being called 3-4 time per WDATA command. Depends whether
++ * the request is divided into chunks or not.
++ * - 1. [cnt=0] WDATA was recorded, wait for header.
++ * - 2. [cnt=1] Header arrived, wait for chunk header or payload
++ * - 3. [cnt=2,no chunks] - payload was written, done this WDATA command
++ *      [cnt=2,chunks]    - chunk header was written, wait for payload
++ * - 4. [cnt=3,chunks]    - payload was written, done this WDATA command
++ *
++ * Arguments:
++ * - data: needs to be set to a designated buffer on which a new data will be
++ *         written into.
++ * - cnt:  the number of time this function is called per current command
++ *         context.
++ *
++ * Returns:
++ *   The number of bytes the lower layer should write into supplied buffer
++ *   before calling this function again. Returning 0 means the command handling
++ *   was finished.
++ */
++u32 i2csi_req_handle_wdata(u8 **data, u8 cnt)
++{
++	switch (cnt) {
++	case 0: /* Header is expected */
++		i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_RECEIVE;
++		i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
++		i2csi_req.chunk.hdr.rqcl = 0;
++		*data = i2csi_req.hdr.data;
++		return HL_I2CI_REQ_WDATA_LEN;
++	case 1: /* Chunk header or payload are expected */
++		if (!i2csi_req.hdr.write) {
++			i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_WRITE_PERM;
++			return 0;
++		}
++
++		if (HL_I2CI_REQ_RQCL_IS_EXISTS(i2csi_req.hdr)) {
++			*data = i2csi_req.chunk.hdr.data;
++			return HL_I2CI_REQ_CHUNK_LEN;
++		}
++		/* Fall through */
++	default:
++		break;
++	}
++
++	if (i2csi_req.chunk.hdr.rqcl)
++		return i2csi_req_wdata_handle_chunk(data, cnt);
++	else
++		return i2csi_req_wdata_handle_payload(data, cnt);
++}
++
++/*
++ * Handle request port status reading by the master. Update the request status
++ * header with the latest WDATA opcode data and send it on its way.
++ */
++u8 i2csi_req_handle_sts(u8 cmd, u32 read_seq)
++{
++	int idx = cmd + read_seq - HL_INDIRECT_REQ_STS_DATA;
++
++	if (idx >= HL_I2CI_REQ_STS_LEN)
++		return 0;
++
++	i2csi_req.sts.opcode = i2csi_req.hdr.opcode;
++	i2csi_req.sts.write = i2csi_req.hdr.write;
++	i2csi_req.sts.ic = i2csi_req.hdr.ic;
++
++	return i2csi_req.sts.data[idx];
++}
++
++/*
++ * Lower layer reports sync error. This means it expected the master to write
++ * bytes but instead is got a read request.
++ * In this case we zero out the state machine and buffer offsets.
++ */
++void i2csi_req_handle_sync_error(void)
++{
++	if (i2csi_req.sts.sm_sts == HL_I2CI_REQ_ST_IDLE)
++		return;
++
++	i2csi_req.chunk.offset = 0;
++	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	i2csi_req.sts.err = HL_I2CI_REQ_ERR_P_DATA_SIZE;
++}
++
++/*
++ * Handle request port configuration register. Set the init bit in request
++ * status reply.
++ * This function is called when the lower layer needs a buffer to write the
++ * data to and the number of bytes it whould write before calling this function
++ * again.
++ *
++ * Arguments:
++ * - data: needs to be set to a designated buffer on which a new data will be
++ *         written into.
++ * - cnt:  the number of time this function is called per current command
++ *         context.
++ *
++ * Returns:
++ *   The number of bytes the lower layer should write into supplied buffer
++ *   before calling this function again. Returning 0 means the command handling
++ *   was finished.
++ */
++u32 i2csi_req_handle_cfg(u8 **data, u8 cnt)
++{
++	if (!cnt) { /* Header is expected */
++		*data = i2csi_req.cfg.data;
++		return HL_I2CI_REQ_CFG_LEN;
++	}
++
++	/* Request config received */
++	i2csi_req.sts.init = i2csi_req.cfg.init;
++	i2csi_req.sts.sm_sts = HL_I2CI_REQ_ST_IDLE;
++	i2csi_req.sts.err = HL_I2CI_REQ_ERR_NONE;
++
++	return 0;
++}
+diff --git a/preboot/i2cslave_indirect.h b/preboot/i2cslave_indirect.h
+new file mode 100644
+index 0000000..d2096ce
+--- /dev/null
++++ b/preboot/i2cslave_indirect.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier:     GPL-2.0+ */
++/*
++ * Copyright (C) 2017-2020 HabanaLabs Ltd.
++ * All Rights Reserved.
++ *
++ */
++
++#ifndef _I2CSLAVE_INDIRECT_H_
++#define _I2CSLAVE_INDIRECT_H_
++
++u8 i2csi_req_handle_sts(u8 cmd, u32 read_seq);
++u32 i2csi_req_handle_wdata(u8 **data, u8 cnt);
++u32 i2csi_req_handle_cfg(u8 **data, u8 cnt);
++void i2csi_req_handle_sync_error(void);
++
++#endif /* _I2CSLAVE_INDIRECT_H_ */
+diff --git a/preboot/module_i2c_slave.c b/preboot/module_i2c_slave.c
+index 64e540d..3bb2e59 100644
+--- a/preboot/module_i2c_slave.c
++++ b/preboot/module_i2c_slave.c
+@@ -5,11 +5,14 @@
+  *
+  */
+ 
++#include <stdint.h>
+ #include <preboot.h>
+ #include <hl_i2c_slave_events.h>
++#include <hl_i2c_indirect.h>
+ 
+ #include "thermal.h"
+ #include "module_i2c_slave.h"
++#include "i2cslave_indirect.h"
+ 
+ u8 i2cslave_handle_read_req(u8 cmd, u32 read_seq)
+ {
+@@ -33,6 +36,25 @@
+ 	case HL_PCIE_VENDOR_ID_VAL_HIGH:
+ 		ret = i2cslave_pcie_vendor_id_cmd(cmd + read_seq);
+ 		break;
++	case HL_INDIRECT_REQ_STS_CODE:
++		if (!read_seq) {
++			ret = HL_I2CI_REQ_STS_LEN;
++			break;
++		}
++		/* Fall through */
++	case HL_INDIRECT_REQ_STS_DATA:
++	case HL_INDIRECT_REQ_STS_DATA_1:
++	case HL_INDIRECT_REQ_STS_DATA_2:
++	case HL_INDIRECT_REQ_STS_DATA_3:
++	case HL_INDIRECT_REQ_STS_DATA_4:
++		ret = i2csi_req_handle_sts(cmd, read_seq);
++		break;
++	case HL_INDIRECT_REQ_WDATA_CODE:
++		ret = HL_I2CI_REQ_WDATA_LEN;
++		break;
++	case HL_INDIRECT_REQ_CFG_CODE:
++		ret = HL_I2CI_REQ_CFG_LEN;
++		break;
+ 	default:
+ 		/* NA */
+ 		ret = 0;
+@@ -44,7 +66,17 @@
+ 
+ u32 i2cslave_handle_write_req(u8 cmd, u8 **data, u8 cnt)
+ {
+-	return 0;
++	switch (cmd) {
++	case HL_INDIRECT_REQ_WDATA_DATA:
++		return i2csi_req_handle_wdata(data, cnt);
++	case HL_INDIRECT_REQ_CFG_DATA:
++		return i2csi_req_handle_cfg(data, cnt);
++	default:
++		return 0;
++	}
+ }
+ 
+-void i2cslave_handle_sync_error(void) {}
++void i2cslave_handle_sync_error(void)
++{
++	i2csi_req_handle_sync_error();
++}

@@ -1,0 +1,98 @@
+From d6fdb69bff474314b29eb5302db4a57240cf3527 Mon Sep 17 00:00:00 2001
+From: Varun Sharma <vsharma@habana.ai>
+Date: Sun, 27 Nov 2022 13:58:18 +0200
+Subject: [PATCH] [SW-112010] eeprom: add support for comms eeprom msg
+
+The COMMs EEPROM message is intended to let LKD enable usage of the
+default EEPROM values for the development environment case (not customer
+site).
+Add support for this message and propagate the data to other FW
+components (e.g. U-Boot).
+
+Change-Id: I6be9f3852785f73b931c52e24911178c0d74a6f4
+Signed-off-by: Varun Sharma <vsharma@habana.ai>
+(cherry picked from commit 01e9417eeea6f955372b48bd176a74bc2c1c918a)
+---
+
+diff --git a/app/preboot/preboot.c b/app/preboot/preboot.c
+index af38fed..70f49c2 100644
+--- a/app/preboot/preboot.c
++++ b/app/preboot/preboot.c
+@@ -51,6 +51,7 @@
+ static struct hl_rsp_err pending_error;
+ static u64 preboot_en_caps;
+ static u8 fw_cfg_skip;
++static u8 eeprom_def_boot_en;
+ 
+ static struct cmd_module_ops cmd_ops[] = {
+ 	{	/* PCI module */
+@@ -585,9 +586,23 @@
+ 	fw_cfg_skip = skip;
+ }
+ 
++void preboot_set_eeprom_defaults_en(u8 eeprom_defaults_on_err)
++{
++	eeprom_def_boot_en = eeprom_defaults_on_err;
++}
++
++void preboot_boot_info_set_eeprom_fw_info(void)
++{
++	fw_info.version = HL_FW_INFO_VERSION;
++	fw_info.eeprom_def_boot_en = eeprom_def_boot_en;
++	boot_info_set(HL_BOOT_INFO_FW_INFO, &fw_info, sizeof(fw_info));
++}
++
+ void preboot_finalize_uboot_override(void)
+ {
+ 	if (fw_cfg_skip)
+ 		boot_info_set(HL_BOOT_INFO_FW_CFG_SKIP, &fw_cfg_skip, sizeof(fw_cfg_skip));
+ 
++	if (eeprom_def_boot_en)
++		preboot_boot_info_set_eeprom_fw_info();
+ }
+diff --git a/include/preboot.h b/include/preboot.h
+index 54086c7..aaa9ea8 100644
+--- a/include/preboot.h
++++ b/include/preboot.h
+@@ -244,6 +244,7 @@
+ void preboot_engines_init(void);
+ void preboot_clear_wd_gpio(void);
+ void preboot_set_fw_cfg_skip(u8 skip);
++void preboot_set_eeprom_defaults_en(u8 eeprom_defaults_on_err);
+ void preboot_finalize_uboot_override(void);
+ void preboot_update_bar_sizes(void);
+ bool hl_fw_cfg_skip_is_supported(void);
+diff --git a/lib/preboot/module_lkd.c b/lib/preboot/module_lkd.c
+index 94838ff..73cabd9 100644
+--- a/lib/preboot/module_lkd.c
++++ b/lib/preboot/module_lkd.c
+@@ -118,6 +118,19 @@
+ 	return 0;
+ }
+ 
++static int module_lkd_msg_eeprom_defaults(struct lkd_fw_comms_msg *mcomms)
++{
++	if (preboot_security_is_enabled()) {
++		preboot_puts("EEPROM defaults are not supported due to security\n");
++		return -1;
++	}
++
++	preboot_set_eeprom_defaults_en(mcomms->eeprom_defaults_on_err);
++
++	return 0;
++}
++
++
+ static int module_lkd_msg_process(struct lkd_fw_comms_msg *mcomms)
+ {
+ 	int err = 1;
+@@ -129,6 +142,9 @@
+ 	case HL_COMMS_FW_CFG_SKIP_TYPE:
+ 		err = module_lkd_msg_fw_cfg_skip(mcomms);
+ 		break;
++	case HL_COMMS_EEPROM_DEFAULTS_TYPE:
++		err = module_lkd_msg_eeprom_defaults(mcomms);
++		break;
+ 	default:
+ 		break;
+ 	}

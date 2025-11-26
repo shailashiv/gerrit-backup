@@ -1,0 +1,84 @@
+From 3234be3a189ff12252d9a0bc5e0ca3f6e6c5d5a7 Mon Sep 17 00:00:00 2001
+From: Sanyog Kale <skale@habana.ai>
+Date: Thu, 05 Aug 2021 15:39:28 +0300
+Subject: [PATCH] [SW-50880] greco: arc: add pci pll workaround
+
+Due to clock domain crossing issues in Greco, pci pll div0 frequency
+must be equal or lower than div2 for pci phy fw upgrade.
+otherwise the phy fw upgrade is very much likely to fail and pci link
+won't be established. In current flow of greco, div0 and div2 are
+maintained at refclock of 50MHz making sure the condition is met.
+
+This patch add change to set PCIe/CPU PLL frequency to actual target
+frequencies once pcie initialization is completed.
+
+Change-Id: I797d7efc0f6c12174883c86b13af1f8b6eb87000
+---
+
+diff --git a/arch/greco/arc/asic.c b/arch/greco/arc/asic.c
+index 6557614..029b7d8 100644
+--- a/arch/greco/arc/asic.c
++++ b/arch/greco/arc/asic.c
+@@ -5,10 +5,43 @@
+  *
+  */
+ 
++#include <stdbool.h>
+ 
++#include <preboot.h>
++#include <pll.h>
++#include <uart.h>
++#include <psoc_pci_pll_ctrl_regs.h>
++#include "common.h"
+ 
+ /* configure yellow LED(GPIO2) in output mode and turn on(active low) */
+ void preboot_led_on(void)
+ {
+ 	/* TODO: perform LED GPIO configuration */
+ }
++
++static struct hl_pll_cfg greco_pll_cfg[] = {
++	{
++		.name = "PCI", .base = mmPSOC_PCI_PLL_CTRL_BASE,
++		.nr = 1, .nf = 60, .od = 2, .nb = 3,
++		.div_factor = {0, 0, 4, -1},
++		.div_sel = { HL_PLL_PLL_CLK,
++			HL_PLL_PLL_CLK,
++			HL_PLL_DIV_PLL,
++			HL_PLL_REF_CLK
++		},
++	}
++};
++
++void hl_dev_pci_pll_wa(void)
++{
++	/*
++	 * make sure uart is not in the middle of transmission before touching
++	 * the plls, otherwise corrupted data is being sent
++	 */
++	preboot_uart_tx_flush();
++
++	/* Perform init of pcie/cpu pll */
++	hl_pll_init(greco_pll_cfg, 1);
++
++	hl_uart_init();
++}
+diff --git a/arch/greco/arc/pll.c b/arch/greco/arc/pll.c
+index f849dcd..2f2fbe5 100644
+--- a/arch/greco/arc/pll.c
++++ b/arch/greco/arc/pll.c
+@@ -50,8 +50,6 @@
+ 	return out_freq;
+ }
+ 
+-#ifdef TARGET_IS_PLDM
+-
+ #define GRECO_PLL_CFG		0x100
+ #define GRECO_PLL_CFG_EN	BIT(0)
+ #define GRECO_PLL_CFG_LOCK	BIT(16)
+@@ -118,5 +116,3 @@
+ {
+ 	regmap_writel(1, cfg->base + GRECO_PLL_DIV_SEL_DELAY);
+ }
+-
+-#endif /* TARGET_IS_PLDM */
